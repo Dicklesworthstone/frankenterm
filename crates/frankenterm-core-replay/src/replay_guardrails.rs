@@ -1,7 +1,7 @@
 //! Simulation guardrails and fail-closed safety controls (ft-og6q6.4.4).
 //!
 //! Provides:
-//! - [`SimulationGuard`] — Thread-local simulation flag with leak detection.
+//! - [`SimulationGuard`] — Process-visible simulation flag with leak detection.
 //! - [`ResourceLimits`] — Configurable event/time/memory/concurrency caps.
 //! - [`ResourceTracker`] — Runtime enforcement of resource limits.
 //! - [`WatchdogConfig`] — Stall detection and force-termination policy.
@@ -11,59 +11,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ============================================================================
-// SimulationGuard — thread-local simulation flag
+// SimulationGuard — process-visible simulation flag
 // ============================================================================
 
-thread_local! {
-    static SIMULATION_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// RAII guard that sets the simulation flag on creation and clears on drop.
-pub struct SimulationGuard {
-    _private: (),
-}
-
-impl SimulationGuard {
-    /// Enter simulation mode. Panics if already in simulation mode.
-    #[must_use]
-    pub fn enter() -> Self {
-        SIMULATION_ACTIVE.with(|f| {
-            assert!(
-                !f.get(),
-                "SimulationGuard::enter called while already in simulation mode"
-            );
-            f.set(true);
-        });
-        Self { _private: () }
-    }
-
-    /// Check if simulation mode is currently active (thread-local).
-    #[must_use]
-    pub fn is_active() -> bool {
-        SIMULATION_ACTIVE.with(|f| f.get())
-    }
-
-    /// Assert that we are NOT in simulation mode. Use in live side-effect code.
-    ///
-    /// Panics with a clear message if simulation mode is active.
-    pub fn assert_not_simulating(operation: &str) {
-        assert!(
-            !Self::is_active(),
-            "SIMULATION SAFETY VIOLATION: attempted live operation '{}' \
-             during counterfactual simulation. This indicates a barrier \
-             leak — all side effects must go through SideEffectBarrier.",
-            operation
-        );
-    }
-}
-
-impl Drop for SimulationGuard {
-    fn drop(&mut self) {
-        SIMULATION_ACTIVE.with(|f| {
-            f.set(false);
-        });
-    }
-}
+pub use frankenterm_core_replay_types::simulation_guard::SimulationGuard;
 
 // ============================================================================
 // ResourceLimits — configurable caps
@@ -476,6 +427,15 @@ impl GuardrailReport {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static SIMULATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn simulation_test_lock() -> MutexGuard<'static, ()> {
+        SIMULATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn non_interfering_limits() -> ResourceLimits {
         ResourceLimits {
@@ -491,30 +451,20 @@ mod tests {
 
     #[test]
     fn guard_sets_and_clears_flag() {
-        assert!(!SimulationGuard::is_active());
+        let _lock = simulation_test_lock();
+        assert!(!SimulationGuard::is_thread_active());
         {
             let _guard = SimulationGuard::enter();
             assert!(SimulationGuard::is_active());
+            assert!(SimulationGuard::is_thread_active());
         }
-        assert!(!SimulationGuard::is_active());
-    }
-
-    #[test]
-    #[should_panic(expected = "SIMULATION SAFETY VIOLATION")]
-    fn guard_panics_on_live_operation() {
-        let _guard = SimulationGuard::enter();
-        SimulationGuard::assert_not_simulating("write_to_pane");
-    }
-
-    #[test]
-    fn assert_not_simulating_ok_outside() {
-        SimulationGuard::assert_not_simulating("write_to_pane");
-        // Should not panic.
+        assert!(!SimulationGuard::is_thread_active());
     }
 
     #[test]
     #[should_panic(expected = "already in simulation mode")]
     fn guard_double_enter_panics() {
+        let _lock = simulation_test_lock();
         let _g1 = SimulationGuard::enter();
         let _g2 = SimulationGuard::enter(); // Should panic.
     }

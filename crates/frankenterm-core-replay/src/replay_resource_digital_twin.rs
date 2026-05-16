@@ -18,6 +18,7 @@ use crate::replay_side_effect_barrier::{
     EffectRequest, EffectType, SideEffectBarrier, SideEffectLog,
 };
 use frankenterm_core::policy::ActionKind;
+use frankenterm_core_replay_types::simulation_guard::SimulationGuard;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -703,6 +704,7 @@ impl ResourceDigitalTwinEngine {
         barrier: &dyn SideEffectBarrier,
         options: &ResourceDigitalTwinRunOptions,
     ) -> Result<ResourceDigitalTwinSimulation, ResourceDigitalTwinError> {
+        let _simulation_guard = SimulationGuard::enter();
         if options.probe_side_effect_attempt {
             let outcome = barrier.process(&EffectRequest {
                 timestamp_ms: options.generated_at_ms,
@@ -2116,6 +2118,75 @@ author = "test"
         ResourceDigitalTwinEngine::default()
             .simulate_with_barrier(trace, package, &barrier)
             .unwrap()
+    }
+
+    #[derive(Default)]
+    struct GuardProbeBarrier {
+        log: SideEffectLog,
+        saw_simulation_active: std::sync::atomic::AtomicBool,
+    }
+
+    impl SideEffectBarrier for GuardProbeBarrier {
+        fn process(
+            &self,
+            request: &EffectRequest,
+        ) -> crate::replay_side_effect_barrier::EffectOutcome {
+            self.saw_simulation_active.store(
+                SimulationGuard::is_active(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.log
+                .record(crate::replay_side_effect_barrier::SideEffectEntry {
+                    index: 0,
+                    timestamp_ms: request.timestamp_ms,
+                    effect_type: request.effect_type,
+                    pane_id: request.pane_id,
+                    payload_summary: request.payload.clone(),
+                    caller_hint: request.caller.clone(),
+                    action_kind: request.action_kind,
+                    metadata: request.metadata.clone(),
+                });
+            crate::replay_side_effect_barrier::EffectOutcome {
+                executed: false,
+                overridden: false,
+                summary: "guard probe captured".to_string(),
+            }
+        }
+
+        fn log(&self) -> Option<&SideEffectLog> {
+            Some(&self.log)
+        }
+
+        fn mode_name(&self) -> &'static str {
+            "guard_probe"
+        }
+    }
+
+    #[test]
+    fn simulation_scope_is_active_while_barrier_probe_runs() {
+        let trace = trace(vec![admission_step(
+            "stable",
+            Some(0.40),
+            Some(12),
+            Some(0.70),
+            0,
+        )]);
+        let options = ResourceDigitalTwinRunOptions {
+            probe_side_effect_attempt: true,
+            ..ResourceDigitalTwinRunOptions::default()
+        };
+        let barrier = GuardProbeBarrier::default();
+
+        ResourceDigitalTwinEngine::default()
+            .simulate_with_options(&trace, &empty_package(), &barrier, &options)
+            .expect("guard-probe simulation should not execute side effects");
+
+        assert!(
+            barrier
+                .saw_simulation_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "simulation entrypoint must hold SimulationGuard while probing side effects"
+        );
     }
 
     #[test]

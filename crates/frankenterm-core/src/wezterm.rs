@@ -1360,6 +1360,9 @@ impl WeztermClient {
                     let changes = match changes_result {
                         Ok(changes) => changes,
                         Err(e) => {
+                            if !self.mux_error_should_fallback_to_cli_for_client(&e) {
+                                return Err(Self::mux_cancelled_error("get_text_with_cx", e));
+                            }
                             self.mux_circuit_record_failure(&e);
                             tracing::debug!(
                                 error = %e,
@@ -1486,7 +1489,8 @@ impl WeztermClient {
         pane_id: u64,
     ) -> Result<PaneTieredScrollbackSummary> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.pane_tiered_scrollback_summary_with_cx(&cx, pane_id).await
+        self.pane_tiered_scrollback_summary_with_cx(&cx, pane_id)
+            .await
     }
 
     /// Get tiered-scrollback telemetry for a pane under an explicit `&Cx`
@@ -1855,6 +1859,9 @@ impl WeztermClient {
         cwd: Option<&str>,
         percent: Option<u8>,
     ) -> Result<u64> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::split_pane",
+        );
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
             if self.mux_circuit_guard() {
@@ -1924,6 +1931,9 @@ impl WeztermClient {
         cwd: Option<&str>,
         percent: Option<u8>,
     ) -> Result<u64> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::split_pane_with_cx",
+        );
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
             if self.mux_circuit_guard() {
@@ -1982,6 +1992,9 @@ impl WeztermClient {
     /// # Arguments
     /// * `pane_id` - The pane to activate
     pub async fn activate_pane(&self, pane_id: u64) -> Result<()> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::activate_pane",
+        );
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
         self.run_cli_with_pane_check(&args, pane_id).await?;
@@ -1994,6 +2007,9 @@ impl WeztermClient {
     /// cancellation, budget, and virtual time from the caller's
     /// context rather than the ambient thread-local one.
     pub async fn activate_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::activate_pane_with_cx",
+        );
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
         self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
@@ -2044,6 +2060,9 @@ impl WeztermClient {
     /// # Arguments
     /// * `pane_id` - The pane to kill
     pub async fn kill_pane(&self, pane_id: u64) -> Result<()> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::kill_pane",
+        );
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
         self.run_cli_with_pane_check(&args, pane_id).await?;
@@ -2055,6 +2074,9 @@ impl WeztermClient {
     /// `wezterm cli kill-pane` subprocess honors caller cancellation,
     /// budget, and virtual time.
     pub async fn kill_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::kill_pane_with_cx",
+        );
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
         self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
@@ -2119,7 +2141,8 @@ impl WeztermClient {
         no_newline: bool,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.send_text_impl_with_cx(&cx, pane_id, text, no_paste, no_newline).await
+        self.send_text_impl_with_cx(&cx, pane_id, text, no_paste, no_newline)
+            .await
     }
 
     /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool fast
@@ -2137,6 +2160,9 @@ impl WeztermClient {
         no_paste: bool,
         no_newline: bool,
     ) -> Result<()> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::send_text_impl_with_cx",
+        );
         if let Some(ref pool) = self.mux_pool {
             if !self.mux_circuit_guard() {
                 tracing::debug!("mux connection circuit open; falling back to CLI send");
@@ -2195,6 +2221,9 @@ impl WeztermClient {
         no_paste: bool,
         no_newline: bool,
     ) -> Result<()> {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "wezterm::WeztermClient::send_text_impl_with_cx",
+        );
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
         if no_paste {

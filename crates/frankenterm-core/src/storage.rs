@@ -8181,6 +8181,9 @@ fn dispatch_write_command_raw(
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, StreamingRedactor>,
 ) {
+    frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+        "storage::dispatch_write_command_raw",
+    );
     match cmd {
         WriteCommand::AppendSegment {
             pane_id,

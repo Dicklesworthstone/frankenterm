@@ -1160,6 +1160,9 @@ impl EventBus {
     /// Returns the number of subscribers that received the event.
     #[must_use]
     pub fn publish(&self, event: Event) -> usize {
+        frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
+            "events::EventBus::publish",
+        );
         let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
             crate::runtime_telemetry::SwarmCapacityStage::EventBusFanout,
             u64::try_from(self.subscriber_count()).unwrap_or(u64::MAX),
