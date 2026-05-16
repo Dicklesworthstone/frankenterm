@@ -10,7 +10,7 @@
 //!
 //! ## Dependency direction
 //!
-//! Leaf — depends only on `serde` + `serde_json`. ZERO `frankenterm-core`
+//! Leaf — depends only on `serde`, `serde_json`, and `sha2`. ZERO `frankenterm-core`
 //! deps. Both `frankenterm-core` and the future
 //! `frankenterm-core-replay` will depend on this crate; no cycle.
 //!

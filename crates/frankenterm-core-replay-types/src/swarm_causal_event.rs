@@ -126,7 +126,7 @@ pub struct CausalPrivacy {
 }
 
 /// Versioned event envelope consumed by the flight-recorder incident DAG.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCausalEvent {
     pub schema_version: String,
     pub event_id: String,
@@ -353,10 +353,10 @@ fn validate_required_correlation(
 ) -> Result<(), SwarmCausalEventError> {
     let ok = match source {
         SwarmCausalEventSource::Pane => correlation.pane_id.is_some(),
-        SwarmCausalEventSource::Beads => is_present(&correlation.bead_id),
-        SwarmCausalEventSource::Rch => is_present(&correlation.rch_build_id),
-        SwarmCausalEventSource::AgentMail => is_present(&correlation.thread_id),
-        SwarmCausalEventSource::Git => is_present(&correlation.git_commit),
+        SwarmCausalEventSource::Beads => is_present(correlation.bead_id.as_ref()),
+        SwarmCausalEventSource::Rch => is_present(correlation.rch_build_id.as_ref()),
+        SwarmCausalEventSource::AgentMail => is_present(correlation.thread_id.as_ref()),
+        SwarmCausalEventSource::Git => is_present(correlation.git_commit.as_ref()),
         SwarmCausalEventSource::Robot
         | SwarmCausalEventSource::Mcp
         | SwarmCausalEventSource::Workflow
@@ -372,10 +372,8 @@ fn validate_required_correlation(
     }
 }
 
-fn is_present(value: &Option<String>) -> bool {
-    value
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+fn is_present(value: Option<&String>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn payload_hash(payload: &Value) -> String {
