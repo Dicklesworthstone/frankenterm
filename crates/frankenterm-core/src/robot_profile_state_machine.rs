@@ -40,10 +40,11 @@
 //!
 //! ## What this is NOT
 //!
-//! - Not the actual handler. Wiring `RobotCommands::Profile`
-//!   into the existing config/profile machinery + the
-//!   `agent_profiles` schema migration is the integration
-//!   follow-on under ft-hac7w.2.cont.handler.
+//! - Not the live handler. `RobotCommands::Profile` now
+//!   dispatches through `robot_profile_handler` for read,
+//!   validation, dry-run apply, and mux-backed non-dry-run apply.
+//!   This module remains the state-space proof substrate rather
+//!   than duplicating the storage and mutation executor.
 //! - Not the differential test against `ntm profile`. That
 //!   lands under ft-hac7w.2.cont.differential once the real
 //!   handler is wired.

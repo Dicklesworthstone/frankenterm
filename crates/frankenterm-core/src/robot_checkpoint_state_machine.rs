@@ -38,9 +38,11 @@
 //!
 //! ## What this is NOT
 //!
-//! - Not the actual handler. Wiring `RobotCommands::Checkpoint`
-//!   into the existing `ft snapshot` + session_restore
-//!   machinery is the integration follow-on.
+//! - Not the live handler. `RobotCommands::Checkpoint` now
+//!   dispatches through `handle_robot_checkpoint_command`, backed
+//!   by the snapshot/session storage surface. This module remains
+//!   the state-space proof substrate rather than duplicating the
+//!   storage and session-restore adapter.
 //! - Not the differential test against `ntm checkpoint`. That
 //!   uses `crate::robot_ntm_differential::DifferentialHarness`
 //!   from `ft-hac7w.1.1` and runs in a separate harness.

@@ -20,10 +20,11 @@ The vision is largely **delivered**, with a few specific gaps:
   rename is documented as "deprecated alias for one release" but is
   effectively the active name — only 3 files use the new name vs ~190
   still using the alias.
-- **What's explicitly not implemented (and the docs say so honestly):**
-  `ft robot checkpoint/context/work/fleet/profile` return
-  `robot.not_implemented` (5 sites in `main.rs`). Documented in
-  AGENTS.md "Not Yet Implemented" with `ntm`-pointer for each.
+- **Previously not implemented, now superseded:** the original sweep found
+  `ft robot checkpoint/context/work/fleet/profile` routed through
+  `robot.not_implemented`. Current HEAD has native dispatch for all five
+  families; `docs/robot-contracts/current-ntm-gap-dispatch.md` is the current
+  source of truth and records an empty generic NTM-gap fallback set.
 
 ## Vision (as stated)
 
@@ -136,27 +137,27 @@ members. The README's bottom-line summary (line 1272) still says
 
 This finding is rolled into `ft-f1ec3` above.
 
-### (4) Robot mode "Not Yet Implemented" — honestly documented
+### (4) Robot mode NTM-gap fallback — superseded by native dispatch
 
-`AGENTS.md:471-489` lists 5 robot families that return
-`robot.not_implemented`:
+At the original review date, five robot families still returned
+`robot.not_implemented`. Current HEAD has since graduated those surfaces to
+native handlers; `docs/robot-contracts/current-ntm-gap-dispatch.md` now records
+that no live Robot family routes through the generic NTM-gap fallback.
 
 | Command            | Dispatch site                          | Status |
 | ------------------ | -------------------------------------- | ------ |
-| `ft robot checkpoint` | `crates/frankenterm/src/main.rs:23025` | NTM punt |
-| `ft robot context`    | `crates/frankenterm/src/main.rs:23072` | NTM punt |
-| `ft robot work`       | `crates/frankenterm/src/main.rs:23150` | NTM punt |
-| `ft robot fleet`      | `crates/frankenterm/src/main.rs:23210` | NTM punt |
-| `ft robot profile`    | `crates/frankenterm/src/main.rs:23259` | NTM punt |
+| `ft robot checkpoint` | `crates/frankenterm/src/main.rs::handle_robot_checkpoint_command` | Native snapshot/session adapter; mutating rollback remains approval-gated |
+| `ft robot context` | `crates/frankenterm/src/main.rs::robot_context_command_response` | Native SQLite `pane_contexts` / `context_rotations` adapter |
+| `ft robot work` | `crates/frankenterm/src/main.rs::robot_work_command_response` | Native SQLite `work_claims` queue |
+| `ft robot fleet` | `crates/frankenterm/src/main.rs::robot_fleet_command_response` | Native inventory reads plus fleet mutation receipts for scale/rebalance |
+| `ft robot profile` | `crates/frankenterm-core/src/robot_profile_handler.rs` via CLI dispatch | Native read/validate/dry-run apply plus mux-backed non-dry-run apply |
 
-Verified all 5 dispatch sites exist and route through
-`build_ntm_not_implemented_response`. The error envelope includes an
-`ntm_equivalent` pointer when one exists. README's Supported Surface
-Matrix (line 174) lists the implemented robot families and is silent
-about these — but AGENTS.md is explicit and points at the wa-rsaf
-session-state-persistence epic.
+The old `build_ntm_not_implemented_response` helper remains as a typed error
+envelope utility and for regression tests, but the live graduated families no
+longer use it as their dispatch target.
 
-**No bead filed** — the docs and code agree, the punt is intentional.
+**Supersession note filed:** `ft-ssm7t` refreshed the stale review text and
+state-machine module comments after the native handlers shipped.
 
 ### (5) Mux boundary — wezterm-fork stance is now codified
 

@@ -32,13 +32,13 @@
 //!
 //! ## What this is NOT
 //!
-//! - Not the production handler. Wiring `RobotCommands::Context`
-//!   to the cass-types + session-resume infrastructure (the
-//!   bead's action #3) is the integration follow-on.
-//! - Not the schema migration for `pane_contexts` +
-//!   `context_rotations` (action #2). The state-machine model
-//!   names the tables; the migration is a separate
-//!   integration step.
+//! - Separate from the production handler. `RobotCommands::Context`
+//!   now dispatches through the native SQLite context adapter for
+//!   status, rotate, and history. This module remains the state-space
+//!   proof substrate rather than duplicating the CLI/storage adapter.
+//! - Not the schema migration code for `pane_contexts` +
+//!   `context_rotations`. The state-machine model names the
+//!   tables; the native adapter owns table creation.
 
 use std::collections::BTreeMap;
 

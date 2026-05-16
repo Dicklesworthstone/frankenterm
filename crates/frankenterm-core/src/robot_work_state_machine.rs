@@ -42,9 +42,11 @@
 //!
 //! ## What this is NOT
 //!
-//! - Not the actual handler. Wiring `RobotCommands::Work` into
-//!   a real `work_claims` storage table with transactional
-//!   atomicity is the integration follow-on.
+//! - Not the live handler. `RobotCommands::Work` now dispatches
+//!   through `robot_work_command_response`, backed by the native
+//!   SQLite `work_claims` table. This module remains the
+//!   state-space proof substrate rather than duplicating the
+//!   persistence adapter.
 //! - Not the differential test against `bv` work-queue
 //!   commands (action #5 of the bead). That uses the
 //!   `crate::robot_ntm_differential::DifferentialHarness` from

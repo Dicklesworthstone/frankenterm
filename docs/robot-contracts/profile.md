@@ -262,7 +262,7 @@ ft-t9a6q.1 / .2 / .3:
 - `crate::robot_family_contract::profile_family_contract` — the schema-DSL contract.
 - `crate::robot_profile_state_machine` — the BFS state-space model.
 - `crate::robot_ntm_surface::ProfileCommand` — the wire-format request types.
-- `crate::config_profiles` — existing config-side profile management (the wiring follow-up integrates here).
+- `crate::config_profiles` — existing config-side profile management; keep it aligned with the native profile handler.
 - `crate::session_profiles` — session-level profile types (ft-3681t.2.4).
 - `tests/robot_family_conformance.rs` — schema + state-machine conformance harness.
 - ft-hac7w (parent epic — Robot Family Closure).
