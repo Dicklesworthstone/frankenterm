@@ -482,6 +482,139 @@ saying the claim is invalid.
 
 ---
 
+## 2A. Operating-Envelope Admission Gate
+
+The operating-envelope contract is the dry-run gate for deciding what kind of
+swarm work is safe right now. Its v1 schema is
+`docs/json-schema/ft-operating-envelope.json` and its source contract is
+[`docs/robot-contracts/operating-envelope.md`](robot-contracts/operating-envelope.md).
+The controller is read-only: it ranks admission windows, records why the
+window is reduced, and lists forbidden action classes. It is never permission
+to mutate panes, claim Beads, restart services, cancel RCH jobs, or substitute
+local Cargo proof.
+
+Current status: the contract, planner, and fixtures exist, but the operator,
+robot, and MCP explain surfaces are still tracked by `ft-booek.4`. Until that
+surface bead lands, use the existing fallback commands in this runbook and cite
+the retained fixture or command artifact that most closely matches the live
+state.
+
+### 2A.1 Trust boundaries
+
+Treat each input domain as evidence with a separate failure mode:
+
+| Domain | Trust boundary |
+| --- | --- |
+| Beads/BV | Source of intended work, dependencies, assignees, and stale candidates. It is not proof that an owner is idle, that code is clean, or that a blocked Bead is safe to bypass. |
+| Agent Mail | Coordination channel only. Unavailable or degraded mail is an envelope input, not an instruction to repair, restart, or kill the shared service. |
+| RCH | Remote proof substrate. Worker selection, sync, and topology preflight are not source proof; closeout proof requires retained remote Cargo/rustc/test evidence for the intended lane. |
+| Git | Local dirty-tree risk. Tracked dirty overlap blocks attribution; untracked files require review before claiming they are harmless. A clean `git status` is not a test result. |
+| Pane inventory | Optional redacted metadata for occupancy and ownership. Raw pane content is forbidden by default and must not be captured to make an envelope more convenient. |
+| Capacity/resource telemetry | Admission pressure signal. Missing, stale, contradictory, or privacy-redacted telemetry lowers the envelope instead of permitting more work by guess. |
+| Proof artifacts | Durable evidence only when command, worker, target dir, exit code, redaction status, and remote Cargo/test reachability are retained. Prose summaries and RCH transfer chatter are secondary. |
+
+### 2A.2 Safe workflows by envelope state
+
+Use the fixture states as examples of the operator posture:
+
+| State | Example artifact | Safe next action |
+| --- | --- | --- |
+| Normal green window | `fixtures/operating-envelope/valid/healthy.json` | Claim only unblocked Beads with clean or non-overlapping paths, run static checks, and run RCH proof if the Bead requires it. Forbidden actions still stay forbidden. |
+| Agent Mail outage | `fixtures/operating-envelope/valid/agent-mail-unavailable.json` | Retry mail once, then continue Beads-only with `scripts/swarm-tick.sh --agent-mail-fallback frankenterm`; post Beads comments instead of attempting service remediation. |
+| RCH proof outage | `fixtures/operating-envelope/valid/rch-no-worker.json` | Do docs/static work or wait. For proof Beads, record `infra_blocked` or the matching reason code; do not run local Cargo as closeout proof. |
+| RCH topology failure | `fixtures/operating-envelope/valid/rch-topology-failure.json` | Preserve the pre-Cargo artifact and classify it as infrastructure. Do not repoint workers, restart daemons, or mutate remote mirrors without explicit operator authorization. |
+| Dirty shared tree | `fixtures/operating-envelope/valid/dirty-overlap.json` | Wait, ask for ownership, or choose a non-overlapping docs/static slice. Do not run proof over another agent's dirty files. |
+| Stale in-progress Bead | `scripts/swarm-tick.sh --agent-mail-fallback frankenterm` stale fields | Comment a status check first, refresh Beads and dirty-path state, and reopen only after ownership is stale and no overlap signal remains. |
+| No ready Beads | `br ready --json` returns `[]` plus `bv --robot-triage` | Do not infer "no work." Use robot-mode `bv`, then pick a blocked-but-static planning/docs slice only if it does not pretend dependencies are complete. |
+| Red or black pressure | capacity/resource source says red, black, stale, or unavailable | Pause admission, shed new proof lanes, and keep only read-only/status work. Escalate with the retained telemetry artifact, not a service restart. |
+
+### 2A.3 Surface examples
+
+These are the target operator shapes for `ft-booek.4`; do not present them as
+live commands until that bead ships. The expected degraded fields are pinned by
+the fixture JSON today.
+
+Human surface:
+
+```bash
+ft swarm envelope --explain rch.no_workers_passed_health
+```
+
+Expected degraded summary:
+
+```text
+outcome=defer tier=red confidence=unavailable
+permitted=read_status,add_beads_comment,wait
+forbidden=claim_bead,edit_files,run_rch_proof,local_cargo_proof,service_restart,agent_mail_repair,worker_drain,build_cancellation,raw_pane_content
+reason=rch.no_workers_passed_health
+remote_cargo_reached=false
+```
+
+Robot surface:
+
+```bash
+ft robot --format toon swarm envelope
+```
+
+Expected degraded fields:
+
+```text
+contract_id: ft.operating_envelope.v1
+decision:
+  outcome: defer
+  envelope_tier: red
+  rch_proof_state: unavailable
+  reason_codes: [rch.no_workers_passed_health, rch.remote_cargo_reached_false, local_cargo.forbidden]
+admission_windows[0]:
+  window_class: defer
+  permitted_action_classes: [read_status, add_beads_comment, wait]
+```
+
+MCP surface:
+
+```text
+resource: wa://swarm/operating-envelope
+tool: wa.swarm_envelope_explain {"reason_code":"dirty_overlap.present"}
+```
+
+Expected degraded fields:
+
+```json
+{
+  "contract_id": "ft.operating_envelope.v1",
+  "decision": {
+    "outcome": "wait",
+    "envelope_tier": "orange",
+    "dirty_tree_state": "dirty_overlap",
+    "reason_codes": ["dirty_overlap.present", "assignee_overlap.active", "envelope.wait"]
+  }
+}
+```
+
+### 2A.4 Artifact citation rules
+
+Every Beads comment or release-attestation note that cites an
+operating-envelope decision should include:
+
+```text
+Operating-envelope: contract ft.operating_envelope.v1; outcome <outcome>; tier <green|yellow|orange|red|black>; reason_codes <codes>; sources <beads,rch,agent_mail,git,capacity,robot>; artifact <path-or-command>; forbidden_actions <action_classes>; closeout <safe|blocked>.
+```
+
+For docs/static work, pair it with the non-proof closeout sentence from the
+proof-doctor section:
+
+```text
+Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
+Target-dir lifecycle: not applicable; no Cargo/RCH target dir created.
+```
+
+For release attestations, cite the retained envelope artifact from the
+producing Bead and keep it separate from the proof artifact. An envelope may
+explain why a proof lane was deferred, but it does not prove the code under
+test.
+
+---
+
 ## 3. Tick #1 — establish baseline
 
 The first tick sets the contract for the session. Skip steps and you
