@@ -80,15 +80,27 @@ The README and AGENTS doctrine sells ft as "asupersync-native." A workspace dep 
 ## G2 — Robot Family Closure w/ Conformance Harness (BR-RC-ROBOT-NTM)
 
 ### Reality-check finding
-- 5 robot families return `robot.not_implemented`: `checkpoint`, `context`, `work`, `fleet`, `profile` (main.rs:22994-23228).
-- README support matrix shows these as ⏳ with "use ntm" pointer.
-- The epic identifier `wa-rsaf` (session state persistence) is referenced in AGENTS.md and README but is NOT in the local beads DB.
+- Original review finding: the checkpoint, context, work, fleet, and profile
+  robot families returned
+  `robot.not_implemented`: `checkpoint`, `context`, `work`, `fleet`, and
+  `profile`.
+- Current status: those families now have native dispatch. The current source
+  of truth is `docs/robot-contracts/current-ntm-gap-dispatch.md`, which records
+  an empty generic NTM-gap fallback set.
+- Historical context: the missing `wa-rsaf` epic identifier and old README
+  "use ntm" pointer described the pre-native-dispatch state; do not treat them
+  as current implementation guidance.
 
 ### Why it matters
-"Robot mode is supported" is a headline claim. 5/12 families silently degrading to "shell out to ntm" undermines the AI-to-AI control narrative. The deeper risk: when we DO ship native impls, how does an AI caller know they behave correctly under failure, partial commit, or adversarial input?
+"Robot mode is supported" is a headline claim. The original risk was that some
+families silently degraded to a generic NTM fallback. The current risk is
+different: after native dispatch ships, AI callers need stable contracts and
+proof that those handlers behave correctly under failure, partial commit, and
+adversarial input.
 
 ### Bridge actions — round-2 elevated
-1. **Per-family semantic spec FIRST** (before any handler code). For each of the 5 families write a typed contract:
+1. **Per-family semantic spec FIRST.** For each graduated family, keep a typed
+   contract that documents:
    - Idempotency class (idempotent / commutative / sequential)
    - Failure-semantics: must-not-partially-mutate / can-partially-mutate-with-receipt / fire-and-forget
    - Observable side-effect surface (events emitted, storage rows mutated, IPC sent)
@@ -98,23 +110,31 @@ The README and AGENTS doctrine sells ft as "asupersync-native." A workspace dep 
    - Asserts idempotency: replay yields identical observable result
    - Asserts atomicity: kill-switch mid-call leaves storage in a recoverable state (per the plan's existing `MissionKillSwitchLevel`)
    - Asserts observable-effect bound: only the declared side-effects occur (events/storage diff matches manifest)
-3. **Differential testing against `ntm` reference**: For families that have an `ntm` equivalent, run both backends against the same input stream and assert identical observable behavior. This makes the "delegate to ntm" → "native impl" transition risk-free because the contract is the same.
+3. **Differential testing against `ntm` reference**: For families that have an
+   `ntm` equivalent, run both backends against the same input stream and assert
+   identical observable behavior. This preserves regression coverage after the
+   "delegate to ntm" → "native impl" transition.
 4. **Per-family scoping** (now contract-driven, not vibe-driven):
    - **checkpoint** {save, rollback, list}: Wires into existing `ft snapshot` + session_restore. Idempotent on save (content-addressed); rollback is `RequireApproval` if cross-pane state mutates.
    - **context** {status, rotate, history}: Per-pane conversation context. New schema integrating cass + session-resume. Rotation is non-idempotent → must emit a TX-style receipt.
    - **work** {claim, complete, status, list}: Build minimal native queue with `claim` semantics that compose with `br`'s ownership model (compatible IDs, non-conflicting reservations). Strong claim/release atomicity guaranteed via storage transaction.
    - **fleet** {status, launch, stop, describe}: Surface `frankenterm-core-fleet` already-extracted dashboard data. `launch`/`stop` route through TX engine for prepare/commit/compensate.
    - **profile** {show, list, set}: Lightweight CRUD on profile table. `set` is idempotent on identical input.
-5. **The `robot.not_implemented` envelope STAYS** as the typed degradation surface for genuinely-unbuilt features — but gets enriched to include `next_check_after` so AI callers can poll for shipped status without rebuild.
+5. **The `robot.not_implemented` envelope STAYS** as the typed degradation
+   surface for genuinely-unbuilt features, but no graduated checkpoint,
+   context, work, fleet, or profile family should route through it.
 6. **Approval-token integration audit**: each family must declare which actions auto-allow vs require an approval token; the `policy.rs` engine wires every shipped handler.
 
 ### Acceptance criteria
-- 5 family contracts checked into `docs/robot-contracts/<family>.md` with typed schemas
-- Conformance harness covers all 5; tests pass on every commit
-- Differential test (where `ntm` equivalent exists) shows zero observable divergence on a 1000-request fuzz corpus
-- Zero call sites hit `build_ntm_not_implemented_response` for the 5 families
-- README support matrix updated; every family has at least one e2e example
-- Each family's contract attested in the release bundle
+- Family contracts checked into `docs/robot-contracts/<family>.md` with typed schemas.
+- Conformance harness covers the graduated families; tests pass on every commit.
+- Differential test, where an `ntm` equivalent exists, shows zero observable
+  divergence on a 1000-request fuzz corpus.
+- Zero live call sites hit `build_ntm_not_implemented_response` for checkpoint,
+  context, work, fleet, or profile.
+- README support matrix stays aligned with native-dispatch reality; every
+  family has at least one e2e example.
+- Each family's contract is attested in the release bundle.
 
 ### Round-3 additions
 - **TLA+ spec per family that mutates state** (checkpoint, work). Model the prepare/commit/compensate against the existing TX engine; check liveness + safety with TLC. Spec lives in `docs/specs/robot-<family>.tla`.
