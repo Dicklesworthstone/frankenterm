@@ -130,6 +130,26 @@ fn pct_to_glyph(pct: u8) -> char {
     }
 }
 
+const INDETERMINATE_PROGRESS_GLYPH: char = '\u{f110}'; // fa-spinner
+
+fn progress_indicator(progress: &Progress) -> Option<(FormatColor, String)> {
+    match progress {
+        Progress::None => None,
+        Progress::Percentage(pct) => Some((
+            FormatColor::AnsiColor(AnsiColor::Green),
+            format!("{} ", pct_to_glyph(*pct)),
+        )),
+        Progress::Error(pct) => Some((
+            FormatColor::AnsiColor(AnsiColor::Red),
+            format!("{} ", pct_to_glyph(*pct)),
+        )),
+        Progress::Indeterminate => Some((
+            FormatColor::AnsiColor(AnsiColor::Yellow),
+            format!("{INDETERMINATE_PROGRESS_GLYPH} "),
+        )),
+    }
+}
+
 fn compute_tab_title(
     tab: &TabInformation,
     tab_info: &[TabInformation],
@@ -171,23 +191,11 @@ fn compute_tab_title(
                     title = format!("{}{classic_spacing}", title);
                 }
 
-                match pane.progress {
-                    Progress::None => {}
-                    Progress::Percentage(pct) | Progress::Error(pct) => {
-                        let graphic = format!("{} ", pct_to_glyph(pct));
-                        len += unicode_column_width(&graphic, None);
-                        let color = if matches!(pane.progress, Progress::Percentage(_)) {
-                            FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Green))
-                        } else {
-                            FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Red))
-                        };
-                        items.push(color);
-                        items.push(FormatItem::Text(graphic));
-                        items.push(FormatItem::Foreground(FormatColor::Default));
-                    }
-                    Progress::Indeterminate => {
-                        // TODO: Decide what to do here to indicate this
-                    }
+                if let Some((color, graphic)) = progress_indicator(&pane.progress) {
+                    len += unicode_column_width(&graphic, None);
+                    items.push(FormatItem::Foreground(color));
+                    items.push(FormatItem::Text(graphic));
+                    items.push(FormatItem::Foreground(FormatColor::Default));
                 }
 
                 // We have a preferred soft minimum on tab width to make it
@@ -737,4 +745,42 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
     });
     flush_print(&mut print_buffer, &mut cells, &pen);
     Line::from_cells(cells, SEQ_ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indeterminate_progress_has_visible_indicator() {
+        let (color, graphic) = progress_indicator(&Progress::Indeterminate)
+            .expect("indeterminate progress should render an indicator");
+
+        assert_eq!(graphic, format!("{INDETERMINATE_PROGRESS_GLYPH} "));
+        assert!(unicode_column_width(&graphic, None) > 0);
+        assert!(matches!(color, FormatColor::AnsiColor(AnsiColor::Yellow)));
+    }
+
+    #[test]
+    fn percentage_and_error_progress_keep_existing_colors() {
+        let (percentage_color, percentage_graphic) =
+            progress_indicator(&Progress::Percentage(50)).expect("percentage progress indicator");
+        let (error_color, error_graphic) =
+            progress_indicator(&Progress::Error(50)).expect("error progress indicator");
+
+        assert_eq!(percentage_graphic, error_graphic);
+        assert!(matches!(
+            percentage_color,
+            FormatColor::AnsiColor(AnsiColor::Green)
+        ));
+        assert!(matches!(
+            error_color,
+            FormatColor::AnsiColor(AnsiColor::Red)
+        ));
+    }
+
+    #[test]
+    fn no_progress_has_no_indicator() {
+        assert!(progress_indicator(&Progress::None).is_none());
+    }
 }
