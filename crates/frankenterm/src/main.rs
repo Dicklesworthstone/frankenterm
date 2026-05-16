@@ -722,7 +722,7 @@ SEE ALSO:
     ft prepare    Prepare plan preview
     ft approve    Validate approval codes"#)]
     Commit {
-        /// Plan ID (from wa prepare)
+        /// Plan ID (from ft prepare)
         plan_id: String,
 
         /// Action text (required for send_text plans)
@@ -1706,7 +1706,7 @@ SEE ALSO:
         format: String,
     },
 
-    /// Simulation mode: run wa with a mock WezTerm driven by YAML scenarios
+    /// Simulation mode: run ft with a mock WezTerm driven by YAML scenarios
     #[command(after_help = r#"EXAMPLES:
     ft simulate run scenario.yaml        Run a scenario file
     ft simulate run scenario.yaml -s 4   Run at 4x speed
@@ -4657,7 +4657,7 @@ enum SetupCommands {
 
     /// Patch wezterm.lua with user-var forwarding (idempotent)
     Patch {
-        /// Remove the wa block instead of adding it
+        /// Remove the ft-managed block instead of adding it
         #[arg(long)]
         remove: bool,
 
@@ -4668,7 +4668,7 @@ enum SetupCommands {
 
     /// Install OSC 133 prompt markers in shell rc file (idempotent)
     Shell {
-        /// Remove the wa block instead of adding it
+        /// Remove the ft-managed block instead of adding it
         #[arg(long)]
         remove: bool,
 
@@ -19604,7 +19604,7 @@ async fn run_robot_rpc_via_cli(
     use std::process::Stdio;
 
     let exe =
-        std::env::current_exe().map_err(|e| format!("failed to resolve wa executable: {e}"))?;
+        std::env::current_exe().map_err(|e| format!("failed to resolve ft executable: {e}"))?;
     let config_path = config_path.map(PathBuf::from);
     let workspace_root = workspace_root.to_path_buf();
     let args = args.to_vec();
@@ -23830,7 +23830,7 @@ async fn run_watcher(
 
     #[cfg(not(feature = "metrics"))]
     if config.metrics.enabled {
-        tracing::warn!("Metrics enabled in config, but wa was built without the metrics feature");
+        tracing::warn!("Metrics enabled in config, but ft was built without the metrics feature");
     }
     #[cfg(not(feature = "metrics"))]
     let _ = dangerous_bind_any;
@@ -24199,7 +24199,7 @@ fn maybe_trigger_e2e_watcher_panic_once(layout: &frankenterm_core::config::Works
         );
     }
 
-    panic!("wa-e2e: intentional watcher panic (one-shot)");
+    panic!("ft-e2e: intentional watcher panic (one-shot)");
 }
 
 async fn run_saved_search_scheduler(
@@ -33612,7 +33612,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         println!("No bookmarks with tag \"{tag}\"");
                                     } else {
                                         println!(
-                                            "No bookmarks. Add one with: wa panes bookmark add <pane_id> --alias <name>"
+                                            "No bookmarks. Add one with: ft panes bookmark add <pane_id> --alias <name>"
                                         );
                                     }
                                 } else {
@@ -36847,7 +36847,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     if decision.requires_approval() {
                         let Some(code) = approval_code.as_deref() else {
                             eprintln!("Error: Approval required (E_PLAN_APPROVAL_MISSING).");
-                            eprintln!("Hint: Use --approval-code from wa prepare.");
+                            eprintln!("Hint: Use --approval-code from ft prepare.");
                             std::process::exit(1);
                         };
                         let store = frankenterm_core::approval::ApprovalStore::new(
@@ -37116,7 +37116,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     if decision.requires_approval() {
                         let Some(code) = approval_code.as_deref() else {
                             eprintln!("Error: Approval required (E_PLAN_APPROVAL_MISSING).");
-                            eprintln!("Hint: Use --approval-code from wa prepare.");
+                            eprintln!("Hint: Use --approval-code from ft prepare.");
                             std::process::exit(1);
                         };
                         let store = frankenterm_core::approval::ApprovalStore::new(
@@ -39257,13 +39257,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 "  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}\n"
                             );
                             println!(
-                                "This ensures wa can capture all terminal output without gaps."
+                                "This ensures ft can capture all terminal output without gaps."
                             );
                         }
 
                         println!("\n--- Why {RECOMMENDED_SCROLLBACK_LINES} lines? ---");
                         println!("• AI coding agents can produce substantial output");
-                        println!("• wa uses delta extraction to capture only new content");
+                        println!("• ft uses delta extraction to capture only new content");
                         println!(
                             "• Insufficient scrollback causes capture gaps (EVENT_GAP_DETECTED)"
                         );
@@ -39325,18 +39325,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 .unwrap_or_default();
                                             if existing.trim_end() == ft_block.trim_end() {
                                                 println!(
-                                                    "✓ wa block already up to date in {}",
+                                                    "✓ ft-managed block already up to date in {}",
                                                     config_path.display()
                                                 );
                                             } else {
                                                 println!(
-                                                    "• wa block would be updated in {}",
+                                                    "• ft-managed block would be updated in {}",
                                                     config_path.display()
                                                 );
                                             }
                                         } else {
                                             println!(
-                                                "• wa block would be added to {}",
+                                                "• ft-managed block would be added to {}",
                                                 config_path.display()
                                             );
                                         }
@@ -42537,7 +42537,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }) => {
             let demos: &[(&str, &str)] = &[
                 ("quickstart", "Basic ft setup and first detection"),
-                ("usage_limit", "Agent hits usage limit, wa auto-rotates"),
+                ("usage_limit", "Agent hits usage limit, ft auto-rotates"),
                 ("compaction", "Context compaction detection and handling"),
             ];
 
@@ -42558,7 +42558,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             println!("  {name:<20} {desc}");
                         }
                         println!();
-                        println!("Run a demo: wa demo <name>");
+                        println!("Run a demo: ft demo <name>");
                         println!(
                             "Note: Demo scenarios are not yet bundled. Use 'ft simulate run' with custom YAML."
                         );
@@ -44569,7 +44569,7 @@ async fn handle_config_command(
 
             println!("Created config at: {}", config_path.display());
             println!();
-            println!("Edit this file to customize wa behavior.");
+            println!("Edit this file to customize FrankenTerm behavior.");
             println!("Run `ft config validate` to check for errors.");
         }
 
@@ -50812,7 +50812,7 @@ async fn handle_auth_command(
     _verbose: bool,
 ) -> anyhow::Result<()> {
     eprintln!("Error: Browser feature not enabled.");
-    eprintln!("Rebuild with: cargo build -p wa --features browser");
+    eprintln!("Rebuild with: cargo build -p frankenterm --features browser");
     std::process::exit(1);
 }
 
@@ -50946,7 +50946,7 @@ fn set_toml_value(
     Ok(())
 }
 
-/// Recommended minimum scrollback lines for wa to function reliably
+/// Recommended minimum scrollback lines for ft to function reliably
 const RECOMMENDED_SCROLLBACK_LINES: u64 = 50_000;
 const PRAGMASEVKA_BUNDLED_VERSION: &str = "1.7.0";
 const PRAGMASEVKA_BUNDLED_SOURCE_URL: &str =
@@ -51427,7 +51427,7 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if setup::has_ft_block(&content) {
-                        println!("\n✓ wezterm.lua already patched (wa block present)");
+                        println!("\n✓ wezterm.lua already patched (ft-managed block present)");
                     } else if apply_changes {
                         let result = setup::patch_wezterm_config_at(&path)?;
                         println!("\n✓ {}", result.message);
@@ -51435,7 +51435,10 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
                             println!("  Backup: {}", backup.display());
                         }
                     } else {
-                        println!("\n⚠ wezterm.lua missing wa block: {}", path.display());
+                        println!(
+                            "\n⚠ wezterm.lua missing ft-managed block: {}",
+                            path.display()
+                        );
                         println!(
                             "  Would patch and create backup: {}",
                             format_backup_hint(&path)
@@ -53269,10 +53272,10 @@ fn run_diagnostics(
                                 checks.push(DiagnosticCheck::error(
                                     "database",
                                     format!(
-                                        "schema v{} is newer than wa supports (v{})",
+                                        "schema v{} is newer than FrankenTerm supports (v{})",
                                         version, target
                                     ),
-                                    "Update wa to a newer version",
+                                    "Update FrankenTerm to a newer version",
                                 ));
                             }
                         }
@@ -72928,7 +72931,7 @@ A  docs/new-proof.md\n";
         let check = DiagnosticCheck::error(
             "database",
             "could not open: locked by another process",
-            "Check if another wa instance is running",
+            "Check if another ft instance is running",
         );
         let json = check.to_json_value();
         assert_eq!(json["name"], "database");
@@ -72938,7 +72941,7 @@ A  docs/new-proof.md\n";
             json["recommendation"]
                 .as_str()
                 .unwrap()
-                .contains("another wa")
+                .contains("another ft")
         );
     }
 
