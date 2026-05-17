@@ -35,6 +35,23 @@ const INITIAL_POLL_DELAY: Duration = Duration::from_millis(100);
 /// See also: Config.ssh_max_poll_delay_ms (config crate).
 const MAX_POLL_DELAY: Duration = Duration::from_secs(2);
 
+#[cfg(feature = "libssh-rs")]
+/// # Safety
+///
+/// `ptr` may be null. When non-null, it must point to a valid NUL-terminated
+/// C string for the lifetime of this call.
+unsafe fn libssh_log_string(ptr: *const std::os::raw::c_char, fallback: &'static str) -> String {
+    if ptr.is_null() {
+        return fallback.to_string();
+    }
+
+    // The callback receives process-external C strings from libssh. Keep the
+    // unsafe boundary here so the callback body can stay null-safe.
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
     pub fd: Option<FileDescriptor>,
@@ -171,9 +188,8 @@ impl SessionInner {
                 message: *const std::os::raw::c_char,
                 _userdata: *mut std::os::raw::c_void,
             ) {
-                use std::ffi::CStr;
-                let function = CStr::from_ptr(function).to_string_lossy().to_string();
-                let message = CStr::from_ptr(message).to_string_lossy().to_string();
+                let function = unsafe { libssh_log_string(function, "unknown") };
+                let message = unsafe { libssh_log_string(message, "<null libssh log message>") };
 
                 // The message typically has "function: message" prefixed, which
                 // looks redundant when logged with the function prefix by the
@@ -524,9 +540,19 @@ impl SessionInner {
                     // Dealt with at the top of the loop
                 } else if poll.revents != 0 {
                     let (channel_id, fd_num) = mapping[idx - 2];
-                    let info = self.channels.get_mut(&channel_id).unwrap();
+                    let Some(info) = self.channels.get_mut(&channel_id) else {
+                        log::debug!(
+                            "poll returned descriptor event for removed channel {channel_id}"
+                        );
+                        continue;
+                    };
                     let state = &mut info.descriptors[fd_num];
-                    let fd = state.fd.as_mut().unwrap();
+                    let Some(fd) = state.fd.as_mut() else {
+                        log::debug!(
+                            "poll returned descriptor event for closed channel {channel_id} fd {fd_num}"
+                        );
+                        continue;
+                    };
 
                     if fd_num == 0 {
                         // There's data we can read into the buffer
@@ -589,8 +615,13 @@ impl SessionInner {
                 if let Some(status) = chan.channel.exit_status() {
                     log::trace!("channel {id} has exit status {status:?}");
                     chan.exited = true;
-                    let exit = chan.exit.take().unwrap();
-                    crate::runtime::block_on(exit.send(status)).ok();
+                    if let Some(exit) = chan.exit.take() {
+                        crate::runtime::block_on(exit.send(status)).ok();
+                    } else {
+                        log::debug!(
+                            "channel {id} reported an exit status after its exit sender was already cleared"
+                        );
+                    }
                 }
             }
 
@@ -608,13 +639,7 @@ impl SessionInner {
                 }
             }
 
-            for (idx, out) in chan
-                .descriptors
-                .get_mut(1..)
-                .unwrap()
-                .iter_mut()
-                .enumerate()
-            {
+            for (idx, out) in chan.descriptors[1..].iter_mut().enumerate() {
                 if out.fd.is_none() {
                     continue;
                 }
@@ -1123,7 +1148,13 @@ impl SessionInner {
                 if sess.sftp.is_none() {
                     sess.sftp = Some(SftpWrap::Ssh2(sess.sess.sftp()?));
                 }
-                Ok(sess.sftp.as_mut().expect("sftp should have been set above"))
+                match sess.sftp.as_mut() {
+                    Some(sftp) => Ok(sftp),
+                    None => Err(std::io::Error::other(
+                        "ssh2 SFTP initialization did not retain a channel handle",
+                    )
+                    .into()),
+                }
             }
 
             #[cfg(feature = "libssh-rs")]
@@ -1131,7 +1162,13 @@ impl SessionInner {
                 if sess.sftp.is_none() {
                     sess.sftp = Some(SftpWrap::LibSsh(sess.sess.sftp()?));
                 }
-                Ok(sess.sftp.as_mut().expect("sftp should have been set above"))
+                match sess.sftp.as_mut() {
+                    Some(sftp) => Ok(sftp),
+                    None => Err(std::io::Error::other(
+                        "libssh SFTP initialization did not retain a channel handle",
+                    )
+                    .into()),
+                }
             }
         }
     }
@@ -1337,6 +1374,24 @@ mod tests {
             delay = next_poll_delay(delay);
         }
         assert_eq!(delay, MAX_POLL_DELAY);
+    }
+
+    #[cfg(feature = "libssh-rs")]
+    #[test]
+    fn libssh_log_string_uses_fallback_for_null_pointer() {
+        assert_eq!(
+            unsafe { libssh_log_string(std::ptr::null(), "<missing>") },
+            "<missing>"
+        );
+    }
+
+    #[cfg(feature = "libssh-rs")]
+    #[test]
+    fn libssh_log_string_decodes_c_string_lossily() {
+        let raw = b"libssh\xffmessage\0";
+        let decoded = unsafe { libssh_log_string(raw.as_ptr().cast(), "<missing>") };
+
+        assert_eq!(decoded, "libssh\u{fffd}message");
     }
 
     #[test]
