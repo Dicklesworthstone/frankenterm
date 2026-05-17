@@ -236,6 +236,62 @@ fn alternate_screen_buffer_geometry(info: CONSOLE_SCREEN_BUFFER_INFO) -> (COORD,
     )
 }
 
+struct ScreenResizePlan {
+    pre_buffer_viewport: Option<SMALL_RECT>,
+    buffer_size: COORD,
+    final_viewport: SMALL_RECT,
+}
+
+fn visible_window_dimensions(info: CONSOLE_SCREEN_BUFFER_INFO) -> COORD {
+    COORD {
+        X: (1 + info.srWindow.Right - info.srWindow.Left).max(1),
+        Y: (1 + info.srWindow.Bottom - info.srWindow.Top).max(1),
+    }
+}
+
+fn viewport_for_buffer_size(size: COORD) -> SMALL_RECT {
+    debug_assert!(size.X > 0);
+    debug_assert!(size.Y > 0);
+    SMALL_RECT {
+        Left: 0,
+        Top: 0,
+        Right: size.X - 1,
+        Bottom: size.Y - 1,
+    }
+}
+
+fn pre_buffer_resize_viewport(
+    info: CONSOLE_SCREEN_BUFFER_INFO,
+    target: COORD,
+) -> Option<SMALL_RECT> {
+    let visible = visible_window_dimensions(info);
+    if visible.X <= target.X && visible.Y <= target.Y {
+        return None;
+    }
+
+    let cols = min(visible.X, target.X).max(1);
+    let rows = min(visible.Y, target.Y).max(1);
+    let max_left = target.X - cols;
+    let max_top = target.Y - rows;
+    let left = min(max(info.srWindow.Left, 0), max_left);
+    let top = min(max(info.srWindow.Top, 0), max_top);
+
+    Some(SMALL_RECT {
+        Left: left,
+        Top: top,
+        Right: left + cols - 1,
+        Bottom: top + rows - 1,
+    })
+}
+
+fn screen_resize_plan(info: CONSOLE_SCREEN_BUFFER_INFO, target: COORD) -> ScreenResizePlan {
+    ScreenResizePlan {
+        pre_buffer_viewport: pre_buffer_resize_viewport(info, target),
+        buffer_size: target,
+        final_viewport: viewport_for_buffer_size(target),
+    }
+}
+
 impl RenderTty for OutputHandle {
     fn get_size_in_cells(&mut self) -> Result<(usize, usize)> {
         let info = self.get_buffer_info()?;
@@ -894,19 +950,27 @@ impl Terminal for WindowsTerminal {
     }
 
     fn set_screen_size(&mut self, size: ScreenSize) -> Result<()> {
-        // FIXME: take into account the visible window size here;
-        // this probably changes the size of everything including scrollback
-        let size = COORD {
+        ensure!(
+            size.cols > 0 && size.rows > 0,
+            "screen size must be positive: cols={}, rows={}",
+            size.cols,
+            size.rows
+        );
+        let target = COORD {
             X: cast(size.cols)?,
             Y: cast(size.rows)?,
         };
-        let handle = self.output_handle.handle.as_raw_handle();
-        if unsafe { SetConsoleScreenBufferSize(handle as *mut _, size) } != 1 {
-            bail!(
-                "failed to SetConsoleScreenBufferSize: {}",
-                IoError::last_os_error()
-            );
+
+        let plan = screen_resize_plan(self.output_handle.get_buffer_info()?, target);
+        if let Some(rect) = plan.pre_buffer_viewport {
+            self.output_handle
+                .set_viewport(rect.Left, rect.Top, rect.Right, rect.Bottom)?;
         }
+        self.output_handle
+            .set_screen_buffer_size(plan.buffer_size)?;
+        let rect = plan.final_viewport;
+        self.output_handle
+            .set_viewport(rect.Left, rect.Top, rect.Right, rect.Bottom)?;
         Ok(())
     }
 
@@ -979,6 +1043,14 @@ impl Terminal for WindowsTerminal {
 mod tests {
     use super::*;
 
+    fn coord(cols: i16, rows: i16) -> COORD {
+        COORD { X: cols, Y: rows }
+    }
+
+    fn rect_tuple(rect: SMALL_RECT) -> (i16, i16, i16, i16) {
+        (rect.Left, rect.Top, rect.Right, rect.Bottom)
+    }
+
     fn buffer_info(
         buffer_cols: i16,
         buffer_rows: i16,
@@ -1031,5 +1103,44 @@ mod tests {
             (rect.Left, rect.Top, rect.Right, rect.Bottom),
             (0, 0, 79, 24)
         );
+    }
+
+    #[test]
+    fn screen_resize_plan_shrinks_viewport_before_shrinking_buffer() {
+        let info = buffer_info(120, 9_000, 0, 8_950, 119, 8_999);
+
+        let plan = screen_resize_plan(info, coord(80, 24));
+
+        let pre_buffer_viewport = plan
+            .pre_buffer_viewport
+            .expect("shrinking below the current viewport needs a pre-buffer viewport");
+        assert_eq!(rect_tuple(pre_buffer_viewport), (0, 0, 79, 23));
+        assert_eq!((plan.buffer_size.X, plan.buffer_size.Y), (80, 24));
+        assert_eq!(rect_tuple(plan.final_viewport), (0, 0, 79, 23));
+    }
+
+    #[test]
+    fn screen_resize_plan_grows_buffer_before_growing_viewport() {
+        let info = buffer_info(80, 24, 0, 0, 79, 23);
+
+        let plan = screen_resize_plan(info, coord(120, 40));
+
+        assert!(plan.pre_buffer_viewport.is_none());
+        assert_eq!((plan.buffer_size.X, plan.buffer_size.Y), (120, 40));
+        assert_eq!(rect_tuple(plan.final_viewport), (0, 0, 119, 39));
+    }
+
+    #[test]
+    fn screen_resize_plan_clamps_offset_viewport_inside_target_buffer() {
+        let info = buffer_info(200, 100, 20, 10, 119, 39);
+
+        let plan = screen_resize_plan(info, coord(80, 50));
+
+        let pre_buffer_viewport = plan
+            .pre_buffer_viewport
+            .expect("width shrink needs the viewport to fit inside the target buffer first");
+        assert_eq!(rect_tuple(pre_buffer_viewport), (0, 10, 79, 39));
+        assert_eq!((plan.buffer_size.X, plan.buffer_size.Y), (80, 50));
+        assert_eq!(rect_tuple(plan.final_viewport), (0, 0, 79, 49));
     }
 }
