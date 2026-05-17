@@ -38,7 +38,7 @@ set +e
 run_rch_cargo_logged "${chaos_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo \
   test --package frankenterm-core \
   --test chaos_planner_dispatcher \
-  --features subprocess-bridge \
+  --features subprocess-bridge,__journal_types_placeholder \
   -- --nocapture
 chaos_rc=$?
 set -e

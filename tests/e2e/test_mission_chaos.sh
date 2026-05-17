@@ -158,7 +158,7 @@ chaos_result="$(run_suite \
   "chaos_planner_dispatcher" \
   "chaos_fault_injection_matrix" \
   20 \
-  cargo test -p frankenterm-core --features subprocess-bridge --test chaos_planner_dispatcher -- --nocapture)"
+  cargo test -p frankenterm-core --features subprocess-bridge,__journal_types_placeholder --test chaos_planner_dispatcher -- --nocapture)"
 tx_matrix_result="$(run_suite \
   "tx_scenario_matrix" \
   "chaos_tx_scenario_matrix" \

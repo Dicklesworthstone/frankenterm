@@ -134,7 +134,7 @@ chaos_result="$(run_suite \
   "chaos" \
   "chaos_fault_injection_suite" \
   24 \
-  cargo test -p frankenterm-core --features subprocess-bridge --test chaos_planner_dispatcher -- --nocapture)"
+  cargo test -p frankenterm-core --features subprocess-bridge,__journal_types_placeholder --test chaos_planner_dispatcher -- --nocapture)"
 perf_result="$(run_suite \
   "performance" \
   "performance_budget_suite" \
