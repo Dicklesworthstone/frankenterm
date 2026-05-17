@@ -3,12 +3,10 @@
 **Bead:** `ft-gzgfc.1`
 **Audience:** Agents implementing generated Robot Mode SDK clients.
 
-The generated Rust, Python, and TypeScript SDKs are finish-line supported SDK
-targets today. Rust uses the in-process `RustSdkTransport`; Python and
-TypeScript use tested default process transports that run
-`ft robot --format json` without shell interpolation. Go still renders a
-template client whose transport panics with `transport not wired`. That is
-intentional honesty, not a supported user workflow. A language may move from
+The generated Rust, Python, TypeScript, and Go SDKs are finish-line supported
+SDK targets today. Rust uses the in-process `RustSdkTransport`; Python,
+TypeScript, and Go use tested default process transports that run
+`ft robot --format json` without shell interpolation. A language may move from
 template-only to supported only after it satisfies this contract and its
 generated artifact no longer contains a placeholder transport.
 
@@ -22,7 +20,7 @@ implement before changing `SdkLanguage::is_fully_supported`.
 | Rust | `supported_daemon_transport` | `frankenterm_client_rust.rs` | Uses `RustSdkTransport` over watcher IPC. |
 | Python | `supported_process_transport` | `frankenterm_client_python.py` | Uses `asyncio.create_subprocess_exec` to run `ft robot --format json` without shell interpolation. |
 | TypeScript | `supported_process_transport` | `frankenterm_client_typescript.ts` | Node-only process transport using `node:child_process`; browser use requires a separate future transport. |
-| Go | `template_only` | Not included in the production bundle | The generated skeleton keeps `panic("transport not wired")` until a real default transport and tests land. |
+| Go | `supported_process_transport` | `frankenterm_client_go.go` | Uses `os/exec.CommandContext` with `context.Context` cancellation and timeouts to run `ft robot --format json` without shell interpolation. |
 
 The checked fixture
 `crates/frankenterm-core/tests/fixtures/robot_sdk_supported_matrix.json`
@@ -151,11 +149,13 @@ The generated source must not contain
 
 ### Go
 
-The Go client should use `context.Context` for cancellation and timeout
-propagation. Robot errors and transport errors should be distinguishable, and
-generated code must be deterministic and `gofmt` compatible.
+The Go client uses `context.Context` for cancellation and timeout propagation
+and exposes an injectable `ProcessRunner` for fixture tests. Robot errors and
+transport errors are distinguishable, and generated code must be deterministic
+and `gofmt` compatible.
 
-Promotion removes the generated `panic("transport not wired")` default.
+The generated source must not contain `panic("transport not wired")` or any
+other placeholder transport default.
 
 ## Artifact Guards
 
@@ -171,7 +171,8 @@ When a language is promoted, tests must assert all of the following:
 - the promoted source includes a real default transport or a real default
   transport factory;
 - SDK docs list the language as supported and identify any runtime constraint,
-  such as TypeScript's Node-only process transport.
+  such as TypeScript's Node-only process transport or Go's
+  `context.Context`-driven process transport.
 
 The artifact bundle must never mix a `supported_*` language state with a
 placeholder transport marker.

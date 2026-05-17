@@ -34,13 +34,13 @@
     },
     {
       "guard_id": "fake_sdk_capability_contract",
-      "invariant": "SdkLanguage::is_fully_supported returns true only for SDK targets with generated, tested default transports; Python, TypeScript, and Rust are supported, while Go remains template-only.",
-      "cargo_test": "ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported",
+      "invariant": "SdkLanguage::is_fully_supported returns true only for SDK targets with generated, tested default transports; Python, TypeScript, Rust, and Go are supported.",
+      "cargo_test": "ft_xbnl0_3_6_sdk_targets_are_finish_line_supported",
       "test_target": "-p frankenterm-core --lib",
       "upstream_bead": "ft-xbnl0.3.6",
       "failure_signatures": [
         "assertion_failed: supported SDK emitted transport stub",
-        "assertion_failed: Go SDK target claimed full support"
+        "assertion_failed: supported SDK target lost full support"
       ]
     },
     {

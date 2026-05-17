@@ -241,14 +241,13 @@ pub struct ErrorCodeSpec {
 
 /// Language target for SDK generation.
 ///
-/// [`SdkLanguage::Python`], [`SdkLanguage::TypeScript`], and
-/// [`SdkLanguage::Rust`] are fully-supported finish-line SDK targets: Python
-/// and TypeScript wire Robot Mode through bounded default process transports,
-/// and Rust wires through [`RustSdkTransport`] end-to-end. The `Go` variant
-/// still renders a *template skeleton* whose transport method panics with
-/// `transport not wired` and must be implemented by the consumer before use.
-/// Use [`SdkLanguage::is_fully_supported`] to gate any code path that requires
-/// a real, wired transport.
+/// [`SdkLanguage::Python`], [`SdkLanguage::TypeScript`],
+/// [`SdkLanguage::Rust`], and [`SdkLanguage::Go`] are fully-supported
+/// finish-line SDK targets. Python, TypeScript, and Go wire Robot Mode through
+/// bounded default process transports, while Rust wires through
+/// [`RustSdkTransport`] end-to-end. Use
+/// [`SdkLanguage::is_fully_supported`] to gate any code path that requires a
+/// real, wired transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SdkLanguage {
     /// Python SDK with a default `ft robot --format json` process transport.
@@ -257,7 +256,7 @@ pub enum SdkLanguage {
     TypeScript,
     /// Rust SDK (client crate). Fully-supported finish-line target.
     Rust,
-    /// Go SDK template. Transport stub: consumer must implement `call`.
+    /// Go SDK with a default `ft robot --format json` process transport.
     Go,
 }
 
@@ -288,7 +287,10 @@ impl SdkLanguage {
     /// fully-wired transport.
     #[must_use]
     pub fn is_fully_supported(&self) -> bool {
-        matches!(self, Self::Python | Self::TypeScript | Self::Rust)
+        matches!(
+            self,
+            Self::Python | Self::TypeScript | Self::Rust | Self::Go
+        )
     }
 }
 
@@ -1898,27 +1900,662 @@ fn render_rust_client(surface: &SdkSurface) -> String {
 }
 
 fn render_go_client(surface: &SdkSurface) -> String {
-    let mut out = String::from("package frankenterm\n\n");
+    let mut out = String::from(
+        r#"package frankenterm
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+const stderrLimit = 4096
+const maxInt64 = int64(^uint64(0) >> 1)
+
+type JsonPayload map[string]interface{}
+
+type FrankentermProcessResult struct {
+	ReturnCode int
+	Stdout     []byte
+	Stderr     []byte
+}
+
+type ProcessRunner func(ctx context.Context, args []string, env map[string]string) (FrankentermProcessResult, error)
+
+type FrankentermTransportError struct {
+	Message string
+	Cause   error
+}
+
+func (e *FrankentermTransportError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+func (e *FrankentermTransportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+type FrankentermRobotError struct {
+	Code      string
+	Message   string
+	Hint      string
+	Details   interface{}
+	ElapsedMs float64
+	Envelope  JsonPayload
+}
+
+func (e *FrankentermRobotError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("%s: %s", e.Code, e.Message)
+	}
+	return e.Message
+}
+
+type FrankentermUnsupportedCommandError struct {
+	Command string
+}
+
+func (e *FrankentermUnsupportedCommandError) Error() string {
+	return fmt.Sprintf("unsupported robot command %q", e.Command)
+}
+
+type FrankentermClient struct {
+	ftBinary  string
+	timeout   time.Duration
+	env       map[string]string
+	runner    ProcessRunner
+}
+
+type FrankentermClientOption func(*FrankentermClient)
+
+func NewFrankentermClient(options ...FrankentermClientOption) *FrankentermClient {
+	client := &FrankentermClient{
+		ftBinary: "ft",
+		timeout: 30 * time.Second,
+		runner: runProcess,
+	}
+	for _, option := range options {
+		option(client)
+	}
+	if client.runner == nil {
+		client.runner = runProcess
+	}
+	if client.ftBinary == "" {
+		client.ftBinary = "ft"
+	}
+	return client
+}
+
+func WithFtBinary(path string) FrankentermClientOption {
+	return func(client *FrankentermClient) {
+		client.ftBinary = path
+	}
+}
+
+func WithTimeout(timeout time.Duration) FrankentermClientOption {
+	return func(client *FrankentermClient) {
+		client.timeout = timeout
+	}
+}
+
+func WithEnv(env map[string]string) FrankentermClientOption {
+	return func(client *FrankentermClient) {
+		client.env = copyEnv(env)
+	}
+}
+
+func WithRunner(runner ProcessRunner) FrankentermClientOption {
+	return func(client *FrankentermClient) {
+		client.runner = runner
+	}
+}
+
+"#,
+    );
 
     for return_type in unique_return_types(surface) {
-        out.push_str(&format!("type {return_type} = map[string]interface{{}}\n"));
+        out.push_str(&format!("type {return_type} = interface{{}}\n"));
     }
 
+    out.push_str("\nvar supportedCommandList = []string{\n");
+    for method in &surface.methods {
+        out.push_str(&format!("\t\"{}\",\n", method.command));
+    }
+    out.push_str("}\n\nvar supportedCommands = map[string]struct{}{\n");
+    for method in &surface.methods {
+        out.push_str(&format!("\t\"{}\": {{}},\n", method.command));
+    }
     out.push_str(
-        "\ntype FrankentermClient struct{}\n\nfunc (c *FrankentermClient) call(command string, payload map[string]interface{}) (map[string]interface{}, error) {\n\tpanic(\"transport not wired\")\n}\n",
+        r#"}
+
+func SupportedCommands() []string {
+	out := make([]string, len(supportedCommandList))
+	copy(out, supportedCommandList)
+	return out
+}
+
+func SupportsCommand(command string) bool {
+	_, ok := supportedCommands[command]
+	return ok
+}
+
+func (c *FrankentermClient) call(ctx context.Context, command string, payload JsonPayload) (interface{}, error) {
+	if !SupportsCommand(command) {
+		return nil, &FrankentermUnsupportedCommandError{Command: command}
+	}
+	if c == nil {
+		return nil, &FrankentermTransportError{Message: "nil FrankentermClient"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ftBinary := c.ftBinary
+	if ftBinary == "" {
+		ftBinary = "ft"
+	}
+	runner := c.runner
+	if runner == nil {
+		runner = runProcess
+	}
+	runCtx := ctx
+	cancel := func() {}
+	if c.timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, c.timeout)
+	}
+	defer cancel()
+
+	cleanPayload := withoutNil(payload)
+	robotArgs, err := commandArgs(command, cleanPayload)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{ftBinary, "robot", "--format", "json"}, robotArgs...)
+	result, err := runner(runCtx, args, c.env)
+	if err != nil {
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			return nil, &FrankentermTransportError{
+				Message: fmt.Sprintf("robot command timed out after %s: %s", c.timeout, strings.Join(args, " ")),
+				Cause:   err,
+			}
+		}
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+			return nil, &FrankentermTransportError{
+				Message: fmt.Sprintf("ft binary not found: %s", ftBinary),
+				Cause:   err,
+			}
+		}
+		return nil, &FrankentermTransportError{
+			Message: fmt.Sprintf("failed to start robot command %s: %s", strings.Join(args, " "), err),
+			Cause:   err,
+		}
+	}
+	if result.ReturnCode != 0 {
+		return nil, &FrankentermTransportError{
+			Message: fmt.Sprintf("robot command exited %d: %s", result.ReturnCode, stderrTail(result.Stderr)),
+		}
+	}
+
+	envelope, err := decodeEnvelope(result.Stdout, command)
+	if err != nil {
+		return nil, err
+	}
+	ok, hasOk := envelope["ok"].(bool)
+	if !hasOk {
+		return nil, &FrankentermTransportError{
+			Message: fmt.Sprintf("robot command %q returned malformed envelope: missing boolean ok", command),
+		}
+	}
+	if ok {
+		data, hasData := envelope["data"]
+		if !hasData {
+			return nil, &FrankentermTransportError{
+				Message: fmt.Sprintf("robot command %q returned ok=true without data", command),
+			}
+		}
+		return data, nil
+	}
+	return nil, robotError(envelope)
+}
+"#,
     );
 
     for method in &surface.methods {
+        let params = render_go_params(&method.params);
+        let signature_params = if params.is_empty() {
+            String::new()
+        } else {
+            format!(", {params}")
+        };
         out.push_str(&format!(
-            "\nfunc (c *FrankentermClient) {}({}) ({}, error) {{\n\tresult, err := c.call(\"{}\", {})\n\tif err != nil {{\n\t\treturn nil, err\n\t}}\n\treturn result, nil\n}}\n",
+            "\nfunc (c *FrankentermClient) {}(ctx context.Context{}) ({}, error) {{\n\tresult, err := c.call(ctx, \"{}\", {})\n\tif err != nil {{\n\t\tvar zero {}\n\t\treturn zero, err\n\t}}\n\treturn result, nil\n}}\n",
             method.method_name,
-            render_go_params(&method.params),
+            signature_params,
             method.return_type,
             method.command,
             render_go_payload(&method.params),
+            method.return_type,
         ));
     }
 
+    out.push_str(
+        r#"
+
+func runProcess(ctx context.Context, args []string, env map[string]string) (FrankentermProcessResult, error) {
+	if len(args) == 0 {
+		return FrankentermProcessResult{}, errors.New("missing process command")
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Env = mergedEnv(env)
+	err := cmd.Run()
+	result := FrankentermProcessResult{
+		ReturnCode: 0,
+		Stdout:     stdout.Bytes(),
+		Stderr:     stderr.Bytes(),
+	}
+	if err == nil {
+		return result, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		result.ReturnCode = exitErr.ExitCode()
+		return result, nil
+	}
+	return result, err
+}
+
+func commandArgs(command string, payload JsonPayload) ([]string, error) {
+	switch command {
+	case "get-text":
+		paneID, err := requiredNonnegativeInteger(payload, command, "pane_id")
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"get-text", fmt.Sprintf("%d", paneID)}
+		tailLines, err := optionalNonnegativeInteger(payload, command, "tail_lines")
+		if err != nil {
+			return nil, err
+		}
+		if tailLines != nil {
+			args = append(args, "--tail", fmt.Sprintf("%d", *tailLines))
+		}
+		escapes, err := optionalBool(payload, command, "escapes")
+		if err != nil {
+			return nil, err
+		}
+		if escapes != nil && *escapes {
+			args = append(args, "--escapes")
+		}
+		return args, nil
+	case "send-text":
+		paneID, err := requiredNonnegativeInteger(payload, command, "pane_id")
+		if err != nil {
+			return nil, err
+		}
+		text, err := requiredString(payload, command, "text")
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"send", fmt.Sprintf("%d", paneID), text}
+		dryRun, err := optionalBool(payload, command, "dry_run")
+		if err != nil {
+			return nil, err
+		}
+		if dryRun != nil && *dryRun {
+			args = append(args, "--dry-run")
+		}
+		approvalCode, err := optionalString(payload, command, "approval_code")
+		if err != nil {
+			return nil, err
+		}
+		if approvalCode != nil {
+			args = append(args, "--approval-code", *approvalCode)
+		}
+		waitFor, err := optionalString(payload, command, "wait_for")
+		if err != nil {
+			return nil, err
+		}
+		waitForRegex, err := optionalBool(payload, command, "wait_for_regex")
+		if err != nil {
+			return nil, err
+		}
+		timeoutSecs, err := optionalNonnegativeInteger(payload, command, "timeout_secs")
+		if err != nil {
+			return nil, err
+		}
+		if waitFor == nil && waitForRegex != nil && *waitForRegex {
+			return nil, invalidPayload(command, "wait_for_regex", "wait_for_regex requires wait_for")
+		}
+		if waitFor == nil && timeoutSecs != nil {
+			return nil, invalidPayload(command, "timeout_secs", "timeout_secs requires wait_for")
+		}
+		if waitFor != nil {
+			args = append(args, "--wait-for", *waitFor)
+			if timeoutSecs != nil {
+				args = append(args, "--timeout-secs", fmt.Sprintf("%d", *timeoutSecs))
+			}
+			if waitForRegex != nil && *waitForRegex {
+				args = append(args, "--wait-for-regex")
+			}
+		}
+		return args, nil
+	case "state":
+		args := []string{"state"}
+		includeText, err := optionalBool(payload, command, "include_text")
+		if err != nil {
+			return nil, err
+		}
+		tail, err := optionalNonnegativeInteger(payload, command, "tail")
+		if err != nil {
+			return nil, err
+		}
+		escapes, err := optionalBool(payload, command, "escapes")
+		if err != nil {
+			return nil, err
+		}
+		if (includeText != nil && *includeText) || tail != nil || (escapes != nil && *escapes) {
+			args = append(args, "--include-text")
+			if tail != nil {
+				args = append(args, "--tail", fmt.Sprintf("%d", *tail))
+			}
+			if escapes != nil && *escapes {
+				args = append(args, "--escapes")
+			}
+		}
+		return args, nil
+	case "search":
+		query, err := requiredString(payload, command, "query")
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"search", query}
+		limit, err := optionalNonnegativeInteger(payload, command, "limit")
+		if err != nil {
+			return nil, err
+		}
+		if limit != nil {
+			args = append(args, "--limit", fmt.Sprintf("%d", *limit))
+		}
+		pane, err := optionalNonnegativeInteger(payload, command, "pane")
+		if err != nil {
+			return nil, err
+		}
+		if pane != nil {
+			args = append(args, "--pane", fmt.Sprintf("%d", *pane))
+		}
+		since, err := optionalInteger(payload, command, "since")
+		if err != nil {
+			return nil, err
+		}
+		if since != nil {
+			args = append(args, "--since", fmt.Sprintf("%d", *since))
+		}
+		until, err := optionalInteger(payload, command, "until")
+		if err != nil {
+			return nil, err
+		}
+		if until != nil {
+			args = append(args, "--until", fmt.Sprintf("%d", *until))
+		}
+		snippets, err := optionalBool(payload, command, "snippets")
+		if err != nil {
+			return nil, err
+		}
+		if snippets != nil {
+			if *snippets {
+				args = append(args, "--snippets")
+			} else {
+				args = append(args, "--snippets=false")
+			}
+		}
+		mode, err := optionalString(payload, command, "mode")
+		if err != nil {
+			return nil, err
+		}
+		if mode != nil {
+			switch *mode {
+			case "lexical", "semantic", "hybrid":
+				args = append(args, "--mode", *mode)
+			default:
+				return nil, &FrankentermTransportError{
+					Message: "mode must be one of: lexical, semantic, hybrid",
+				}
+			}
+		}
+		return args, nil
+	default:
+		return nil, &FrankentermUnsupportedCommandError{Command: command}
+	}
+}
+
+func requiredString(payload JsonPayload, command string, field string) (string, error) {
+	value, ok := payload[field]
+	if !ok || value == nil {
+		return "", invalidPayload(command, field, "missing required string")
+	}
+	if text, ok := value.(string); ok {
+		return text, nil
+	}
+	if text, ok := value.(*string); ok && text != nil {
+		return *text, nil
+	}
+	return "", invalidPayload(command, field, "expected string")
+}
+
+func optionalString(payload JsonPayload, command string, field string) (*string, error) {
+	value, ok := payload[field]
+	if !ok || value == nil {
+		return nil, nil
+	}
+	if text, ok := value.(string); ok {
+		return &text, nil
+	}
+	if text, ok := value.(*string); ok {
+		return text, nil
+	}
+	return nil, invalidPayload(command, field, "expected string")
+}
+
+func optionalBool(payload JsonPayload, command string, field string) (*bool, error) {
+	value, ok := payload[field]
+	if !ok || value == nil {
+		return nil, nil
+	}
+	if flag, ok := value.(bool); ok {
+		return &flag, nil
+	}
+	if flag, ok := value.(*bool); ok {
+		return flag, nil
+	}
+	return nil, invalidPayload(command, field, "expected boolean")
+}
+
+func requiredNonnegativeInteger(payload JsonPayload, command string, field string) (int64, error) {
+	value, err := optionalNonnegativeInteger(payload, command, field)
+	if err != nil {
+		return 0, err
+	}
+	if value == nil {
+		return 0, invalidPayload(command, field, "missing required integer")
+	}
+	return *value, nil
+}
+
+func optionalNonnegativeInteger(payload JsonPayload, command string, field string) (*int64, error) {
+	value, err := optionalInteger(payload, command, field)
+	if err != nil {
+		return nil, err
+	}
+	if value != nil && *value < 0 {
+		return nil, invalidPayload(command, field, "expected non-negative integer")
+	}
+	return value, nil
+}
+
+func optionalInteger(payload JsonPayload, command string, field string) (*int64, error) {
+	value, ok := payload[field]
+	if !ok || value == nil {
+		return nil, nil
+	}
+	integer, err := asInt64(value)
+	if err != nil {
+		return nil, invalidPayload(command, field, "expected integer")
+	}
+	return &integer, nil
+}
+
+func asInt64(value interface{}) (int64, error) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), nil
+	case int8:
+		return int64(typed), nil
+	case int16:
+		return int64(typed), nil
+	case int32:
+		return int64(typed), nil
+	case int64:
+		return typed, nil
+	case uint:
+		if uint64(typed) > uint64(maxInt64) {
+			return 0, errors.New("integer out of range")
+		}
+		return int64(typed), nil
+	case uint8:
+		return int64(typed), nil
+	case uint16:
+		return int64(typed), nil
+	case uint32:
+		return int64(typed), nil
+	case uint64:
+		if typed > uint64(maxInt64) {
+			return 0, errors.New("integer out of range")
+		}
+		return int64(typed), nil
+	case float64:
+		integer := int64(typed)
+		if float64(integer) != typed {
+			return 0, errors.New("not an integer")
+		}
+		return integer, nil
+	case *int64:
+		if typed == nil {
+			return 0, errors.New("nil integer")
+		}
+		return *typed, nil
+	default:
+		return 0, errors.New("not an integer")
+	}
+}
+
+func invalidPayload(command string, field string, message string) *FrankentermTransportError {
+	return &FrankentermTransportError{
+		Message: fmt.Sprintf("invalid payload for %q field %q: %s", command, field, message),
+	}
+}
+
+func decodeEnvelope(stdout []byte, command string) (JsonPayload, error) {
+	var envelope JsonPayload
+	if err := json.Unmarshal(stdout, &envelope); err != nil {
+		return nil, &FrankentermTransportError{
+			Message: fmt.Sprintf("robot command %q returned invalid JSON", command),
+			Cause:   err,
+		}
+	}
+	if envelope == nil {
+		return nil, &FrankentermTransportError{
+			Message: fmt.Sprintf("robot command %q returned non-object JSON envelope", command),
+		}
+	}
+	return envelope, nil
+}
+
+func robotError(envelope JsonPayload) error {
+	message := "unknown robot error"
+	if raw, ok := envelope["error"].(string); ok && raw != "" {
+		message = raw
+	} else if raw, ok := envelope["message"].(string); ok && raw != "" {
+		message = raw
+	}
+	err := &FrankentermRobotError{
+		Message:  message,
+		Details:  envelope["details"],
+		Envelope: envelope,
+	}
+	if code, ok := envelope["error_code"].(string); ok {
+		err.Code = code
+	}
+	if hint, ok := envelope["hint"].(string); ok {
+		err.Hint = hint
+	}
+	if elapsed, ok := envelope["elapsed_ms"].(float64); ok {
+		err.ElapsedMs = elapsed
+	}
+	return err
+}
+
+func stderrTail(stderr []byte) string {
+	trimmed := strings.TrimSpace(string(stderr))
+	if trimmed == "" {
+		return "stderr was empty"
+	}
+	if len(trimmed) <= stderrLimit {
+		return trimmed
+	}
+	return trimmed[len(trimmed)-stderrLimit:]
+}
+
+func mergedEnv(env map[string]string) []string {
+	merged := os.Environ()
+	for key, value := range env {
+		merged = append(merged, key+"="+value)
+	}
+	return merged
+}
+
+func copyEnv(env map[string]string) map[string]string {
+	if env == nil {
+		return nil
+	}
+	copy := make(map[string]string, len(env))
+	for key, value := range env {
+		copy[key] = value
+	}
+	return copy
+}
+
+func withoutNil(payload JsonPayload) JsonPayload {
+	if payload == nil {
+		return JsonPayload{}
+	}
+	clean := JsonPayload{}
+	for key, value := range payload {
+		if value != nil {
+			clean[key] = value
+		}
+	}
+	return clean
+}
+"#,
+    );
     out
 }
 
@@ -1970,7 +2607,17 @@ fn render_rust_params(params: &[SdkParam]) -> String {
 fn render_go_params(params: &[SdkParam]) -> String {
     params
         .iter()
-        .map(|param| format!("{} {}", param.name, param.param_type))
+        .map(|param| {
+            if param.optional {
+                if param.param_type.starts_with('*') {
+                    format!("{} {}", param.name, param.param_type)
+                } else {
+                    format!("{} *{}", param.name, param.param_type)
+                }
+            } else {
+                format!("{} {}", param.name, param.param_type)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -3125,7 +3772,7 @@ mod tests {
     #[test]
     fn contract_artifact_bundle_renders_deterministic_exports() {
         let bundle = standard_contract_artifacts().unwrap();
-        assert_eq!(bundle.sdk_count(), 3);
+        assert_eq!(bundle.sdk_count(), 4);
         assert!(
             bundle
                 .endpoint_specs_json
@@ -3146,6 +3793,7 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             vec![
+                "frankenterm_client_go.go",
                 "frankenterm_client_python.py",
                 "frankenterm_client_rust.rs",
                 "frankenterm_client_typescript.ts"
@@ -3206,6 +3854,23 @@ mod tests {
         assert!(typescript.contains("wait_for_regex requires wait_for"));
         assert!(typescript.contains("mode must be one of: lexical, semantic, hybrid"));
         assert!(!typescript.contains("transport not wired"));
+    }
+
+    #[test]
+    fn contract_artifact_bundle_go_sdk_source_includes_process_transport() {
+        let bundle = standard_contract_artifacts().unwrap();
+        let go = bundle.sdk_sources.get("frankenterm_client_go.go").unwrap();
+
+        assert!(go.contains("exec.CommandContext"));
+        assert!(go.contains("context.Context"));
+        assert!(go.contains("FrankentermRobotError"));
+        assert!(go.contains("FrankentermTransportError"));
+        assert!(go.contains("FrankentermUnsupportedCommandError"));
+        assert!(go.contains("supportedCommands"));
+        assert!(go.contains("wait_for_regex requires wait_for"));
+        assert!(go.contains("mode must be one of: lexical, semantic, hybrid"));
+        assert!(!go.contains("transport not wired"));
+        assert!(!go.contains("panic("));
     }
 
     #[test]
@@ -3344,6 +4009,25 @@ mod tests {
         assert!(source.contains("--snippets=false"));
         assert!(source.contains("mode must be one of: lexical, semantic, hybrid"));
         assert!(!source.contains("transport not wired"));
+    }
+
+    #[test]
+    fn go_sdk_render_uses_real_transport_backend() {
+        let mut sdk = SdkSurface::new(SdkLanguage::Go, "frankenterm");
+        sdk.generate_from_specs(&core_endpoint_specs());
+        let source = sdk.render_client_source();
+
+        assert!(source.contains("exec.CommandContext"));
+        assert!(source.contains("ProcessRunner"));
+        assert!(source.contains("FrankentermUnsupportedCommandError"));
+        assert!(source.contains("FrankentermRobotError"));
+        assert!(source.contains("FrankentermTransportError"));
+        assert!(source.contains("\"send\","));
+        assert!(source.contains("--snippets=false"));
+        assert!(source.contains("mode must be one of: lexical, semantic, hybrid"));
+        assert!(source.contains("context.Context"));
+        assert!(!source.contains("transport not wired"));
+        assert!(!source.contains("panic("));
     }
 
     #[cfg(unix)]
@@ -3763,19 +4447,19 @@ main();
     }
 
     #[test]
-    fn ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported() {
-        // Truth-sweep guard for ft-xbnl0.3.6 plus ft-gzgfc.3: Python,
-        // TypeScript, and Rust now ship real generated transports. Go stays
-        // template-only until its dedicated promotion bead wires and tests it.
+    fn ft_xbnl0_3_6_sdk_targets_are_finish_line_supported() {
+        // Truth-sweep guard for ft-xbnl0.3.6, ft-gzgfc.3, and ft-0xkbb:
+        // Python, TypeScript, Rust, and Go now ship real generated transports.
         assert!(SdkLanguage::Python.is_fully_supported());
         assert!(SdkLanguage::TypeScript.is_fully_supported());
         assert!(SdkLanguage::Rust.is_fully_supported());
-        assert!(!SdkLanguage::Go.is_fully_supported());
+        assert!(SdkLanguage::Go.is_fully_supported());
 
         for lang in [
             SdkLanguage::Python,
             SdkLanguage::TypeScript,
             SdkLanguage::Rust,
+            SdkLanguage::Go,
         ] {
             let mut sdk = SdkSurface::new(lang, "frankenterm");
             sdk.generate_from_specs(&core_endpoint_specs());
@@ -3786,14 +4470,6 @@ main();
                 lang.label()
             );
         }
-
-        let mut go_sdk = SdkSurface::new(SdkLanguage::Go, "frankenterm");
-        go_sdk.generate_from_specs(&core_endpoint_specs());
-        let go_source = go_sdk.render_client_source();
-        assert!(
-            go_source.contains("transport not wired"),
-            "Go SDK template must keep an explicit unsupported transport marker until promoted"
-        );
     }
 
     // ---- E2E ----

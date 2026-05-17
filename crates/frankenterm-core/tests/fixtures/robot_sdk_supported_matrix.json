@@ -54,15 +54,21 @@
     },
     {
       "language": "Go",
-      "state": "template_only",
+      "state": "supported_process_transport",
       "artifact_filename": "frankenterm_client_go.go",
-      "fully_supported": false,
-      "included_in_production_bundle": false,
-      "runtime_note": "Template-only skeleton; consumer must provide a real transport before promotion.",
+      "fully_supported": true,
+      "included_in_production_bundle": true,
+      "runtime_note": "Uses os/exec CommandContext to run ft robot --format json without shell interpolation.",
       "required_source_markers": [
-        "transport not wired"
+        "exec.CommandContext",
+        "FrankentermRobotError",
+        "FrankentermTransportError",
+        "FrankentermUnsupportedCommandError"
       ],
-      "forbidden_source_markers": []
+      "forbidden_source_markers": [
+        "transport not wired",
+        "panic("
+      ]
     }
   ]
 }
