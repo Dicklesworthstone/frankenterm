@@ -126,7 +126,7 @@ emit_log \
   "representative_mission_tx_bundle" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "Executing via shared rch guard: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --test ${test_target} -- --nocapture"
+  "Executing via shared rch guard: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --features subprocess-bridge --test ${test_target} -- --nocapture"
 
 set +e
 run_rch_cargo_logged "${step_log}" \
@@ -135,7 +135,7 @@ run_rch_cargo_logged "${step_log}" \
     CARGO_INCREMENTAL="${CARGO_INCREMENTAL}" \
     RUSTFLAGS="${RUSTFLAGS}" \
     CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
-    cargo test -p frankenterm-core --test "${test_target}" -- --nocapture
+    cargo test -p frankenterm-core --features subprocess-bridge --test "${test_target}" -- --nocapture
 status=$?
 set -e
 tee -a "${STDOUT_FILE}" <"${step_log}"
