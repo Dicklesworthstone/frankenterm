@@ -1206,7 +1206,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 ├── Cargo.toml
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft)
-│   ├── frankenterm-core/                 # Core library — 521 top-level modules, ~1.01M LOC
+│   ├── frankenterm-core/                 # Core library — 509 top-level modules, ~1.01M LOC
 │   │   ├── src/
 │   │   │   ├── runtime.rs                # Observation runtime orchestration
 │   │   │   ├── runtime_async.rs          # Canonical asupersync wrapper API surface
