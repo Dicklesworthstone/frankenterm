@@ -144,7 +144,7 @@ command_index=0
 for test_name in "${TESTS[@]}"; do
   command_index=$((command_index + 1))
   step_stdout="${LOG_DIR}/ft_1i2ge_3_7_${RUN_ID}.step_${command_index}.stdout.log"
-  test_cmd=(env CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core --test orchestration_integration "${test_name}" -- --nocapture)
+  test_cmd=(env CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core --features subprocess-bridge,__journal_types_placeholder --test orchestration_integration "${test_name}" -- --nocapture)
 
   emit_log "running" "cargo_test" "none" "none" \
     "$(basename "${STDOUT_FILE}")" "Executing through rch: ${test_cmd[*]}"
