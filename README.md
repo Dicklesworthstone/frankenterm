@@ -1364,7 +1364,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
 ├── fuzz/                                 # 48 fuzz targets
 ├── docs/                                 # 428 Markdown documentation files
-├── tests/e2e/                            # 273 shell E2E scripts
+├── tests/e2e/                            # 274 shell E2E scripts
 └── fixtures/                             # Test fixtures (including operating-envelope goldens)
 ```
 
@@ -3751,7 +3751,7 @@ The project maintains extensive test coverage:
 |---|---|---|
 | Test annotations | <!--count:test_count-->55330<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
 | Core Rust test files | <!--count:core_rust_test_files-->952<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
-| E2E shell scripts | <!--count:e2e_scripts-->273<!--/count--> | Full-pipeline validation |
+| E2E shell scripts | <!--count:e2e_scripts-->274<!--/count--> | Full-pipeline validation |
 | Criterion bench files | <!--count:criterion_bench_files-->111<!--/count--> | Performance regression detection |
 | Fuzz targets | <!--count:fuzz_targets-->48<!--/count--> | Security / robustness |
 

@@ -5,6 +5,7 @@ on:
     paths:
       - 'crates/frankenterm-core/**'
       - 'docs/json-schema/**'
+      - 'docs/security/adversarial-contract-fuzz.json'
       - 'fuzz/**'
       - '.github/workflows/adversarial-contract-fuzz.yml'
   release:
