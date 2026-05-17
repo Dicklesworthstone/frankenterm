@@ -39,7 +39,7 @@ against the inventory from `ft-xbnl0.1.2` using these decision rules:
 |-----------------|----------------|
 | Inside `#[cfg(test)]` / `#[cfg(all(test, ...))]` / `mod tests` | test-only — not finish-line scope |
 | Inside `#[cfg(not(any(target_os = "linux", target_os = "macos")))]` | unsupported-platform shim — out of scope per inventory |
-| Inside an unsupported SDK template renderer (currently Go) | template-only — out of scope per inventory exclusion |
+| Inside an unsupported SDK template renderer | template-only — out of scope per inventory exclusion |
 | Anywhere else with a tracked `ft-xbnl0` / `ft-akx00` owner bead | acknowledged finish-line gap with a named owner |
 | Anywhere else with no tracked owner | new finding — must be filed as a follow-up bead before close |
 
@@ -83,6 +83,11 @@ instead of `unimplemented!()`. The permanent CI guard
 marker scan and classifies only test-only fakes plus unsupported SDK
 template markers as exclusions.
 
+`ft-0xkbb` update: the Go SDK is no longer an unsupported template. Current
+source promotes Go to a supported process transport, includes
+`frankenterm_client_go.go` in the production artifact bundle, and requires the
+generated Go source to avoid `transport not wired` and `panic(` placeholders.
+
 The other renderer honesty gap that previously sat under
 `ft-xbnl0.3.5` was GUI image decode/bootstrap failure handling in
 `crates/frankenterm-gui/src/glyphcache.rs`. That path used to swap in
@@ -113,9 +118,10 @@ returns no matches in the workspace.
 rg -in 'panic!\(.*not.implemented|panic!\(.*unimplemented|panic!\(.*placeholder|panic!\(.*todo' --type rust
 ```
 
-returns no matches in the workspace, including the Go SDK template's
-`panic("transport not wired")` (which lives in a quoted Go-source string
-inside a Rust string literal, not in a Rust `panic!`).
+returns no matches in the workspace. The historical Go SDK
+`panic("transport not wired")` placeholder has been removed from the
+generated transport body; only guard strings and bead history should mention
+that marker.
 
 ### `"transport not wired"` matches
 
@@ -127,37 +133,36 @@ matches:
 
 | File / line | Classification | Owner |
 |-------------|----------------|-------|
-| `crates/frankenterm-core/src/robot_sdk_contracts.rs` (Go template) | template-only — unsupported Go SDK | inventory exclusion |
-| `crates/frankenterm-core/src/robot_sdk_contracts.rs` (test assertions) | assertion guard for supported SDKs and the remaining Go template | n/a |
+| `crates/frankenterm-core/src/robot_sdk_contracts.rs` (test assertions) | assertion guard for supported SDKs | n/a |
 | `.beads/issues.jsonl` | bead history | n/a |
 
-The inventory excludes template SDKs from the finish-line supported matrix. The
-current sweep tightens this exclusion in code by:
+The original inventory excluded template SDKs from the finish-line supported
+matrix. The active guard now promotes Go alongside the other supported SDKs and
+tightens the exclusion in code by:
 
 - adding a fully-supported gating method on `SdkLanguage`:
 
   ```rust
 	  impl SdkLanguage {
 	      pub fn is_fully_supported(&self) -> bool {
-	          matches!(self, Self::Python | Self::TypeScript | Self::Rust)
+	          matches!(
+	              self,
+	              Self::Python | Self::TypeScript | Self::Rust | Self::Go
+	          )
 	      }
 	  }
 	  ```
 
-- promoting the doc comments on `Python`, `TypeScript`, and `Rust` to call
-  out their real transports and on `Go` to call out the remaining
-  `transport not wired` stub explicitly;
+- promoting the doc comments on `Python`, `TypeScript`, `Rust`, and `Go` to
+  call out their real transports;
 
 - adding a regression test
-  `ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported`
-  that asserts (a) Python, TypeScript, and Rust report
-  `is_fully_supported() == true` and emit no transport stub and (b) Go
-  remains unsupported while its template still emits its `transport not wired`
-  marker.
+  `ft_xbnl0_3_6_sdk_targets_are_finish_line_supported` that asserts Python,
+  TypeScript, Rust, and Go report `is_fully_supported() == true` and emit no
+  transport stub.
 
 Operator-visible docs already match: `docs/robot-contracts/sdk-transports.md`
-lists Rust, Python, and TypeScript as supported and keeps Go in the
-template-only bucket.
+lists Rust, Python, TypeScript, and Go as supported.
 
 ### Unsupported-platform shims
 
@@ -188,9 +193,9 @@ production null object. No widening required.
    2026-05-09, `ft-akx00.6.3` is closed and the active guard report in
    `docs/ft-xbnl0-3-6-supported-path-stub-markers-validation.json`
    finds no unexpected production stub marker.
-2. The Go SDK template remains template-only. If the supported matrix is ever
-   widened to Go, the `is_fully_supported` gate must flip and the regression
-   test must be updated alongside the wiring.
+2. The historical Go SDK template-only risk has been retired under `ft-0xkbb`;
+   the remaining risk is regression, guarded by `is_fully_supported`, artifact
+   bundle, and generated-source marker assertions.
 3. CI now enforces the supported-path stub-marker inventory through the
    `supported_path_stub_markers` entry in
    `docs/ft-xbnl0-5-2-finish-line-guards.json`, which is run by
@@ -202,7 +207,7 @@ production null object. No widening required.
 The sweep is anchored by two new artifacts in this commit:
 
 - the regression test
-  `ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported`
+  `ft_xbnl0_3_6_sdk_targets_are_finish_line_supported`
   in
   `crates/frankenterm-core/src/robot_sdk_contracts.rs`;
 - the deterministic E2E harness
@@ -217,7 +222,7 @@ Recommended remote-verification commands (per the
 ```bash
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-test \
   cargo test -p frankenterm-core --lib \
-  ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported -- --nocapture
+  ft_xbnl0_3_6_sdk_targets_are_finish_line_supported -- --nocapture
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-check \
   cargo check -p frankenterm-core --lib --tests
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-clippy \

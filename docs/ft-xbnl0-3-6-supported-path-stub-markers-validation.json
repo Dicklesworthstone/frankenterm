@@ -2,77 +2,70 @@
   "allowed_markers": [
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 249,
-      "marker": "transport_not_wired_marker",
-      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "/// `transport not wired` and must be implemented by the consumer before use."
-    },
-    {
-      "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 1908,
-      "marker": "transport_not_wired_marker",
-      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "\"\\ntype FrankentermClient struct{}\\n\\nfunc (c *FrankentermClient) call(command string, payload map[string]interface{}) (map[string]interface{}, error) {\\n\\tpanic(\\\"transport not wired\\\")\\n}\\n\","
-    },
-    {
-      "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3158,
+      "line": 3806,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": ".all(|source| !source.contains(\"transport not wired\")),"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3188,
+      "line": 3836,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!python.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3208,
+      "line": 3856,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!typescript.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3309,
+      "line": 3872,
+      "marker": "transport_not_wired_marker",
+      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
+      "source": "assert!(!go.contains(\"transport not wired\"));"
+    },
+    {
+      "classification": "non_rust_sdk_template_or_assertion_guard",
+      "line": 3974,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!source.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3328,
+      "line": 3993,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!source.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3346,
+      "line": 4011,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!source.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3784,
+      "line": 4029,
+      "marker": "transport_not_wired_marker",
+      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
+      "source": "assert!(!source.contains(\"transport not wired\"));"
+    },
+    {
+      "classification": "non_rust_sdk_template_or_assertion_guard",
+      "line": 4468,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "!source.contains(\"transport not wired\"),"
-    },
-    {
-      "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3794,
-      "marker": "transport_not_wired_marker",
-      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "go_source.contains(\"transport not wired\"),"
     }
   ],
   "bead_id": "ft-g6lfc",
-  "checked_at": "2026-05-17T00:03:08Z",
+  "checked_at": "2026-05-17T02:08:24Z",
   "contract_id": "ft.xbnl0.3.6.supported_path_stub_markers.v1",
   "scan_roots": [
     "crates",
@@ -80,7 +73,7 @@
   ],
   "status": "passed",
   "totals": {
-    "allowed_markers": 10,
+    "allowed_markers": 9,
     "rust_files_scanned": 1203,
     "unexpected_markers": 0
   },
