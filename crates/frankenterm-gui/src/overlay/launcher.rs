@@ -180,11 +180,7 @@ impl LauncherArgs {
             for dom in domains.into_iter() {
                 let name = dom.domain_name();
                 let label = dom.domain_label().await;
-                let label = if name == label || label == "" {
-                    format!("domain `{}`", name)
-                } else {
-                    format!("domain `{}` - {}", name, label)
-                };
+                let label = crate::commands::domain_display_label(name, &label);
                 d.push(LauncherDomainEntry {
                     domain_id: dom.domain_id(),
                     name: name.to_string(),

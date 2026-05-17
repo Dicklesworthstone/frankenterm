@@ -5404,8 +5404,34 @@ impl TermWindow {
                 frankenterm_open_url::open_url(link);
             }
             ActivateCommandPalette => {
-                let modal = crate::termwindow::palette::CommandPalette::new(self);
-                self.set_modal(Rc::new(modal));
+                let Some(window) = self.window.clone() else {
+                    log::warn!("cannot open command palette without an active window");
+                    return Ok(PerformAssignmentResult::Handled);
+                };
+                let active_pane = self.get_active_pane_or_overlay();
+                let filter_copy_mode = active_pane
+                    .as_ref()
+                    .map(|pane| {
+                        pane.downcast_ref::<crate::termwindow::CopyOverlay>()
+                            .is_none()
+                    })
+                    .unwrap_or(true);
+                let mux_pane = active_pane.as_ref().map(|pane| MuxPane(pane.pane_id()));
+                let gui_window = GuiWin::try_new(self);
+
+                promise::spawn::spawn(async move {
+                    let commands = crate::termwindow::palette::build_commands(
+                        gui_window,
+                        mux_pane,
+                        filter_copy_mode,
+                    )
+                    .await;
+                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        let modal = crate::termwindow::palette::CommandPalette::new(commands);
+                        term_window.set_modal(Rc::new(modal));
+                    })));
+                })
+                .detach();
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),

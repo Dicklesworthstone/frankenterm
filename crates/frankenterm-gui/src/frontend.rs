@@ -253,7 +253,10 @@ impl GuiFrontEnd {
         config::reload();
 
         // And build the initial menu bar.
-        crate::commands::CommandDef::recreate_menubar(&config::configuration());
+        promise::spawn::spawn_into_main_thread(async {
+            crate::commands::CommandDef::recreate_menubar(config::configuration()).await;
+        })
+        .detach();
 
         Ok(front_end)
     }
@@ -781,7 +784,7 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     let config_subscription = config::subscribe_to_config_reload({
         move || {
             promise::spawn::spawn_into_main_thread(async {
-                crate::commands::CommandDef::recreate_menubar(&config::configuration());
+                crate::commands::CommandDef::recreate_menubar(config::configuration()).await;
             })
             .detach();
             true
