@@ -10,7 +10,9 @@ Same cross-reference pattern as `ft-2okh0.5.1 ↔ ft-kscfg`,
 `ft-2okh0.2.3 ↔ ft-mpc9b.5.1`.
 
 **Speaker substrate:** `ft-hs5f6` (closed) — `crates/frankenterm-core/src/tmux_control_protocol.rs`.
-**Daemon integration:** `ft-2h56m` (open — socket listener + dispatch).
+**Daemon integration:** `ft-l4cef` (blocked by `ft-4tp7g`) — live tmux
+line-protocol dispatch + notification stream. `ft-2h56m` is closed as a
+socket-lock/listener slice only; it did not promote these rows to wired-pass.
 **Parent epic:** `ft-2okh0.5` (crash-safe scrollback + native tmux speaker).
 
 This document is the matrix the parent bead's acceptance criterion calls
@@ -24,7 +26,7 @@ against the speaker we actually ship, not the spec we wish we shipped.
   Verified by golden-vector tests in
   `crates/frankenterm-core/src/tmux_control_protocol.rs::tests`.
 - **wired-pass** — substrate-pass *and* the daemon socket listener
-  (ft-2h56m) routes the parsed `TmuxCommand` to the live mux backend
+  (ft-l4cef) routes the parsed `TmuxCommand` to the live mux backend
   and the tool round-trips end-to-end against a real ft session.
   Verified by an integration test under
   `crates/frankenterm-core/tests/`.
@@ -37,15 +39,15 @@ against the speaker we actually ship, not the spec we wish we shipped.
 
 | Tool | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
-| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | substrate-pass | tmux_control_protocol.rs::tests (21/21 green) | All 7 Tier-1 verbs parse + encode. End-to-end round-trip against a live `tmux` binary blocked on ft-2h56m. |
-| neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | substrate-pass | parse_send_keys_with_target_and_payload + parse_list_windows_with_session_target | Pane navigator emits `send-keys -t <pane> <keystroke>` — covered by send-keys parse path. End-to-end blocked on ft-2h56m. |
-| vscode tmux extension (`vscode-tmux`) | substrate-pass | parse_attach_session_with_target + response_encode_success_uses_end_trailer | Extension speaks attach-session + capture-pane. Both wire-syntax shapes covered. End-to-end blocked on ft-2h56m. |
+| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | substrate-pass | tmux_control_protocol.rs::tests (21/21 green) | All 7 Tier-1 verbs parse + encode. End-to-end round-trip against a live `tmux` binary blocked on ft-l4cef. |
+| neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | substrate-pass | parse_send_keys_with_target_and_payload + parse_list_windows_with_session_target | Pane navigator emits `send-keys -t <pane> <keystroke>` — covered by send-keys parse path. End-to-end blocked on ft-l4cef. |
+| vscode tmux extension (`vscode-tmux`) | substrate-pass | parse_attach_session_with_target + response_encode_success_uses_end_trailer | Extension speaks attach-session + capture-pane. Both wire-syntax shapes covered. End-to-end blocked on ft-l4cef. |
 
 **Tier-1 acceptance**: substrate-pass for all three. The bead's
 acceptance criterion ("Tier-1 rows all pass") is graded against the
 speaker we shipped — wire-format compliance against tmux's literal
 syntax is the gate the speaker is responsible for; live socket
-plumbing is ft-2h56m's gate, not this matrix's. When ft-2h56m closes,
+plumbing is ft-l4cef's gate, not this matrix's. When ft-l4cef lands,
 each Tier-1 row promotes from substrate-pass → wired-pass with an
 integration-test evidence link.
 
@@ -54,9 +56,9 @@ integration-test evidence link.
 | Tool | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
 | tmuxinator | substrate-pass | parse_send_keys_with_target_and_payload + parse_new_session_with_name | tmuxinator drives ft via `new-session` + scripted `send-keys`. Both verbs are Tier-1, so the substrate already covers it; the YAML config layer is tmuxinator's, not ft's. |
-| fish shell tmux helpers | substrate-pass | parse_list_sessions_takes_no_args + parse_attach_session_with_target | Fish's helpers (`fish_tmux_resize`, etc.) emit `list-sessions` + `attach-session`. Substrate covers; live testing blocked on ft-2h56m. |
-| tmux pipe-pane | TODO | — | `pipe-pane` is Tier-2 but the parser currently routes it through the `Unknown` fallthrough (returns graceful `%error`). Adding a `PipePane{target, command}` variant is straightforward; deferred to ft-2h56m's daemon-integration sweep. |
-| tmux copy-mode | TODO | — | `copy-mode` requires a separate keybinding state machine (vi vs emacs mode) — not just a wire-syntax addition. Deferred until ft has a copy-mode equivalent (orthogonal feature). |
+| fish shell tmux helpers | substrate-pass | parse_list_sessions_takes_no_args + parse_attach_session_with_target | Fish's helpers (`fish_tmux_resize`, etc.) emit `list-sessions` + `attach-session`. Substrate covers; live testing blocked on ft-l4cef. |
+| tmux pipe-pane | TODO | ft-l4cef | `pipe-pane` is Tier-2 but the parser currently routes it through the `Unknown` fallthrough (returns graceful `%error`). Adding a `PipePane{target, command}` variant is straightforward; tracked under ft-l4cef so it is no longer doc-only. |
+| tmux copy-mode | TODO | ft-l4cef | `copy-mode` requires a separate keybinding state machine (vi vs emacs mode) — not just a wire-syntax addition. The control-mode parser/dispatcher status is tracked under ft-l4cef; any full copy-mode implementation should split into a dedicated follow-up if it exceeds that dispatch slice. |
 
 **Tier-2 acceptance**: known-status. Two pass at substrate level, two
 documented as TODO with the reason.
@@ -113,7 +115,7 @@ Wire-syntax edge cases:
 ## Promotion path
 
 Each Tier-1 + Tier-2 substrate-pass row promotes to wired-pass when
-ft-2h56m lands the daemon side. The promotion criterion per row:
+ft-l4cef lands the daemon side. The promotion criterion per row:
 
 1. The tool runs against `ft -S /tmp/ft-test.sock <cmd>` end-to-end.
 2. The output matches what the same command produces against a real
@@ -121,15 +123,17 @@ ft-2h56m lands the daemon side. The promotion criterion per row:
 3. An integration test under `crates/frankenterm-core/tests/` captures
    (1)+(2) as a regression guard.
 
-When ft-2h56m closes, this matrix gets revised in-place: each
+When ft-l4cef closes, this matrix gets revised in-place: each
 substrate-pass row gains a wired-pass annotation + the integration
-test path. ft-2h56m's close-out is responsible for that revision.
+test path. ft-l4cef's close-out is responsible for that revision.
 
 ## Cross-references
 
 - **ft-hs5f6** (closed) — wire-format substrate at
   `crates/frankenterm-core/src/tmux_control_protocol.rs`.
-- **ft-2h56m** (open) — daemon side: socket listener + handler dispatch
+- **ft-2h56m** (closed partial) — socket-lock/listener slice only; it
+  did not wire the tmux line-protocol dispatcher or notification stream.
+- **ft-l4cef** (blocked) — daemon side: tmux line-protocol dispatch
   + notification stream. Promotes the substrate-pass rows above to
   wired-pass.
 - **ft-2okh0.5** (parent epic) — crash-safe scrollback + native tmux
