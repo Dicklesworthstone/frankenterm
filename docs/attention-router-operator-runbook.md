@@ -2,11 +2,11 @@
 
 Tracking bead: `ft-x3nsb.7`
 
-Status: operator runbook for the planned `ft.attention_router.v1` contract.
-The contract lives at `docs/robot-contracts/attention-router.md`. This runbook
-describes how humans and agents should act on the router's read-only attention
-snapshot once an implementation exists, and how to apply the same discipline by
-hand until then.
+Status: supplemental detail for the planned `ft.attention_router.v1` contract.
+The canonical operator runbook entry is `docs/operator-runbook.md` section 2C,
+linked from `docs/robot-contracts/attention-router.md`. This file preserves the
+expanded scenario guidance from `ft-x3nsb.7`; when the two documents differ,
+the canonical operator-runbook section controls.
 
 The attention router answers one question: what needs attention now? It does
 not claim Beads, send Agent Mail, release reservations, repair services, cancel
