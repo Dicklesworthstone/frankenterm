@@ -6,6 +6,8 @@ Status: planned contract. This document defines the target behavior for a
 future side-effect-free attention-router surface. It does not claim a shipped
 CLI, Robot Mode, or MCP implementation.
 
+Operator runbook: `docs/attention-router-operator-runbook.md`.
+
 ## Purpose
 
 Large FrankenTerm swarms need a reliable answer to one operational question:
