@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778936280000,
+  "envelope_id": "rch-topology-failure",
+  "scope": {
+    "objective": "Handle a selected RCH worker that fails topology preflight before Cargo.",
+    "target_class": "developer_workstation",
+    "host_class": "mac-mini-local-plus-rch",
+    "dry_run_only": true,
+    "mutation_allowed": false
+  },
+  "source_policy": {
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "unproven_signal_policy": "lower_envelope"
+  },
+  "sources": [
+    {
+      "source_id": "rch-topology-preflight",
+      "source_kind": "rch",
+      "state": "blocked",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778936280000,
+      "command_or_api": "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test ...",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "unsafe_to_admit": true,
+      "reason_codes": [
+        "rch.topology_preflight_failed",
+        "rch.remote_cargo_reached_false",
+        "source.redacted_summary_only"
+      ],
+      "summary": "A worker was selected, but topology preflight failed before Cargo.",
+      "counters": {
+        "selected_workers": 1,
+        "remote_cargo_reached": 0,
+        "topology_failures": 1
+      },
+      "degraded_reason": "A topology failure cannot be treated as a source test result.",
+      "artifact_paths": [
+        "fixtures/operating-envelope/rch-topology-failure.json"
+      ]
+    }
+  ],
+  "admission_window": {
+    "state": "pause",
+    "max_new_agents": 0,
+    "max_remote_proof_lanes": 0,
+    "queue_recommendation": "wait_for_recovery",
+    "reason_codes": [
+      "rch.topology_preflight_failed",
+      "rch.remote_cargo_reached_false"
+    ],
+    "expires_at_ms": null
+  },
+  "proof_lane_policy": {
+    "cargo_required_via_rch": true,
+    "local_cargo_proof_allowed": false,
+    "remote_cargo_reached": false,
+    "remote_rustc_reached": false,
+    "test_binary_reached": false,
+    "blocker_codes": [
+      "rch.topology_preflight_failed",
+      "guardrail.no_local_cargo_proof"
+    ]
+  },
+  "guardrails": {
+    "forbidden_actions": [
+      "agent_mail_repair",
+      "build_cancellation",
+      "destructive_git",
+      "local_cargo_proof",
+      "raw_pane_content_capture",
+      "rch_daemon_restart",
+      "service_restart",
+      "worker_drain"
+    ],
+    "required_approvals": [
+      "rch.topology_recovery_required"
+    ]
+  },
+  "redaction": {
+    "redacted": true,
+    "raw_pane_content_stored": false,
+    "secret_material_stored": false,
+    "notes": [
+      "Topology stderr is summarized by reason code only."
+    ]
+  },
+  "artifact_paths": [
+    "docs/json-schema/ft-operating-envelope.json",
+    "fixtures/operating-envelope/rch-topology-failure.json"
+  ]
+}

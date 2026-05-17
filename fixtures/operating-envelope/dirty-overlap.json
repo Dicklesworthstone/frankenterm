@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778936340000,
+  "envelope_id": "dirty-overlap",
+  "scope": {
+    "objective": "Avoid claiming work that overlaps active dirty paths in a shared checkout.",
+    "target_class": "developer_workstation",
+    "host_class": "mac-mini-local-plus-rch",
+    "dry_run_only": true,
+    "mutation_allowed": false
+  },
+  "source_policy": {
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "unproven_signal_policy": "lower_envelope"
+  },
+  "sources": [
+    {
+      "source_id": "git-dirty-overlap",
+      "source_kind": "git",
+      "state": "degraded",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778936340000,
+      "command_or_api": "git status --short --branch --untracked-files=all",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "unsafe_to_admit": true,
+      "reason_codes": [
+        "git.dirty_paths_present",
+        "git.dirty_overlap_risk",
+        "source.redacted_summary_only"
+      ],
+      "summary": "Dirty tracked paths overlap an active source/proof surface.",
+      "counters": {
+        "dirty_count": 5,
+        "tracked_dirty_count": 5,
+        "dirty_overlap_count": 4
+      },
+      "degraded_reason": "New work should use a disjoint path or wait for the active owner.",
+      "artifact_paths": [
+        "fixtures/operating-envelope/dirty-overlap.json"
+      ]
+    },
+    {
+      "source_id": "beads-active-owner",
+      "source_kind": "beads",
+      "state": "degraded",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778936340000,
+      "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "unsafe_to_admit": true,
+      "reason_codes": [
+        "beads.in_progress_active",
+        "source.redacted_summary_only"
+      ],
+      "summary": "The active in-progress bead is recent and must not be reopened.",
+      "counters": {
+        "in_progress_count": 1,
+        "stale_candidate_count": 0
+      },
+      "degraded_reason": "The envelope must pause overlapping work until ownership is clear.",
+      "artifact_paths": [
+        "fixtures/operating-envelope/dirty-overlap.json"
+      ]
+    }
+  ],
+  "admission_window": {
+    "state": "pause",
+    "max_new_agents": 0,
+    "max_remote_proof_lanes": 0,
+    "queue_recommendation": "manual_review",
+    "reason_codes": [
+      "git.dirty_overlap_risk",
+      "beads.in_progress_active"
+    ],
+    "expires_at_ms": null
+  },
+  "proof_lane_policy": {
+    "cargo_required_via_rch": true,
+    "local_cargo_proof_allowed": false,
+    "remote_cargo_reached": false,
+    "remote_rustc_reached": false,
+    "test_binary_reached": false,
+    "blocker_codes": [
+      "git.dirty_overlap_risk",
+      "guardrail.no_local_cargo_proof"
+    ]
+  },
+  "guardrails": {
+    "forbidden_actions": [
+      "agent_mail_repair",
+      "build_cancellation",
+      "destructive_git",
+      "local_cargo_proof",
+      "raw_pane_content_capture",
+      "rch_daemon_restart",
+      "service_restart",
+      "worker_drain"
+    ],
+    "required_approvals": [
+      "dirty_overlap.owner_clearance_required"
+    ]
+  },
+  "redaction": {
+    "redacted": true,
+    "raw_pane_content_stored": false,
+    "secret_material_stored": false,
+    "notes": [
+      "Dirty paths are represented as aggregate counts in this fixture."
+    ]
+  },
+  "artifact_paths": [
+    "docs/json-schema/ft-operating-envelope.json",
+    "fixtures/operating-envelope/dirty-overlap.json"
+  ]
+}

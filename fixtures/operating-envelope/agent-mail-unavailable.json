@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778936160000,
+  "envelope_id": "agent-mail-unavailable",
+  "scope": {
+    "objective": "Continue Beads-only coordination after Agent Mail fails the allowed retry.",
+    "target_class": "developer_workstation",
+    "host_class": "mac-mini-local-plus-rch",
+    "dry_run_only": true,
+    "mutation_allowed": false
+  },
+  "source_policy": {
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "unproven_signal_policy": "lower_envelope"
+  },
+  "sources": [
+    {
+      "source_id": "agent-mail-red",
+      "source_kind": "agent_mail",
+      "state": "unavailable",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778936160000,
+      "command_or_api": "fetch_inbox after one retry",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "unsafe_to_admit": true,
+      "reason_codes": [
+        "agent_mail.database_error",
+        "agent_mail.unavailable_after_retry",
+        "guardrail.no_service_restart",
+        "source.redacted_summary_only"
+      ],
+      "summary": "Agent Mail is unavailable after the allowed retry.",
+      "counters": {
+        "allowed_retries": 1,
+        "successful_retries": 0
+      },
+      "degraded_reason": "Coordination must use Beads fallback and must not repair or restart Agent Mail.",
+      "artifact_paths": [
+        "fixtures/operating-envelope/agent-mail-unavailable.json"
+      ]
+    },
+    {
+      "source_id": "beads-fallback",
+      "source_kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778936160000,
+      "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "unsafe_to_admit": false,
+      "reason_codes": [
+        "beads.ready_available",
+        "source.redacted_summary_only"
+      ],
+      "summary": "Beads fallback remains available but admission is reduced.",
+      "counters": {
+        "ready_count": 1,
+        "in_progress_count": 1
+      },
+      "degraded_reason": null,
+      "artifact_paths": [
+        "fixtures/operating-envelope/agent-mail-unavailable.json"
+      ]
+    }
+  ],
+  "admission_window": {
+    "state": "defer",
+    "max_new_agents": 1,
+    "max_remote_proof_lanes": 1,
+    "queue_recommendation": "queue_when_idle",
+    "reason_codes": [
+      "agent_mail.unavailable_after_retry",
+      "beads.fallback_active"
+    ],
+    "expires_at_ms": 1778937060000
+  },
+  "proof_lane_policy": {
+    "cargo_required_via_rch": true,
+    "local_cargo_proof_allowed": false,
+    "remote_cargo_reached": false,
+    "remote_rustc_reached": false,
+    "test_binary_reached": false,
+    "blocker_codes": [
+      "agent_mail.unavailable_after_retry",
+      "guardrail.no_local_cargo_proof"
+    ]
+  },
+  "guardrails": {
+    "forbidden_actions": [
+      "agent_mail_repair",
+      "build_cancellation",
+      "destructive_git",
+      "local_cargo_proof",
+      "raw_pane_content_capture",
+      "rch_daemon_restart",
+      "service_restart",
+      "worker_drain"
+    ],
+    "required_approvals": [
+      "beads.fallback_coordination_required"
+    ]
+  },
+  "redaction": {
+    "redacted": true,
+    "raw_pane_content_stored": false,
+    "secret_material_stored": false,
+    "notes": [
+      "Agent Mail failure body is summarized, not copied."
+    ]
+  },
+  "artifact_paths": [
+    "docs/json-schema/ft-operating-envelope.json",
+    "fixtures/operating-envelope/agent-mail-unavailable.json"
+  ]
+}

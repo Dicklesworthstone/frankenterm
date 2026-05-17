@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778936400000,
+  "envelope_id": "target-class-skipped",
+  "scope": {
+    "objective": "Avoid promoting target-class 256GB/64-core claims without retained target-class evidence.",
+    "target_class": "target_256gb_64core",
+    "host_class": "local_degraded",
+    "dry_run_only": true,
+    "mutation_allowed": false
+  },
+  "source_policy": {
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "unproven_signal_policy": "lower_envelope"
+  },
+  "sources": [
+    {
+      "source_id": "target-class-hardware",
+      "source_kind": "resource_pressure",
+      "state": "skipped",
+      "freshness_state": "not_collected",
+      "collected_at_ms": null,
+      "command_or_api": "target-class retained proof lookup",
+      "evidence_level": "not_collected",
+      "redacted": true,
+      "unsafe_to_admit": true,
+      "reason_codes": [
+        "target_class.hardware_not_available",
+        "attestation.skipped_not_proven",
+        "source.redacted_summary_only"
+      ],
+      "summary": "No retained target-class hardware run is available for this envelope.",
+      "counters": {
+        "target_ram_gb": 256,
+        "target_cpu_cores": 64,
+        "retained_target_class_artifacts": 0
+      },
+      "degraded_reason": "High-scale claims must remain skipped until retained target-class evidence exists.",
+      "artifact_paths": [
+        "fixtures/operating-envelope/target-class-skipped.json"
+      ]
+    }
+  ],
+  "admission_window": {
+    "state": "blocked",
+    "max_new_agents": 0,
+    "max_remote_proof_lanes": 0,
+    "queue_recommendation": "manual_review",
+    "reason_codes": [
+      "target_class.hardware_not_available",
+      "attestation.skipped_not_proven"
+    ],
+    "expires_at_ms": null
+  },
+  "proof_lane_policy": {
+    "cargo_required_via_rch": true,
+    "local_cargo_proof_allowed": false,
+    "remote_cargo_reached": false,
+    "remote_rustc_reached": false,
+    "test_binary_reached": false,
+    "blocker_codes": [
+      "target_class.hardware_not_available",
+      "attestation.skipped_not_proven",
+      "guardrail.no_local_cargo_proof"
+    ]
+  },
+  "guardrails": {
+    "forbidden_actions": [
+      "agent_mail_repair",
+      "build_cancellation",
+      "destructive_git",
+      "local_cargo_proof",
+      "raw_pane_content_capture",
+      "rch_daemon_restart",
+      "service_restart",
+      "worker_drain"
+    ],
+    "required_approvals": [
+      "target_class.retained_artifact_required"
+    ]
+  },
+  "redaction": {
+    "redacted": true,
+    "raw_pane_content_stored": false,
+    "secret_material_stored": false,
+    "notes": [
+      "This fixture prevents local degraded evidence from backing target-class claims."
+    ]
+  },
+  "artifact_paths": [
+    "docs/json-schema/ft-operating-envelope.json",
+    "fixtures/operating-envelope/target-class-skipped.json"
+  ]
+}

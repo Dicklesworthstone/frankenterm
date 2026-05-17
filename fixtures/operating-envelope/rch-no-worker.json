@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778936220000,
+  "envelope_id": "rch-no-worker",
+  "scope": {
+    "objective": "Decide whether remote proof lanes can start when worker selection rejects all candidates.",
+    "target_class": "developer_workstation",
+    "host_class": "mac-mini-local-plus-rch",
+    "dry_run_only": true,
+    "mutation_allowed": false
+  },
+  "source_policy": {
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "unproven_signal_policy": "lower_envelope"
+  },
+  "sources": [
+    {
+      "source_id": "rch-no-workers-passed-health",
+      "source_kind": "rch",
+      "state": "blocked",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778936220000,
+      "command_or_api": "rch diagnose --json --dry-run -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "unsafe_to_admit": true,
+      "reason_codes": [
+        "rch.no_workers_passed_health",
+        "rch.remote_cargo_reached_false",
+        "source.redacted_summary_only"
+      ],
+      "summary": "RCH classifies the command as a proof lane but selects no worker.",
+      "counters": {
+        "workers_healthy_reported": 5,
+        "selected_workers": 0,
+        "remote_cargo_reached": 0
+      },
+      "degraded_reason": "No remote proof lane can be counted because Cargo was not reached.",
+      "artifact_paths": [
+        "fixtures/operating-envelope/rch-no-worker.json"
+      ]
+    }
+  ],
+  "admission_window": {
+    "state": "pause",
+    "max_new_agents": 0,
+    "max_remote_proof_lanes": 0,
+    "queue_recommendation": "wait_for_recovery",
+    "reason_codes": [
+      "rch.no_workers_passed_health",
+      "rch.remote_cargo_reached_false"
+    ],
+    "expires_at_ms": null
+  },
+  "proof_lane_policy": {
+    "cargo_required_via_rch": true,
+    "local_cargo_proof_allowed": false,
+    "remote_cargo_reached": false,
+    "remote_rustc_reached": false,
+    "test_binary_reached": false,
+    "blocker_codes": [
+      "rch.no_workers_passed_health",
+      "guardrail.no_local_cargo_proof"
+    ]
+  },
+  "guardrails": {
+    "forbidden_actions": [
+      "agent_mail_repair",
+      "build_cancellation",
+      "destructive_git",
+      "local_cargo_proof",
+      "raw_pane_content_capture",
+      "rch_daemon_restart",
+      "service_restart",
+      "worker_drain"
+    ],
+    "required_approvals": [
+      "rch.recovery_required_before_proof"
+    ]
+  },
+  "redaction": {
+    "redacted": true,
+    "raw_pane_content_stored": false,
+    "secret_material_stored": false,
+    "notes": [
+      "Worker details are summarized as counts and reason codes."
+    ]
+  },
+  "artifact_paths": [
+    "docs/json-schema/ft-operating-envelope.json",
+    "fixtures/operating-envelope/rch-no-worker.json"
+  ]
+}
