@@ -312,15 +312,15 @@ proptest! {
         prop_assert!(result.is_none());
     }
 
-    // 23. pressure_failopen returns Green for missing binary
+    // 23. pressure_failclosed returns Black for missing binary
     #[test]
-    fn failopen_pressure_returns_green(suffix in "[a-z]{3,10}") {
+    fn failclosed_pressure_returns_black(suffix in "[a-z]{3,10}") {
         let obs = NetworkObserver::with_binary(
             format!("/nonexistent-{}", suffix),
             NetworkObserverConfig::default(),
         );
-        let tier = pressure_failopen(&obs, "10.0.0.1");
-        prop_assert_eq!(tier, NetworkPressureTier::Green);
+        let tier = pressure_failclosed(&obs, "10.0.0.1");
+        prop_assert_eq!(tier, NetworkPressureTier::Black);
     }
 
     // 24. NetworkObserverError Display is non-empty

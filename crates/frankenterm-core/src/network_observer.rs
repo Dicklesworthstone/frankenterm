@@ -477,11 +477,19 @@ pub fn attribute_failopen(
     }
 }
 
-/// Classify network pressure from latency, returning Green if rano is unavailable.
-pub fn pressure_failopen(observer: &NetworkObserver, remote_addr: &str) -> NetworkPressureTier {
+/// Classify network pressure from latency, returning Black if rano is unavailable.
+pub fn pressure_failclosed(observer: &NetworkObserver, remote_addr: &str) -> NetworkPressureTier {
     match observer.attribute_connection(remote_addr) {
         Ok(attr) => observer.classify_pressure(&attr),
-        Err(_) => NetworkPressureTier::Green, // fail open
+        Err(e) => {
+            warn!(
+                bridge = "rano",
+                remote = %remote_addr,
+                error = %e,
+                "pressure attribution failed, failing closed"
+            );
+            NetworkPressureTier::Black
+        }
     }
 }
 
@@ -843,7 +851,7 @@ mod tests {
         );
     }
 
-    // -- Fail-open helpers --
+    // -- Unavailable-substrate helpers --
 
     #[test]
     fn attribute_failopen_returns_none() {
@@ -853,10 +861,10 @@ mod tests {
     }
 
     #[test]
-    fn pressure_failopen_returns_green() {
+    fn pressure_failclosed_returns_black() {
         let obs = NetworkObserver::new();
-        let tier = pressure_failopen(&obs, "10.0.0.1");
-        assert_eq!(tier, NetworkPressureTier::Green);
+        let tier = pressure_failclosed(&obs, "10.0.0.1");
+        assert_eq!(tier, NetworkPressureTier::Black);
     }
 
     // -- Edge cases --
