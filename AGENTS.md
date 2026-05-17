@@ -648,10 +648,11 @@ pointing back at this section.
 The original NTM-gap family fallback has been retired for the checkpoint,
 context, work, and live fleet CLI shapes. `ft robot fleet status` and
 `ft robot fleet agents` use native agent-inventory/work-queue read paths.
-`ft robot fleet scale` and `ft robot fleet rebalance` parse natively but return
-the typed `robot.fleet.capability_unavailable` envelope until daemon-side fleet
-mutation is wired. Agents should treat those mutating controls as unavailable
-instead of planning workflows around them.
+`ft robot fleet scale` and `ft robot fleet rebalance` also use native plan
+builders: dry-run requests return side-effect-free plan receipts, and
+non-dry-run requests persist durable mutation receipts with idempotent replay.
+Failed or denied mutations return typed `robot.fleet.*` envelopes rather than
+falling back to the retired `robot.not_implemented` path.
 
 `ft robot checkpoint` shipped a native snapshot/session adapter under
 ft-bs9uh.2. `save`, `list`, `show`, and `delete` use the existing

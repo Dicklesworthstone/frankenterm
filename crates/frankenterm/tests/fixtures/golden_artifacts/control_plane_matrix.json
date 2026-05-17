@@ -59,7 +59,7 @@
     "blocked",
     "policy_required",
     "unsupported",
-    "capability_unavailable"
+    "backend_unavailable"
   ],
   "required_robot_families": [
     "state",
@@ -239,20 +239,20 @@
       "notes": "Pins the native agent-inventory fleet status success path."
     },
     {
-      "id": "robot.fleet.json.capability_unavailable",
+      "id": "robot.fleet.json.inventory_unavailable",
       "transport": "robot_cli",
       "family": "fleet",
       "action": "scale",
       "format": "json",
-      "scenario": "capability_unavailable",
-      "command": "ft robot --format json fleet scale codex 1 --dry-run",
+      "scenario": "backend_unavailable",
+      "command": "ft robot --format json fleet scale codex 2 --dry-run",
       "expected_ok": false,
-      "expected_code": "robot.fleet.capability_unavailable",
+      "expected_code": "robot.fleet.inventory_unavailable",
       "fixture_path": null,
       "schema_path": null,
       "doc_path": "docs/robot-contracts/fleet.md",
       "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-fleet cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
-      "notes": "Scale and rebalance parse natively but intentionally fail typed until daemon-side mutation is wired."
+      "notes": "Pins unavailable inventory as a typed backend error without reverting to the retired mutation stub."
     },
     {
       "id": "mcp.state.toon.healthy",
