@@ -115,12 +115,13 @@ impl Layer for TiledGridLayer {
         &mut self,
         _ctx: &crate::termwindow::render::compositor::LayerContext,
     ) -> Vec<DrawCmd> {
-        if self.dirty_rect.is_none() {
+        let Some(damage) = self.dirty_rect else {
             return Vec::new();
-        }
-        vec![DrawCmd::Placeholder {
-            layer: LayerKind::TiledGrid,
-            count: self.dirty_rows.max(1),
+        };
+        vec![DrawCmd::TiledGridQuads {
+            pane_id: self.pane_id,
+            damage,
+            dirty_rows: self.dirty_rows.max(1),
         }]
     }
 
@@ -1026,12 +1027,14 @@ mod tests {
 
             let mut render_layer = layer.clone();
             let commands = render_layer.render(&LayerContext::new(1, full_rect, 0));
-            let expected_commands = expected_rect.map_or_else(Vec::new, |_| {
-                vec![DrawCmd::Placeholder {
-                    layer: LayerKind::TiledGrid,
-                    count: (expected_rows.len() as u32).max(1),
-                }]
-            });
+            let expected_commands = match expected_rect {
+                Some(damage) => vec![DrawCmd::TiledGridQuads {
+                    pane_id: 9,
+                    damage,
+                    dirty_rows: (expected_rows.len() as u32).max(1),
+                }],
+                None => Vec::new(),
+            };
 
             prop_assert_eq!(commands, expected_commands);
         }

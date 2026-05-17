@@ -31,9 +31,10 @@
 //! - `DirtyRect` — small (x, y, w, h) struct in viewport pixels.
 //!   Distinct from `window::Rect` so the compositor's dirty
 //!   tracking doesn't pull in euclid units we don't need.
-//! - `DrawCmd` — placeholder enum for the layer's emitted commands.
-//!   The continuation bead replaces this with the real wgpu /
-//!   glium command shape once paint.rs is migrated.
+//! - `DrawCmd` — typed paint commands emitted by layers. The
+//!   current foundation keeps commands renderer-neutral, but each
+//!   variant carries concrete layer damage and batch metadata that
+//!   the paint.rs migration can lower into wgpu / glium work.
 //! - `LayerKind` — the canonical 5 named layers from the bead so
 //!   z_order conventions stay consistent across implementations.
 //! - `RenderReport` — telemetry returned from `LayerStack::render`
@@ -43,10 +44,9 @@
 //!
 //! ## What is deferred (continuation, see follow-up bead)
 //!
-//! - Migrating the current tiled-grid rendering into a real
-//!   `Layer` impl in `crates/frankenterm-gui/src/termwindow/render/pane.rs`
-//! - The paint.rs integration that replaces the single-sweep
-//!   render path with `LayerStack::render`
+//! - Lowering `DrawCmd::TiledGridQuads` into the live paint.rs GPU
+//!   path and replacing the single-sweep render path with
+//!   `LayerStack::render`
 //! - Per-layer atlas regions vs shared atlas — current default is
 //!   shared (the existing GlyphCache); follow-up may revisit
 //! - A11Y: each layer contributing to the platform accessibility
@@ -195,15 +195,31 @@ impl LayerContext {
     }
 }
 
-/// Placeholder for the GPU-side draw commands a layer emits.
-/// Continuation replaces this with the real wgpu / glium command
-/// shape; today the trait can compile and unit-test against a
-/// stable surface.
+/// Renderer-neutral paint commands emitted by compositor layers.
+///
+/// The layer stack does not own GPU resources; it emits concrete
+/// command payloads that the active paint backend can lower into its
+/// own quad/cache operations. This keeps command emission production
+/// typed without forcing the compositor abstraction to depend on a
+/// specific wgpu or glium command encoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrawCmd {
-    /// A no-op marker the continuation bead replaces with concrete
-    /// GPU commands (clear, draw_quads, ...).
-    Placeholder { layer: LayerKind, count: u32 },
+    /// A batch of quads for a non-specialized layer. Test/custom
+    /// layers use this path, and future backdrop/status/modal layers
+    /// can lower it into backend-owned quad buffers.
+    LayerQuadBatch {
+        layer: LayerKind,
+        damage: DirtyRect,
+        quad_count: u32,
+    },
+    /// The current tiled-pane grid paint operation. `dirty_rows`
+    /// drives line/quad cache selection in the existing pane renderer;
+    /// `damage` is the exact viewport region the layer dirtied.
+    TiledGridQuads {
+        pane_id: usize,
+        damage: DirtyRect,
+        dirty_rows: u32,
+    },
 }
 
 /// The contract every compositor layer implements.
@@ -425,9 +441,10 @@ mod tests {
         fn render(&mut self, _ctx: &LayerContext) -> Vec<DrawCmd> {
             self.rendered_calls += 1;
             (0..self.cmds_per_render)
-                .map(|_| DrawCmd::Placeholder {
+                .map(|_| DrawCmd::LayerQuadBatch {
                     layer: self.kind,
-                    count: 1,
+                    damage: self.dirty.unwrap_or_default(),
+                    quad_count: 1,
                 })
                 .collect()
         }
