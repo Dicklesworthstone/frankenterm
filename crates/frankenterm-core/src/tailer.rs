@@ -659,9 +659,8 @@ impl CaptureScheduler {
         let taken_high = high_prio.len().min(slots_remaining);
         slots_remaining -= taken_high;
 
-        let low_tier_contention = !high_prio.is_empty()
-            && guaranteed_low > 0
-            && guaranteed_low + slots_remaining < low_prio.len();
+        let low_tier_contention =
+            guaranteed_low > 0 && guaranteed_low + slots_remaining < low_prio.len();
 
         let mut low_floor = Vec::with_capacity(guaranteed_low);
         if guaranteed_low > 0 {
@@ -3323,6 +3322,33 @@ mod tests {
                 "{scenario_id} round {round}: low-priority order should stay stable when all low panes fit"
             );
         }
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_low_subtier_floor_rotates_without_high_prio_pressure() {
+        let scenario_id = "scheduler_low_subtier_low_only_pressure";
+        let mut scheduler = CaptureScheduler::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+        let mut panes = (100_u64..112)
+            .map(|pane_id| (pane_id, 100))
+            .collect::<Vec<_>>();
+        panes.extend((200_u64..204).map(|pane_id| (pane_id, 200)));
+
+        let mut lowest_low_seen = HashSet::<u64>::new();
+        for _round in 0..20 {
+            for pane_id in scheduler.select_panes(&panes, 5) {
+                if (200_u64..204).contains(&pane_id) {
+                    lowest_low_seen.insert(pane_id);
+                }
+            }
+        }
+
+        assert!(
+            (200_u64..204).all(|pane_id| lowest_low_seen.contains(&pane_id)),
+            "{scenario_id}: reserved low-tier floor must rotate lower low-priority subtiers even when high-priority panes are absent"
+        );
     }
 
     #[test]

@@ -515,9 +515,10 @@ impl StorageIoSchedulerSnapshot {
 pub struct StorageIoScheduler {
     config: StorageIoSchedulerConfig,
     queues: HashMap<StorageIoClass, VecDeque<QueuedWork>>,
+    class_bytes: HashMap<StorageIoClass, u128>,
     counters: HashMap<StorageIoClass, StorageIoClassCounters>,
     aggregate_items: u64,
-    aggregate_bytes: u64,
+    aggregate_bytes: u128,
     last_served_class: Option<StorageIoClass>,
     consecutive_from_last_class: usize,
 }
@@ -527,13 +528,16 @@ impl StorageIoScheduler {
     pub fn new(config: StorageIoSchedulerConfig) -> Self {
         let mut queues = HashMap::new();
         let mut counters = HashMap::new();
+        let mut class_bytes = HashMap::new();
         for class in StorageIoClass::ALL {
             queues.insert(class, VecDeque::new());
             counters.insert(class, StorageIoClassCounters::default());
+            class_bytes.insert(class, 0);
         }
         Self {
             config,
             queues,
+            class_bytes,
             counters,
             aggregate_items: 0,
             aggregate_bytes: 0,
@@ -553,8 +557,8 @@ impl StorageIoScheduler {
     }
 
     #[must_use]
-    pub fn aggregate_bytes(&self) -> u64 {
-        self.aggregate_bytes_pending_saturating()
+    pub const fn aggregate_bytes(&self) -> u64 {
+        saturating_u128_to_u64(self.aggregate_bytes)
     }
 
     pub fn admit(&mut self, item: StorageIoWorkItem, now_ms: u64) -> StorageIoAdmissionDecision {
@@ -571,7 +575,7 @@ impl StorageIoScheduler {
         }
 
         if self.aggregate_items.saturating_add(1) > self.config.aggregate_max_items
-            || self.aggregate_bytes.saturating_add(item_bytes) > self.config.aggregate_max_bytes
+            || self.aggregate_bytes().saturating_add(item_bytes) > self.config.aggregate_max_bytes
         {
             return self.reject(class, budget, StorageIoReason::QueueFull);
         }
@@ -587,7 +591,9 @@ impl StorageIoScheduler {
             admitted_at_ms: now_ms,
         });
         self.aggregate_items = self.aggregate_items.saturating_add(1);
-        self.aggregate_bytes = self.aggregate_bytes_pending_saturating();
+        self.aggregate_bytes = self.aggregate_bytes.saturating_add(u128::from(item_bytes));
+        let class_total = self.class_bytes.entry(class).or_insert(0);
+        *class_total = class_total.saturating_add(u128::from(item_bytes));
 
         let queued_depth = self.class_queue_depth(class);
         let bytes_pending = self.class_bytes_pending(class);
@@ -610,8 +616,12 @@ impl StorageIoScheduler {
             .queues
             .get_mut(&candidate.class)?
             .remove(candidate.index)?;
+
+        let item_bytes = queued.item.estimated_bytes.max(1);
         self.aggregate_items = self.aggregate_items.saturating_sub(1);
-        self.aggregate_bytes = self.aggregate_bytes_pending_saturating();
+        self.aggregate_bytes = self.aggregate_bytes.saturating_sub(u128::from(item_bytes));
+        let class_total = self.class_bytes.entry(candidate.class).or_insert(0);
+        *class_total = class_total.saturating_sub(u128::from(item_bytes));
 
         if self.last_served_class == Some(candidate.class) {
             self.consecutive_from_last_class = self.consecutive_from_last_class.saturating_add(1);
@@ -679,9 +689,10 @@ impl StorageIoScheduler {
 
     #[must_use]
     pub fn class_bytes_pending(&self, class: StorageIoClass) -> u64 {
-        self.queues
+        self.class_bytes
             .get(&class)
-            .map_or(0, queue_estimated_bytes_saturating)
+            .copied()
+            .map_or(0, saturating_u128_to_u64)
     }
 
     #[must_use]
@@ -891,20 +902,20 @@ impl StorageIoScheduler {
     }
 
     fn aggregate_bytes_pending_saturating(&self) -> u64 {
-        self.queues.values().fold(0, |total, queue| {
-            total.saturating_add(queue_estimated_bytes_saturating(queue))
-        })
+        saturating_u128_to_u64(self.aggregate_bytes)
+    }
+}
+
+const fn saturating_u128_to_u64(value: u128) -> u64 {
+    if value > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        value as u64
     }
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn queue_estimated_bytes_saturating(queue: &VecDeque<QueuedWork>) -> u64 {
-    queue.iter().fold(0, |total, queued| {
-        total.saturating_add(queued.item.estimated_bytes.max(1))
-    })
 }
 
 fn ratio_at_least(value: u64, cap: u64, numerator: u64, denominator: u64) -> bool {
