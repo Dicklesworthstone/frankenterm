@@ -30,8 +30,9 @@ pub const DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 /// Smallest pending-buffer cap that can make overflow emission progress.
 ///
-/// The overflow path emits `max_pending_bytes / 2`; caps below 2 would make
-/// forced emission drain zero bytes while still incrementing overflow telemetry.
+/// The overflow path targets `max_pending_bytes / 2`; caps below 2 make
+/// progress depend on a zero-byte target. The forced boundary may advance to
+/// the first UTF-8 scalar when flooring would otherwise drain nothing.
 pub const MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES: usize = 2;
 
 /// br-ft-4socw: cumulative count of [`StreamingRedactor::redact_chunk`]
@@ -816,14 +817,17 @@ impl StreamingRedactor {
         // on the remaining tail. Merges into the same RedactionResult
         // as the normal-path emission so callers see a single result
         // per chunk regardless of overflow.
-        let overflow_result = if self.pending.len() > self.max_pending_bytes {
+        let mut overflow_result: Option<RedactionResult> = None;
+        while self.pending.len() > self.max_pending_bytes {
             record_streaming_redactor_pending_overflow();
             let half = self.max_pending_bytes / 2;
-            let force_boundary = floor_char_boundary(&self.pending, half);
-            Some(self.emit_prefix(force_boundary))
-        } else {
-            None
-        };
+            let force_boundary = overflow_emit_boundary(&self.pending, half);
+            let forced = self.emit_prefix(force_boundary);
+            overflow_result = Some(match overflow_result {
+                Some(prev) => merge_redaction_results(prev, forced),
+                None => forced,
+            });
+        }
 
         let boundary = self.stable_emit_boundary();
         let normal = self.emit_prefix(boundary);
@@ -965,6 +969,17 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+fn overflow_emit_boundary(text: &str, index: usize) -> usize {
+    let floor = floor_char_boundary(text, index);
+    if floor > 0 || text.is_empty() {
+        return floor;
+    }
+
+    text.char_indices()
+        .nth(1)
+        .map_or_else(|| text.len(), |(boundary, _)| boundary)
 }
 
 /// br-ft-4socw: combine a forced-emission result with the
@@ -1201,11 +1216,21 @@ mod tests {
         for split in 1..input.len() {
             let mut streaming = StreamingRedactor::new();
             let mut out = Vec::new();
-            out.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
-            out.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+            let mut made_changes = false;
+
+            let c1 = streaming.redact_chunk(&input.as_bytes()[..split]);
+            made_changes |= c1.evidence.made_changes();
+            out.extend(c1.bytes);
+
+            let c2 = streaming.redact_chunk(&input.as_bytes()[split..]);
+            made_changes |= c2.evidence.made_changes();
+            out.extend(c2.bytes);
+
             let finish = streaming.finish();
-            assert!(finish.evidence.made_changes(), "split={split}");
+            made_changes |= finish.evidence.made_changes();
             out.extend(finish.bytes);
+
+            assert!(made_changes, "split={split}");
 
             assert_eq!(out, expected, "split={split}");
             let rendered = String::from_utf8(out).unwrap();
@@ -1428,9 +1453,8 @@ mod tests {
 
             let result = streaming.redact_chunk(b"rk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
 
-            assert_eq!(
-                super::streaming_redactor_pending_overflow_count(),
-                1,
+            assert!(
+                super::streaming_redactor_pending_overflow_count() > 0,
                 "br-ft-r4nwe: cap={requested_cap} must still trip overflow telemetry"
             );
             assert!(
@@ -1441,6 +1465,40 @@ mod tests {
             assert!(
                 streaming.pending_bytes() <= super::MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES,
                 "br-ft-r4nwe: cap={requested_cap} left pending above normalized minimum: {}",
+                streaming.pending_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_degenerate_pending_caps_handle_four_byte_prefix() {
+        let _guard = streaming_overflow_test_lock();
+
+        for requested_cap in [0, 1, 2] {
+            super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+            let mut streaming = StreamingRedactor::new()
+                .with_tail_bytes(64)
+                .with_max_pending_bytes(requested_cap);
+
+            let result =
+                streaming.redact_chunk("\u{1F9EA}rk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".as_bytes());
+
+            assert!(
+                super::streaming_redactor_pending_overflow_count() > 0,
+                "br-ft-wjjkp.1: cap={requested_cap} must trip overflow telemetry"
+            );
+            assert!(
+                !result.bytes.is_empty(),
+                "br-ft-wjjkp.1: cap={requested_cap} must emit the leading UTF-8 scalar instead of a zero-byte drain"
+            );
+            assert!(
+                String::from_utf8(result.bytes).is_ok(),
+                "br-ft-wjjkp.1: forced overflow emission must preserve UTF-8 boundaries"
+            );
+            assert!(
+                streaming.pending_bytes() <= super::MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES,
+                "br-ft-wjjkp.1: cap={requested_cap} left pending above normalized minimum: {}",
                 streaming.pending_bytes()
             );
         }
