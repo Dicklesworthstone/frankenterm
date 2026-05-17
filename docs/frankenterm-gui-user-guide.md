@@ -161,10 +161,10 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `check_for_updates` | `false` | disable update checks by default |
 | `automatically_reload_config` | `true` | hot-reload config changes |
 
-Current placeholder knobs in `crates/frankenterm-gui/frankenterm.toml`:
-
-- `swap_layout_enabled` and `floating_panes_enabled` are comments only today; the live GUI code treats those features as available through their key assignments rather than as TOML-gated features.
-- `swap_layout_cycle` and `floating_pane_opacity` are documented placeholders in the sample config but are not parsed as active GUI config fields yet.
+Swap layouts and floating panes are currently keybinding-driven features, not
+TOML-gated features. The default sample config does not list `swap_layout_*` or
+`floating_pane_*` keys because those fields are not parsed as active GUI config
+fields yet.
 
 SSH domain fields (optional per entry):
 
