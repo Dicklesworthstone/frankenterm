@@ -3162,12 +3162,19 @@ Curated runbook fragments. The full operator playbook lives in [`docs/operator-p
 
 ### "I see exit 143 from cargo"
 
-That's an RCH (Remote Compilation Helper) SIGTERM with no diagnostic. Bypass:
+That's an RCH (Remote Compilation Helper) SIGTERM with no diagnostic. Treat it
+as a blocked remote proof lane, not as permission to run Cargo locally:
 ```bash
-scripts/cargo-local.sh test -p frankenterm-core --lib
-scripts/cargo-local.sh build --release
+rch doctor
+rch workers probe --all
 ```
-The script handles unique per-agent `CARGO_TARGET_DIR`, Homebrew clang for native deps, and a python fork+setsid that breaks out of the rch hook process group.
+
+Record the exact command that failed, the RCH health output, and the worker or
+admission reason code in the bead. Keep proof-required beads open or blocked
+until a remote RCH run reaches Cargo/test execution. While RCH is unavailable,
+use static/read-only checks only; local Cargo output is not acceptable closeout
+proof unless the human operator explicitly approves a local fallback for that
+specific incident.
 
 ### "I think there's a memory leak"
 

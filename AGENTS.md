@@ -1227,24 +1227,30 @@ rch queue                     # See active/waiting builds
 
 ### When rch is down: the exit-143 failure mode
 
-The fails-open story is **aspirational**, not current. When `force_remote=true` is set in `~/.config/rch/config.toml` and the remote workers are unhealthy, the intercepted cargo subprocess receives **SIGTERM (exit 143)** with no diagnostic. Operators see `cargo test foo ... exit 143` and have to know the bypass recipe exists — new agents routinely lose 30 minutes rediscovering it (ft-45805).
+The fails-open story is **aspirational**, not current. When `force_remote=true` is set in `~/.config/rch/config.toml` and the remote workers are unhealthy, the intercepted cargo subprocess receives **SIGTERM (exit 143)** with no diagnostic. Operators see `cargo test foo ... exit 143` and must treat that as a blocked remote proof lane, not as permission to run Cargo locally.
 
 **Symptoms:**
 - `cargo <anything>` exits with code 143 and no stderr explanation
 - `rch doctor` shows workers down or timing out
 - `rch workers probe --all` shows most/all workers unreachable
 
-**Bypass recipe — use this whenever you see exit 143 from cargo:**
+**Fail-closed procedure:**
 
 ```bash
-scripts/cargo-local.sh test -p frankenterm-core --lib
-scripts/cargo-local.sh build --release
-scripts/cargo-local.sh clippy --all-targets
+rch doctor
+rch workers probe --all
 ```
 
-The script hardcodes the known-good local recipe: unique per-agent `CARGO_TARGET_DIR` under `/tmp`, Homebrew clang for `CC`/`CXX` (aws-lc-sys and other native deps fail without this — the `cc` shell alias on this machine maps to `claude`, not the C compiler), and a python `fork()+setsid()` that breaks out of the Claude-Code-owned process group so the rch hook cannot SIGTERM the cargo subprocess. Override knobs (target dir, compiler paths, disable the fork) are documented in the script header.
+Record the failed Cargo command, RCH health output, selected-worker/admission
+state, and exact reason code in the bead. Keep proof-required beads open or
+blocked until a remote RCH run reaches Cargo/test execution and emits retained
+proof artifacts. Static/read-only checks may support diagnosis while workers
+are unavailable, but they do not replace remote Cargo proof.
 
-The long-term fix lives in rch itself (catch worker-SIGTERM, fall back to local, mark worker unhealthy) — rch is not in this repo, so ft-45805 closes out with the documented bypass rather than a code change.
+Local Cargo proof is invalid unless the human operator explicitly approves a
+local fallback for that specific incident. Even with approval, label the result
+as approved local fallback and rerun through RCH before claiming release-grade
+proof.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
