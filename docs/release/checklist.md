@@ -97,10 +97,15 @@ catch common omissions.
 
 ## Recommended
 
-- **Run the headline-claim benches.** `cargo bench -p
-  frankenterm-core` followed by reviewing
-  `target/criterion/wa-bench-distributions.jsonl` for any
-  unexplained drift in the 5 SLO claims (ft-syqcz.3 manifest).
+- **Run the headline-claim benches through RCH.**
+  ```bash
+  rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-headline-benches \
+    cargo bench -p frankenterm-core
+  ```
+  Then review `target/criterion/wa-bench-distributions.jsonl` for any
+  unexplained drift in the 5 SLO claims (ft-syqcz.3 manifest). Retain
+  the selected worker, target dir, artifact path, exit code, and any
+  failure classification if RCH does not reach the bench binary.
 - **Sanity-check the doctrine guards.** The CI lint job is
   authoritative, but a local
   `python3 scripts/check_runtime_proof_coverage.py --summary`
@@ -108,9 +113,14 @@ catch common omissions.
 - **Smoke-test the installer.** `bash install.sh --dry-run`
   against `vX.Y.0` (the tagged version) to catch `curl|bash` shape
   drift before users do.
-- **Test the e2e workflow trigger.** `cargo test --test
-  e2e_workflow_trigger` against the renamed binaries to confirm
-  end-to-end paths still resolve.
+- **Test the e2e workflow trigger through RCH.**
+  ```bash
+  rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-e2e-workflow \
+    cargo test -p frankenterm --test e2e_workflow_trigger -- --nocapture
+  ```
+  Run this against the renamed binaries to confirm end-to-end paths still
+  resolve, and retain the selected worker, target dir, artifact path, exit
+  code, and failure classification.
 
 ## Cross-references
 
