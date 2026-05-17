@@ -1227,7 +1227,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   │   │   ├── incident_bundle.rs        # Live incident-bundle collectors
 │   │   │   ├── mission_objective_plan.rs # Capacity-aware objective planner
 │   │   │   └── …                         # 500+ additional modules
-│   │   ├── tests/                        # 952 Rust test files, 51k+ test annotations
+│   │   ├── tests/                        # 952 Rust test files, 55k+ test annotations
 │   │   └── benches/                      # 111 Criterion benchmarks
 │   │
 │   ├── frankenterm-core-ars/             # ARS (Adaptive/Autonomous Reflex System)
