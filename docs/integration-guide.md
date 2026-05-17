@@ -123,7 +123,7 @@ Each `ft robot <command>` dispatch returns either a named typed struct in
 `frankenterm_core::robot_ntm_surface`, a subsystem-owned wire type, or an
 untyped `serde_json::Value`. The table below is maintained against the
 `RobotCommands` enum in `crates/frankenterm/src/main.rs` and the live
-NTM-gap manifest in `docs/robot-contracts/current-ntm-gap-dispatch.md`.
+[NTM-gap dispatch manifest](robot-contracts/current-ntm-gap-dispatch.md).
 Checkpoint, context, work, fleet, and profile are native Robot Mode
 families; they no longer route through the generic `robot.not_implemented`
 fallback.
