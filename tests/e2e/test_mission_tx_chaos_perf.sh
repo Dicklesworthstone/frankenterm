@@ -217,7 +217,13 @@ jq -n \
   --argjson kill_switch_hits "${kill_switch_hits}" \
   --argjson rollback_hits "${rollback_hits}" \
   --arg metrics_contract "ft-1i2ge.8.12" \
-  '{
+  'def runtime_log($path): {
+    status: "runtime_log_unretained",
+    original_runtime_path: $path,
+    committed_retention: "not_retained",
+    storage_details: "Generated under tests/e2e/logs for this local harness run. The path is ignored by repo policy; scripts/e2e_test.sh copies fresh logs into its per-scenario artifact directory when the wrapper owns a retained run artifact."
+  };
+  {
     generated_at_utc: $generated_at,
     bead_id: $metrics_contract,
     run_id: $run_id,
@@ -231,28 +237,28 @@ jq -n \
         passing_tests: $chaos_pass,
         expected_min: $chaos_expected_min,
         duration_seconds: $chaos_duration,
-        artifact_log: $chaos_log
+        artifact_log: runtime_log($chaos_log)
       },
       performance_budget: {
         test_binary: "mission_perf_scalability",
         passing_tests: $perf_pass,
         expected_min: $perf_expected_min,
         duration_seconds: $perf_duration,
-        artifact_log: $perf_log
+        artifact_log: runtime_log($perf_log)
       },
       failure_recovery_matrix: {
         test_binary: "tx_e2e_scenario_matrix",
         passing_tests: $matrix_pass,
         expected_min: $matrix_expected_min,
         duration_seconds: $matrix_duration,
-        artifact_log: $matrix_log
+        artifact_log: runtime_log($matrix_log)
       },
       tx_correctness_regression: {
         test_binary: "tx_correctness_suite",
         passing_tests: $correctness_pass,
         expected_min: $correctness_expected_min,
         duration_seconds: $correctness_duration,
-        artifact_log: $correctness_log
+        artifact_log: runtime_log($correctness_log)
       }
     },
     readiness_gates: {

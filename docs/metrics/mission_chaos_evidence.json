@@ -23,11 +23,39 @@
     "no_unbounded_degradation": true
   },
   "artifacts": {
-    "chaos_log": "tests/e2e/logs/mission_chaos_20260227_031811.chaos_planner_dispatcher.stdout.log",
-    "tx_matrix_log": "tests/e2e/logs/mission_chaos_20260227_031811.tx_scenario_matrix.stdout.log",
-    "tx_observability_log": "tests/e2e/logs/mission_chaos_20260227_031811.tx_observability.stdout.log",
-    "resume_run_a_log": "tests/e2e/logs/mission_chaos_20260227_031811.resume_recovery_a.stdout.log",
-    "resume_run_b_log": "tests/e2e/logs/mission_chaos_20260227_031811.resume_recovery_b.stdout.log"
+    "retention_status": "runtime_logs_unretained_in_committed_metrics",
+    "raw_logs": {
+      "chaos_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_chaos_20260227_031811.chaos_planner_dispatcher.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      },
+      "tx_matrix_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_chaos_20260227_031811.tx_scenario_matrix.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      },
+      "tx_observability_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_chaos_20260227_031811.tx_observability.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      },
+      "resume_run_a_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_chaos_20260227_031811.resume_recovery_a.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      },
+      "resume_run_b_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_chaos_20260227_031811.resume_recovery_b.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      }
+    }
   },
   "residual_risks": [
     "Chaos campaign is deterministic with fixed seeds and does not model fully random external faults.",

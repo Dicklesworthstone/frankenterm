@@ -62,7 +62,7 @@ is not a source failure and cannot support a high-scale performance claim.
 | Storage/indexing pressure | `scripts/high-scale-rehearsal.sh` | `fixtures/scale-lab/storage-index-heatmap-summary.v1.json` exists | copied heat-map fixture, event row | `READY` for fixture presence | If pressure rows are stale, hand off to the storage/indexing heat-map bead rather than tuning blindly. |
 | Policy approval backlog | `scripts/high-scale-rehearsal.sh` plus the active policy bead receipts when available | `docs/risk-scoring.md` exists; richer receipts may come from `ft-bsfb9.10` | copied risk-scoring doc, event row, optional policy receipt fixture | `READY` for static rehearsal input; richer receipts must distinguish `allow`, `deny`, `require_approval`, `delay`, and `ask_human` | If only prose exists, avoid claiming approval automation beyond bounded rehearsal coverage. |
 | Robot/MCP control-plane smoke | `scripts/high-scale-rehearsal.sh` | `crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json` exists | copied golden matrix, event row | `READY` for fixture presence | If matrix drift is found, run the focused RCH proof from `docs/robot-contracts/current-ntm-gap-dispatch.md`. |
-| Mission chaos recovery | `scripts/high-scale-rehearsal.sh` | `docs/metrics/mission_chaos_evidence.json` exists | copied chaos evidence, event row | `READY` for fixture presence | If missing or stale, use the chaos harness owner path; do not synthesize a pass from operator notes. |
+| Mission chaos recovery | `scripts/high-scale-rehearsal.sh` | `docs/metrics/mission_chaos_evidence.json` exists and does not mark raw logs unretained | copied chaos summary evidence, event row | `READY` only for retained raw proof; `SKIPPED_NOT_PROVEN` when the metric marks runtime logs as unretained | If missing, stale, or raw logs are unavailable, use the chaos harness owner path; do not synthesize a pass from operator notes. |
 | SLO cockpit bottlenecks | `scripts/high-scale-rehearsal.sh` | `SloCockpitSnapshot` exists in `runtime_health.rs` | `slo-cockpit-symbols.txt`, event row | `READY` for core API availability | For missing domains or wrong next steps, reopen the cockpit bead or file a focused follow-up. |
 
 ## Chaos Restore Scenario Specs
@@ -135,8 +135,10 @@ Use these anchors when interpreting rehearsal output:
 - `crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json`
   and `crates/frankenterm-core/tests/control_plane_golden_matrix.rs` for
   Robot/MCP envelope drift checks.
-- `docs/metrics/mission_chaos_evidence.json` for retained chaos/recovery
-  evidence.
+- `docs/metrics/mission_chaos_evidence.json` for chaos/recovery evidence
+  summaries. If it marks raw runtime logs as unretained, the high-scale
+  rehearsal must emit `SKIPPED_NOT_PROVEN` rather than treating summary
+  counters as retained raw proof.
 - `crates/frankenterm-core/src/runtime_health.rs` for the SLO cockpit model.
 
 Closeout wording must distinguish:

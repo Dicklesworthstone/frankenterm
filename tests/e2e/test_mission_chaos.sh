@@ -262,7 +262,13 @@ jq -n \
   --argjson resume_b_pass "${resume_b_pass}" \
   --argjson resume_a_duration "${resume_a_duration}" \
   --argjson resume_b_duration "${resume_b_duration}" \
-  '{
+  'def runtime_log($path): {
+    status: "runtime_log_unretained",
+    original_runtime_path: $path,
+    committed_retention: "not_retained",
+    storage_details: "Generated under tests/e2e/logs for this local harness run. The path is ignored by repo policy; scripts/e2e_test.sh copies fresh logs into its per-scenario artifact directory when the wrapper owns a retained run artifact."
+  };
+  {
     generated_at_utc: $generated_at,
     bead_id: $bead_id,
     run_id: $run_id,
@@ -287,11 +293,14 @@ jq -n \
       no_unbounded_degradation: true
     },
     artifacts: {
-      chaos_log: $chaos_log,
-      tx_matrix_log: $tx_matrix_log,
-      tx_observability_log: $observability_log,
-      resume_run_a_log: $resume_a_log,
-      resume_run_b_log: $resume_b_log
+      retention_status: "runtime_logs_unretained_in_committed_metrics",
+      raw_logs: {
+        chaos_log: runtime_log($chaos_log),
+        tx_matrix_log: runtime_log($tx_matrix_log),
+        tx_observability_log: runtime_log($observability_log),
+        resume_run_a_log: runtime_log($resume_a_log),
+        resume_run_b_log: runtime_log($resume_b_log)
+      }
     },
     residual_risks: [
       "Chaos campaign is deterministic with fixed seeds and does not model fully random external faults.",

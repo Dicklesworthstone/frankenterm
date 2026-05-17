@@ -224,6 +224,26 @@ record_static_fixture() {
   fi
 }
 
+record_mission_chaos_fixture() {
+  local source="docs/metrics/mission_chaos_evidence.json"
+  local target="$OUT_DIR/mission-chaos-evidence.json"
+
+  if ! copy_if_present "$ROOT_DIR/$source" "$target"; then
+    write_event mission_chaos_recovery SKIP SKIPPED_NOT_PROVEN "$target" "missing fixture: $source"
+    return
+  fi
+
+  if command -v jq >/dev/null 2>&1 \
+    && jq -e '.artifacts.retention_status == "runtime_logs_unretained_in_committed_metrics"' "$target" >/dev/null; then
+    write_event mission_chaos_recovery SKIP SKIPPED_NOT_PROVEN "$target" \
+      "mission chaos summary copied, but raw runtime logs are marked unretained; rerun the owner harness for retained raw proof"
+    return
+  fi
+
+  write_event mission_chaos_recovery PASS READY "$target" \
+    "mission chaos evidence fixture copied for recovery rehearsal"
+}
+
 record_optional_live_probe() {
   local scenario="$1"
   local command_name="$2"
@@ -277,11 +297,7 @@ record_static_fixture \
   control-plane-golden-matrix.json \
   "Robot/MCP control-plane golden matrix copied for smoke rehearsal"
 
-record_static_fixture \
-  mission_chaos_recovery \
-  docs/metrics/mission_chaos_evidence.json \
-  mission-chaos-evidence.json \
-  "mission chaos evidence fixture copied for recovery rehearsal"
+record_mission_chaos_fixture
 
 if rg -n "SloCockpitSnapshot|SLO_COCKPIT_SCHEMA_VERSION" \
   "$ROOT_DIR/crates/frankenterm-core/src/runtime_health.rs" >"$OUT_DIR/slo-cockpit-symbols.txt" 2>&1; then

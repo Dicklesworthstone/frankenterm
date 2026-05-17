@@ -12,28 +12,48 @@
       "passing_tests": 24,
       "expected_min": 24,
       "duration_seconds": 105,
-      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.chaos.stdout.log"
+      "artifact_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.chaos.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      }
     },
     "performance_budget": {
       "test_binary": "mission_perf_scalability",
       "passing_tests": 26,
       "expected_min": 20,
       "duration_seconds": 6,
-      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.performance.stdout.log"
+      "artifact_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.performance.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      }
     },
     "failure_recovery_matrix": {
       "test_binary": "tx_e2e_scenario_matrix",
       "passing_tests": 19,
       "expected_min": 19,
       "duration_seconds": 9,
-      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.tx_matrix.stdout.log"
+      "artifact_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.tx_matrix.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      }
     },
     "tx_correctness_regression": {
       "test_binary": "tx_correctness_suite",
       "passing_tests": 44,
       "expected_min": 20,
       "duration_seconds": 14,
-      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.tx_correctness.stdout.log"
+      "artifact_log": {
+        "status": "raw_log_unavailable",
+        "original_runtime_path": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.tx_correctness.stdout.log",
+        "committed_retention": "not_retained",
+        "storage_details": "This historical runtime log was generated under ignored tests/e2e/logs output and is not present as a tracked retained artifact in this checkout."
+      }
     }
   },
   "readiness_gates": {

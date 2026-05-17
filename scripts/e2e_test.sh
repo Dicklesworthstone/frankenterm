@@ -11557,14 +11557,23 @@ run_scenario_ft_1i2ge_7_6() {
             --arg chaos_log "$(newest_existing_path "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_*.jsonl | sed "s#^${PROJECT_ROOT}/##")" \
             --argjson soak "$(cat "$soak_report")" \
             --argjson chaos "$(cat "$chaos_report")" \
-            '{
+            'def runtime_jsonl($path): {
+                status: "runtime_log_unretained",
+                original_runtime_path: $path,
+                committed_retention: "not_retained",
+                storage_details: "Generated under tests/e2e/logs for this local wrapper run. The path is ignored by repo policy; this wrapper copies fresh logs into scenario_dir for retained run artifacts."
+            };
+            {
                 generated_at_utc: $generated_at,
                 bead_id: $bead_id,
                 run_id: $run_id,
                 scenario_name: $scenario_name,
                 log_bundle: {
-                    mission_soak_jsonl: $soak_log,
-                    mission_chaos_jsonl: $chaos_log
+                    retention_status: "runtime_logs_unretained_in_committed_metrics",
+                    raw_logs: {
+                        mission_soak_jsonl: runtime_jsonl($soak_log),
+                        mission_chaos_jsonl: runtime_jsonl($chaos_log)
+                    }
                 },
                 soak_report: $soak,
                 chaos_report: $chaos
