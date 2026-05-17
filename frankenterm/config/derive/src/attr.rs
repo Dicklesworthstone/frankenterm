@@ -128,8 +128,19 @@ impl<'a> FieldInfo<'a> {
     }
 }
 
+fn unhandled_type_error(name: &str, ty: &Type) -> Error {
+    Error::new_spanned(
+        ty,
+        format!("unhandled type for {name}: {}", ty.to_token_stream()),
+    )
+}
+
 pub fn field_info(field: &Field) -> Result<FieldInfo<'_>> {
-    let mut name = field.ident.as_ref().unwrap().to_string();
+    let mut name = field
+        .ident
+        .as_ref()
+        .ok_or_else(|| Error::new_spanned(field, "config fields must be named"))?
+        .to_string();
     let mut skip = false;
     let mut flatten = false;
     let mut allow_default = DefValue::None;
@@ -142,7 +153,11 @@ pub fn field_info(field: &Field) -> Result<FieldInfo<'_>> {
 
     let type_name = match &field.ty {
         Type::Path(p) => {
-            let last_seg = p.path.segments.last().unwrap();
+            let last_seg = p
+                .path
+                .segments
+                .last()
+                .ok_or_else(|| unhandled_type_error(&name, &field.ty))?;
             match &last_seg.arguments {
                 PathArguments::None => last_seg.ident.to_string(),
                 PathArguments::AngleBracketed(args) if args.args.len() == 1 => {
@@ -152,14 +167,16 @@ pub fn field_info(field: &Field) -> Result<FieldInfo<'_>> {
                             container_type = match last_seg.ident.to_string().as_str() {
                                 "Option" => ContainerType::Option,
                                 "Vec" => ContainerType::Vec,
-                                _ => panic!(
-                                    "unhandled type for {name}: {}",
-                                    field.ty.to_token_stream()
-                                ),
+                                _ => return Err(unhandled_type_error(&name, &field.ty)),
                             };
-                            t.path.segments.last().unwrap().ident.to_string()
+                            t.path
+                                .segments
+                                .last()
+                                .ok_or_else(|| unhandled_type_error(&name, &field.ty))?
+                                .ident
+                                .to_string()
                         }
-                        _ => panic!("unhandled type for {name}: {}", field.ty.to_token_stream()),
+                        _ => return Err(unhandled_type_error(&name, &field.ty)),
                     }
                 }
                 PathArguments::AngleBracketed(args) if args.args.len() == 2 => {
@@ -168,20 +185,22 @@ pub fn field_info(field: &Field) -> Result<FieldInfo<'_>> {
                         GenericArgument::Type(Type::Path(t)) => {
                             container_type = match last_seg.ident.to_string().as_str() {
                                 "HashMap" => ContainerType::Map,
-                                _ => panic!(
-                                    "unhandled type for {name}: {}",
-                                    field.ty.to_token_stream()
-                                ),
+                                _ => return Err(unhandled_type_error(&name, &field.ty)),
                             };
-                            t.path.segments.last().unwrap().ident.to_string()
+                            t.path
+                                .segments
+                                .last()
+                                .ok_or_else(|| unhandled_type_error(&name, &field.ty))?
+                                .ident
+                                .to_string()
                         }
-                        _ => panic!("unhandled type for {name}: {}", field.ty.to_token_stream()),
+                        _ => return Err(unhandled_type_error(&name, &field.ty)),
                     }
                 }
-                _ => panic!("unhandled type for {name}: {}", field.ty.to_token_stream()),
+                _ => return Err(unhandled_type_error(&name, &field.ty)),
             }
         }
-        _ => panic!("unhandled type for {name}: {}", field.ty.to_token_stream()),
+        _ => return Err(unhandled_type_error(&name, &field.ty)),
     };
 
     for attr in &field.attrs {
@@ -282,4 +301,41 @@ pub fn field_info(field: &Field) -> Result<FieldInfo<'_>> {
         doc,
         container_type,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    fn field_info_error(field: Field) -> String {
+        match field_info(&field) {
+            Ok(_) => panic!("expected field_info to reject unsupported type"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn field_info_rejects_unsupported_single_arg_container() {
+        let field: Field = parse_quote! {
+            unsupported: Result<String>
+        };
+
+        let err = field_info_error(field);
+
+        assert!(err.contains("unhandled type for unsupported"));
+        assert!(err.contains("Result < String >"));
+    }
+
+    #[test]
+    fn field_info_rejects_unsupported_tuple_type() {
+        let field: Field = parse_quote! {
+            unsupported: (String, String)
+        };
+
+        let err = field_info_error(field);
+
+        assert!(err.contains("unhandled type for unsupported"));
+        assert!(err.contains("(String, String)"));
+    }
 }
