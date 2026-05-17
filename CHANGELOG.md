@@ -60,7 +60,93 @@ CC=$(xcrun --find clang) CXX=$(xcrun --find clang++) cargo install ...
 
 ## [Unreleased] -- development on `main` since v0.1.0
 
-> Continued development after the v0.1.0 baseline.
+> Continued development after the v0.1.0 baseline. Roughly 1,600+ commits land between 2026-05-01 and 2026-05-16.
+
+### Operating envelope + incident-bundle plumbing (2026-05-10 -- 2026-05-16)
+
+The swarm-safety stack matures from "we have telemetry" to "we fail closed when telemetry is missing."
+
+- **Operating-envelope contract shipped** (ft-booek + ft-booek.1) — `ft.operating_envelope.v1` contract with a side-effect-free planner module and golden fixtures lands as the canonical capacity-admission surface ([`b5bd5d352`](https://github.com/Dicklesworthstone/frankenterm/commit/b5bd5d352)).
+- **Operator runbook gate** (ft-booek.6) — adds `docs/operator-runbook.md` gate entry that operators reach from `ft doctor` when envelope state is degraded ([`d71b8076b`](https://github.com/Dicklesworthstone/frankenterm/commit/d71b8076b)).
+- **Fail-closed posture for missing telemetry** — telemetry/network-pressure paths now refuse to advance when their measurement source is absent, instead of papering over with defaults:
+  - missing process snapshots fail closed in `telemetry` ([`fe8a5bb6a`](https://github.com/Dicklesworthstone/frankenterm/commit/fe8a5bb6a))
+  - `core` fails closed on missing network-pressure telemetry (ft-9wp2u, [`1f596e721`](https://github.com/Dicklesworthstone/frankenterm/commit/1f596e721))
+  - `operating-envelope` fails closed on RCH critical pressure ([`8ec3c5db3`](https://github.com/Dicklesworthstone/frankenterm/commit/8ec3c5db3))
+- **Crash + incident-bundle swarm sources** (ft-9sy9e family) — wires swarm incident-bundle sources to live collectors ([`fc6dfc97e`](https://github.com/Dicklesworthstone/frankenterm/commit/fc6dfc97e)) and adds a publish-side snapshot path so producers don't have to re-derive bundle inputs ([`bd70318ff`](https://github.com/Dicklesworthstone/frankenterm/commit/bd70318ff)).
+- **Beads coordination snapshot** (ft-tkkqx) — collector against `.beads/issues.jsonl` so incident bundles carry the live task-tracker state ([`c6e63354e`](https://github.com/Dicklesworthstone/frankenterm/commit/c6e63354e)).
+- **Mission objective planner** (ft-auy2g, capacity-aware) — core planner + source adapters + golden corpus ([`824fc50dd`](https://github.com/Dicklesworthstone/frankenterm/commit/824fc50dd), [`d312ecf0d`](https://github.com/Dicklesworthstone/frankenterm/commit/d312ecf0d), [`e94d0885c`](https://github.com/Dicklesworthstone/frankenterm/commit/e94d0885c)).
+
+### Reality-check round 2 substrate (2026-05-12, ft-tf6g3)
+
+The second `/reality-check-for-project` epic opens with a wide substrate pass that names the remaining outward-facing gaps and stands up the machinery to close them.
+
+- **Final-mile convergence epic** (ft-tf6g3) — umbrella for the second reality-check run; closes the attestation graph, the headline-claim artifact links, the renderer SLO suite, and the round-3 statistical elevations the bridge plan owes (Lindley/min-plus, Fano, SPRT, conformal bands, Mazurkiewicz cancel-traces, TLA+ tx-killswitch, Stateright work-family atomicity).
+- **Renderer SLO catalog** — consolidated `docs/perf/resize-quality-slo.md` + machine-readable JSON; scheduler/reflow stage budgets land at `docs/resize-performance-slos.md`.
+- **`ft-perf-gate` substrate crate** — SPRT + conformal + KL-divergence + causal-DAG primitives extracted to their own workspace crate so attestation gating can compose them without leaking through `frankenterm-core`.
+- **`ft-test-log` substrate** — centralized test-logging convention crate for the evidence-stream fixture corpus.
+- **Resource-pressure cockpit contract** — `docs/resource-pressure-cockpit-contract.md` separates `rust_heap`, `mmap_file_backed`, `sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, and `unknown` residency before anything is called a leak.
+- **Target-class hardware gate** — `docs/perf/target-class-hardware.md` defines the per-SKU artifact contract; the current `linux-x86_64-high-core` artifact stays `skipped_not_proven` and 200-pane / high-scale memory wording is held back accordingly.
+
+### Substrate audit waves (2026-04-15 -- 2026-05-02)
+
+Multi-pass substrate audit closes eight defect families across the codebase. Each fix is small; the discipline is that the families were systematically swept rather than spot-patched.
+
+- **Public-field-bypass family** — six audits where `pub` struct fields let callers bypass clamping, validation, or invariants. Fixed across `audit_erasure_spec::ErasureShard` ([`7cfb6218f`](https://github.com/Dicklesworthstone/frankenterm/commit/7cfb6218f), [`f47a2451e`](https://github.com/Dicklesworthstone/frankenterm/commit/f47a2451e)), `circuit_breaker::Config` ([`29c028e01`](https://github.com/Dicklesworthstone/frankenterm/commit/29c028e01)), `latency_model::QuantileBudgetMs` + `network_calculus_bound::{ArrivalCurve, ServiceCurve}` ([`b4bb7c373`](https://github.com/Dicklesworthstone/frankenterm/commit/b4bb7c373), [`b79f814a8`](https://github.com/Dicklesworthstone/frankenterm/commit/b79f814a8)), `approval::ApprovalScope`/`AuditContext` ([`611e0573e`](https://github.com/Dicklesworthstone/frankenterm/commit/611e0573e)), `subpixel_positioning::ScaleFactor` ([`46c8f8af9`](https://github.com/Dicklesworthstone/frankenterm/commit/46c8f8af9)), `font_features::AxisValue` ([`a45045e39`](https://github.com/Dicklesworthstone/frankenterm/commit/a45045e39)).
+- **Rubber-stamp `is_safe` family** — seventeen audits where `is_safe()` returned true on cold-start, before measurements were recorded, or after a pure-rejection storm. Fixed across `display_pipeline_ci_matrix` (CRITICAL release-gate forgery, [`5b743bc6f`](https://github.com/Dicklesworthstone/frankenterm/commit/5b743bc6f)), `gpu_regression_fuzz_report` ([`35d52b848`](https://github.com/Dicklesworthstone/frankenterm/commit/35d52b848)), `redactor_coverage_matrix` ([`fd1d0bb23`](https://github.com/Dicklesworthstone/frankenterm/commit/fd1d0bb23)), `iterm2_osc_1337` ([`9a19c5b32`](https://github.com/Dicklesworthstone/frankenterm/commit/9a19c5b32)), `chaos::ChaosReport` ([`a399f598d`](https://github.com/Dicklesworthstone/frankenterm/commit/a399f598d)), `disaster_recovery_drills::ContinuityReport` ([`399f8157b`](https://github.com/Dicklesworthstone/frankenterm/commit/399f8157b)), `cell_consistency_crc` ([`94031e411`](https://github.com/Dicklesworthstone/frankenterm/commit/94031e411)), 7 cold-start doctor snapshots ([`8256d7554`](https://github.com/Dicklesworthstone/frankenterm/commit/8256d7554)), and others.
+- **Sanitization-gap family** — `restore_process` rejects DEL + C1 controls including CSI ([`de6e21a51`](https://github.com/Dicklesworthstone/frankenterm/commit/de6e21a51)), `kitty_graphics_alt_text` closes HIGH sanitization bypass ([`2ec72f165`](https://github.com/Dicklesworthstone/frankenterm/commit/2ec72f165)), `browser::sanitize_path_component` blocks bare `.` and `..` ([`74caa6354`](https://github.com/Dicklesworthstone/frankenterm/commit/74caa6354)), `cass` closes argv flag-injection vector ([`bd617a723`](https://github.com/Dicklesworthstone/frankenterm/commit/bd617a723)).
+- **NaN / unbounded-input family** — `chaos` rejects NaN probability + unbounded delay DoS + `p=1.0` false-negative ([`d06ef64d1`](https://github.com/Dicklesworthstone/frankenterm/commit/d06ef64d1)), `recorder_replay::ReplayConfig` + `VirtualClock` reject NaN + `NEG_INFINITY` ([`9558a155b`](https://github.com/Dicklesworthstone/frankenterm/commit/9558a155b), [`0e174c634`](https://github.com/Dicklesworthstone/frankenterm/commit/0e174c634)), `bench_stats::empirical_bernstein_ci` rejects non-finite range ([`c00847bcd`](https://github.com/Dicklesworthstone/frankenterm/commit/c00847bcd)), `disk_pressure::EwmaEstimator` sanitizes NaN alpha ([`78a2adea3`](https://github.com/Dicklesworthstone/frankenterm/commit/78a2adea3)).
+- **Privacy-bypass family** — `scrollback_cold_tier::ChunkMetadata.redaction` made private to prevent skipping redactor ([`f9cff43d8`](https://github.com/Dicklesworthstone/frankenterm/commit/f9cff43d8)); `incident_bundle::truncate_file_content` honors `max_bytes_per_file` ([`4de738d04`](https://github.com/Dicklesworthstone/frankenterm/commit/4de738d04)) and `truncate_excerpt` honors `max_output_excerpt_len` ([`ae731d77b`](https://github.com/Dicklesworthstone/frankenterm/commit/ae731d77b)).
+- **Redactor coverage expansion** (ft-8nd26) — adds JWT, GitLab, Twilio, SendGrid, and Datadog token patterns to the secret redactor ([`79b0d5d12`](https://github.com/Dicklesworthstone/frankenterm/commit/79b0d5d12)).
+- **State-machine + telemetry correctness** — `pane_groups` closes 3 state-machine defects ([`f03cd10d7`](https://github.com/Dicklesworthstone/frankenterm/commit/f03cd10d7)), `triple_buffer_watchdog` closes 4 audit findings ([`5c43e4fea`](https://github.com/Dicklesworthstone/frankenterm/commit/5c43e4fea)), `sync_output_watchdog` closes 3 ([`fb155bd46`](https://github.com/Dicklesworthstone/frankenterm/commit/fb155bd46)), `frame_budget::SustainedBurstHarness` closes 3 ([`d67c59707`](https://github.com/Dicklesworthstone/frankenterm/commit/d67c59707)).
+- **Workflow lock manager telemetry** (ft-rai3h) — `LockManagerHealth` telemetry surface for the workflow lock manager ([`3173f9f71`](https://github.com/Dicklesworthstone/frankenterm/commit/3173f9f71)).
+
+### GUI render-state + renderer correctness (2026-04-15 -- 2026-05-16)
+
+The GUI moves from "compiles" to "live render-state plumbed through paint and reduce-motion gates."
+
+- **Live render-state wiring** — terminal triple-buffer registry, quad allocation snapshot, frame-budget reduce-motion gate, and render placeholder replacements all wired through to the live paint path ([`9ecb1df1a`](https://github.com/Dicklesworthstone/frankenterm/commit/9ecb1df1a)).
+- **SynchronizedOutput (BSU/ESU)** — mux notification plumbing for BSU/ESU sync-output, drain telemetry into GUI, ApiSurface coverage made dynamic, and Operator drain-cause pinned for soft-reset under BSU ([`5f087525a`](https://github.com/Dicklesworthstone/frankenterm/commit/5f087525a), [`53cde2b47`](https://github.com/Dicklesworthstone/frankenterm/commit/53cde2b47), [`83c932646`](https://github.com/Dicklesworthstone/frankenterm/commit/83c932646)).
+- **Drag handling classified** (ft-spcu0) — "drag not implemented" catch-all replaced with classified per-mode handlers ([`1edf9998e`](https://github.com/Dicklesworthstone/frankenterm/commit/1edf9998e)).
+- **Command palette uses domain labels** (ft-dkd26) — palette renders the user-facing label instead of raw domain IDs ([`b0da8840b`](https://github.com/Dicklesworthstone/frankenterm/commit/b0da8840b)).
+- **Tab progress indicator** — indeterminate-mode rendering for tabs whose work has unknown completion ([`8da923e5d`](https://github.com/Dicklesworthstone/frankenterm/commit/8da923e5d)).
+- **Layer placeholder replacement** (ft-1l5n2) — compositor's placeholder `DrawCmd` replaced with the real draw command ([`fa0e427ef`](https://github.com/Dicklesworthstone/frankenterm/commit/fa0e427ef)).
+- **Scripting dimensions expose window state** (ft-zfcsc) — Lua/scripting `window:get_dimensions()` returns the live window state instead of stale config ([`ef175fc68`](https://github.com/Dicklesworthstone/frankenterm/commit/ef175fc68)).
+- **Renderer correctness substrate** — `iter_dirty` render-pass gate behind phase flag ([`2fccd13d0`](https://github.com/Dicklesworthstone/frankenterm/commit/2fccd13d0)), per-platform display probe schema ([`75bac2270`](https://github.com/Dicklesworthstone/frankenterm/commit/75bac2270)), platform reduce-motion probe primitive ([`ab9100dc0`](https://github.com/Dicklesworthstone/frankenterm/commit/ab9100dc0)), kitty graphics alt-text attestation generator + release gate ([`d418cd68e`](https://github.com/Dicklesworthstone/frankenterm/commit/d418cd68e)), stateful BSU ring buffer ([`30da3a5c4`](https://github.com/Dicklesworthstone/frankenterm/commit/30da3a5c4)), dirty-line frame-end clear predicate ([`fd4e98cbc`](https://github.com/Dicklesworthstone/frankenterm/commit/fd4e98cbc)), Wayland direct-scanout policy ([`cd9d4ba47`](https://github.com/Dicklesworthstone/frankenterm/commit/cd9d4ba47)).
+- **Terminal protocol** — DEC private mode restore implemented ([`19d289158`](https://github.com/Dicklesworthstone/frankenterm/commit/19d289158)) with cache-reset coverage ([`0332dca07`](https://github.com/Dicklesworthstone/frankenterm/commit/0332dca07)); termwiz preserves input on empty history search ([`d102d12bd`](https://github.com/Dicklesworthstone/frankenterm/commit/d102d12bd)).
+- **OSC protocol omnibus** (ft-ncwh5, ft-uea9o) — 3 audit findings closed across `osc_protocol_omnibus`, plus OSC 52 docstring honesty alignment.
+
+### Native asupersync cutover closed (2026-04-01 -- 2026-04-15, ft-xbnl0.2)
+
+The dual-runtime era ends. The remaining tokio-shaped seams in core observation, workflow, and maintenance loops collapse onto `Cx`-first asupersync.
+
+- **Cx-first structured-concurrency entry points** (ft-xbnl0.2.2) — landed across `session_retention` ([`94faa1660`](https://github.com/Dicklesworthstone/frankenterm/commit/94faa1660)), `caut` ([`151d689cc`](https://github.com/Dicklesworthstone/frankenterm/commit/151d689cc)), `retry` ([`f4fbb7d47`](https://github.com/Dicklesworthstone/frankenterm/commit/f4fbb7d47)), and `native_events` ([`bd0aa03d1`](https://github.com/Dicklesworthstone/frankenterm/commit/bd0aa03d1)).
+- **`timeout_with_cx` promoted to public API** ([`e4d6d62a0`](https://github.com/Dicklesworthstone/frankenterm/commit/e4d6d62a0)).
+- **`broadcast` + `oneshot` channels migrated** to asupersync wrappers ([`e4ecb4700`](https://github.com/Dicklesworthstone/frankenterm/commit/e4ecb4700), [`154267b28`](https://github.com/Dicklesworthstone/frankenterm/commit/154267b28)).
+- **Workspace crate defaults flipped** from `async-io`/`smol` to `async-asupersync` ([`4db7f7a62`](https://github.com/Dicklesworthstone/frankenterm/commit/4db7f7a62), [`1761e2a2d`](https://github.com/Dicklesworthstone/frankenterm/commit/1761e2a2d), [`7e6c334ff`](https://github.com/Dicklesworthstone/frankenterm/commit/7e6c334ff)).
+- **LabRuntime test substrate** — `LabRuntime` deterministic tests for `DirectMuxClient` (wa-p48pw, [`3efa3a39c`](https://github.com/Dicklesworthstone/frankenterm/commit/3efa3a39c)), LabRuntime port regression guard + time-dependent comparison bench (wa-22x4r, [`94677214c`](https://github.com/Dicklesworthstone/frankenterm/commit/94677214c)), LabRuntime observation-loop tests and criterion benches (wa-1m7nk, [`9a9ce8691`](https://github.com/Dicklesworthstone/frankenterm/commit/9a9ce8691)).
+- **Supported-path truth sweep closed** (ft-xbnl0.3.6) — final sweep with Rust SDK narrowed as the fully-supported envelope ([`302fcbf8e`](https://github.com/Dicklesworthstone/frankenterm/commit/302fcbf8e), [`8697fe0dd`](https://github.com/Dicklesworthstone/frankenterm/commit/8697fe0dd)).
+- **No-runtime-regression gate** (ft-xbnl0.2.6) — explicit gate so future imports of `tokio::*` fail the build ([`a72fb92ca`](https://github.com/Dicklesworthstone/frankenterm/commit/a72fb92ca)).
+- **ft-xbnl0 epic closed** — the goal-line epic for native asupersync + zero fake capabilities + verifiable mission completion is recorded as done in the beads ledger.
+
+### Sub-crate carving completed (2026-04-25 -- 2026-05-03, ft-y0loj.* + post-hdvvo)
+
+Layering enforced through extraction rather than discipline alone. `frankenterm-core` now has 19 sibling sub-crates plus three new utility/topology crates.
+
+- **Cluster extractions** — `frankenterm-core-ars` (ARS subsystem, ~14k LOC), `frankenterm-core-tantivy` (lexical search, ~16k LOC), `frankenterm-core-replay` (~25k LOC), `frankenterm-core-fleet` (partial, fleet dashboard), `frankenterm-core-connectors` (connector boundary), `frankenterm-core-mcp` (MCP type boundary).
+- **Leaf type crates** — `*-resource-types`, `*-error-types`, `*-config-types`, `*-policy-types`, `*-replay-types`, `*-telemetry-types`, `*-cass-types`, `*-caut-types`, `*-connector-types`, `*-audit-types`, `*-atlas-pack-types`, `*-x11-resize-types`.
+- **Test infrastructure crate** — `frankenterm-core-test-macros` exposes `#[lab_runtime_test]` and friends so the LabRuntime substrate isn't trapped inside `frankenterm-core`.
+- **Topology + perf gating** — new `frankenterm-topo`, `ft-perf-gate`, and `ft-test-log` workspace crates land for cross-cutting concerns that don't belong in `frankenterm-core`.
+- **Workspace tally** — `Cargo.toml` `members = [...]` now lists 77 workspace members (28 first-party FrankenTerm crates + 47 vendored `frankenterm/` crates + `fuzz` + `lints/cx_propagation`); the vendored count includes nested `derive` and `lua-api-crates/*` members.
+- **One-way edges** — no `frankenterm-core` → sub-crate edges; leaves declare zero first-party deps; cluster sub-crates depend on `frankenterm-core` only.
+
+### RCH worker health + admission (ongoing, ft-ilxky, ft-4tp7g)
+
+RCH (Remote Compilation Helper) hardening continues as a steady drumbeat of fixes; remote-build pressure is the most-blocking class of operator pain.
+
+- **RCH attestation hardening** (ft-ilxky.2) — worker mirror selection pinned on SHA-256 hash equality + e2e nounset propagation hardened ([`0d023d18a`](https://github.com/Dicklesworthstone/frankenterm/commit/0d023d18a)).
+- **Sync-check + attest selected worker** before guarded cargo ([`acc18de78`](https://github.com/Dicklesworthstone/frankenterm/commit/acc18de78), [`2fd9bce0a`](https://github.com/Dicklesworthstone/frankenterm/commit/2fd9bce0a)).
+- **RCH no-workers admission decomposed** (ft-4tp7g) — 5 blocked sub-beads spelling out exactly which admission predicates fail when no workers pass health ([`ed14598df`](https://github.com/Dicklesworthstone/frankenterm/commit/ed14598df)).
+- **rch dry-run summary** correctness fixes recorded as ongoing.
 
 ### Doctrine + reality-check (2026-05-01, ft-i2eni)
 
@@ -602,7 +688,14 @@ There are no GitHub Releases published for this repository.
 | 2026-03-13 | Transaction execution engine. Input-to-display latency framework. |
 | 2026-03-17 | Distributed checkpoint save/restore. Replay forensics with sensitivity tiers. |
 | 2026-03-20 | CASS export feature. 92+ proptest serde roundtrip suites. |
-| 2026-03-21 | HEAD. 3,969 commits. ~775k lines of code. 120 workspace crates. 45,000+ tests. |
+| 2026-04-11 | **v0.1.0** tagged. First feature-complete baseline. |
+| 2026-04-12 | Native asupersync cutover begins. tokio dual-runtime seams retired. |
+| 2026-04-25 | Sub-crate carving wave begins (ft-y0loj.*). `frankenterm-core` shedding leaves. |
+| 2026-05-01 | Doctrine epic closes (ft-i2eni): RuntimeProof sealed trait, asupersync_test! macro, cargo-deny tokio ban, vendored fork rename complete. |
+| 2026-05-02 | Substrate audit waves (rubber-stamp `is_safe`, public-field bypass, NaN/sanitization) sweep across the codebase. |
+| 2026-05-10 | Operating-envelope contract (ft-booek) + incident-bundle live collectors (ft-9sy9e family) land. |
+| 2026-05-12 | Reality-check round 2 (ft-tf6g3) opens — final-mile convergence: attestation graph, renderer SLO suite, round-3 statistical elevations. |
+| 2026-05-16 | HEAD. 10,156 total commits (8,271 since `backup-before-rewrite`). 77 workspace members (28 first-party + 47 vendored). 521 top-level core modules. ~1.01M LOC across the core. 952 core test files, 111 Criterion benches, 48 fuzz targets, 265 E2E shell scripts, 426 docs. |
 
 ---
 
