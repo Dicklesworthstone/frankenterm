@@ -158,6 +158,14 @@ pub trait TerminalSession {
     fn leave(&mut self);
 }
 
+fn publish_crash_session_markers(phase: SessionPhase, mode: Option<ScreenMode>) {
+    crate::crash::update_crash_terminal_session_markers(
+        format!("{phase:?}"),
+        mode.map(|screen_mode| format!("{screen_mode:?}"))
+            .unwrap_or_else(|| "None".to_string()),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SessionGuard — RAII teardown guarantee
 // ---------------------------------------------------------------------------
@@ -189,6 +197,7 @@ impl<S: TerminalSession> SessionGuard<S> {
     pub fn enter(mut session: S, mode: ScreenMode) -> Result<Self, SessionError> {
         session.enter(mode)?;
         super::output_gate::set_phase(super::output_gate::GatePhase::Active);
+        publish_crash_session_markers(session.phase(), session.screen_mode());
         Ok(Self {
             session: Some(session),
             left: false,
@@ -231,6 +240,7 @@ impl<S: TerminalSession> SessionGuard<S> {
             session.leave();
         }
         super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
+        publish_crash_session_markers(SessionPhase::Idle, None);
         self.left = true;
 
         let elapsed = started.elapsed();
@@ -347,6 +357,7 @@ impl TerminalSession for CrosstermSession {
                 self.terminal = Some(terminal);
                 self.mode = Some(mode);
                 self.phase = SessionPhase::Active;
+                publish_crash_session_markers(self.phase, self.mode);
                 Ok(())
             }
             Err(err) => {
@@ -431,6 +442,7 @@ impl TerminalSession for CrosstermSession {
         }
         self.phase = SessionPhase::Suspended;
         super::output_gate::set_phase(super::output_gate::GatePhase::Suspended);
+        publish_crash_session_markers(self.phase, self.mode);
         Ok(())
     }
 
@@ -451,6 +463,7 @@ impl TerminalSession for CrosstermSession {
         crossterm::terminal::enable_raw_mode()?;
         self.phase = SessionPhase::Active;
         super::output_gate::set_phase(super::output_gate::GatePhase::Active);
+        publish_crash_session_markers(self.phase, self.mode);
         Ok(())
     }
 
@@ -471,6 +484,7 @@ impl TerminalSession for CrosstermSession {
         self.mode = None;
         self.phase = SessionPhase::Idle;
         super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
+        publish_crash_session_markers(self.phase, self.mode);
     }
 }
 
@@ -525,6 +539,7 @@ impl TerminalSession for MockTerminalSession {
         }
         self.mode = Some(mode);
         self.phase = SessionPhase::Active;
+        publish_crash_session_markers(self.phase, self.mode);
         self.history.push("enter");
         Ok(())
     }
@@ -567,6 +582,7 @@ impl TerminalSession for MockTerminalSession {
             });
         }
         self.phase = SessionPhase::Suspended;
+        publish_crash_session_markers(self.phase, self.mode);
         self.history.push("suspend");
         Ok(())
     }
@@ -579,6 +595,7 @@ impl TerminalSession for MockTerminalSession {
             });
         }
         self.phase = SessionPhase::Active;
+        publish_crash_session_markers(self.phase, self.mode);
         self.history.push("resume");
         Ok(())
     }
@@ -588,6 +605,7 @@ impl TerminalSession for MockTerminalSession {
             self.history.push("leave");
             self.mode = None;
             self.phase = SessionPhase::Idle;
+            publish_crash_session_markers(self.phase, self.mode);
         }
     }
 }

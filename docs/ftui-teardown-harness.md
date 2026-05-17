@@ -113,21 +113,23 @@ Written to `.ft/crash/ft_crash_YYYYMMDD_HHMMSS/`:
 **Permissions:** 0o600 (owner-only read/write).
 **Atomicity:** Temp directory + rename (all-or-nothing on POSIX).
 
-### 4.2  Environment Markers (required — not yet implemented)
+### 4.2  Environment Markers
 
-The crash bundle should additionally capture:
+The crash bundle additionally writes `environment_markers.json` with:
 
 | Marker | Source | Purpose |
 |--------|--------|---------|
 | `gate_phase` | `output_gate::phase()` | Was TUI active at crash time? |
-| `session_phase` | `TerminalSession::phase()` | Which lifecycle state was active? |
-| `screen_mode` | `TerminalSession::screen_mode()` | AltScreen vs Inline at crash? |
+| `session_phase` | latest published `TerminalSession::phase()` | Which lifecycle state was active? |
+| `screen_mode` | latest published `TerminalSession::screen_mode()` | AltScreen vs Inline at crash? |
 | `feature_flags` | Compile-time cfg | tui vs ftui vs headless? |
 | `terminal_type` | `$TERM` / `$TERM_PROGRAM` | Terminal emulator identification |
 | `backpressure_tier` | Last known tier | Was system under load? |
 
 These markers allow fast triage: "crash during Active+AltScreen in tmux" vs
 "crash during Suspended in WezTerm" lead to very different investigations.
+The crash manifest records `has_environment_markers` so incident tooling can
+distinguish a missing marker file from an older bundle schema.
 
 ### 4.3  Recording Checkpoint (existing — crash.rs)
 

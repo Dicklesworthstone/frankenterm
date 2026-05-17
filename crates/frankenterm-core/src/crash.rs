@@ -11,6 +11,7 @@
 //! .ft/crash/ft_crash_YYYYMMDD_HHMMSS/
 //! ├── manifest.json        # Bundle metadata (version, timestamp, schema)
 //! ├── crash_report.json    # Panic details (message, location, backtrace)
+//! ├── environment_markers.json # Terminal/session crash triage markers
 //! └── health_snapshot.json # Last known HealthSnapshot (if available)
 //! ```
 
@@ -49,6 +50,11 @@ static GLOBAL_INCIDENT_PROOF_RCH_EVIDENCE: OnceLock<
 /// Latest read-only Agent Mail evidence supplied to incident bundles.
 static GLOBAL_INCIDENT_AGENT_MAIL: OnceLock<RwLock<Option<IncidentAgentMailSnapshot>>> =
     OnceLock::new();
+
+/// Latest TUI lifecycle markers published by terminal-session code.
+static GLOBAL_CRASH_TERMINAL_SESSION_MARKERS: OnceLock<
+    RwLock<Option<CrashTerminalSessionMarkers>>,
+> = OnceLock::new();
 
 // ============================================================================
 // br-ft-94cdu: crash-bundle parse-drop observability
@@ -321,6 +327,119 @@ pub struct HealthSnapshot {
     /// Leak-risk lifecycle inventory for retention debugging.
     #[serde(default)]
     pub leak_risk_inventory: LeakRiskInventorySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CrashTerminalSessionMarkers {
+    session_phase: String,
+    screen_mode: String,
+}
+
+/// Environment markers written to `environment_markers.json` in crash bundles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrashEnvironmentMarkers {
+    /// Current output-gate phase at crash-bundle write time.
+    pub gate_phase: String,
+    /// Last published TUI terminal-session phase.
+    pub session_phase: String,
+    /// Last published screen mode.
+    pub screen_mode: String,
+    /// Compile-time frontend/runtime flags relevant to TUI crash triage.
+    pub feature_flags: Vec<String>,
+    /// `$TERM` value, redacted before persistence.
+    pub terminal_type: String,
+    /// `$TERM_PROGRAM` value, redacted before persistence.
+    pub terminal_program: String,
+    /// Last known runtime backpressure tier.
+    pub backpressure_tier: String,
+}
+
+impl CrashEnvironmentMarkers {
+    fn capture(health: Option<&HealthSnapshot>) -> Self {
+        let session = crash_terminal_session_markers_global();
+        Self {
+            gate_phase: crash_output_gate_phase(),
+            session_phase: session
+                .as_ref()
+                .map(|markers| markers.session_phase.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            screen_mode: session
+                .as_ref()
+                .map(|markers| markers.screen_mode.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            feature_flags: crash_feature_flags(),
+            terminal_type: std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string()),
+            terminal_program: std::env::var("TERM_PROGRAM")
+                .unwrap_or_else(|_| "unknown".to_string()),
+            backpressure_tier: health
+                .and_then(|snapshot| snapshot.backpressure_tier.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+        }
+    }
+
+    fn redacted(&self, redactor: &Redactor) -> Self {
+        Self {
+            gate_phase: self.gate_phase.clone(),
+            session_phase: self.session_phase.clone(),
+            screen_mode: self.screen_mode.clone(),
+            feature_flags: self.feature_flags.clone(),
+            terminal_type: redactor.redact(&self.terminal_type),
+            terminal_program: redactor.redact(&self.terminal_program),
+            backpressure_tier: redactor.redact(&self.backpressure_tier),
+        }
+    }
+}
+
+fn crash_terminal_session_markers_global() -> Option<CrashTerminalSessionMarkers> {
+    let lock = GLOBAL_CRASH_TERMINAL_SESSION_MARKERS.get_or_init(|| RwLock::new(None));
+    lock.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Publish the current TUI terminal-session markers for future crash bundles.
+pub fn update_crash_terminal_session_markers(
+    session_phase: impl Into<String>,
+    screen_mode: impl Into<String>,
+) {
+    let lock = GLOBAL_CRASH_TERMINAL_SESSION_MARKERS.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(CrashTerminalSessionMarkers {
+            session_phase: session_phase.into(),
+            screen_mode: screen_mode.into(),
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_crash_terminal_session_markers_for_test() {
+    let lock = GLOBAL_CRASH_TERMINAL_SESSION_MARKERS.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = None;
+    }
+}
+
+fn crash_feature_flags() -> Vec<String> {
+    let mut flags = Vec::new();
+    if cfg!(feature = "tui") {
+        flags.push("tui".to_string());
+    }
+    if cfg!(feature = "ftui") {
+        flags.push("ftui".to_string());
+    }
+    if flags.is_empty() {
+        flags.push("headless".to_string());
+    }
+    flags
+}
+
+fn crash_output_gate_phase() -> String {
+    #[cfg(any(feature = "tui", feature = "ftui"))]
+    {
+        format!("{:?}", crate::tui::output_gate::phase())
+    }
+    #[cfg(not(any(feature = "tui", feature = "ftui")))]
+    {
+        "unavailable".to_string()
+    }
 }
 
 /// Text-free pane inventory supplied to the incident-bundle robot_state source.
@@ -1193,6 +1312,9 @@ pub struct CrashManifest {
     /// Whether resize/reflow crash forensics were available
     #[serde(default)]
     pub has_resize_forensics: bool,
+    /// Whether environment markers were written.
+    #[serde(default)]
+    pub has_environment_markers: bool,
     /// Total bundle size in bytes
     pub bundle_size_bytes: u64,
 }
@@ -1372,6 +1494,13 @@ pub fn write_crash_bundle(
         false
     };
 
+    // 2c. Write environment_markers.json.
+    let has_environment_markers = {
+        let markers = CrashEnvironmentMarkers::capture(health).redacted(&redactor);
+        let json = serde_json::to_string_pretty(&markers).map_err(std::io::Error::other)?;
+        maybe_write_bounded("environment_markers.json", json.as_bytes())?
+    };
+
     // 3. Write manifest.json
     {
         let manifest = CrashManifest {
@@ -1380,6 +1509,7 @@ pub fn write_crash_bundle(
             files: files.clone(),
             has_health_snapshot: has_health,
             has_resize_forensics,
+            has_environment_markers,
             bundle_size_bytes: total_size,
         };
         let json = serde_json::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
@@ -7496,6 +7626,7 @@ mod tests {
             files: vec!["crash_report.json".to_string()],
             has_health_snapshot: false,
             has_resize_forensics: false,
+            has_environment_markers: false,
             bundle_size_bytes: 1024,
         };
 
@@ -7529,6 +7660,7 @@ mod tests {
         assert!(bundle_path.exists());
         assert!(bundle_path.join("manifest.json").exists());
         assert!(bundle_path.join("crash_report.json").exists());
+        assert!(bundle_path.join("environment_markers.json").exists());
         assert!(bundle_path.join("health_snapshot.json").exists());
     }
 
@@ -7550,13 +7682,15 @@ mod tests {
 
         assert!(bundle_path.join("manifest.json").exists());
         assert!(bundle_path.join("crash_report.json").exists());
+        assert!(bundle_path.join("environment_markers.json").exists());
         assert!(!bundle_path.join("health_snapshot.json").exists());
 
         // Verify manifest records no health snapshot
         let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
         assert!(!manifest.has_health_snapshot);
-        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.has_environment_markers);
+        assert_eq!(manifest.files.len(), 2);
     }
 
     #[test]
@@ -7788,6 +7922,36 @@ mod tests {
     }
 
     #[test]
+    fn write_crash_bundle_environment_markers_include_ftui_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let mut health = test_snapshot();
+        health.backpressure_tier = Some("Yellow".to_string());
+        clear_crash_terminal_session_markers_for_test();
+        update_crash_terminal_session_markers("Suspended", "Inline { ui_height: 12 }");
+
+        let bundle_path = write_crash_bundle(&crash_dir, &test_report(), Some(&health), None)
+            .expect("write crash bundle");
+
+        let markers_json =
+            fs::read_to_string(bundle_path.join("environment_markers.json")).unwrap();
+        let markers: CrashEnvironmentMarkers = serde_json::from_str(&markers_json).unwrap();
+        assert!(!markers.session_phase.is_empty());
+        assert!(!markers.screen_mode.is_empty());
+        assert_eq!(markers.backpressure_tier, "Yellow");
+        assert!(!markers.feature_flags.is_empty());
+
+        let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
+        let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
+        assert!(manifest.has_environment_markers);
+        assert!(
+            manifest
+                .files
+                .contains(&"environment_markers.json".to_string())
+        );
+    }
+
+    #[test]
     fn write_crash_bundle_size_budget_skips_oversized_files() {
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
@@ -7854,8 +8018,14 @@ mod tests {
                 .files
                 .contains(&"resize_forensics.json".to_string())
         );
+        assert!(
+            manifest
+                .files
+                .contains(&"environment_markers.json".to_string())
+        );
         assert!(!manifest.has_health_snapshot);
         assert!(manifest.has_resize_forensics);
+        assert!(manifest.has_environment_markers);
 
         let actual_bytes: u64 = manifest
             .files
@@ -7887,10 +8057,16 @@ mod tests {
         let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
 
-        assert_eq!(manifest.files.len(), 2);
+        assert_eq!(manifest.files.len(), 3);
         assert!(manifest.files.contains(&"crash_report.json".to_string()));
         assert!(manifest.files.contains(&"health_snapshot.json".to_string()));
+        assert!(
+            manifest
+                .files
+                .contains(&"environment_markers.json".to_string())
+        );
         assert!(manifest.has_health_snapshot);
+        assert!(manifest.has_environment_markers);
         assert!(manifest.bundle_size_bytes > 0);
         assert!(manifest.bundle_size_bytes < MAX_BUNDLE_SIZE as u64);
     }
@@ -10095,6 +10271,7 @@ not-json
             ],
             has_health_snapshot: true,
             has_resize_forensics: true,
+            has_environment_markers: false,
             bundle_size_bytes: 4096,
         };
         let json = serde_json::to_string(&manifest).unwrap();
@@ -10115,6 +10292,7 @@ not-json
         }"#;
         let parsed: CrashManifest = serde_json::from_str(json).unwrap();
         assert!(!parsed.has_resize_forensics); // defaults to false
+        assert!(!parsed.has_environment_markers); // defaults to false
     }
 }
 
@@ -10576,6 +10754,7 @@ mod e2e_crash_recovery {
             files: vec!["crash_report.json".to_string()],
             has_health_snapshot: false,
             has_resize_forensics: false,
+            has_environment_markers: false,
             bundle_size_bytes: 0,
         };
         std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
