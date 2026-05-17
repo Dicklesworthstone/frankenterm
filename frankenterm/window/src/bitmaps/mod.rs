@@ -1,7 +1,7 @@
 use crate::color::{LinearRgba, SrgbaPixel};
 use crate::{Point, Rect, Size};
 use anyhow::{anyhow, ensure};
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use glium::texture::SrgbTexture2d;
 use std::cell::RefCell;
 
@@ -11,6 +11,48 @@ pub struct TextureUnit;
 pub type TextureCoord = euclid::Point2D<f32, TextureUnit>;
 pub type TextureRect = euclid::Rect<f32, TextureUnit>;
 pub type TextureSize = euclid::Size2D<f32, TextureUnit>;
+
+fn checked_pixel_count(width: usize, height: usize) -> usize {
+    width
+        .checked_mul(height)
+        .expect("image dimensions overflow pixel count")
+}
+
+fn checked_bgra32_len(width: usize, height: usize) -> usize {
+    checked_pixel_count(width, height)
+        .checked_mul(4)
+        .expect("image dimensions overflow bgra32 byte length")
+}
+
+fn checked_bgra32_offset(width: usize, x: usize, y: usize) -> usize {
+    y.checked_mul(width)
+        .and_then(|row| row.checked_add(x))
+        .and_then(|pixel| pixel.checked_mul(4))
+        .expect("image pixel offset overflow")
+}
+
+fn assert_pixel_in_bounds(width: usize, height: usize, x: usize, y: usize) {
+    assert!(
+        x < width && y < height,
+        "x={} width={} y={} height={}",
+        x,
+        width,
+        y,
+        height
+    );
+}
+
+fn assert_horizontal_range_in_bounds(width: usize, height: usize, x1: usize, x2: usize, y: usize) {
+    assert!(
+        x1 <= x2 && x2 <= width && y < height,
+        "x1={} x2={} width={} y={} height={}",
+        x1,
+        x2,
+        width,
+        y,
+        height
+    );
+}
 
 /// Represents a big endian bgra32 bitmap that may not be present
 /// in local RAM, but may be addressable in eg: video RAM
@@ -217,9 +259,10 @@ pub trait BitmapImage {
 
     fn pixel_data_slice(&self) -> &[u8] {
         let (width, height) = self.image_dimensions();
+        let len = checked_bgra32_len(width, height);
         unsafe {
             let first = self.pixel_data();
-            std::slice::from_raw_parts(first, width * height * 4)
+            std::slice::from_raw_parts(first, len)
         }
     }
 
@@ -229,19 +272,21 @@ pub trait BitmapImage {
             "BitmapImage::pixel_data_slice_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
         );
         let (width, height) = self.image_dimensions();
+        let len = checked_bgra32_len(width, height);
         unsafe {
             let first = self.pixel_data_mut();
-            std::slice::from_raw_parts_mut(first, width * height * 4)
+            std::slice::from_raw_parts_mut(first, len)
         }
     }
 
     #[inline]
     fn pixels(&self) -> &[u32] {
         let (width, height) = self.image_dimensions();
+        let len = checked_pixel_count(width, height);
         unsafe {
             #[allow(clippy::cast_ptr_alignment)]
             let first = self.pixel_data() as *const u32;
-            std::slice::from_raw_parts(first, width * height)
+            std::slice::from_raw_parts(first, len)
         }
     }
 
@@ -252,10 +297,11 @@ pub trait BitmapImage {
             "BitmapImage::pixels_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
         );
         let (width, height) = self.image_dimensions();
+        let len = checked_pixel_count(width, height);
         unsafe {
             #[allow(clippy::cast_ptr_alignment)]
             let first = self.pixel_data_mut() as *mut u32;
-            std::slice::from_raw_parts_mut(first, width * height)
+            std::slice::from_raw_parts_mut(first, len)
         }
     }
 
@@ -267,16 +313,9 @@ pub trait BitmapImage {
             "BitmapImage::pixel_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
         );
         let (width, height) = self.image_dimensions();
-        debug_assert!(
-            x < width && y < height,
-            "x={} width={} y={} height={}",
-            x,
-            width,
-            y,
-            height
-        );
+        assert_pixel_in_bounds(width, height, x, y);
         unsafe {
-            let offset = (y * width * 4) + (x * 4);
+            let offset = checked_bgra32_offset(width, x, y);
             #[allow(clippy::cast_ptr_alignment)]
             &mut *(self.pixel_data_mut().add(offset) as *mut u32)
         }
@@ -286,9 +325,9 @@ pub trait BitmapImage {
     /// Read the raw bgra pixel at the specified coordinates
     fn pixel(&self, x: usize, y: usize) -> &u32 {
         let (width, height) = self.image_dimensions();
-        debug_assert!(x < width && y < height);
+        assert_pixel_in_bounds(width, height, x, y);
         unsafe {
-            let offset = (y * width * 4) + (x * 4);
+            let offset = checked_bgra32_offset(width, x, y);
             #[allow(clippy::cast_ptr_alignment)]
             &*(self.pixel_data().add(offset) as *const u32)
         }
@@ -296,12 +335,30 @@ pub trait BitmapImage {
 
     #[inline]
     fn horizontal_pixel_range(&self, x1: usize, x2: usize, y: usize) -> &[u32] {
-        unsafe { std::slice::from_raw_parts(self.pixel(x1, y), x2 - x1) }
+        let (width, height) = self.image_dimensions();
+        assert_horizontal_range_in_bounds(width, height, x1, x2, y);
+        let offset = checked_bgra32_offset(width, x1, y);
+        unsafe {
+            #[allow(clippy::cast_ptr_alignment)]
+            let first = self.pixel_data().add(offset) as *const u32;
+            std::slice::from_raw_parts(first, x2 - x1)
+        }
     }
 
     #[inline]
     fn horizontal_pixel_range_mut(&mut self, x1: usize, x2: usize, y: usize) -> &mut [u32] {
-        unsafe { std::slice::from_raw_parts_mut(self.pixel_mut(x1, y), x2 - x1) }
+        assert!(
+            self.is_mutable(),
+            "BitmapImage::horizontal_pixel_range_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
+        );
+        let (width, height) = self.image_dimensions();
+        assert_horizontal_range_in_bounds(width, height, x1, x2, y);
+        let offset = checked_bgra32_offset(width, x1, y);
+        unsafe {
+            #[allow(clippy::cast_ptr_alignment)]
+            let first = self.pixel_data_mut().add(offset) as *mut u32;
+            std::slice::from_raw_parts_mut(first, x2 - x1)
+        }
     }
 
     /// Clear the entire image to the specific color
@@ -465,9 +522,8 @@ impl Image {
     /// Create a new bgra32 image buffer with the specified dimensions.
     /// The buffer is initialized to all zeroes.
     pub fn new(width: usize, height: usize) -> Image {
-        let size = height * width * 4;
-        let mut data = vec![0; size];
-        data.resize(size, 0);
+        let size = checked_bgra32_len(width, height);
+        let data = vec![0; size];
         Image {
             data,
             width,
@@ -476,6 +532,12 @@ impl Image {
     }
 
     pub fn from_raw(width: usize, height: usize, data: Vec<u8>) -> Self {
+        let expected_len = checked_bgra32_len(width, height);
+        assert_eq!(
+            data.len(),
+            expected_len,
+            "raw bgra32 image buffer length does not match dimensions"
+        );
         Self {
             data,
             width,
@@ -486,10 +548,32 @@ impl Image {
     /// Create a new bgra32 image buffer with the specified dimensions.
     /// The buffer is populated with the source data in rgba32 format.
     pub fn with_rgba32(width: usize, height: usize, stride: usize, data: &[u8]) -> Image {
+        let row_bytes = width
+            .checked_mul(4)
+            .expect("rgba32 row byte length overflows usize");
+        assert!(
+            stride >= row_bytes,
+            "rgba32 stride is smaller than row byte length"
+        );
+        let required_len = if height == 0 || row_bytes == 0 {
+            0
+        } else {
+            (height - 1)
+                .checked_mul(stride)
+                .and_then(|last_row| last_row.checked_add(row_bytes))
+                .expect("rgba32 source dimensions overflow byte length")
+        };
+        assert!(
+            data.len() >= required_len,
+            "rgba32 source buffer is smaller than dimensions require"
+        );
+
         let mut image = Image::new(width, height);
         for y in 0..height {
-            let src_offset = y * stride;
-            let dest_offset = y * width * 4;
+            let src_offset = y
+                .checked_mul(stride)
+                .expect("rgba32 source stride offset overflow");
+            let dest_offset = checked_bgra32_offset(width, 0, y);
             #[allow(clippy::identity_op)]
             for x in 0..width {
                 let red = data[src_offset + (x * 4) + 0];
@@ -508,8 +592,10 @@ impl Image {
     /// Creates a new image with the contents of the current image, but
     /// resized to the specified dimensions.
     pub fn resize(&self, width: usize, height: usize) -> Image {
+        let target_pixels = checked_pixel_count(width, height);
+        let source_pixels = checked_pixel_count(self.width, self.height);
         let mut dest = Image::new(width, height);
-        let algo = if (width * height) < (self.width * self.height) {
+        let algo = if target_pixels < source_pixels {
             resize::Type::Lanczos3
         } else {
             resize::Type::Mitchell
@@ -603,8 +689,8 @@ impl Texture2d for ImageTexture {
 #[cfg(test)]
 mod tests {
     use super::{
-        unsupported_texture_readback_error, validate_texture_readback_request, BitmapImage, Image,
-        ImageTexture, Texture2d,
+        BitmapImage, Image, ImageTexture, Texture2d, unsupported_texture_readback_error,
+        validate_texture_readback_request,
     };
     use crate::{Point, Rect, Size};
 
@@ -641,24 +727,82 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "image dimensions overflow bgra32 byte length")]
+    fn image_new_rejects_overflowing_dimensions() {
+        let _ = Image::new(usize::MAX, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "raw bgra32 image buffer length does not match dimensions")]
+    fn image_from_raw_rejects_wrong_buffer_length() {
+        let _ = Image::from_raw(2, 2, vec![0; 12]);
+    }
+
+    #[test]
+    #[should_panic(expected = "rgba32 stride is smaller than row byte length")]
+    fn image_with_rgba32_rejects_short_stride() {
+        let _ = Image::with_rgba32(2, 1, 4, &[0; 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "rgba32 source buffer is smaller than dimensions require")]
+    fn image_with_rgba32_rejects_short_source_buffer() {
+        let _ = Image::with_rgba32(2, 2, 8, &[0; 8]);
+    }
+
+    #[test]
+    fn image_with_rgba32_allows_zero_width_without_source_rows() {
+        let image = Image::with_rgba32(0, 2, 16, &[]);
+        assert_eq!(image.image_dimensions(), (0, 2));
+        assert!(image.pixel_data_slice().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "x=1 width=1 y=0 height=1")]
+    fn image_pixel_mut_rejects_out_of_bounds_coordinates() {
+        let mut image = Image::new(1, 1);
+        let _ = image.pixel_mut(1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "x=0 width=1 y=1 height=1")]
+    fn image_pixel_rejects_out_of_bounds_coordinates() {
+        let image = Image::new(1, 1);
+        let _ = image.pixel(0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "x1=0 x2=2 width=1 y=0 height=1")]
+    fn image_horizontal_pixel_range_rejects_out_of_bounds_end() {
+        let image = Image::new(1, 1);
+        let _ = image.horizontal_pixel_range(0, 2, 0);
+    }
+
+    #[test]
     fn readonly_bitmap_mut_helpers_panic_before_mut_ptr_access() {
         let mut bytes = ReadOnlyBitmap { pixel: [0; 4] };
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = bytes.pixel_data_slice_mut();
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = bytes.pixel_data_slice_mut();
+            }))
+            .is_err()
+        );
 
         let mut pixels = ReadOnlyBitmap { pixel: [0; 4] };
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = pixels.pixels_mut();
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = pixels.pixels_mut();
+            }))
+            .is_err()
+        );
 
         let mut one_pixel = ReadOnlyBitmap { pixel: [0; 4] };
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = one_pixel.pixel_mut(0, 0);
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = one_pixel.pixel_mut(0, 0);
+            }))
+            .is_err()
+        );
     }
 
     #[test]
