@@ -255,7 +255,7 @@
       {
         "slo_id": "RQ-S13.ssim_parity_oracle_corpus",
         "status": "retained_run_validated",
-        "proof_ledger_path": "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.proof-ledger.jsonl",
+        "proof_ledger_path": "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.proof-ledger.jsonl",
         "proof_ledger_sha256": "00fab2a7344e2710e6733cb8a0f39e6638c42c100ad8ffcdf4bf667e0b9f9a50",
         "source_artifact_path": "crates/frankenterm-gui/tests/ssim_parity.rs",
         "source_artifact_sha256": "8a67f9eb199cac90813d159adb5b3745176d06ad41e2eba5b0d75e839b062234",
@@ -284,7 +284,7 @@
     "docs/attestations/perf/lindley-bounds.json",
     "docs/attestations/tui/render-parity-gpu.json",
     "docs/attestations/tui/topology-parity.json",
-    "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.proof-ledger.jsonl",
+    "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.proof-ledger.jsonl",
     "docs/attestations/tui/atlas-stability-rq-s10-20260516T073720Z.jsonl",
     "crates/frankenterm-core/benches/atlas_stability.rs",
     "crates/frankenterm-core/src/tui_parity_oracle.rs",
