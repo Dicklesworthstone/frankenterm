@@ -1,6 +1,6 @@
 use crate::scripting::guiwin::GuiWin;
-use chrono::prelude::*;
 use flume::{Receiver, bounded};
+use frankenterm_gui::gui_debug_log::{self, GuiDebugLogEntry};
 use futures::FutureExt;
 use luahelper::ValuePrinter;
 use mlua::Value;
@@ -9,13 +9,15 @@ use promise::spawn::block_on;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use termwiz::cell::{AttributeChange, CellAttributes, Intensity};
+use termwiz::color::AnsiColor;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent};
 use termwiz::lineedit::*;
 use termwiz::surface::Change;
 use termwiz::terminal::Terminal;
 
 lazy_static::lazy_static! {
-    static ref LATEST_LOG_ENTRY: Mutex<Option<DateTime<Local>>> = Mutex::new(None);
+    static ref LATEST_LOG_ENTRY: Mutex<Option<u64>> = Mutex::new(None);
 }
 
 struct LuaReplHost {
@@ -154,11 +156,59 @@ pub fn show_debug_overlay(
 
     term.render(&[Change::Title("Debug".to_string())])?;
 
+    fn print_empty_log_status(term: &mut TermWizTerminal) -> termwiz::Result<()> {
+        term.render(&[
+            Change::AllAttributes(CellAttributes::default()),
+            Change::Text("Debug log stream ready; no entries captured yet\r\n".to_string()),
+        ])
+    }
+
+    fn log_level_color(level: log::Level) -> AnsiColor {
+        match level {
+            log::Level::Error => AnsiColor::Maroon,
+            log::Level::Warn => AnsiColor::Red,
+            log::Level::Info => AnsiColor::Green,
+            log::Level::Debug => AnsiColor::Blue,
+            log::Level::Trace => AnsiColor::Fuchsia,
+        }
+    }
+
+    fn render_log_entry(changes: &mut Vec<Change>, entry: &GuiDebugLogEntry) {
+        changes.push(Change::AllAttributes(CellAttributes::default()));
+        changes.push(Change::Text(entry.then.format("%H:%M:%S%.3f ").to_string()));
+        changes.push(AttributeChange::Foreground(log_level_color(entry.level).into()).into());
+        changes.push(Change::Text(entry.level.as_str().to_string()));
+        changes.push(Change::AllAttributes(CellAttributes::default()));
+        changes.push(AttributeChange::Intensity(Intensity::Bold).into());
+        changes.push(Change::Text(format!(" {}", entry.target)));
+        changes.push(Change::AllAttributes(CellAttributes::default()));
+        changes.push(Change::Text(format!(
+            " > {}\r\n",
+            entry.message.replace('\n', "\r\n")
+        )));
+    }
+
     fn print_new_log_entries(term: &mut TermWizTerminal) -> termwiz::Result<()> {
-        // env_bootstrap::ringlog not available (Lua deps not vendored).
-        // Debug overlay log entries deferred to ft-1memj.8.
-        let _ = term;
-        Ok(())
+        let latest_sequence = *LATEST_LOG_ENTRY.lock().unwrap();
+        let entries = gui_debug_log::entries_after(latest_sequence);
+
+        if entries.is_empty() {
+            let mut latest = LATEST_LOG_ENTRY.lock().unwrap();
+            if latest.is_none() {
+                *latest = Some(0);
+                return print_empty_log_status(term);
+            }
+            return Ok(());
+        }
+
+        let mut changes = Vec::new();
+        for entry in &entries {
+            render_log_entry(&mut changes, entry);
+        }
+        if let Some(entry) = entries.last() {
+            LATEST_LOG_ENTRY.lock().unwrap().replace(entry.sequence);
+        }
+        term.render(&changes)
     }
 
     let version = config::wezterm_version();

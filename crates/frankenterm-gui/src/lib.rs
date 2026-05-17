@@ -17,6 +17,102 @@ pub mod smart_selection_a11y;
 pub mod status_bar;
 pub mod triple_buffer_gui;
 
+pub mod gui_debug_log {
+    use chrono::{DateTime, Local};
+    use log::Level;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const CAPACITY: usize = 256;
+
+    #[derive(Debug, Clone)]
+    pub struct GuiDebugLogEntry {
+        pub sequence: u64,
+        pub then: DateTime<Local>,
+        pub level: Level,
+        pub target: String,
+        pub message: String,
+    }
+
+    static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    lazy_static::lazy_static! {
+        static ref ENTRIES: Mutex<VecDeque<GuiDebugLogEntry>> =
+            Mutex::new(VecDeque::with_capacity(CAPACITY));
+    }
+
+    pub fn record(level: Level, target: impl Into<String>, message: impl Into<String>) -> u64 {
+        let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let entry = GuiDebugLogEntry {
+            sequence,
+            then: Local::now(),
+            level,
+            target: target.into(),
+            message: message.into(),
+        };
+
+        let mut entries = ENTRIES.lock().unwrap();
+        if entries.len() == CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+        sequence
+    }
+
+    pub fn entries_after(sequence: Option<u64>) -> Vec<GuiDebugLogEntry> {
+        let min_sequence = sequence.unwrap_or(0);
+        ENTRIES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.sequence > min_sequence)
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn reset_for_tests() {
+        NEXT_SEQUENCE.store(1, Ordering::Relaxed);
+        ENTRIES.lock().unwrap().clear();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn entries_after_filters_by_sequence() {
+            reset_for_tests();
+
+            let first = record(Level::Info, "test", "first");
+            let second = record(Level::Warn, "test", "second");
+
+            let entries = entries_after(Some(first));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].sequence, second);
+            assert_eq!(entries[0].message, "second");
+        }
+
+        #[test]
+        fn entries_are_bounded_to_recent_capacity() {
+            reset_for_tests();
+
+            for index in 0..(CAPACITY + 4) {
+                record(Level::Info, "test", format!("entry-{index}"));
+            }
+
+            let entries = entries_after(None);
+            assert_eq!(entries.len(), CAPACITY);
+            assert_eq!(entries[0].message, "entry-4");
+            assert_eq!(
+                entries[CAPACITY - 1].message,
+                format!("entry-{}", CAPACITY + 3)
+            );
+        }
+    }
+}
+
 #[cfg(any(feature = "debug-cell-crc", test))]
 pub mod cell_crc;
 

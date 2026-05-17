@@ -545,11 +545,91 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Lua scripting deferred to ft-1memj.8
-async fn trigger_and_log_gui_startup(_spawn_command: Option<SpawnCommand>) {}
+async fn trigger_gui_startup(
+    lua: Option<Rc<mlua::Lua>>,
+    spawn: Option<SpawnCommand>,
+) -> anyhow::Result<bool> {
+    let Some(lua) = lua else {
+        return Ok(false);
+    };
 
-// Lua scripting deferred to ft-1memj.8
-async fn trigger_and_log_gui_attached(_domain: MuxDomain) {}
+    let args = lua.pack_multi(spawn)?;
+    config::lua::emit_event(&lua, ("gui-startup".to_string(), args)).await?;
+    Ok(true)
+}
+
+async fn trigger_and_log_gui_startup(spawn_command: Option<SpawnCommand>) {
+    let result =
+        config::with_lua_config_on_main_thread(move |lua| trigger_gui_startup(lua, spawn_command))
+            .await;
+    log_gui_hook_result("gui-startup", result);
+}
+
+async fn trigger_gui_attached(
+    lua: Option<Rc<mlua::Lua>>,
+    domain: MuxDomain,
+) -> anyhow::Result<bool> {
+    let Some(lua) = lua else {
+        return Ok(false);
+    };
+
+    let args = lua.pack_multi(domain)?;
+    config::lua::emit_event(&lua, ("gui-attached".to_string(), args)).await?;
+    Ok(true)
+}
+
+async fn trigger_and_log_gui_attached(domain: MuxDomain) {
+    let result =
+        config::with_lua_config_on_main_thread(move |lua| trigger_gui_attached(lua, domain)).await;
+    log_gui_hook_result("gui-attached", result);
+}
+
+fn log_gui_hook_result(event_name: &str, result: anyhow::Result<bool>) {
+    match result {
+        Ok(true) => {
+            let message = format!("{event_name} Lua event emitted");
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Info,
+                "frankenterm_gui::lua",
+                message.clone(),
+            );
+            log::debug!("{message}");
+        }
+        Ok(false) => {
+            let message = format!("{event_name} Lua event unavailable: no Lua config is loaded");
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Warn,
+                "frankenterm_gui::lua",
+                message.clone(),
+            );
+            log::warn!("{message}");
+        }
+        Err(err) => {
+            let message = format!("while processing {event_name} event: {err:#}");
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Error,
+                "frankenterm_gui::lua",
+                message.clone(),
+            );
+            log::error!("{message}");
+            persistent_toast_notification("Error", &message);
+        }
+    }
+}
+
+fn register_gui_lua_modules() {
+    let setup_funcs: [config::lua::SetupFunc; 5] = [
+        termwiz_funcs::register,
+        mux_lua::register,
+        url_funcs::register,
+        scripting::register,
+        stats::register,
+    ];
+
+    for setup in setup_funcs {
+        config::lua::add_context_setup_func(setup);
+    }
+}
 
 fn cell_pixel_dims(config: &ConfigHandle, dpi: f64) -> anyhow::Result<(usize, usize)> {
     let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi as usize)?);
@@ -1465,9 +1545,7 @@ fn run() -> anyhow::Result<()> {
     // Inline bootstrap (env_bootstrap has too many Lua deps).
     // Sets version info, executable env vars, locale, cleans env.
     frankenterm_bootstrap();
-    // Lua function registration deferred to ft-1memj.8.
-    // Legacy: env_bootstrap registered all Lua modules here,
-    // plus window_funcs, scripting, and stats.
+    register_gui_lua_modules();
 
     stats::Stats::init()?;
     let _saver = umask::UmaskSaver::new();
