@@ -17,7 +17,7 @@ allowed/forbidden paths, negative examples, and validation evidence hooks.
 | R1 Exclusive write ownership | `output_gate.rs` `OutputGate` | Atomic phase gate; `TuiAwareWriter` checks before stderr writes |
 | R2 Log routing | `output_gate.rs` `TuiAwareWriter` | tracing subscriber wraps stderr with gate check |
 | R3 Command handoff | `command_handoff.rs` `execute()` | `TerminalSession::suspend()`/`resume()` lifecycle |
-| R4 Inline-mode | Not yet implemented | Future: ftui inline Program variant |
+| R4 Inline-mode | `terminal_session.rs` + `ftui_compat.rs`; output gate gap tracked by `ft-9xube` | `ScreenMode::Inline` / `InlineAuto` lifecycle exists; region-scoped gate enforcement remains blocked on RCH proof (`ft-4tp7g`) |
 | R5 Panic safety | `terminal_session.rs` `SessionGuard` | RAII drop calls `leave()`; `crash.rs` checks gate before panic output |
 
 ### Process Boundary: Who Owns What
@@ -105,19 +105,24 @@ user stuck at a raw terminal.
 **Validation:** `command_handoff.rs` tests verify suspend/resume lifecycle including
 error paths.
 
-### Inline Mode (Future)
+### Inline Mode
 
 **Risk:** Inline mode scopes ownership to a render region, not the full terminal.
 Output above the region may interleave with scrollback from other processes.
 
-**Mitigation (planned):**
+**Remaining mitigation:**
 1. ftui's inline Program variant manages region boundaries
-2. Output gate gains a fourth state: `InlineActive` with region-scoped enforcement
+2. Output gate gains a fourth state or equivalent typed ownership model:
+   `InlineActive` with region-scoped enforcement
 3. Writes outside the region are permitted (scrollback area)
 4. Writes inside the region without ownership are forbidden
 
-**Current status:** Not implemented.  The `ScreenMode::Inline` variant exists in
-`terminal_session.rs` but is not yet wired to ftui.  Tracked by FTUI-08 milestone.
+**Current status:** Partially wired.  `ScreenMode::Inline` exists in
+`terminal_session.rs`, and `ScreenMode::InlineAuto` compatibility is covered in
+`ftui_compat.rs`.  The live output gate still models only `Inactive`, `Active`,
+and `Suspended`, so region-scoped inline ownership is not enforced yet.  The
+remaining implementation and PTY/golden proof are tracked by `ft-9xube`; the
+remote-required proof lane is blocked by `ft-4tp7g`.
 
 ## Required Evidence Fields
 
@@ -128,7 +133,7 @@ Each rule must be validated by at least one of:
 | R1 | Unit test: gate blocks writes during Active | `output_gate.rs` tests |
 | R2 | Unit test: TuiAwareWriter suppresses during Active | `output_gate.rs` tests |
 | R3 | Unit test: suspend/resume lifecycle | `command_handoff.rs` tests |
-| R4 | PTY E2E: inline mode scrollback integrity | Future: FTUI-08 |
+| R4 | PTY E2E: inline mode scrollback integrity | `ft-9xube` |
 | R5 | Unit test: SessionGuard drop calls leave() | `terminal_session.rs` tests |
 | R5 | Unit test: panic hook writes crash bundle | `crash.rs` tests |
 
