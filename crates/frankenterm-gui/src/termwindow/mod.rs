@@ -51,7 +51,9 @@ use frankenterm_gui::accessibility_preferences::config_with_accessibility_palett
 use frankenterm_gui::floating_panes::{
     GuiFloatingPaneController, emit_floating_pane_a11y_messages,
 };
-use frankenterm_gui::triple_buffer_gui::TerminalStateTripleBufferRegistry;
+use frankenterm_gui::triple_buffer_gui::{
+    GuiTripleBufferPollReport, TerminalStateTripleBufferRegistry,
+};
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
@@ -75,7 +77,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
@@ -767,6 +769,32 @@ pub fn pane_health_snapshot_from_watchdoged_health(
     }
 }
 
+fn unix_epoch_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+pub(crate) fn poll_terminal_state_buffer_health_snapshots(
+    panes: &mut TerminalStateTripleBufferRegistry,
+    health: &mut HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
+    now: Instant,
+    now_ms: u64,
+    alert_policy: frankenterm_core::triple_buffer_fleet_health::ConsecutiveRecyclePolicy,
+) -> Vec<GuiTripleBufferPollReport> {
+    health.retain(|pane_id, _| panes.contains(*pane_id));
+
+    let reports = panes
+        .panes_mut()
+        .map(|pane| pane.poll(now, now_ms, alert_policy))
+        .collect::<Vec<_>>();
+    for report in &reports {
+        health.insert(report.pane_id, report.snapshot);
+    }
+    reports
+}
+
 /// Snapshot of the workspace-wide ElasticBuffer policy state. Read
 /// via `TermWindow::elastic_buffer_telemetry()` and consumed by `ft doctor`.
 /// Capacity and used counters come from the live `RenderState`
@@ -927,16 +955,15 @@ pub struct TermWindow {
     /// for ft-doctor's lines-redrawn-by-source breakdown.
     dirty_marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource,
     /// Per-pane `TerminalState` triple-buffer owners. The render
-    /// path publishes the current visible pane state here; the
-    /// ft-r9kr6 follow-up can poll these live owners into the
-    /// doctor-facing health snapshots without inventing a second
-    /// registry.
+    /// path publishes the current visible pane state here; the status
+    /// tick polls these live owners into doctor-facing health snapshots
+    /// without inventing a second registry.
     triple_buffer_panes: TerminalStateTripleBufferRegistry,
     /// Per-pane WatchdogedTripleBuffer health snapshots
     /// (ft-gso6n / ft-l0oe3 slice). `triple_buffer_telemetry()`
-    /// aggregates these into the substrate's FleetHealthAggregate.
-    /// The ft-r9kr6 follow-up owns the status-tick poll from the
-    /// live owners above into this map.
+    /// aggregates these into the substrate's FleetHealthAggregate. The
+    /// status-tick poll refreshes this map from `triple_buffer_panes`
+    /// and prunes snapshots for panes that no longer have live owners.
     triple_buffer_pane_health:
         HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
     /// DEC 2026 Begin-Synchronized-Update watchdog telemetry
@@ -1657,6 +1684,26 @@ impl TermWindow {
             .collect();
         out.sort_unstable();
         out
+    }
+
+    fn poll_terminal_state_buffer_health(&mut self) {
+        let reports = poll_terminal_state_buffer_health_snapshots(
+            &mut self.triple_buffer_panes,
+            &mut self.triple_buffer_pane_health,
+            Instant::now(),
+            unix_epoch_ms_now(),
+            frankenterm_core::triple_buffer_fleet_health::ConsecutiveRecyclePolicy::default(),
+        );
+        for report in reports {
+            if report.alert
+                == frankenterm_core::triple_buffer_fleet_health::RecycleAlertDecision::FireAlert
+            {
+                log::warn!(
+                    "pane {} triple-buffer watchdog force-recycled repeatedly; renderer suspected stuck",
+                    report.pane_id
+                );
+            }
+        }
     }
 
     /// Per ft-a9eu1 / ft-1dq8h slice 1: combined doctor surface
@@ -2928,6 +2975,7 @@ impl TermWindow {
             },
             TermWindowNotif::EmitStatusUpdate => {
                 let _ = self.poll_idle_scheduler();
+                self.poll_terminal_state_buffer_health();
                 self.emit_status_event();
                 // ft-kciew: drive the quad-buffer policy's idle
                 // shrink consideration on the same cadence as the
@@ -5985,12 +6033,12 @@ mod tests {
         base_policy_for_frame_budget_state, classify_webgpu_surface_error,
         default_frame_budget_cost_ns, evaluate_frame_budget_reduce_motion_gate, frame_budget,
         mark_cursor_rows_dirty, mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
-        pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
-        record_frame_budget_execution_outstanding, record_sync_output_mux_event,
-        reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
-        should_force_paint_for_frame_budget, should_run_frame_budget_decision,
-        should_skip_clean_line, terminal_pane_id_to_u64, terminal_u16_from_stable_delta,
-        terminal_u16_from_usize,
+        pane_health_snapshot_from_watchdoged_health, poll_terminal_state_buffer_health_snapshots,
+        record_drained_frame_budget_ops, record_frame_budget_execution_outstanding,
+        record_sync_output_mux_event, reduce_motion_state_from_preference, render,
+        run_clear_dirty_lines_after_frame, should_force_paint_for_frame_budget,
+        should_run_frame_budget_decision, should_skip_clean_line, terminal_pane_id_to_u64,
+        terminal_u16_from_stable_delta, terminal_u16_from_usize,
     };
 
     /// ft-camu6: stable→visible translation marks the right rows.
@@ -6282,6 +6330,54 @@ mod tests {
         assert_eq!(aggregate.total_panes, 2);
         assert_eq!(aggregate.panes_ever_force_recycled, 1);
         assert_eq!(aggregate.total_force_recycles, hung_snapshot.force_recycles);
+    }
+
+    #[test]
+    fn terminal_state_health_poll_records_live_snapshots_and_prunes_stale_panes() {
+        use frankenterm_core::triple_buffer_fleet_health::{
+            ConsecutiveRecyclePolicy, PaneHealthSnapshot, PaneId,
+        };
+        use frankenterm_gui::triple_buffer_gui::TerminalStateTripleBufferRegistry;
+
+        let origin = std::time::Instant::now();
+        let mut registry = TerminalStateTripleBufferRegistry::default();
+        registry.publish(7, terminal_state_for_watchdog_tests(1));
+        registry.publish(8, terminal_state_for_watchdog_tests(2));
+
+        {
+            let guard = registry
+                .pane(7)
+                .expect("pane 7 should have a live terminal-state buffer")
+                .acquire(origin);
+            assert_eq!(guard.cursor_row, 1);
+        }
+
+        let mut retained_health = HashMap::new();
+        retained_health.insert(
+            99,
+            PaneHealthSnapshot {
+                pane_id: PaneId(99),
+                force_recycles: 1,
+                watchdog_active: true,
+                ..PaneHealthSnapshot::default()
+            },
+        );
+
+        let reports = poll_terminal_state_buffer_health_snapshots(
+            &mut registry,
+            &mut retained_health,
+            origin + std::time::Duration::from_millis(1),
+            1_000,
+            ConsecutiveRecyclePolicy::default(),
+        );
+
+        assert_eq!(reports.len(), 2);
+        assert!(!retained_health.contains_key(&99));
+        assert!(retained_health.contains_key(&7));
+        assert!(retained_health.contains_key(&8));
+        assert_eq!(retained_health[&7].pane_id, PaneId(7));
+        assert_eq!(retained_health[&7].acquires, 1);
+        assert_eq!(retained_health[&7].releases, 1);
     }
 
     /// ft-a9eu1: SyncOutputDoctorSnapshot folds both substrate
