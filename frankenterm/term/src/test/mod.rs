@@ -44,6 +44,22 @@ struct TestTerm {
     term: Terminal,
 }
 
+#[derive(Clone, Debug)]
+struct SharedWriter {
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.output.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct TestTermConfig {
     scrollback: usize,
@@ -558,6 +574,36 @@ fn basic_output() {
 
     term.erase_in_line(EraseInLine::EraseToStartOfLine);
     assert_visible_contents(&term, file!(), line!(), &["", "          ", "   ", "", ""]);
+}
+
+#[test]
+fn primary_device_attributes_do_not_advertise_selective_erase_without_support() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = SharedWriter {
+        output: Arc::clone(&output),
+    };
+    let mut term = Terminal::new(
+        TerminalSize {
+            rows: 5,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 80,
+            dpi: 0,
+        },
+        Arc::new(TestTermConfig {
+            scrollback: 0,
+            scrollback_tier: crate::config::ScrollbackTierConfig::default(),
+        }),
+        "WezTerm",
+        "O_o",
+        Box::new(writer),
+    );
+
+    term.advance_bytes("\x1b[c");
+    term.writer.flush().unwrap();
+
+    let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert_eq!(output, "\x1b[?65;4;18;22;52c");
 }
 
 /// Ensure that we dirty lines as the cursor is moved around, otherwise

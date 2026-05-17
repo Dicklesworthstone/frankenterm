@@ -1310,7 +1310,6 @@ impl TerminalState {
             Device::RequestPrimaryDeviceAttributes => {
                 let mut ident = "\x1b[?65".to_string(); // Vt500
                 ident.push_str(";4"); // Sixel graphics
-                ident.push_str(";6"); // Selective erase
                 ident.push_str(";18"); // windowing extensions
                 ident.push_str(";22"); // ANSI color, vt525
                 ident.push_str(";52"); // Clipboard access
