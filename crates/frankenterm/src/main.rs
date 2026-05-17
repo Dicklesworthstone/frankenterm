@@ -3957,7 +3957,7 @@ enum RobotTxCommands {
     },
 }
 
-/// NTM-gap checkpoint subcommands (ft-3681t.4.1)
+/// Native checkpoint robot subcommands, graduated from ft-3681t.4.1.
 #[derive(Subcommand)]
 enum RobotCheckpointCommands {
     /// Save a checkpoint of the current session state
@@ -4005,7 +4005,7 @@ enum RobotCheckpointCommands {
     },
 }
 
-/// NTM-gap context subcommands (ft-3681t.4.1)
+/// Native context robot subcommands, graduated from ft-3681t.4.1.
 #[derive(Subcommand)]
 enum RobotContextCommands {
     /// Show context budget status for one or all panes
@@ -4052,7 +4052,7 @@ enum RobotContextCommands {
     },
 }
 
-/// NTM-gap work queue subcommands (ft-3681t.4.1)
+/// Native work-queue robot subcommands, graduated from ft-3681t.4.1.
 #[derive(Subcommand)]
 enum RobotWorkCommands {
     /// Claim a work item for an agent
@@ -4129,7 +4129,7 @@ enum RobotWorkCommands {
     },
 }
 
-/// NTM-gap fleet subcommands (ft-3681t.4.1)
+/// Native fleet robot subcommands, graduated from ft-3681t.4.1.
 #[derive(Subcommand)]
 enum RobotFleetCommands {
     /// Show fleet status (agents, allocations, health)
@@ -4180,7 +4180,7 @@ enum RobotFleetCommands {
     },
 }
 
-/// NTM-gap profile subcommands (ft-3681t.4.1)
+/// Native profile robot subcommands, graduated from ft-3681t.4.1.
 #[derive(Subcommand)]
 enum RobotProfileCommands {
     /// List available profiles
@@ -17824,10 +17824,11 @@ fn build_robot_context(
     Ok(RobotContext { effective })
 }
 
-/// Build a proper error response for an NTM-gap command that has been parsed
-/// but whose handler backend is not yet connected. Returns an error envelope
-/// with `robot.not_implemented` error code so callers get an explicit signal
-/// that the command surface exists but has no backend wired yet.
+/// Build the legacy degradation response for tests covering a parsed robot
+/// command whose handler backend is unavailable. The graduated checkpoint,
+/// context, work, fleet, and profile families should not route through this in
+/// live dispatch; the helper remains to validate the `robot.not_implemented`
+/// envelope for genuinely unbuilt command surfaces.
 #[cfg(test)]
 fn build_ntm_not_implemented_response(
     cmd: &frankenterm_core::robot_ntm_surface::RobotNtmCommand,

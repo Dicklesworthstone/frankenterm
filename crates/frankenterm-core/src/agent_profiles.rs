@@ -6,7 +6,7 @@
 //! **State-machine model:** [`crate::robot_profile_state_machine`].
 //! **Contract doc:** `docs/robot-contracts/profile.md`.
 //!
-//! # What this module ships (substrate-pass)
+//! # What this module ships
 //!
 //! - [`AgentProfile`] — typed shape matching the bead's stated
 //!   schema: `id, name, role, tags, shell, command, env,
@@ -19,29 +19,23 @@
 //!   - `role` 0..=64 chars (empty allowed).
 //!   - tag values 1..=64 chars each.
 //!
-//! # What this module does NOT ship (wired-pass follow-ups)
+//! # Wired consumers
 //!
-//! - The actual storage.rs migration step that registers
-//!   `AGENT_PROFILES_SCHEMA` against the schema_migrations table.
-//!   Filed as `ft-df3cz.cont.migration_step` (this commit files
-//!   that bead).
-//! - The `RobotCommands::Profile` handler at
-//!   `crates/frankenterm/src/main.rs:23227` that replaces the
-//!   `build_ntm_not_implemented_response` fallback. Filed as
-//!   `ft-df3cz.cont.handler_integration`.
-//! - Mux integration for `Apply` (spawning `count` panes via
-//!   wezterm.rs). Filed alongside cont.handler_integration.
-//! - Idempotency check via ApplyReceipt content-hash. Same.
+//! - The storage migration registers `AGENT_PROFILES_SCHEMA` and the role index
+//!   through the schema migration runner.
+//! - `RobotCommands::Profile` dispatches through
+//!   [`crate::robot_profile_handler`] for list/show/validate/dry-run apply.
+//! - Non-dry-run apply uses the mux-backed mutation executor and content-hash
+//!   replay receipts in the profile apply handler.
 //!
-//! Substrate-pass / wired-pass split mirrors the rest of this
-//! session's work (ft-t9a6q.1 / ft-hac7w.2 / wa-2l27x.8 / etc.).
+//! The substrate remains in this module; the robot-facing behavior lives in the
+//! profile handler and CLI dispatch layer.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// `CREATE TABLE` SQL for the `agent_profiles` table. Consumed
-/// by the storage.rs migration runner under
-/// `ft-df3cz.cont.migration_step`.
+/// `CREATE TABLE` SQL for the `agent_profiles` table. Consumed by the storage
+/// migration runner.
 ///
 /// Schema rationale:
 /// - `name` is the primary key (TEXT, unique). Profile names

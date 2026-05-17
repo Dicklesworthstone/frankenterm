@@ -1,11 +1,11 @@
 //! Real handler for the `robot profile` family (ft-b0g7g).
 //!
-//! Replaces the `build_ntm_not_implemented_response` placeholder at
-//! `crates/frankenterm/src/main.rs:23270`. The handler operates on a
-//! [`StorageBackend`](crate::storage_backend_trait::StorageBackend) so
-//! the conformance test in `tests/robot_family_conformance.rs` can drive
-//! it against a fresh in-memory backend without standing up the full
-//! async `StorageHandle`.
+//! Native replacement for the historical `build_ntm_not_implemented_response`
+//! profile fallback. The handler operates on a
+//! [`StorageBackend`](crate::storage_backend_trait::StorageBackend) so the
+//! conformance test in `tests/robot_family_conformance.rs` can drive it against
+//! a fresh in-memory backend without standing up the full async
+//! `StorageHandle`.
 //!
 //! ## Action coverage
 //!
@@ -20,9 +20,9 @@
 //! - `validate` — looks the row up, runs
 //!   [`AgentProfile::validate`], reports `valid` / `issues`.
 //! - `apply` — verifies the row exists; for `dry_run = true` returns
-//!   the planned `ProfileApplyData`; for `dry_run = false` this
-//!   standalone handler reports a typed `SpawnFailed` because real
-//!   spawning is daemon-mediated and must run through the mux service.
+//!   the planned `ProfileApplyData`; for `dry_run = false` the CLI dispatch
+//!   path calls [`handle_profile_apply_with_executor`] so real spawning runs
+//!   through the mux-backed mutation executor.
 //!   The contract spec at
 //!   `docs/robot-contracts/profile.md` calls `apply` `Sequential`
 //!   (mutating, transactional); this slice is the read-only-safe

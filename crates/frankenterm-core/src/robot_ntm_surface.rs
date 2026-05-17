@@ -1,9 +1,10 @@
-//! Expanded robot API surface for NTM-gap command domains (ft-3681t.4.1).
+//! Expanded robot API surface for command domains that graduated from the
+//! NTM-gap parity work (ft-3681t.4.1).
 //!
-//! Defines request/response types for robot command families that cover
-//! NTM operational workflows not yet present in the existing `ft robot`
-//! surface. Each command family maps to existing FrankenTerm infrastructure
-//! and carries an explicit NTM equivalence annotation for parity tracking.
+//! Defines request/response types for robot command families that now dispatch
+//! through native `ft robot` handlers. Each command family maps to existing
+//! FrankenTerm infrastructure and keeps an explicit NTM equivalence annotation
+//! for parity and differential tracking.
 //!
 //! # Command Families
 //!
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 // Top-level command dispatch
 // =============================================================================
 
-/// Expanded robot command families covering NTM operational workflow gaps.
+/// Native robot command families with retained NTM parity metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "family", content = "command", rename_all = "snake_case")]
 pub enum RobotNtmCommand {
@@ -1144,7 +1145,7 @@ pub struct ProfileValidateData {
 // Surface registry — enumerate all expanded API surfaces
 // =============================================================================
 
-/// Expanded API surface identifiers for the NTM-gap command families.
+/// Expanded API surface identifiers for the graduated robot command families.
 ///
 /// Complements `robot_api_contracts::ApiSurface` with the new command families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
