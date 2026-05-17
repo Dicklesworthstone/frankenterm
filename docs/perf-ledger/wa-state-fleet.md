@@ -34,24 +34,42 @@ Pre-measurement predictions, to be falsified or supported by criterion output. T
 
 ## Methodology
 
-```
-cargo bench -p frankenterm-core --bench wa_state_fleet 2>&1 | tee \
-  tests/artifacts/perf/wa-state-fleet-$(git rev-parse --short HEAD).log
-```
-
-Compare against the criterion baseline saved by previous runs:
+Benchmark collection is remote-required RCH work. Keep the inner
+`cargo bench` command behind `rch exec` with `RCH_REQUIRE_REMOTE=1`;
+do not use local benchmark wrapper output as perf-ledger evidence.
 
 ```
-cargo bench -p frankenterm-core --bench wa_state_fleet -- --save-baseline ft-3r0n4
+env -u CARGO_TARGET_DIR \
+  RCH_REQUIRE_REMOTE=1 \
+  RCH_VISIBILITY=verbose \
+  RCH_NO_SELF_HEALING=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=7200 \
+  rch exec -- env \
+    CARGO_BUILD_JOBS=1 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_DIR=/tmp/ft-3r0n4-wa-state-fleet-target \
+    cargo bench -p frankenterm-core --bench wa_state_fleet
+```
+
+Compare against the criterion baseline saved by previous retained RCH runs:
+
+```
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  CARGO_TARGET_DIR=/tmp/ft-3r0n4-wa-state-fleet-baseline-target \
+  cargo bench -p frankenterm-core --bench wa_state_fleet -- --save-baseline ft-3r0n4
 # … later:
-cargo bench -p frankenterm-core --bench wa_state_fleet -- --baseline ft-3r0n4
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  CARGO_TARGET_DIR=/tmp/ft-3r0n4-wa-state-fleet-compare-target \
+  cargo bench -p frankenterm-core --bench wa_state_fleet -- --baseline ft-3r0n4
 ```
 
 CI integration: `scripts/check_bench_budgets.sh` reads `target/criterion/wa-budgets.json` and fails the build if any group's median exceeds the `bench_common` threshold table.
 
 ## Measured (CI fills this in)
 
-Numbers below are placeholders — the table will be populated by the first CI run. Each value is criterion's reported median; throughput shows bytes/sec for the JSON+TOON groups, elements/sec for construct.
+Numbers below are pending retained RCH measurement — do not populate them from local Cargo output. Each value is criterion's reported median; throughput shows bytes/sec for the JSON+TOON groups, elements/sec for construct.
 
 ```
 | Pipeline                 | 10 panes  | 50 panes   | 200 panes  | scale 200/10 |

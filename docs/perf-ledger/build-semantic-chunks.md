@@ -53,19 +53,35 @@ analysis.
 
 ## Methodology
 
-```
-FT_LOCAL_NAME=cc_1 \
-CARGO_TARGET_DIR=/tmp/ft-cc_1-target \
-scripts/cargo-local.sh bench -p frankenterm-core --bench semantic_chunks 2>&1 | tee \
-  tests/artifacts/perf/semantic-chunks-$(git rev-parse --short HEAD).log
-```
-
-Compare against the criterion baseline saved by previous runs:
+Benchmark collection is remote-required RCH work. Keep the inner
+`cargo bench` command behind `rch exec` with `RCH_REQUIRE_REMOTE=1`;
+do not use local benchmark wrapper output as perf-ledger evidence.
 
 ```
-scripts/cargo-local.sh bench -p frankenterm-core --bench semantic_chunks -- --save-baseline ft-o2mtn
+env -u CARGO_TARGET_DIR \
+  RCH_REQUIRE_REMOTE=1 \
+  RCH_VISIBILITY=verbose \
+  RCH_NO_SELF_HEALING=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=7200 \
+  rch exec -- env \
+    CARGO_BUILD_JOBS=1 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_DIR=/tmp/ft-o2mtn-semantic-chunks-target \
+    cargo bench -p frankenterm-core --bench semantic_chunks
+```
+
+Compare against the criterion baseline saved by previous retained RCH runs:
+
+```
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  CARGO_TARGET_DIR=/tmp/ft-o2mtn-semantic-chunks-baseline-target \
+  cargo bench -p frankenterm-core --bench semantic_chunks -- --save-baseline ft-o2mtn
 # … later:
-scripts/cargo-local.sh bench -p frankenterm-core --bench semantic_chunks -- --baseline ft-o2mtn
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  CARGO_TARGET_DIR=/tmp/ft-o2mtn-semantic-chunks-compare-target \
+  cargo bench -p frankenterm-core --bench semantic_chunks -- --baseline ft-o2mtn
 ```
 
 CI integration: `scripts/check_bench_budgets.sh` reads
@@ -74,9 +90,9 @@ group's median exceeds the `bench_common` threshold table.
 
 ## Measured (CI fills this in)
 
-Numbers below are placeholders — the table will be populated by
-the first CI run. Each value is criterion's reported median;
-throughput shows elements/sec for all groups.
+Numbers below are pending retained RCH measurement — do not populate
+them from local Cargo output. Each value is criterion's reported
+median; throughput shows elements/sec for all groups.
 
 ```
 | Pipeline                  | 100 evts  | 1000 evts | 10000 evts | scale 10000/100 |
