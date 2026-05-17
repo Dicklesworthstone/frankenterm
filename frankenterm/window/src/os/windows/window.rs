@@ -7,7 +7,7 @@ use crate::{
     RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations,
     WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use frankenterm_font::FontConfiguration;
@@ -49,8 +49,8 @@ use winapi::um::winnt::OSVERSIONINFOW;
 use winapi::um::winuser::*;
 use windows::UI::Color as WUIColor;
 use windows::UI::ViewManagement::{UIColorType, UISettings};
-use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 
 const GCS_RESULTSTR: DWORD = 0x800;
 const GCS_COMPSTR: DWORD = 0x8;
@@ -237,8 +237,8 @@ impl HasDisplayHandle for WindowInner {
 
 impl HasWindowHandle for WindowInner {
     fn window_handle(&self) -> Result<WindowHandle, HandleError> {
-        let mut handle =
-            Win32WindowHandle::new(NonZeroIsize::new(self.hwnd.0 as _).expect("non-zero"));
+        let window = NonZeroIsize::new(self.hwnd.0 as _).ok_or(HandleError::Unavailable)?;
+        let mut handle = Win32WindowHandle::new(window);
         handle.hinstance = NonZeroIsize::new(unsafe { GetModuleHandleW(null()) } as _);
         unsafe { Ok(WindowHandle::borrow_raw(RawWindowHandle::Win32(handle))) }
     }
@@ -246,7 +246,9 @@ impl HasWindowHandle for WindowInner {
 
 impl WindowInner {
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
-        let conn = Connection::get().unwrap();
+        let Some(conn) = Connection::get() else {
+            bail!("Windows connection is unavailable");
+        };
 
         let (gl_state, backend) = if self.config.prefer_egl {
             match conn.gl_connection.borrow().as_ref() {
@@ -785,8 +787,12 @@ impl HasDisplayHandle for Window {
 
 impl HasWindowHandle for Window {
     fn window_handle(&self) -> Result<WindowHandle, HandleError> {
-        let conn = Connection::get().expect("raw_window_handle only callable on main thread");
-        let handle = conn.get_window(self.0).expect("window handle invalid!?");
+        let Some(conn) = Connection::get() else {
+            return Err(HandleError::Unavailable);
+        };
+        let Some(handle) = conn.get_window(self.0) else {
+            return Err(HandleError::Unavailable);
+        };
 
         let inner = handle.borrow();
         let handle = inner.window_handle()?;
@@ -799,7 +805,11 @@ impl WindowOps for Window {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
         promise::spawn::spawn(async move {
-            if let Some(handle) = Connection::get().unwrap().get_window(window) {
+            let Some(conn) = Connection::get() else {
+                bail!("Windows connection is unavailable");
+            };
+
+            if let Some(handle) = conn.get_window(window) {
                 let mut inner = handle.borrow_mut();
                 inner.enable_opengl()
             } else {
@@ -901,7 +911,7 @@ impl WindowOps for Window {
     }
 
     fn invalidate(&self) {
-        let hwnd = self.0 .0;
+        let hwnd = self.0.0;
         log::trace!("WindowOps::invalidate calling InvalidateRect");
         unsafe {
             InvalidateRect(hwnd, null(), 0);
@@ -1021,7 +1031,7 @@ impl WindowOps for Window {
         config: &ConfigHandle,
         window_state: WindowState,
     ) -> anyhow::Result<Option<Parameters>> {
-        let hwnd = self.0 .0;
+        let hwnd = self.0.0;
         anyhow::ensure!(!hwnd.is_null(), "HWND is null");
 
         let has_focus = unsafe { GetFocus() } == hwnd;
@@ -1107,11 +1117,7 @@ unsafe fn get_title_log_font(hwnd: HWND, hdc: HDC) -> Option<LOGFONTW> {
         CloseThemeData(theme);
     }
 
-    if res == S_OK {
-        Some(log_font)
-    } else {
-        None
-    }
+    if res == S_OK { Some(log_font) } else { None }
 }
 
 unsafe fn update_title_font(hwnd: HWND) {
@@ -1189,7 +1195,7 @@ unsafe fn wm_nccalcsize(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
         let frame_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
         let padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
 
-        let params = (lparam as *mut NCCALCSIZE_PARAMS).as_mut().unwrap();
+        let params = (lparam as *mut NCCALCSIZE_PARAMS).as_mut()?;
 
         let requested_client_rect = &mut params.rgrc[0];
 
@@ -1716,7 +1722,12 @@ fn mods_and_buttons(wparam: WPARAM) -> (Modifiers, MouseButtons) {
     if wparam & MK_RBUTTON != 0 {
         buttons |= MouseButtons::RIGHT;
     }
-    // TODO: XBUTTON1 and XBUTTON2?
+    if wparam & MK_XBUTTON1 != 0 {
+        buttons |= MouseButtons::X1;
+    }
+    if wparam & MK_XBUTTON2 != 0 {
+        buttons |= MouseButtons::X2;
+    }
     (modifiers, buttons)
 }
 
@@ -3029,5 +3040,18 @@ unsafe extern "system" fn wnd_proc(
             log::error!("caught {:?}", e);
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mods_and_buttons_maps_xbutton_state_flags() {
+        let (_, buttons) = mods_and_buttons(MK_XBUTTON1 | MK_XBUTTON2);
+
+        assert!(buttons.contains(MouseButtons::X1));
+        assert!(buttons.contains(MouseButtons::X2));
     }
 }
