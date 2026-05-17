@@ -65,6 +65,8 @@ pub struct MockRequest {
 pub enum MockProviderOutcome {
     /// Request succeeded.
     Success,
+    /// The named mock provider was not registered in the testbed.
+    MissingProvider,
     /// Provider is offline.
     Offline,
     /// Simulated failure (random based on failure_rate_pct).
@@ -77,6 +79,7 @@ impl std::fmt::Display for MockProviderOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Success => f.write_str("success"),
+            Self::MissingProvider => f.write_str("missing_provider"),
             Self::Offline => f.write_str("offline"),
             Self::SimulatedFailure => f.write_str("simulated_failure"),
             Self::RateLimited => f.write_str("rate_limited"),
@@ -558,12 +561,15 @@ impl ConnectorTestbed {
             }
             Some(outcome)
         } else {
-            None
+            self.telemetry.provider_failures += 1;
+            self.governor.record_outcome(connector_id, false, now_ms);
+            Some(MockProviderOutcome::MissingProvider)
         };
 
         // Create and ingest canonical event.
         let severity = match &provider_outcome {
             Some(MockProviderOutcome::Success) => CanonicalSeverity::Info,
+            Some(MockProviderOutcome::MissingProvider) => CanonicalSeverity::Critical,
             Some(MockProviderOutcome::Offline) => CanonicalSeverity::Critical,
             _ => CanonicalSeverity::Warning,
         };
@@ -1055,6 +1061,27 @@ mod tests {
     }
 
     #[test]
+    fn testbed_send_request_missing_provider_records_failure() {
+        let mut tb = ConnectorTestbed::new(TestbedConfig::default());
+        let action = sample_action("conn-1", ConnectorActionKind::Notify);
+        let result = tb.send_request("missing", "conn-1", &action, 1000, 50);
+        assert_eq!(
+            result.provider_outcome,
+            Some(MockProviderOutcome::MissingProvider)
+        );
+        assert_eq!(result.ingestion_outcome, Some(IngestionOutcome::Recorded));
+        assert_eq!(tb.telemetry().provider_requests, 1);
+        assert_eq!(tb.telemetry().provider_failures, 1);
+        let snapshot = tb.governor.snapshot(1000);
+        let connector = snapshot
+            .connectors
+            .iter()
+            .find(|connector| connector.connector_id == "conn-1")
+            .expect("missing provider failure should register connector state");
+        assert_eq!(connector.consecutive_failures, 1);
+    }
+
+    #[test]
     fn testbed_sandbox_probe() {
         let mut tb = ConnectorTestbed::new(TestbedConfig::default());
         let attempts = standard_escape_attempts();
@@ -1177,6 +1204,10 @@ mod tests {
     #[test]
     fn mock_provider_outcome_display() {
         assert_eq!(MockProviderOutcome::Success.to_string(), "success");
+        assert_eq!(
+            MockProviderOutcome::MissingProvider.to_string(),
+            "missing_provider"
+        );
         assert_eq!(MockProviderOutcome::Offline.to_string(), "offline");
         assert_eq!(
             MockProviderOutcome::SimulatedFailure.to_string(),
