@@ -60,7 +60,7 @@ CC=$(xcrun --find clang) CXX=$(xcrun --find clang++) cargo install ...
 
 ## [Unreleased] -- development on `main` since v0.1.0
 
-> Continued development after the v0.1.0 baseline. Roughly 1,600+ commits land between 2026-05-01 and 2026-05-16.
+> Continued development after the v0.1.0 baseline. Roughly 2,700 commits land between 2026-05-01 and 2026-05-16 across the concurrent agent swarm.
 
 ### Operating envelope + incident-bundle plumbing (2026-05-10 -- 2026-05-16)
 

@@ -200,7 +200,7 @@ $ ft robot events --limit 10
 $ ft tx run --contract-file tx.json
 
 # Plan a capacity-aware swarm objective
-$ ft mission plan --objective-file objective.json
+$ ft mission objective-plan --objective "spawn 5 codex panes for the pricing refactor"
 
 # Verify the latest release attestation bundle offline
 $ ft attestation verify docs/attestations/0.2.0.json
@@ -1396,15 +1396,23 @@ This is the surface that protects swarms from accidentally being driven outside 
 
 ## Mission Objective Planner
 
-`ft mission plan --objective-file objective.json` invokes the capacity-aware mission objective planner (ft-auy2g). The planner:
+```bash
+ft mission objective-plan --objective "<operator goal as free text>" \
+                          --strictness {normal|strict|tolerant} \
+                          --target-bead <ft-XXXXX>            # optional Beads candidate
+                          --owned-path <path>[,<path>...]     # for dirty-overlap checks
+                          --dirty-path <path>[,<path>...]     # caller-observed dirty state
+```
 
-1. Reads the objective contract (panes, agents, dependencies, deadlines).
-2. Queries the operating-envelope planner for the current admission verdict.
-3. Builds a plan that fits inside the envelope, sequencing pane spawns and workflow triggers so no admission gate is violated.
-4. Emits a golden-fixture-comparable plan artifact.
+`ft mission objective-plan` invokes the capacity-aware mission objective planner (ft-auy2g). Inputs and behavior:
+
+1. Takes a free-text `--objective` string (operator's stated goal). No JSON contract is required.
+2. Queries the operating-envelope planner for the current admission verdict against the supplied scope (owned paths, candidate bead, dirty paths).
+3. Builds a read-only plan that fits inside the envelope, ranking a candidate as ready work when a `--target-bead` is supplied or `--candidate-id` / `--candidate-title` describe one.
+4. Emits a deterministic plan artifact (golden-fixture-comparable).
 5. Records the plan + decision rationale to the mission audit trail.
 
-The planner is side-effect-free: planning never spawns panes or sends input. Execution is a separate `ft mission run` step that re-validates the plan against the live envelope before each commit phase.
+The planner is side-effect-free: objective-plan never spawns panes or sends input. Execution is a separate `ft mission run` step (which operates on a mission contract file at `.ft/mission/active.json` by default, see [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts)) that re-validates against the live envelope before each commit phase.
 
 ---
 
