@@ -151,6 +151,12 @@
       "status": "pass"
     }
   ],
+  "supporting_test_binaries_retention": {
+    "status": "transient_not_retained",
+    "bundle_verifiable": false,
+    "path_prefix": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/",
+    "note": "These hashes document local binary provenance only. The binaries are not retained release-bundle artifacts and must not be treated as release proof inputs."
+  },
   "supporting_test_binaries": [
     {
       "target": "loom_broadcast",
@@ -219,9 +225,9 @@
     {
       "kind": "binary_hash_capture",
       "command": "env RCH_REQUIRE_REMOTE=1 rch exec -- bash -lc 'set -euo pipefail; export CARGO_TARGET_DIR=/tmp/ft-tf6g3-6-attest-20260512T090000Z; export LOOM_MAX_BRANCHES=4000; export LOOM_MAX_DURATION_SECS=1500; cargo test -p frankenterm-core --test loom_oneshot --test loom_notify --test loom_broadcast --test loom_watch --test loom_mpsc --test loom_sync --test loom_spsc_ring_buffer --test loom_lockfree --test loom_triple_buffer cancel_trace_classes_are_declared -- --nocapture; shasum -a 256 <supporting test binaries>'",
-      "status": "pass",
+      "status": "local_provenance_not_release_proof",
       "execution_mode": "local hash capture through a non-compilation rch wrapper; no RCH remote footer was emitted",
-      "result": "All nine cancel_trace_classes_are_declared tests passed again and supporting test binary hashes were emitted from the same target directory."
+      "result": "All nine cancel_trace_classes_are_declared tests passed again and supporting test binary hashes were emitted from the same transient target directory. This local hash capture is provenance only; release proof comes from the remote_filtered_loom_proof and remote_targeted_clippy records."
     },
     {
       "kind": "remote_targeted_clippy",
