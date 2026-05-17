@@ -160,7 +160,7 @@ for test_name in "${TESTS[@]}"; do
   set +e
   run_rch_cargo_logged "${test_stdout_file}" \
     env CARGO_TARGET_DIR="${TARGET_DIR}" \
-    cargo test -p frankenterm-core --test tx_correctness_suite "${test_name}" -- --nocapture
+    cargo test -p frankenterm-core --features subprocess-bridge --test tx_correctness_suite "${test_name}" -- --nocapture
   rc=$?
   set -e
 

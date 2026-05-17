@@ -55,6 +55,7 @@ matrix_log="$LOG_DIR/scenario_matrix_${RUN_ID}.log"
 set +e
 run_rch_cargo_logged "${matrix_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo \
   test --package frankenterm-core \
+  --features subprocess-bridge \
   --test tx_e2e_scenario_matrix \
   -- --nocapture
 matrix_rc=$?
@@ -72,6 +73,7 @@ correctness_log="$LOG_DIR/correctness_suite_${RUN_ID}.log"
 set +e
 run_rch_cargo_logged "${correctness_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo \
   test --package frankenterm-core \
+  --features subprocess-bridge \
   --test tx_correctness_suite \
   -- --nocapture
 correctness_rc=$?

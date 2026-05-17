@@ -34,6 +34,7 @@ ensure_rch_ready
 echo "[1/2] Running tx E2E scenario matrix (19 tests)..."
 step1_log="${LOG_DIR}/tx_e2e_matrix_${RUN_ID}.scenario_matrix.log"
 run_rch_cargo_logged "${step1_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test --package frankenterm-core \
+  --features subprocess-bridge \
   --test tx_e2e_scenario_matrix \
   -- --nocapture
 echo ""
@@ -42,6 +43,7 @@ echo ""
 echo "[2/2] Running tx correctness suite (regression check)..."
 step2_log="${LOG_DIR}/tx_e2e_matrix_${RUN_ID}.correctness_suite.log"
 run_rch_cargo_logged "${step2_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test --package frankenterm-core \
+  --features subprocess-bridge \
   --test tx_correctness_suite \
   -- --nocapture
 echo ""
