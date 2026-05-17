@@ -38,9 +38,20 @@
 
 </div>
 
+### What's here
+
+| If you're... | Start with |
+|---|---|
+| Trying it out | [10-Minute Tour](#10-minute-tour) → [Commands](#commands) → [Robot Mode](#robot-mode-json-api) |
+| Building a meta-agent | [Robot Mode](#robot-mode-json-api) → [Sample Mission/Tx Contracts](#deep-dive-sample-mission-and-tx-contracts) → [Operating Envelope](#operating-envelope) |
+| Operating at scale | [Capacity Planning](#deep-dive-capacity-planning) → [Operator Playbook](#operator-playbook-excerpts) → [Troubleshooting](#troubleshooting) |
+| Understanding how it works | [Architecture](#architecture) → [System Components](#system-components-and-responsibilities) → [Deep Dives](#deep-dive-the-watcher-capture-loop) |
+| Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
+| Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
+
 **A swarm-native terminal platform that observes, controls, and audits fleets of 200+ concurrent AI coding agents.** <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->509<!--/count--> core-library modules, <!--count:core_loc-->1012656<!--/count-->+ lines of Rust, <!--count:test_count-->55330<!--/count-->+ test annotations across <!--count:core_rust_test_files-->952<!--/count--> integration test files.
 
-_Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast; the canonical figures are whatever these commands return at HEAD: `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"'` for the workspace member count, `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently <!--count:core_subcrates-->19<!--/count-->), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored Cargo workspace member count (currently <!--count:vendored_members-->47<!--/count-->), `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l` for top-level vendored crate directory count (currently <!--count:vendored_top_level-->42<!--/count-->), `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently <!--count:core_top_level_modules-->509<!--/count-->), `find crates/frankenterm-core/tests -type f -name '*.rs' | wc -l` for core Rust test files (currently <!--count:core_rust_test_files-->952<!--/count-->), `find crates/frankenterm-core/benches -type f -name '*.rs' | wc -l` for Criterion bench files (currently <!--count:criterion_bench_files-->111<!--/count-->), `find fuzz -type f -path '*/fuzz_targets/*.rs' | wc -l` for fuzz targets (currently <!--count:fuzz_targets-->48<!--/count-->), `find docs -type f -name '*.md' | wc -l` for Markdown docs (currently <!--count:doc_markdown_files-->428<!--/count-->), and `find tests/e2e -type f -name '*.sh' | wc -l` for E2E shell scripts (currently <!--count:e2e_scripts-->272<!--/count-->)._
+_Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe; everything cited above is whatever the live `find`/`awk` returns at HEAD._
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -63,7 +74,193 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 
 **Runtime model.** Fully `Cx`-aware, structured, cancel-correct async on **asupersync**. Direct `tokio` usage is **banned at the dependency level** via `cargo-deny` and at the type level via the `RuntimeProof` sealed trait. The `runtime_async` module is the canonical asupersync wrapper that every first-party crate imports. The dual-runtime era is over.
 
-### Why use ft?
+If you'd rather see commands than prose, jump straight to the [10-Minute Tour](#10-minute-tour) below.
+
+---
+
+## 10-Minute Tour
+
+A guided walkthrough from "I cloned this" to "I have an AI driving an AI." Each step builds on the previous one.
+
+### 1 · Install + verify (1 minute)
+
+```bash
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
+
+ft --version       # smoke test — should print version + git commit
+ft doctor          # environment check — exits non-zero on missing prerequisites
+```
+
+`ft` talks to a live mux through the WezTerm interop boundary, so `wezterm` must be in `PATH`. `ft doctor` will tell you if it isn't. If you need from-source builds or optional features (`mcp`, `web`, `distributed`, `semantic-search`, `ftui`), see [Installation](#installation) below.
+
+### 2 · See the fleet (1 minute, no daemon yet)
+
+`ft robot state` gives an AI-readable snapshot of every pane the mux can see, *without* starting a long-running daemon. This is the call a meta-agent makes when it wants a one-shot view.
+
+```bash
+$ ft robot state
+{
+  "ok": true,
+  "data": [
+    {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"},
+    {"pane_id": 1, "title": "codex",       "domain": "local", "cwd": "/project"},
+    {"pane_id": 2, "title": "build",       "domain": "local", "cwd": "/project"}
+  ],
+  "elapsed_ms": 4,
+  "version": "ft.0.2.0"
+}
+```
+
+Pipe to an LLM? Add `--format toon` for the lower-token serialization:
+
+```bash
+$ ft robot --format toon state
+ok=true
+data[3]{
+  {pane_id=0,title=claude-code,domain=local,cwd=/project}
+  {pane_id=1,title=codex,domain=local,cwd=/project}
+  {pane_id=2,title=build,domain=local,cwd=/project}
+}
+elapsed_ms=4 version=ft.0.2.0
+```
+
+### 3 · Start observing (2 minutes)
+
+Now start the watcher so capture, pattern detection, and workflow execution kick in. Run it in the foreground for the tour:
+
+```bash
+ft watch --foreground
+# (leave this running; new terminal for the next steps)
+```
+
+In a second shell, peek at what the watcher is seeing:
+
+```bash
+$ ft status                                     # human-readable fleet overview
+$ ft robot events --limit 5                     # recent pattern-triggered detections
+{
+  "ok": true,
+  "data": [
+    {
+      "id": 1247,
+      "pane_id": 1,
+      "rule_id": "codex.usage.reached",
+      "severity": "warn",
+      "matched_at_ms": 1747371642000,
+      "snippet": "Usage limit reached. Try again at 14:32 UTC.",
+      "handled": false
+    }
+  ],
+  "elapsed_ms": 3
+}
+```
+
+The watcher's pattern engine has already noticed pane 1 hit a rate limit; the event is queued for any registered workflow handler to react.
+
+### 4 · React safely (2 minutes — send + wait-for + policy gate)
+
+Send a `/compact` to the stuck codex pane, but block until the recovery confirms:
+
+```bash
+$ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
+{
+  "ok": true,
+  "data": {
+    "pane_id": 1,
+    "injection": {"bytes_sent": 9, "paste_mode": false},
+    "wait_for": {
+      "pane_id": 1,
+      "pattern": "compaction complete",
+      "matched": true,
+      "elapsed_ms": 4823,
+      "polls": 96
+    }
+  },
+  "elapsed_ms": 4829
+}
+```
+
+Notice three things: (1) **`ft robot send` is policy-gated** — if you try to send something that violates a policy rule, you get a structured `RequireApproval` envelope with an 8-char approval code, not a silent error. (2) **`--wait-for` is condition-based**, not `sleep`-based — it polls until the pattern shows up or the timeout fires. (3) The response is **structured JSON** the calling agent can route on.
+
+If the policy gate denies, you'll see:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "robot.require_approval",
+    "message": "Action requires approval",
+    "hint": "Run: ft approve AB12CD34"
+  }
+}
+```
+
+### 5 · Search the past (1 minute)
+
+Every byte of pane output the watcher captured is FTS5-indexed. Search across all panes:
+
+```bash
+$ ft robot search "error: compilation failed" --limit 3
+{
+  "ok": true,
+  "data": {
+    "hits": [
+      {
+        "pane_id": 1,
+        "ts_ms": 1747370104000,
+        "snippet": "  --> services/billing/pricing.rs:142:12\n  error: compilation failed: type mismatch",
+        "rank": 1.2845
+      }
+    ],
+    "mode": "lexical"
+  }
+}
+```
+
+Add `--mode hybrid` for semantic-ranked results (requires `--features semantic-search` build).
+
+### 6 · Orchestrate transactionally (2 minutes — mission + tx)
+
+For multi-pane operations that need rollback semantics, use the Tx engine:
+
+```bash
+$ ft tx plan --contract-file deploy-staging.json     # validate the contract
+$ ft tx run                                          # prepare + commit, with auto-compensation on failure
+$ ft tx show --include-contract                      # full receipt with per-step audit
+```
+
+For a free-text operator goal that respects the safety envelope:
+
+```bash
+$ ft mission objective-plan --objective "spawn 5 codex panes for the pricing refactor"
+```
+
+This invokes the capacity-aware objective planner, which asks the operating envelope whether 5 new panes are safe given current RCH pressure, fleet memory, etc. — and returns a plan only if it fits. See [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts) for the JSON shapes.
+
+### 7 · Verify the release attestation (1 minute)
+
+Every load-bearing claim links to a signed artifact slot. Verify any release offline:
+
+```bash
+$ ft attestation verify docs/attestations/0.2.0.json
+ok: 21/21 slots, sigstore signature verified, payload hash matches
+```
+
+### Where to go next
+
+- **[Robot Mode (JSON API)](#robot-mode-json-api)** — the full call contract AI agents use to drive other AI agents
+- **[Operating Envelope](#operating-envelope)** — the fail-closed safety surface that gates new pane admission
+- **[Commands](#commands)** — every `ft` subcommand with examples
+- **[Configuration](#configuration)** — `ft.toml` reference for tuning poll intervals, retention, redaction tiers
+- **[Operator Playbook](#operator-playbook-excerpts)** — what to do when things break
+
+Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, and MCP `wa.get_text` / `wa.search`) are policy-evaluated and redact secret material in returned text/snippets — you won't accidentally leak a JWT into a notification or an event payload.
+
+---
+
+## Why use ft?
+
+Now that you've seen it run, here's the full capability surface:
 
 | Capability | What it does |
 |---|---|
@@ -104,109 +301,6 @@ The phrase has a concrete meaning here:
 - **Anyone who has to audit what an AI did** in a terminal session after the fact
 - **Anyone who has lost work to a rate limit they didn't notice for 30 minutes**
 - **Anyone who wants their multi-agent infrastructure to fail closed rather than silently degrade**
-
----
-
-## Quickstart
-
-Zero to first useful output in four commands.
-
-### 1. Install
-
-```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
-```
-
-External requirement: `ft` talks to a live mux through the WezTerm interop boundary, so `wezterm` must be in `PATH` and `wezterm cli list --format json` must succeed before pane read/write operations work. See [Installation](#installation) for from-source and feature-gated builds.
-
-### 2. Verify
-
-```bash
-ft --version                 # semver + short git commit (+dirty marker)
-ft version --full            # adds built, rustc, target, and enabled features
-ft doctor --json | jq .      # environment checks as structured JSON
-```
-
-`ft doctor` exits non-zero on missing prerequisites; treat that as the authoritative signal that the environment is not ready yet.
-
-### 3. First robot call
-
-```bash
-ft robot state                # list every pane the current mux can see, as JSON
-ft robot --format toon state  # same, TOON-compact; use this when piping to an AI
-```
-
-A single call that gives an AI agent a full snapshot of the swarm's panes without starting the watch daemon.
-
-### 4. Watch, then react
-
-```bash
-ft watch --foreground        # run the capture/pattern/workflow daemon
-# in another shell:
-ft robot events --limit 10   # recent pattern-triggered events
-ft robot search "error"      # full-text search across captured output
-```
-
-### Next steps
-
-- [Quick Example](#quick-example) — fuller command tour (send, wait-for, mission, tx)
-- [Installation](#installation) — from-source build and optional features (`mcp`, `web`, `distributed`, `semantic-search`, `ftui`)
-- [Robot Mode (JSON API)](#robot-mode-json-api) — the contract AI agents use to drive other AI agents
-- [Operating Envelope](#operating-envelope) — the safety surface that gates new pane admission
-
----
-
-## Quick Example
-
-```bash
-# Start the ft watcher / runtime
-$ ft watch
-
-# See all active panes as JSON
-$ ft robot state
-{
-  "ok": true,
-  "data": [
-    {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"},
-    {"pane_id": 1, "title": "codex", "domain": "local", "cwd": "/project"}
-  ]
-}
-
-# Compact TOON output (lower-token AI-to-AI output)
-$ ft robot --format toon state
-
-# Get recent output from a specific pane
-$ ft robot get-text 0 --tail 50
-
-# Batch output from multiple panes in one call
-$ ft robot get-text --panes 0,1,2 --tail 20
-
-# Wait for a specific pattern (e.g., agent hitting rate limit)
-$ ft robot wait-for 0 "codex.usage.reached" --timeout-secs 3600
-
-# Search captured output
-$ ft robot search "error: compilation failed"
-
-# Semantic / hybrid search mode
-$ ft robot search "error: compilation failed" --mode hybrid
-
-# Send input to a pane (policy-gated, secrets redacted)
-$ ft robot send 1 "/compact"
-
-# View recent detection events
-$ ft robot events --limit 10
-
-# Run a transactional multi-pane operation
-$ ft tx run --contract-file tx.json
-
-# Plan a capacity-aware swarm objective
-$ ft mission objective-plan --objective "spawn 5 codex panes for the pricing refactor"
-
-# Verify the latest release attestation bundle offline
-$ ft attestation verify docs/attestations/0.2.0.json
-```
-
-Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, and MCP `wa.get_text` / `wa.search`) are policy-evaluated and redact secret material in returned text/snippets.
 
 ---
 
@@ -624,7 +718,9 @@ cargo build -p frankenterm --release --all-features
 
 ---
 
-## Quick Start
+## Setup & First-Run Checklist
+
+For *setting up a new host* (font, daemon, persistent config). For *learning the tool*, see the [10-Minute Tour](#10-minute-tour) above.
 
 ### 1. Run setup (recommended)
 
@@ -3860,6 +3956,34 @@ Currently: **Codex** (OpenAI), **Claude Code** (Anthropic), **Gemini** (Google),
 - **Operator runbook**: [`docs/operator-runbook.md`](docs/operator-runbook.md) — the gate operators reach from `ft doctor` when envelope state is degraded (ft-booek.6).
 - **Audit checklist**: [`docs/audit-checklist.md`](docs/audit-checklist.md) — the per-substrate audit pattern catalog driving the substrate-audit family closures.
 - **Tuning reference**: [`docs/tuning-reference.md`](docs/tuning-reference.md) — every `[tuning.*]` key, default, unit, validation guard, and starting ranges for 10/50/200+-pane fleets.
+
+---
+
+## Maintainers: how counts stay honest
+
+Every numeric claim in this README is wrapped in `<!--count:* -->` markers and refreshed by `scripts/stamp-readme-counts.sh`. The exact `find` / `awk` recipe each marker maps to:
+
+<details>
+<summary>Click for the full marker → command mapping</summary>
+
+| Marker | Command at HEAD |
+|---|---|
+| `<!--count:workspace_members-->` | `awk '/^members = \[/,/^]/' Cargo.toml \| grep -c '^\s*"'` |
+| `<!--count:core_subcrates-->` | `ls -d crates/frankenterm-core-* \| wc -l` |
+| `<!--count:vendored_members-->` | `awk '/^members = \[/,/^]/' Cargo.toml \| grep -c '^\s*"frankenterm/'` |
+| `<!--count:vendored_top_level-->` | `find frankenterm -maxdepth 2 -name Cargo.toml \| wc -l` |
+| `<!--count:core_top_level_modules-->` | `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' \| wc -l` |
+| `<!--count:core_rust_test_files-->` | `find crates/frankenterm-core/tests -type f -name '*.rs' \| wc -l` |
+| `<!--count:criterion_bench_files-->` | `find crates/frankenterm-core/benches -type f -name '*.rs' \| wc -l` |
+| `<!--count:fuzz_targets-->` | `find fuzz -type f -path '*/fuzz_targets/*.rs' \| wc -l` |
+| `<!--count:doc_markdown_files-->` | `find docs -type f -name '*.md' \| wc -l` |
+| `<!--count:e2e_scripts-->` | `find tests/e2e -type f -name '*.sh' \| wc -l` |
+| `<!--count:core_loc-->` | LOC count across `crates/frankenterm-core/src/**/*.rs` |
+| `<!--count:test_count-->` | rough total of `#[test]` / `#[asupersync_test]` / etc. annotations |
+
+</details>
+
+Stamp markers and their plain-text duplicates (in tables, the workspace tree, and the Testing section) should agree. If you see a numeric drift, re-run the stamp script. Plain-text duplications without `<!--count:* -->` wrapping need manual updates; if you spot one, wrap it in markers so the script picks it up on the next pass.
 
 ---
 
