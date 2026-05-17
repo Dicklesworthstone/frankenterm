@@ -502,6 +502,7 @@ impl Line {
                 break;
             }
             let grapheme_idx = cell.cell_index() as u16;
+            let grapheme_end = grapheme_idx.saturating_add(1);
             let semantic_type = cell.attrs().semantic_type();
             let new_zone = match last_cell {
                 None => true,
@@ -514,13 +515,13 @@ impl Line {
                 }
 
                 current_zone.replace(ZoneRange {
-                    range: grapheme_idx..grapheme_idx + 1,
+                    range: grapheme_idx..grapheme_end,
                     semantic_type,
                 });
             }
 
             if let Some(zone) = current_zone.as_mut() {
-                zone.range.end = grapheme_idx;
+                zone.range.end = grapheme_end;
             }
 
             last_cell.replace(cell);
@@ -2824,8 +2825,68 @@ mod tests {
     fn line_semantic_zone_ranges() {
         let mut line: Line = "hello".into();
         let zones = line.semantic_zone_ranges();
-        // Default text should produce at least one zone
-        assert!(!zones.is_empty());
+        assert_eq!(
+            zones,
+            &[ZoneRange {
+                semantic_type: SemanticType::Output,
+                range: 0..5,
+            }]
+        );
+    }
+
+    #[test]
+    fn line_semantic_zone_ranges_use_exclusive_end_for_single_cell_zone() {
+        let mut input = CellAttributes::default();
+        input.set_semantic_type(SemanticType::Input);
+
+        let mut line = Line::from_cells(vec![Cell::new('x', input)], SEQ_ZERO);
+        let zones = line.semantic_zone_ranges();
+
+        assert_eq!(
+            zones,
+            &[ZoneRange {
+                semantic_type: SemanticType::Input,
+                range: 0..1,
+            }]
+        );
+    }
+
+    #[test]
+    fn line_semantic_zone_ranges_preserve_mixed_run_bounds() {
+        let mut prompt = CellAttributes::default();
+        prompt.set_semantic_type(SemanticType::Prompt);
+        let mut input = CellAttributes::default();
+        input.set_semantic_type(SemanticType::Input);
+        let output = CellAttributes::default();
+
+        let mut line = Line::from_cells(
+            vec![
+                Cell::new('p', prompt.clone()),
+                Cell::new('s', prompt),
+                Cell::new('i', input),
+                Cell::new('o', output),
+            ],
+            SEQ_ZERO,
+        );
+        let zones = line.semantic_zone_ranges();
+
+        assert_eq!(
+            zones,
+            &[
+                ZoneRange {
+                    semantic_type: SemanticType::Prompt,
+                    range: 0..2,
+                },
+                ZoneRange {
+                    semantic_type: SemanticType::Input,
+                    range: 2..3,
+                },
+                ZoneRange {
+                    semantic_type: SemanticType::Output,
+                    range: 3..4,
+                },
+            ]
+        );
     }
 
     #[test]
