@@ -1,0 +1,378 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-attention-router-scenarios.json",
+  "title": "FrankenTerm Attention Router Scenario Inventory",
+  "description": "Static retained scenario inventory for the future attention-router JSON/TOON golden harness.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "producing_bead",
+    "parent_bead",
+    "purpose",
+    "source_policy",
+    "golden_strategy",
+    "classification_vocabulary",
+    "scenarios"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.attention_router.scenario_inventory.v1"
+    },
+    "producing_bead": {
+      "type": "string",
+      "const": "ft-x3nsb.6.1"
+    },
+    "parent_bead": {
+      "type": "string",
+      "const": "ft-x3nsb.6"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_policy": {
+      "$ref": "#/$defs/source_policy"
+    },
+    "golden_strategy": {
+      "$ref": "#/$defs/golden_strategy"
+    },
+    "classification_vocabulary": {
+      "$ref": "#/$defs/classification_vocabulary"
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "$ref": "#/$defs/scenario"
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "hyphen_identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+    },
+    "non_empty_string_array": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+      }
+    },
+    "source_policy": {
+      "type": "object",
+      "required": [
+        "raw_pane_content_allowed",
+        "secret_material_allowed",
+        "full_agent_mail_bodies_allowed",
+        "service_mutation_allowed",
+        "destructive_actions_allowed",
+        "local_cargo_proof_allowed",
+        "build_cancellation_allowed",
+        "worker_mutation_allowed",
+        "dirty_overlap_mutation_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "secret_material_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "full_agent_mail_bodies_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "service_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "destructive_actions_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_cargo_proof_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "build_cancellation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "worker_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "dirty_overlap_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "golden_strategy": {
+      "type": "object",
+      "required": [
+        "artifact_kind",
+        "formats_required",
+        "canonicalization",
+        "review_required_before_freeze",
+        "update_policy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "artifact_kind": {
+          "type": "string",
+          "const": "canonicalized_structural_golden"
+        },
+        "formats_required": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "json",
+              "toon"
+            ]
+          },
+          "allOf": [
+            {
+              "contains": {
+                "const": "json"
+              }
+            },
+            {
+              "contains": {
+                "const": "toon"
+              }
+            }
+          ]
+        },
+        "canonicalization": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "review_required_before_freeze": {
+          "type": "boolean",
+          "const": true
+        },
+        "update_policy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "classification_vocabulary": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/classification"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "const": "ready_now"
+          }
+        },
+        {
+          "contains": {
+            "const": "blocked_infra"
+          }
+        },
+        {
+          "contains": {
+            "const": "blocked_domain"
+          }
+        },
+        {
+          "contains": {
+            "const": "waiting_comm"
+          }
+        },
+        {
+          "contains": {
+            "const": "stale_claim"
+          }
+        },
+        {
+          "contains": {
+            "const": "dirty_overlap"
+          }
+        },
+        {
+          "contains": {
+            "const": "proof_starved"
+          }
+        },
+        {
+          "contains": {
+            "const": "do_not_touch"
+          }
+        }
+      ]
+    },
+    "classification": {
+      "type": "string",
+      "enum": [
+        "ready_now",
+        "blocked_infra",
+        "blocked_domain",
+        "waiting_comm",
+        "stale_claim",
+        "dirty_overlap",
+        "proof_starved",
+        "do_not_touch"
+      ]
+    },
+    "scenario": {
+      "type": "object",
+      "required": [
+        "scenario_id",
+        "title",
+        "summary",
+        "source_fixture_requirements",
+        "expected",
+        "forbidden_actions",
+        "volatility"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scenario_id": {
+          "$ref": "#/$defs/hyphen_identifier"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_fixture_requirements": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/source_fixture_requirement"
+          }
+        },
+        "expected": {
+          "$ref": "#/$defs/expected_classification"
+        },
+        "forbidden_actions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/hyphen_identifier"
+          }
+        },
+        "volatility": {
+          "$ref": "#/$defs/volatility"
+        }
+      }
+    },
+    "source_fixture_requirement": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "command_or_api",
+        "required_reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "$ref": "#/$defs/hyphen_identifier"
+        },
+        "command_or_api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required_reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "required_subjects": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "required_counters": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "expected_classification": {
+      "type": "object",
+      "required": [
+        "classification",
+        "recommended_safe_action",
+        "confidence",
+        "explanation_must_include"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "classification": {
+          "$ref": "#/$defs/classification"
+        },
+        "recommended_safe_action": {
+          "$ref": "#/$defs/identifier"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "explanation_must_include": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "volatility": {
+      "type": "object",
+      "required": [
+        "level",
+        "strategy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "strategy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

@@ -5,6 +5,10 @@ attention-router golden harness (`ft-x3nsb.6`). It is intentionally static:
 the inventory freezes the cases the router must classify before the Rust/CLI
 surface exists, while `ft-4tp7g` keeps remote Cargo proof blocked.
 
+The fixture contract is `docs/json-schema/ft-attention-router-scenarios.json`.
+It is a hand-authored Draft 2020-12 schema tracked in
+`docs/json-schema/PROVENANCE.md`.
+
 Future harnesses should turn `scenarios.v1.json` into generated JSON and TOON
 goldens by collecting reduced command artifacts, canonicalizing dynamic fields,
 and comparing the router output against each scenario's expected
@@ -15,10 +19,16 @@ Agent Mail message bodies, or unsanitized build logs.
 The inventory is static-proof only. Validating this directory requires:
 
 ```bash
+jq empty docs/json-schema/ft-attention-router-scenarios.json
 jq empty fixtures/attention-router/scenarios.v1.json
-git diff --check -- fixtures/attention-router
+jsonschema -i fixtures/attention-router/scenarios.v1.json docs/json-schema/ft-attention-router-scenarios.json
+git diff --check -- docs/json-schema/ft-attention-router-scenarios.json docs/json-schema/PROVENANCE.md fixtures/attention-router
 br dep cycles --json
 ```
+
+If the `jsonschema` CLI is not installed, the JSON parse and provenance checks
+are still useful static proof, but the schema-validation command must be rerun
+before any harness claims conformance.
 
 Do not use local Cargo as proof for this lane. Do not repair or restart Agent
 Mail, restart RCH, cancel builds, mutate workers, delete files, or touch dirty
