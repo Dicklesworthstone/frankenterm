@@ -3614,13 +3614,17 @@ The wire protocol's safety review and diff-fuzz coverage are tracked in [`docs/s
 
 ## Performance Benchmarks
 
-Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->111<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts.
+Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->111<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts. In the shared agent checkout, proof and closeout benchmark runs must go through RCH:
 
 ```bash
-cargo bench -p frankenterm-core --benches --no-run             # compile sanity check
-cargo bench -p frankenterm-core --bench pattern_detection
-cargo bench -p frankenterm-core --bench delta_extraction
-cargo bench -p frankenterm-core --bench fts_query
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-compile \
+  cargo bench -p frankenterm-core --benches --no-run             # compile sanity check
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-pattern \
+  cargo bench -p frankenterm-core --bench pattern_detection
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-delta \
+  cargo bench -p frankenterm-core --bench delta_extraction
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-fts \
+  cargo bench -p frankenterm-core --bench fts_query
 ```
 
 When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
@@ -3656,10 +3660,14 @@ The project maintains extensive test coverage:
 | Fuzz targets | <!--count:fuzz_targets-->48<!--/count--> | Security / robustness |
 
 ```bash
-cargo test --workspace                                          # all tests
-cargo test -p frankenterm-core --lib                            # core lib tests
-cargo test -p frankenterm-core --features subprocess-bridge     # specific feature
-cargo test -p frankenterm-core --test 'proptest_*'              # property tests
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
+  cargo test --workspace                                      # all tests
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-core-lib-test \
+  cargo test -p frankenterm-core --lib                        # core lib tests
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-subprocess-test \
+  cargo test -p frankenterm-core --features subprocess-bridge # specific feature
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-proptest \
+  cargo test -p frankenterm-core --test 'proptest_*'          # property tests
 ```
 
 ### Methodology playbooks

@@ -209,10 +209,13 @@ deliberately.
 8. If an upstream change conflicts with FrankenTerm architecture, do not force
    it in. Record it as skipped/deferred with the reason.
 9. Validate with the narrowest relevant proof first, usually package-scoped for
-   vendored crates (for example `cargo check -p mux --lib` and
-   `cargo test -p mux --lib` for mux-only changes). Then run broader workspace
-   checks when feasible. Report unrelated workspace or system-package blockers
-   separately from the backport result.
+   vendored crates (for example
+   `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-mux-check cargo check -p mux --lib`
+   and
+   `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-mux-test cargo test -p mux --lib`
+   for mux-only changes). Then run broader workspace checks when feasible.
+   Report unrelated workspace or system-package blockers separately from the
+   backport result.
 10. Update provenance/backport notes at the end of the batch so the next weekly
     pass knows which upstream SHAs were accepted, skipped, or deferred.
 
@@ -325,13 +328,16 @@ We do not care about backwards compatibility—we're in early development with n
 
 ```bash
 # Check for compiler errors and warnings (workspace-wide)
-cargo check --workspace --all-targets
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-check \
+  cargo check --workspace --all-targets
 
 # Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --workspace --all-targets -- -D warnings
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-clippy \
+  cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
-cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-fmt \
+  cargo fmt --check
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
@@ -1070,20 +1076,26 @@ gate vacuous-pass, redactor pattern drift), see
 
 ```bash
 # Run all tests across the workspace
-cargo test --workspace
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
+  cargo test --workspace
 
 # Run with output
-cargo test --workspace -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test-output \
+  cargo test --workspace -- --nocapture
 
 # Run tests for a specific crate
-cargo test -p frankenterm
-cargo test -p frankenterm-core
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-ft-test \
+  cargo test -p frankenterm
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-core-test \
+  cargo test -p frankenterm-core
 
 # Run specific test by name pattern
-cargo test pattern_matching
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-pattern-test \
+  cargo test pattern_matching
 
 # Run tests with all features enabled
-cargo test --workspace --all-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-all-features-test \
+  cargo test --workspace --all-features
 ```
 
 ---
@@ -1212,9 +1224,9 @@ RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation 
 
 To manually offload a build:
 ```bash
-rch exec -- cargo build --release
-rch exec -- cargo test
-rch exec -- cargo clippy
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-build cargo build --release
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-test cargo test
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-clippy cargo clippy
 ```
 
 Quick commands:
