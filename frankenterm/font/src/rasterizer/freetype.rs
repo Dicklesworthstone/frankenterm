@@ -575,8 +575,8 @@ impl<'a> Walker<'a> {
                     let grad = paint.u.sweep_gradient.as_ref();
                     log::trace!("{level:>3} {grad:?}");
                     let (x0, y0) = vector_x_y(&grad.center);
-                    let start_angle = grad.start_angle.to_num();
-                    let end_angle = grad.end_angle.to_num();
+                    let start_angle = colr_sweep_angle_to_radians(grad.start_angle.to_num());
+                    let end_angle = colr_sweep_angle_to_radians(grad.end_angle.to_num());
 
                     let paint = PaintOp::PaintSweepGradient {
                         x0,
@@ -786,6 +786,10 @@ impl<'a> Walker<'a> {
     }
 }
 
+fn colr_sweep_angle_to_radians(angle: f64) -> f64 {
+    (angle + 1.0) * PI
+}
+
 fn affine2x3_to_matrix(t: FT_Affine23) -> Matrix {
     Matrix::new(
         t.xx.to_num(),
@@ -906,4 +910,16 @@ fn record_to_cairo_surface(
     }
 
     Ok((surface, has_color))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colr_sweep_angle_to_radians_matches_spec_convention() {
+        assert!((colr_sweep_angle_to_radians(-1.0) - 0.0).abs() < f64::EPSILON);
+        assert!((colr_sweep_angle_to_radians(0.0) - PI).abs() < f64::EPSILON);
+        assert!((colr_sweep_angle_to_radians(1.0) - (2.0 * PI)).abs() < f64::EPSILON);
+    }
 }
