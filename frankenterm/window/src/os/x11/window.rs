@@ -61,6 +61,49 @@ impl CopyAndPaste {
     }
 }
 
+const X11_LINES_PER_WHEEL_TICK: i16 = 5;
+
+fn x11_button_event_kind(pressed: bool, detail: xcb::x::Button) -> Option<MouseEventKind> {
+    match detail {
+        b @ 1..=3 => {
+            let button = match b {
+                1 => MousePress::Left,
+                2 => MousePress::Middle,
+                3 => MousePress::Right,
+                _ => unreachable!(),
+            };
+            if pressed {
+                Some(MouseEventKind::Press(button))
+            } else {
+                Some(MouseEventKind::Release(button))
+            }
+        }
+        b @ 4..=5 => {
+            if !pressed {
+                return None;
+            }
+
+            Some(MouseEventKind::VertWheel(if b == 4 {
+                X11_LINES_PER_WHEEL_TICK
+            } else {
+                -X11_LINES_PER_WHEEL_TICK
+            }))
+        }
+        b @ 6..=7 => {
+            if !pressed {
+                return None;
+            }
+
+            Some(MouseEventKind::HorzWheel(if b == 6 {
+                X11_LINES_PER_WHEEL_TICK
+            } else {
+                -X11_LINES_PER_WHEEL_TICK
+            }))
+        }
+        _ => None,
+    }
+}
+
 struct DragAndDrop {
     src_window: Option<xcb::x::Window>,
     src_types: Vec<Atom>,
@@ -150,9 +193,14 @@ impl HasDisplayHandle for XWindowInner {
 
 impl HasWindowHandle for XWindowInner {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let mut handle =
-            XcbWindowHandle::new(NonZeroU32::new(self.child_id.resource_id()).expect("non-zero"));
-        handle.visual_id = NonZeroU32::new(self.conn.upgrade().unwrap().visual.visual_id());
+        let child_id =
+            NonZeroU32::new(self.child_id.resource_id()).ok_or(HandleError::Unavailable)?;
+        let Some(conn) = self.conn.upgrade() else {
+            return Err(HandleError::Unavailable);
+        };
+
+        let mut handle = XcbWindowHandle::new(child_id);
+        handle.visual_id = NonZeroU32::new(conn.visual.visual_id());
         unsafe { Ok(WindowHandle::borrow_raw(RawWindowHandle::Xcb(handle))) }
     }
 }
@@ -434,38 +482,10 @@ impl XWindowInner {
             return Ok(());
         }
 
-        let kind = match detail {
-            b @ 1..=3 => {
-                let button = match b {
-                    1 => MousePress::Left,
-                    2 => MousePress::Middle,
-                    3 => MousePress::Right,
-                    _ => unreachable!(),
-                };
-                if pressed {
-                    MouseEventKind::Press(button)
-                } else {
-                    MouseEventKind::Release(button)
-                }
-            }
-            b @ 4..=5 => {
-                if !pressed {
-                    return Ok(());
-                }
-
-                // Ideally this would be configurable, but it's currently a bit
-                // awkward to configure this layer, so let's just improve the
-                // default for now!
-                const LINES_PER_TICK: i16 = 5;
-
-                MouseEventKind::VertWheel(if b == 4 {
-                    LINES_PER_TICK
-                } else {
-                    -LINES_PER_TICK
-                })
-            }
-            _ => {
-                log::trace!("button {} is not implemented", detail);
+        let kind = match x11_button_event_kind(pressed, detail) {
+            Some(kind) => kind,
+            None => {
+                log::trace!("button {} has no X11 mouse event mapping", detail);
                 return Ok(());
             }
         };
@@ -912,7 +932,7 @@ impl XWindowInner {
         };
         let current_owner = conn
             .send_and_wait_request(&xcb::x::GetSelectionOwner { selection })
-            .unwrap()
+            .context("query X selection owner")?
             .owner();
 
         let we_own_it = self.copy_and_paste.clipboard(clipboard).is_some();
@@ -1544,7 +1564,7 @@ impl XWindow {
 
         window
             .lock()
-            .unwrap()
+            .map_err(|_| anyhow!("X11 window lock poisoned"))?
             .adjust_decorations(config.window_decorations)?;
 
         let window_handle = Window::X11(XWindow::from_id(window_id));
@@ -1621,7 +1641,11 @@ impl XWindowInner {
         let window = self.window_id;
         promise::spawn::spawn(async move {
             promise::spawn::sleep(std::time::Duration::from_secs(2)).await;
-            let conn = Connection::get().unwrap().x11();
+            let Some(connection) = Connection::get() else {
+                log::debug!("skip DestroyWindow for {window:?}; X connection is unavailable");
+                return;
+            };
+            let conn = connection.x11();
             log::trace!("close sending DestroyWindow for {:?}", window);
             conn.send_request_no_reply_log(&xcb::x::DestroyWindow { window });
         })
@@ -1922,9 +1946,10 @@ impl XWindowInner {
 
 impl HasDisplayHandle for XWindow {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-        let conn = Connection::get()
-            .expect("display_handle only callable on main thread")
-            .x11();
+        let Some(connection) = Connection::get() else {
+            return Err(HandleError::Unavailable);
+        };
+        let conn = connection.x11();
         let handle = XcbDisplayHandle::new(NonNull::new(conn.get_raw_conn() as _), conn.screen_num);
 
         unsafe { Ok(DisplayHandle::borrow_raw(RawDisplayHandle::Xcb(handle))) }
@@ -1933,13 +1958,14 @@ impl HasDisplayHandle for XWindow {
 
 impl HasWindowHandle for XWindow {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let conn = Connection::get().expect("window_handle only callable on main thread");
-        let handle = conn
-            .x11()
-            .window_by_id(self.0)
-            .expect("window handle invalid!?");
+        let Some(connection) = Connection::get() else {
+            return Err(HandleError::Unavailable);
+        };
+        let Some(handle) = connection.x11().window_by_id(self.0) else {
+            return Err(HandleError::Unavailable);
+        };
 
-        let inner = handle.lock().unwrap();
+        let inner = handle.lock().map_err(|_| HandleError::Unavailable)?;
         let handle = inner.window_handle()?;
         unsafe { Ok(WindowHandle::borrow_raw(handle.as_raw())) }
     }
@@ -1950,8 +1976,14 @@ impl WindowOps for XWindow {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
         promise::spawn::spawn(async move {
-            if let Some(handle) = Connection::get().unwrap().x11().window_by_id(window) {
-                let mut inner = handle.lock().unwrap();
+            let Some(connection) = Connection::get() else {
+                anyhow::bail!("X connection is unavailable");
+            };
+
+            if let Some(handle) = connection.x11().window_by_id(window) {
+                let mut inner = handle
+                    .lock()
+                    .map_err(|_| anyhow!("X11 window lock poisoned"))?;
                 inner.enable_opengl()
             } else {
                 anyhow::bail!("invalid window");
@@ -2117,7 +2149,9 @@ impl WindowOps for XWindow {
         let window_id = self.0;
         log::trace!("SEL: window_id={window_id:?} Window::get_clipboard {clipboard:?} called");
         let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        let Some(future) = promise.get_future() else {
+            return Future::err(anyhow!("new clipboard promise did not yield a future"));
+        };
         let pending_promise = Arc::new(Mutex::new(Some(promise)));
 
         let promise_for_request = Arc::clone(&pending_promise);
@@ -2129,7 +2163,11 @@ impl WindowOps for XWindow {
             // invalidate that state, so we always ask the X server to for
             // the selection, even if it is a little slower.
             // <https://github.com/wezterm/wezterm/issues/2110>
-            let promise = promise_for_request.lock().unwrap().take().unwrap();
+            let promise = promise_for_request
+                .lock()
+                .map_err(|_| anyhow!("clipboard promise lock poisoned"))?
+                .take()
+                .ok_or_else(|| anyhow!("clipboard promise was already consumed"))?;
             log::debug!(
                 "SEL: window_id={window_id:?} Window::get_clipboard: \
                         {clipboard:?}, prepare promise, time={}",
@@ -2153,7 +2191,11 @@ impl WindowOps for XWindow {
         let promise_on_error = Arc::clone(&pending_promise);
         promise::spawn::spawn(async move {
             if let Err(err) = window_future.await {
-                if let Some(mut promise) = promise_on_error.lock().unwrap().take() {
+                let pending = match promise_on_error.lock() {
+                    Ok(mut guard) => guard.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                if let Some(mut promise) = pending {
                     promise.err(err);
                 }
             }
@@ -2258,5 +2300,43 @@ impl NetWmStateAction {
         } else {
             Self::Remove
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x11_button_event_kind_maps_horizontal_wheel_buttons() {
+        assert_eq!(
+            x11_button_event_kind(true, 6),
+            Some(MouseEventKind::HorzWheel(X11_LINES_PER_WHEEL_TICK))
+        );
+        assert_eq!(
+            x11_button_event_kind(true, 7),
+            Some(MouseEventKind::HorzWheel(-X11_LINES_PER_WHEEL_TICK))
+        );
+    }
+
+    #[test]
+    fn x11_button_event_kind_ignores_wheel_button_release() {
+        assert_eq!(x11_button_event_kind(false, 4), None);
+        assert_eq!(x11_button_event_kind(false, 5), None);
+        assert_eq!(x11_button_event_kind(false, 6), None);
+        assert_eq!(x11_button_event_kind(false, 7), None);
+    }
+
+    #[test]
+    fn x11_button_event_kind_keeps_primary_button_press_release() {
+        assert_eq!(
+            x11_button_event_kind(true, 1),
+            Some(MouseEventKind::Press(MousePress::Left))
+        );
+        assert_eq!(
+            x11_button_event_kind(false, 1),
+            Some(MouseEventKind::Release(MousePress::Left))
+        );
+        assert_eq!(x11_button_event_kind(true, 8), None);
     }
 }
