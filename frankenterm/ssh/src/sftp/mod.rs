@@ -1,5 +1,5 @@
 use super::{SessionRequest, SessionSender};
-use crate::runtime::channel::{bounded, RecvError, Sender};
+use crate::runtime::channel::{RecvError, Sender, bounded};
 use crate::sftp::dir::{Dir, DirRequest};
 use crate::sftp::file::{File, FileRequest};
 use crate::sftp::types::{Metadata, OpenFileType, OpenOptions, RenameOptions, WriteMode};
@@ -46,9 +46,6 @@ pub enum SftpChannelError {
     #[cfg(feature = "libssh-rs")]
     #[error("Library-specific error: {}", .0)]
     LibSsh(#[source] libssh_rs::Error),
-
-    #[error("Not Implemented")]
-    NotImplemented,
 }
 
 /// Represents an open sftp channel for performing filesystem operations

@@ -1,5 +1,5 @@
 use super::{Metadata, SessionRequest, SessionSender, SftpChannelResult, SftpRequest};
-use crate::runtime::channel::{bounded, Sender};
+use crate::runtime::channel::{Sender, bounded};
 #[cfg(feature = "async-asupersync")]
 use crate::runtime::io::ReadBuf;
 use crate::runtime::io::{AsyncRead, AsyncWrite};

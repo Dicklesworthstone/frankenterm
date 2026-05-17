@@ -1,8 +1,10 @@
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
 use crate::sftp::types::{Metadata, OpenOptions, RenameOptions};
-use crate::sftp::SftpChannelResult;
+use crate::sftp::{SftpChannelError, SftpChannelResult};
 use camino::{Utf8Path, Utf8PathBuf};
+#[cfg(feature = "libssh-rs")]
+use std::io;
 
 pub(crate) enum SftpWrap {
     #[cfg(feature = "ssh2")]
@@ -14,11 +16,20 @@ pub(crate) enum SftpWrap {
 
 #[cfg(feature = "ssh2")]
 fn pathconv(path: std::path::PathBuf) -> SftpChannelResult<Utf8PathBuf> {
-    use crate::sftp::SftpChannelError;
     use std::convert::TryFrom;
     Ok(Utf8PathBuf::try_from(path).map_err(|x| {
         SftpChannelError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, x))
     })?)
+}
+
+#[cfg(feature = "libssh-rs")]
+fn libssh_mode(mode: i32, operation: &str) -> SftpChannelResult<libssh_rs::sys::mode_t> {
+    mode.try_into().map_err(|_| {
+        SftpChannelError::from(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{operation} mode {mode} cannot be represented as libssh mode_t"),
+        ))
+    })
 }
 
 impl SftpWrap {
@@ -51,7 +62,7 @@ impl SftpWrap {
                 let file = sftp.open(
                     filename.as_str(),
                     OpenFlags::from_bits_truncate(accesstype),
-                    opts.mode.try_into().unwrap(),
+                    libssh_mode(opts.mode, "open")?,
                 )?;
                 Ok(FileWrap::LibSsh {
                     file,
@@ -118,8 +129,7 @@ impl SftpWrap {
 
             #[cfg(feature = "libssh-rs")]
             Self::LibSsh(sftp) => {
-                use std::convert::TryInto;
-                Ok(sftp.create_dir(filename.as_str(), mode.try_into().unwrap())?)
+                Ok(sftp.create_dir(filename.as_str(), libssh_mode(mode, "create_dir")?)?)
             }
         }
     }
@@ -205,9 +215,12 @@ impl SftpWrap {
                 let entries = sftp.read_dir(filename.as_str())?;
                 let mut mapped_entries = vec![];
                 for metadata in entries {
-                    let path = metadata
-                        .name()
-                        .expect("name to be present in read dir results");
+                    let path = metadata.name().ok_or_else(|| {
+                        SftpChannelError::from(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SFTP directory entry missing name",
+                        ))
+                    })?;
                     if path == "." || path == ".." {
                         continue;
                     }
@@ -217,5 +230,25 @@ impl SftpWrap {
                 Ok(mapped_entries)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "libssh-rs")]
+    use super::*;
+
+    #[cfg(feature = "libssh-rs")]
+    #[test]
+    fn libssh_mode_accepts_valid_permissions() {
+        assert_eq!(libssh_mode(0o755, "test").unwrap(), 0o755);
+    }
+
+    #[cfg(feature = "libssh-rs")]
+    #[test]
+    fn libssh_mode_rejects_negative_permissions() {
+        let err = libssh_mode(-1, "test").expect_err("negative mode should fail");
+        let text = err.to_string();
+        assert!(text.contains("test mode -1"), "{text}");
     }
 }

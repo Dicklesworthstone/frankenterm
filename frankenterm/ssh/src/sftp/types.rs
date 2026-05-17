@@ -369,10 +369,9 @@ mod libssh_impl {
         }
     }
 
-    fn sys_time_to_unix(t: SystemTime) -> u64 {
+    pub(super) fn sys_time_to_unix(t: SystemTime) -> u64 {
         t.duration_since(SystemTime::UNIX_EPOCH)
-            .expect("UNIX_EPOCH < SystemTime")
-            .as_secs()
+            .map_or(0, |duration| duration.as_secs())
     }
 
     fn unix_to_sys(u: u64) -> SystemTime {
@@ -418,6 +417,18 @@ mod libssh_impl {
                 permissions,
                 atime_mtime,
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn sys_time_to_unix_saturates_pre_epoch_times() {
+            let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+            assert_eq!(sys_time_to_unix(before_epoch), 0);
         }
     }
 }
