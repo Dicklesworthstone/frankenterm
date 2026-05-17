@@ -5,6 +5,7 @@ use crate::sftp::{SftpChannelError, SftpChannelResult};
 use camino::{Utf8Path, Utf8PathBuf};
 #[cfg(feature = "libssh-rs")]
 use std::io;
+use std::convert::TryInto;
 
 pub(crate) enum SftpWrap {
     #[cfg(feature = "ssh2")]
@@ -50,7 +51,6 @@ impl SftpWrap {
                 use crate::sftp::types::WriteMode;
                 use libc::{O_APPEND, O_RDONLY, O_RDWR, O_WRONLY};
                 use libssh_rs::OpenFlags;
-                use std::convert::TryInto;
                 let accesstype = match (opts.write, opts.read) {
                     (Some(WriteMode::Append), true) => O_RDWR | O_APPEND,
                     (Some(WriteMode::Append), false) => O_WRONLY | O_APPEND,

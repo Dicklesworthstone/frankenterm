@@ -2678,7 +2678,7 @@ fn add_pane_text_summaries_source(
         } else {
             0
         };
-        let panes_for_payload = if snapshot.privacy_allowed {
+        let panes_for_payload: Vec<_> = if snapshot.privacy_allowed {
             snapshot
                 .panes
                 .iter()
@@ -4390,7 +4390,7 @@ fn collect_incident_bundle_inner(
             contract_id: "ft.swarm_incident_bundle.v1".to_string(),
             schema_version: 1,
             format_version: "1.0".to_string(),
-            bundle_id: bundle_name,
+            bundle_id: bundle_name.clone(),
             kind: opts.kind,
             created_at: exported_at.clone(),
             generator: IncidentBundleGenerator::current(),
