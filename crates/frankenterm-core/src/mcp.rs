@@ -44,10 +44,10 @@ use crate::ingest::Osc133State;
 #[cfg(test)]
 use crate::mcp_error::MCP_ERR_RESERVATION_CONFLICT;
 use crate::mcp_error::{
-    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
-    MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE,
-    MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
-    map_caut_error, map_mcp_error,
+    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INTERNAL,
+    MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
+    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError,
+    map_cass_error, map_caut_error, map_mcp_error,
 };
 use crate::patterns::{AgentType, PatternEngine};
 use crate::plan::mission_tx_compensation_inputs as mcp_build_tx_compensation_inputs;
@@ -1558,6 +1558,7 @@ mod tests {
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
+            MCP_ERR_INTERNAL,
         ];
         for code in &codes {
             assert!(
@@ -1586,6 +1587,7 @@ mod tests {
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
+            MCP_ERR_INTERNAL,
         ];
         for code in &codes {
             let suffix = &code["FT-MCP-".len()..];
@@ -3087,7 +3089,7 @@ mod tests {
     fn map_mcp_error_runtime_fallback() {
         let err = crate::Error::runtime_backend("mcp test runtime", "misc error");
         let (code, _) = map_mcp_error(&err);
-        assert_eq!(code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(code, MCP_ERR_INTERNAL);
     }
 
     // ── map_caut_error ────────────────────────────────────────────────────
@@ -3173,7 +3175,7 @@ mod tests {
     fn mcp_tool_error_from_error() {
         let err =
             McpToolError::from_error(crate::Error::runtime_backend("mcp test runtime", "oops"));
-        assert_eq!(err.code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(err.code, MCP_ERR_INTERNAL);
         assert_eq!(err.message, "Internal error");
     }
 

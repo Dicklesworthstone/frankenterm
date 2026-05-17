@@ -1425,6 +1425,7 @@ fn mcp_envelope_schema_tracks_current_core_error_codes() {
         "FT-MCP-0013",
         "FT-MCP-0014",
         "FT-MCP-0015",
+        "FT-MCP-9000",
     ]
     .into_iter()
     .collect();

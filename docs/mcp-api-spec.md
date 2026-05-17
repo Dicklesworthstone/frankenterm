@@ -229,6 +229,8 @@ All MCP errors use stable codes prefixed with `FT-MCP-`:
 | `FT-MCP-0012` | Reservation conflict | `robot.reservation_conflict` |
 | `FT-MCP-0013` | CAAM/CAUT account backend error | `robot.caut_error` |
 | `FT-MCP-0014` | CASS integration error | `robot.cass_error` |
+| `FT-MCP-0015` | Remote pane text unavailable | `robot.remote_text_unavailable` |
+| `FT-MCP-9000` | Internal MCP/server error with redacted details | Internal runtime, IO, JSON, setup, cancellation, or other unclassified failures |
 
 ## Safety & Policy
 

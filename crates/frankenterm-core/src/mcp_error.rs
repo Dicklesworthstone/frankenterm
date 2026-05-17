@@ -18,6 +18,7 @@ pub(crate) const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 pub(crate) const MCP_ERR_CASS: &str = "FT-MCP-0014";
 pub(crate) const MCP_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "FT-MCP-0015";
+pub(crate) const MCP_ERR_INTERNAL: &str = "FT-MCP-9000";
 
 #[derive(Debug)]
 pub(crate) struct McpToolError {
@@ -65,14 +66,14 @@ impl McpToolError {
 }
 
 fn redacted_mcp_error_message(error: &Error, code: &'static str) -> String {
-    // MCP_ERR_NOT_IMPLEMENTED is the catch-all bucket in `map_mcp_error`.
+    // MCP_ERR_INTERNAL is the catch-all bucket in `map_mcp_error`.
     // Any variant falling through carries unstructured Display output that
     // may expose filesystem paths (Error::Io), config paths (Error::SetupError),
     // runtime internals (Error::RuntimeOperation, Error::Cancelled), or raw
     // serde detail (Error::Json). Redact the whole bucket, not just Error::Runtime.
     match (code, error) {
         (MCP_ERR_STORAGE, _) => "Storage unavailable".to_string(),
-        (MCP_ERR_NOT_IMPLEMENTED, _) => "Internal error".to_string(),
+        (MCP_ERR_INTERNAL, _) => "Internal error".to_string(),
         (MCP_ERR_CONFIG, _) => "Configuration unavailable".to_string(),
         _ => error.to_string(),
     }
@@ -139,15 +140,15 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
         Error::Storage(_) => (MCP_ERR_STORAGE, None),
         Error::Workflow(_) => (MCP_ERR_WORKFLOW, None),
         Error::Policy(_) => (MCP_ERR_POLICY, None),
-        _ => (MCP_ERR_NOT_IMPLEMENTED, None),
+        _ => (MCP_ERR_INTERNAL, None),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
-        MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
+        MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INTERNAL,
+        MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
         MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE,
         MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
         map_caut_error, map_mcp_error,
@@ -178,6 +179,7 @@ mod tests {
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
             MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+            MCP_ERR_INTERNAL,
         ];
         let mut seen = std::collections::HashSet::new();
         for code in codes {
@@ -201,6 +203,7 @@ mod tests {
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
+            MCP_ERR_INTERNAL,
         ];
         for code in codes {
             assert!(
@@ -262,18 +265,18 @@ mod tests {
         let runtime =
             Error::runtime_backend("mcp test runtime", "tokio worker panic: internal detail");
         let runtime_err = McpToolError::from_error(runtime);
-        assert_eq!(runtime_err.code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(runtime_err.code, MCP_ERR_INTERNAL);
         assert_eq!(runtime_err.message, "Internal error");
         assert!(!runtime_err.message.contains("internal detail"));
 
-        // Every variant routed to MCP_ERR_NOT_IMPLEMENTED via the wildcard in
+        // Every variant routed to MCP_ERR_INTERNAL via the wildcard in
         // map_mcp_error must also be redacted — especially Io which leaks fs paths.
         let io = Error::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "No such file: /Users/x/.ssh/id_rsa",
         ));
         let io_err = McpToolError::from_error(io);
-        assert_eq!(io_err.code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(io_err.code, MCP_ERR_INTERNAL);
         assert_eq!(io_err.message, "Internal error");
         assert!(!io_err.message.contains("id_rsa"));
     }
@@ -361,7 +364,7 @@ mod tests {
     fn map_error_runtime_falls_through() {
         let err = Error::runtime_backend("mcp test runtime", "unexpected");
         let (code, _) = map_mcp_error(&err);
-        assert_eq!(code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(code, MCP_ERR_INTERNAL);
     }
 
     // ========================================================================
