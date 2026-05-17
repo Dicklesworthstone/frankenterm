@@ -17,7 +17,7 @@ TICK 1: dispatch initial marching orders to each pane (slug-based target dirs)
 LOOP:   every ~4 min — swarm-tick.sh → tail panes → classify → nudge idle
 NUDGE:  ntm --robot-send -t S:0.N "msg" + tmux Enter (twice for codex)
 RESET:  in_progress >2h with no commits → broadcast first, force-release after silence
-DISK:   >96% → run scripts/clean-stale-targets.sh; nudge agents to rm release/
+DISK:   >96% → inventory + dry-run stale targets; ask before deletion
 MODE:   CLAIM → REVIEW → FINAL → DRAIN; pivot when the relevant trigger fires
 DONE:   commits-1h ≤ 4 + open=0 + ready=0 + ≥2 cc panes "converged"
 END:    write SESSION SUMMARY → close beads → push → notify
@@ -48,9 +48,12 @@ Before sending the first marching order, verify the environment.
 
 **If any pre-flight check fails:**
 - rch unhealthy → for RCH-required proof lanes, record an infra-blocked
-  proof-doctor verdict; use `scripts/cargo-local.sh` only as explicitly
-  labeled local smoke when the Bead allows non-proof diagnostics.
-- Disk >90% → run `scripts/clean-stale-targets.sh` *before* dispatching work, not after.
+  proof-doctor verdict. Do not run local Cargo as a fallback; if the human
+  explicitly requests an emergency local diagnostic, record it as non-closeout
+  context only.
+- Disk >90% → run `scripts/clean-stale-targets.sh --inventory` and
+  `scripts/clean-stale-targets.sh --dry-run` before dispatching work. Do not
+  run cleanup without explicit written permission for that exact command.
 - Beads DB locked → wait 10s; if persistent, `lsof .beads/beads.db` to find writer; if no writer, the DB is corrupted (use `bv` for triage instead, per MEMORY.md note `br-db-corruption`).
 - ntm pane missing → relaunch via the project's spawn script before the swarm tick begins.
 - Agent Mail red/unreachable → retry once after a few seconds; if it still fails, do not repair, restart, or kill the shared service. Continue with a Beads-only handoff snapshot:
@@ -723,6 +726,86 @@ explanation surface and planning artifact only.
 
 ---
 
+## 2C. Attention Router Trust Boundary
+
+The planned attention router answers "what needs attention now?" for large
+swarms. Its contract is
+[`docs/robot-contracts/attention-router.md`](robot-contracts/attention-router.md)
+and the initial Beads epic is `ft-x3nsb`. Until the CLI/Robot/MCP surfaces
+ship, use this section as the operator runbook for interpreting attention
+snapshots and for writing Beads or Agent Mail handoffs that cite them.
+
+The attention router is planning-only. It may recommend a Beads claim, docs
+slice, status-check nudge, Agent Mail reply, wait action, or blocker refresh,
+but the router must not perform the mutation. Agents still run the normal
+claim, reservation, ownership, proof-doctor, and RCH gates before editing or
+closing anything.
+
+### 2C.1 Attention classifications
+
+| Classification | Operator meaning | Safe next action |
+| --- | --- | --- |
+| `ready_now` | Work is actionable and has no known owner/path conflict. | Claim or continue the Bead, reserve owned paths, and run only the proof lane the Bead requires. |
+| `blocked_infra` | RCH, Agent Mail, or another substrate blocks the work. | Refresh the blocker evidence and pick docs/static or status work that does not claim implementation proof. |
+| `blocked_domain` | Product dependencies block the work. | Work the dependency first or leave a precise dependency note. |
+| `waiting_comm` | A direct question, contact request, or `ack_required` message needs response. | Acknowledge or reply directly; do not start a conflicting edit first. |
+| `stale_claim` | In-progress ownership lacks recent Beads, Mail, git, or pane evidence. | Send a status-check comment or targeted message before any reopen or force-release request. |
+| `dirty_overlap` | Candidate paths overlap another dirty tree, reservation, or active owner. | Avoid those paths and choose a disjoint slice. |
+| `proof_starved` | Source work exists but retained RCH proof is missing, refused, or stale. | Keep the Bead open/blocked and cite the exact RCH reason code. |
+| `do_not_touch` | The suggested action would require service repair, destructive cleanup, local Cargo proof, raw pane capture, or active human/agent work. | Stop and ask only if the user explicitly assigns that exact action. |
+
+### 2C.2 Required examples
+
+Use these examples when interpreting or documenting attention-router output:
+
+| Scenario | Required interpretation |
+| --- | --- |
+| `br ready --json` is empty, but `bv --robot-triage --robot-next` points at blocked `ft-4tp7g`. | `br` controls actionability. Record `bv_br_disagreement`, treat the Bead as blocked, and pick a docs/static ready slice if one exists. |
+| RCH reports `worker=null`, `no_admissible_workers`, topology failure, critical pressure, or no retained remote Cargo. | Mark proof-heavy work as `blocked_infra` or `proof_starved`; do not run local Cargo as proof. |
+| Agent Mail has an `ack_required` message or contact request. | Classify `waiting_comm`, acknowledge or reply, then continue. If Agent Mail is unavailable after one retry, use Beads comments and the coordination-risk fallback. |
+| An in-progress Bead has no recent Beads, Mail, git, or pane evidence. | Classify `stale_claim`; post a status-check before reopening. Age alone is not enough. |
+| Dirty paths overlap a candidate Bead, reservation, or recently active owner. | Classify `dirty_overlap`; do not stash, revert, overwrite, or clean. Choose another slice or wait for handoff. |
+| The only available work is docs/static while implementation proof is blocked. | Proceed only with docs/static proof and write `Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.` |
+
+### 2C.3 Handoff citation shape
+
+When a Beads comment or Agent Mail note cites an attention-router snapshot, use
+this shape:
+
+```text
+Attention-router: contract ft.attention_router.v1; item <item_id>; classification <classification>; subject <bead-or-path>; confidence <confidence>; sources <beads,agent_mail,git,rch,robot,operating_envelope>; reason_codes <codes>; recommended_action <action_id>; side_effects_executed false; forbidden_actions <actions>; artifact <path-or-command>; closeout <safe|blocked|not_applicable>.
+```
+
+Pair docs/static work with the non-proof closeout footer:
+
+```text
+Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
+Target-dir lifecycle: not applicable; no Cargo/RCH target dir created.
+```
+
+For implementation work, attention-router output is planning context only. It
+does not prove source correctness, target-class capacity, Beads ownership, RCH
+health, or Agent Mail freshness.
+
+### 2C.4 Hard safety boundary
+
+Attention-router output must never authorize:
+
+- Agent Mail repair/restart, RCH service mutation, worker mutation, build
+  cancellation, or remote mirror mutation.
+- Destructive git commands, file deletion, target cleanup, or any cleanup of
+  another agent's work.
+- Local Cargo proof for closeout.
+- Raw pane text capture or storage.
+- Automatic Beads reopen/force-release, broad Agent Mail broadcasts, or file
+  reservation release without a future explicit policy-gated mutating command.
+
+High-scale claims remain planned unless they cite retained target-hardware or
+capacity artifacts. The attention router may say which work should get
+attention; it does not elevate a 64-core/256 GiB claim by itself.
+
+---
+
 ## 3. Tick #1 — establish baseline
 
 The first tick sets the contract for the session. Skip steps and you
@@ -829,17 +912,17 @@ If `swarm-tick.json` reports `disk_used_pct >= 96`:
 scripts/clean-stale-targets.sh --inventory --threshold-hours 12
 scripts/clean-stale-targets.sh --inventory --format json --threshold-hours 12
 scripts/clean-stale-targets.sh --dry-run --threshold-hours 12
-# Review the would-remove list; if it looks safe:
-scripts/clean-stale-targets.sh --threshold-hours 12
+# Review the would-remove list, then ask the user before cleanup.
+# Only run the cleanup command after explicit written approval for that exact scope.
 ```
 
 The inventory commands are read-only. Use the text form for human review and
 the JSON form in Beads comments when requesting deletion authorization; it
 reports per-target age, size, active-skip status, and total reclaimable bytes.
 
-Also nudge any agent whose bead is closed to clean their own
-`/tmp/ft-<slug>-target/release` directory. Per AGENTS.md Rule SO-6,
-keep the `debug` subdirectory for incremental rebuilds.
+Also nudge any agent whose bead is closed to request cleanup approval for their
+own `/tmp/ft-<slug>-target/release` directory. Per AGENTS.md Rule SO-6, keep the
+`debug` subdirectory for incremental rebuilds.
 
 ---
 
