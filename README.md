@@ -1213,20 +1213,19 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   │   │   ├── ingest.rs                 # Pane discovery + delta extraction
 │   │   │   ├── patterns.rs               # Pattern detection engine
 │   │   │   ├── events.rs                 # Event bus and detection fanout
-│   │   │   ├── storage/                  # SQLite + FTS5 (schema v26+)
+│   │   │   ├── storage/                  # SQLite + FTS5 (schema v27)
 │   │   │   ├── policy.rs                 # Safety / access control
 │   │   │   ├── redactor.rs               # Secret redaction (T1/T2/T3 tiers)
 │   │   │   ├── plan.rs                   # Mission + Tx types
 │   │   │   ├── workflows/                # Workflow engine + handlers + lock
 │   │   │   ├── search/                   # Lexical / semantic / hybrid + daemon
-│   │   │   ├── connector_*.rs            # Connector fabric
-│   │   │   ├── tx_*.rs                   # Transaction subsystem
+│   │   │   ├── connector_*.rs            # Connector fabric (14 modules)
 │   │   │   ├── scrollback_tiers.rs       # Three-tier scrollback storage
 │   │   │   ├── scan_pipeline.rs          # SIMD scan + trigger + compression
 │   │   │   ├── wire_protocol.rs          # Distributed messaging
-│   │   │   ├── operating_envelope*.rs    # ft.operating_envelope.v1 planner
-│   │   │   ├── incident_bundle*.rs       # Live incident-bundle collectors
-│   │   │   ├── mission_objective_planner.rs  # Capacity-aware objective planner
+│   │   │   ├── operating_envelope.rs     # ft.operating_envelope.v1 planner
+│   │   │   ├── incident_bundle.rs        # Live incident-bundle collectors
+│   │   │   ├── mission_objective_plan.rs # Capacity-aware objective planner
 │   │   │   └── …                         # 500+ additional modules
 │   │   ├── tests/                        # 952 Rust test files, 51k+ test annotations
 │   │   └── benches/                      # 111 Criterion benchmarks
@@ -1330,8 +1329,8 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 | **Search** (`search/`) | Lexical (FTS5), semantic (embeddings), hybrid (RRF fusion), index daemon | Storage (read), embedder daemon | Pattern matching, workflow execution |
 | **Policy engine** (`policy.rs`) | Capability gates, rate limits, approval tokens, audit trail writes, secret redaction | Storage (audit writes), Event bus (denials) | Direct pane I/O |
 | **Workflow engine** (`workflows/`) | Engine + runner + lock + handlers + trigger-policy allowlists | Event bus (subscribe to triggers), Policy gate, Pane I/O | Pattern detection |
-| **Mission engine** (`plan.rs` + `mission_*.rs`) | Mission contracts, lifecycle state machine, dispatch, objective planner | Policy gate, Workflow engine, Storage | Pane discovery |
-| **Tx engine** (`tx_*.rs`) | Prepare/commit/compensate, idempotency ledger, kill switches | Mission engine, Policy gate, Storage | Pattern detection |
+| **Mission engine** (`plan.rs`, `mission_objective_plan.rs`, `mcp_missions.rs`) | Mission contracts, lifecycle state machine, dispatch, objective planner | Policy gate, Workflow engine, Storage | Pane discovery |
+| **Tx engine** (`plan.rs::TxReceipt` + `prepared_plans` table + `workflow_action_plans` table) | Prepare/commit/compensate, idempotency ledger, kill switches | Mission engine, Policy gate, Storage | Pattern detection |
 | **Operating envelope** (`operating_envelope.rs`) | Admission decisions, fail-closed verdicts, telemetry composition | Mission engine (consumer), Diagnostics | Spawning panes, sending input |
 | **Connector fabric** (`connector_*.rs`) | Inbound/outbound bridges, mesh routing, capability envelopes, host runtime | Event bus, Policy gate, External systems | Storage management, pane I/O |
 | **Robot/MCP surface** (`robot_*.rs`, `mcp*.rs`) | JSON/TOON envelope contracts, MCP tool registration, request routing | All read+action subsystems through their public APIs | Direct storage I/O |
@@ -2165,8 +2164,11 @@ pub const SCHEMA_VERSION: i32 = 27;   // crates/frankenterm-core/src/storage/sch
 | `pane_contexts` + `context_rotations` | Native context registry for `ft robot context status / rotate / history`. |
 | `agent_profiles` + `profiles_applied_log` | Profile definitions + per-apply receipts. |
 | `session_checkpoints` + `mux_pane_state` | Session persistence (snapshots, restore IDs). |
-| `mission_*` | Mission contracts, lifecycle state, dispatch ledger. |
-| `tx_*` | Tx contracts, prepare/commit/compensate receipts, idempotency ledger. |
+| `prepared_plans` + `workflow_action_plans` | Tx prepare-phase state and pre-planned action records. Mission and Tx contracts themselves live as JSON files at `.ft/mission/active.json` and `.ft/mission/tx-active.json`; tx receipts (`TxReceipt`) are typed values persisted into those workspace contracts. |
+| `mux_sessions` + `agent_sessions` + `panes` | Live mux/session/pane registry. |
+| `notification_history` + `event_labels` + `event_notes` + `event_mutes` | Notification dedup history and event annotation. |
+| `output_gaps` + `segment_embeddings` + `fts_index_state` + `fts_pane_progress` | Capture gaps, semantic embeddings, FTS5 index health. |
+| `saved_searches` + `pane_bookmarks` + `accounts` + `action_undo` + `secret_scan_reports` + `usage_metrics` + `maintenance_log` | Operator-facing surfaces (saved queries, bookmarks, accounts, undo log, secret-scan reports, usage metrics, GC log). |
 | `ft_meta` | Single-row table holding `schema_version`, `min_compatible_ft`, `created_by_ft`. |
 
 ### Why SQLite specifically
