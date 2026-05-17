@@ -366,9 +366,19 @@ struct DecodedFrame {
     height: usize,
 }
 
+fn checked_decoded_frame_bytes(width: usize, height: usize) -> Option<usize> {
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+}
+
 impl DecodedFrame {
     fn decoded_bytes(&self) -> usize {
         self.width.saturating_mul(self.height).saturating_mul(4)
+    }
+
+    fn checked_decoded_bytes(&self) -> Option<usize> {
+        checked_decoded_frame_bytes(self.width, self.height)
     }
 }
 
@@ -1538,8 +1548,17 @@ impl GlyphCache {
                     return Ok((sprite.clone(), next, frames.load_state));
                 }
 
-                let expected_byte_size =
-                    frames.current_frame.width * frames.current_frame.height * 4;
+                let Some(expected_byte_size) = frames.current_frame.checked_decoded_bytes() else {
+                    report_frame_error(format!(
+                        "frame data dimensions overflow: {}x{}",
+                        frames.current_frame.width, frames.current_frame.height
+                    ));
+                    frames.load_state = LoadState::Failed;
+                    let frame = Image::new(1, 1);
+                    let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
+                    frame_cache.insert(hash, sprite.clone());
+                    return Ok((sprite, next, frames.load_state));
+                };
 
                 let frame_data = match frames.current_frame.lease.get_data() {
                     Ok(data) => {
@@ -2563,6 +2582,12 @@ mod tests {
         assert!(next_due.is_none());
         assert_eq!(sprite.coords.size.width, 1);
         assert_eq!(sprite.coords.size.height, 1);
+    }
+
+    #[test]
+    fn decoded_frame_checked_bytes_rejects_overflowing_dimensions() {
+        assert_eq!(checked_decoded_frame_bytes(2, 3), Some(24));
+        assert_eq!(checked_decoded_frame_bytes(usize::MAX, 2), None);
     }
 
     fn small_decoded_image() -> DecodedImage {
