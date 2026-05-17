@@ -3129,7 +3129,7 @@ Shape per `pub struct MissionTxContract` in `plan.rs`. The tx steps live **insid
       }
     ],
     "preconditions": [
-      { "type": "prompt_active", "pane_id": 1 }
+      { "prompt_active": { "pane_id": 1 } }
     ],
     "compensations": [
       {
