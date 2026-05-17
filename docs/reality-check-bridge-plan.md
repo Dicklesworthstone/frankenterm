@@ -80,16 +80,18 @@ The README and AGENTS doctrine sells ft as "asupersync-native." A workspace dep 
 ## G2 — Robot Family Closure w/ Conformance Harness (BR-RC-ROBOT-NTM)
 
 ### Reality-check finding
-- Original review finding: the checkpoint, context, work, fleet, and profile
-  robot families returned
-  `robot.not_implemented`: `checkpoint`, `context`, `work`, `fleet`, and
-  `profile`.
-- Current status: those families now have native dispatch. The current source
-  of truth is `docs/robot-contracts/current-ntm-gap-dispatch.md`, which records
-  an empty generic NTM-gap fallback set.
-- Historical context: the missing `wa-rsaf` epic identifier and old README
-  "use ntm" pointer described the pre-native-dispatch state; do not treat them
-  as current implementation guidance.
+- Historical bridge-plan snapshot, not current HEAD: G2 originally captured
+  `checkpoint`, `context`, `work`, `fleet`, and `profile` as NTM-gap robot
+  families because they still degraded through the generic
+  `robot.not_implemented` fallback at that time.
+- Current HEAD: those families now have native dispatch. The live source of
+  truth is `docs/robot-contracts/current-ntm-gap-dispatch.md`, which records an
+  empty generic NTM-gap fallback set for the graduated families. The README
+  Supported Surface Matrix also records Robot Mode as supported with the
+  NTM-gap fallback retired.
+- Historical-only references such as the missing `wa-rsaf` epic identifier and
+  old README "use ntm" pointer describe the pre-native-dispatch state; do not
+  treat them as current implementation guidance.
 
 ### Why it matters
 "Robot mode is supported" is a headline claim. The original risk was that some
