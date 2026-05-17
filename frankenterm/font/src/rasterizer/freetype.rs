@@ -1,18 +1,18 @@
 use crate::ftwrap::{
-    composite_mode_to_operator, vector_x_y, FT_Affine23, FT_ColorIndex, FT_ColorLine, FT_ColorStop,
-    FT_Fixed, FT_Get_Colorline_Stops, FT_Int32, FT_PaintExtend, IsColr1OrLater, IsSvg,
-    SelectedFontSize, FT_LOAD_NO_HINTING,
+    FT_Affine23, FT_ColorIndex, FT_ColorLine, FT_ColorStop, FT_Fixed, FT_Get_Colorline_Stops,
+    FT_Int32, FT_LOAD_NO_HINTING, FT_PaintExtend, IsColr1OrLater, IsSvg, SelectedFontSize,
+    composite_mode_to_operator, vector_x_y,
 };
 use crate::parser::ParsedFont;
 use crate::rasterizer::colr::{
-    apply_draw_ops_to_context, paint_linear_gradient, paint_radial_gradient, paint_sweep_gradient,
-    ColorLine, ColorStop, PaintOp,
+    ColorLine, ColorStop, PaintOp, apply_draw_ops_to_context, paint_linear_gradient,
+    paint_radial_gradient, paint_sweep_gradient,
 };
-use crate::rasterizer::harfbuzz::{argb_to_rgba, HarfbuzzRasterizer};
-use crate::rasterizer::{FontRasterizer, FAKE_ITALIC_SKEW};
+use crate::rasterizer::harfbuzz::{HarfbuzzRasterizer, argb_to_rgba};
+use crate::rasterizer::{FAKE_ITALIC_SKEW, FontRasterizer};
 use crate::units::*;
-use crate::{ftwrap, FontRasterizerSelection, RasterizedGlyph};
-use anyhow::{bail, Context as _};
+use crate::{FontRasterizerSelection, RasterizedGlyph, ftwrap};
+use anyhow::{Context as _, bail};
 use cairo::{Content, Context, Extend, Format, ImageSurface, Matrix, Operator, RecordingSurface};
 use config::{DisplayPixelGeometry, FreeTypeLoadFlags, FreeTypeLoadTarget};
 use freetype::{
@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::mem;
 use std::mem::MaybeUninit;
-use wezterm_color_types::{linear_u8_to_srgb8, SrgbaPixel};
+use wezterm_color_types::{SrgbaPixel, linear_u8_to_srgb8};
 
 pub struct FreeTypeRasterizer {
     has_color: bool,
