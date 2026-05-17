@@ -239,6 +239,23 @@ fn smart_match_logical_x_range(text: &str, click_logical_x: usize) -> Option<Sma
 }
 
 impl SelectionRange {
+    fn from_logical_click_range(
+        start: SelectionCoordinate,
+        logical: &mux::pane::LogicalLine,
+        click_range: Range<usize>,
+    ) -> Self {
+        if click_range.is_empty() {
+            return Self { start, end: start };
+        }
+
+        let (start_y, start_x) = logical.logical_x_to_physical_coord(click_range.start);
+        let (end_y, end_x) = logical.logical_x_to_physical_coord(click_range.end - 1);
+        Self {
+            start: SelectionCoordinate::x_y(start_x, start_y),
+            end: SelectionCoordinate::x_y(end_x, end_y),
+        }
+    }
+
     /// Create a new range that starts at the specified location
     pub fn start(start: SelectionCoordinate) -> Self {
         let end = start;
@@ -317,14 +334,7 @@ impl SelectionRange {
                 {
                     DoubleClickRange::RangeWithWrap(click_range)
                     | DoubleClickRange::Range(click_range) => {
-                        let (start_y, start_x) =
-                            logical.logical_x_to_physical_coord(click_range.start);
-                        let (end_y, end_x) =
-                            logical.logical_x_to_physical_coord(click_range.end - 1);
-                        Self {
-                            start: SelectionCoordinate::x_y(start_x, start_y),
-                            end: SelectionCoordinate::x_y(end_x, end_y),
-                        }
+                        Self::from_logical_click_range(start, &logical, click_range)
                     }
                 };
             }
@@ -556,6 +566,21 @@ mod tests {
         let click_x = 3;
 
         assert_eq!(byte_offset_for_logical_x(text, click_x), "表 ".len());
+    }
+
+    #[test]
+    fn word_click_range_empty_stays_at_clicked_point() {
+        let line: termwiz::surface::line::Line = "abc".into();
+        let logical = mux::pane::LogicalLine {
+            physical_lines: vec![line.clone()],
+            logical: line,
+            first_row: 0,
+        };
+        let start = SelectionCoordinate::x_y(1, 0);
+
+        let range = SelectionRange::from_logical_click_range(start, &logical, 0..0);
+
+        assert_eq!(range, SelectionRange { start, end: start });
     }
 
     // ----------------------------------------------------------------

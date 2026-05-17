@@ -727,12 +727,19 @@ impl Line {
             return DoubleClickRange::Range(click_col..click_col);
         }
 
+        let cells = self.visible_cells().collect::<Vec<_>>();
+        let click_col = match cells.iter().find(|cell| {
+            let start = cell.cell_index();
+            let end = start.saturating_add(cell.width().max(1));
+            start <= click_col && click_col < end
+        }) {
+            Some(cell) if is_word(cell.str()) => cell.cell_index(),
+            Some(_) | None => return DoubleClickRange::Range(click_col..click_col),
+        };
+
         let mut lower = click_col;
         let mut upper = click_col;
 
-        // TODO: look back and look ahead for cells that are hidden by
-        // a preceding multi-wide cell
-        let cells = self.visible_cells().collect::<Vec<_>>();
         for cell in &cells {
             if cell.cell_index() < click_col {
                 continue;
@@ -2797,6 +2804,28 @@ mod tests {
         let line: Line = "hello world".into();
         let r = line.compute_double_click_range(5, |s| s.chars().all(|c| c.is_alphanumeric()));
         assert_eq!(r, DoubleClickRange::Range(5..5));
+    }
+
+    #[test]
+    fn line_double_click_range_inside_wide_word_cell_uses_owner() {
+        let line = Line::from_text("中a ", &CellAttributes::default(), SEQ_ZERO, None);
+        let first = line.visible_cells().next().expect("wide first cell");
+        assert_eq!(first.width(), 2);
+
+        let r = line.compute_double_click_range(1, |s| s != " ");
+        assert_eq!(r, DoubleClickRange::Range(0..3));
+    }
+
+    #[test]
+    fn line_double_click_range_inside_wide_non_word_cell_stays_empty() {
+        let line = Line::from_text("❤a", &CellAttributes::default(), SEQ_ZERO, None);
+        let first = line.visible_cells().next().expect("wide first cell");
+        assert_eq!(first.width(), 2);
+
+        let r = line.compute_double_click_range(1, |s| {
+            s.chars().all(|c| c.is_alphanumeric())
+        });
+        assert_eq!(r, DoubleClickRange::Range(1..1));
     }
 
     #[test]
