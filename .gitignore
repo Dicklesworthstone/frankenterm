@@ -63,6 +63,8 @@ coverage/
 *.actual.plain
 *.actual.bin
 crates/frankenterm-core/tests/fixtures/mcp_manifest_no_db.actual.json
+# Proof-ledger aggregate validation scratch directories.
+*.aggregate-validation/
 
 # Temporary files
 tmp/
