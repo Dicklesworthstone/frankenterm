@@ -1,18 +1,18 @@
 {
   "schema_version": 1,
   "contract_id": "ft.operating_envelope.v1",
-  "generated_at_ms": 1778936100000,
-  "envelope_id": "healthy",
-  "objective_id": "ft-booek.1",
-  "controller_mode": "admission_preview",
+  "generated_at_ms": 1778912100000,
+  "envelope_id": "envelope-healthy",
+  "objective_id": "objective-healthy",
+  "controller_mode": "dry_run",
   "target_class": {
-    "profile": "developer_laptop",
-    "requested_agent_count": 24,
-    "requested_cpu_cores": 8,
-    "requested_memory_gib": 64,
+    "profile": "target_64_core_256g",
+    "requested_agent_count": 64,
+    "requested_cpu_cores": 64,
+    "requested_memory_gib": 256,
     "proof_state": "measured",
     "reason_codes": [
-      "target_hardware.developer_workstation"
+      "target_hardware.measured"
     ]
   },
   "input_domains": {
@@ -20,97 +20,85 @@
       "source_id": "capacity-green",
       "source_kind": "capacity_resource",
       "state": "available",
-      "freshness_state": "fresh",
-      "collected_at_ms": 1778936100000,
-      "freshness_ms": 30000,
-      "command_or_api": "ft robot perf slo-status --format json",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912100000,
+      "freshness_ms": 2000,
+      "command_or_api": "resource cockpit retained artifact",
       "evidence_level": "fixture",
       "redacted": true,
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
         "notes": [
-          "Fixture stores capacity counters only."
+          "Capacity summary stores pressure tiers only."
         ]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
-        "capacity.within_budget",
-        "source.redacted_summary_only"
+        "capacity.green",
+        "capacity.measured"
       ],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
         {
-          "evidence_id": "capacity-green-pressure",
+          "evidence_id": "evidence-capacity-green",
           "category": "capacity_pressure",
           "state": "pass",
-          "subject": "bounded agent and proof lane admission",
+          "subject": "resource cockpit",
           "reason_codes": [
-            "capacity.within_budget"
+            "capacity.green"
           ],
           "artifact_paths": [
-            "fixtures/operating-envelope/healthy.json"
+            "fixtures/operating-envelope/valid/healthy.json"
           ]
         }
       ],
       "artifact_paths": [
-        "fixtures/operating-envelope/healthy.json"
+        "fixtures/operating-envelope/valid/healthy.json"
       ]
     },
     "rch": {
-      "source_id": "rch-remote-available",
+      "source_id": "rch-healthy",
       "source_kind": "rch",
       "state": "available",
-      "freshness_state": "fresh",
-      "collected_at_ms": 1778936100000,
-      "freshness_ms": 45000,
-      "command_or_api": "rch diagnose --json --dry-run -- cargo test ...",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912100000,
+      "freshness_ms": 1000,
+      "command_or_api": "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
       "evidence_level": "fixture",
       "redacted": true,
       "redaction_posture": {
         "pane_content": "not_collected",
-        "secret_material": "not_collected",
+        "secret_material": "redacted",
         "notes": [
-          "Worker identity is omitted from the fixture."
+          "RCH summary records verdict classes, not build logs."
         ]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
-        "rch.remote_proof_available",
-        "rch.remote_cargo_reached",
-        "source.redacted_summary_only"
+        "rch.worker_selection.pass",
+        "rch.topology_preflight.pass",
+        "rch.remote_cargo_reached_true"
       ],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
         {
-          "evidence_id": "rch-worker-selection",
-          "category": "rch_worker_selection",
-          "state": "pass",
-          "subject": "remote worker selected",
-          "reason_codes": [
-            "rch.remote_proof_available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/healthy.json"
-          ]
-        },
-        {
-          "evidence_id": "rch-cargo-reached",
+          "evidence_id": "evidence-rch-cargo-reached",
           "category": "rch_cargo_reached",
           "state": "pass",
-          "subject": "remote Cargo reached",
+          "subject": "remote cargo proof",
           "reason_codes": [
-            "rch.remote_cargo_reached"
+            "rch.remote_cargo_reached_true"
           ],
           "artifact_paths": [
-            "fixtures/operating-envelope/healthy.json"
+            "fixtures/operating-envelope/valid/healthy.json"
           ]
         }
       ],
       "artifact_paths": [
-        "fixtures/operating-envelope/healthy.json"
+        "fixtures/operating-envelope/valid/healthy.json"
       ]
     },
     "beads": {
@@ -118,8 +106,8 @@
       "source_kind": "beads",
       "state": "available",
       "freshness_state": "fresh",
-      "collected_at_ms": 1778936100000,
-      "freshness_ms": 30000,
+      "collected_at_ms": 1778912100000,
+      "freshness_ms": 0,
       "command_or_api": "br ready --json",
       "evidence_level": "fixture",
       "redacted": true,
@@ -127,121 +115,163 @@
         "pane_content": "not_collected",
         "secret_material": "not_collected",
         "notes": [
-          "Fixture stores queue counts only."
+          "Beads summary records ids and statuses only."
         ]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
         "beads.ready_available",
-        "source.redacted_summary_only"
+        "assignee_overlap.none"
       ],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
         {
-          "evidence_id": "beads-ready-queue",
+          "evidence_id": "evidence-beads-ready",
           "category": "beads_ready_queue",
           "state": "pass",
-          "subject": "ready beads exist and no stale reopen is required",
+          "subject": "ready queue",
           "reason_codes": [
             "beads.ready_available"
           ],
           "artifact_paths": [
-            "fixtures/operating-envelope/healthy.json"
+            "fixtures/operating-envelope/valid/healthy.json"
           ]
         }
       ],
       "artifact_paths": [
-        "fixtures/operating-envelope/healthy.json"
+        "fixtures/operating-envelope/valid/healthy.json"
       ]
     },
     "agent_mail": {
-      "source_id": "agent-mail-available",
+      "source_id": "agent-mail-healthy",
       "source_kind": "agent_mail",
       "state": "available",
-      "freshness_state": "fresh",
-      "collected_at_ms": 1778936100000,
-      "freshness_ms": 30000,
-      "command_or_api": "fetch_inbox",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912100000,
+      "freshness_ms": 1000,
+      "command_or_api": "macro_start_session",
       "evidence_level": "fixture",
       "redacted": true,
       "redaction_posture": {
         "pane_content": "not_collected",
-        "secret_material": "not_collected",
+        "secret_material": "redacted",
         "notes": [
-          "Mailbox body content is not retained."
+          "Agent Mail summary omits message bodies."
         ]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
-        "agent_mail.available",
-        "source.redacted_summary_only"
+        "agent_mail.available"
       ],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
         {
-          "evidence_id": "agent-mail-health",
+          "evidence_id": "evidence-agent-mail",
           "category": "agent_mail_availability",
           "state": "pass",
-          "subject": "Agent Mail available",
+          "subject": "macro_start_session",
           "reason_codes": [
             "agent_mail.available"
           ],
           "artifact_paths": [
-            "fixtures/operating-envelope/healthy.json"
+            "fixtures/operating-envelope/valid/healthy.json"
           ]
         }
       ],
       "artifact_paths": [
-        "fixtures/operating-envelope/healthy.json"
+        "fixtures/operating-envelope/valid/healthy.json"
       ]
     },
     "git": {
-      "source_id": "git-clean-for-scope",
+      "source_id": "git-clean",
       "source_kind": "git",
       "state": "available",
       "freshness_state": "fresh",
-      "collected_at_ms": 1778936100000,
-      "freshness_ms": 30000,
-      "command_or_api": "git status --short --branch",
+      "collected_at_ms": 1778912100000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --untracked-files=all",
       "evidence_level": "fixture",
       "redacted": true,
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
         "notes": [
-          "Fixture stores overlap counts only."
+          "Git summary records path classes only."
         ]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
         "git.clean_for_scope",
-        "source.redacted_summary_only"
+        "dirty_overlap.none",
+        "deletion_risk.none"
       ],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
         {
-          "evidence_id": "git-dirty-tree",
+          "evidence_id": "evidence-git-clean",
           "category": "git_dirty_tree",
           "state": "pass",
-          "subject": "no overlapping dirty paths",
+          "subject": "owned paths",
           "reason_codes": [
             "git.clean_for_scope"
           ],
           "artifact_paths": [
-            "fixtures/operating-envelope/healthy.json"
+            "fixtures/operating-envelope/valid/healthy.json"
           ]
         }
       ],
       "artifact_paths": [
-        "fixtures/operating-envelope/healthy.json"
+        "fixtures/operating-envelope/valid/healthy.json"
+      ]
+    },
+    "robot_inventory": {
+      "source_id": "robot-inventory",
+      "source_kind": "robot_inventory",
+      "state": "available",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912100000,
+      "freshness_ms": 2500,
+      "command_or_api": "ft robot --format toon state",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Robot inventory fixture omits pane text."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "robot.inventory_available",
+        "robot.raw_pane_text_skipped"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-robot-inventory",
+          "category": "robot_inventory",
+          "state": "pass",
+          "subject": "pane inventory",
+          "reason_codes": [
+            "robot.inventory_available"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/healthy.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/healthy.json"
       ]
     }
   },
   "decision": {
-    "decision_id": "healthy-admit",
+    "decision_id": "decision-healthy",
     "outcome": "admit",
     "envelope_tier": "green",
     "confidence": "measured",
@@ -249,22 +279,22 @@
     "rch_proof_state": "measured",
     "agent_mail_state": "available",
     "dirty_tree_state": "clean",
-    "max_parallel_agents": 24,
-    "max_parallel_proofs": 2,
+    "max_parallel_agents": 32,
+    "max_parallel_proofs": 8,
     "reason_codes": [
-      "envelope.all_required_sources_available",
-      "capacity.within_budget",
-      "rch.remote_proof_available"
+      "capacity.green",
+      "rch.remote_cargo_reached_true",
+      "git.clean_for_scope"
     ]
   },
   "admission_windows": [
     {
-      "window_id": "healthy-open",
-      "window_class": "open",
-      "starts_at_ms": 1778936100000,
-      "expires_at_ms": 1778937900000,
-      "max_parallel_agents": 24,
-      "max_parallel_proofs": 2,
+      "window_id": "window-healthy",
+      "window_class": "rch_proof_allowed",
+      "starts_at_ms": 1778912100000,
+      "expires_at_ms": 1778912400000,
+      "max_parallel_agents": 32,
+      "max_parallel_proofs": 8,
       "permitted_action_classes": [
         "read_status",
         "claim_bead",
@@ -274,26 +304,29 @@
         "run_rch_proof"
       ],
       "forbidden_action_classes": [
+        "local_cargo_proof",
+        "raw_pane_content",
+        "pane_mutation",
+        "service_mutation",
+        "service_restart",
+        "destructive_filesystem",
+        "destructive_git",
         "agent_mail_repair",
         "build_cancellation",
-        "local_cargo_proof",
-        "raw_pane_content_capture",
-        "raw_pane_content",
         "rch_daemon_restart",
-        "service_mutation",
-        "pane_mutation",
-        "destructive_filesystem",
-        "worker_drain"
+        "worker_drain",
+        "raw_pane_content_capture"
       ],
       "source_ids": [
         "capacity-green",
-        "rch-remote-available",
+        "rch-healthy",
         "beads-ready",
-        "agent-mail-available",
-        "git-clean-for-scope"
+        "agent-mail-healthy",
+        "git-clean"
       ],
       "reason_codes": [
-        "envelope.all_required_sources_available"
+        "envelope.admit",
+        "proof.remote_only"
       ]
     }
   ],
@@ -302,9 +335,10 @@
     "stale_signal_behavior": "lower_envelope",
     "contradictory_signal_behavior": "block",
     "privacy_redaction_behavior": "lower_envelope",
-    "target_hardware_gap_behavior": "not_applicable",
+    "target_hardware_gap_behavior": "defer_target_class_claim",
     "reason_codes": [
-      "fail_closed.missing_signals_lower_envelope"
+      "fail_closed.lower_missing",
+      "fail_closed.block_contradiction"
     ]
   },
   "side_effect_policy": {
@@ -316,21 +350,20 @@
     "local_cargo_proof_allowed": false
   },
   "redaction_policy": {
-    "policy_id": "redacted-summary-only",
+    "policy_id": "ft.redaction.operating_envelope.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
     "notes": [
-      "Fixtures store redacted summaries and counters only."
+      "Envelope stores source summaries and reason codes only."
     ]
   },
   "raw_pane_content_stored": false,
   "reason_codes": [
-    "envelope.all_required_sources_available",
-    "policy.no_local_cargo_proof",
+    "envelope.admit",
     "source.redacted_summary_only"
   ],
   "artifact_paths": [
     "docs/json-schema/ft-operating-envelope.json",
-    "fixtures/operating-envelope/healthy.json"
+    "fixtures/operating-envelope/valid/healthy.json"
   ]
 }

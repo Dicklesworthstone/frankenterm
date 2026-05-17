@@ -1,97 +1,324 @@
 {
   "schema_version": 1,
   "contract_id": "ft.operating_envelope.v1",
-  "generated_at_ms": 1778936220000,
-  "envelope_id": "rch-no-worker",
-  "scope": {
-    "objective": "Decide whether remote proof lanes can start when worker selection rejects all candidates.",
-    "target_class": "developer_workstation",
-    "host_class": "mac-mini-local-plus-rch",
-    "dry_run_only": true,
-    "mutation_allowed": false
+  "generated_at_ms": 1778912220000,
+  "envelope_id": "envelope-rch-no-worker",
+  "objective_id": "objective-rch-no-worker",
+  "controller_mode": "dry_run",
+  "target_class": {
+    "profile": "target_64_core_256g",
+    "requested_agent_count": 64,
+    "requested_cpu_cores": 64,
+    "requested_memory_gib": 256,
+    "proof_state": "unavailable",
+    "reason_codes": [
+      "target_hardware.proof_unavailable"
+    ]
   },
-  "source_policy": {
-    "raw_pane_content_allowed": false,
-    "service_mutation_allowed": false,
-    "destructive_actions_allowed": false,
-    "local_cargo_proof_allowed": false,
-    "unproven_signal_policy": "lower_envelope"
-  },
-  "sources": [
-    {
-      "source_id": "rch-no-workers-passed-health",
+  "input_domains": {
+    "capacity_resource": {
+      "source_id": "capacity-unknown",
+      "source_kind": "capacity_resource",
+      "state": "degraded",
+      "freshness_state": "unknown",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "resource cockpit unavailable",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Capacity cannot be trusted without proof worker state."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "capacity.unavailable",
+        "capacity.remote_proof_unavailable"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": "Remote proof worker health did not pass.",
+      "evidence": [
+        {
+          "evidence_id": "evidence-capacity-proof-unavailable",
+          "category": "capacity_pressure",
+          "state": "unknown",
+          "subject": "target-class capacity",
+          "reason_codes": [
+            "capacity.remote_proof_unavailable"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-no-worker.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-no-worker.json"
+      ]
+    },
+    "rch": {
+      "source_id": "rch-no-worker",
       "source_kind": "rch",
       "state": "blocked",
       "freshness_state": "fresh",
-      "collected_at_ms": 1778936220000,
-      "command_or_api": "rch diagnose --json --dry-run -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
+      "collected_at_ms": 1778912220000,
+      "freshness_ms": 0,
+      "command_or_api": "rch diagnose --json --dry-run",
       "evidence_level": "fixture",
       "redacted": true,
-      "unsafe_to_admit": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "RCH blocker class is retained without Cargo output."
+        ]
+      },
+      "raw_pane_content_stored": false,
       "reason_codes": [
         "rch.no_workers_passed_health",
         "rch.remote_cargo_reached_false",
-        "source.redacted_summary_only"
+        "local_cargo.forbidden"
       ],
-      "summary": "RCH classifies the command as a proof lane but selects no worker.",
-      "counters": {
-        "workers_healthy_reported": 5,
-        "selected_workers": 0,
-        "remote_cargo_reached": 0
-      },
-      "degraded_reason": "No remote proof lane can be counted because Cargo was not reached.",
+      "unavailable_reason": null,
+      "degraded_reason": "No RCH worker passed health for this project.",
+      "evidence": [
+        {
+          "evidence_id": "evidence-rch-no-worker",
+          "category": "rch_worker_selection",
+          "state": "blocked",
+          "subject": "worker selection",
+          "reason_codes": [
+            "rch.no_workers_passed_health"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-no-worker.json"
+          ]
+        }
+      ],
       "artifact_paths": [
-        "fixtures/operating-envelope/rch-no-worker.json"
+        "fixtures/operating-envelope/valid/rch-no-worker.json"
+      ]
+    },
+    "beads": {
+      "source_id": "beads-rch-blocker",
+      "source_kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912220000,
+      "freshness_ms": 0,
+      "command_or_api": "br show ft-4tp7g --json",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Beads records blocked proof lane."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.blocked_rch_substrate"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-beads-blocked-rch",
+          "category": "beads_blocked_queue",
+          "state": "warn",
+          "subject": "ft-4tp7g",
+          "reason_codes": [
+            "beads.blocked_rch_substrate"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-no-worker.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-no-worker.json"
+      ]
+    },
+    "agent_mail": {
+      "source_id": "agent-mail-not-required",
+      "source_kind": "agent_mail",
+      "state": "not_collected",
+      "freshness_state": "not_collected",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "not collected for RCH-only fixture",
+      "evidence_level": "not_collected",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Fixture does not require mailbox state."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.not_collected",
+        "fail_closed.lower_missing"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-not-collected",
+          "category": "agent_mail_availability",
+          "state": "not_applicable",
+          "subject": "agent mail",
+          "reason_codes": [
+            "agent_mail.not_collected"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-no-worker.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-no-worker.json"
+      ]
+    },
+    "git": {
+      "source_id": "git-non-overlap",
+      "source_kind": "git",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912220000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --untracked-files=all",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Dirty paths do not matter while RCH is blocked."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.dirty_non_overlap",
+        "dirty_overlap.none"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-git-non-overlap",
+          "category": "dirty_path_overlap",
+          "state": "pass",
+          "subject": "proof lane paths",
+          "reason_codes": [
+            "dirty_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-no-worker.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-no-worker.json"
+      ]
+    }
+  },
+  "decision": {
+    "decision_id": "decision-rch-no-worker",
+    "outcome": "defer",
+    "envelope_tier": "red",
+    "confidence": "unavailable",
+    "target_hardware_state": "unavailable",
+    "rch_proof_state": "unavailable",
+    "agent_mail_state": "not_collected",
+    "dirty_tree_state": "dirty_non_overlap",
+    "max_parallel_agents": 0,
+    "max_parallel_proofs": 0,
+    "reason_codes": [
+      "rch.no_workers_passed_health",
+      "rch.remote_cargo_reached_false",
+      "local_cargo.forbidden"
+    ]
+  },
+  "admission_windows": [
+    {
+      "window_id": "window-rch-no-worker",
+      "window_class": "defer",
+      "starts_at_ms": null,
+      "expires_at_ms": null,
+      "max_parallel_agents": 0,
+      "max_parallel_proofs": 0,
+      "permitted_action_classes": [
+        "read_status",
+        "add_beads_comment",
+        "wait"
+      ],
+      "forbidden_action_classes": [
+        "claim_bead",
+        "edit_files",
+        "run_rch_proof",
+        "local_cargo_proof",
+        "raw_pane_content",
+        "pane_mutation",
+        "service_mutation",
+        "service_restart",
+        "destructive_filesystem",
+        "destructive_git",
+        "agent_mail_repair",
+        "build_cancellation",
+        "rch_daemon_restart",
+        "worker_drain",
+        "raw_pane_content_capture"
+      ],
+      "source_ids": [
+        "rch-no-worker",
+        "beads-rch-blocker",
+        "capacity-unknown"
+      ],
+      "reason_codes": [
+        "envelope.defer",
+        "proof.remote_unavailable"
       ]
     }
   ],
-  "admission_window": {
-    "state": "pause",
-    "max_new_agents": 0,
-    "max_remote_proof_lanes": 0,
-    "queue_recommendation": "wait_for_recovery",
+  "fail_closed_policy": {
+    "missing_signal_behavior": "lower_envelope",
+    "stale_signal_behavior": "lower_envelope",
+    "contradictory_signal_behavior": "block",
+    "privacy_redaction_behavior": "lower_envelope",
+    "target_hardware_gap_behavior": "defer_target_class_claim",
     "reason_codes": [
-      "rch.no_workers_passed_health",
-      "rch.remote_cargo_reached_false"
-    ],
-    "expires_at_ms": null
-  },
-  "proof_lane_policy": {
-    "cargo_required_via_rch": true,
-    "local_cargo_proof_allowed": false,
-    "remote_cargo_reached": false,
-    "remote_rustc_reached": false,
-    "test_binary_reached": false,
-    "blocker_codes": [
-      "rch.no_workers_passed_health",
-      "guardrail.no_local_cargo_proof"
+      "fail_closed.lower_missing",
+      "proof.no_local_cargo_fallback"
     ]
   },
-  "guardrails": {
-    "forbidden_actions": [
-      "agent_mail_repair",
-      "build_cancellation",
-      "destructive_git",
-      "local_cargo_proof",
-      "raw_pane_content_capture",
-      "rch_daemon_restart",
-      "service_restart",
-      "worker_drain"
-    ],
-    "required_approvals": [
-      "rch.recovery_required_before_proof"
-    ]
+  "side_effect_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "pane_mutation_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
   },
-  "redaction": {
-    "redacted": true,
-    "raw_pane_content_stored": false,
-    "secret_material_stored": false,
+  "redaction_policy": {
+    "policy_id": "ft.redaction.operating_envelope.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
     "notes": [
-      "Worker details are summarized as counts and reason codes."
+      "RCH fixture retains blocker class only."
     ]
   },
+  "raw_pane_content_stored": false,
+  "reason_codes": [
+    "envelope.defer",
+    "rch.no_workers_passed_health"
+  ],
   "artifact_paths": [
     "docs/json-schema/ft-operating-envelope.json",
-    "fixtures/operating-envelope/rch-no-worker.json"
+    "fixtures/operating-envelope/valid/rch-no-worker.json"
   ]
 }

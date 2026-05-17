@@ -1,98 +1,324 @@
 {
   "schema_version": 1,
   "contract_id": "ft.operating_envelope.v1",
-  "generated_at_ms": 1778936400000,
-  "envelope_id": "target-class-skipped",
-  "scope": {
-    "objective": "Avoid promoting target-class 256GB/64-core claims without retained target-class evidence.",
-    "target_class": "target_256gb_64core",
-    "host_class": "local_degraded",
-    "dry_run_only": true,
-    "mutation_allowed": false
+  "generated_at_ms": 1778912400000,
+  "envelope_id": "envelope-target-hardware-skipped",
+  "objective_id": "objective-target-hardware-skipped",
+  "controller_mode": "attestation_preview",
+  "target_class": {
+    "profile": "target_64_core_256g",
+    "requested_agent_count": 128,
+    "requested_cpu_cores": 64,
+    "requested_memory_gib": 256,
+    "proof_state": "skipped_not_proven",
+    "reason_codes": [
+      "target_hardware.skipped_not_proven",
+      "capacity.target_class_unproven"
+    ]
   },
-  "source_policy": {
-    "raw_pane_content_allowed": false,
-    "service_mutation_allowed": false,
-    "destructive_actions_allowed": false,
-    "local_cargo_proof_allowed": false,
-    "unproven_signal_policy": "lower_envelope"
-  },
-  "sources": [
-    {
-      "source_id": "target-class-hardware",
-      "source_kind": "resource_pressure",
-      "state": "skipped",
-      "freshness_state": "not_collected",
-      "collected_at_ms": null,
-      "command_or_api": "target-class retained proof lookup",
-      "evidence_level": "not_collected",
+  "input_domains": {
+    "capacity_resource": {
+      "source_id": "capacity-simulated",
+      "source_kind": "capacity_resource",
+      "state": "degraded",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912400000,
+      "freshness_ms": 3000,
+      "command_or_api": "simulated capacity fixture",
+      "evidence_level": "fixture",
       "redacted": true,
-      "unsafe_to_admit": true,
-      "reason_codes": [
-        "target_class.hardware_not_available",
-        "attestation.skipped_not_proven",
-        "source.redacted_summary_only"
-      ],
-      "summary": "No retained target-class hardware run is available for this envelope.",
-      "counters": {
-        "target_ram_gb": 256,
-        "target_cpu_cores": 64,
-        "retained_target_class_artifacts": 0
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Simulated capacity cannot prove target-class admission."
+        ]
       },
-      "degraded_reason": "High-scale claims must remain skipped until retained target-class evidence exists.",
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "capacity.simulated",
+        "target_hardware.skipped_not_proven",
+        "capacity.target_class_unproven"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": "Capacity is simulated rather than measured on target hardware.",
+      "evidence": [
+        {
+          "evidence_id": "evidence-target-hardware-skipped",
+          "category": "target_hardware",
+          "state": "warn",
+          "subject": "64-core 256GiB target class",
+          "reason_codes": [
+            "target_hardware.skipped_not_proven"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+          ]
+        }
+      ],
       "artifact_paths": [
-        "fixtures/operating-envelope/target-class-skipped.json"
+        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+      ]
+    },
+    "rch": {
+      "source_id": "rch-available-non-target",
+      "source_kind": "rch",
+      "state": "available",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912400000,
+      "freshness_ms": 1500,
+      "command_or_api": "rch status --json",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "RCH is healthy but not proven on target-class hardware."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.worker_selection.pass",
+        "target_hardware.not_target_class"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-rch-non-target",
+          "category": "rch_worker_selection",
+          "state": "warn",
+          "subject": "non-target worker",
+          "reason_codes": [
+            "target_hardware.not_target_class"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+      ]
+    },
+    "beads": {
+      "source_id": "beads-target-class-plan",
+      "source_kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912400000,
+      "freshness_ms": 0,
+      "command_or_api": "br ready --json",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Target-class planning bead exists."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_available"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-beads-target-plan",
+          "category": "beads_ready_queue",
+          "state": "pass",
+          "subject": "target-class planning",
+          "reason_codes": [
+            "beads.ready_available"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+      ]
+    },
+    "agent_mail": {
+      "source_id": "agent-mail-available",
+      "source_kind": "agent_mail",
+      "state": "available",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912400000,
+      "freshness_ms": 1000,
+      "command_or_api": "fetch_inbox",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "Mailbox summary only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.available"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-target",
+          "category": "agent_mail_availability",
+          "state": "pass",
+          "subject": "fetch_inbox",
+          "reason_codes": [
+            "agent_mail.available"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+      ]
+    },
+    "git": {
+      "source_id": "git-clean-target",
+      "source_kind": "git",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912400000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --untracked-files=all",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Clean for target-class planning docs."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.clean_for_scope",
+        "dirty_overlap.none"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-git-target-clean",
+          "category": "dirty_path_overlap",
+          "state": "pass",
+          "subject": "target-class docs",
+          "reason_codes": [
+            "dirty_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
+      ]
+    }
+  },
+  "decision": {
+    "decision_id": "decision-target-hardware-skipped",
+    "outcome": "defer",
+    "envelope_tier": "orange",
+    "confidence": "mixed",
+    "target_hardware_state": "skipped_not_proven",
+    "rch_proof_state": "simulated",
+    "agent_mail_state": "available",
+    "dirty_tree_state": "clean",
+    "max_parallel_agents": 8,
+    "max_parallel_proofs": 1,
+    "reason_codes": [
+      "target_hardware.skipped_not_proven",
+      "capacity.target_class_unproven",
+      "envelope.defer"
+    ]
+  },
+  "admission_windows": [
+    {
+      "window_id": "window-target-hardware-skipped",
+      "window_class": "static_only",
+      "starts_at_ms": 1778912400000,
+      "expires_at_ms": 1778912700000,
+      "max_parallel_agents": 8,
+      "max_parallel_proofs": 1,
+      "permitted_action_classes": [
+        "read_status",
+        "add_beads_comment",
+        "create_bead",
+        "run_static_check"
+      ],
+      "forbidden_action_classes": [
+        "claim_bead",
+        "edit_files",
+        "run_rch_proof",
+        "local_cargo_proof",
+        "raw_pane_content",
+        "pane_mutation",
+        "service_mutation",
+        "service_restart",
+        "destructive_filesystem",
+        "destructive_git",
+        "agent_mail_repair",
+        "build_cancellation",
+        "rch_daemon_restart",
+        "worker_drain",
+        "raw_pane_content_capture"
+      ],
+      "source_ids": [
+        "capacity-simulated",
+        "rch-available-non-target",
+        "beads-target-class-plan"
+      ],
+      "reason_codes": [
+        "target_hardware.skipped_not_proven",
+        "proof.static_only"
       ]
     }
   ],
-  "admission_window": {
-    "state": "blocked",
-    "max_new_agents": 0,
-    "max_remote_proof_lanes": 0,
-    "queue_recommendation": "manual_review",
+  "fail_closed_policy": {
+    "missing_signal_behavior": "lower_envelope",
+    "stale_signal_behavior": "lower_envelope",
+    "contradictory_signal_behavior": "block",
+    "privacy_redaction_behavior": "lower_envelope",
+    "target_hardware_gap_behavior": "defer_target_class_claim",
     "reason_codes": [
-      "target_class.hardware_not_available",
-      "attestation.skipped_not_proven"
-    ],
-    "expires_at_ms": null
-  },
-  "proof_lane_policy": {
-    "cargo_required_via_rch": true,
-    "local_cargo_proof_allowed": false,
-    "remote_cargo_reached": false,
-    "remote_rustc_reached": false,
-    "test_binary_reached": false,
-    "blocker_codes": [
-      "target_class.hardware_not_available",
-      "attestation.skipped_not_proven",
-      "guardrail.no_local_cargo_proof"
+      "fail_closed.defer_target_class_claim"
     ]
   },
-  "guardrails": {
-    "forbidden_actions": [
-      "agent_mail_repair",
-      "build_cancellation",
-      "destructive_git",
-      "local_cargo_proof",
-      "raw_pane_content_capture",
-      "rch_daemon_restart",
-      "service_restart",
-      "worker_drain"
-    ],
-    "required_approvals": [
-      "target_class.retained_artifact_required"
-    ]
+  "side_effect_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "pane_mutation_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
   },
-  "redaction": {
-    "redacted": true,
-    "raw_pane_content_stored": false,
-    "secret_material_stored": false,
+  "redaction_policy": {
+    "policy_id": "ft.redaction.operating_envelope.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
     "notes": [
-      "This fixture prevents local degraded evidence from backing target-class claims."
+      "Target-class fixture stores proof posture, not raw worker logs."
     ]
   },
+  "raw_pane_content_stored": false,
+  "reason_codes": [
+    "envelope.defer",
+    "target_hardware.skipped_not_proven"
+  ],
   "artifact_paths": [
     "docs/json-schema/ft-operating-envelope.json",
-    "fixtures/operating-envelope/target-class-skipped.json"
+    "fixtures/operating-envelope/valid/target-hardware-skipped.json"
   ]
 }
