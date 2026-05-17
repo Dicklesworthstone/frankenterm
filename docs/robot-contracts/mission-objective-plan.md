@@ -96,6 +96,16 @@ static checks. `service_mutation` remains forbidden by default.
 5. `service_mutation` covers Agent Mail and RCH restart/repair/drain/update
    actions and is forbidden by default.
 
+## Operator Runbook
+
+Operational use of objective-plan is documented in
+[`docs/operator-runbook.md`](../operator-runbook.md#2b-mission-objective-planner-safety-gate).
+That runbook is the source for degraded workflows: no ready Beads, Agent Mail
+unavailable, RCH proof outage, dirty overlap, stale ownership, and
+capacity-pressure admission. The important rule is unchanged: an objective plan
+is an explanation artifact, not permission to mutate panes, claim Beads, repair
+services, cancel builds, or count local Cargo as proof.
+
 ## Golden Fixtures
 
 The initial fixtures live under `fixtures/mission-planner/objective-plan/`:

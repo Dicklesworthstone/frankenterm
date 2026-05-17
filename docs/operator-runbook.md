@@ -615,6 +615,114 @@ test.
 
 ---
 
+## 2B. Mission Objective Planner Safety Gate
+
+`ft mission objective-plan` is the operator-facing dry-run planner for turning
+a high-level objective into ranked next steps. The contract is
+`ft.mission_objective_plan.v1`; its schema is
+`docs/json-schema/ft-mission-objective-plan.json`, and the Robot/MCP contract is
+[`docs/robot-contracts/mission-objective-plan.md`](robot-contracts/mission-objective-plan.md).
+
+Use it when an operator asks "what should the swarm do next?" or when the ready
+queue is empty and the next action is not obvious. Do not use it as an execution
+grant. A plan can recommend a Beads claim, Beads comment, docs/static slice, or
+RCH proof lane, but the operator or agent still has to perform the normal claim,
+reservation, ownership, and proof gates before mutating anything.
+
+Current status: the dry-run CLI, Robot, and MCP surfaces are shipped, and the
+golden corpus exists under `fixtures/mission-planner/objective-plan-corpus/`.
+The corpus/proof Bead `ft-auy2g.5` still blocks final runbook closeout, so this
+section is operating guidance for the shipped dry-run surface, not a release
+attestation.
+
+### 2B.1 Trust boundaries
+
+| Domain | Planner boundary |
+| --- | --- |
+| Objective text | Intent only. It is not a Beads claim, a pane command, or proof that the requested work is safe. |
+| Beads/BV | Source of ready, blocked, in-progress, stale, and dependency state. `br ready --json` returning `[]` means "no ready Beads," not "no work." |
+| Agent Mail | Coordination freshness signal. Red or degraded mail lowers confidence and switches handoff to Beads comments; it never permits service repair/restart. |
+| RCH | Proof availability signal. `worker=null`, topology failure, or critical pressure makes proof lanes unavailable; local Cargo remains forbidden as closeout proof. |
+| Git | Dirty-tree attribution signal. Any overlap with candidate paths produces a wait/dirty-overlap plan until ownership is clear. |
+| Robot/pane inventory | Occupancy metadata only. Raw pane content is not collected for objective planning. |
+| Capacity and operating envelope | Admission constraint. Missing, stale, or red capacity input reduces the plan to docs/static/status work. |
+
+### 2B.2 Safe degraded workflows
+
+| Planner state | Safe operator action |
+| --- | --- |
+| `actionable` | Claim the Bead explicitly, reserve touched files, run the narrow proof lane required by that Bead, and cite the plan artifact as planning context only. |
+| `planning_only` | Refine the objective, gather missing source snapshots, or do docs/static prework that does not claim implementation is complete. |
+| `no_ready_work` | Run robot-mode `bv` triage, inspect open planning/docs Beads, and choose only a non-overlapping static slice unless the user assigns blocked implementation work. |
+| `waiting_owner` | Post a status-check comment or targeted Agent Mail note. Do not reopen or edit the owned path until the owner is stale and dirty-path overlap is resolved. |
+| `dirty_overlap` | Stop before editing. Identify the owner from Beads, reservations, or git history; pick a different slice or wait for handoff. |
+| `rch_substrate_blocked` | Keep proof Beads blocked with reason codes and dry-run artifacts. Docs/static changes may proceed with `Proof-doctor: not applicable`. |
+| `degraded` | Continue only with actions whose required sources are still trustworthy. Mark unavailable sources in the Beads comment. |
+| `unavailable` | Do not act on the plan. Refresh source snapshots or fall back to the lower-level runbook steps above. |
+
+### 2B.3 Surface examples
+
+Human surface:
+
+```bash
+ft mission objective-plan --objective "pick the next safe docs/static slice" --format json
+```
+
+Robot surface:
+
+```bash
+ft robot mission objective-plan --objective "recover from no ready beads" --format toon
+```
+
+MCP surface:
+
+```text
+tool: wa.mission_objective_plan {"objective":"recover from no ready beads"}
+resource: wa://mission/objective-plan/recover%20from%20no%20ready%20beads
+```
+
+Expected safety fields in any projection:
+
+```text
+contract_id=ft.mission_objective_plan.v1
+dry_run=true
+side_effects_executed=false
+raw_pane_content_stored=false
+forbidden_actions includes service_mutation, destructive, local_cargo_proof, raw_pane_content
+```
+
+### 2B.4 Moving from plan to work
+
+Before implementing a planned step:
+
+1. Re-read the target Bead with `br show <id> --json`.
+2. Confirm `git status --short` and file reservations do not overlap another
+   active owner.
+3. Claim or comment the Bead explicitly. A plan artifact is not a claim.
+4. Reserve only the paths you will edit.
+5. Run docs/static checks locally only for docs/static work. Any Cargo, clippy,
+   test, bench, E2E, or target-class proof remains RCH-only.
+6. Keep proof-doctor language separate from the objective-plan citation.
+
+Use this Beads/attestation citation shape:
+
+```text
+Mission-objective-plan: contract ft.mission_objective_plan.v1; objective <summary>; status <plan_status>; reason_codes <codes>; artifact <path-or-command>; sources <beads,rch,agent_mail,git,capacity,robot>; dry_run true; side_effects_executed false; raw_pane_content_stored false; closeout <safe|blocked|not_applicable>.
+```
+
+For docs/static prework on a dependency-blocked planner Bead, pair it with:
+
+```text
+Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
+Target-dir lifecycle: not applicable; no Cargo/RCH target dir created.
+```
+
+Do not cite `ft mission objective-plan` as proof that target-class capacity,
+source correctness, RCH health, or Beads ownership is green. It is an
+explanation surface and planning artifact only.
+
+---
+
 ## 3. Tick #1 — establish baseline
 
 The first tick sets the contract for the session. Skip steps and you
