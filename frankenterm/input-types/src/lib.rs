@@ -1943,10 +1943,8 @@ impl KeyEvent {
                     return output;
                 }
 
-                // FIXME: ideally we'd get the correct unshifted key from
-                // the OS based on the current keyboard layout. That needs
-                // more plumbing, so for now, we're assuming the US layout.
-                let c = us_layout_unshift(shifted_key);
+                let c = layout_unshifted_char(self.raw.as_ref(), shifted_key)
+                    .unwrap_or_else(|| ansi_us_unshift_fallback(shifted_key));
 
                 let base_layout = self
                     .raw
@@ -2218,12 +2216,29 @@ impl FromDynamic for IntegratedTitleButtonStyle {
     }
 }
 
-/// Kitty wants us to report the un-shifted version of a key.
-/// It's a PITA to obtain that from the OS-dependent keyboard
-/// layout stuff. For the moment, we'll do the slightly gross
-/// thing and make an assumption that a US ANSI layout is in
-/// use; this function encodes that mapping.
-fn us_layout_unshift(c: char) -> char {
+fn layout_unshifted_char(raw: Option<&RawKeyEvent>, shifted_key: char) -> Option<char> {
+    let raw = raw?;
+    let raw_key = match &raw.key {
+        KeyCode::Char(raw_key) => *raw_key,
+        _ => return None,
+    };
+
+    if raw_key.is_control() {
+        return None;
+    }
+
+    let fallback = ansi_us_unshift_fallback(shifted_key);
+    if raw_key == shifted_key && fallback != shifted_key {
+        return None;
+    }
+
+    Some(raw_key)
+}
+
+/// Kitty wants the layout-specific unshifted key in the primary field of
+/// alternate-key reports. Callers should prefer OS/raw event data first; this
+/// is only the explicit ANSI-US compatibility fallback for paths without it.
+pub fn ansi_us_unshift_fallback(c: char) -> char {
     match c {
         '!' => '1',
         '@' => '2',
@@ -2248,11 +2263,7 @@ fn us_layout_unshift(c: char) -> char {
         '?' => '/',
         c => {
             let s: Vec<char> = c.to_lowercase().collect();
-            if s.len() == 1 {
-                s[0]
-            } else {
-                c
-            }
+            if s.len() == 1 { s[0] } else { c }
         }
     }
 }
@@ -2644,6 +2655,100 @@ mod test {
         });
 
         event
+    }
+
+    fn make_event_with_raw_key(
+        mut event: KeyEvent,
+        raw_key: KeyCode,
+        phys: Option<PhysKeyCode>,
+    ) -> KeyEvent {
+        event.raw = Some(RawKeyEvent {
+            key: raw_key,
+            modifiers: event.modifiers,
+            leds: KeyboardLedStatus::empty(),
+            phys_code: phys,
+            raw_code: 0,
+            #[cfg(windows)]
+            scan_code: 0,
+            repeat_count: 1,
+            key_is_down: event.key_is_down,
+            handled: Handled::new(),
+        });
+
+        event
+    }
+
+    #[test]
+    fn kitty_alternate_keys_use_raw_layout_unshifted_key() {
+        let flags = KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KittyKeyboardFlags::REPORT_EVENT_TYPES
+            | KittyKeyboardFlags::REPORT_ALTERNATE_KEYS
+            | KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+
+        let event = make_event_with_raw_key(
+            KeyEvent {
+                key: KeyCode::Char('"'),
+                modifiers: Modifiers::SHIFT,
+                leds: KeyboardLedStatus::empty(),
+                repeat_count: 1,
+                key_is_down: true,
+                raw: None,
+                #[cfg(windows)]
+                win32_uni_char: None,
+            },
+            KeyCode::Char('2'),
+            Some(PhysKeyCode::K2),
+        );
+
+        assert_eq!(event.encode_kitty(flags), "\x1b[50:34;2u".to_string());
+    }
+
+    #[test]
+    fn kitty_alternate_keys_keep_ansi_fallback_when_raw_layout_is_unavailable() {
+        let flags = KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KittyKeyboardFlags::REPORT_EVENT_TYPES
+            | KittyKeyboardFlags::REPORT_ALTERNATE_KEYS
+            | KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+
+        let physical_raw_event = make_event_with_raw_key(
+            KeyEvent {
+                key: KeyCode::Char('"'),
+                modifiers: Modifiers::SHIFT,
+                leds: KeyboardLedStatus::empty(),
+                repeat_count: 1,
+                key_is_down: true,
+                raw: None,
+                #[cfg(windows)]
+                win32_uni_char: None,
+            },
+            KeyCode::Physical(PhysKeyCode::K2),
+            Some(PhysKeyCode::K2),
+        );
+
+        assert_eq!(
+            physical_raw_event.encode_kitty(flags),
+            "\x1b[39:34:50;2u".to_string()
+        );
+
+        let shifted_raw_event = make_event_with_raw_key(
+            KeyEvent {
+                key: KeyCode::Char('"'),
+                modifiers: Modifiers::SHIFT,
+                leds: KeyboardLedStatus::empty(),
+                repeat_count: 1,
+                key_is_down: true,
+                raw: None,
+                #[cfg(windows)]
+                win32_uni_char: None,
+            },
+            KeyCode::Char('"'),
+            Some(PhysKeyCode::K2),
+        );
+
+        assert_eq!(
+            shifted_raw_event.encode_kitty(flags),
+            "\x1b[39:34:50;2u".to_string()
+        );
     }
 
     #[test]

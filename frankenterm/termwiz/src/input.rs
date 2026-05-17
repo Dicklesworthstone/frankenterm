@@ -7,7 +7,7 @@ use crate::escape::parser::Parser;
 use crate::escape::{Action, CSI};
 use crate::keymap::{Found, KeyMap};
 use crate::readbuf::ReadBuffer;
-use frankenterm_input_types::ctrl_mapping;
+use frankenterm_input_types::{ansi_us_unshift_fallback, ctrl_mapping};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
@@ -652,7 +652,7 @@ fn kitty_encode(
                 return Ok(output);
             }
 
-            let unshifted_key = us_layout_unshift(shifted_key);
+            let unshifted_key = ansi_us_unshift_fallback(shifted_key);
             let mut key_code = (unshifted_key as u32).to_string();
             if flags.contains(KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)
                 && unshifted_key != shifted_key
@@ -768,34 +768,6 @@ fn kitty_associated_text(key: KeyCode, flags: KittyKeyboardFlags, is_down: bool)
 fn is_kitty_disambiguated_control(c: char, flags: KittyKeyboardFlags) -> bool {
     flags.contains(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES)
         && matches!(c, '\x1b' | '\x7f' | '\x08')
-}
-
-fn us_layout_unshift(c: char) -> char {
-    match c {
-        'A'..='Z' => c.to_ascii_lowercase(),
-        '~' => '`',
-        '!' => '1',
-        '@' => '2',
-        '#' => '3',
-        '$' => '4',
-        '%' => '5',
-        '^' => '6',
-        '&' => '7',
-        '*' => '8',
-        '(' => '9',
-        ')' => '0',
-        '_' => '-',
-        '+' => '=',
-        '{' => '[',
-        '}' => ']',
-        '|' => '\\',
-        ':' => ';',
-        '"' => '\'',
-        '<' => ',',
-        '>' => '.',
-        '?' => '/',
-        _ => c,
-    }
 }
 
 fn application_keypad_final_byte(key: KeyCode) -> Option<char> {
@@ -2526,6 +2498,29 @@ mod test {
                 .encode(Modifiers::SUPER, mode, false)
                 .unwrap(),
             "\x1b[112;9:3u"
+        );
+    }
+
+    #[test]
+    fn encode_kitty_alternate_keys_use_shared_ansi_fallback_without_raw_layout() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Kitty(
+                KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KittyKeyboardFlags::REPORT_EVENT_TYPES
+                    | KittyKeyboardFlags::REPORT_ALTERNATE_KEYS
+                    | KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ),
+            newline_mode: false,
+            application_cursor_keys: false,
+            application_keypad: false,
+            modify_other_keys: None,
+        };
+
+        assert_eq!(
+            KeyCode::Char('"')
+                .encode(Modifiers::SHIFT, mode, true)
+                .unwrap(),
+            "\x1b[39:34;2u"
         );
     }
 
