@@ -575,7 +575,9 @@ impl ImageData {
             ImageDataType::EncodedFile(d) => d.len(),
             ImageDataType::EncodedLease(_) => 0,
             ImageDataType::Rgba8 { data, .. } => data.len(),
-            ImageDataType::AnimRgba8 { frames, .. } => frames.len() * frames[0].len(),
+            ImageDataType::AnimRgba8 { frames, .. } => frames
+                .iter()
+                .fold(0usize, |acc, frame| acc.saturating_add(frame.len())),
         }
     }
 
@@ -765,6 +767,35 @@ mod tests {
         let idt = ImageDataType::new_single_frame(2, 2, vec![0u8; 16]);
         let id = ImageData::with_data(idt);
         assert_eq!(id.len(), 16);
+    }
+
+    #[test]
+    fn image_data_len_empty_animation() {
+        let id = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: Vec::new(),
+            frames: Vec::new(),
+            hashes: Vec::new(),
+        });
+
+        assert_eq!(id.len(), 0);
+    }
+
+    #[test]
+    fn image_data_len_sums_animation_frame_buffers() {
+        let id = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(10), Duration::from_millis(20)],
+            frames: vec![vec![0u8; 4], vec![0u8; 8]],
+            hashes: vec![
+                ImageDataType::hash_bytes(&[0u8; 4]),
+                ImageDataType::hash_bytes(&[0u8; 8]),
+            ],
+        });
+
+        assert_eq!(id.len(), 12);
     }
 
     #[test]
