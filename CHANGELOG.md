@@ -695,7 +695,7 @@ There are no GitHub Releases published for this repository.
 | 2026-05-02 | Substrate audit waves (rubber-stamp `is_safe`, public-field bypass, NaN/sanitization) sweep across the codebase. |
 | 2026-05-10 | Operating-envelope contract (ft-booek) + incident-bundle live collectors (ft-9sy9e family) land. |
 | 2026-05-12 | Reality-check round 2 (ft-tf6g3) opens — final-mile convergence: attestation graph, renderer SLO suite, round-3 statistical elevations. |
-| 2026-05-16 | HEAD. 10,156 total commits (8,271 since `backup-before-rewrite`). 77 workspace members (28 first-party + 47 vendored). 521 top-level core modules. ~1.01M LOC across the core. 952 core test files, 111 Criterion benches, 48 fuzz targets, 265 E2E shell scripts, 426 docs. |
+| 2026-05-16 | HEAD. 10,156 total commits (8,271 since `backup-before-rewrite`). 77 workspace members (28 first-party + 47 vendored). 509 top-level core modules. ~1.01M LOC across the core. 952 core test files, 111 Criterion benches, 48 fuzz targets, 265 E2E shell scripts, 426 docs. |
 
 ---
 
