@@ -220,6 +220,24 @@ impl IntoRawHandle for OwnedHandle {
 
 impl FileDescriptor {
     #[inline]
+    pub(crate) fn try_as_socket_descriptor_impl(&self) -> Result<SocketDescriptor> {
+        if self.handle.is_socket_handle() {
+            Ok(self.handle.as_raw_handle() as SocketDescriptor)
+        } else {
+            Err(Error::OnlySockets)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_into_socket_descriptor_impl(self) -> Result<SocketDescriptor> {
+        if self.handle.is_socket_handle() {
+            Ok(self.handle.into_raw_handle() as SocketDescriptor)
+        } else {
+            Err(Error::OnlySockets)
+        }
+    }
+
+    #[inline]
     pub(crate) fn as_stdio_impl(&self) -> Result<std::process::Stdio> {
         let duped = self.handle.try_clone()?;
         let handle = duped.into_raw_handle();
@@ -241,14 +259,9 @@ impl FileDescriptor {
             return Err(Error::OnlySocketsNonBlocking);
         }
 
+        let socket = self.try_as_socket_descriptor_impl()?;
         let mut on = if non_blocking { 1 } else { 0 };
-        let res = unsafe {
-            ioctlsocket(
-                self.as_raw_socket() as SOCKET,
-                winapi::um::winsock2::FIONBIO,
-                &mut on,
-            )
-        };
+        let res = unsafe { ioctlsocket(socket, winapi::um::winsock2::FIONBIO, &mut on) };
         if res != 0 {
             Err(Error::FionBio(std::io::Error::last_os_error()))
         } else {
@@ -298,25 +311,17 @@ impl FromRawHandle for FileDescriptor {
     }
 }
 
-impl IntoRawSocket for FileDescriptor {
-    fn into_raw_socket(self) -> RawSocket {
-        // FIXME: this isn't a guaranteed conversion!
-        debug_assert!(self.handle.is_socket_handle());
-        self.handle.into_raw_handle() as RawSocket
+impl IntoRawSocketDescriptor for FileDescriptor {
+    fn into_socket_descriptor(self) -> SocketDescriptor {
+        self.try_into_socket_descriptor()
+            .expect("FileDescriptor does not contain a Windows socket")
     }
 }
 
-impl AsRawSocket for FileDescriptor {
-    fn as_raw_socket(&self) -> RawSocket {
-        // FIXME: this isn't a guaranteed conversion!
-        debug_assert!(self.handle.is_socket_handle());
-        self.handle.as_raw_handle() as RawSocket
-    }
-}
-
-impl AsSocket for FileDescriptor {
-    fn as_socket(&self) -> BorrowedSocket<'_> {
-        unsafe { BorrowedSocket::borrow_raw(self.as_raw_socket()) }
+impl AsRawSocketDescriptor for FileDescriptor {
+    fn as_socket_descriptor(&self) -> SocketDescriptor {
+        self.try_as_socket_descriptor()
+            .expect("FileDescriptor does not contain a Windows socket")
     }
 }
 
@@ -334,14 +339,10 @@ impl io::Read for FileDescriptor {
             // It's important to use the winsock functions to read/write
             // even though ReadFile and WriteFile technically work; only
             // the winsock functions respect non-blocking mode.
-            let num_read = unsafe {
-                recv(
-                    self.as_socket_descriptor(),
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len() as _,
-                    0,
-                )
-            };
+            let socket = self
+                .try_as_socket_descriptor_impl()
+                .map_err(|err| IoError::new(io::ErrorKind::InvalidInput, err))?;
+            let num_read = unsafe { recv(socket, buf.as_mut_ptr() as *mut _, buf.len() as _, 0) };
             if num_read < 0 {
                 Err(IoError::last_os_error())
             } else {
@@ -375,14 +376,10 @@ impl io::Read for FileDescriptor {
 impl io::Write for FileDescriptor {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.handle.is_socket_handle() {
-            let num_wrote = unsafe {
-                send(
-                    self.as_socket_descriptor(),
-                    buf.as_ptr() as *const _,
-                    buf.len() as _,
-                    0,
-                )
-            };
+            let socket = self
+                .try_as_socket_descriptor_impl()
+                .map_err(|err| IoError::new(io::ErrorKind::InvalidInput, err))?;
+            let num_wrote = unsafe { send(socket, buf.as_ptr() as *const _, buf.len() as _, 0) };
             if num_wrote < 0 {
                 Err(IoError::last_os_error())
             } else {
@@ -565,6 +562,7 @@ pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize
 
 #[cfg(test)]
 mod test {
+    use crate::AsRawSocketDescriptor;
     use std::io::{Read, Write};
 
     #[test]
@@ -574,5 +572,32 @@ mod test {
         let mut buf = [0u8; 5];
         assert_eq!(b.read(&mut buf).unwrap(), 5);
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn socket_descriptor_accessors_accept_sockets() {
+        let (a, b) = super::socketpair_impl().unwrap();
+        assert!(a.try_as_socket_descriptor().is_ok());
+        assert!(b.try_into_socket_descriptor().is_ok());
+    }
+
+    #[test]
+    fn socket_descriptor_accessors_reject_pipe_handles() {
+        let pipe = super::Pipe::new().unwrap();
+        assert!(matches!(
+            pipe.read.try_as_socket_descriptor(),
+            Err(super::Error::OnlySockets)
+        ));
+        assert!(matches!(
+            pipe.write.try_into_socket_descriptor(),
+            Err(super::Error::OnlySockets)
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "FileDescriptor does not contain a Windows socket")]
+    fn as_socket_descriptor_panics_for_pipe_handle() {
+        let pipe = super::Pipe::new().unwrap();
+        let _ = pipe.read.as_socket_descriptor();
     }
 }

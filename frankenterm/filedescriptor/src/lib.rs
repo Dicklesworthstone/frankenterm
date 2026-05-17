@@ -146,6 +146,8 @@ pub enum Error {
     FdValueOutsideFdSetSize(i64),
     #[error("Only socket descriptors can change their non-blocking mode on Windows")]
     OnlySocketsNonBlocking,
+    #[error("operation requires a socket descriptor on Windows")]
+    OnlySockets,
     #[error("SetStdHandle failed")]
     SetStdHandle(#[source] std::io::Error),
 
@@ -335,6 +337,24 @@ impl FileDescriptor {
     /// that can be successfully made non-blocking.
     pub fn set_non_blocking(&mut self, non_blocking: bool) -> Result<()> {
         self.set_non_blocking_impl(non_blocking)
+    }
+
+    /// Return the underlying socket descriptor when this value owns a socket.
+    ///
+    /// On Unix, sockets and file descriptors share the same descriptor space,
+    /// so this succeeds for any descriptor. On Windows, this returns an error
+    /// for pipes, files, consoles, and other non-socket handles.
+    pub fn try_as_socket_descriptor(&self) -> Result<SocketDescriptor> {
+        self.try_as_socket_descriptor_impl()
+    }
+
+    /// Convert this value into its underlying socket descriptor.
+    ///
+    /// On Unix, sockets and file descriptors share the same descriptor space,
+    /// so this succeeds for any descriptor. On Windows, this returns an error
+    /// for pipes, files, consoles, and other non-socket handles.
+    pub fn try_into_socket_descriptor(self) -> Result<SocketDescriptor> {
+        self.try_into_socket_descriptor_impl()
     }
 
     /// Attempt to redirect stdio to the underlying handle and return
@@ -1383,6 +1403,7 @@ mod tests {
     // ── Poll with POLLOUT on pipe write end ─────────────────
 
     #[test]
+    #[cfg(unix)]
     fn poll_pipe_write_end_is_writable() {
         let pipe = Pipe::new().unwrap();
         let mut pfd = [pollfd {
@@ -1408,6 +1429,7 @@ mod tests {
     // ── FileDescriptor as_socket_descriptor on pipe ─────────
 
     #[test]
+    #[cfg(unix)]
     fn pipe_as_socket_descriptor() {
         let pipe = Pipe::new().unwrap();
         // On unix, socket descriptor and file descriptor are the same

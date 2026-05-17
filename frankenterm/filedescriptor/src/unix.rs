@@ -258,6 +258,16 @@ impl FromRawFd for FileDescriptor {
 
 impl FileDescriptor {
     #[inline]
+    pub(crate) fn try_as_socket_descriptor_impl(&self) -> Result<SocketDescriptor> {
+        Ok(self.as_raw_fd())
+    }
+
+    #[inline]
+    pub(crate) fn try_into_socket_descriptor_impl(self) -> Result<SocketDescriptor> {
+        Ok(self.into_raw_fd())
+    }
+
+    #[inline]
     pub(crate) fn as_stdio_impl(&self) -> Result<std::process::Stdio> {
         let duped = OwnedHandle::dup(self)?;
         let fd = duped.into_raw_fd();
