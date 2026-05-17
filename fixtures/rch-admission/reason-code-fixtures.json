@@ -1,0 +1,805 @@
+{
+  "schema_version": "ft.rch_admission.fixtures.v1",
+  "schema_path": "docs/json-schema/ft-rch-admission.json",
+  "contract_doc": "docs/rch-admission-contract.md",
+  "cases": [
+    {
+      "fixture_id": "local-eno-space",
+      "reason_code": "local_eno_space",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013359000,
+        "source": "fixture:local-eno-space",
+        "advisory_only": true,
+        "proof_status": "blocked",
+        "command": {
+          "raw": "rch exec -- cargo test -p frankenterm-core",
+          "normalized": "cargo test -p frankenterm-core",
+          "classification": "cargo_test",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-proof"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 104857600,
+          "private_tmp_free_bytes": 104857600,
+          "repo_write_probe": {
+            "status": "failed",
+            "error_code": "ENOSPC",
+            "message": "No space left on device"
+          },
+          "rch_cache_write_probe": {
+            "status": "failed",
+            "error_code": "config.cache.write_failed",
+            "message": "RCH cache write failed before transfer"
+          }
+        },
+        "beads": {
+          "db_writeable": false,
+          "jsonl_writeable": false,
+          "active_bead": "ft-e2egh",
+          "blocking_beads": []
+        },
+        "agent_mail": {
+          "db_open": false,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "local_only",
+          "active_project_exclusion": false,
+          "active_builds": 0,
+          "queued_builds": 0,
+          "workers_healthy": 0,
+          "workers_total": 8
+        },
+        "worker_rejections": [],
+        "cargo_jobs": 1,
+        "estimated_slots": 1,
+        "reason_codes": [
+          "local_eno_space"
+        ],
+        "recommendations": [
+          {
+            "action": "Stop proof work and request operator-approved cleanup evidence.",
+            "reason_code": "local_eno_space",
+            "operator_approval_required": true
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "df and RCH cache probe reported ENOSPC"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "no-admissible-workers",
+      "reason_code": "no_admissible_workers",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013898000,
+        "source": "fixture:no-admissible-workers",
+        "advisory_only": true,
+        "proof_status": "blocked",
+        "command": {
+          "raw": "rch diagnose --dry-run -- cargo test -p frankenterm-core",
+          "normalized": "cargo test -p frankenterm-core",
+          "classification": "cargo_test",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-redactor"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 579862528,
+          "private_tmp_free_bytes": 579862528,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "cache probe succeeded"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": "ft-wjjkp.1",
+          "blocking_beads": [
+            "ft-4tp7g"
+          ]
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "degraded",
+          "active_project_exclusion": false,
+          "active_builds": 0,
+          "queued_builds": 0,
+          "workers_healthy": 0,
+          "workers_total": 8
+        },
+        "worker_rejections": [
+          {
+            "worker": null,
+            "reason_code": "no_admissible_workers",
+            "detail": "worker_selection.worker=null",
+            "severity": "blocked"
+          }
+        ],
+        "cargo_jobs": 1,
+        "estimated_slots": 4,
+        "reason_codes": [
+          "no_admissible_workers"
+        ],
+        "recommendations": [
+          {
+            "action": "Block the proof bead on RCH admission and retain dry-run output.",
+            "reason_code": "no_admissible_workers",
+            "operator_approval_required": false
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "RCH dry-run selected no worker"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "critical-pressure",
+      "reason_code": "critical_pressure",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013898000,
+        "source": "fixture:critical-pressure",
+        "advisory_only": true,
+        "proof_status": "blocked",
+        "command": {
+          "raw": "rch exec -- cargo test -p frankenterm-core redactor",
+          "normalized": "cargo test -p frankenterm-core redactor",
+          "classification": "cargo_test",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-redactor"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 579862528,
+          "private_tmp_free_bytes": 579862528,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "cache probe succeeded"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": "ft-wjjkp.1",
+          "blocking_beads": [
+            "ft-4tp7g"
+          ]
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "degraded",
+          "active_project_exclusion": false,
+          "active_builds": 0,
+          "queued_builds": 0,
+          "workers_healthy": 0,
+          "workers_total": 8
+        },
+        "worker_rejections": [
+          {
+            "worker": "vmi1227854",
+            "reason_code": "critical_pressure",
+            "detail": "root free ratio below threshold",
+            "severity": "critical"
+          }
+        ],
+        "cargo_jobs": 1,
+        "estimated_slots": 4,
+        "reason_codes": [
+          "critical_pressure",
+          "no_admissible_workers"
+        ],
+        "recommendations": [
+          {
+            "action": "Wait for worker disk recovery or operator-approved cleanup.",
+            "reason_code": "critical_pressure",
+            "operator_approval_required": true
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "RCH worker selection rejected workers for critical pressure"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "telemetry-gap",
+      "reason_code": "telemetry_gap",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013900000,
+        "source": "fixture:telemetry-gap",
+        "advisory_only": true,
+        "proof_status": "unknown",
+        "command": {
+          "raw": "rch diagnose --dry-run -- cargo check -p frankenterm-core",
+          "normalized": "cargo check -p frankenterm-core",
+          "classification": "cargo_check",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-check"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 10737418240,
+          "private_tmp_free_bytes": 10737418240,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "cache probe succeeded"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": null,
+          "blocking_beads": []
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "degraded",
+          "active_project_exclusion": false,
+          "active_builds": 0,
+          "queued_builds": 0,
+          "workers_healthy": null,
+          "workers_total": 8
+        },
+        "worker_rejections": [
+          {
+            "worker": "vmi1264463",
+            "reason_code": "telemetry_gap",
+            "detail": "capability snapshot stale or missing",
+            "severity": "warning"
+          }
+        ],
+        "cargo_jobs": null,
+        "estimated_slots": null,
+        "reason_codes": [
+          "telemetry_gap"
+        ],
+        "recommendations": [
+          {
+            "action": "Refresh read-only worker status and do not mutate workers.",
+            "reason_code": "telemetry_gap",
+            "operator_approval_required": false
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "worker health telemetry gap"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "insufficient-slots",
+      "reason_code": "insufficient_slots",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013901000,
+        "source": "fixture:insufficient-slots",
+        "advisory_only": true,
+        "proof_status": "blocked",
+        "command": {
+          "raw": "rch diagnose --dry-run -- cargo test -j 1 -p frankenterm-core-replay-types",
+          "normalized": "cargo test -j 1 -p frankenterm-core-replay-types",
+          "classification": "cargo_test",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-rch-refresh"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 10737418240,
+          "private_tmp_free_bytes": 10737418240,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "cache probe succeeded"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": "ft-4tp7g.6",
+          "blocking_beads": [
+            "ft-4tp7g"
+          ]
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "degraded",
+          "active_project_exclusion": false,
+          "active_builds": 1,
+          "queued_builds": 0,
+          "workers_healthy": 1,
+          "workers_total": 8
+        },
+        "worker_rejections": [
+          {
+            "worker": "vmi1264463",
+            "reason_code": "insufficient_slots",
+            "detail": "estimated slots exceed free slots",
+            "severity": "blocked"
+          }
+        ],
+        "cargo_jobs": 1,
+        "estimated_slots": 4,
+        "reason_codes": [
+          "insufficient_slots"
+        ],
+        "recommendations": [
+          {
+            "action": "Wait for free slots or fix slot estimation before retrying.",
+            "reason_code": "insufficient_slots",
+            "operator_approval_required": false
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "dry-run reported insufficient slots"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "active-project-exclusion",
+      "reason_code": "active_project_exclusion",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013902000,
+        "source": "fixture:active-project-exclusion",
+        "advisory_only": true,
+        "proof_status": "blocked",
+        "command": {
+          "raw": "rch diagnose --dry-run -- cargo test -p frankenterm-core demo_scenarios",
+          "normalized": "cargo test -p frankenterm-core demo_scenarios",
+          "classification": "cargo_test",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-demo"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 10737418240,
+          "private_tmp_free_bytes": 10737418240,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "cache probe succeeded"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": "ft-4tp7g",
+          "blocking_beads": [
+            "ft-4tp7g"
+          ]
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "degraded",
+          "active_project_exclusion": true,
+          "active_builds": 1,
+          "queued_builds": 0,
+          "workers_healthy": 5,
+          "workers_total": 8
+        },
+        "worker_rejections": [
+          {
+            "worker": null,
+            "reason_code": "active_project_exclusion",
+            "detail": "same-project build is active",
+            "severity": "blocked"
+          }
+        ],
+        "cargo_jobs": 1,
+        "estimated_slots": 4,
+        "reason_codes": [
+          "active_project_exclusion"
+        ],
+        "recommendations": [
+          {
+            "action": "Wait for the same-project build or coordinate with the owner.",
+            "reason_code": "active_project_exclusion",
+            "operator_approval_required": false
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "queue had active same-project build"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "speedscore-response-shape",
+      "reason_code": "speedscore_response_shape",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013903000,
+        "source": "fixture:speedscore-response-shape",
+        "advisory_only": true,
+        "proof_status": "unknown",
+        "command": {
+          "raw": "rch speedscore --all --json",
+          "normalized": null,
+          "classification": null,
+          "would_intercept": null,
+          "target_dir": null
+        },
+        "local_disk": {
+          "system_data_free_bytes": 10737418240,
+          "private_tmp_free_bytes": 10737418240,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "not_checked",
+            "error_code": null,
+            "message": "not relevant to speedscore parse"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": null,
+          "blocking_beads": []
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "degraded",
+          "active_project_exclusion": false,
+          "active_builds": 0,
+          "queued_builds": 0,
+          "workers_healthy": 5,
+          "workers_total": 8
+        },
+        "worker_rejections": [],
+        "cargo_jobs": null,
+        "estimated_slots": null,
+        "reason_codes": [
+          "speedscore_response_shape"
+        ],
+        "recommendations": [
+          {
+            "action": "Ignore ranking data for admission and preserve the parse artifact.",
+            "reason_code": "speedscore_response_shape",
+            "operator_approval_required": false
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "RCH-E003 invalid type string healthy"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "dry-run-inconsistent-worker",
+      "reason_code": "dry_run_inconsistent_worker",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013904000,
+        "source": "fixture:dry-run-inconsistent-worker",
+        "advisory_only": true,
+        "proof_status": "unknown",
+        "command": {
+          "raw": "rch diagnose --dry-run -- cargo test -p frankenterm-core",
+          "normalized": "cargo test -p frankenterm-core",
+          "classification": "cargo_test",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-proof"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 10737418240,
+          "private_tmp_free_bytes": 10737418240,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "cache probe succeeded"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": "ft-4tp7g",
+          "blocking_beads": [
+            "ft-4tp7g"
+          ]
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "degraded",
+          "active_project_exclusion": false,
+          "active_builds": 0,
+          "queued_builds": 0,
+          "workers_healthy": 5,
+          "workers_total": 8
+        },
+        "worker_rejections": [
+          {
+            "worker": null,
+            "reason_code": "dry_run_inconsistent_worker",
+            "detail": "dry_run.reason says worker available while worker_selection.worker is null",
+            "severity": "warning"
+          }
+        ],
+        "cargo_jobs": null,
+        "estimated_slots": 4,
+        "reason_codes": [
+          "dry_run_inconsistent_worker"
+        ],
+        "recommendations": [
+          {
+            "action": "Report both fields and classify the diagnostic as advisory only.",
+            "reason_code": "dry_run_inconsistent_worker",
+            "operator_approval_required": false
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "command_output",
+            "path": null,
+            "summary": "dry-run envelope contradicted selected-worker field"
+          }
+        ]
+      }
+    },
+    {
+      "fixture_id": "unknown",
+      "reason_code": "unknown",
+      "payload": {
+        "schema_version": 1,
+        "contract_id": "ft.rch_admission.v1",
+        "generated_at_ms": 1779013905000,
+        "source": "fixture:unknown",
+        "advisory_only": true,
+        "proof_status": "unknown",
+        "command": {
+          "raw": "rch diagnose --dry-run -- cargo bench -p frankenterm-core",
+          "normalized": "cargo bench -p frankenterm-core",
+          "classification": "cargo_bench",
+          "would_intercept": true,
+          "target_dir": "/tmp/ft-bench"
+        },
+        "local_disk": {
+          "system_data_free_bytes": 10737418240,
+          "private_tmp_free_bytes": 10737418240,
+          "repo_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "repo write probe succeeded"
+          },
+          "rch_cache_write_probe": {
+            "status": "ok",
+            "error_code": null,
+            "message": "cache probe succeeded"
+          }
+        },
+        "beads": {
+          "db_writeable": true,
+          "jsonl_writeable": true,
+          "active_bead": null,
+          "blocking_beads": []
+        },
+        "agent_mail": {
+          "db_open": true,
+          "api_reachable": true,
+          "reservation_conflicts": []
+        },
+        "rch_queue": {
+          "posture": "unknown",
+          "active_project_exclusion": false,
+          "active_builds": 0,
+          "queued_builds": 0,
+          "workers_healthy": null,
+          "workers_total": null
+        },
+        "worker_rejections": [
+          {
+            "worker": null,
+            "reason_code": "unknown",
+            "detail": "unclassified admission blocker",
+            "severity": "warning"
+          }
+        ],
+        "cargo_jobs": null,
+        "estimated_slots": null,
+        "reason_codes": [
+          "unknown"
+        ],
+        "recommendations": [
+          {
+            "action": "File or update a bead with retained evidence and propose a stable reason code.",
+            "reason_code": "unknown",
+            "operator_approval_required": false
+          }
+        ],
+        "forbidden_actions": [
+          "run_local_cargo_as_proof",
+          "restart_agent_mail",
+          "repair_agent_mail_db",
+          "restart_rch_daemon",
+          "mutate_rch_worker",
+          "cancel_other_agent_build",
+          "delete_files_without_approval",
+          "treat_dry_run_as_compile_proof"
+        ],
+        "citations": [
+          {
+            "kind": "fixture",
+            "path": "fixtures/rch-admission/reason-code-fixtures.json",
+            "summary": "fallback reason-code fixture"
+          }
+        ]
+      }
+    }
+  ]
+}

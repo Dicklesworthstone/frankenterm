@@ -95,7 +95,7 @@ ft doctor          # environment check — exits non-zero on missing prerequisit
 
 ### 2 · See the fleet (1 minute, no daemon yet)
 
-`ft robot state` gives an AI-readable snapshot of every pane the mux can see, *without* starting a long-running daemon. This is the call a meta-agent makes when it wants a one-shot view.
+`ft robot state` gives an AI-readable snapshot of every pane the mux can see, *without* starting a long-running daemon. This is the call a meta-agent makes when it wants a one-shot view. The full `RobotResponse` envelope wraps every response with `ok`, `data`, `elapsed_ms`, `version`, `now`, and `mcp_version`; `data` for the `state` endpoint is a bare array of pane records (truncated below for clarity):
 
 ```bash
 $ ft robot state
@@ -107,22 +107,13 @@ $ ft robot state
     {"pane_id": 2, "title": "build",       "domain": "local", "cwd": "/project"}
   ],
   "elapsed_ms": 4,
-  "version": "ft.0.2.0"
+  "version": "0.2.0",
+  "now": 1747371642000,
+  "mcp_version": "v1"
 }
 ```
 
-Pipe to an LLM? Add `--format toon` for the lower-token serialization:
-
-```bash
-$ ft robot --format toon state
-ok=true
-data[3]{
-  {pane_id=0,title=claude-code,domain=local,cwd=/project}
-  {pane_id=1,title=codex,domain=local,cwd=/project}
-  {pane_id=2,title=build,domain=local,cwd=/project}
-}
-elapsed_ms=4 version=ft.0.2.0
-```
+For AI-to-AI use, add `--format toon` to swap the JSON encoder for the lower-token [TOON](#deep-dive-toon-encoding) serialization. Exact byte savings depend on payload shape; the CLI prints JSON-vs-TOON byte counts to stderr if you pass `--stats`.
 
 ### 3 · Start observing (2 minutes)
 
@@ -133,25 +124,34 @@ ft watch --foreground
 # (leave this running; new terminal for the next steps)
 ```
 
-In a second shell, peek at what the watcher is seeing:
+In a second shell, peek at what the watcher is seeing. `ft robot events` returns an `EventsData` envelope that wraps the event list with filter + count metadata:
 
 ```bash
 $ ft status                                     # human-readable fleet overview
 $ ft robot events --limit 5                     # recent pattern-triggered detections
 {
   "ok": true,
-  "data": [
-    {
-      "id": 1247,
-      "pane_id": 1,
-      "rule_id": "codex.usage.reached",
-      "severity": "warn",
-      "matched_at_ms": 1747371642000,
-      "snippet": "Usage limit reached. Try again at 14:32 UTC.",
-      "handled": false
-    }
-  ],
-  "elapsed_ms": 3
+  "data": {
+    "events": [
+      {
+        "id": 1247,
+        "pane_id": 1,
+        "rule_id": "codex.usage.reached",
+        "pack_id": "builtin:core",
+        "event_type": "detection",
+        "severity": "warn",
+        "confidence": 0.95,
+        "captured_at": 1747371642000
+      }
+    ],
+    "total_count": 1,
+    "limit": 5,
+    "unhandled_only": false
+  },
+  "elapsed_ms": 3,
+  "version": "0.2.0",
+  "now": 1747371643000,
+  "mcp_version": "v1"
 }
 ```
 
@@ -159,7 +159,7 @@ The watcher's pattern engine has already noticed pane 1 hit a rate limit; the ev
 
 ### 4 · React safely (2 minutes — send + wait-for + policy gate)
 
-Send a `/compact` to the stuck codex pane, but block until the recovery confirms:
+Send a `/compact` to the stuck codex pane, but block until the recovery confirms. The response `data` is a `SendData` with an `injection` blob (the wire-level bytes-sent record, an unstructured `serde_json::Value`) and a `wait_for` field carrying `WaitForData { pane_id, pattern, matched, elapsed_ms, polls, is_regex }`:
 
 ```bash
 $ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
@@ -167,57 +167,72 @@ $ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
   "ok": true,
   "data": {
     "pane_id": 1,
-    "injection": {"bytes_sent": 9, "paste_mode": false},
+    "injection": { /* wire-level injection record */ },
     "wait_for": {
       "pane_id": 1,
       "pattern": "compaction complete",
       "matched": true,
       "elapsed_ms": 4823,
-      "polls": 96
+      "polls": 96,
+      "is_regex": false
     }
   },
-  "elapsed_ms": 4829
+  "elapsed_ms": 4829,
+  "version": "0.2.0",
+  "now": 1747371646829,
+  "mcp_version": "v1"
 }
 ```
 
 Notice three things: (1) **`ft robot send` is policy-gated** — if you try to send something that violates a policy rule, you get a structured `RequireApproval` envelope with an 8-char approval code, not a silent error. (2) **`--wait-for` is condition-based**, not `sleep`-based — it polls until the pattern shows up or the timeout fires. (3) The response is **structured JSON** the calling agent can route on.
 
-If the policy gate denies, you'll see:
+When `ok=false`, the error fields live at the top level of the envelope (not nested under `error`):
 
 ```json
 {
   "ok": false,
-  "error": {
-    "code": "robot.require_approval",
-    "message": "Action requires approval",
-    "hint": "Run: ft approve AB12CD34"
-  }
+  "error": "Action requires approval",
+  "error_code": "robot.require_approval",
+  "hint": "Run: ft approve AB12CD34",
+  "elapsed_ms": 1,
+  "version": "0.2.0",
+  "now": 1747371646830,
+  "mcp_version": "v1"
 }
 ```
 
 ### 5 · Search the past (1 minute)
 
-Every byte of pane output the watcher captured is FTS5-indexed. Search across all panes:
+Every byte of pane output the watcher captured is FTS5-indexed. `ft robot search` returns a `SearchData` wrapping the result list:
 
 ```bash
 $ ft robot search "error: compilation failed" --limit 3
 {
   "ok": true,
   "data": {
-    "hits": [
+    "query": "error: compilation failed",
+    "results": [
       {
+        "segment_id": 41827,
         "pane_id": 1,
-        "ts_ms": 1747370104000,
-        "snippet": "  --> services/billing/pricing.rs:142:12\n  error: compilation failed: type mismatch",
-        "rank": 1.2845
+        "seq": 5821,
+        "captured_at": 1747370104000,
+        "score": 1.2845,
+        "snippet": "  --> services/billing/pricing.rs:142:12\n  error: compilation failed: type mismatch"
       }
     ],
+    "total_hits": 1,
+    "limit": 3,
     "mode": "lexical"
-  }
+  },
+  "elapsed_ms": 7,
+  "version": "0.2.0",
+  "now": 1747371700000,
+  "mcp_version": "v1"
 }
 ```
 
-Add `--mode hybrid` for semantic-ranked results (requires `--features semantic-search` build).
+Add `--mode hybrid` for semantic-ranked results (requires `--features semantic-search` build); hits then carry `semantic_score` and `fusion_rank` fields alongside `score`.
 
 ### 6 · Orchestrate transactionally (2 minutes — mission + tx)
 
@@ -239,12 +254,15 @@ This invokes the capacity-aware objective planner, which asks the operating enve
 
 ### 7 · Verify the release attestation (1 minute)
 
-Every load-bearing claim links to a signed artifact slot. Verify any release offline:
+Every load-bearing claim links to a signed artifact slot. The CLI re-hashes every artifact from disk, recomputes the canonical signing payload, checks the recorded `.sigstore` file hash + size, and verifies the Sigstore signature. Exits 0 on full pass, non-zero on any failure.
 
 ```bash
-$ ft attestation verify docs/attestations/0.2.0.json
-ok: 21/21 slots, sigstore signature verified, payload hash matches
+ft attestation verify docs/attestations/0.2.0.json          # human-readable verdict
+ft attestation verify docs/attestations/0.2.0.json --json   # machine-readable verdict
+ft attestation show docs/attestations/0.2.0.json            # pretty-print without re-verifying
 ```
+
+`ft attestation` is a thin Rust wrapper over `scripts/attestation-verify.sh`; third parties without the `ft` binary can run the script directly.
 
 ### Where to go next
 
@@ -1364,7 +1382,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
 ├── fuzz/                                 # 48 fuzz targets
 ├── docs/                                 # 428 Markdown documentation files
-├── tests/e2e/                            # 275 shell E2E scripts
+├── tests/e2e/                            # 276 shell E2E scripts
 └── fixtures/                             # Test fixtures (including operating-envelope goldens)
 ```
 
@@ -3751,7 +3769,7 @@ The project maintains extensive test coverage:
 |---|---|---|
 | Test annotations | <!--count:test_count-->55330<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
 | Core Rust test files | <!--count:core_rust_test_files-->952<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
-| E2E shell scripts | <!--count:e2e_scripts-->275<!--/count--> | Full-pipeline validation |
+| E2E shell scripts | <!--count:e2e_scripts-->276<!--/count--> | Full-pipeline validation |
 | Criterion bench files | <!--count:criterion_bench_files-->111<!--/count--> | Performance regression detection |
 | Fuzz targets | <!--count:fuzz_targets-->48<!--/count--> | Security / robustness |
 

@@ -1,0 +1,449 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-rch-admission.json",
+  "title": "FrankenTerm RCH Admission Diagnostic",
+  "description": "Static contract for advisory RCH admission diagnostics emitted before a FrankenTerm proof lane may claim remote Cargo or test evidence.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source",
+    "advisory_only",
+    "proof_status",
+    "command",
+    "local_disk",
+    "beads",
+    "agent_mail",
+    "rch_queue",
+    "worker_rejections",
+    "cargo_jobs",
+    "estimated_slots",
+    "reason_codes",
+    "recommendations",
+    "forbidden_actions",
+    "citations"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.rch_admission.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "advisory_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "proof_status": {
+      "type": "string",
+      "enum": [
+        "advisory_only",
+        "runnable",
+        "blocked",
+        "unknown"
+      ]
+    },
+    "command": {
+      "$ref": "#/$defs/command"
+    },
+    "local_disk": {
+      "$ref": "#/$defs/local_disk"
+    },
+    "beads": {
+      "$ref": "#/$defs/beads"
+    },
+    "agent_mail": {
+      "$ref": "#/$defs/agent_mail"
+    },
+    "rch_queue": {
+      "$ref": "#/$defs/rch_queue"
+    },
+    "worker_rejections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/worker_rejection"
+      }
+    },
+    "cargo_jobs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "estimated_slots": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/reason_code"
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/recommendation"
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/citation"
+      }
+    }
+  },
+  "$defs": {
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "local_eno_space",
+        "no_admissible_workers",
+        "critical_pressure",
+        "telemetry_gap",
+        "insufficient_slots",
+        "active_project_exclusion",
+        "speedscore_response_shape",
+        "dry_run_inconsistent_worker",
+        "unknown"
+      ]
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "blocked",
+        "critical"
+      ]
+    },
+    "command": {
+      "type": "object",
+      "required": [
+        "raw",
+        "normalized",
+        "classification",
+        "would_intercept",
+        "target_dir"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw": {
+          "type": "string",
+          "minLength": 1
+        },
+        "normalized": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "classification": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "would_intercept": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "target_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "local_disk": {
+      "type": "object",
+      "required": [
+        "system_data_free_bytes",
+        "private_tmp_free_bytes",
+        "repo_write_probe",
+        "rch_cache_write_probe"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "system_data_free_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "private_tmp_free_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "repo_write_probe": {
+          "$ref": "#/$defs/probe"
+        },
+        "rch_cache_write_probe": {
+          "$ref": "#/$defs/probe"
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "required": [
+        "status",
+        "error_code",
+        "message"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "failed",
+            "not_checked"
+          ]
+        },
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "beads": {
+      "type": "object",
+      "required": [
+        "db_writeable",
+        "jsonl_writeable",
+        "active_bead",
+        "blocking_beads"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "db_writeable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "jsonl_writeable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "active_bead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blocking_beads": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "agent_mail": {
+      "type": "object",
+      "required": [
+        "db_open",
+        "api_reachable",
+        "reservation_conflicts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "db_open": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "api_reachable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "reservation_conflicts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "rch_queue": {
+      "type": "object",
+      "required": [
+        "posture",
+        "active_project_exclusion",
+        "active_builds",
+        "queued_builds",
+        "workers_healthy",
+        "workers_total"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "posture": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active_project_exclusion": {
+          "type": "boolean"
+        },
+        "active_builds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queued_builds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "workers_healthy": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "workers_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "worker_rejection": {
+      "type": "object",
+      "required": [
+        "worker",
+        "reason_code",
+        "detail",
+        "severity"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "worker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reason_code"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/severity"
+        }
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "required": [
+        "action",
+        "reason_code",
+        "operator_approval_required"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reason_code"
+        },
+        "operator_approval_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "run_local_cargo_as_proof",
+        "restart_agent_mail",
+        "repair_agent_mail_db",
+        "restart_rch_daemon",
+        "mutate_rch_worker",
+        "cancel_other_agent_build",
+        "delete_files_without_approval",
+        "treat_dry_run_as_compile_proof"
+      ]
+    },
+    "citation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "command_output",
+            "artifact",
+            "bead",
+            "agent_mail",
+            "manual_note",
+            "fixture"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
