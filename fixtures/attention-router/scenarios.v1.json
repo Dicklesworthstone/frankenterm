@@ -306,7 +306,7 @@
           "command_or_api": "bead proof section plus AGENTS.md RCH policy",
           "required_reason_codes": [
             "proof.static_only",
-            "local_cargo_not_required"
+            "proof.local_cargo_not_required"
           ]
         }
       ],
