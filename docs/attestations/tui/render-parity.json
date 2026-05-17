@@ -191,7 +191,7 @@
     "produced_by_bead": "ft-tf6g3.3.10",
     "generated_at": "2026-05-16T07:37:24Z",
     "source_catalog_path": "docs/perf/resize-quality-slo.json",
-    "source_catalog_sha256": "5f97b7b2d5f08dac69bcba4857e8ab2f1de08d5ba2d1ea18e4c61ef6d59cb3ce",
+    "source_catalog_sha256": "d4e8271c1aa812efb59555113c57d807bd940b29d5e91ef73d1a55512bd1faa1",
     "closeout_status": "blocked_pending_missing_retained_runs",
     "summary": "The renderer-SLO umbrella does not yet have five retained target-run proofs. RQ-S10 and RQ-S13 have retained remote RCH proof; RQ-S1/RQ-S2/RQ-S3/RQ-S5 remain substrate-only pending target runs.",
     "entries": [
@@ -202,7 +202,7 @@
         "source_artifact_sha256": "7364ac394a0892540263a55e4bece61a7b6218e6c980d620f228b83b73a5ee24",
         "declared_structured_log": "target/criterion/slo-resize_fps.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "5f97b7b2d5f08dac69bcba4857e8ab2f1de08d5ba2d1ea18e4c61ef6d59cb3ce",
+        "gap_evidence_sha256": "d4e8271c1aa812efb59555113c57d807bd940b29d5e91ef73d1a55512bd1faa1",
         "follow_up_bead": "ft-tf6g3.3.7"
       },
       {
@@ -230,7 +230,7 @@
         "source_artifact_sha256": "6997ac32a2eb813771c88336ec7158e774d26a1a1703c0c295a7dcd86c0cb2cd",
         "declared_structured_log": "target/criterion/slo-idle_gpu.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "5f97b7b2d5f08dac69bcba4857e8ab2f1de08d5ba2d1ea18e4c61ef6d59cb3ce",
+        "gap_evidence_sha256": "d4e8271c1aa812efb59555113c57d807bd940b29d5e91ef73d1a55512bd1faa1",
         "follow_up_bead": "ft-tf6g3.3.9"
       },
       {
@@ -256,13 +256,21 @@
         "slo_id": "RQ-S13.ssim_parity_oracle_corpus",
         "status": "retained_run_validated",
         "proof_ledger_path": "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.proof-ledger.jsonl",
-        "proof_ledger_sha256": "00fab2a7344e2710e6733cb8a0f39e6638c42c100ad8ffcdf4bf667e0b9f9a50",
+        "proof_ledger_sha256": "bea4aff526014313decf2aeb41818744c64a1a5bca369570ab11e56e1c84e6ad",
+        "core_driver_meta_path": "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.core-driver-rch-meta.json",
+        "core_driver_meta_sha256": "11e0f0910e003eb91fc88edc4074aab162d4cf11c8481356a927ed1438c51fca",
+        "gui_corpus_meta_path": "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.gui-corpus-rch-meta.json",
+        "gui_corpus_meta_sha256": "0fb4e05180e0d2d3cb6838e92ecd32884c426ebde957c4baefb591c7c34630d2",
         "source_artifact_path": "crates/frankenterm-gui/tests/ssim_parity.rs",
         "source_artifact_sha256": "8a67f9eb199cac90813d159adb5b3745176d06ad41e2eba5b0d75e839b062234",
         "remote_cargo_reached": true,
         "remote_rustc_reached": true,
         "test_binary_reached": true,
-        "selected_worker_id": "vmi1293453"
+        "selected_worker_id": "vmi1293453",
+        "retained_artifacts_bundle_verifiable": true,
+        "raw_log_retention_status": "unretained_local_log",
+        "raw_log_bundle_verifiable": false,
+        "raw_log_gitignore_rule": "logs/"
       }
     ]
   },
@@ -285,6 +293,8 @@
     "docs/attestations/tui/render-parity-gpu.json",
     "docs/attestations/tui/topology-parity.json",
     "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.proof-ledger.jsonl",
+    "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.core-driver-rch-meta.json",
+    "docs/attestations/tui/ssim-parity-release-gate-20260516T024353Z.gui-corpus-rch-meta.json",
     "docs/attestations/tui/atlas-stability-rq-s10-20260516T073720Z.jsonl",
     "crates/frankenterm-core/benches/atlas_stability.rs",
     "crates/frankenterm-core/src/tui_parity_oracle.rs",
