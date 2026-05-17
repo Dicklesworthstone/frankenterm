@@ -21,6 +21,42 @@ pub struct GuiWin {
     pub window: ::window::Window,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
+struct GuiWindowDimensions {
+    pixel_width: usize,
+    pixel_height: usize,
+    dpi: usize,
+    is_full_screen: bool,
+    is_maximized: bool,
+    is_hidden: bool,
+    is_always_on_top: bool,
+    is_always_on_bottom: bool,
+    can_resize: bool,
+    can_paint: bool,
+    window_level: config::window::WindowLevel,
+}
+
+impl_lua_conversion_dynamic!(GuiWindowDimensions);
+
+fn gui_window_dimensions(
+    dims: ::window::Dimensions,
+    window_state: WindowState,
+) -> GuiWindowDimensions {
+    GuiWindowDimensions {
+        pixel_width: dims.pixel_width,
+        pixel_height: dims.pixel_height,
+        dpi: dims.dpi,
+        is_full_screen: window_state.contains(WindowState::FULL_SCREEN),
+        is_maximized: window_state.contains(WindowState::MAXIMIZED),
+        is_hidden: window_state.contains(WindowState::HIDDEN),
+        is_always_on_top: window_state.contains(WindowState::ALWAYS_ON_TOP),
+        is_always_on_bottom: window_state.contains(WindowState::ALWAYS_ON_BOTTOM),
+        can_resize: window_state.can_resize(),
+        can_paint: window_state.can_paint(),
+        window_level: window_state.as_window_level(),
+    }
+}
+
 impl GuiWin {
     pub fn try_new(term_window: &TermWindow) -> Option<Self> {
         let window = term_window.window.clone()?;
@@ -116,23 +152,7 @@ impl UserData for GuiWin {
                 .map_err(|e| anyhow::anyhow!("{:#}", e))
                 .map_err(luaerr)?;
 
-            #[derive(FromDynamic, ToDynamic)]
-            struct Dims {
-                pixel_width: usize,
-                pixel_height: usize,
-                dpi: usize,
-                is_full_screen: bool,
-            }
-            impl_lua_conversion_dynamic!(Dims);
-
-            let dims = Dims {
-                pixel_width: dims.pixel_width,
-                pixel_height: dims.pixel_height,
-                dpi: dims.dpi,
-                is_full_screen: window_state.contains(WindowState::FULL_SCREEN),
-                // FIXME: expose other states here
-            };
-            Ok(dims)
+            Ok(gui_window_dimensions(dims, window_state))
         });
         methods.add_async_method(
             "get_selection_text_for_pane",
@@ -338,5 +358,55 @@ impl UserData for GuiWin {
                 Ok(result)
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dims() -> ::window::Dimensions {
+        ::window::Dimensions {
+            pixel_width: 1920,
+            pixel_height: 1080,
+            dpi: 144,
+        }
+    }
+
+    #[test]
+    fn gui_window_dimensions_exposes_all_window_state_flags() {
+        let payload = gui_window_dimensions(
+            dims(),
+            WindowState::FULL_SCREEN | WindowState::ALWAYS_ON_TOP | WindowState::HIDDEN,
+        );
+
+        assert_eq!(payload.pixel_width, 1920);
+        assert_eq!(payload.pixel_height, 1080);
+        assert_eq!(payload.dpi, 144);
+        assert!(payload.is_full_screen);
+        assert!(!payload.is_maximized);
+        assert!(payload.is_hidden);
+        assert!(payload.is_always_on_top);
+        assert!(!payload.is_always_on_bottom);
+        assert!(!payload.can_resize);
+        assert!(!payload.can_paint);
+        assert_eq!(
+            payload.window_level,
+            config::window::WindowLevel::AlwaysOnTop
+        );
+    }
+
+    #[test]
+    fn gui_window_dimensions_reports_normal_window_capabilities() {
+        let payload = gui_window_dimensions(dims(), WindowState::default());
+
+        assert!(!payload.is_full_screen);
+        assert!(!payload.is_maximized);
+        assert!(!payload.is_hidden);
+        assert!(!payload.is_always_on_top);
+        assert!(!payload.is_always_on_bottom);
+        assert!(payload.can_resize);
+        assert!(payload.can_paint);
+        assert_eq!(payload.window_level, config::window::WindowLevel::Normal);
     }
 }
