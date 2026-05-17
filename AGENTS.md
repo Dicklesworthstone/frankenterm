@@ -1247,10 +1247,10 @@ blocked until a remote RCH run reaches Cargo/test execution and emits retained
 proof artifacts. Static/read-only checks may support diagnosis while workers
 are unavailable, but they do not replace remote Cargo proof.
 
-Local Cargo proof is invalid unless the human operator explicitly approves a
-local fallback for that specific incident. Even with approval, label the result
-as approved local fallback and rerun through RCH before claiming release-grade
-proof.
+Do not run local Cargo as the fallback for an exit-143 proof lane. If the human
+operator explicitly requests an emergency local diagnostic, record it as
+non-closeout context only; it is not proof for the bead, and the bead remains
+open or blocked until RCH produces retained remote Cargo artifacts.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 

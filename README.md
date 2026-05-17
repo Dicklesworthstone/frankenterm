@@ -3172,9 +3172,10 @@ rch workers probe --all
 Record the exact command that failed, the RCH health output, and the worker or
 admission reason code in the bead. Keep proof-required beads open or blocked
 until a remote RCH run reaches Cargo/test execution. While RCH is unavailable,
-use static/read-only checks only; local Cargo output is not acceptable closeout
-proof unless the human operator explicitly approves a local fallback for that
-specific incident.
+use static/read-only checks only. Do not use local Cargo as an exit-143 bypass;
+if a human explicitly requests an emergency local diagnostic, record it as
+non-closeout context only and wait for retained RCH proof before closing the
+bead.
 
 ### "I think there's a memory leak"
 
