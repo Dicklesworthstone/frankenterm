@@ -1,8 +1,49 @@
-use crate::color::RgbColor;
+use crate::color::{LinearRgba, RgbColor};
 use crate::{Sixel, SixelData};
 
 const MAX_PARAMS: usize = 5;
 const MAX_SIXEL_SIZE: usize = 100_000_000;
+
+fn sixel_color_number(value: i64) -> u16 {
+    value.clamp(0, i64::from(u16::MAX)) as u16
+}
+
+fn sixel_percent_component(value: i64) -> f32 {
+    value.clamp(0, 100) as f32 / 100.0
+}
+
+fn sixel_percent_u8(value: i64) -> u8 {
+    value.clamp(0, 100) as u8
+}
+
+fn sixel_hue_angle(value: i64) -> u16 {
+    value.clamp(0, 360) as u16
+}
+
+fn srgb_unit_to_u8(value: f32) -> u8 {
+    if value <= 0.0 {
+        0
+    } else if value >= 1.0 {
+        255
+    } else {
+        (value * 255.0 + 0.5) as u8
+    }
+}
+
+fn sixel_rgb_percent_to_color(red: i64, green: i64, blue: i64) -> RgbColor {
+    let srgb = LinearRgba::with_components(
+        sixel_percent_component(red),
+        sixel_percent_component(green),
+        sixel_percent_component(blue),
+        1.0,
+    )
+    .to_srgb();
+    RgbColor::new_8bpc(
+        srgb_unit_to_u8(srgb.0),
+        srgb_unit_to_u8(srgb.1),
+        srgb_unit_to_u8(srgb.2),
+    )
+}
 
 pub struct SixelBuilder {
     pub sixel: Sixel,
@@ -104,24 +145,21 @@ impl SixelBuilder {
             }
             b'#' if self.param_no >= 4 => {
                 // Define a color
-                let color_number = self.params[0] as u16;
-                let system = self.params[1] as u16;
-                let a = self.params[2] as u16;
-                let b = self.params[3] as u8;
-                let c = self.params[4] as u8;
+                let color_number = sixel_color_number(self.params[0]);
+                let system = self.params[1];
+                let a = self.params[2];
+                let b = self.params[3];
+                let c = self.params[4];
 
                 if system == 1 {
                     self.sixel.data.push(SixelData::DefineColorMapHSL {
                         color_number,
-                        hue_angle: a,
-                        lightness: b,
-                        saturation: c,
+                        hue_angle: sixel_hue_angle(a),
+                        lightness: sixel_percent_u8(b),
+                        saturation: sixel_percent_u8(c),
                     });
                 } else {
-                    let r = a as f32 * 255.0 / 100.;
-                    let g = b as f32 * 255.0 / 100.;
-                    let b = c as f32 * 255.0 / 100.;
-                    let rgb = RgbColor::new_8bpc(r as u8, g as u8, b as u8); // FIXME: from linear
+                    let rgb = sixel_rgb_percent_to_color(a, b, c);
                     self.sixel
                         .data
                         .push(SixelData::DefineColorMapRGB { color_number, rgb });
@@ -129,7 +167,7 @@ impl SixelBuilder {
             }
             b'#' => {
                 // Use a color
-                let color_number = self.params[0] as u16;
+                let color_number = sixel_color_number(self.params[0]);
 
                 self.sixel
                     .data
@@ -450,6 +488,57 @@ mod test {
                 rgb: RgbColor::new_8bpc(255, 0, 0),
             }]
         );
+    }
+
+    #[test]
+    fn builder_define_rgb_color_treats_percent_as_linear_intensity() {
+        let mut b = SixelBuilder::new(&[]);
+        for byte in b"#1;2;50;0;0" {
+            b.push(*byte);
+        }
+        b.finish();
+
+        let expected = SixelData::DefineColorMapRGB {
+            color_number: 1,
+            rgb: sixel_rgb_percent_to_color(50, 0, 0),
+        };
+        assert_eq!(b.sixel.data, vec![expected.clone()]);
+        assert_ne!(
+            expected,
+            SixelData::DefineColorMapRGB {
+                color_number: 1,
+                rgb: RgbColor::new_8bpc(127, 0, 0),
+            }
+        );
+        assert_eq!(format!("{}", expected), "#1;2;50;0;0");
+    }
+
+    #[test]
+    fn builder_define_rgb_color_clamps_missing_and_oversized_components() {
+        let mut b = SixelBuilder::new(&[]);
+        for byte in b"#1;2;;;" {
+            b.push(*byte);
+        }
+        b.finish();
+        assert_eq!(
+            b.sixel.data,
+            vec![SixelData::DefineColorMapRGB {
+                color_number: 1,
+                rgb: RgbColor::new_8bpc(0, 0, 0),
+            }]
+        );
+
+        let mut b = SixelBuilder::new(&[]);
+        for byte in b"#1;2;150;101;50" {
+            b.push(*byte);
+        }
+        b.finish();
+        let expected = SixelData::DefineColorMapRGB {
+            color_number: 1,
+            rgb: sixel_rgb_percent_to_color(100, 100, 50),
+        };
+        assert_eq!(b.sixel.data, vec![expected.clone()]);
+        assert_eq!(format!("{}", expected), "#1;2;100;100;50");
     }
 
     #[test]
