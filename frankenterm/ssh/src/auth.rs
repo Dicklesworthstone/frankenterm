@@ -26,6 +26,39 @@ impl AuthenticationEvent {
     }
 }
 
+#[cfg(feature = "libssh-rs")]
+fn first_libssh_auth_answer(answers: Vec<String>) -> libssh_rs::SshResult<String> {
+    answers
+        .into_iter()
+        .next()
+        .ok_or_else(|| libssh_rs::Error::fatal("user cancelled authentication"))
+}
+
+#[cfg(feature = "libssh-rs")]
+fn prompt_libssh_auth_callback_answer(
+    tx: &Sender<SessionEvent>,
+    prompt: String,
+    echo: bool,
+) -> libssh_rs::SshResult<String> {
+    let (reply, answers) = bounded(1);
+    tx.try_send(SessionEvent::Authenticate(AuthenticationEvent {
+        username: String::new(),
+        instructions: String::new(),
+        prompts: vec![AuthenticationPrompt { prompt, echo }],
+        reply,
+    }))
+    .map_err(|err| {
+        libssh_rs::Error::fatal(format!("sending Authenticate request to user: {err}"))
+    })?;
+
+    let answers = crate::runtime::block_on(answers.recv()).map_err(|err| {
+        libssh_rs::Error::fatal(format!(
+            "waiting for authentication answers from user: {err}"
+        ))
+    })?;
+    first_libssh_auth_answer(answers)
+}
+
 impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
     fn agent_auth(&mut self, sess: &ssh2::Session, user: &str) -> anyhow::Result<bool> {
@@ -135,25 +168,11 @@ impl crate::sessioninner::SessionInner {
 
         // Set the callback for pubkey auth
         sess.set_auth_callback(move |prompt, echo, _verify, identity| {
-            let (reply, answers) = bounded(1);
-            tx.try_send(SessionEvent::Authenticate(AuthenticationEvent {
-                username: "".to_string(),
-                instructions: "".to_string(),
-                prompts: vec![AuthenticationPrompt {
-                    prompt: match identity {
-                        Some(ident) => format!("{} ({}): ", prompt, ident),
-                        None => prompt.to_string(),
-                    },
-                    echo,
-                }],
-                reply,
-            }))
-            .unwrap();
-
-            let mut answers = crate::runtime::block_on(answers.recv())
-                .context("waiting for authentication answers from user")
-                .unwrap();
-            Ok(answers.remove(0))
+            let prompt = match identity {
+                Some(ident) => format!("{} ({}): ", prompt, ident),
+                None => prompt.to_string(),
+            };
+            prompt_libssh_auth_callback_answer(&tx, prompt, echo)
         });
 
         use libssh_rs::{AuthMethods, AuthStatus};
@@ -222,20 +241,21 @@ impl crate::sessioninner::SessionInner {
                 let (reply, answers) = bounded(1);
                 self.tx_event
                     .try_send(SessionEvent::Authenticate(AuthenticationEvent {
-                        username: "".to_string(),
-                        instructions: "".to_string(),
+                        username: String::new(),
+                        instructions: String::new(),
                         prompts: vec![AuthenticationPrompt {
                             prompt: "Password: ".to_string(),
                             echo: false,
                         }],
                         reply,
                     }))
-                    .unwrap();
+                    .context("sending Authenticate request to user")?;
 
-                let mut answers = crate::runtime::block_on(answers.recv())
-                    .context("waiting for authentication answers from user")
-                    .unwrap();
-                let pw = answers.remove(0);
+                let answers = crate::runtime::block_on(answers.recv())
+                    .context("waiting for authentication answers from user")?;
+                let Some(pw) = answers.into_iter().next() else {
+                    anyhow::bail!("user cancelled authentication");
+                };
 
                 match sess.userauth_password(None, Some(&pw))? {
                     AuthStatus::Success => return Ok(()),
@@ -509,6 +529,24 @@ mod tests {
         event.try_answer(vec![]).unwrap();
         let result = crate::runtime::block_on(rx.recv()).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[cfg(feature = "libssh-rs")]
+    #[test]
+    fn first_libssh_auth_answer_returns_first_answer() {
+        let answer =
+            first_libssh_auth_answer(vec!["secret".to_string(), "ignored".to_string()]).unwrap();
+        assert_eq!(answer, "secret");
+    }
+
+    #[cfg(feature = "libssh-rs")]
+    #[test]
+    fn first_libssh_auth_answer_rejects_empty_answers() {
+        let err = first_libssh_auth_answer(Vec::new()).unwrap_err();
+        assert_eq!(
+            err,
+            libssh_rs::Error::Fatal("user cancelled authentication".to_string())
+        );
     }
 
     #[test]
