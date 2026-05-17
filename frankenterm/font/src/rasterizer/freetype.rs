@@ -12,12 +12,12 @@ use crate::rasterizer::harfbuzz::{argb_to_rgba, HarfbuzzRasterizer};
 use crate::rasterizer::{FontRasterizer, FAKE_ITALIC_SKEW};
 use crate::units::*;
 use crate::{ftwrap, FontRasterizerSelection, RasterizedGlyph};
-use ::freetype::{
-    FT_Color_Root_Transform, FT_GlyphSlotRec_, FT_Matrix, FT_Opaque_Paint_, FT_PaintFormat_,
-};
 use anyhow::{bail, Context as _};
 use cairo::{Content, Context, Extend, Format, ImageSurface, Matrix, Operator, RecordingSurface};
 use config::{DisplayPixelGeometry, FreeTypeLoadFlags, FreeTypeLoadTarget};
+use freetype::{
+    FT_Color_Root_Transform, FT_GlyphSlotRec_, FT_Matrix, FT_Opaque_Paint_, FT_PaintFormat_,
+};
 use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::mem;
@@ -642,7 +642,7 @@ impl<'a> Walker<'a> {
 
                     // Scaling around a center coordinate
                     let center_x = scale.center_x.to_num();
-                    let center_y = scale.center_x.to_num();
+                    let center_y = scale.center_y.to_num();
 
                     let mut p1 = Matrix::identity();
                     p1.translate(center_x, center_y);
@@ -667,7 +667,7 @@ impl<'a> Walker<'a> {
 
                     // Rotating around a center coordinate
                     let center_x = rot.center_x.to_num();
-                    let center_y = rot.center_x.to_num();
+                    let center_y = rot.center_y.to_num();
 
                     let mut p1 = Matrix::identity();
                     p1.translate(center_x, center_y);
@@ -692,7 +692,7 @@ impl<'a> Walker<'a> {
 
                     // Skewing around a center coordinate
                     let center_x = skew.center_x.to_num();
-                    let center_y = skew.center_x.to_num();
+                    let center_y = skew.center_y.to_num();
 
                     let mut p1 = Matrix::identity();
                     p1.translate(center_x, center_y);
