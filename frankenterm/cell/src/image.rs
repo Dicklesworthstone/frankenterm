@@ -269,13 +269,10 @@ impl std::fmt::Debug for ImageDataType {
 impl ImageDataType {
     pub fn new_single_frame(width: u32, height: u32, data: Vec<u8>) -> Self {
         let hash = Self::hash_bytes(&data);
-        let expected_len = u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .expect("image dimensions overflow RGBA byte length");
+        let expected_len = u128::from(width) * u128::from(height) * 4;
         assert_eq!(
             expected_len,
-            data.len() as u64,
+            data.len() as u128,
             "invalid dimensions {}x{} for pixel data of length {}",
             width,
             height,
@@ -671,6 +668,14 @@ mod tests {
     #[should_panic(expected = "invalid dimensions 4294967295x1 for pixel data of length 12")]
     fn image_data_type_new_single_frame_rejects_wrapped_byte_len() {
         ImageDataType::new_single_frame(u32::MAX, 1, vec![0u8; 12]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "invalid dimensions 4294967295x4294967295 for pixel data of length 0"
+    )]
+    fn image_data_type_new_single_frame_preserves_diagnostic_for_extreme_dimensions() {
+        ImageDataType::new_single_frame(u32::MAX, u32::MAX, Vec::new());
     }
 
     #[test]
