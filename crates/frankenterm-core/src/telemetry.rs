@@ -25,6 +25,48 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info_span, warn};
 
 // =============================================================================
+// Clock anomaly observability
+// =============================================================================
+
+static TELEMETRY_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of telemetry timestamp fallbacks caused by a host clock before
+/// `UNIX_EPOCH`.
+#[must_use]
+pub fn telemetry_clock_anomaly_count() -> u64 {
+    TELEMETRY_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn reset_telemetry_clock_anomaly_count_for_test() {
+    TELEMETRY_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
+}
+
+fn record_telemetry_clock_anomaly() {
+    TELEMETRY_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn epoch_secs_now() -> u64 {
+    epoch_secs_from(SystemTime::now())
+}
+
+fn epoch_secs_from(now: SystemTime) -> u64 {
+    match now.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(err) => {
+            record_telemetry_clock_anomaly();
+            warn!(
+                target: "ft.telemetry.clock",
+                event = "telemetry_clock_anomaly",
+                pre_epoch_secs = err.duration().as_secs(),
+                "system clock is before UNIX_EPOCH; telemetry timestamp falling back to 0 (ft-6opx5)"
+            );
+            0
+        }
+    }
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -94,9 +136,7 @@ impl ResourceSnapshot {
     pub fn collect(pid: u32) -> Option<Self> {
         let effective_pid = if pid == 0 { std::process::id() } else { pid };
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = epoch_secs_now();
 
         let mut snap = ResourceSnapshot {
             pid: effective_pid,
@@ -262,9 +302,7 @@ impl MetricPoint {
     /// Create a new metric point with the current timestamp.
     #[must_use]
     pub fn new(name: impl Into<String>, value: f64) -> Self {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = epoch_secs_now();
 
         Self {
             name: name.into(),
@@ -1137,9 +1175,7 @@ impl TelemetryCollector {
     /// Produce a serializable telemetry snapshot.
     #[must_use]
     pub fn snapshot(&self) -> TelemetrySnapshot {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = epoch_secs_now();
 
         TelemetrySnapshot {
             timestamp_secs: now,
@@ -1508,9 +1544,7 @@ impl TelemetryStore {
             return Ok(0);
         }
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = epoch_secs_now();
         let hour_ts = now - (now % 3600);
         let next_hour_ts = hour_ts.saturating_add(3600);
         // Fail closed at the current hour boundary so stale buffer entries
@@ -1750,6 +1784,19 @@ mod tests {
         let back: TelemetryConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(back.buffer_capacity, 120);
         assert_eq!(back.mux_server_pid, 0);
+    }
+
+    #[test]
+    fn telemetry_epoch_secs_from_records_pre_epoch_anomaly_ft_6opx5() {
+        reset_telemetry_clock_anomaly_count_for_test();
+
+        let post_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
+        assert_eq!(epoch_secs_from(post_epoch), 42);
+        assert_eq!(telemetry_clock_anomaly_count(), 0);
+
+        let pre_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(7);
+        assert_eq!(epoch_secs_from(pre_epoch), 0);
+        assert_eq!(telemetry_clock_anomaly_count(), 1);
     }
 
     // -- ResourceSnapshot -----------------------------------------------------
@@ -3035,9 +3082,7 @@ mod tests {
     fn store_flush_buffer() {
         let store = TelemetryStore::open_in_memory(30).unwrap();
         let buf = CircularMetricBuffer::new(100);
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = epoch_secs_now();
         let hour_ts = now - (now % 3600);
 
         buf.push(ResourceSnapshot {
@@ -3070,9 +3115,7 @@ mod tests {
     fn store_flush_buffer_ignores_prior_hour_snapshots() {
         let store = TelemetryStore::open_in_memory(30).unwrap();
         let buf = CircularMetricBuffer::new(100);
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = epoch_secs_now();
         let hour_ts = now - (now % 3600);
         let prior_hour_ts = hour_ts.saturating_sub(3600);
 
@@ -3548,9 +3591,7 @@ mod tests {
     fn integration_store_multiple_flushes() {
         let store = TelemetryStore::open_in_memory(30).unwrap();
         let buf = CircularMetricBuffer::new(100);
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = epoch_secs_now();
         let hour_ts = now - (now % 3600);
 
         // First flush

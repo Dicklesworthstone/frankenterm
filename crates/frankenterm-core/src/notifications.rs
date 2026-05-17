@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // =============================================================================
 // br-ft-wd0fc: notifications Mutex poison-recovery observability counter
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 // fail-soft poison recovery — correct but invisible. Same defect
 // class as ft-ky7nf / ft-l65jg / ft-rln0q.
 static NOTIFICATIONS_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+static NOTIFICATIONS_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Read the current count of recovered notification-cooldown
 /// Mutex-poison events. Non-zero values mean a prior thread
@@ -29,11 +30,23 @@ pub fn notifications_lock_poisoned_count() -> u64 {
     NOTIFICATIONS_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
 }
 
+/// Number of notification timestamp fallbacks caused by a host clock before
+/// `UNIX_EPOCH`.
+#[must_use]
+pub fn notifications_clock_anomaly_count() -> u64 {
+    NOTIFICATIONS_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed)
+}
+
 /// Test-only reset of the counter so tests don't observe
 /// cross-test pollution.
 #[cfg(test)]
 pub fn reset_notifications_lock_poisoned_count_for_test() {
     NOTIFICATIONS_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_notifications_clock_anomaly_count_for_test() {
+    NOTIFICATIONS_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
@@ -42,6 +55,10 @@ pub fn reset_notifications_lock_poisoned_count_for_test() {
 fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
     NOTIFICATIONS_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
     poison.into_inner()
+}
+
+fn record_notifications_clock_anomaly() {
+    NOTIFICATIONS_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 use crate::event_templates::{RenderedEvent, render_event};
@@ -138,13 +155,46 @@ fn severity_str(detection: &Detection) -> String {
 }
 
 fn now_iso8601() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let ts = epoch_secs_now();
     chrono::DateTime::from_timestamp(ts as i64, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(|| format!("{ts}"))
+}
+
+fn epoch_secs_now() -> u64 {
+    epoch_secs_from(SystemTime::now())
+}
+
+fn epoch_secs_from(now: SystemTime) -> u64 {
+    match now.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(err) => {
+            record_notifications_clock_anomaly();
+            tracing::warn!(
+                target: "ft.notifications.clock",
+                event = "notifications_clock_anomaly",
+                pre_epoch_secs = err.duration().as_secs(),
+                "system clock is before UNIX_EPOCH; notification timestamp falling back to 0 (ft-6opx5)"
+            );
+            0
+        }
+    }
+}
+
+fn epoch_ms_from(now: SystemTime) -> i64 {
+    match now.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(0),
+        Err(err) => {
+            record_notifications_clock_anomaly();
+            tracing::warn!(
+                target: "ft.notifications.clock",
+                event = "notifications_clock_anomaly",
+                pre_epoch_secs = err.duration().as_secs(),
+                "system clock is before UNIX_EPOCH; notification timestamp falling back to 0 (ft-6opx5)"
+            );
+            0
+        }
+    }
 }
 
 /// Record of a single delivery attempt for observability.
@@ -510,10 +560,7 @@ fn render_detection(detection: &Detection, pane_id: u64, event_id: Option<i64>) 
 }
 
 fn now_epoch_ms() -> i64 {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    i64::try_from(ts.as_millis()).unwrap_or(0)
+    epoch_ms_from(SystemTime::now())
 }
 
 #[cfg(test)]
@@ -1423,6 +1470,22 @@ mod tests {
         let ts = now_iso8601();
         // Should contain 'T' separator (ISO 8601 format)
         assert!(ts.contains('T'), "should be ISO 8601 format: {ts}");
+    }
+
+    #[test]
+    fn notification_epoch_helpers_record_pre_epoch_anomaly_ft_6opx5() {
+        reset_notifications_clock_anomaly_count_for_test();
+
+        let post_epoch = UNIX_EPOCH + Duration::from_secs(5);
+        assert_eq!(epoch_secs_from(post_epoch), 5);
+        assert_eq!(epoch_ms_from(post_epoch), 5_000);
+        assert_eq!(notifications_clock_anomaly_count(), 0);
+
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(3);
+        assert_eq!(epoch_secs_from(pre_epoch), 0);
+        assert_eq!(notifications_clock_anomaly_count(), 1);
+        assert_eq!(epoch_ms_from(pre_epoch), 0);
+        assert_eq!(notifications_clock_anomaly_count(), 2);
     }
 
     // ========================================================================
