@@ -1,0 +1,351 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.attention_router.scenario_inventory.v1",
+  "producing_bead": "ft-x3nsb.6.1",
+  "parent_bead": "ft-x3nsb.6",
+  "purpose": "Static retained scenario inventory for the future attention-router JSON/TOON golden harness.",
+  "source_policy": {
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "full_agent_mail_bodies_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "build_cancellation_allowed": false,
+    "worker_mutation_allowed": false,
+    "dirty_overlap_mutation_allowed": false
+  },
+  "golden_strategy": {
+    "artifact_kind": "canonicalized_structural_golden",
+    "formats_required": [
+      "json",
+      "toon"
+    ],
+    "canonicalization": [
+      "replace wall-clock timestamps with [TIMESTAMP]",
+      "replace generated message ids and reservation ids with [ID]",
+      "replace agent names only when the scenario is not about active ownership",
+      "sort unordered source-health and evidence arrays by stable id",
+      "summarize command outputs into reason codes and counters"
+    ],
+    "review_required_before_freeze": true,
+    "update_policy": "UPDATE_GOLDENS-style updates require human review of the diff and a Beads comment citing the scenario ids changed."
+  },
+  "classification_vocabulary": [
+    "ready_now",
+    "blocked_infra",
+    "blocked_domain",
+    "waiting_comm",
+    "stale_claim",
+    "dirty_overlap",
+    "proof_starved",
+    "do_not_touch"
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "empty-ready-bv-blocked-recommendation",
+      "title": "Empty br ready while bv recommends a blocked RCH issue",
+      "summary": "The router must trust Beads readiness over a stale graph recommendation when `br ready --json` is empty and `bv --robot-next` points at `ft-4tp7g`.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "beads-ready",
+          "command_or_api": "br ready --json",
+          "required_reason_codes": [
+            "beads.ready_empty"
+          ],
+          "required_counters": {
+            "ready_count": 0
+          }
+        },
+        {
+          "source_id": "bv-next",
+          "command_or_api": "bv --robot-next",
+          "required_reason_codes": [
+            "bv.recommends_blocked_issue"
+          ],
+          "required_subjects": [
+            "ft-4tp7g"
+          ]
+        },
+        {
+          "source_id": "beads-blocker-state",
+          "command_or_api": "br show ft-4tp7g --json",
+          "required_reason_codes": [
+            "beads.status_blocked",
+            "beads.assignee_present"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "blocked_infra",
+        "recommended_safe_action": "do_not_claim_bv_pick_record_blocker_or_find_disjoint_static_slice",
+        "confidence": "high",
+        "explanation_must_include": [
+          "br state is authoritative for actionability",
+          "bv recommendation is advisory only",
+          "ft-4tp7g remains blocked until RCH reaches remote Cargo proof"
+        ]
+      },
+      "forbidden_actions": [
+        "claim_ft_4tp7g",
+        "run_local_cargo",
+        "restart_rch",
+        "cancel_builds",
+        "force_release_assignee"
+      ],
+      "volatility": {
+        "level": 3,
+        "strategy": "scrub timestamps and active assignee name unless ownership is under test"
+      }
+    },
+    {
+      "scenario_id": "rch-no-admissible-worker",
+      "title": "RCH degraded with no admissible worker",
+      "summary": "The router must separate source readiness from proof substrate failure when RCH selects no worker and remote Cargo is not reached.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "rch-diagnose",
+          "command_or_api": "rch diagnose --json --dry-run -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-<bead>-proof cargo test ...",
+          "required_reason_codes": [
+            "rch.no_admissible_workers",
+            "rch.remote_cargo_reached_false"
+          ],
+          "required_counters": {
+            "selected_workers": 0,
+            "remote_cargo_reached": 0
+          }
+        },
+        {
+          "source_id": "beads-blocker",
+          "command_or_api": "br show ft-4tp7g --json",
+          "required_reason_codes": [
+            "beads.status_blocked"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "proof_starved",
+        "recommended_safe_action": "keep_proof_required_bead_open_or_blocked_and_record_rch_reason_code",
+        "confidence": "high",
+        "explanation_must_include": [
+          "remote proof did not reach Cargo or rustc",
+          "local Cargo output cannot close a proof lane",
+          "static checks may support diagnosis only"
+        ]
+      },
+      "forbidden_actions": [
+        "local_cargo_proof",
+        "rch_service_restart",
+        "worker_mutation",
+        "build_cancellation",
+        "remote_mirror_mutation"
+      ],
+      "volatility": {
+        "level": 4,
+        "strategy": "structural golden with reason-code matching; scrub worker names, slots, queue ids, timestamps, and target dirs"
+      }
+    },
+    {
+      "scenario_id": "agent-mail-ack-required",
+      "title": "Ack-required Agent Mail request",
+      "summary": "The router must recommend acknowledging direct communication before starting unrelated work.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "agent-mail-inbox",
+          "command_or_api": "fetch_inbox(project_key, agent_name, include_bodies=false, limit=20)",
+          "required_reason_codes": [
+            "agent_mail.ack_required_present"
+          ],
+          "required_counters": {
+            "ack_required_count_min": 1
+          }
+        }
+      ],
+      "expected": {
+        "classification": "waiting_comm",
+        "recommended_safe_action": "acknowledge_message_then_reply_or_continue_based_on_request",
+        "confidence": "high",
+        "explanation_must_include": [
+          "ack-required messages are work coordination inputs",
+          "acknowledgement is a lightweight receipt, not permission to mutate files",
+          "Agent Mail repair is forbidden if the service is degraded"
+        ]
+      },
+      "forbidden_actions": [
+        "ignore_ack_required_message",
+        "agent_mail_repair",
+        "broadcast_spam",
+        "claim_conflicting_bead_before_ack"
+      ],
+      "volatility": {
+        "level": 4,
+        "strategy": "fixture should use synthetic reduced metadata or scrub sender, message id, and timestamps; do not store full bodies"
+      }
+    },
+    {
+      "scenario_id": "stale-in-progress-candidate",
+      "title": "Possibly stale in-progress bead",
+      "summary": "The router must recommend a status-check before force-release when a bead appears stale but has incomplete evidence.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "beads-in-progress",
+          "command_or_api": "br list --status in_progress --json",
+          "required_reason_codes": [
+            "beads.in_progress_present",
+            "beads.no_recent_update"
+          ]
+        },
+        {
+          "source_id": "git-history",
+          "command_or_api": "git log --since=<window> --format=<agent-aware-format>",
+          "required_reason_codes": [
+            "git.no_recent_owner_commit"
+          ]
+        },
+        {
+          "source_id": "agent-mail-thread",
+          "command_or_api": "search_messages(project_key, query=<bead-id>, ranking=recency)",
+          "required_reason_codes": [
+            "agent_mail.no_recent_owner_message_or_unavailable"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "stale_claim",
+        "recommended_safe_action": "send_or_draft_status_check_before_force_release",
+        "confidence": "medium",
+        "explanation_must_include": [
+          "elapsed time alone is not enough",
+          "Codex idle placeholder text is not stuck evidence",
+          "broadcast/status-check precedes force-release"
+        ]
+      },
+      "forbidden_actions": [
+        "force_release_without_status_check",
+        "reassign_human_owned_work",
+        "touch_owned_dirty_paths",
+        "treat_idle_placeholder_as_stuck"
+      ],
+      "volatility": {
+        "level": 5,
+        "strategy": "structural golden over evidence classes and counters; scrub times, agent names, pane ids, and commit shas unless they are the scenario subject"
+      }
+    },
+    {
+      "scenario_id": "dirty-overlap-active-owner",
+      "title": "Dirty tree overlaps active owner paths",
+      "summary": "The router must pause overlapping work and pick a disjoint path when tracked dirty files belong to another active lane.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "git-status",
+          "command_or_api": "git status --short --branch --untracked-files=all",
+          "required_reason_codes": [
+            "git.dirty_paths_present",
+            "git.dirty_overlap_risk"
+          ]
+        },
+        {
+          "source_id": "agent-mail-reservations",
+          "command_or_api": "file reservation snapshot or reduced Agent Mail metadata",
+          "required_reason_codes": [
+            "reservation.owner_present_or_dirty_owner_inferred"
+          ]
+        },
+        {
+          "source_id": "beads-owner-state",
+          "command_or_api": "br list --status in_progress --json or br show <bead> --json",
+          "required_reason_codes": [
+            "beads.owner_active_or_recent"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "dirty_overlap",
+        "recommended_safe_action": "avoid_overlapping_paths_and_claim_only_disjoint_ready_work",
+        "confidence": "high",
+        "explanation_must_include": [
+          "dirty files in shared checkout are presumed to be another agent's work",
+          "do not stash, revert, overwrite, or stage unrelated dirty files",
+          "path reservations and Beads ownership bound the safe edit surface"
+        ]
+      },
+      "forbidden_actions": [
+        "stash_unrelated_changes",
+        "revert_unrelated_changes",
+        "stage_unowned_dirty_files",
+        "edit_reserved_paths"
+      ],
+      "volatility": {
+        "level": 3,
+        "strategy": "canonicalize paths relative to repo root; keep filenames when overlap classification depends on them"
+      }
+    },
+    {
+      "scenario_id": "docs-only-ready-while-proof-blocked",
+      "title": "Docs-only or fixture-only ready slice while code proof is blocked",
+      "summary": "The router must allow a static docs/fixture task when RCH blocks code proof lanes and the edit surface is disjoint from active dirty work.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "beads-ready-static",
+          "command_or_api": "br ready --json",
+          "required_reason_codes": [
+            "beads.ready_one_or_more",
+            "beads.static_or_docs_slice"
+          ]
+        },
+        {
+          "source_id": "git-disjoint",
+          "command_or_api": "git status --short --branch --untracked-files=all",
+          "required_reason_codes": [
+            "git.dirty_paths_present_or_clean",
+            "dirty_overlap.none_for_candidate"
+          ]
+        },
+        {
+          "source_id": "proof-policy",
+          "command_or_api": "bead proof section plus AGENTS.md RCH policy",
+          "required_reason_codes": [
+            "proof.static_only",
+            "local_cargo_not_required"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "ready_now",
+        "recommended_safe_action": "claim_ready_static_slice_reserve_paths_and_run_static_checks",
+        "confidence": "high",
+        "explanation_must_include": [
+          "static/docs fixture work can proceed without remote Cargo",
+          "owned paths are disjoint from active dirty work",
+          "future code-bearing closeout still requires RCH"
+        ]
+      },
+      "forbidden_actions": [
+        "expand_scope_into_code_harness",
+        "run_local_cargo_as_proof",
+        "touch_active_docs_lane",
+        "skip_file_reservation"
+      ],
+      "volatility": {
+        "level": 2,
+        "strategy": "exact structural golden after scrubbing timestamps and generated Bead ids"
+      }
+    }
+  ],
+  "future_harness_requirements": {
+    "must_generate": [
+      "json golden output for every scenario",
+      "toon golden output or documented TOON-equivalent rendering for every scenario",
+      "structured decision log explaining source health, evidence, classification, confidence, and safe action"
+    ],
+    "must_fail_when": [
+      "bv advisory output is treated as claim authority over br status",
+      "local Cargo is counted as proof for a proof-required lane",
+      "Agent Mail degraded state recommends repair or restart",
+      "RCH degraded state recommends service mutation or build cancellation",
+      "dirty overlap recommends stashing, reverting, or staging another agent's work",
+      "stale-claim detection force-releases without status-check evidence"
+    ],
+    "proof_policy": "RCH-only for Rust/e2e harness execution after code exists; static jq and diff checks are sufficient for this inventory."
+  }
+}
