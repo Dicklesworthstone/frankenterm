@@ -55,7 +55,7 @@ impl LocalListener {
                 Ok(stream) => {
                     let dispatch_config = self.dispatch_config;
                     spawn_into_main_thread(async move {
-                        crate::dispatch::process_with_config(stream, dispatch_config)
+                        crate::dispatch::process_unix_auto_with_config(stream, dispatch_config)
                             .await
                             .map_err(|e| {
                                 log::error!("{:#}", e);

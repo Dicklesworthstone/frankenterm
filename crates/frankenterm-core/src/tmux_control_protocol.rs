@@ -34,12 +34,14 @@
 //! command line into a [`TmuxCommand`], format a [`TmuxResponse`]
 //! back into the tmux block-line wire shape (`%begin`/`%end`/`%error`).
 //!
-//! What this module is NOT (filed as `ft-hs5f6.cont` follow-up):
+//! What this module is NOT:
 //!
-//! - The actual socket listener at `$TMUX_TMPDIR/tmux-<uid>/default`.
-//! - Handler dispatch — translating a parsed [`TmuxCommand`] into
-//!   ft's mux state (the dispatcher hooks the parsed command into
-//!   the existing `wezterm.rs` surface).
+//! - The socket listener/protocol discriminator lives in
+//!   `frankenterm-mux-server-impl`, not here.
+//! - Full handler dispatch — `ft-l4cef` starts the daemon-side path
+//!   with read-only session/window listing and graceful `%error`
+//!   frames for unsupported commands, but the full Tier-1 mutating
+//!   command set is still follow-up work.
 //! - Notification stream (the asynchronous `%output`,
 //!   `%window-add`, etc. lines tmux clients subscribe to).
 //!

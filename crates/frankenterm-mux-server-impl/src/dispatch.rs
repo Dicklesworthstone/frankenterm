@@ -2,7 +2,7 @@
 #![allow(clippy::type_repetition_in_bounds)]
 use crate::sessionhandler::{PduSender, SessionHandler};
 use anyhow::Context;
-use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use asupersync::runtime::IoDriverHandle;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -10,6 +10,7 @@ use asupersync::runtime::reactor::{Interest, IoUringReactor};
 use async_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use async_ossl::AsyncSslStream;
 use codec::{DecodedPdu, Pdu};
+use frankenterm_core::tmux_control_protocol::{TmuxCommand, TmuxResponse, parse_command};
 use futures::future::{Either, select};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use futures::task::{ArcWake, waker};
@@ -17,8 +18,9 @@ use futures::{FutureExt, pin_mut};
 use mux::{Mux, MuxNotification};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use parking_lot::Mutex as ParkingMutex;
+use std::collections::VecDeque;
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -31,6 +33,7 @@ use wezterm_uds::UnixStream;
 
 pub const DISPATCH_ITEM_QUEUE_CAPACITY: usize = 4096;
 const TRANSIENT_WRITE_RETRY_LIMIT: usize = 8;
+const TMUX_CONTROL_MAX_LINE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchIoBackend {
@@ -799,6 +802,411 @@ where
     process_async_with_config(stream, config).await
 }
 
+pub async fn process_unix_auto_with_config(
+    stream: UnixStream,
+    config: DispatchRuntimeConfig,
+) -> anyhow::Result<()> {
+    process_auto_with_config(stream, config).await
+}
+
+async fn process_auto_with_config<T>(stream: T, config: DispatchRuntimeConfig) -> anyhow::Result<()>
+where
+    T: 'static,
+    T: DispatchStream,
+{
+    match detect_incoming_protocol(stream).await? {
+        IncomingProtocol::CleanDisconnect => Ok(()),
+        IncomingProtocol::BinaryPdu(stream) => process_async_with_config(stream, config).await,
+        IncomingProtocol::TmuxControl { stream, prefix } => {
+            process_tmux_control_stream(stream, prefix).await
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProtocolProbe {
+    NeedMore,
+    BinaryPdu,
+    TmuxControl,
+}
+
+enum IncomingProtocol<T>
+where
+    T: DispatchStream,
+{
+    CleanDisconnect,
+    BinaryPdu(PrefetchedDispatchStream<T>),
+    TmuxControl { stream: T, prefix: Vec<u8> },
+}
+
+#[derive(Debug)]
+struct PrefetchedDispatchStream<T>
+where
+    T: DispatchStream,
+{
+    inner: T,
+    pending: VecDeque<u8>,
+}
+
+impl<T> PrefetchedDispatchStream<T>
+where
+    T: DispatchStream,
+{
+    fn new(inner: T, pending: Vec<u8>) -> Self {
+        Self {
+            inner,
+            pending: pending.into(),
+        }
+    }
+}
+
+impl<T> DispatchStream for PrefetchedDispatchStream<T>
+where
+    T: DispatchStream,
+{
+    fn dispatch_stream_kind(&self) -> DispatchStreamKind {
+        self.inner.dispatch_stream_kind()
+    }
+
+    fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        if self.pending.is_empty() {
+            self.inner.wait_for_readable()
+        } else {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        self.inner.wait_for_writable()
+    }
+
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    fn io_uring_fd(&self) -> Option<RawFd> {
+        self.inner.io_uring_fd()
+    }
+}
+
+impl<T> AsyncRead for PrefetchedDispatchStream<T>
+where
+    T: DispatchStream,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut drained_pending = false;
+        while buf.remaining() > 0 {
+            let Some(byte) = this.pending.pop_front() else {
+                break;
+            };
+            buf.put_slice(&[byte]);
+            drained_pending = true;
+        }
+        if drained_pending {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T> AsyncWrite for PrefetchedDispatchStream<T>
+where
+    T: DispatchStream,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+async fn detect_incoming_protocol<T>(mut stream: T) -> anyhow::Result<IncomingProtocol<T>>
+where
+    T: DispatchStream,
+{
+    let mut prefix = Vec::new();
+    loop {
+        wait_for_dispatch_readable(&stream, None)
+            .await
+            .context("waiting to probe incoming mux socket protocol")?;
+        let mut byte = [0u8; 1];
+        let read = stream
+            .read(&mut byte)
+            .await
+            .context("probing incoming mux socket protocol")?;
+        if read == 0 {
+            if prefix.is_empty() {
+                return Ok(IncomingProtocol::CleanDisconnect);
+            }
+            return Ok(IncomingProtocol::BinaryPdu(PrefetchedDispatchStream::new(
+                stream, prefix,
+            )));
+        }
+        prefix.push(byte[0]);
+        match classify_protocol_probe(&prefix) {
+            ProtocolProbe::NeedMore => {}
+            ProtocolProbe::BinaryPdu => {
+                return Ok(IncomingProtocol::BinaryPdu(PrefetchedDispatchStream::new(
+                    stream, prefix,
+                )));
+            }
+            ProtocolProbe::TmuxControl => {
+                return Ok(IncomingProtocol::TmuxControl { stream, prefix });
+            }
+        }
+    }
+}
+
+fn classify_protocol_probe(bytes: &[u8]) -> ProtocolProbe {
+    let Some((&first, rest)) = bytes.split_first() else {
+        return ProtocolProbe::NeedMore;
+    };
+    if !first.is_ascii_alphabetic() {
+        return ProtocolProbe::BinaryPdu;
+    }
+    for byte in rest {
+        match *byte {
+            b'\n' => return ProtocolProbe::TmuxControl,
+            b'\r' | b'\t' | b' '..=b'~' => {}
+            _ => return ProtocolProbe::BinaryPdu,
+        }
+    }
+    if bytes.len() >= TMUX_CONTROL_MAX_LINE_BYTES {
+        ProtocolProbe::BinaryPdu
+    } else {
+        ProtocolProbe::NeedMore
+    }
+}
+
+async fn process_tmux_control_stream<T>(mut stream: T, mut buffer: Vec<u8>) -> anyhow::Result<()>
+where
+    T: DispatchStream,
+{
+    let mut command_id = 0u64;
+    loop {
+        while let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = buffer.drain(..=line_end).collect::<Vec<_>>();
+            let line = String::from_utf8_lossy(&line);
+            command_id = command_id.saturating_add(1);
+            let response =
+                tmux_control_response_at(current_unix_timestamp_secs(), command_id, &line);
+            write_tmux_response(&mut stream, response).await?;
+        }
+
+        if buffer.len() > TMUX_CONTROL_MAX_LINE_BYTES {
+            command_id = command_id.saturating_add(1);
+            let response = tmux_error_response(
+                current_unix_timestamp_secs(),
+                command_id,
+                "tmux control command exceeded maximum line length",
+            );
+            write_tmux_response(&mut stream, response).await?;
+            return Ok(());
+        }
+
+        wait_for_dispatch_readable(&stream, None)
+            .await
+            .context("waiting for tmux control command line")?;
+        let mut chunk = [0u8; 1024];
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .context("reading tmux control command line")?;
+        if read == 0 {
+            return Ok(());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn write_tmux_response<T>(stream: &mut T, response: TmuxResponse) -> anyhow::Result<()>
+where
+    T: DispatchStream,
+{
+    stream
+        .write_all(response.encode().as_bytes())
+        .await
+        .context("writing tmux control response")?;
+    stream
+        .flush()
+        .await
+        .context("flushing tmux control response")
+}
+
+fn current_unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn tmux_control_response_at(timestamp_secs: u64, command_id: u64, line: &str) -> TmuxResponse {
+    match parse_command(line) {
+        Ok(command) => tmux_command_response_at(timestamp_secs, command_id, command),
+        Err(err) => tmux_error_response(timestamp_secs, command_id, &format!("parse error: {err}")),
+    }
+}
+
+fn tmux_command_response_at(
+    timestamp_secs: u64,
+    command_id: u64,
+    command: TmuxCommand,
+) -> TmuxResponse {
+    match command {
+        TmuxCommand::ListSessions => match Mux::try_get() {
+            Some(mux) => tmux_success_response(
+                timestamp_secs,
+                command_id,
+                tmux_control_list_sessions_output(&mux),
+            ),
+            None => tmux_error_response(timestamp_secs, command_id, "mux singleton is unavailable"),
+        },
+        TmuxCommand::ListWindows { target_session } => match Mux::try_get() {
+            Some(mux) => match tmux_control_list_windows_output(&mux, target_session.as_deref()) {
+                Ok(output) => tmux_success_response(timestamp_secs, command_id, output),
+                Err(err) => tmux_error_response(timestamp_secs, command_id, &err),
+            },
+            None => tmux_error_response(timestamp_secs, command_id, "mux singleton is unavailable"),
+        },
+        TmuxCommand::Unknown { verb, .. } => tmux_error_response(
+            timestamp_secs,
+            command_id,
+            &format!("unsupported command: {verb}"),
+        ),
+        command => tmux_error_response(
+            timestamp_secs,
+            command_id,
+            &format!(
+                "unsupported command in native tmux dispatcher: {}",
+                tmux_command_name(&command)
+            ),
+        ),
+    }
+}
+
+fn tmux_command_name(command: &TmuxCommand) -> &'static str {
+    match command {
+        TmuxCommand::SendKeys { .. } => "send-keys",
+        TmuxCommand::ListWindows { .. } => "list-windows",
+        TmuxCommand::ListSessions => "list-sessions",
+        TmuxCommand::CapturePane { .. } => "capture-pane",
+        TmuxCommand::SplitWindow { .. } => "split-window",
+        TmuxCommand::NewSession { .. } => "new-session",
+        TmuxCommand::AttachSession { .. } => "attach-session",
+        TmuxCommand::Detach => "detach",
+        TmuxCommand::Unknown { .. } => "unknown",
+    }
+}
+
+fn tmux_success_response(
+    timestamp_secs: u64,
+    command_id: u64,
+    output: Vec<String>,
+) -> TmuxResponse {
+    TmuxResponse {
+        timestamp_secs,
+        command_id,
+        flags: 0,
+        output,
+        outcome: Ok(()),
+    }
+}
+
+fn tmux_error_response(timestamp_secs: u64, command_id: u64, message: &str) -> TmuxResponse {
+    TmuxResponse {
+        timestamp_secs,
+        command_id,
+        flags: 0,
+        output: vec![message.to_string()],
+        outcome: Err(message.to_string()),
+    }
+}
+
+fn tmux_control_list_sessions_output(mux: &Mux) -> Vec<String> {
+    let active_workspace = mux.active_workspace();
+    let mut workspaces = mux.iter_workspaces();
+    if workspaces.is_empty() {
+        workspaces.push(active_workspace.clone());
+    }
+    workspaces.sort();
+    workspaces.dedup();
+
+    workspaces
+        .into_iter()
+        .map(|workspace| {
+            let window_count = mux.iter_windows_in_workspace(&workspace).len();
+            let attached = if workspace == active_workspace {
+                " (attached)"
+            } else {
+                ""
+            };
+            format!("{workspace}: {window_count} windows{attached}")
+        })
+        .collect()
+}
+
+fn tmux_control_list_windows_output(
+    mux: &Mux,
+    target_session: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let active_workspace;
+    let workspace = match target_session {
+        Some(workspace) => workspace,
+        None => {
+            active_workspace = mux.active_workspace();
+            active_workspace.as_str()
+        }
+    };
+    let window_ids = mux.iter_windows_in_workspace(workspace);
+    if target_session.is_some() && window_ids.is_empty() {
+        return Err(format!("session not found: {workspace}"));
+    }
+
+    let mut lines = Vec::new();
+    for window_id in window_ids {
+        let Some(window) = mux.get_window(window_id) else {
+            continue;
+        };
+        let active_tab_id = window.get_active().map(|tab| tab.tab_id());
+        for (idx, tab) in window.iter().enumerate() {
+            let size = tab.get_size();
+            let title = tab.get_title();
+            let active = if Some(tab.tab_id()) == active_tab_id {
+                "*"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{idx}: {title}{active} ({} panes) [{}x{}] @{}",
+                tab.iter_panes().len(),
+                size.cols,
+                size.rows,
+                tab.tab_id()
+            ));
+        }
+    }
+
+    Ok(lines)
+}
+
 pub async fn process_async<T>(stream: T) -> anyhow::Result<()>
 where
     T: 'static,
@@ -1068,6 +1476,80 @@ mod tests {
                 Mux::shutdown();
             }
         }
+    }
+
+    #[test]
+    fn protocol_probe_recognizes_tmux_control_line() {
+        assert_eq!(
+            classify_protocol_probe(b"list-windows"),
+            ProtocolProbe::NeedMore
+        );
+        assert_eq!(
+            classify_protocol_probe(b"list-windows -t dev\n"),
+            ProtocolProbe::TmuxControl
+        );
+    }
+
+    #[test]
+    fn protocol_probe_keeps_binary_pdu_prefixes_on_pdu_path() {
+        assert_eq!(classify_protocol_probe(&[0]), ProtocolProbe::BinaryPdu);
+        assert_eq!(classify_protocol_probe(b"d\0"), ProtocolProbe::BinaryPdu);
+    }
+
+    #[test]
+    fn tmux_control_parse_errors_are_framed_errors() {
+        let response = tmux_control_response_at(10, 7, "send-keys \"unterminated\n");
+        let encoded = response.encode();
+
+        assert!(encoded.contains("parse error:"));
+        assert!(encoded.ends_with("%error 10 7 0\n"));
+    }
+
+    #[test]
+    fn tmux_control_unknown_commands_return_tmux_error_frames() {
+        let response = tmux_control_response_at(11, 8, "pipe-pane -o 'cat >/tmp/out'\n");
+        let encoded = response.encode();
+
+        assert!(encoded.contains("unsupported command: pipe-pane"));
+        assert!(encoded.ends_with("%error 11 8 0\n"));
+    }
+
+    #[test]
+    fn tmux_control_unsupported_tier_one_does_not_echo_payload() {
+        let response = tmux_control_response_at(11, 8, "send-keys secret-token Enter\n");
+        let encoded = response.encode();
+
+        assert!(encoded.contains("unsupported command in native tmux dispatcher: send-keys"));
+        assert!(!encoded.contains("secret-token"));
+        assert!(encoded.ends_with("%error 11 8 0\n"));
+    }
+
+    #[test]
+    fn tmux_control_list_sessions_reports_mux_workspaces() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let window = mux.new_empty_window(Some("dev".to_string()), None);
+        drop(window);
+
+        let response = tmux_control_response_at(12, 9, "list-sessions\n");
+
+        assert!(response.outcome.is_ok());
+        assert!(
+            response.output.iter().any(|line| line == "dev: 1 windows"),
+            "{:?}",
+            response.output
+        );
+    }
+
+    #[test]
+    fn tmux_control_list_windows_missing_session_is_error() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+
+        let response = tmux_control_response_at(13, 10, "list-windows -t missing\n");
+
+        assert!(response.outcome.is_err());
+        assert_eq!(response.output, vec!["session not found: missing"]);
     }
 
     #[derive(Debug, Default)]

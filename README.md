@@ -1726,7 +1726,7 @@ A workflow is a registered handler that triggers on detected patterns. The engin
 - **Engine** (`workflows/engine.rs`) — the orchestrator. Registers handlers, listens to the event bus, dispatches matching events to handlers.
 - **Runner** (`workflows/runner.rs`) — runs a single workflow execution. Persists state to `workflow_executions`. Enforces timeout + cancellation.
 - **Lock** (`workflows/lock.rs`) — per-pane workflow lock. Prevents two workflows from racing each other on the same pane. `LockManagerHealth` telemetry surface (ft-rai3h) tracks lock acquisition latency, hold time, and contention.
-- **Handlers** (`workflows/handlers.rs`) — built-in workflow implementations (handle_compaction, handle_usage_limits, handle_approval_needed, handle_on_error_cass_search, …).
+- **Handlers** (`workflows/handlers.rs`) — built-in workflow implementations (`HandleCompaction`, `HandleUsageLimits`, `HandleAuthRequired`, `HandleOnErrorCassSearch`, others; see the [Built-in Workflow Handler Catalog](#deep-dive-built-in-workflow-handler-catalog) for the full list).
 - **Traits** (`workflows/traits.rs`) — the `Workflow` trait every handler implements. Required methods: `id()`, `triggers()`, `execute(ctx)`, `trigger_policy()` (defaults to `allow_all`).
 
 ### Trigger-policy allowlists (ft-j0ufc)
@@ -3062,62 +3062,97 @@ When something does go wrong, the policy_denied_audit table (schema v24+), the a
 
 ## Deep Dive: Sample Mission and Tx Contracts
 
-For operators writing their first mission or tx contract, here are minimal working shapes.
+For operators writing their first mission or tx contract, the authoritative shapes are the Rust types in [`crates/frankenterm-core/src/plan.rs`](crates/frankenterm-core/src/plan.rs) — `pub struct Mission` (`MISSION_SCHEMA_VERSION = 1`) and `pub struct MissionTxContract` (`MISSION_TX_SCHEMA_VERSION = 1`). The skeletons below are illustrative; check the structs for the complete field list, defaults, and required vs `#[serde(default)]` fields before authoring a contract.
 
 ### Mission contract (`.ft/mission/active.json`)
 
+Shape per `pub struct Mission` in `plan.rs`:
+
 ```json
 {
-  "id": "mission-refactor-pricing-2026-05-16",
+  "mission_version": 1,
+  "mission_id": "mission-refactor-pricing-2026-05-16",
   "title": "Refactor pricing module across services",
-  "objective": "Apply the new currency-bucketing schema to pricing.rs in all 4 service crates",
+  "workspace_id": "frankenterm",
+  "lifecycle_state": "Planning",
+  "ownership": { "...": "MissionOwnership shape" },
+  "created_at_ms": 1747371600000,
+  "candidates": [
+    { "...": "CandidateAction entries" }
+  ],
   "assignments": [
     {
       "assignment_id": "a1",
-      "agent_profile": "codex_ws",
-      "pane_id": 1,
-      "scope": ["services/billing/pricing.rs"]
-    },
-    {
-      "assignment_id": "a2",
-      "agent_profile": "codex_ws",
-      "pane_id": 2,
-      "scope": ["services/catalog/pricing.rs"]
+      "candidate_id": "c1",
+      "assigned_by": "operator",
+      "assignee": "codex_ws",
+      "approval_state": "...",
+      "created_at_ms": 1747371600000
     }
-  ],
-  "lifecycle": "Planned",
-  "kill_switch": "Off"
+  ]
 }
 ```
+
+Required fields: `mission_version`, `mission_id`, `title`, `workspace_id`, `ownership`, `created_at_ms`. Defaulted: `lifecycle_state`, `candidates`, `assignments`, `pause_resume_state`. Optional: `provenance`, `updated_at_ms`.
 
 `ft mission plan` validates the contract and produces a planning summary. `ft mission run` advances the lifecycle into execution. `ft mission status` shows current assignment + approval state.
 
 ### Tx contract (`.ft/mission/tx-active.json`)
 
+Shape per `pub struct MissionTxContract` in `plan.rs`. The tx steps live **inside** `plan`, and compensations are a `Vec<TxCompensation>` keyed by `for_step_id`:
+
 ```json
 {
-  "id": "tx-deploy-staging-2026-05-16",
-  "steps": [
-    {
-      "step_id": "build",
-      "action": {"kind": "Send", "pane_id": 1, "text": "cargo build --release"},
-      "depends_on": []
-    },
-    {
-      "step_id": "deploy",
-      "action": {"kind": "Send", "pane_id": 2, "text": "./deploy-staging.sh"},
-      "depends_on": ["build"]
-    }
-  ],
-  "compensations": {
-    "deploy": {"kind": "Send", "pane_id": 2, "text": "./rollback-staging.sh"}
-  }
+  "tx_version": 1,
+  "intent": { "...": "TxIntent shape" },
+  "plan": {
+    "plan_id": "deploy-staging-plan",
+    "tx_id": "tx-deploy-staging-2026-05-16",
+    "steps": [
+      {
+        "step_id": "build",
+        "ordinal": 0,
+        "action": {
+          "type": "send_text",
+          "pane_id": 1,
+          "text": "cargo build --release"
+        }
+      },
+      {
+        "step_id": "deploy",
+        "ordinal": 1,
+        "action": {
+          "type": "send_text",
+          "pane_id": 2,
+          "text": "./deploy-staging.sh"
+        }
+      }
+    ],
+    "preconditions": [
+      { "type": "prompt_active", "pane_id": 1 }
+    ],
+    "compensations": [
+      {
+        "for_step_id": "deploy",
+        "action": {
+          "type": "send_text",
+          "pane_id": 2,
+          "text": "./rollback-staging.sh"
+        }
+      }
+    ]
+  },
+  "lifecycle_state": "Pending",
+  "outcome": "Pending",
+  "receipts": []
 }
 ```
 
+Note the action discriminator (`#[serde(tag = "type", rename_all = "snake_case")]`): use `"type": "send_text"`, not `"kind": "Send"`. `StepAction` variants include `send_text`, `wait_for`, `acquire_lock`, `release_lock`, `store_data`, and others; consult the enum in `plan.rs` for the full list.
+
 `ft tx plan` validates. `ft tx run` prepares + commits. `ft tx run --fail-step tx-step:commit` triggers failure-injection (useful in test/dev). `ft tx rollback` runs the compensations for steps that committed. `ft tx show --include-contract` shows the receipts and full payload.
 
-These are minimal shapes; production contracts include policy preconditions, idempotency keys, timeouts, and approval-token requirements. The full JSON schemas live in [`docs/json-schema/`](docs/json-schema/).
+The complete shapes (including `TxIntent`, `MissionOwnership`, `CandidateAction`, `Approval*`, etc.) are in [`crates/frankenterm-core/src/plan.rs`](crates/frankenterm-core/src/plan.rs); the operating-envelope, blocker-radar, and herd-wave JSON schemas (which mission contracts *consume*) live under [`docs/json-schema/`](docs/json-schema/).
 
 ---
 
