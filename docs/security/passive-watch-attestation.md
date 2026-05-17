@@ -3,10 +3,12 @@
 **Bead:** [BR-RC-SAFETY-PROOFS.G9] / `ft-x0666.1`
 **Status:** Foundation slice shipped. Contract module +
 adversarial-corpus catalog + cargo-fuzz target +
-seed corpus + invariant runner all live; integration with the
-real `ft watch` driver is the follow-on bead. The 1h/PR + 24h/
-release CI cadence is a CI configuration concern (separate
-bead).
+seed corpus + invariant runner all live. The recovery JSON
+attestation is published at
+`docs/security/passive-watch-attestation.json` and wired through
+`docs/attestations/manifest.json`; integration with the real
+`ft watch` driver remains the follow-on. The 1h/PR + 24h/release
+CI cadence is a separate CI configuration concern.
 
 ## Headline rule (the bead's strict-no)
 
@@ -30,6 +32,7 @@ proof that no such input exists in the explored space.
 | Contract module | `crates/frankenterm-core/src/passive_watch_invariant.rs` |
 | cargo-fuzz target | `fuzz/fuzz_targets/passive_watch_invariant.rs` |
 | Seed corpus | `fuzz/corpus/passive_watch_invariant/` (10 hand-curated seeds) |
+| JSON attestation | `docs/security/passive-watch-attestation.json` |
 | This audit doc | `docs/security/passive-watch-attestation.md` |
 
 ## Action taxonomy
@@ -49,10 +52,8 @@ loop can produce:
 | `Other { description }` | flagged as soft signal (review-but-not-fail) |
 
 Adding a new action variant requires extending this taxonomy and
-classifying it; the unit test
-`every_action_kind_has_a_classification` (the harness's
-exhaustive `WatchAction::is_mutating` switch) pins that none
-stays unclassified.
+classifying it; the exhaustive `WatchAction::is_mutating`
+switch pins that no variant stays unclassified.
 
 ## Adversarial corpus
 
@@ -113,9 +114,9 @@ matching the `*Health` shape used across this session
 | `mutating_violations_total` | OutboundSend/Spawn/Close + NonCaptureStorageWrite |
 | `unclassified_other_total` | Other actions (review queue) |
 
-`is_safe()` returns `mutating_violations_total == 0`. The
-production attestation surface dumps this struct verbatim in
-the per-release JSON artifact (depends on `ft-syqcz.1`).
+`is_safe()` returns `iterations_total > 0 && mutating_violations_total == 0`,
+so a cold baseline with no iterations is not reported safe. The production
+attestation surface dumps this struct verbatim in the recovery JSON artifact.
 
 ## Harness shape (current vs. follow-on)
 
@@ -169,7 +170,6 @@ contract that lane consumes.
   `crates/frankenterm-core/src/scan_pipeline.rs`.
 - **Production trigger taxonomy:** `pattern_trigger::TriggerCategory`
   in `crates/frankenterm-core/src/pattern_trigger.rs`.
-- **Attestation cross-link:** `BR-RC-FOUNDATION.G3.1`
-  (`ft-syqcz.1`) — the attestation graph schema bead. Per-
-  release attestation entry for the passive-watch proof is
-  authored once that schema lands.
+- **Attestation cross-link:** `docs/attestations/manifest.json`
+  contains the `security/passive-watch` slot pointing at
+  `docs/security/passive-watch-attestation.json`.

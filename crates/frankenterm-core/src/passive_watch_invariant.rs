@@ -73,9 +73,8 @@ use serde::{Deserialize, Serialize};
 ///   `OutboundSend`, `OutboundSpawn`, `OutboundClose`,
 ///   `NonCaptureStorageWrite`.
 ///
-/// Adding a new action requires extending this enum and
-/// classifying it; the unit test
-/// `every_action_kind_has_a_classification` pins that none stays
+/// Adding a new action requires extending this enum and classifying it; the
+/// exhaustive `WatchAction::is_mutating` match pins that no variant stays
 /// unclassified.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
