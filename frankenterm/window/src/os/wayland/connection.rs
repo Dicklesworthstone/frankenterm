@@ -65,7 +65,11 @@ impl WaylandConnection {
         let mut events = Events::with_capacity(8);
 
         let wl_fd = {
-            let read_guard = self.event_queue.borrow().prepare_read().unwrap();
+            let read_guard = self
+                .event_queue
+                .borrow()
+                .prepare_read()
+                .context("prepare initial Wayland event queue read guard")?;
             read_guard.connection_fd().as_raw_fd()
         };
 
@@ -88,9 +92,7 @@ impl WaylandConnection {
             {
                 let mut wayland_state = self.wayland_state.borrow_mut();
                 if let Err(err) = event_q.dispatch_pending(&mut wayland_state) {
-                    // TODO: show the protocol error in the display
-                    return Err(err)
-                        .with_context(|| format!("error during event_q.dispatch protcol_error"));
+                    return Err(err).context("Wayland event queue dispatch failed");
                 }
             }
 
@@ -111,12 +113,8 @@ impl WaylandConnection {
                     if let Err(err) = guard.read() {
                         log::trace!("Event Q error: {:?}", err);
                         if let WaylandError::Protocol(perr) = err {
-                            return Err(perr.into());
-                            // TODO
-                            // return Err(perr).with_context(|| {
-                            //     format!("error during event_q.read protocol_error={:?}",
-                            //             perr)
-                            // })
+                            return Err(anyhow::Error::new(perr)
+                                .context("Wayland protocol error during event queue read"));
                         }
                     }
                 }
@@ -148,7 +146,12 @@ impl WaylandConnection {
         let (mut prom, future) = new_window_op_promise();
 
         promise::spawn::spawn_into_main_thread(async move {
-            if let Some(handle) = Connection::get().unwrap().wayland().window_by_id(window) {
+            let Some(connection) = Connection::get() else {
+                fail_window_op_for_destroyed_window(&mut prom, "Wayland", window);
+                return;
+            };
+
+            if let Some(handle) = connection.wayland().window_by_id(window) {
                 let mut inner = handle.borrow_mut();
                 prom.result(f(&mut inner));
             } else {
