@@ -35,12 +35,15 @@ A tracked count lives between an HTML-comment open/close pair:
 
 ## Authoring a new tracked count
 
-1. Add a row to the `MANIFEST` array near the top of
-   `scripts/stamp-readme-counts.sh`:
+1. Add rows to the `WORKTREE_MANIFEST` and `HEAD_MANIFEST` arrays near
+   the top of `scripts/stamp-readme-counts.sh`:
    ```
    "my_count_name|<shell command that prints one integer>"
    ```
-   The command must produce an integer to stdout. Whitespace is trimmed.
+   Each command must produce an integer to stdout. Whitespace is
+   trimmed. The worktree command is for local drift checks; the HEAD
+   command must read from the committed tree with Git plumbing so
+   release snapshots cannot absorb unrelated dirty files.
 2. Insert the placeholder block in `README.md` and/or `AGENTS.md`:
    ```markdown
    …<!--count:my_count_name-->0<!--/count-->…
@@ -68,14 +71,21 @@ bash scripts/stamp-readme-counts.sh --check --strict
 bash scripts/stamp-readme-counts.sh --check --threshold=10
 
 # Machine-readable attestation snapshot.
-bash scripts/stamp-readme-counts.sh --json > docs/attestations/doctrine/agents-md-counts.json
+bash scripts/stamp-readme-counts.sh --source=head --json > docs/attestations/doctrine/agents-md-counts.json
+
+# Release-tree rewrite/check: ignore unrelated dirty worktree files.
+bash scripts/stamp-readme-counts.sh --source=head
+bash scripts/stamp-readme-counts.sh --source=head --check --strict
 ```
 
-CI runs `--check` (5% threshold) on every PR. Failure prints
-the offending placeholder occurrence with its documented vs. live
-values and the calculated drift percentage. Re-run the stamper without
-`--check` to fix the doc, then commit alongside the workspace change
-that moved the count.
+CI runs `--check` (5% threshold) on every PR against the default
+worktree source. Failure prints the offending placeholder occurrence
+with its documented vs. live values and the calculated drift
+percentage. Re-run the stamper without `--check` to fix the doc, then
+commit alongside the workspace change that moved the count. Release
+operators should use `--source=head` for the rewrite, strict check, and
+JSON snapshot so the attestation artifact reflects only committed
+sources.
 
 ## Tracked counts (current manifest)
 

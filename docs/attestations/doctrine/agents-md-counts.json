@@ -1,10 +1,11 @@
 {
   "schema_version": "1.0.0",
   "bead_id": "ft-tf6g3.2",
-  "generated_at": "2026-05-12T07:27:32Z",
-  "generator": "scripts/stamp-readme-counts.sh --json",
+  "generated_at": "2026-05-18T06:02:09Z",
+  "generator": "scripts/stamp-readme-counts.sh --json --source=head",
   "source": {
     "script": "scripts/stamp-readme-counts.sh",
+    "count_source": "head",
     "docs": [
       "README.md",
       "AGENTS.md"
@@ -17,25 +18,25 @@
   },
   "summary": {
     "tracked_counts": 12,
-    "placeholder_occurrences": 39,
-    "missing_placeholders": 9,
-    "matching_placeholders": 39,
+    "placeholder_occurrences": 22,
+    "missing_placeholders": 10,
+    "matching_placeholders": 22,
     "within_threshold_placeholders": 0,
     "violation_count": 0
   },
   "counts": [
     {
       "name": "workspace_members",
-      "command": "awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"'",
-      "live_value": 75,
+      "command": "git show HEAD:Cargo.toml | awk '/^members = \\[/,/^]/' | grep -c '^[[:space:]]*\"'",
+      "live_value": 77,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 75,
-          "live_value": 75,
+          "documented_value": 77,
+          "live_value": 77,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -43,17 +44,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 75,
-          "live_value": 75,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
-          "placeholder_present": true,
-          "documented_value": 75,
-          "live_value": 75,
+          "documented_value": 77,
+          "live_value": 77,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -69,31 +61,13 @@
     },
     {
       "name": "vendored_members",
-      "command": "awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"frankenterm/'",
+      "command": "git show HEAD:Cargo.toml | awk '/^members = \\[/,/^]/' | grep -c '^[[:space:]]*\"frankenterm/'",
       "live_value": 47,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
-          "placeholder_present": true,
-          "documented_value": 47,
-          "live_value": 47,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 2,
-          "placeholder_present": true,
-          "documented_value": 47,
-          "live_value": 47,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
           "placeholder_present": true,
           "documented_value": 47,
           "live_value": 47,
@@ -113,31 +87,13 @@
     },
     {
       "name": "vendored_top_level",
-      "command": "find frankenterm -maxdepth 2 -name Cargo.toml | wc -l",
+      "command": "git ls-tree -r --name-only HEAD frankenterm | awk -F/ '$NF == \"Cargo.toml\" && NF <= 3 { count++ } END { print count + 0 }'",
       "live_value": 42,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
-          "placeholder_present": true,
-          "documented_value": 42,
-          "live_value": 42,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 2,
-          "placeholder_present": true,
-          "documented_value": 42,
-          "live_value": 42,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
           "placeholder_present": true,
           "documented_value": 42,
           "live_value": 42,
@@ -156,7 +112,7 @@
     },
     {
       "name": "core_subcrates",
-      "command": "ls -d crates/frankenterm-core-* | wc -l",
+      "command": "git ls-tree --name-only HEAD:crates | awk '/^frankenterm-core-/ { count++ } END { print count + 0 }'",
       "live_value": 19,
       "live_status": "ok",
       "documents": [
@@ -191,16 +147,16 @@
     },
     {
       "name": "core_top_level_modules",
-      "command": "find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l",
-      "live_value": 506,
+      "command": "git ls-tree --name-only HEAD:crates/frankenterm-core/src | awk '/\\.rs$/ { count++ } END { print count + 0 }'",
+      "live_value": 511,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 506,
-          "live_value": 506,
+          "documented_value": 511,
+          "live_value": 511,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -208,26 +164,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 506,
-          "live_value": 506,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
-          "placeholder_present": true,
-          "documented_value": 506,
-          "live_value": 506,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 4,
-          "placeholder_present": true,
-          "documented_value": 506,
-          "live_value": 506,
+          "documented_value": 511,
+          "live_value": 511,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -235,8 +173,8 @@
           "path": "AGENTS.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 506,
-          "live_value": 506,
+          "documented_value": 511,
+          "live_value": 511,
           "drift_pct": 0,
           "status": "matches"
         }
@@ -244,16 +182,16 @@
     },
     {
       "name": "core_loc",
-      "command": "find crates/frankenterm-core/src -name '*.rs' -exec cat {} + | wc -l",
-      "live_value": 996607,
+      "command": "git ls-tree -r --name-only HEAD crates/frankenterm-core/src | awk '/\\.rs$/ { print }' | while IFS= read -r file_path; do git show \"HEAD:${file_path}\"; done | wc -l",
+      "live_value": 1017819,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 996607,
-          "live_value": 996607,
+          "documented_value": 1017819,
+          "live_value": 1017819,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -261,8 +199,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 996607,
-          "live_value": 996607,
+          "documented_value": 1017819,
+          "live_value": 1017819,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -278,16 +216,16 @@
     },
     {
       "name": "test_count",
-      "command": "grep -rE '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' crates/ | wc -l",
-      "live_value": 55330,
+      "command": "git grep -E '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' HEAD -- crates | wc -l",
+      "live_value": 55765,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 55330,
-          "live_value": 55330,
+          "documented_value": 55765,
+          "live_value": 55765,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -295,8 +233,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 55330,
-          "live_value": 55330,
+          "documented_value": 55765,
+          "live_value": 55765,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -304,17 +242,8 @@
           "path": "README.md",
           "occurrence": 3,
           "placeholder_present": true,
-          "documented_value": 55330,
-          "live_value": 55330,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 4,
-          "placeholder_present": true,
-          "documented_value": 55330,
-          "live_value": 55330,
+          "documented_value": 55765,
+          "live_value": 55765,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -330,16 +259,16 @@
     },
     {
       "name": "core_rust_test_files",
-      "command": "find crates/frankenterm-core/tests -type f -name '*.rs' | wc -l",
-      "live_value": 936,
+      "command": "git ls-tree -r --name-only HEAD crates/frankenterm-core/tests | awk '/\\.rs$/ { count++ } END { print count + 0 }'",
+      "live_value": 952,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 936,
-          "live_value": 936,
+          "documented_value": 952,
+          "live_value": 952,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -347,17 +276,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 936,
-          "live_value": 936,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
-          "placeholder_present": true,
-          "documented_value": 936,
-          "live_value": 936,
+          "documented_value": 952,
+          "live_value": 952,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -373,16 +293,16 @@
     },
     {
       "name": "criterion_bench_files",
-      "command": "find crates/frankenterm-core/benches -type f -name '*.rs' | wc -l",
-      "live_value": 108,
+      "command": "git ls-tree -r --name-only HEAD crates/frankenterm-core/benches | awk '/\\.rs$/ { count++ } END { print count + 0 }'",
+      "live_value": 111,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 108,
-          "live_value": 108,
+          "documented_value": 111,
+          "live_value": 111,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -390,26 +310,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 108,
-          "live_value": 108,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
-          "placeholder_present": true,
-          "documented_value": 108,
-          "live_value": 108,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 4,
-          "placeholder_present": true,
-          "documented_value": 108,
-          "live_value": 108,
+          "documented_value": 111,
+          "live_value": 111,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -425,31 +327,13 @@
     },
     {
       "name": "fuzz_targets",
-      "command": "find fuzz -type f -path '*/fuzz_targets/*.rs' | wc -l",
+      "command": "git ls-tree -r --name-only HEAD fuzz | awk '/\\/fuzz_targets\\/.*\\.rs$/ { count++ } END { print count + 0 }'",
       "live_value": 48,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
-          "placeholder_present": true,
-          "documented_value": 48,
-          "live_value": 48,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 2,
-          "placeholder_present": true,
-          "documented_value": 48,
-          "live_value": 48,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
           "placeholder_present": true,
           "documented_value": 48,
           "live_value": 48,
@@ -468,27 +352,17 @@
     },
     {
       "name": "doc_markdown_files",
-      "command": "find docs -type f -name '*.md' | wc -l",
-      "live_value": 393,
+      "command": "git ls-tree -r --name-only HEAD docs | awk '/\\.md$/ { count++ } END { print count + 0 }'",
+      "live_value": 441,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
-          "occurrence": 1,
-          "placeholder_present": true,
-          "documented_value": 393,
-          "live_value": 393,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 2,
-          "placeholder_present": true,
-          "documented_value": 393,
-          "live_value": 393,
-          "drift_pct": 0,
-          "status": "matches"
+          "occurrence": null,
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
         },
         {
           "path": "AGENTS.md",
@@ -502,34 +376,16 @@
     },
     {
       "name": "e2e_scripts",
-      "command": "find tests/e2e -type f -name '*.sh' | wc -l",
-      "live_value": 214,
+      "command": "git ls-tree -r --name-only HEAD tests/e2e | awk '/\\.sh$/ { count++ } END { print count + 0 }'",
+      "live_value": 251,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 214,
-          "live_value": 214,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 2,
-          "placeholder_present": true,
-          "documented_value": 214,
-          "live_value": 214,
-          "drift_pct": 0,
-          "status": "matches"
-        },
-        {
-          "path": "README.md",
-          "occurrence": 3,
-          "placeholder_present": true,
-          "documented_value": 214,
-          "live_value": 214,
+          "documented_value": 251,
+          "live_value": 251,
           "drift_pct": 0,
           "status": "matches"
         },

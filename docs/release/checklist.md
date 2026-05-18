@@ -13,10 +13,10 @@ catch common omissions.
    new `[X.Y.0] — YYYY-MM-DD` section; add a fresh `[Unreleased]`
    stub above it.
 3. **Stamp README/AGENTS counts.** Run
-   `bash scripts/stamp-readme-counts.sh` so every documented
-   workspace count matches HEAD (ft-tf6g3.2), then refresh the
+   `bash scripts/stamp-readme-counts.sh --source=head` so every documented
+   workspace count matches the committed release tree (ft-tf6g3.2), then refresh the
    release-attestation snapshot with
-   `bash scripts/stamp-readme-counts.sh --json > docs/attestations/doctrine/agents-md-counts.json`.
+   `bash scripts/stamp-readme-counts.sh --source=head --json > docs/attestations/doctrine/agents-md-counts.json`.
    CI's drift check will block a divergent release.
 4. **Regenerate the vendored-fork provenance manifest.** Run
    `python3 scripts/regen-provenance.py` so

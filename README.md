@@ -49,9 +49,9 @@
 | Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
 | Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
 
-**A swarm-native terminal platform that observes, controls, and audits fleets of 200+ concurrent AI coding agents.** <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->511<!--/count--> core-library modules, <!--count:core_loc-->1017913<!--/count-->+ lines of Rust, <!--count:test_count-->55765<!--/count-->+ test annotations across <!--count:core_rust_test_files-->952<!--/count--> integration test files.
+**A swarm-native terminal platform that observes, controls, and audits fleets of 200+ concurrent AI coding agents.** <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->511<!--/count--> core-library modules, <!--count:core_loc-->1017819<!--/count-->+ lines of Rust, <!--count:test_count-->55765<!--/count-->+ test annotations across <!--count:core_rust_test_files-->952<!--/count--> integration test files.
 
-_Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe; everything cited above is whatever the live `find`/`awk` returns at HEAD._
+_Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe. Developer checks use the live worktree by default; release snapshots use `--source=head` so unrelated dirty files cannot alter the attested counts._
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -4002,12 +4002,12 @@ Currently: **Codex** (OpenAI), **Claude Code** (Anthropic), **Gemini** (Google),
 
 ## Maintainers: how counts stay honest
 
-Every numeric claim in this README is wrapped in `<!--count:* -->` markers and refreshed by `scripts/stamp-readme-counts.sh`. The exact `find` / `awk` recipe each marker maps to:
+Every numeric claim in this README is wrapped in `<!--count:* -->` markers and refreshed by `scripts/stamp-readme-counts.sh`. The default worktree recipe each marker maps to:
 
 <details>
 <summary>Click for the full marker → command mapping</summary>
 
-| Marker | Command at HEAD |
+| Marker | Default worktree command |
 |---|---|
 | `<!--count:workspace_members-->` | `awk '/^members = \[/,/^]/' Cargo.toml \| grep -c '^\s*"'` |
 | `<!--count:core_subcrates-->` | `ls -d crates/frankenterm-core-* \| wc -l` |
@@ -4024,7 +4024,7 @@ Every numeric claim in this README is wrapped in `<!--count:* -->` markers and r
 
 </details>
 
-Stamp markers and their plain-text duplicates (in tables, the workspace tree, and the Testing section) should agree. If you see a numeric drift, re-run the stamp script. Plain-text duplications without `<!--count:* -->` wrapping need manual updates; if you spot one, wrap it in markers so the script picks it up on the next pass.
+Stamp markers and their plain-text duplicates (in tables, the workspace tree, and the Testing section) should agree. If you see numeric drift during normal development, re-run the stamp script. For release or attestation work, run `bash scripts/stamp-readme-counts.sh --source=head` and regenerate `docs/attestations/doctrine/agents-md-counts.json` with `--source=head --json` so the artifact is based on the committed tree. Plain-text duplications without `<!--count:* -->` wrapping need manual updates; if you spot one, wrap it in markers so the script picks it up on the next pass.
 
 ---
 
@@ -4044,6 +4044,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*<!--count:workspace_members-->77<!--/count--> workspace crates. <!--count:core_top_level_modules-->511<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1017913<!--/count-->+ lines. <!--count:test_count-->55765<!--/count-->+ tests. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->77<!--/count--> workspace crates. <!--count:core_top_level_modules-->511<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1017819<!--/count-->+ lines. <!--count:test_count-->55765<!--/count-->+ tests. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>

@@ -25,6 +25,8 @@
 #     bash scripts/stamp-readme-counts.sh --check          # advisory
 #     bash scripts/stamp-readme-counts.sh --check --strict # exact match
 #     bash scripts/stamp-readme-counts.sh --json           # machine-readable snapshot
+#     bash scripts/stamp-readme-counts.sh --source=head --json
+#                                                          # release snapshot from committed tree
 #
 # Cross-references:
 #   ft-d3awp / ft-hdvvo — drift incidents that motivated this work
@@ -41,11 +43,14 @@ cd "${REPO_ROOT}"
 MODE="write"
 THRESHOLD_PCT=5
 STRICT=0
+SOURCE_MODE="worktree"
 for arg in "$@"; do
     case "$arg" in
         --check)   MODE="check" ;;
         --json)    MODE="json" ;;
         --strict)  STRICT=1 ;;
+        --source=worktree) SOURCE_MODE="worktree" ;;
+        --source=head) SOURCE_MODE="head" ;;
         --threshold=*) THRESHOLD_PCT="${arg#--threshold=}" ;;
         --help|-h)
             sed -n '1,40p' "$0" | sed -e 's/^# \?//'
@@ -60,7 +65,7 @@ done
 # row here AND the matching <!--count:NAME-->...<!--/count--> blocks in
 # README.md / AGENTS.md (or anywhere — the script scans both files for
 # any matching placeholder names).
-MANIFEST=(
+WORKTREE_MANIFEST=(
     "workspace_members|awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"'"
     "vendored_members|awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"frankenterm/'"
     "vendored_top_level|find frankenterm -maxdepth 2 -name Cargo.toml | wc -l"
@@ -74,6 +79,27 @@ MANIFEST=(
     "doc_markdown_files|find docs -type f -name '*.md' | wc -l"
     "e2e_scripts|git ls-files tests/e2e | awk '/\\.sh$/ { count++ } END { print count + 0 }'"
 )
+
+HEAD_MANIFEST=(
+    "workspace_members|git show HEAD:Cargo.toml | awk '/^members = \\[/,/^]/' | grep -c '^[[:space:]]*\"'"
+    "vendored_members|git show HEAD:Cargo.toml | awk '/^members = \\[/,/^]/' | grep -c '^[[:space:]]*\"frankenterm/'"
+    "vendored_top_level|git ls-tree -r --name-only HEAD frankenterm | awk -F/ '\$NF == \"Cargo.toml\" && NF <= 3 { count++ } END { print count + 0 }'"
+    "core_subcrates|git ls-tree --name-only HEAD:crates | awk '/^frankenterm-core-/ { count++ } END { print count + 0 }'"
+    "core_top_level_modules|git ls-tree --name-only HEAD:crates/frankenterm-core/src | awk '/\\.rs$/ { count++ } END { print count + 0 }'"
+    "core_loc|git ls-tree -r --name-only HEAD crates/frankenterm-core/src | awk '/\\.rs$/ { print }' | while IFS= read -r file_path; do git show \"HEAD:\${file_path}\"; done | wc -l"
+    "test_count|git grep -E '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' HEAD -- crates | wc -l"
+    "core_rust_test_files|git ls-tree -r --name-only HEAD crates/frankenterm-core/tests | awk '/\\.rs$/ { count++ } END { print count + 0 }'"
+    "criterion_bench_files|git ls-tree -r --name-only HEAD crates/frankenterm-core/benches | awk '/\\.rs$/ { count++ } END { print count + 0 }'"
+    "fuzz_targets|git ls-tree -r --name-only HEAD fuzz | awk '/\\/fuzz_targets\\/.*\\.rs$/ { count++ } END { print count + 0 }'"
+    "doc_markdown_files|git ls-tree -r --name-only HEAD docs | awk '/\\.md$/ { count++ } END { print count + 0 }'"
+    "e2e_scripts|git ls-tree -r --name-only HEAD tests/e2e | awk '/\\.sh$/ { count++ } END { print count + 0 }'"
+)
+
+case "${SOURCE_MODE}" in
+    worktree) MANIFEST=("${WORKTREE_MANIFEST[@]}") ;;
+    head) MANIFEST=("${HEAD_MANIFEST[@]}") ;;
+    *) echo "ft-tf6g3.2: unknown source mode: ${SOURCE_MODE}" >&2; exit 2 ;;
+esac
 
 DOCS=(README.md AGENTS.md)
 
@@ -291,7 +317,8 @@ if [[ "${MODE}" == "json" ]]; then
         --arg schema_version "1.0.0" \
         --arg bead_id "ft-tf6g3.2" \
         --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg generator "scripts/stamp-readme-counts.sh --json" \
+        --arg generator "scripts/stamp-readme-counts.sh --json --source=${SOURCE_MODE}" \
+        --arg source_mode "${SOURCE_MODE}" \
         --arg check_status "${overall_status}" \
         --argjson threshold_pct "${THRESHOLD_PCT}" \
         --argjson strict "${STRICT}" \
@@ -309,6 +336,7 @@ if [[ "${MODE}" == "json" ]]; then
           generator: $generator,
           source: {
             script: "scripts/stamp-readme-counts.sh",
+            count_source: $source_mode,
             docs: ["README.md", "AGENTS.md"]
           },
           check: {
@@ -345,8 +373,8 @@ if [[ "${MODE}" == "check" ]]; then
     cat >&2 <<EOF
 
 What to do:
-  - Run \`bash scripts/stamp-readme-counts.sh\` (no --check) to rewrite
-    README.md / AGENTS.md so the placeholder values match the live tree.
+  - Run \`bash scripts/stamp-readme-counts.sh --source=${SOURCE_MODE}\` (no --check) to rewrite
+    README.md / AGENTS.md so the placeholder values match the selected source.
   - If the live counts moved unexpectedly, investigate the underlying
     change before stamping (the threshold is the early-warning signal).
 
