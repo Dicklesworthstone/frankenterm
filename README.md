@@ -3920,16 +3920,31 @@ Yes. The pattern detection and search work for any terminal output. Useful for d
 
 ### How do I add custom patterns?
 
-Edit `~/.config/ft/patterns.toml`:
+Custom rules live in a **pattern pack** file (a TOML doc with `name`, `version`, and a `[[rules]]` array). Put the file anywhere readable; reference it from your `ft.toml`:
 
 ```toml
-[[patterns]]
-id = "custom:my_error"
-pattern = "FATAL ERROR:.*"
-severity = "critical"
+# ft.toml — load builtin pack + your custom file
+[patterns]
+packs = ["builtin:core", "/path/to/my_lab_pack.toml"]
 ```
 
-Then validate with `ft rules test "FATAL ERROR: database connection lost"`.
+A minimal `my_lab_pack.toml`:
+
+```toml
+name = "lab:my-pack"
+version = "0.1.0"
+
+[[rules]]
+id = "lab.fatal_error"
+agent_type = "claude_code"          # claude_code / codex / gemini / wezterm / custom
+event_type = "error"                # short, machine-readable event taxonomy key
+severity = "critical"               # info / warn / critical
+anchors = ["FATAL ERROR"]           # literal strings for Bloom + Aho-Corasick prefilter (required)
+regex = "FATAL ERROR:.*"            # optional confirming regex
+description = "Application-level fatal error in agent output."
+```
+
+Validate with `ft rules test "FATAL ERROR: database connection lost"` and lint with `ft rules lint --fixtures --strict`. See the [`crates/frankenterm-core/src/patterns.rs`](crates/frankenterm-core/src/patterns.rs) `RuleDef` struct for the full optional-field surface (`remediation`, `workflow`, `manual_fix`, `preview_command`, `learn_more_url`).
 
 ### What's the performance overhead?
 
