@@ -1570,12 +1570,21 @@ impl WaylandState {
         let surface_data = SurfaceUserData::from_wl(window.wl_surface());
         let window_id = surface_data.window_id;
 
-        let window_inner = self
-            .window_by_id(window_id)
-            .expect("Inner Window should exist");
+        let Some(window_inner) = self.window_by_id(window_id) else {
+            log::warn!("Ignoring Wayland window event for unknown window id {window_id}");
+            return;
+        };
 
         let p = window_inner.borrow().pending_event.clone();
-        let mut pending_event = p.lock().unwrap();
+        let mut pending_event = match p.lock() {
+            Ok(pending_event) => pending_event,
+            Err(_) => {
+                log::warn!(
+                    "Ignoring Wayland window event for window id {window_id}: pending event lock was poisoned"
+                );
+                return;
+            }
+        };
 
         let changed = match event {
             WaylandWindowEvent::Close => {
