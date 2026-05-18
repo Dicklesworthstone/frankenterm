@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_snapshot.v1",
+  "generated_at_ms": 1779120006000,
+  "snapshot_id": "untracked-review-required",
+  "source_bead": "ft-5lsqo.1",
+  "mode": "agent_mail_unavailable_beads_only",
+  "agent_mail": {
+    "status": "unavailable",
+    "attempt_count": 2,
+    "retry_limit": 1,
+    "registered": false,
+    "inbox_checked": false,
+    "failure_class": "unknown",
+    "reason_codes": [
+      "agent_mail.unavailable_after_retry",
+      "fallback.beads_only"
+    ],
+    "forbidden_actions": [
+      "am_service_restart",
+      "am_service_stop",
+      "am_doctor_fix",
+      "am_doctor_repair",
+      "am_doctor_reconstruct",
+      "kill_agent_mail_process",
+      "destructive_git",
+      "delete_files",
+      "mutate_rch_worker",
+      "cancel_build",
+      "run_local_cargo_as_proof",
+      "reopen_dirty_overlap_without_owner_clear"
+    ],
+    "error_summary": "Unknown Agent Mail startup failure after retry."
+  },
+  "beads": {
+    "ready_count": 1,
+    "in_progress_count": 0,
+    "active_agents": [],
+    "stale_reopen": {
+      "default_action": "do_not_reopen",
+      "threshold_seconds": 7200,
+      "candidates": [],
+      "dirty_overlap_unknown": [
+        {
+          "path": "docs/robot-contracts/new-contract.md",
+          "status": "??",
+          "category": "untracked_review_required",
+          "severity": "medium",
+          "recommendation": "Do not stage or overwrite until ownership is known."
+        }
+      ]
+    }
+  },
+  "git": {
+    "dirty_count": 1,
+    "tracked_dirty_count": 0,
+    "untracked_dirty_count": 1,
+    "risk_level": "medium",
+    "dirty_paths": [
+      {
+        "path": "docs/robot-contracts/new-contract.md",
+        "status": "??",
+        "category": "untracked_review_required",
+        "severity": "medium",
+        "recommendation": "Review ownership before editing or staging."
+      }
+    ]
+  },
+  "safety": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "local_cargo_counted_as_proof": false,
+    "raw_mail_body_stored": false,
+    "raw_pane_text_stored": false,
+    "proof_disclaimer": "Untracked files require ownership review; no cleanup or proof action is implied."
+  },
+  "next_actions": [
+    "Avoid the untracked path unless it is reserved or clearly owned.",
+    "Continue with a non-overlapping ready bead."
+  ],
+  "artifact_paths": [
+    "fixtures/agent-mail-failover/valid/untracked-review-required.json"
+  ]
+}

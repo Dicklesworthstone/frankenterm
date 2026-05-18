@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_snapshot.v1",
+  "generated_at_ms": 1779120003000,
+  "snapshot_id": "empty-in-progress",
+  "source_bead": "ft-5lsqo.1",
+  "mode": "agent_mail_unavailable_beads_only",
+  "agent_mail": {
+    "status": "unavailable",
+    "attempt_count": 2,
+    "retry_limit": 1,
+    "registered": false,
+    "inbox_checked": false,
+    "failure_class": "database_error",
+    "reason_codes": [
+      "agent_mail.unavailable_after_retry",
+      "fallback.beads_only"
+    ],
+    "forbidden_actions": [
+      "am_service_restart",
+      "am_service_stop",
+      "am_doctor_fix",
+      "am_doctor_repair",
+      "am_doctor_reconstruct",
+      "kill_agent_mail_process",
+      "destructive_git",
+      "delete_files",
+      "mutate_rch_worker",
+      "cancel_build",
+      "run_local_cargo_as_proof",
+      "reopen_dirty_overlap_without_owner_clear"
+    ],
+    "error_summary": "Agent Mail database error after retry."
+  },
+  "beads": {
+    "ready_count": 1,
+    "in_progress_count": 0,
+    "active_agents": [],
+    "stale_reopen": {
+      "default_action": "do_not_reopen",
+      "threshold_seconds": 7200,
+      "candidates": [],
+      "dirty_overlap_unknown": []
+    }
+  },
+  "git": {
+    "dirty_count": 0,
+    "tracked_dirty_count": 0,
+    "untracked_dirty_count": 0,
+    "risk_level": "low",
+    "dirty_paths": []
+  },
+  "safety": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "local_cargo_counted_as_proof": false,
+    "raw_mail_body_stored": false,
+    "raw_pane_text_stored": false,
+    "proof_disclaimer": "No stalled in-progress Beads were found; no reopen action is authorized."
+  },
+  "next_actions": [
+    "Claim the first ready non-overlapping bead.",
+    "Do not invent stale work when in-progress count is zero."
+  ],
+  "artifact_paths": [
+    "fixtures/agent-mail-failover/valid/empty-in-progress.json"
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_snapshot.v1",
+  "generated_at_ms": 1779120005000,
+  "snapshot_id": "dirty-tracked-overlap",
+  "source_bead": "ft-5lsqo.1",
+  "mode": "agent_mail_unavailable_beads_only",
+  "agent_mail": {
+    "status": "unavailable",
+    "attempt_count": 2,
+    "retry_limit": 1,
+    "registered": false,
+    "inbox_checked": false,
+    "failure_class": "database_recovery_notice",
+    "reason_codes": [
+      "agent_mail.database_recovery_retry_exhausted",
+      "fallback.beads_only"
+    ],
+    "forbidden_actions": [
+      "am_service_restart",
+      "am_service_stop",
+      "am_doctor_fix",
+      "am_doctor_repair",
+      "am_doctor_reconstruct",
+      "kill_agent_mail_process",
+      "destructive_git",
+      "delete_files",
+      "mutate_rch_worker",
+      "cancel_build",
+      "run_local_cargo_as_proof",
+      "reopen_dirty_overlap_without_owner_clear"
+    ],
+    "error_summary": "Database recovery notice repeated; fallback only."
+  },
+  "beads": {
+    "ready_count": 0,
+    "in_progress_count": 1,
+    "active_agents": [],
+    "stale_reopen": {
+      "default_action": "do_not_reopen",
+      "threshold_seconds": 7200,
+      "candidates": [
+        {
+          "bead_id": "ft-def34.2",
+          "assignee": "SilverTrout",
+          "age_seconds": 9200,
+          "recommended_action": "do_not_reopen",
+          "reason_codes": [
+            "dirty_overlap.present",
+            "coordination.wait_for_owner"
+          ]
+        }
+      ],
+      "dirty_overlap_unknown": [
+        {
+          "path": "crates/frankenterm-core/src/events.rs",
+          "status": " M",
+          "category": "tracked_overlap_risk",
+          "severity": "high",
+          "recommendation": "Do not reopen or edit related Beads until owner state is clear."
+        }
+      ]
+    }
+  },
+  "git": {
+    "dirty_count": 1,
+    "tracked_dirty_count": 1,
+    "untracked_dirty_count": 0,
+    "risk_level": "high",
+    "dirty_paths": [
+      {
+        "path": "crates/frankenterm-core/src/events.rs",
+        "status": " M",
+        "category": "tracked_overlap_risk",
+        "severity": "high",
+        "recommendation": "Treat as another active pane work item."
+      }
+    ]
+  },
+  "safety": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "local_cargo_counted_as_proof": false,
+    "raw_mail_body_stored": false,
+    "raw_pane_text_stored": false,
+    "proof_disclaimer": "Dirty tracked overlap blocks stale reopen; no source proof or cleanup is claimed."
+  },
+  "next_actions": [
+    "Leave the bead in its current state.",
+    "Pick a disjoint docs or fixture slice."
+  ],
+  "artifact_paths": [
+    "fixtures/agent-mail-failover/valid/dirty-tracked-overlap.json"
+  ]
+}

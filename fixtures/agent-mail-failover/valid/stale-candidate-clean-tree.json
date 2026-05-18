@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_snapshot.v1",
+  "generated_at_ms": 1779120004000,
+  "snapshot_id": "stale-candidate-clean-tree",
+  "source_bead": "ft-5lsqo.1",
+  "mode": "agent_mail_unavailable_beads_only",
+  "agent_mail": {
+    "status": "unavailable",
+    "attempt_count": 2,
+    "retry_limit": 1,
+    "registered": false,
+    "inbox_checked": false,
+    "failure_class": "timeout",
+    "reason_codes": [
+      "agent_mail.unavailable_after_retry",
+      "fallback.beads_only"
+    ],
+    "forbidden_actions": [
+      "am_service_restart",
+      "am_service_stop",
+      "am_doctor_fix",
+      "am_doctor_repair",
+      "am_doctor_reconstruct",
+      "kill_agent_mail_process",
+      "destructive_git",
+      "delete_files",
+      "mutate_rch_worker",
+      "cancel_build",
+      "run_local_cargo_as_proof",
+      "reopen_dirty_overlap_without_owner_clear"
+    ],
+    "error_summary": "Agent Mail request timed out twice."
+  },
+  "beads": {
+    "ready_count": 0,
+    "in_progress_count": 1,
+    "active_agents": [],
+    "stale_reopen": {
+      "default_action": "status_check_before_reopen",
+      "threshold_seconds": 7200,
+      "candidates": [
+        {
+          "bead_id": "ft-abc12.1",
+          "assignee": "BlueLake",
+          "age_seconds": 9000,
+          "recommended_action": "comment_status_check",
+          "reason_codes": [
+            "stale_candidate.clean_tree",
+            "coordination.status_check_required"
+          ]
+        }
+      ],
+      "dirty_overlap_unknown": []
+    }
+  },
+  "git": {
+    "dirty_count": 0,
+    "tracked_dirty_count": 0,
+    "untracked_dirty_count": 0,
+    "risk_level": "low",
+    "dirty_paths": []
+  },
+  "safety": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "local_cargo_counted_as_proof": false,
+    "raw_mail_body_stored": false,
+    "raw_pane_text_stored": false,
+    "proof_disclaimer": "Clean stale candidate permits a status-check comment only; reopen requires follow-up evidence."
+  },
+  "next_actions": [
+    "Add a Beads status-check comment before reopening.",
+    "Re-run fallback snapshot after the waiting window."
+  ],
+  "artifact_paths": [
+    "fixtures/agent-mail-failover/valid/stale-candidate-clean-tree.json"
+  ]
+}

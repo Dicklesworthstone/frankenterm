@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_snapshot.v1",
+  "generated_at_ms": 1779120002000,
+  "snapshot_id": "database-recovery-retry-exhausted",
+  "source_bead": "ft-5lsqo.1",
+  "mode": "agent_mail_unavailable_beads_only",
+  "agent_mail": {
+    "status": "unavailable",
+    "attempt_count": 2,
+    "retry_limit": 1,
+    "registered": false,
+    "inbox_checked": false,
+    "failure_class": "database_recovery_notice",
+    "reason_codes": [
+      "agent_mail.database_recovery_retry_exhausted",
+      "agent_mail.unavailable_after_retry",
+      "fallback.beads_only"
+    ],
+    "forbidden_actions": [
+      "am_service_restart",
+      "am_service_stop",
+      "am_doctor_fix",
+      "am_doctor_repair",
+      "am_doctor_reconstruct",
+      "kill_agent_mail_process",
+      "destructive_git",
+      "delete_files",
+      "mutate_rch_worker",
+      "cancel_build",
+      "run_local_cargo_as_proof",
+      "reopen_dirty_overlap_without_owner_clear"
+    ],
+    "error_summary": "Database recovery notice returned twice; do not repair or restart Agent Mail."
+  },
+  "beads": {
+    "ready_count": 1,
+    "in_progress_count": 0,
+    "active_agents": [],
+    "stale_reopen": {
+      "default_action": "do_not_reopen",
+      "threshold_seconds": 7200,
+      "candidates": [],
+      "dirty_overlap_unknown": []
+    }
+  },
+  "git": {
+    "dirty_count": 3,
+    "tracked_dirty_count": 1,
+    "untracked_dirty_count": 2,
+    "risk_level": "medium",
+    "dirty_paths": [
+      {
+        "path": ".beads/issues.jsonl",
+        "status": " M",
+        "category": "tracked_overlap_risk",
+        "severity": "medium",
+        "recommendation": "Commit only owned Beads hunks or wait for the owner to flush."
+      }
+    ]
+  },
+  "safety": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "local_cargo_counted_as_proof": false,
+    "raw_mail_body_stored": false,
+    "raw_pane_text_stored": false,
+    "proof_disclaimer": "This records Agent Mail failure class only; it is not service recovery evidence."
+  },
+  "next_actions": [
+    "Stop retrying Agent Mail for this session.",
+    "Use scripts/swarm-tick.sh --agent-mail-fallback frankenterm and Beads state."
+  ],
+  "artifact_paths": [
+    "fixtures/agent-mail-failover/valid/database-recovery-retry-exhausted.json"
+  ]
+}

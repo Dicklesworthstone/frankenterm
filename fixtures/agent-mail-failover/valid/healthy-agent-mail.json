@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_snapshot.v1",
+  "generated_at_ms": 1779120000000,
+  "snapshot_id": "healthy-agent-mail",
+  "source_bead": "ft-5lsqo.1",
+  "mode": "agent_mail_available",
+  "agent_mail": {
+    "status": "available",
+    "attempt_count": 1,
+    "retry_limit": 1,
+    "registered": true,
+    "inbox_checked": true,
+    "failure_class": null,
+    "reason_codes": [
+      "agent_mail.available"
+    ],
+    "forbidden_actions": [
+      "am_service_restart",
+      "am_service_stop",
+      "am_doctor_fix",
+      "am_doctor_repair",
+      "am_doctor_reconstruct",
+      "kill_agent_mail_process",
+      "destructive_git",
+      "delete_files",
+      "mutate_rch_worker",
+      "cancel_build",
+      "run_local_cargo_as_proof",
+      "reopen_dirty_overlap_without_owner_clear"
+    ],
+    "error_summary": null
+  },
+  "beads": {
+    "ready_count": 2,
+    "in_progress_count": 0,
+    "active_agents": [
+      "GreenCastle"
+    ],
+    "stale_reopen": {
+      "default_action": "do_not_reopen",
+      "threshold_seconds": 7200,
+      "candidates": [],
+      "dirty_overlap_unknown": []
+    }
+  },
+  "git": {
+    "dirty_count": 0,
+    "tracked_dirty_count": 0,
+    "untracked_dirty_count": 0,
+    "risk_level": "low",
+    "dirty_paths": []
+  },
+  "safety": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "local_cargo_counted_as_proof": false,
+    "raw_mail_body_stored": false,
+    "raw_pane_text_stored": false,
+    "proof_disclaimer": "Static coordination snapshot only; no Cargo or RCH proof claimed."
+  },
+  "next_actions": [
+    "Use Agent Mail for reservations and Beads thread messages.",
+    "Continue from br ready and avoid unrelated dirty paths."
+  ],
+  "artifact_paths": [
+    "fixtures/agent-mail-failover/valid/healthy-agent-mail.json"
+  ]
+}
