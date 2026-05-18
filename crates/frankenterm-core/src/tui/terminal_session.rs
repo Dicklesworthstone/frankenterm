@@ -166,6 +166,24 @@ fn publish_crash_session_markers(phase: SessionPhase, mode: Option<ScreenMode>) 
     );
 }
 
+fn set_active_output_gate_for_mode(mode: ScreenMode) {
+    match mode {
+        ScreenMode::AltScreen => {
+            super::output_gate::set_phase(super::output_gate::GatePhase::Active)
+        }
+        ScreenMode::Inline { ui_height } => {
+            super::output_gate::set_inline_active_region(super::output_gate::InlineRegion::bottom(
+                ui_height,
+            ));
+        }
+        ScreenMode::InlineAuto { max_height, .. } => {
+            super::output_gate::set_inline_active_region(super::output_gate::InlineRegion::bottom(
+                max_height,
+            ));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SessionGuard — RAII teardown guarantee
 // ---------------------------------------------------------------------------
@@ -192,11 +210,11 @@ impl<S: TerminalSession> SessionGuard<S> {
     /// Enter the session with the specified screen mode and return a guard
     /// that will leave on drop.
     ///
-    /// Sets the output gate to [`Active`](super::output_gate::GatePhase::Active),
+    /// Sets the output gate to the active phase for the selected screen mode,
     /// signaling that direct stderr/stdout writes are unsafe.
     pub fn enter(mut session: S, mode: ScreenMode) -> Result<Self, SessionError> {
         session.enter(mode)?;
-        super::output_gate::set_phase(super::output_gate::GatePhase::Active);
+        set_active_output_gate_for_mode(mode);
         publish_crash_session_markers(session.phase(), session.screen_mode());
         Ok(Self {
             session: Some(session),
@@ -462,7 +480,7 @@ impl TerminalSession for CrosstermSession {
         }
         crossterm::terminal::enable_raw_mode()?;
         self.phase = SessionPhase::Active;
-        super::output_gate::set_phase(super::output_gate::GatePhase::Active);
+        set_active_output_gate_for_mode(self.mode.unwrap_or(ScreenMode::AltScreen));
         publish_crash_session_markers(self.phase, self.mode);
         Ok(())
     }
@@ -782,6 +800,53 @@ mod tests {
     }
 
     #[test]
+    fn guard_uses_inline_active_gate_for_inline_modes() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase, InlineRegion, RowSpan};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        {
+            let session = MockTerminalSession::new();
+            let _guard = SessionGuard::enter(session, ScreenMode::Inline { ui_height: 5 }).unwrap();
+            assert_eq!(output_gate::phase(), GatePhase::InlineActive);
+            assert_eq!(output_gate::inline_region(), Some(InlineRegion::bottom(5)));
+            assert!(output_gate::is_output_suppressed());
+            assert!(!output_gate::is_region_output_suppressed(
+                RowSpan::new(0, 19, 24).unwrap()
+            ));
+            assert!(output_gate::is_region_output_suppressed(
+                RowSpan::new(19, 5, 24).unwrap()
+            ));
+        }
+
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+    }
+
+    #[test]
+    fn guard_uses_inline_active_gate_for_inline_auto_max_height() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase, InlineRegion};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let session = MockTerminalSession::new();
+        let guard = SessionGuard::enter(
+            session,
+            ScreenMode::InlineAuto {
+                min_height: 2,
+                max_height: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(output_gate::phase(), GatePhase::InlineActive);
+        assert_eq!(output_gate::inline_region(), Some(InlineRegion::bottom(7)));
+
+        drop(guard);
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+    }
+
+    #[test]
     fn guard_into_inner_clears_gate() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
@@ -973,7 +1038,12 @@ mod tests {
                 ScreenMode::Inline { ui_height: 10 }
             };
             let guard = SessionGuard::enter(session, mode).unwrap();
-            assert_eq!(output_gate::phase(), GatePhase::Active);
+            let expected_phase = if mode.is_alt_screen() {
+                GatePhase::Active
+            } else {
+                GatePhase::InlineActive
+            };
+            assert_eq!(output_gate::phase(), expected_phase);
             assert_eq!(guard.screen_mode(), Some(mode));
             let session = guard.into_inner();
             assert_eq!(output_gate::phase(), GatePhase::Inactive);
@@ -1669,7 +1739,12 @@ mod tests {
 
             {
                 let _guard = SessionGuard::enter(session, mode).unwrap();
-                assert_eq!(output_gate::phase(), GatePhase::Active);
+                let expected_phase = if mode.is_alt_screen() {
+                    GatePhase::Active
+                } else {
+                    GatePhase::InlineActive
+                };
+                assert_eq!(output_gate::phase(), expected_phase);
             }
             // Guard dropped — gate back to Inactive
             assert_eq!(output_gate::phase(), GatePhase::Inactive);

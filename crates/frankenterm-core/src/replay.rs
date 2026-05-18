@@ -295,8 +295,9 @@ impl OutputSink for HeadlessSink {
 /// # One-writer rule
 ///
 /// This sink writes directly to stdout/stderr and must NOT be used while
-/// the TUI rendering pipeline is active (`GatePhase::Active`).  A
-/// `debug_assert!` fires if the output gate is suppressed.
+/// the TUI rendering pipeline owns output (`GatePhase::Active` or
+/// `GatePhase::InlineActive`). A `debug_assert!` fires if the output gate is
+/// suppressed.
 pub struct TerminalSink;
 
 impl OutputSink for TerminalSink {

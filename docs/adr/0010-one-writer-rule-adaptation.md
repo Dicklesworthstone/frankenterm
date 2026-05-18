@@ -17,7 +17,7 @@ allowed/forbidden paths, negative examples, and validation evidence hooks.
 | R1 Exclusive write ownership | `output_gate.rs` `OutputGate` | Atomic phase gate; `TuiAwareWriter` checks before stderr writes |
 | R2 Log routing | `output_gate.rs` `TuiAwareWriter` | tracing subscriber wraps stderr with gate check |
 | R3 Command handoff | `command_handoff.rs` `execute()` | `TerminalSession::suspend()`/`resume()` lifecycle |
-| R4 Inline-mode | `terminal_session.rs` + `ftui_compat.rs`; output gate gap tracked by `ft-9xube` | `ScreenMode::Inline` / `InlineAuto` lifecycle exists; region-scoped gate enforcement remains blocked on RCH proof (`ft-4tp7g`) |
+| R4 Inline-mode | `terminal_session.rs` + `ftui_compat.rs` + `output_gate.rs` | `ScreenMode::Inline` / `InlineAuto` select `InlineActive`; region-aware checks permit writes outside the owned inline rows |
 | R5 Panic safety | `terminal_session.rs` `SessionGuard` | RAII drop calls `leave()`; `crash.rs` checks gate before panic output |
 
 ### Process Boundary: Who Owns What
@@ -26,15 +26,15 @@ allowed/forbidden paths, negative examples, and validation evidence hooks.
   TerminalSession (owns lifecycle)
        │
        ├── OutputGate (process-global AtomicU8)
-       │     Inactive ─► Active ─► Suspended ─► Active ─► Inactive
+       │     Inactive ─► Active/InlineActive ─► Suspended ─► Active/InlineActive ─► Inactive
        │
        ├── SessionGuard (RAII, owns TerminalSession)
-       │     enter() sets gate=Active
+       │     enter() selects Active or InlineActive from ScreenMode
        │     drop()  sets gate=Inactive
        │
        └── command_handoff::execute()
              suspend() sets gate=Suspended
-             resume()  sets gate=Active
+             resume()  restores Active or InlineActive from ScreenMode
 ```
 
 ## Write-Path Decision Table
@@ -49,6 +49,16 @@ allowed/forbidden paths, negative examples, and validation evidence hooks.
 | `std::process::Command` | **No** | Subprocess inherits stdio, overwrites screen | Spawning `ls` without suspending first |
 | `crash.rs` panic hook → stderr | Conditional | Only after `SessionGuard::leave()` restores terminal | Panic hook writing before `leave()` called |
 
+### Phase: InlineActive (inline TUI rendering in progress)
+
+| Writer | Allowed? | Rationale | Negative Example |
+|---|---|---|---|
+| ftui inline region renderer | Yes | Owner of the inline region writes | - |
+| Region-aware write outside owned rows | Yes | Preserves scrollback/log area outside the inline UI | Status line above the bottom inline panel |
+| Region-aware write overlapping owned rows | **No** | Would corrupt inline panel state | Debug write into rows owned by the inline panel |
+| Raw `stdout`/`stderr` without row metadata | **No** | The gate cannot prove the write is outside the owned region | `eprintln!()` during inline render |
+| `tracing::info!()` → stderr | **No** | `TuiAwareWriter` has no row metadata and suppresses conservatively | `tracing::info!("event fired")` during inline render |
+
 ### Phase: Suspended (command handoff in progress)
 
 | Writer | Allowed? | Rationale | Negative Example |
@@ -57,7 +67,7 @@ allowed/forbidden paths, negative examples, and validation evidence hooks.
 | `tracing::info!()` → stderr | Yes | Gate is Suspended, TuiAwareWriter permits | - |
 | `println!()` / `eprintln!()` | Yes | Terminal is in normal mode, safe for line output | - |
 | Subprocess stdout/stderr | Yes | This is the entire point of suspension | - |
-| `session.resume()` | Yes | Reclaims ownership; transitions to Active | - |
+| `session.resume()` | Yes | Reclaims ownership; restores the active phase for the current screen mode | - |
 
 ### Phase: Inactive (no TUI, CLI/robot mode)
 
@@ -70,8 +80,8 @@ allowed/forbidden paths, negative examples, and validation evidence hooks.
 
 ### Panic Path
 
-**Risk:** Panic during Active phase leaves terminal in raw mode, alt-screen, with
-cursor hidden.
+**Risk:** Panic during an active TUI phase leaves terminal in raw mode,
+alt-screen, with cursor hidden.
 
 **Mitigation chain:**
 1. `std::panic::set_hook` installed by `crash::install_panic_hook()`
@@ -110,19 +120,20 @@ error paths.
 **Risk:** Inline mode scopes ownership to a render region, not the full terminal.
 Output above the region may interleave with scrollback from other processes.
 
-**Remaining mitigation:**
-1. ftui's inline Program variant manages region boundaries
-2. Output gate gains a fourth state or equivalent typed ownership model:
-   `InlineActive` with region-scoped enforcement
-3. Writes outside the region are permitted (scrollback area)
-4. Writes inside the region without ownership are forbidden
+**Mitigation chain:**
+1. ftui's inline Program variant manages concrete region boundaries
+2. `SessionGuard::enter()` maps `ScreenMode::Inline` / `InlineAuto` to
+   `GatePhase::InlineActive`
+3. `output_gate::InlineRegion` records the owned top- or bottom-anchored rows
+4. Raw writes remain suppressed because they carry no row metadata
+5. Region-aware callers can use `is_region_output_suppressed()` to permit
+   writes outside the owned rows and forbid writes inside or overlapping them
 
-**Current status:** Partially wired.  `ScreenMode::Inline` exists in
-`terminal_session.rs`, and `ScreenMode::InlineAuto` compatibility is covered in
-`ftui_compat.rs`.  The live output gate still models only `Inactive`, `Active`,
-and `Suspended`, so region-scoped inline ownership is not enforced yet.  The
-remaining implementation and PTY/golden proof are tracked by `ft-9xube`; the
-remote-required proof lane is blocked by `ft-4tp7g`.
+**Current status:** Source wiring is present.  `ScreenMode::Inline` exists in
+`terminal_session.rs`, `ScreenMode::InlineAuto` compatibility is covered in
+`ftui_compat.rs`, and `output_gate.rs` models `InlineActive` with owned-row
+metadata.  The remaining target-class PTY/golden proof is tracked by
+`ft-9xube`; the remote-required proof lane is blocked by `ft-4tp7g`.
 
 ## Required Evidence Fields
 
@@ -133,6 +144,8 @@ Each rule must be validated by at least one of:
 | R1 | Unit test: gate blocks writes during Active | `output_gate.rs` tests |
 | R2 | Unit test: TuiAwareWriter suppresses during Active | `output_gate.rs` tests |
 | R3 | Unit test: suspend/resume lifecycle | `command_handoff.rs` tests |
+| R4 | Unit test: `InlineActive` row classification | `output_gate.rs` tests |
+| R4 | Unit test: inline screen modes select `InlineActive` | `terminal_session.rs` tests |
 | R4 | PTY E2E: inline mode scrollback integrity | `ft-9xube` |
 | R5 | Unit test: SessionGuard drop calls leave() | `terminal_session.rs` tests |
 | R5 | Unit test: panic hook writes crash bundle | `crash.rs` tests |
