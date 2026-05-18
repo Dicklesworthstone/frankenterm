@@ -185,6 +185,7 @@ impl<'a> FuzzInput<'a> {
         let report = build_rch_admission_report(&input);
         assert_report_invariants(&report, &analysis);
         assert_reason_contract(self.reason.reason_code(), report.proof_status);
+        assert_error_category_contract(self.reason);
     }
 }
 
@@ -535,6 +536,30 @@ fn assert_reason_only_contract(reason_code: RchAdmissionReasonCode) {
     ) {
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Unknown);
     }
+}
+
+fn assert_error_category_contract(reason: ReasonInput) {
+    let reason_code = reason.reason_code();
+    let report = build_rch_admission_report(
+        &RchAdmissionCollectorInput::new(
+            GENERATED_AT_MS,
+            "fuzz.rch_admission_cargo.error_category",
+            RchAdmissionCommandDiagnostic::new("cargo check")
+                .classification("cargo_check")
+                .would_intercept(true),
+        )
+        .with_collector_observation(
+            RchAdmissionCollectorObservation::new(
+                "fuzz.error_category",
+                "synthetic collector category",
+                "category-only normalization fuzz input",
+            )
+            .error_category(reason.error_category()),
+        ),
+    );
+
+    assert!(report.reason_codes.contains(&reason_code));
+    assert_reason_contract(reason_code, report.proof_status);
 }
 
 fn assert_seeded_regressions() {
