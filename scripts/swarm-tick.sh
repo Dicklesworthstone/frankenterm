@@ -21,11 +21,18 @@
 #                /System/Volumes/Data on Darwin, / elsewhere.
 #   FT_OPERATOR_LOCK_DIR — shared operator-script lock dir (default: /tmp/ft-operator-scripts.lock)
 #   FT_OPERATOR_NOW_ISO / FT_OPERATOR_NOW_EPOCH — deterministic test clock.
+#   FT_AGENT_MAIL_FAILURE_CLASS — classifier input for fallback snapshots:
+#                available, database_recovery_notice, database_error,
+#                api_unreachable, timeout, registration_failed,
+#                contact_failed, or unknown.
 #
 # Platform: macOS + Linux (ft-v5lz3.2.7). All external commands used here
 # (df -h, du -sk, find -maxdepth -mmin, ls -d) accept identical flags on
 # BSD and GNU coreutils.
 set -uo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${script_dir}/agent-mail-failover-classifier.sh"
 
 mode="tick"
 session="frankenterm"
@@ -219,10 +226,11 @@ emit_agent_mail_fallback_snapshot() {
   local now_epoch
   now_epoch="${FT_OPERATOR_NOW_EPOCH:-$(date -u +%s)}"
 
-  local in_progress_json ready_json dirty_json
+  local in_progress_json ready_json dirty_json agent_mail_json
   in_progress_json=$(beads_issue_array br list --status in_progress --json)
   ready_json=$(beads_issue_array br ready --json)
   dirty_json=$(git_dirty_paths_json)
+  agent_mail_json=$(agent_mail_failover_classify_json "${FT_AGENT_MAIL_FAILURE_CLASS:-api_unreachable}")
 
   jq -cn \
     --arg ts "$now" \
@@ -231,6 +239,7 @@ emit_agent_mail_fallback_snapshot() {
     --argjson in_progress "$in_progress_json" \
     --argjson ready "$ready_json" \
     --argjson dirty "$dirty_json" \
+    --argjson agent_mail "$agent_mail_json" \
     '
     def parse_bead_ts:
       if . == null then
@@ -398,19 +407,8 @@ emit_agent_mail_fallback_snapshot() {
     {
       ts: $ts,
       session: $session,
-      mode: "agent_mail_unavailable_beads_only",
-      agent_mail: {
-        status: "unavailable",
-        marker: "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
-        forbidden_actions: [
-          "am service restart",
-          "am service stop",
-          "am doctor fix",
-          "am doctor repair",
-          "am doctor reconstruct",
-          "kill am/serve-http/mcp-agent-mail"
-        ]
-      },
+      mode: (if $agent_mail.status == "available" then "agent_mail_available" else "agent_mail_unavailable_beads_only" end),
+      agent_mail: $agent_mail,
       beads: {
         in_progress_count: ($in_progress | length),
         ready_count: ($ready | length),
@@ -531,7 +529,7 @@ emit_agent_mail_handoff_block() {
     [
       "Red-mail Beads handoff for " + $bead,
       "",
-      "Agent Mail: " + .agent_mail.status + " - " + .agent_mail.marker,
+      "Agent Mail: " + .agent_mail.status + " - " + (.agent_mail.error_summary // (.agent_mail.reason_codes | join(","))),
       "Snapshot: " + .ts + " session=" + .session + " ready_count=" + (.beads.ready_count | tostring),
       "",
       "Active assignees:",

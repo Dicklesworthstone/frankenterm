@@ -8,6 +8,7 @@ cd "${ROOT}"
 SCHEMA="fixtures/agent-mail-failover/fallback-snapshot.schema.json"
 DOC="docs/robot-contracts/agent-mail-failover-snapshot.md"
 MANIFEST="fixtures/agent-mail-failover/manifest.json"
+CLASSIFIER_CASES="fixtures/agent-mail-failover/retry-classifier-cases.json"
 
 fail() {
   printf 'agent mail failover snapshot contract: %s\n' "$*" >&2
@@ -27,8 +28,9 @@ require_command ruby
 require_file "${SCHEMA}"
 require_file "${DOC}"
 require_file "${MANIFEST}"
+require_file "${CLASSIFIER_CASES}"
 
-jq empty "${SCHEMA}" "${MANIFEST}" fixtures/agent-mail-failover/valid/*.json
+jq empty "${SCHEMA}" "${MANIFEST}" "${CLASSIFIER_CASES}" fixtures/agent-mail-failover/valid/*.json
 
 ruby <<'RUBY'
 require "json"
@@ -37,6 +39,7 @@ require "set"
 SCHEMA = "fixtures/agent-mail-failover/fallback-snapshot.schema.json"
 DOC = "docs/robot-contracts/agent-mail-failover-snapshot.md"
 MANIFEST = "fixtures/agent-mail-failover/manifest.json"
+CLASSIFIER_CASES = "fixtures/agent-mail-failover/retry-classifier-cases.json"
 EXPECTED_FIXTURE_IDS = %w[
   healthy-agent-mail
   unavailable-after-retry
@@ -106,6 +109,7 @@ end
 
 schema = read_json(SCHEMA)
 manifest = read_json(MANIFEST)
+classifier_cases = read_json(CLASSIFIER_CASES)
 doc = File.read(DOC)
 
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-agent-mail-failover-snapshot.json")
@@ -121,6 +125,9 @@ fail!("manifest bead drifted") unless manifest["bead"] == "ft-5lsqo.1"
 fail!("manifest schema pointer drifted") unless manifest["schema"] == SCHEMA
 fail!("manifest contract pointer drifted") unless manifest["contract"] == DOC
 fail!("manifest verifier missing") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh")
+fail!("manifest classifier verifier missing") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_retry_classifier_contract.sh")
+fail!("manifest classifier cases pointer drifted") unless manifest["classifier_cases"] == CLASSIFIER_CASES
+fail!("classifier cases bead drifted") unless classifier_cases["source_bead"] == "ft-5lsqo.2"
 
 fixture_paths = manifest.fetch("valid")
 fixture_ids = fixture_paths.map { |path| File.basename(path, ".json") }

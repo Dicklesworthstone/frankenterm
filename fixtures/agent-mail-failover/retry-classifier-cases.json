@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_retry_classifier.fixture_cases.v1",
+  "source_bead": "ft-5lsqo.2",
+  "retry_limit": 1,
+  "cases": [
+    {
+      "id": "success",
+      "input": "available",
+      "expected_status": "available",
+      "expected_attempt_count": 1,
+      "expected_failure_class": null,
+      "expected_registered": true,
+      "expected_inbox_checked": true,
+      "required_reason_codes": [
+        "agent_mail.available"
+      ]
+    },
+    {
+      "id": "transient-database-recovery",
+      "input": "database_recovery_notice",
+      "expected_status": "degraded",
+      "expected_attempt_count": 2,
+      "expected_failure_class": "database_recovery_notice",
+      "expected_registered": false,
+      "expected_inbox_checked": false,
+      "required_reason_codes": [
+        "agent_mail.database_recovery_retry_exhausted",
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only"
+      ]
+    },
+    {
+      "id": "unreachable-api",
+      "input": "api_unreachable",
+      "expected_status": "unavailable",
+      "expected_attempt_count": 2,
+      "expected_failure_class": "api_unreachable",
+      "expected_registered": false,
+      "expected_inbox_checked": false,
+      "required_reason_codes": [
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only"
+      ]
+    },
+    {
+      "id": "timeout-or-hang",
+      "input": "timeout",
+      "expected_status": "unavailable",
+      "expected_attempt_count": 2,
+      "expected_failure_class": "timeout",
+      "expected_registered": false,
+      "expected_inbox_checked": false,
+      "required_reason_codes": [
+        "agent_mail.timeout_after_retry",
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only"
+      ]
+    },
+    {
+      "id": "registration-failed",
+      "input": "registration_failed",
+      "expected_status": "unavailable",
+      "expected_attempt_count": 2,
+      "expected_failure_class": "registration_failed",
+      "expected_registered": false,
+      "expected_inbox_checked": false,
+      "required_reason_codes": [
+        "agent_mail.registration_failed_after_retry",
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only"
+      ]
+    },
+    {
+      "id": "contact-permission-failed",
+      "input": "contact_permission_failed",
+      "expected_status": "unavailable",
+      "expected_attempt_count": 2,
+      "expected_failure_class": "contact_permission_failed",
+      "expected_registered": false,
+      "expected_inbox_checked": false,
+      "required_reason_codes": [
+        "agent_mail.contact_permission_failed_after_retry",
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only"
+      ]
+    },
+    {
+      "id": "unknown-response",
+      "input": "unknown",
+      "expected_status": "unavailable",
+      "expected_attempt_count": 2,
+      "expected_failure_class": "unknown",
+      "expected_registered": false,
+      "expected_inbox_checked": false,
+      "required_reason_codes": [
+        "agent_mail.unknown_after_retry",
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only"
+      ]
+    }
+  ]
+}
