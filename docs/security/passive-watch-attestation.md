@@ -33,6 +33,7 @@ proof that no such input exists in the explored space.
 | cargo-fuzz target | `fuzz/fuzz_targets/passive_watch_invariant.rs` |
 | Seed corpus | `fuzz/corpus/passive_watch_invariant/` (10 hand-curated seeds) |
 | JSON attestation | `docs/security/passive-watch-attestation.json` |
+| Static verifier | `tests/e2e/test_passive_watch_attestation_manifest.sh` |
 | This audit doc | `docs/security/passive-watch-attestation.md` |
 
 ## Action taxonomy
@@ -173,3 +174,7 @@ contract that lane consumes.
 - **Attestation cross-link:** `docs/attestations/manifest.json`
   contains the `security/passive-watch` slot pointing at
   `docs/security/passive-watch-attestation.json`.
+- **Static verifier helper:** `tests/e2e/test_passive_watch_attestation_manifest.sh`
+  uses `tests/scripts/static_attestation_helpers.rb` so source-document,
+  seed-corpus, direct-exec, and multi-word term checks share the common
+  static attestation contract.
