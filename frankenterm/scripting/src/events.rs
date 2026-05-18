@@ -9,7 +9,7 @@ use anyhow::Result;
 use frankenterm_dynamic::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Well-known event types that FrankenTerm fires.
 pub mod event_types {
@@ -79,6 +79,26 @@ impl EventBus {
         Self::default()
     }
 
+    fn hooks_guard(&self) -> MutexGuard<'_, Vec<RegisteredHook>> {
+        match self.hooks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.hooks.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn fire_counts_guard(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        match self.fire_counts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.fire_counts.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Register a hook for the given event pattern.
     ///
     /// The pattern can be an exact event name or `"*"` for a catch-all.
@@ -104,31 +124,25 @@ impl EventBus {
             handler: Arc::new(handler),
         };
 
-        if let Ok(mut hooks) = self.hooks.lock() {
-            hooks.push(hook);
-        }
+        self.hooks_guard().push(hook);
 
         id
     }
 
     /// Unregister a hook by its handle.
     pub fn unregister(&self, id: EventHookId) -> bool {
-        if let Ok(mut hooks) = self.hooks.lock() {
-            let len_before = hooks.len();
-            hooks.retain(|h| h.id != id);
-            return hooks.len() < len_before;
-        }
-        false
+        let mut hooks = self.hooks_guard();
+        let len_before = hooks.len();
+        hooks.retain(|h| h.id != id);
+        hooks.len() < len_before
     }
 
     /// Unregister all hooks for a given extension.
     pub fn unregister_extension(&self, extension_id: &str) -> usize {
-        if let Ok(mut hooks) = self.hooks.lock() {
-            let len_before = hooks.len();
-            hooks.retain(|h| h.extension_id.as_deref() != Some(extension_id));
-            return len_before - hooks.len();
-        }
-        0
+        let mut hooks = self.hooks_guard();
+        let len_before = hooks.len();
+        hooks.retain(|h| h.extension_id.as_deref() != Some(extension_id));
+        len_before - hooks.len()
     }
 
     /// Maximum number of unique event names tracked in fire_counts.
@@ -140,18 +154,16 @@ impl EventBus {
     /// Hooks are executed in tier order, then priority order within each tier.
     pub fn fire(&self, event: &str, payload: &Value) -> Result<Vec<Action>> {
         // Update fire count (capped to prevent unbounded growth)
-        if let Ok(mut counts) = self.fire_counts.lock()
-            && (counts.contains_key(event) || counts.len() < Self::MAX_FIRE_COUNT_ENTRIES)
         {
-            *counts.entry(event.to_string()).or_default() += 1;
+            let mut counts = self.fire_counts_guard();
+            if counts.contains_key(event) || counts.len() < Self::MAX_FIRE_COUNT_ENTRIES {
+                *counts.entry(event.to_string()).or_default() += 1;
+            }
         }
 
         // Collect matching hooks (sorted by tier then priority)
         let matching: Vec<(DispatchTier, i32, Arc<NativeHandlerFn>)> = {
-            let hooks = self
-                .hooks
-                .lock()
-                .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+            let hooks = self.hooks_guard();
             let mut matched: Vec<_> = hooks
                 .iter()
                 .filter(|h| matches_event(&h.event_pattern, event))
@@ -172,42 +184,29 @@ impl EventBus {
 
     /// Number of currently registered hooks.
     pub fn hook_count(&self) -> usize {
-        self.hooks.lock().map(|h| h.len()).unwrap_or(0)
+        self.hooks_guard().len()
     }
 
     /// Number of hooks registered for a specific event.
     pub fn hooks_for_event(&self, event: &str) -> usize {
-        self.hooks
-            .lock()
-            .map(|hooks| {
-                hooks
-                    .iter()
-                    .filter(|h| matches_event(&h.event_pattern, event))
-                    .count()
-            })
-            .unwrap_or(0)
+        self.hooks_guard()
+            .iter()
+            .filter(|h| matches_event(&h.event_pattern, event))
+            .count()
     }
 
     /// Get the number of times each event has been fired.
     pub fn fire_counts(&self) -> HashMap<String, u64> {
-        self.fire_counts
-            .lock()
-            .map(|c| c.clone())
-            .unwrap_or_default()
+        self.fire_counts_guard().clone()
     }
 
     /// List all registered hook IDs for an extension.
     pub fn hooks_for_extension(&self, extension_id: &str) -> Vec<EventHookId> {
-        self.hooks
-            .lock()
-            .map(|hooks| {
-                hooks
-                    .iter()
-                    .filter(|h| h.extension_id.as_deref() == Some(extension_id))
-                    .map(|h| h.id)
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.hooks_guard()
+            .iter()
+            .filter(|h| h.extension_id.as_deref() == Some(extension_id))
+            .map(|h| h.id)
+            .collect()
     }
 }
 
@@ -244,6 +243,44 @@ mod tests {
 
         let actions = bus.fire(event_types::PANE_FOCUS, &Value::Null).unwrap();
         assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn hooks_registry_recovers_after_poisoned_lock() {
+        let bus = EventBus::new();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = bus.hooks.lock().unwrap();
+            panic!("poison hooks registry");
+        }));
+        assert!(poison.is_err());
+
+        let id = bus.register("evt", DispatchTier::Native, 0, Some("ext"), |_, _| {
+            Ok(vec![Action::Log {
+                level: crate::types::LogLevel::Info,
+                message: "recovered".to_string(),
+            }])
+        });
+
+        assert_eq!(bus.hook_count(), 1);
+        assert_eq!(bus.hooks_for_event("evt"), 1);
+        assert_eq!(bus.hooks_for_extension("ext"), vec![id]);
+        assert_eq!(bus.fire("evt", &Value::Null).unwrap().len(), 1);
+        assert!(bus.unregister(id));
+        assert_eq!(bus.hook_count(), 0);
+    }
+
+    #[test]
+    fn fire_counts_recovers_after_poisoned_lock() {
+        let bus = EventBus::new();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = bus.fire_counts.lock().unwrap();
+            panic!("poison event fire counts");
+        }));
+        assert!(poison.is_err());
+
+        bus.fire("evt", &Value::Null).unwrap();
+        let counts = bus.fire_counts();
+        assert_eq!(counts.get("evt"), Some(&1));
     }
 
     #[test]
