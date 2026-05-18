@@ -1,0 +1,1 @@
+cargo test --workspace --exclude frankenterm-core --exclude=frankenterm-gui rch_admission --all-targets

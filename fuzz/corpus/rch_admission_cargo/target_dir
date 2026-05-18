@@ -1,0 +1,1 @@
+cargo test --target-dir=/tmp/ft-proof --workspace rch_admission
