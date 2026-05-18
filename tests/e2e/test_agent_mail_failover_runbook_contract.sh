@@ -8,6 +8,9 @@ cd "${ROOT}"
 RUNBOOK="docs/robot-contracts/agent-mail-failover-runbook.md"
 MANIFEST="fixtures/agent-mail-failover/manifest.json"
 GATE="fixtures/agent-mail-failover/no-service-action-gate.json"
+COMPANION_MANIFEST="fixtures/agent-mail-no-service-action/manifest.json"
+COMPANION_DOC="docs/robot-contracts/agent-mail-no-service-action-gate.md"
+COMPANION_VERIFIER="tests/e2e/test_agent_mail_no_service_action_contract.sh"
 
 fail() {
   printf 'agent mail failover runbook contract: %s\n' "$*" >&2
@@ -27,9 +30,12 @@ require_command ruby
 require_file "${RUNBOOK}"
 require_file "${MANIFEST}"
 require_file "${GATE}"
+require_file "${COMPANION_MANIFEST}"
+require_file "${COMPANION_DOC}"
+require_file "${COMPANION_VERIFIER}"
 
 bash -n "${BASH_SOURCE[0]}"
-jq empty "${MANIFEST}" "${GATE}"
+jq empty "${MANIFEST}" "${GATE}" "${COMPANION_MANIFEST}"
 
 ruby <<'RUBY'
 require "json"
@@ -37,6 +43,9 @@ require "json"
 RUNBOOK = "docs/robot-contracts/agent-mail-failover-runbook.md"
 MANIFEST = "fixtures/agent-mail-failover/manifest.json"
 GATE = "fixtures/agent-mail-failover/no-service-action-gate.json"
+COMPANION_MANIFEST = "fixtures/agent-mail-no-service-action/manifest.json"
+COMPANION_DOC = "docs/robot-contracts/agent-mail-no-service-action-gate.md"
+COMPANION_VERIFIER = "tests/e2e/test_agent_mail_no_service_action_contract.sh"
 REQUIRED_TEXT = [
   "single allowed retry",
   "scripts/agent-mail-failover-classifier.sh",
@@ -55,16 +64,20 @@ REQUIRED_TEXT = [
   "source defect",
   "RCH fleet pressure",
   "dirty tree",
-  "tests/e2e/test_agent_mail_no_service_action_gate.sh"
+  "tests/e2e/test_agent_mail_no_service_action_gate.sh",
+  "tests/e2e/test_agent_mail_no_service_action_contract.sh"
 ].freeze
 REQUIRED_PATHS = [
   "docs/robot-contracts/agent-mail-failover-snapshot.md",
   "docs/robot-contracts/agent-mail-stale-reopen-policy.md",
+  "docs/robot-contracts/agent-mail-no-service-action-gate.md",
   "fixtures/agent-mail-failover/manifest.json",
   "fixtures/agent-mail-failover/no-service-action-gate.json",
+  "fixtures/agent-mail-no-service-action/manifest.json",
   "tests/e2e/test_agent_mail_failover_snapshot_contract.sh",
   "tests/e2e/test_agent_mail_retry_classifier_contract.sh",
-  "tests/e2e/test_agent_mail_no_service_action_gate.sh"
+  "tests/e2e/test_agent_mail_no_service_action_gate.sh",
+  "tests/e2e/test_agent_mail_no_service_action_contract.sh"
 ].freeze
 FORBIDDEN_LITERAL = [
   "am service restart",
@@ -94,10 +107,17 @@ end
 runbook = File.read(RUNBOOK)
 manifest = read_json(MANIFEST)
 gate = read_json(GATE)
+companion = read_json(COMPANION_MANIFEST)
 
 fail!("manifest runbook pointer drifted") unless manifest["runbook"] == RUNBOOK
 fail!("manifest runbook verifier missing") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_failover_runbook_contract.sh")
+fail!("manifest companion verifier missing") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_no_service_action_contract.sh")
+fail!("manifest companion pointer drifted") unless manifest["no_service_action_gate_companion_manifest"] == COMPANION_MANIFEST
+fail!("manifest companion document pointer drifted") unless manifest["no_service_action_gate_document"] == COMPANION_DOC
 fail!("gate does not scan runbook") unless gate.fetch("scan_paths").include?(RUNBOOK)
+fail!("gate companion manifest pointer drifted") unless gate["companion_manifest"] == COMPANION_MANIFEST
+fail!("companion manifest contract drifted") unless companion["contract_id"] == gate["contract_id"]
+fail!("companion manifest verifier drifted") unless companion["verifier"] == COMPANION_VERIFIER
 
 REQUIRED_TEXT.each do |needle|
   fail!("runbook missing #{needle}") unless runbook.include?(needle)

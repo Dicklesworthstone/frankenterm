@@ -94,6 +94,15 @@ The gate must fail on service repair/restart commands, process-kill guidance,
 destructive git cleanup, deletion guidance, worker mutation, build
 cancellation, or local Cargo-as-proof language.
 
+The canonical no-service-action contract id is
+`ft.agent_mail_failover_no_service_action_gate.v1`. The companion manifest,
+fixtures, and verifier live under
+`fixtures/agent-mail-no-service-action/manifest.json`,
+`fixtures/agent-mail-no-service-action/{positive,negative}/`, and
+`tests/e2e/test_agent_mail_no_service_action_contract.sh`; they intentionally
+reuse the canonical failover contract id instead of introducing a second
+parallel contract name.
+
 ## Operator Runbook
 
 The operator sequence and recovery handoff templates live at
@@ -110,8 +119,9 @@ jq empty fixtures/agent-mail-failover/fallback-snapshot.schema.json fixtures/age
 bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh
 bash tests/e2e/test_agent_mail_retry_classifier_contract.sh
 bash tests/e2e/test_agent_mail_no_service_action_gate.sh
+bash tests/e2e/test_agent_mail_no_service_action_contract.sh
 bash tests/e2e/test_agent_mail_failover_runbook_contract.sh
-git diff --check -- docs/robot-contracts/agent-mail-failover-snapshot.md docs/robot-contracts/agent-mail-failover-runbook.md fixtures/agent-mail-failover scripts/agent-mail-failover-classifier.sh scripts/swarm-tick.sh tests/e2e/test_agent_mail_failover_snapshot_contract.sh tests/e2e/test_agent_mail_retry_classifier_contract.sh tests/e2e/test_agent_mail_no_service_action_gate.sh tests/e2e/test_agent_mail_failover_runbook_contract.sh
+git diff --check -- docs/robot-contracts/agent-mail-failover-snapshot.md docs/robot-contracts/agent-mail-failover-runbook.md docs/robot-contracts/agent-mail-no-service-action-gate.md fixtures/agent-mail-failover fixtures/agent-mail-no-service-action scripts/agent-mail-failover-classifier.sh scripts/swarm-tick.sh tests/e2e/test_agent_mail_failover_snapshot_contract.sh tests/e2e/test_agent_mail_retry_classifier_contract.sh tests/e2e/test_agent_mail_no_service_action_gate.sh tests/e2e/test_agent_mail_no_service_action_contract.sh tests/e2e/test_agent_mail_failover_runbook_contract.sh
 br dep cycles --json
 ```
 

@@ -17,6 +17,9 @@
   ],
   "classifier_cases": "fixtures/agent-mail-failover/retry-classifier-cases.json",
   "no_service_action_gate": "fixtures/agent-mail-failover/no-service-action-gate.json",
+  "no_service_action_gate_companion_manifest": "fixtures/agent-mail-no-service-action/manifest.json",
+  "no_service_action_gate_document": "docs/robot-contracts/agent-mail-no-service-action-gate.md",
+  "no_service_action_gate_companion_verifier": "tests/e2e/test_agent_mail_no_service_action_contract.sh",
   "runbook": "docs/robot-contracts/agent-mail-failover-runbook.md",
   "invalid": [],
   "verification": [
@@ -24,6 +27,7 @@
     "bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh",
     "bash tests/e2e/test_agent_mail_retry_classifier_contract.sh",
     "bash tests/e2e/test_agent_mail_no_service_action_gate.sh",
+    "bash tests/e2e/test_agent_mail_no_service_action_contract.sh",
     "bash tests/e2e/test_agent_mail_failover_runbook_contract.sh"
   ]
 }

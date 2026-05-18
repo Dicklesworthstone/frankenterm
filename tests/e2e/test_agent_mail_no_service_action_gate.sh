@@ -7,6 +7,9 @@ cd "${ROOT}"
 
 GATE="fixtures/agent-mail-failover/no-service-action-gate.json"
 MANIFEST="fixtures/agent-mail-failover/manifest.json"
+COMPANION_MANIFEST="fixtures/agent-mail-no-service-action/manifest.json"
+COMPANION_DOC="docs/robot-contracts/agent-mail-no-service-action-gate.md"
+COMPANION_VERIFIER="tests/e2e/test_agent_mail_no_service_action_contract.sh"
 CLASSIFIER_CASES="fixtures/agent-mail-failover/retry-classifier-cases.json"
 CLASSIFIER="scripts/agent-mail-failover-classifier.sh"
 
@@ -28,12 +31,18 @@ require_command jq
 require_command ruby
 require_file "${GATE}"
 require_file "${MANIFEST}"
+require_file "${COMPANION_MANIFEST}"
+require_file "${COMPANION_DOC}"
+require_file "${COMPANION_VERIFIER}"
 require_file "${CLASSIFIER_CASES}"
 require_file "${CLASSIFIER}"
 
 bash -n "${CLASSIFIER}"
 bash -n "${BASH_SOURCE[0]}"
-jq empty "${GATE}" "${MANIFEST}" "${CLASSIFIER_CASES}"
+bash -n "${COMPANION_VERIFIER}"
+jq empty "${GATE}" "${MANIFEST}" "${COMPANION_MANIFEST}" "${CLASSIFIER_CASES}" \
+  fixtures/agent-mail-no-service-action/positive/*.json \
+  fixtures/agent-mail-no-service-action/negative/*.json
 
 ruby <<'RUBY'
 require "json"
@@ -42,6 +51,9 @@ require "set"
 
 GATE = "fixtures/agent-mail-failover/no-service-action-gate.json"
 MANIFEST = "fixtures/agent-mail-failover/manifest.json"
+COMPANION_MANIFEST = "fixtures/agent-mail-no-service-action/manifest.json"
+COMPANION_DOC = "docs/robot-contracts/agent-mail-no-service-action-gate.md"
+COMPANION_VERIFIER = "tests/e2e/test_agent_mail_no_service_action_contract.sh"
 CLASSIFIER_CASES = "fixtures/agent-mail-failover/retry-classifier-cases.json"
 CLASSIFIER = "scripts/agent-mail-failover-classifier.sh"
 
@@ -74,15 +86,55 @@ def flatten_strings(value)
   end
 end
 
+def guidance_strings(value)
+  fields = %w[
+    generated_guidance
+    next_actions
+    recommendations
+    error_summary
+    proof_disclaimer
+    message
+  ]
+  fields.flat_map { |field| flatten_strings(value[field]) }
+end
+
+def guidance_hits(strings, patterns)
+  lowered_patterns = patterns.map(&:downcase)
+  strings.flat_map do |text|
+    lowered = text.downcase
+    lowered_patterns.select { |pattern| lowered.include?(pattern) }.map { |pattern| [pattern, text] }
+  end
+end
+
+def assert_false_flags!(path, object)
+  flags = object.fetch("side_effects", object.fetch("safety", object.fetch("side_effect_policy", {})))
+  bad = flags.select { |_key, value| value == true }
+  fail!("#{path} has non-false side-effect flags: #{bad.keys.inspect}") unless bad.empty?
+end
+
 gate = read_json(GATE)
 manifest = read_json(MANIFEST)
+companion_manifest = read_json(COMPANION_MANIFEST)
 classifier_cases = read_json(CLASSIFIER_CASES)
 
 fail!("gate schema version drifted") unless gate["schema_version"] == 1
 fail!("gate contract drifted") unless gate["contract_id"] == "ft.agent_mail_failover_no_service_action_gate.v1"
 fail!("gate bead drifted") unless gate["source_bead"] == "ft-5lsqo.4"
 fail!("gate manifest pointer drifted") unless gate["manifest"] == MANIFEST
+fail!("gate contract document pointer drifted") unless gate["contract_document"] == COMPANION_DOC
+fail!("gate companion manifest pointer drifted") unless gate["companion_manifest"] == COMPANION_MANIFEST
+fail!("gate companion verifier pointer drifted") unless gate["companion_verifier"] == COMPANION_VERIFIER
 fail!("manifest verifier missing no-service gate") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_no_service_action_gate.sh")
+fail!("manifest verifier missing companion no-service gate") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_no_service_action_contract.sh")
+fail!("manifest companion pointer drifted") unless manifest["no_service_action_gate_companion_manifest"] == COMPANION_MANIFEST
+fail!("manifest companion document pointer drifted") unless manifest["no_service_action_gate_document"] == COMPANION_DOC
+fail!("manifest companion verifier pointer drifted") unless manifest["no_service_action_gate_companion_verifier"] == COMPANION_VERIFIER
+
+fail!("companion manifest contract drifted") unless companion_manifest["contract_id"] == gate["contract_id"]
+fail!("companion manifest canonical gate drifted") unless companion_manifest["canonical_gate"] == GATE
+fail!("companion manifest canonical manifest drifted") unless companion_manifest["canonical_manifest"] == MANIFEST
+fail!("companion manifest document drifted") unless companion_manifest["contract_document"] == COMPANION_DOC
+fail!("companion manifest verifier drifted") unless companion_manifest["verifier"] == COMPANION_VERIFIER
 
 source_forbidden = gate.fetch("source_scan_forbidden_literals")
 guidance_forbidden = gate.fetch("guidance_forbidden_patterns")
@@ -117,6 +169,31 @@ classifier_cases.fetch("cases").each do |row|
   payload = JSON.parse(stdout)
   text = [payload["error_summary"], payload.fetch("reason_codes").join(" ")].compact.join(" ")
   fail!("classifier guidance suggests forbidden action for #{row.fetch("id")}: #{text}") if unsafe_guidance?(text, guidance_forbidden)
+end
+
+companion_positive = gate.fetch("companion_positive_fixtures")
+companion_negative = gate.fetch("companion_negative_fixtures")
+fail!("companion positive fixture list drifted") unless companion_manifest.fetch("positive_fixtures").sort == companion_positive.sort
+fail!("companion negative fixture list drifted") unless companion_manifest.fetch("negative_fixtures").sort == companion_negative.sort
+
+companion_positive.each do |path|
+  payload = read_json(path)
+  fail!("#{path} is not a positive fixture") unless payload["case_kind"] == "positive"
+  fail!("#{path} expected verdict drifted") unless payload["expected_verdict"] == "allow"
+  assert_false_flags!(path, payload)
+  hits = guidance_hits(guidance_strings(payload), guidance_forbidden)
+  fail!("#{path} emitted forbidden guidance: #{hits.inspect}") unless hits.empty?
+end
+
+companion_negative.each do |path|
+  payload = read_json(path)
+  fail!("#{path} is not a negative fixture") unless payload["case_kind"] == "negative"
+  fail!("#{path} expected verdict drifted") unless payload["expected_verdict"] == "reject"
+  assert_false_flags!(path, payload)
+  hits = guidance_hits(guidance_strings(payload), guidance_forbidden)
+  fail!("#{path} failed to trigger forbidden guidance detector") if hits.empty?
+  expected = payload.fetch("expected_pattern").downcase
+  fail!("#{path} did not trigger expected pattern #{expected.inspect}") unless hits.any? { |pattern, _text| pattern == expected }
 end
 
 gate.fetch("positive_guidance_cases").each do |row|

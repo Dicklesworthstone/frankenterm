@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "negative.service_restart_guidance",
+  "case_kind": "negative",
+  "expected_verdict": "reject",
+  "expected_pattern": "am service restart",
+  "generated_guidance": [
+    "Run am service restart and retry the mailbox."
+  ],
+  "side_effects": {
+    "agent_mail_repair_attempted": false,
+    "agent_mail_restart_attempted": false,
+    "process_kill_attempted": false,
+    "destructive_git_attempted": false,
+    "file_deletion_attempted": false,
+    "worker_mutation_attempted": false,
+    "build_cancellation_attempted": false,
+    "local_cargo_counted_as_proof": false
+  }
+}

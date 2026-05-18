@@ -10,6 +10,9 @@ DOC="docs/robot-contracts/agent-mail-failover-snapshot.md"
 MANIFEST="fixtures/agent-mail-failover/manifest.json"
 CLASSIFIER_CASES="fixtures/agent-mail-failover/retry-classifier-cases.json"
 NO_SERVICE_GATE="fixtures/agent-mail-failover/no-service-action-gate.json"
+NO_SERVICE_COMPANION="fixtures/agent-mail-no-service-action/manifest.json"
+NO_SERVICE_DOC="docs/robot-contracts/agent-mail-no-service-action-gate.md"
+NO_SERVICE_COMPANION_VERIFIER="tests/e2e/test_agent_mail_no_service_action_contract.sh"
 RUNBOOK="docs/robot-contracts/agent-mail-failover-runbook.md"
 
 fail() {
@@ -32,9 +35,15 @@ require_file "${DOC}"
 require_file "${MANIFEST}"
 require_file "${CLASSIFIER_CASES}"
 require_file "${NO_SERVICE_GATE}"
+require_file "${NO_SERVICE_COMPANION}"
+require_file "${NO_SERVICE_DOC}"
+require_file "${NO_SERVICE_COMPANION_VERIFIER}"
 require_file "${RUNBOOK}"
 
-jq empty "${SCHEMA}" "${MANIFEST}" "${CLASSIFIER_CASES}" "${NO_SERVICE_GATE}" fixtures/agent-mail-failover/valid/*.json
+jq empty "${SCHEMA}" "${MANIFEST}" "${CLASSIFIER_CASES}" "${NO_SERVICE_GATE}" "${NO_SERVICE_COMPANION}" \
+  fixtures/agent-mail-failover/valid/*.json \
+  fixtures/agent-mail-no-service-action/positive/*.json \
+  fixtures/agent-mail-no-service-action/negative/*.json
 
 ruby <<'RUBY'
 require "json"
@@ -45,6 +54,9 @@ DOC = "docs/robot-contracts/agent-mail-failover-snapshot.md"
 MANIFEST = "fixtures/agent-mail-failover/manifest.json"
 CLASSIFIER_CASES = "fixtures/agent-mail-failover/retry-classifier-cases.json"
 NO_SERVICE_GATE = "fixtures/agent-mail-failover/no-service-action-gate.json"
+NO_SERVICE_COMPANION = "fixtures/agent-mail-no-service-action/manifest.json"
+NO_SERVICE_DOC = "docs/robot-contracts/agent-mail-no-service-action-gate.md"
+NO_SERVICE_COMPANION_VERIFIER = "tests/e2e/test_agent_mail_no_service_action_contract.sh"
 RUNBOOK = "docs/robot-contracts/agent-mail-failover-runbook.md"
 EXPECTED_FIXTURE_IDS = %w[
   healthy-agent-mail
@@ -117,6 +129,7 @@ schema = read_json(SCHEMA)
 manifest = read_json(MANIFEST)
 classifier_cases = read_json(CLASSIFIER_CASES)
 no_service_gate = read_json(NO_SERVICE_GATE)
+no_service_companion = read_json(NO_SERVICE_COMPANION)
 doc = File.read(DOC)
 
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-agent-mail-failover-snapshot.json")
@@ -136,9 +149,17 @@ fail!("manifest classifier verifier missing") unless manifest.fetch("verificatio
 fail!("manifest no-service verifier missing") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_no_service_action_gate.sh")
 fail!("manifest classifier cases pointer drifted") unless manifest["classifier_cases"] == CLASSIFIER_CASES
 fail!("manifest no-service gate pointer drifted") unless manifest["no_service_action_gate"] == NO_SERVICE_GATE
+fail!("manifest no-service companion pointer drifted") unless manifest["no_service_action_gate_companion_manifest"] == NO_SERVICE_COMPANION
+fail!("manifest no-service document pointer drifted") unless manifest["no_service_action_gate_document"] == NO_SERVICE_DOC
+fail!("manifest no-service companion verifier drifted") unless manifest["no_service_action_gate_companion_verifier"] == NO_SERVICE_COMPANION_VERIFIER
 fail!("manifest runbook pointer drifted") unless manifest["runbook"] == RUNBOOK
 fail!("classifier cases bead drifted") unless classifier_cases["source_bead"] == "ft-5lsqo.2"
 fail!("no-service gate bead drifted") unless no_service_gate["source_bead"] == "ft-5lsqo.4"
+fail!("no-service companion bead drifted") unless no_service_companion["bead"] == "ft-5lsqo.4"
+fail!("no-service companion contract drifted") unless no_service_companion["contract_id"] == no_service_gate["contract_id"]
+fail!("no-service companion canonical gate drifted") unless no_service_companion["canonical_gate"] == NO_SERVICE_GATE
+fail!("no-service companion canonical manifest drifted") unless no_service_companion["canonical_manifest"] == MANIFEST
+fail!("no-service gate companion pointer drifted") unless no_service_gate["companion_manifest"] == NO_SERVICE_COMPANION
 
 fixture_paths = manifest.fetch("valid")
 fixture_ids = fixture_paths.map { |path| File.basename(path, ".json") }

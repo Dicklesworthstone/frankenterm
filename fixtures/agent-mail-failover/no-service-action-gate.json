@@ -4,6 +4,9 @@
   "source_bead": "ft-5lsqo.4",
   "source_epic": "ft-5lsqo",
   "manifest": "fixtures/agent-mail-failover/manifest.json",
+  "contract_document": "docs/robot-contracts/agent-mail-no-service-action-gate.md",
+  "companion_manifest": "fixtures/agent-mail-no-service-action/manifest.json",
+  "companion_verifier": "tests/e2e/test_agent_mail_no_service_action_contract.sh",
   "forbidden_literal_count": 7,
   "source_scan_forbidden_literals": [
     "am service restart",
@@ -21,13 +24,18 @@
     "am doctor repair",
     "am doctor reconstruct",
     "kill am",
+    "kill agent mail",
     "kill serve-http",
     "kill mcp-agent-mail",
+    "kill am serve-http",
     "git reset --hard",
     "git clean -fd",
+    "rm -rf",
     "delete files",
     "run local Cargo as proof",
+    "local cargo proof",
     "mutate RCH worker",
+    "cancel build",
     "cancel RCH build"
   ],
   "scan_paths": [
@@ -50,6 +58,10 @@
       "id": "dirty-overlap-denial",
       "text": "Dirty tracked overlap keeps the decision at do_not_reopen unless the owner explicitly clears the overlap."
     }
+  ],
+  "companion_positive_fixtures": [
+    "fixtures/agent-mail-no-service-action/positive/beads-only-guidance.json",
+    "fixtures/agent-mail-no-service-action/positive/status-check-guidance.json"
   ],
   "negative_guidance_cases": [
     {
@@ -80,5 +92,10 @@
       "id": "worker-mutation",
       "text": "mutate RCH worker state or cancel RCH build."
     }
+  ],
+  "companion_negative_fixtures": [
+    "fixtures/agent-mail-no-service-action/negative/service-restart-guidance.json",
+    "fixtures/agent-mail-no-service-action/negative/destructive-cleanup-guidance.json",
+    "fixtures/agent-mail-no-service-action/negative/local-cargo-proof-guidance.json"
   ]
 }

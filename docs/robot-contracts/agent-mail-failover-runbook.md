@@ -122,15 +122,18 @@ The retained contract and static proof surfaces are:
 - `docs/robot-contracts/agent-mail-stale-reopen-policy.md`
 - `fixtures/agent-mail-failover/manifest.json`
 - `fixtures/agent-mail-failover/no-service-action-gate.json`
+- `fixtures/agent-mail-no-service-action/manifest.json`
+- `docs/robot-contracts/agent-mail-no-service-action-gate.md`
 - `tests/e2e/test_agent_mail_failover_snapshot_contract.sh`
 - `tests/e2e/test_agent_mail_retry_classifier_contract.sh`
 - `tests/e2e/test_agent_mail_no_service_action_gate.sh`
+- `tests/e2e/test_agent_mail_no_service_action_contract.sh`
 - `tests/e2e/test_agent_mail_failover_runbook_contract.sh`
 
 Runbook smoke proof:
 
 ```text
 bash tests/e2e/test_agent_mail_failover_runbook_contract.sh
-git diff --check -- docs/robot-contracts/agent-mail-failover-runbook.md tests/e2e/test_agent_mail_failover_runbook_contract.sh fixtures/agent-mail-failover/manifest.json
+git diff --check -- docs/robot-contracts/agent-mail-failover-runbook.md docs/robot-contracts/agent-mail-no-service-action-gate.md tests/e2e/test_agent_mail_failover_runbook_contract.sh fixtures/agent-mail-failover/manifest.json fixtures/agent-mail-no-service-action/manifest.json
 br dep cycles --json
 ```
