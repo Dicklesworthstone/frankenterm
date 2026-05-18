@@ -740,7 +740,7 @@ impl WaylandWindowInner {
             self.events.dispatch(WindowEvent::NeedRepaint);
         }
 
-        self.do_paint().unwrap();
+        self.request_paint("show");
     }
 
     fn refresh_frame(&mut self) {
@@ -1062,26 +1062,32 @@ impl WaylandWindowInner {
                         wegl_surface.resize(pixel_width, pixel_height, 0, 0);
                     }
                     if self.surface_factor != factor {
-                        let wayland_conn = Connection::get().unwrap().wayland();
-                        let wayland_state = wayland_conn.wayland_state.borrow();
-                        let mut pool = wayland_state.mem_pool.borrow_mut();
+                        if let Some(connection) = Connection::get() {
+                            let wayland_conn = connection.wayland();
+                            let wayland_state = wayland_conn.wayland_state.borrow();
+                            let mut pool = wayland_state.mem_pool.borrow_mut();
 
-                        // Make a "fake" buffer with the right dimensions, as
-                        // simply detaching the buffer can cause wlroots-derived
-                        // compositors consider the window to be unconfigured.
-                        if let Ok((buffer, _bytes)) = pool.create_buffer(
-                            factor as i32,
-                            factor as i32,
-                            (factor * 4.0) as i32,
-                            wayland_client::protocol::wl_shm::Format::Argb8888,
-                        ) {
-                            self.surface().attach(Some(buffer.wl_buffer()), 0, 0);
-                            self.surface().set_buffer_scale(factor as i32);
-                            self.surface_factor = factor;
+                            // Make a "fake" buffer with the right dimensions, as
+                            // simply detaching the buffer can cause wlroots-derived
+                            // compositors consider the window to be unconfigured.
+                            if let Ok((buffer, _bytes)) = pool.create_buffer(
+                                factor as i32,
+                                factor as i32,
+                                (factor * 4.0) as i32,
+                                wayland_client::protocol::wl_shm::Format::Argb8888,
+                            ) {
+                                self.surface().attach(Some(buffer.wl_buffer()), 0, 0);
+                                self.surface().set_buffer_scale(factor as i32);
+                                self.surface_factor = factor;
+                            }
+                        } else {
+                            log::debug!(
+                                "Skipping Wayland scale buffer update: connection unavailable"
+                            );
                         }
                     }
                 }
-                self.do_paint().unwrap();
+                self.request_paint("configure");
             }
         }
         if pending.refresh_decorations && self.window.is_some() {
@@ -1138,7 +1144,7 @@ impl WaylandWindowInner {
             self.invalidated = true;
             return;
         }
-        self.do_paint().unwrap();
+        self.request_paint("invalidate");
     }
 
     fn set_text_cursor_position(&mut self, rect: Rect) {
@@ -1229,12 +1235,16 @@ impl WaylandWindowInner {
             return Ok(());
         }
 
-        self.invalidated = false;
-
         // Ask the compositor to wake us up when its time to paint the next frame,
         // note that this only happens _after_ the next commit
-        let conn = WaylandConnection::get().unwrap().wayland();
+        let Some(conn) = WaylandConnection::get() else {
+            self.invalidated = true;
+            return Err(anyhow!("Wayland connection unavailable while painting"));
+        };
+        let conn = conn.wayland();
         let qh = conn.event_queue.borrow().handle();
+
+        self.invalidated = false;
 
         let callback = self.surface().frame(&qh, self.surface().clone());
 
@@ -1275,6 +1285,12 @@ impl WaylandWindowInner {
         Ok(())
     }
 
+    fn request_paint(&mut self, context: &str) {
+        if let Err(err) = self.do_paint() {
+            log::debug!("Dropping Wayland repaint during {context}: {err:#}");
+        }
+    }
+
     /// Diagnostic accessor for the in-flight frame-callback count.
     /// Linux integration tests use this to assert the chain-depth
     /// invariant under the resize-storm reproducer the bead
@@ -1305,7 +1321,7 @@ impl WaylandWindowInner {
             self.frame_callback_chain_depth = self.frame_callback_chain_depth.saturating_sub(1);
         }
         if self.invalidated {
-            self.do_paint().ok();
+            self.request_paint("frame callback");
         }
     }
 
