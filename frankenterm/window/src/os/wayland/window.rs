@@ -457,7 +457,10 @@ impl WindowOps for WaylandWindow {
 
     fn hide(&self) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
-            inner.window.as_ref().unwrap().set_minimized();
+            let Some(window) = inner.window_or_log("hide request") else {
+                return Ok(());
+            };
+            window.set_minimized();
             Ok(())
         });
     }
@@ -571,10 +574,13 @@ impl WindowOps for WaylandWindow {
 
     fn toggle_fullscreen(&self) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
+            let Some(window) = inner.window_or_log("fullscreen toggle") else {
+                return Ok(());
+            };
             if inner.window_state.contains(WindowState::FULL_SCREEN) {
-                inner.window.as_ref().unwrap().unset_fullscreen();
+                window.unset_fullscreen();
             } else {
-                inner.window.as_ref().unwrap().set_fullscreen(None);
+                window.set_fullscreen(None);
             }
             Ok(())
         });
@@ -1291,6 +1297,16 @@ impl WaylandWindowInner {
         }
     }
 
+    fn window_or_log(&self, action: &str) -> Option<&XdgWindow> {
+        match self.window.as_ref() {
+            Some(window) => Some(window),
+            None => {
+                log::debug!("Dropping Wayland {action}: window unavailable");
+                None
+            }
+        }
+    }
+
     /// Diagnostic accessor for the in-flight frame-callback count.
     /// Linux integration tests use this to assert the chain-depth
     /// invariant under the resize-storm reproducer the bead
@@ -1432,14 +1448,25 @@ impl WaylandWindowInner {
         let seat = pointer_data.pdata.seat();
         match action {
             FrameAction::Close => self.events.dispatch(WindowEvent::CloseRequested),
-            FrameAction::Minimize => self.window.as_ref().unwrap().set_minimized(),
-            FrameAction::Maximize => self.window.as_ref().unwrap().set_maximized(),
-            FrameAction::UnMaximize => self.window.as_ref().unwrap().unset_maximized(),
+            FrameAction::Minimize => {
+                if let Some(window) = self.window_or_log("frame minimize action") {
+                    window.set_minimized();
+                }
+            }
+            FrameAction::Maximize => {
+                if let Some(window) = self.window_or_log("frame maximize action") {
+                    window.set_maximized();
+                }
+            }
+            FrameAction::UnMaximize => {
+                if let Some(window) = self.window_or_log("frame unmaximize action") {
+                    window.unset_maximized();
+                }
+            }
             FrameAction::ShowMenu(x, y) => {
-                self.window
-                    .as_ref()
-                    .unwrap()
-                    .show_window_menu(seat, serial, (x, y))
+                if let Some(window) = self.window_or_log("frame menu action") {
+                    window.show_window_menu(seat, serial, (x, y));
+                }
             }
             FrameAction::Resize(edge) => {
                 let edge = match edge {
@@ -1454,9 +1481,15 @@ impl WaylandWindowInner {
                     ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
                     _ => return, // Realistically, there probably won't be any new edges added.
                 };
-                self.window.as_ref().unwrap().resize(seat, serial, edge)
+                if let Some(window) = self.window_or_log("frame resize action") {
+                    window.resize(seat, serial, edge);
+                }
             }
-            FrameAction::Move => self.window.as_ref().unwrap().move_(seat, serial),
+            FrameAction::Move => {
+                if let Some(window) = self.window_or_log("frame move action") {
+                    window.move_(seat, serial);
+                }
+            }
             _ => log::warn!("unhandled FrameAction: {:?}", action),
         }
     }
