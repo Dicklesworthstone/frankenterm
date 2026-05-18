@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{PackOverride, PatternsConfig};
 
@@ -483,7 +483,11 @@ fn timestamps_for(path: &Path) -> (Option<u64>, Option<u64>) {
 fn system_time_to_epoch_ms(ts: SystemTime) -> Option<u64> {
     ts.duration_since(UNIX_EPOCH)
         .ok()
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
+        .and_then(duration_to_epoch_ms)
+}
+
+fn duration_to_epoch_ms(duration: Duration) -> Option<u64> {
+    u64::try_from(duration.as_millis()).ok()
 }
 
 #[cfg(test)]
@@ -1141,8 +1145,26 @@ mod tests {
     }
 
     // =========================================================================
-    // system_time_to_epoch_ms (private, tested indirectly)
+    // system_time_to_epoch_ms / duration_to_epoch_ms
     // =========================================================================
+
+    #[test]
+    fn system_time_to_epoch_ms_converts_post_epoch_time() {
+        let ts = UNIX_EPOCH + Duration::from_millis(1_234);
+        assert_eq!(system_time_to_epoch_ms(ts), Some(1_234));
+    }
+
+    #[test]
+    fn system_time_to_epoch_ms_returns_none_for_pre_epoch_time() {
+        let ts = UNIX_EPOCH - Duration::from_millis(1);
+        assert_eq!(system_time_to_epoch_ms(ts), None);
+    }
+
+    #[test]
+    fn duration_to_epoch_ms_returns_none_on_u64_overflow() {
+        let overflowing_duration = Duration::from_secs(u64::MAX / 1_000 + 1);
+        assert_eq!(duration_to_epoch_ms(overflowing_duration), None);
+    }
 
     #[test]
     fn resolve_rulesets_dir_with_config_path() {
