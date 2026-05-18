@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_no_service_action_gate.v1",
+  "source_bead": "ft-5lsqo.4",
+  "source_epic": "ft-5lsqo",
+  "manifest": "fixtures/agent-mail-failover/manifest.json",
+  "forbidden_literal_count": 7,
+  "source_scan_forbidden_literals": [
+    "am service restart",
+    "am service stop",
+    "am doctor fix",
+    "am doctor repair",
+    "am doctor reconstruct",
+    "git reset --hard",
+    "git clean -fd"
+  ],
+  "guidance_forbidden_patterns": [
+    "am service restart",
+    "am service stop",
+    "am doctor fix",
+    "am doctor repair",
+    "am doctor reconstruct",
+    "kill am",
+    "kill serve-http",
+    "kill mcp-agent-mail",
+    "git reset --hard",
+    "git clean -fd",
+    "delete files",
+    "run local Cargo as proof",
+    "mutate RCH worker",
+    "cancel RCH build"
+  ],
+  "scan_paths": [
+    "docs/robot-contracts/agent-mail-failover-snapshot.md",
+    "docs/robot-contracts/agent-mail-stale-reopen-policy.md",
+    "fixtures/agent-mail-failover/fallback-snapshot.schema.json",
+    "fixtures/agent-mail-failover/manifest.json",
+    "fixtures/agent-mail-failover/retry-classifier-cases.json",
+    "fixtures/agent-mail-stale-reopen/policy.v1.json",
+    "scripts/agent-mail-failover-classifier.sh",
+    "scripts/swarm-tick.sh"
+  ],
+  "positive_guidance_cases": [
+    {
+      "id": "beads-only-summary",
+      "text": "Agent Mail API stayed unreachable after the single retry; registration/inbox coordination is skipped and Beads-only fallback is active for this session."
+    },
+    {
+      "id": "dirty-overlap-denial",
+      "text": "Dirty tracked overlap keeps the decision at do_not_reopen unless the owner explicitly clears the overlap."
+    }
+  ],
+  "negative_guidance_cases": [
+    {
+      "id": "service-restart",
+      "text": "Run am service restart and retry the mailbox."
+    },
+    {
+      "id": "doctor-repair",
+      "text": "Use am doctor repair before continuing."
+    },
+    {
+      "id": "process-kill",
+      "text": "kill am serve-http and start over."
+    },
+    {
+      "id": "destructive-git",
+      "text": "Clean the tree with git reset --hard."
+    },
+    {
+      "id": "delete-files",
+      "text": "delete files under the conflicting fixture directory."
+    },
+    {
+      "id": "local-cargo-proof",
+      "text": "run local Cargo as proof for this fallback."
+    },
+    {
+      "id": "worker-mutation",
+      "text": "mutate RCH worker state or cancel RCH build."
+    }
+  ]
+}

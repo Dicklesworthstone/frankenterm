@@ -85,15 +85,25 @@ was skipped for the session and must not recommend service repair, restart,
 process killing, destructive git cleanup, file deletion, worker mutation, or
 local Cargo proof.
 
+## No-Service-Action Gate
+
+`fixtures/agent-mail-failover/no-service-action-gate.json` defines the static
+gate for fallback artifacts. It scans only retained contract paths and
+manifest-listed fixtures, then checks positive and negative guidance strings.
+The gate must fail on service repair/restart commands, process-kill guidance,
+destructive git cleanup, deletion guidance, worker mutation, build
+cancellation, or local Cargo-as-proof language.
+
 ## Proof Posture
 
 This is a static contract slice. Validation is:
 
 ```text
-jq empty fixtures/agent-mail-failover/fallback-snapshot.schema.json fixtures/agent-mail-failover/manifest.json fixtures/agent-mail-failover/retry-classifier-cases.json fixtures/agent-mail-failover/valid/*.json
+jq empty fixtures/agent-mail-failover/fallback-snapshot.schema.json fixtures/agent-mail-failover/manifest.json fixtures/agent-mail-failover/retry-classifier-cases.json fixtures/agent-mail-failover/no-service-action-gate.json fixtures/agent-mail-failover/valid/*.json
 bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh
 bash tests/e2e/test_agent_mail_retry_classifier_contract.sh
-git diff --check -- docs/robot-contracts/agent-mail-failover-snapshot.md fixtures/agent-mail-failover scripts/agent-mail-failover-classifier.sh scripts/swarm-tick.sh tests/e2e/test_agent_mail_failover_snapshot_contract.sh tests/e2e/test_agent_mail_retry_classifier_contract.sh
+bash tests/e2e/test_agent_mail_no_service_action_gate.sh
+git diff --check -- docs/robot-contracts/agent-mail-failover-snapshot.md fixtures/agent-mail-failover scripts/agent-mail-failover-classifier.sh scripts/swarm-tick.sh tests/e2e/test_agent_mail_failover_snapshot_contract.sh tests/e2e/test_agent_mail_retry_classifier_contract.sh tests/e2e/test_agent_mail_no_service_action_gate.sh
 br dep cycles --json
 ```
 
