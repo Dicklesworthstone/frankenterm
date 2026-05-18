@@ -42,17 +42,29 @@ impl SeatHandler for WaylandState {
             Capability::Pointer if self.pointer.is_none() => {
                 log::trace!("Setting pointer capability");
                 let surface = self.compositor.create_surface(qh);
-                let pointer = self
+                let pointer = match self
                     .seat
-                    .get_pointer_with_theme_and_data::<WaylandState, SurfaceUserData, PointerUserData>(
+                    .get_pointer_with_theme_and_data::<
+                        WaylandState,
+                        SurfaceUserData,
+                        PointerUserData,
+                    >(
                         qh,
                         &seat,
                         &self.shm.wl_shm(),
                         surface,
                         ThemeSpec::System,
                         PointerUserData::new(seat.clone()),
-                    )
-                    .expect("Failed to create pointer");
+                    ) {
+                    Ok(pointer) => pointer,
+                    Err(err) => {
+                        log::warn!(
+                            "Failed to create themed Wayland pointer for seat {:?}: {err:?}",
+                            seat.id()
+                        );
+                        return;
+                    }
+                };
                 self.seat_bindings.note_pointer(seat.id());
                 self.pointer = Some(pointer);
             }
