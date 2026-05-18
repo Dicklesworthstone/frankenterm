@@ -320,8 +320,8 @@ impl ScreenInfoHelper {
 
 /// Convert a UCS2 wide char string to a Rust String
 fn wstr(slice: &[u16]) -> String {
-    let len = slice.iter().position(|&c| c == 0).unwrap_or(0);
-    OsString::from_wide(&slice[0..len])
+    let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    OsString::from_wide(&slice[..len])
         .to_string_lossy()
         .to_string()
 }
@@ -432,4 +432,32 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
         map.insert(gdi_name, name);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wstr;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    #[test]
+    fn wstr_reads_terminated_slice_up_to_first_nul() {
+        let mut raw = wide("DISPLAY1");
+        raw.push(0);
+        raw.extend(wide("ignored"));
+
+        assert_eq!(wstr(&raw), "DISPLAY1");
+    }
+
+    #[test]
+    fn wstr_reads_entire_unterminated_slice() {
+        assert_eq!(wstr(&wide("DISPLAY2")), "DISPLAY2");
+    }
+
+    #[test]
+    fn wstr_handles_empty_slice() {
+        assert_eq!(wstr(&[]), "");
+    }
 }
