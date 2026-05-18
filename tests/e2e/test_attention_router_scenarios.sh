@@ -7,6 +7,8 @@ cd "${ROOT}"
 
 SCHEMA="docs/json-schema/ft-attention-router-scenarios.json"
 INVENTORY="fixtures/attention-router/scenarios.v1.json"
+BLOCKER_RADAR_CONTRACT="docs/blocker-radar-contract.md"
+BLOCKER_RADAR_RUNBOOK="docs/blocker-radar-runbook.md"
 
 fail() {
   printf 'attention-router scenario inventory: %s\n' "$*" >&2
@@ -20,6 +22,8 @@ require_file() {
 
 require_file "${SCHEMA}"
 require_file "${INVENTORY}"
+require_file "${BLOCKER_RADAR_CONTRACT}"
+require_file "${BLOCKER_RADAR_RUNBOOK}"
 
 jq empty "${SCHEMA}" "${INVENTORY}"
 
@@ -122,6 +126,46 @@ jq -e '
     and (.volatility.strategy | type == "string" and length > 0)
   )
 ' "${INVENTORY}" >/dev/null || fail "scenario entries are incomplete"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "empty-ready-bv-blocked-recommendation")
+  | ([.source_fixture_requirements[].command_or_api] | sort) == [
+      "br ready --json",
+      "br show ft-4tp7g --json",
+      "bv --robot-next"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "beads-ready")
+      | .required_counters.ready_count == 0
+      and (.required_reason_codes | index("beads.ready_empty") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "bv-next")
+      | (.required_subjects | index("ft-4tp7g") != null)
+      and (.required_reason_codes | index("bv.recommends_blocked_issue") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "beads-blocker-state")
+      | (.required_reason_codes | index("beads.status_blocked") != null)
+      and (.required_reason_codes | index("beads.assignee_present") != null))
+    and .expected.classification == "blocked_infra"
+    and .expected.recommended_safe_action == "do_not_claim_bv_pick_record_blocker_or_find_disjoint_static_slice"
+    and (.expected.explanation_must_include | index("br state is authoritative for actionability") != null)
+    and (.expected.explanation_must_include | index("bv recommendation is advisory only") != null)
+    and (.expected.explanation_must_include | index("ft-4tp7g remains blocked until RCH reaches remote Cargo proof") != null)
+    and (.forbidden_actions | index("claim_ft_4tp7g") != null)
+' "${INVENTORY}" >/dev/null || fail "empty-ready/BV-blocked reconciliation scenario drifted"
+
+grep -Fq "The claimability check must treat \`bv --robot-triage\` and \`bv --robot-next\` as" \
+  "${BLOCKER_RADAR_CONTRACT}" || fail "blocker-radar contract no longer treats BV as advisory"
+grep -Fq "\`br ready --json\` and \`br show <id> --json\` are" \
+  "${BLOCKER_RADAR_CONTRACT}" || fail "blocker-radar contract no longer treats BR as authoritative"
+grep -Fq "final verdict is \`tracker_inconsistent\` and non-claimable" \
+  "${BLOCKER_RADAR_CONTRACT}" || fail "blocker-radar contract no longer fails closed on tracker inconsistency"
+grep -Fq "\`no_ready\`" \
+  "${BLOCKER_RADAR_CONTRACT}" || fail "blocker-radar contract no longer defines no_ready"
+grep -Fq "When \`br ready --json\` is empty, fail closed." \
+  "${BLOCKER_RADAR_RUNBOOK}" || fail "blocker-radar runbook no longer fails closed on empty BR ready"
+grep -Fq "Read \`bv --robot-triage\` only as an advisory ranking snapshot." \
+  "${BLOCKER_RADAR_RUNBOOK}" || fail "blocker-radar runbook no longer frames BV as advisory"
+grep -Fq "PageRank, unblock count, and \"available for work\" language are never enough" \
+  "${BLOCKER_RADAR_RUNBOOK}" || fail "blocker-radar runbook no longer rejects BV-only claims"
 
 scenario_count="$(jq -r '.scenarios | length' "${INVENTORY}")"
 printf 'attention-router scenario inventory: static verifier passed (%s scenarios)\n' "${scenario_count}"
