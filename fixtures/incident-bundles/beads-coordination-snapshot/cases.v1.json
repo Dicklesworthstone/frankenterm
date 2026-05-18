@@ -1,0 +1,305 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.incident_bundle.beads_coordination_snapshot.fixtures.v1",
+  "producing_bead": "ft-qc8r2",
+  "related_bead": "ft-tkkqx",
+  "purpose": "Static golden fixture corpus for the incident-bundle beads_coordination_snapshot source before the blocked Rust collector can close with RCH proof.",
+  "golden_confidence": {
+    "artifact_kind": "structural_json_golden",
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 3,
+    "strategy": "Structural validation with scrubbed agent names, bounded bead lists, and reason-code checks."
+  },
+  "source_policy": {
+    "mutates_beads_allowed": false,
+    "claim_allowed": false,
+    "reopen_allowed": false,
+    "sync_allowed": false,
+    "agent_mail_repair_allowed": false,
+    "service_restart_allowed": false,
+    "full_agent_mail_bodies_allowed": false,
+    "raw_pane_content_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "rch_service_mutation_allowed": false
+  },
+  "required_cases": [
+    "healthy-ready-queue",
+    "agent-mail-fallback",
+    "dirty-overlap",
+    "stale-candidate"
+  ],
+  "cases": [
+    {
+      "case_id": "healthy-ready-queue",
+      "title": "Ready queue available with no active owner conflict",
+      "source_name": "beads_coordination_snapshot",
+      "source_surface": "br ready --json",
+      "allowed_source_commands": [
+        "br ready --json",
+        "br list --status in_progress --json",
+        "br dep cycles --json",
+        "bv --robot-triage",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": []
+      },
+      "coordination": {
+        "ready_count": 2,
+        "in_progress_count": 0,
+        "active_agents": [],
+        "ready_candidates": [
+          {
+            "id": "ft-ready-a",
+            "priority": 2,
+            "claimability": "candidate_requires_show_check"
+          },
+          {
+            "id": "ft-ready-b",
+            "priority": 3,
+            "claimability": "candidate_requires_show_check"
+          }
+        ],
+        "stale_reopen": {
+          "default_action": "do_not_reopen",
+          "candidate_count": 0,
+          "requires_status_check": false
+        },
+        "dirty_overlap": {
+          "risk_level": "clean",
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 0
+        },
+        "reason_codes": [
+          "beads.ready_present",
+          "beads.no_in_progress",
+          "git.clean_for_claimability"
+        ]
+      },
+      "safe_next_action": "record_ready_candidates_without_claiming",
+      "forbidden_actions": [
+        "br update --claim",
+        "br reopen",
+        "br sync --flush-only",
+        "am doctor repair",
+        "am service restart",
+        "kill agent-mail",
+        "delete_files"
+      ]
+    },
+    {
+      "case_id": "agent-mail-fallback",
+      "title": "Agent Mail unavailable with Beads-only fallback snapshot",
+      "source_name": "beads_coordination_snapshot",
+      "source_surface": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "allowed_source_commands": [
+        "br ready --json",
+        "br list --status in_progress --json",
+        "br dep cycles --json",
+        "bv --robot-triage",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "mixed",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "beads-coordination.agent-mail-unavailable"
+        ]
+      },
+      "coordination": {
+        "ready_count": 0,
+        "in_progress_count": 0,
+        "active_agents": [],
+        "ready_candidates": [],
+        "stale_reopen": {
+          "default_action": "do_not_reopen",
+          "candidate_count": 0,
+          "requires_status_check": false
+        },
+        "dirty_overlap": {
+          "risk_level": "medium",
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 3
+        },
+        "reason_codes": [
+          "agent_mail.unavailable_after_retry",
+          "fallback.beads_only",
+          "beads.ready_empty"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "beads-coordination.agent-mail-unavailable",
+          "severity": "medium",
+          "reason_code": "agent_mail.unavailable_after_retry",
+          "message": "Agent Mail stayed unavailable after the allowed retry; bundle records Beads/git fallback evidence without service repair."
+        }
+      ],
+      "safe_next_action": "record_fallback_snapshot_without_mail_repair",
+      "forbidden_actions": [
+        "br update --claim",
+        "br reopen",
+        "br sync --flush-only",
+        "am doctor repair",
+        "am service restart",
+        "kill agent-mail",
+        "delete_files"
+      ]
+    },
+    {
+      "case_id": "dirty-overlap",
+      "title": "Dirty tracked overlap makes ownership unsafe",
+      "source_name": "beads_coordination_snapshot",
+      "source_surface": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "allowed_source_commands": [
+        "br ready --json",
+        "br list --status in_progress --json",
+        "br dep cycles --json",
+        "bv --robot-triage",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "beads-coordination.dirty-overlap"
+        ]
+      },
+      "coordination": {
+        "ready_count": 0,
+        "in_progress_count": 1,
+        "active_agents": [
+          {
+            "assignee": "[AGENT]",
+            "active_count": 1,
+            "beads": [
+              {
+                "id": "ft-owned",
+                "stale_over_2h": false
+              }
+            ]
+          }
+        ],
+        "ready_candidates": [],
+        "stale_reopen": {
+          "default_action": "do_not_reopen",
+          "candidate_count": 0,
+          "requires_status_check": true
+        },
+        "dirty_overlap": {
+          "risk_level": "high",
+          "tracked_dirty_count": 4,
+          "untracked_dirty_count": 1
+        },
+        "reason_codes": [
+          "beads.active_owner_present",
+          "git.tracked_overlap_risk",
+          "beads.stale_reopen_blocked_by_dirty_tree"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "beads-coordination.dirty-overlap",
+          "severity": "high",
+          "reason_code": "git.tracked_overlap_risk",
+          "message": "Dirty tracked files overlap likely owned work; bundle must not reopen, claim, or stage related paths."
+        }
+      ],
+      "safe_next_action": "record_dirty_overlap_without_reopen",
+      "forbidden_actions": [
+        "br update --claim",
+        "br reopen",
+        "br sync --flush-only",
+        "am doctor repair",
+        "am service restart",
+        "kill agent-mail",
+        "delete_files"
+      ]
+    },
+    {
+      "case_id": "stale-candidate",
+      "title": "Stale candidate requires status-check evidence before reopen",
+      "source_name": "beads_coordination_snapshot",
+      "source_surface": "br list --status in_progress --json",
+      "allowed_source_commands": [
+        "br ready --json",
+        "br list --status in_progress --json",
+        "br dep cycles --json",
+        "bv --robot-triage",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "beads-coordination.stale-candidate"
+        ]
+      },
+      "coordination": {
+        "ready_count": 0,
+        "in_progress_count": 1,
+        "active_agents": [
+          {
+            "assignee": "[AGENT]",
+            "active_count": 1,
+            "beads": [
+              {
+                "id": "ft-stale",
+                "stale_over_2h": true
+              }
+            ]
+          }
+        ],
+        "ready_candidates": [],
+        "stale_reopen": {
+          "default_action": "comment_for_status",
+          "candidate_count": 1,
+          "requires_status_check": true
+        },
+        "dirty_overlap": {
+          "risk_level": "clean",
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 0
+        },
+        "reason_codes": [
+          "beads.in_progress_stale_candidate",
+          "beads.status_check_required",
+          "beads.no_dirty_overlap"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "beads-coordination.stale-candidate",
+          "severity": "medium",
+          "reason_code": "beads.status_check_required",
+          "message": "Elapsed time alone is not enough to reopen; record candidate evidence and request status first."
+        }
+      ],
+      "safe_next_action": "record_stale_candidate_without_reopen",
+      "forbidden_actions": [
+        "br update --claim",
+        "br reopen",
+        "br sync --flush-only",
+        "am doctor repair",
+        "am service restart",
+        "kill agent-mail",
+        "delete_files"
+      ]
+    }
+  ]
+}
