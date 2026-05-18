@@ -7,6 +7,8 @@ use futures_util::stream::{abortable, StreamExt};
 use promise::spawn::block_on;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::TryFrom;
+use std::time::Duration;
 use zbus::proxy;
 use zvariant::{Type, Value};
 
@@ -123,7 +125,7 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
             &notif.message,
             &actions,
             &hints,
-            notif.timeout.map(|d| d.as_millis() as _).unwrap_or(0),
+            dbus_expire_timeout(notif.timeout),
         )
         .await?;
 
@@ -170,4 +172,36 @@ pub fn show_notif(notif: ToastNotification) -> Result<(), Box<dyn std::error::Er
             }
         })?;
     Ok(())
+}
+
+fn dbus_expire_timeout(timeout: Option<Duration>) -> i32 {
+    timeout
+        .map(|duration| i32::try_from(duration.as_millis()).unwrap_or(i32::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dbus_expire_timeout_preserves_no_timeout() {
+        assert_eq!(dbus_expire_timeout(None), 0);
+    }
+
+    #[test]
+    fn dbus_expire_timeout_converts_milliseconds() {
+        assert_eq!(
+            dbus_expire_timeout(Some(Duration::from_millis(12_345))),
+            12_345
+        );
+    }
+
+    #[test]
+    fn dbus_expire_timeout_saturates_large_duration() {
+        let overflowing = Duration::from_millis(i32::MAX as u64)
+            .checked_add(Duration::from_millis(1))
+            .expect("duration addition should fit");
+        assert_eq!(dbus_expire_timeout(Some(overflowing)), i32::MAX);
+    }
 }
