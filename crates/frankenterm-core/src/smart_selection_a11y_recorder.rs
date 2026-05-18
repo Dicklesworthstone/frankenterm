@@ -37,7 +37,7 @@
 //!   (br-ft-5w9ij). GUI callsites use
 //!   [`find_announcement_for_kind`] (the safe variant).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::a11y_tree::{
     AccessibilityEvent, AccessibilityRecorder, AccessibilityScenario, AnnouncePriority,
@@ -61,15 +61,21 @@ impl RecorderHandle {
         Self::default()
     }
 
-    /// Append `event` to the buffer. Lock-poisoning is treated as
-    /// "buffer corrupted" and silently dropped — the recorder is
-    /// a test fixture, not a load-bearing pipeline; surfacing the
-    /// poison would only obscure the underlying panic that caused
-    /// it.
-    pub fn record(&self, event: AccessibilityEvent) {
-        if let Ok(mut buf) = self.inner.lock() {
-            buf.push(event);
+    fn inner_guard(&self) -> MutexGuard<'_, Vec<AccessibilityEvent>> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.inner.clear_poison();
+                poisoned.into_inner()
+            }
         }
+    }
+
+    /// Append `event` to the buffer. The buffer is owned by this
+    /// recorder, so a panic in one assertion phase must not make
+    /// later fixture assertions silently lose accessibility events.
+    pub fn record(&self, event: AccessibilityEvent) {
+        self.inner_guard().push(event);
     }
 
     /// Convenience: render `msg` via
@@ -89,16 +95,14 @@ impl RecorderHandle {
     /// the lock.
     #[must_use]
     pub fn events(&self) -> Vec<AccessibilityEvent> {
-        self.inner.lock().map_or_else(|_| Vec::new(), |b| b.clone())
+        self.inner_guard().clone()
     }
 
     /// Drain the buffer and return its previous contents. Used
     /// between test phases to reset the assertion surface.
     #[must_use]
     pub fn take(&self) -> Vec<AccessibilityEvent> {
-        self.inner
-            .lock()
-            .map_or_else(|_| Vec::new(), |mut b| std::mem::take(&mut *b))
+        std::mem::take(&mut *self.inner_guard())
     }
 
     /// Convenience: locate the most recent
@@ -113,7 +117,7 @@ impl RecorderHandle {
         kind: SelectionPatternKind,
     ) -> Option<AccessibilityEvent> {
         let prefix = kind.display_name();
-        let buf = self.inner.lock().ok()?;
+        let buf = self.inner_guard();
         buf.iter()
             .rev()
             .find(|event| match event {
@@ -150,7 +154,7 @@ impl RecorderHandle {
     /// Length of the underlying buffer. Cheap snapshot.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().map_or(0, |b| b.len())
+        self.inner_guard().len()
     }
 
     /// Whether the recorder has captured any events. Convenience
@@ -394,6 +398,55 @@ mod tests {
             priority: AnnouncePriority::Assertive,
             value: "manual".to_string(),
         });
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn recorder_recovers_after_poisoned_buffer_lock() {
+        let r = RecorderHandle::new();
+        let poison_target = r.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut buf = poison_target.inner.lock().expect("initial lock");
+            buf.push(
+                synth(SelectionPatternKind::Email, "alice@example.com")
+                    .to_announcement_event(1, AnnouncePriority::Polite),
+            );
+            panic!("poison recorder buffer");
+        }));
+
+        r.record_smart_selection(
+            &synth(SelectionPatternKind::Url, "https://example.com"),
+            2,
+            AnnouncePriority::Assertive,
+        );
+
+        let events = r.events();
+        assert_eq!(events.len(), 2);
+        let url_event = r
+            .find_announcement_for_kind(SelectionPatternKind::Url)
+            .expect("URL announcement after poison recovery");
+        match url_event {
+            AccessibilityEvent::AnnounceMessage {
+                ts_ms,
+                priority,
+                value,
+            } => {
+                assert_eq!(ts_ms, 2);
+                assert_eq!(priority, AnnouncePriority::Assertive);
+                assert_eq!(value, "URL selected: https://example.com");
+            }
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+
+        let drained = r.take();
+        assert_eq!(drained.len(), 2);
+        assert!(r.is_empty());
+
+        r.record_smart_selection(
+            &synth(SelectionPatternKind::HexColor, "#abcdef"),
+            3,
+            AnnouncePriority::Polite,
+        );
         assert_eq!(r.len(), 1);
     }
 }
