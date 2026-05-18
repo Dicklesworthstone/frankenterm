@@ -43,6 +43,8 @@ Fixtures live under `fixtures/agent-mail-failover/valid/`:
 - `healthy-agent-mail.json`
 - `unavailable-after-retry.json`
 - `database-recovery-retry-exhausted.json`
+- `registration-failed.json`
+- `contact-permission-failed.json`
 - `empty-in-progress.json`
 - `stale-candidate-clean-tree.json`
 - `dirty-tracked-overlap.json`
@@ -51,6 +53,25 @@ Fixtures live under `fixtures/agent-mail-failover/valid/`:
 The fixtures cover both normal Agent Mail availability and degraded fallback
 states. Dirty overlap fixtures must recommend `do_not_reopen`; clean stale work
 may recommend only a status check before reopen.
+
+## Retry Classifier
+
+Every degraded startup fixture represents exactly two attempts: the first
+attempt plus the single allowed retry. After that, the classifier must emit
+`agent_mail.unavailable_after_retry` and `fallback.beads_only`, then stop using
+Agent Mail for that session.
+
+| Fixture | Failure class | Required specific reason |
+| --- | --- | --- |
+| `healthy-agent-mail.json` | none | `agent_mail.available` |
+| `database-recovery-retry-exhausted.json` | `database_recovery_notice` | `agent_mail.database_recovery_retry_exhausted` |
+| `unavailable-after-retry.json` | `api_unreachable` | `agent_mail.unavailable_after_retry` |
+| `empty-in-progress.json` | `database_error` | `agent_mail.unavailable_after_retry` |
+| `stale-candidate-clean-tree.json` | `timeout` | `agent_mail.unavailable_after_retry` |
+| `registration-failed.json` | `registration_failed` | `agent_mail.registration_failed_after_retry` |
+| `contact-permission-failed.json` | `contact_permission_failed` | `agent_mail.contact_permission_failed_after_retry` |
+| `dirty-tracked-overlap.json` | `database_recovery_notice` | `agent_mail.database_recovery_retry_exhausted` |
+| `untracked-review-required.json` | `unknown` | `agent_mail.unavailable_after_retry` |
 
 ## Proof Posture
 

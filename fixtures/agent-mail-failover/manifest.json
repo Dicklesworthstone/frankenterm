@@ -8,6 +8,8 @@
     "fixtures/agent-mail-failover/valid/healthy-agent-mail.json",
     "fixtures/agent-mail-failover/valid/unavailable-after-retry.json",
     "fixtures/agent-mail-failover/valid/database-recovery-retry-exhausted.json",
+    "fixtures/agent-mail-failover/valid/registration-failed.json",
+    "fixtures/agent-mail-failover/valid/contact-permission-failed.json",
     "fixtures/agent-mail-failover/valid/empty-in-progress.json",
     "fixtures/agent-mail-failover/valid/stale-candidate-clean-tree.json",
     "fixtures/agent-mail-failover/valid/dirty-tracked-overlap.json",

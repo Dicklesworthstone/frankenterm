@@ -14,6 +14,7 @@
     "failure_class": "database_recovery_notice",
     "reason_codes": [
       "agent_mail.database_recovery_retry_exhausted",
+      "agent_mail.unavailable_after_retry",
       "fallback.beads_only"
     ],
     "forbidden_actions": [

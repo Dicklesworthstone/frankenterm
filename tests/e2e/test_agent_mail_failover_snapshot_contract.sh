@@ -41,6 +41,8 @@ EXPECTED_FIXTURE_IDS = %w[
   healthy-agent-mail
   unavailable-after-retry
   database-recovery-retry-exhausted
+  registration-failed
+  contact-permission-failed
   empty-in-progress
   stale-candidate-clean-tree
   dirty-tracked-overlap
@@ -70,6 +72,26 @@ SAFETY_FALSE_FLAGS = %w[
   raw_mail_body_stored
   raw_pane_text_stored
 ].freeze
+CLASSIFIER_EXPECTATIONS = {
+  "healthy-agent-mail" => [nil, "agent_mail.available"],
+  "database-recovery-retry-exhausted" => ["database_recovery_notice", "agent_mail.database_recovery_retry_exhausted"],
+  "unavailable-after-retry" => ["api_unreachable", "agent_mail.unavailable_after_retry"],
+  "empty-in-progress" => ["database_error", "agent_mail.unavailable_after_retry"],
+  "stale-candidate-clean-tree" => ["timeout", "agent_mail.unavailable_after_retry"],
+  "registration-failed" => ["registration_failed", "agent_mail.registration_failed_after_retry"],
+  "contact-permission-failed" => ["contact_permission_failed", "agent_mail.contact_permission_failed_after_retry"],
+  "dirty-tracked-overlap" => ["database_recovery_notice", "agent_mail.database_recovery_retry_exhausted"],
+  "untracked-review-required" => ["unknown", "agent_mail.unavailable_after_retry"]
+}.freeze
+EXPECTED_FAILURE_CLASSES = %w[
+  database_recovery_notice
+  database_error
+  api_unreachable
+  timeout
+  registration_failed
+  contact_permission_failed
+  unknown
+].freeze
 
 def fail!(message)
   warn "agent mail failover snapshot contract: #{message}"
@@ -91,6 +113,7 @@ fail!("contract id const missing") unless schema.dig("properties", "contract_id"
 fail!("source bead const missing") unless schema.dig("properties", "source_bead", "const") == "ft-5lsqo.1"
 fail!("mode enum drifted") unless schema.dig("$defs", "mode", "enum").sort == %w[agent_mail_available agent_mail_unavailable_beads_only].sort
 fail!("forbidden-action enum drifted") unless schema.dig("$defs", "forbidden_action", "enum").sort == EXPECTED_FORBIDDEN.sort
+fail!("classifier failure classes drifted") unless schema.dig("$defs", "failure_class", "enum").compact.sort == (EXPECTED_FAILURE_CLASSES + %w[none]).sort
 
 fail!("manifest schema_version drifted") unless manifest["schema_version"] == 1
 fail!("manifest contract id drifted") unless manifest["contract_id"] == "ft.agent_mail_failover_snapshot.fixture_manifest.v1"
@@ -105,6 +128,7 @@ fail!("fixture ids drifted: #{fixture_ids.sort.inspect}") unless fixture_ids.sor
 fixture_paths.each { |path| fail!("manifest references missing fixture #{path}") unless File.file?(path) }
 
 payloads = fixture_paths.map { |path| [File.basename(path, ".json"), read_json(path)] }.to_h
+covered_failure_classes = Set.new
 payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} schema_version drifted") unless payload["schema_version"] == 1
   fail!("#{fixture_id} contract id drifted") unless payload["contract_id"] == "ft.agent_mail_failover_snapshot.v1"
@@ -113,6 +137,27 @@ payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} forbidden actions drifted") unless payload.dig("agent_mail", "forbidden_actions").sort == EXPECTED_FORBIDDEN.sort
   fail!("#{fixture_id} next actions missing") if payload.fetch("next_actions").empty?
   fail!("#{fixture_id} artifact path missing self") unless payload.fetch("artifact_paths").include?("fixtures/agent-mail-failover/valid/#{fixture_id}.json")
+
+  expected_failure_class, expected_reason = CLASSIFIER_EXPECTATIONS.fetch(fixture_id)
+  mail = payload.fetch("agent_mail")
+  if fixture_id == "healthy-agent-mail"
+    fail!("#{fixture_id} should succeed on first attempt") unless mail.fetch("attempt_count") == 1
+    fail!("#{fixture_id} should not carry failure class") unless mail["failure_class"].nil?
+    fail!("#{fixture_id} should not fall back") if mail.fetch("reason_codes").include?("fallback.beads_only")
+  else
+    fail!("#{fixture_id} degraded mode drifted") unless payload["mode"] == "agent_mail_unavailable_beads_only"
+    fail!("#{fixture_id} should represent exactly one retry before fallback") unless mail.fetch("attempt_count") == mail.fetch("retry_limit") + 1
+    fail!("#{fixture_id} should not register after degraded startup") if mail.fetch("registered")
+    fail!("#{fixture_id} should not check inbox after degraded startup") if mail.fetch("inbox_checked")
+    fail!("#{fixture_id} failure class drifted") unless mail.fetch("failure_class") == expected_failure_class
+    fail!("#{fixture_id} missing specific classifier reason") unless mail.fetch("reason_codes").include?(expected_reason)
+    fail!("#{fixture_id} missing unavailable-after-retry reason") unless mail.fetch("reason_codes").include?("agent_mail.unavailable_after_retry")
+    fail!("#{fixture_id} missing fallback reason") unless mail.fetch("reason_codes").include?("fallback.beads_only")
+    covered_failure_classes.add(mail.fetch("failure_class"))
+  end
+
+  forbidden_guidance = payload.fetch("next_actions").grep(/doctor|repair|restart|kill|reset --hard|clean -fd|delete|local Cargo/i)
+  fail!("#{fixture_id} next actions suggest forbidden service or cleanup work: #{forbidden_guidance.inspect}") unless forbidden_guidance.empty?
 
   SAFETY_FALSE_FLAGS.each do |flag|
     fail!("#{fixture_id} safety flag #{flag} drifted") unless payload.fetch("safety").fetch(flag) == false
@@ -128,6 +173,7 @@ payloads.each do |fixture_id, payload|
   untracked_count = payload.fetch("git").fetch("untracked_dirty_count")
   fail!("#{fixture_id} dirty counts inconsistent") unless dirty_count == tracked_count + untracked_count
 end
+fail!("classifier branch coverage drifted") unless covered_failure_classes.sort == EXPECTED_FAILURE_CLASSES.sort
 
 healthy = payloads.fetch("healthy-agent-mail")
 fail!("healthy fixture mode drifted") unless healthy["mode"] == "agent_mail_available"
@@ -145,6 +191,14 @@ database = payloads.fetch("database-recovery-retry-exhausted")
 fail!("database fixture failure class drifted") unless database.dig("agent_mail", "failure_class") == "database_recovery_notice"
 fail!("database fixture missing retry-exhausted reason") unless database.dig("agent_mail", "reason_codes").include?("agent_mail.database_recovery_retry_exhausted")
 fail!("database fixture should not suggest repair") if database.fetch("next_actions").any? { |action| action.include?("repair") || action.include?("restart") }
+
+registration = payloads.fetch("registration-failed")
+fail!("registration fixture failure class drifted") unless registration.dig("agent_mail", "failure_class") == "registration_failed"
+fail!("registration fixture missing reason code") unless registration.dig("agent_mail", "reason_codes").include?("agent_mail.registration_failed_after_retry")
+
+contact = payloads.fetch("contact-permission-failed")
+fail!("contact fixture failure class drifted") unless contact.dig("agent_mail", "failure_class") == "contact_permission_failed"
+fail!("contact fixture missing reason code") unless contact.dig("agent_mail", "reason_codes").include?("agent_mail.contact_permission_failed_after_retry")
 
 empty = payloads.fetch("empty-in-progress")
 fail!("empty fixture in-progress drifted") unless empty.dig("beads", "in_progress_count") == 0
@@ -171,6 +225,8 @@ fail!("untracked fixture must do_not_reopen") unless untracked.dig("beads", "sta
   fixtures/agent-mail-failover/fallback-snapshot.schema.json
   unavailable-after-retry
   database-recovery-retry-exhausted
+  registration-failed
+  contact-permission-failed
   Local Cargo
 ].each do |needle|
   fail!("doc missing #{needle}") unless doc.include?(needle)
