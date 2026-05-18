@@ -11,7 +11,7 @@ use crate::storage::ExtensionStorage;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Lifecycle state for an extension.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +81,16 @@ impl ExtensionLifecycle {
         })
     }
 
+    fn extensions_guard(&self) -> MutexGuard<'_, HashMap<String, ManagedExtension>> {
+        match self.extensions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.extensions.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Install a .ftx package and return the managed extension.
     pub fn install(&self, ftx_path: &Path) -> Result<ManagedExtension> {
         let installed = self.manager.install(ftx_path)?;
@@ -97,19 +107,15 @@ impl ExtensionLifecycle {
             hook_ids: Vec::new(),
         };
 
-        if let Ok(mut exts) = self.extensions.lock() {
-            exts.insert(managed.name.clone(), managed.clone());
-        }
+        self.extensions_guard()
+            .insert(managed.name.clone(), managed.clone());
 
         Ok(managed)
     }
 
     /// Enable a disabled extension.
     pub fn enable(&self, name: &str) -> Result<()> {
-        let mut exts = self
-            .extensions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let mut exts = self.extensions_guard();
 
         let ext = exts
             .get_mut(name)
@@ -128,10 +134,7 @@ impl ExtensionLifecycle {
 
     /// Disable a loaded or installed extension.
     pub fn disable(&self, name: &str) -> Result<()> {
-        let mut exts = self
-            .extensions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let mut exts = self.extensions_guard();
 
         let ext = exts
             .get_mut(name)
@@ -152,11 +155,12 @@ impl ExtensionLifecycle {
     /// Remove an extension entirely (unload + delete from disk).
     pub fn remove(&self, name: &str) -> Result<()> {
         // Unregister all hooks and bindings
-        if let Ok(exts) = self.extensions.lock()
-            && let Some(ext) = exts.get(name)
         {
-            for hook_id in &ext.hook_ids {
-                self.event_bus.unregister(*hook_id);
+            let exts = self.extensions_guard();
+            if let Some(ext) = exts.get(name) {
+                for hook_id in &ext.hook_ids {
+                    self.event_bus.unregister(*hook_id);
+                }
             }
         }
         self.keybindings.unregister_extension(name);
@@ -169,19 +173,14 @@ impl ExtensionLifecycle {
         self.manager.remove(name)?;
 
         // Remove from tracked extensions
-        if let Ok(mut exts) = self.extensions.lock() {
-            exts.remove(name);
-        }
+        self.extensions_guard().remove(name);
 
         Ok(())
     }
 
     /// Mark an extension as loaded (call after successfully compiling and registering hooks).
     pub fn mark_loaded(&self, name: &str, hook_ids: Vec<EventHookId>) -> Result<()> {
-        let mut exts = self
-            .extensions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let mut exts = self.extensions_guard();
 
         let ext = exts
             .get_mut(name)
@@ -194,10 +193,7 @@ impl ExtensionLifecycle {
 
     /// Mark an extension as having a load error.
     pub fn mark_error(&self, name: &str, error: &str) -> Result<()> {
-        let mut exts = self
-            .extensions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let mut exts = self.extensions_guard();
 
         let ext = exts
             .get_mut(name)
@@ -229,9 +225,7 @@ impl ExtensionLifecycle {
                 hook_ids: Vec::new(),
             };
 
-            if let Ok(mut exts) = self.extensions.lock() {
-                exts.insert(m.name.clone(), m.clone());
-            }
+            self.extensions_guard().insert(m.name.clone(), m.clone());
 
             managed.push(m);
         }
@@ -241,35 +235,23 @@ impl ExtensionLifecycle {
 
     /// Get the state of a specific extension.
     pub fn get_state(&self, name: &str) -> Option<ExtensionState> {
-        self.extensions
-            .lock()
-            .ok()
-            .and_then(|exts| exts.get(name).map(|e| e.state.clone()))
+        self.extensions_guard().get(name).map(|e| e.state.clone())
     }
 
     /// List all managed extensions.
     pub fn list(&self) -> Vec<ManagedExtension> {
-        self.extensions
-            .lock()
-            .map(|exts| {
-                let mut list: Vec<_> = exts.values().cloned().collect();
-                list.sort_by(|a, b| a.name.cmp(&b.name));
-                list
-            })
-            .unwrap_or_default()
+        let mut list: Vec<_> = self.extensions_guard().values().cloned().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
     }
 
     /// List names of extensions that should be loaded.
     pub fn loadable_extensions(&self) -> Vec<String> {
-        self.extensions
-            .lock()
-            .map(|exts| {
-                exts.values()
-                    .filter(|e| e.state.should_load())
-                    .map(|e| e.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.extensions_guard()
+            .values()
+            .filter(|e| e.state.should_load())
+            .map(|e| e.name.clone())
+            .collect()
     }
 
     /// Access the underlying extension manager.
@@ -352,6 +334,33 @@ entry = "main.wasm"
             lifecycle.get_state("test-ext"),
             Some(ExtensionState::Installed)
         );
+    }
+
+    #[test]
+    fn extension_registry_recovers_after_poisoned_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle(dir.path());
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lifecycle.extensions.lock().unwrap();
+            panic!("poison extension registry");
+        }));
+        assert!(poison.is_err());
+
+        let ftx = create_test_ftx(dir.path(), "poisoned-ext");
+        lifecycle.install(&ftx).unwrap();
+        assert_eq!(
+            lifecycle.get_state("poisoned-ext"),
+            Some(ExtensionState::Installed)
+        );
+
+        lifecycle.disable("poisoned-ext").unwrap();
+        assert_eq!(
+            lifecycle.get_state("poisoned-ext"),
+            Some(ExtensionState::Disabled)
+        );
+        assert_eq!(lifecycle.list().len(), 1);
+        assert!(lifecycle.loadable_extensions().is_empty());
     }
 
     #[test]
