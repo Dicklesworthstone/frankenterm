@@ -1,7 +1,7 @@
 //! Implements zwp_text_input_v3 for handling IME
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use smithay_client_toolkit::globals::GlobalData;
 use wayland_client::backend::ObjectId;
@@ -40,6 +40,16 @@ struct Inner {
 }
 
 impl TextInputState {
+    fn lock_inner(&self, context: &str) -> Option<MutexGuard<'_, Inner>> {
+        match self.inner.lock() {
+            Ok(inner) => Some(inner),
+            Err(_) => {
+                log::error!("Wayland text input state lock was poisoned during {context}");
+                None
+            }
+        }
+    }
+
     pub(super) fn bind(
         globals: &GlobalList,
         queue_handle: &QueueHandle<WaylandState>,
@@ -52,14 +62,14 @@ impl TextInputState {
     }
 
     pub fn get_text_input_for_keyboard(&self, keyboard: &WlKeyboard) -> Option<ZwpTextInputV3> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner("keyboard lookup")?;
         let keyboard_id = keyboard.id();
         let seat_id = inner.keyboard_to_seat.get(&keyboard_id)?;
         inner.input_by_seat.get(&seat_id).cloned()
     }
 
     pub(super) fn get_text_input_for_surface(&self, surface: &WlSurface) -> Option<ZwpTextInputV3> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner("surface lookup")?;
         let surface_id = surface.id();
         let keyboard_id = inner.surface_to_keyboard.get(&surface_id)?;
         let seat_id = inner.keyboard_to_seat.get(&keyboard_id)?;
@@ -72,7 +82,7 @@ impl TextInputState {
         qh: &QueueHandle<WaylandState>,
     ) -> Option<ZwpTextInputV3> {
         let mgr = &self.text_input_manager;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner("seat lookup")?;
         let seat_id = seat.id();
         let input = inner.input_by_seat.entry(seat_id).or_insert_with(|| {
             let input = mgr.get_text_input(seat, &qh, TextInputData::default());
@@ -84,11 +94,9 @@ impl TextInputState {
     pub(super) fn advise_surface(&self, surface: &WlSurface, keyboard: &WlKeyboard) {
         let surface_id = surface.id();
         let keyboard_id = keyboard.id();
-        self.inner
-            .lock()
-            .unwrap()
-            .surface_to_keyboard
-            .insert(surface_id, keyboard_id);
+        if let Some(mut inner) = self.lock_inner("surface advice") {
+            inner.surface_to_keyboard.insert(surface_id, keyboard_id);
+        }
     }
 
     pub(super) fn advise_seat(
@@ -100,16 +108,16 @@ impl TextInputState {
         self.get_text_input_for_seat(seat, qh);
         let keyboard_id = keyboard.id();
         let seat_id = seat.id();
-        self.inner
-            .lock()
-            .unwrap()
-            .keyboard_to_seat
-            .insert(keyboard_id, seat_id);
+        if let Some(mut inner) = self.lock_inner("seat advice") {
+            inner.keyboard_to_seat.insert(keyboard_id, seat_id);
+        }
     }
 
     pub(super) fn forget_keyboard(&self, keyboard: &WlKeyboard) {
         let keyboard_id = keyboard.id();
-        let mut inner = self.inner.lock().unwrap();
+        let Some(mut inner) = self.lock_inner("keyboard removal") else {
+            return;
+        };
         inner.keyboard_to_seat.remove(&keyboard_id);
         inner
             .surface_to_keyboard
@@ -118,7 +126,9 @@ impl TextInputState {
 
     pub(super) fn forget_seat(&self, seat: &WlSeat) {
         let seat_id = seat.id();
-        let mut inner = self.inner.lock().unwrap();
+        let Some(mut inner) = self.lock_inner("seat removal") else {
+            return;
+        };
 
         inner
             .keyboard_to_seat
@@ -139,7 +149,9 @@ impl TextInputState {
     /// If we make sure to disable things before we close the app,
     /// mutter is less likely to get in a bad state
     pub fn shutdown(&self) {
-        self.inner.lock().unwrap().disable_all();
+        if let Some(mut inner) = self.lock_inner("shutdown") {
+            inner.disable_all();
+        }
     }
 }
 
@@ -186,8 +198,13 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
     ) {
         log::trace!("ZwpTextInputEvent: {event:?}");
         let mut pending_state = {
-            let text_input = state.text_input.as_mut().unwrap();
-            let mut inner = text_input.inner.lock().unwrap();
+            let Some(text_input) = state.text_input.as_ref() else {
+                log::warn!("Wayland text input event arrived without text input state");
+                return;
+            };
+            let Some(mut inner) = text_input.lock_inner("text input event") else {
+                return;
+            };
             inner.pending_state.entry(input.id()).or_default().clone()
         };
 
@@ -227,15 +244,13 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
             _ => {}
         }
 
-        state
-            .text_input
-            .as_ref()
-            .unwrap()
-            .inner
-            .lock()
-            .unwrap()
-            .pending_state
-            .insert(input.id(), pending_state);
+        let Some(text_input) = state.text_input.as_ref() else {
+            log::warn!("Wayland text input state disappeared before event completion");
+            return;
+        };
+        if let Some(mut inner) = text_input.lock_inner("text input event completion") {
+            inner.pending_state.insert(input.id(), pending_state);
+        }
     }
 }
 
