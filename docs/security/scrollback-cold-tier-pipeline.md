@@ -21,20 +21,26 @@ accidentally break the bead's "DO NOT BREAK" invariants.
 > The substrate enforces this at the **type level**: the
 > integration cannot construct a `ChunkBytes<Compressed>`
 > without first consuming a `ChunkBytes<Redacted>`, which
-> can only come from `ChunkBytes<Raw>::redact_with()`.
+> can only come from a `ChunkBytes<Raw>` redaction transition
+> such as `redact_with`, `redact_with_evidence`, or
+> `redact_with_streaming`.
 > Skipping the redactor is a compile error.
 
 ## Typed-state pipeline (DO NOT BREAK rule)
 
-`ChunkBytes<Stage>` is a phantom-typed wrapper. Each stage
-admits exactly one transition:
+`ChunkBytes<Stage>` is a phantom-typed wrapper. Each stage admits only the
+next valid transition set. Production chunked persistence uses the
+evidence-bearing streaming transition; the simple `redact_with` helper remains
+for tests and non-streaming adapters:
 
 ```
-ChunkBytes<Raw>          → redact_with(redactor)        → ChunkBytes<Redacted>
-ChunkBytes<Redacted>     → compress_with(zstd)          → ChunkBytes<Compressed>
-ChunkBytes<Compressed>   → encrypt_with(key, cipher)    → ChunkBytes<Encrypted>
-                         → skip_encryption()            → ChunkBytes<Encrypted>  (operator opt-out)
-ChunkBytes<Encrypted>    → mark_written()               → ChunkBytes<Written>
+ChunkBytes<Raw>          -> redact_with(redactor)        -> ChunkBytes<Redacted>
+ChunkBytes<Raw>          -> redact_with_evidence(...)    -> (ChunkBytes<Redacted>, RedactionEvidence)
+ChunkBytes<Raw>          -> redact_with_streaming(...)   -> (ChunkBytes<Redacted>, RedactionEvidence)
+ChunkBytes<Redacted>     -> compress_with(zstd)          -> ChunkBytes<Compressed>
+ChunkBytes<Compressed>   -> encrypt_with(key, cipher)    -> ChunkBytes<Encrypted>
+                         -> skip_encryption()            -> ChunkBytes<Encrypted>  (operator opt-out)
+ChunkBytes<Encrypted>    -> mark_written()               -> ChunkBytes<Written>
 ```
 
 Compile-time invariants (verified by absence — these
@@ -124,15 +130,18 @@ clean.
 - `chunks_written_total` / `chunks_read_total` — lifetime
   counters.
 - `redactions_applied_total` — privacy invariant
-  observability (always ≥ `chunks_written_total`).
+  observability. It must equal `chunks_written_total`.
+- `chunks_written_without_redactor` — fail-closed counter for writes where
+  the integration explicitly reported that the redactor was not applied. It
+  must remain 0.
 - `encryptions_applied_total` / `encryption_skipped_total`
   — operator opt-in/out split.
 - `evictions_total` / `retention_purges_total` — cleanup
   observability.
 - `stage_failures` — per-stage failure counter
   (`compress_zstd`, `encrypt_aes256_gcm`, `write_disk`).
-- `is_safe()`: `redactions_applied_total >=
-  chunks_written_total` (privacy invariant).
+- `is_safe()`: `redactions_applied_total == chunks_written_total` and
+  `chunks_written_without_redactor == 0` (privacy invariant).
 
 ## Tests (22)
 
