@@ -1,0 +1,133 @@
+{
+  "schema_version": "ft.provider_quota_assignment.invalid_fragments.v1",
+  "contract_id": "ft.provider_quota_assignment.invalid_fragments.v1",
+  "schema_path": "docs/json-schema/ft-provider-quota-assignment.json",
+  "valid_fixture": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+  "contract_doc": "docs/robot-contracts/provider-quota-assignment.md",
+  "source_bead": "ft-auy2g.11",
+  "verification": [
+    "jq empty docs/json-schema/ft-provider-quota-assignment.json fixtures/mission-planner/provider-quota-assignment/cases.v1.json fixtures/mission-planner/provider-quota-assignment/invalid/fragments.v1.json",
+    "bash tests/e2e/test_provider_quota_assignment_contract.sh"
+  ],
+  "cases": [
+    {
+      "case_id": "provider-api-call-permitted",
+      "expected_failure": "provider_api_call_must_stay_forbidden",
+      "reason_codes": [
+        "planner.provider_api_call_forbidden"
+      ],
+      "invalid_fragment": {
+        "missing_forbidden_action": "provider_api_call",
+        "forbidden_actions": [
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ]
+      }
+    },
+    {
+      "case_id": "credential-mutation-permitted",
+      "expected_failure": "credential_mutation_must_stay_forbidden",
+      "reason_codes": [
+        "planner.credential_mutation_forbidden"
+      ],
+      "invalid_fragment": {
+        "missing_forbidden_action": "credential_mutation",
+        "forbidden_actions": [
+          "provider_api_call",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ]
+      }
+    },
+    {
+      "case_id": "hidden-spend-decision-permitted",
+      "expected_failure": "hidden_spend_decision_must_stay_forbidden",
+      "reason_codes": [
+        "planner.hidden_spend_decision_forbidden"
+      ],
+      "invalid_fragment": {
+        "missing_forbidden_action": "hidden_spend_decision",
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ]
+      }
+    },
+    {
+      "case_id": "assign-with-stale-evidence",
+      "expected_failure": "assign_requires_fresh_evidence",
+      "reason_codes": [
+        "quota.stale_evidence"
+      ],
+      "invalid_fragment": {
+        "recommendation": {
+          "action": "assign",
+          "requires_approval": false
+        },
+        "evidence": [
+          {
+            "evidence_id": "stale-quota-row",
+            "freshness_state": "stale"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "raw-secret-storage-permitted",
+      "expected_failure": "raw_secret_storage_must_stay_forbidden",
+      "reason_codes": [
+        "planner.raw_secret_storage_forbidden"
+      ],
+      "invalid_fragment": {
+        "missing_forbidden_action": "raw_secret_storage",
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof"
+        ]
+      }
+    },
+    {
+      "case_id": "toon-row-width-mismatch",
+      "expected_failure": "toon_rows_must_match_declared_columns",
+      "reason_codes": [
+        "toon.row_width_mismatch"
+      ],
+      "invalid_fragment": {
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "recommendation",
+            "reason",
+            "approval",
+            "fallback"
+          ],
+          "rows": [
+            [
+              "toon-row-width-mismatch",
+              "provider.fixture",
+              "request_fresh_quota_evidence",
+              "quota.unknown",
+              "false"
+            ]
+          ]
+        }
+      }
+    }
+  ]
+}

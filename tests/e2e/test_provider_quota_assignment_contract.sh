@@ -8,6 +8,7 @@ cd "${ROOT}"
 SCHEMA="docs/json-schema/ft-provider-quota-assignment.json"
 DOC="docs/robot-contracts/provider-quota-assignment.md"
 FIXTURES="fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+INVALID_FIXTURES="fixtures/mission-planner/provider-quota-assignment/invalid/fragments.v1.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 REQUIRED_CASES=(
   "healthy-quota"
@@ -47,6 +48,14 @@ REQUIRED_FORBIDDEN=(
   "local_cargo_proof"
   "raw_secret_storage"
 )
+REQUIRED_INVALID_CASES=(
+  "provider-api-call-permitted"
+  "credential-mutation-permitted"
+  "hidden-spend-decision-permitted"
+  "assign-with-stale-evidence"
+  "raw-secret-storage-permitted"
+  "toon-row-width-mismatch"
+)
 
 fail() {
   printf 'provider quota assignment contract: %s\n' "$*" >&2
@@ -68,9 +77,10 @@ require_command rg
 require_file "${SCHEMA}"
 require_file "${DOC}"
 require_file "${FIXTURES}"
+require_file "${INVALID_FIXTURES}"
 require_file "${PROVENANCE}"
 
-jq empty "${SCHEMA}" "${FIXTURES}"
+jq empty "${SCHEMA}" "${FIXTURES}" "${INVALID_FIXTURES}"
 
 ruby <<'RUBY'
 require "json"
@@ -79,6 +89,7 @@ require "set"
 SCHEMA = "docs/json-schema/ft-provider-quota-assignment.json"
 DOC = "docs/robot-contracts/provider-quota-assignment.md"
 FIXTURES = "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+INVALID_FIXTURES = "fixtures/mission-planner/provider-quota-assignment/invalid/fragments.v1.json"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 REQUIRED_CASES = %w[
   healthy-quota
@@ -118,6 +129,14 @@ REQUIRED_FORBIDDEN = %w[
   local_cargo_proof
   raw_secret_storage
 ].freeze
+REQUIRED_INVALID_CASES = %w[
+  provider-api-call-permitted
+  credential-mutation-permitted
+  hidden-spend-decision-permitted
+  assign-with-stale-evidence
+  raw-secret-storage-permitted
+  toon-row-width-mismatch
+].freeze
 FAIL_CLOSED_ACTIONS = %w[
   defer
   degrade_model_class
@@ -138,6 +157,7 @@ end
 
 schema = read_json(SCHEMA)
 fixtures = read_json(FIXTURES)
+invalid_fixtures = read_json(INVALID_FIXTURES)
 doc = File.read(DOC)
 provenance = File.read(PROVENANCE)
 
@@ -165,10 +185,68 @@ fail!("fixture verifier missing") unless fixtures.fetch("verification").include?
 fail!("fixture forbidden actions drifted") unless fixtures.fetch("required_forbidden_actions").sort == REQUIRED_FORBIDDEN.sort
 fail!("toon columns too sparse") unless fixtures.fetch("toon_columns").length >= 6
 
+fail!("invalid fixture schema version drifted") unless invalid_fixtures["schema_version"] == "ft.provider_quota_assignment.invalid_fragments.v1"
+fail!("invalid fixture contract id drifted") unless invalid_fixtures["contract_id"] == "ft.provider_quota_assignment.invalid_fragments.v1"
+fail!("invalid fixture schema pointer drifted") unless invalid_fixtures["schema_path"] == SCHEMA
+fail!("invalid fixture valid fixture pointer drifted") unless invalid_fixtures["valid_fixture"] == FIXTURES
+fail!("invalid fixture doc pointer drifted") unless invalid_fixtures["contract_doc"] == DOC
+fail!("invalid fixture source bead drifted") unless invalid_fixtures["source_bead"] == "ft-auy2g.11"
+fail!("invalid fixture verifier missing") unless invalid_fixtures.fetch("verification").include?("bash tests/e2e/test_provider_quota_assignment_contract.sh")
+
 cases = fixtures.fetch("cases")
 case_ids = cases.map { |entry| entry.fetch("case_id") }
 fail!("case coverage drifted: #{case_ids.sort.inspect}") unless case_ids.sort == REQUIRED_CASES.sort
 fail!("case ids are not unique") unless case_ids.uniq.length == case_ids.length
+
+invalid_cases = invalid_fixtures.fetch("cases")
+invalid_case_ids = invalid_cases.map { |entry| entry.fetch("case_id") }
+fail!("invalid case coverage drifted: #{invalid_case_ids.sort.inspect}") unless invalid_case_ids.sort == REQUIRED_INVALID_CASES.sort
+fail!("invalid case ids are not unique") unless invalid_case_ids.uniq.length == invalid_case_ids.length
+
+invalid_by_id = invalid_cases.to_h { |entry| [entry.fetch("case_id"), entry] }
+invalid_cases.each do |entry|
+  %w[case_id expected_failure reason_codes invalid_fragment].each do |field|
+    fail!("invalid case #{entry["case_id"] || "(missing)"} lacks #{field}") unless entry.key?(field)
+  end
+  fail!("invalid case #{entry.fetch("case_id")} has no reason codes") if entry.fetch("reason_codes").empty?
+end
+
+provider_api = invalid_by_id.fetch("provider-api-call-permitted")
+fail!("provider-api expected failure drifted") unless provider_api.fetch("expected_failure") == "provider_api_call_must_stay_forbidden"
+fail!("provider-api reason drifted") unless provider_api.fetch("reason_codes").include?("planner.provider_api_call_forbidden")
+fail!("provider-api missing action marker drifted") unless provider_api.dig("invalid_fragment", "missing_forbidden_action") == "provider_api_call"
+fail!("provider-api forbidden list should omit provider_api_call") if provider_api.dig("invalid_fragment", "forbidden_actions").include?("provider_api_call")
+
+credential_mutation = invalid_by_id.fetch("credential-mutation-permitted")
+fail!("credential mutation expected failure drifted") unless credential_mutation.fetch("expected_failure") == "credential_mutation_must_stay_forbidden"
+fail!("credential mutation reason drifted") unless credential_mutation.fetch("reason_codes").include?("planner.credential_mutation_forbidden")
+fail!("credential mutation marker drifted") unless credential_mutation.dig("invalid_fragment", "missing_forbidden_action") == "credential_mutation"
+fail!("credential mutation forbidden list should omit credential_mutation") if credential_mutation.dig("invalid_fragment", "forbidden_actions").include?("credential_mutation")
+
+hidden_spend = invalid_by_id.fetch("hidden-spend-decision-permitted")
+fail!("hidden spend expected failure drifted") unless hidden_spend.fetch("expected_failure") == "hidden_spend_decision_must_stay_forbidden"
+fail!("hidden spend reason drifted") unless hidden_spend.fetch("reason_codes").include?("planner.hidden_spend_decision_forbidden")
+fail!("hidden spend marker drifted") unless hidden_spend.dig("invalid_fragment", "missing_forbidden_action") == "hidden_spend_decision"
+fail!("hidden spend forbidden list should omit hidden_spend_decision") if hidden_spend.dig("invalid_fragment", "forbidden_actions").include?("hidden_spend_decision")
+
+stale_assign = invalid_by_id.fetch("assign-with-stale-evidence")
+fail!("stale assign expected failure drifted") unless stale_assign.fetch("expected_failure") == "assign_requires_fresh_evidence"
+fail!("stale assign reason drifted") unless stale_assign.fetch("reason_codes").include?("quota.stale_evidence")
+fail!("stale assign action drifted") unless stale_assign.dig("invalid_fragment", "recommendation", "action") == "assign"
+fail!("stale assign evidence drifted") unless stale_assign.dig("invalid_fragment", "evidence", 0, "freshness_state") == "stale"
+
+raw_secret = invalid_by_id.fetch("raw-secret-storage-permitted")
+fail!("raw secret expected failure drifted") unless raw_secret.fetch("expected_failure") == "raw_secret_storage_must_stay_forbidden"
+fail!("raw secret reason drifted") unless raw_secret.fetch("reason_codes").include?("planner.raw_secret_storage_forbidden")
+fail!("raw secret marker drifted") unless raw_secret.dig("invalid_fragment", "missing_forbidden_action") == "raw_secret_storage"
+fail!("raw secret forbidden list should omit raw_secret_storage") if raw_secret.dig("invalid_fragment", "forbidden_actions").include?("raw_secret_storage")
+
+toon_width = invalid_by_id.fetch("toon-row-width-mismatch")
+fail!("toon width expected failure drifted") unless toon_width.fetch("expected_failure") == "toon_rows_must_match_declared_columns"
+fail!("toon width reason drifted") unless toon_width.fetch("reason_codes").include?("toon.row_width_mismatch")
+toon_columns = toon_width.dig("invalid_fragment", "toon_projection", "columns")
+toon_rows = toon_width.dig("invalid_fragment", "toon_projection", "rows")
+fail!("toon width fragment drifted") unless toon_rows.any? { |row| row.length != toon_columns.length }
 
 recommendations_seen = Set.new
 reasons_seen = Set.new
@@ -302,16 +380,19 @@ end
 ].each do |needle|
   fail!("doc missing #{needle}") unless doc.include?(needle)
 end
+REQUIRED_INVALID_CASES.each do |needle|
+  fail!("doc missing invalid case #{needle}") unless doc.include?(needle)
+end
 
 fail!("provenance missing schema row") unless provenance.include?("ft-provider-quota-assignment.json")
 fail!("provenance missing verifier") unless provenance.include?("test_provider_quota_assignment_contract.sh")
 
-puts "provider quota assignment contract: static verifier passed (#{cases.length} cases, #{recommendations_seen.length} recommendations)"
+puts "provider quota assignment contract: static verifier passed (#{cases.length} cases, #{recommendations_seen.length} recommendations, #{invalid_cases.length} invalid cases)"
 RUBY
 
 if rg -n --hidden --glob '!*.md' \
   '(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|Bearer [A-Za-z0-9._-]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
-  "${FIXTURES}" >/tmp/ft-provider-quota-assignment-secret-scan.txt; then
+  "${FIXTURES}" "${INVALID_FIXTURES}" >/tmp/ft-provider-quota-assignment-secret-scan.txt; then
   cat /tmp/ft-provider-quota-assignment-secret-scan.txt >&2
   fail "secret-shaped strings found in provider quota assignment fixtures"
 fi

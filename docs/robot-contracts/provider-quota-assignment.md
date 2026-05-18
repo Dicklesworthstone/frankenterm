@@ -91,3 +91,22 @@ secret-shaped string scan. It uses only shell, `jq`, and Ruby.
 
 Any future Rust implementation or compiled conformance proof must run through
 RCH. Local Cargo output is not accepted as proof for this surface.
+
+## Negative Fixtures
+
+The retained negative fragment corpus lives at
+`fixtures/mission-planner/provider-quota-assignment/invalid/fragments.v1.json`.
+It is parseable JSON that the static verifier must reject by contract shape
+rather than by syntax. The required cases are:
+
+- `provider-api-call-permitted`
+- `credential-mutation-permitted`
+- `hidden-spend-decision-permitted`
+- `assign-with-stale-evidence`
+- `raw-secret-storage-permitted`
+- `toon-row-width-mismatch`
+
+These fragments prove that the provider quota assignment contract stays
+fail-closed for provider calls, credential mutation, hidden spend decisions,
+assignment from stale evidence, raw secret storage, and malformed TOON
+projections.
