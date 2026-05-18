@@ -54,6 +54,16 @@ pub(crate) fn reset_lock_metadata_parse_drop_count_for_test() {
     LOCK_METADATA_PARSE_DROP_COUNT.store(0, AtomicOrdering::Relaxed);
 }
 
+#[cfg(test)]
+static LOCK_METADATA_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn lock_metadata_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    LOCK_METADATA_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 #[inline]
 fn record_lock_metadata_parse_drop() {
     LOCK_METADATA_PARSE_DROP_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
@@ -273,18 +283,14 @@ fn metadata_path(lock_path: &Path) -> PathBuf {
 }
 
 /// Read metadata from an existing lock to provide a helpful error message.
-#[allow(clippy::option_if_let_else)]
 fn read_existing_lock_error(lock_path: &Path) -> LockError {
     let meta_path = metadata_path(lock_path);
-    match fs::read_to_string(&meta_path) {
-        Ok(contents) => match serde_json::from_str::<LockMetadata>(&contents) {
-            Ok(meta) => LockError::AlreadyRunning {
-                pid: meta.pid,
-                started_at: meta.started_at_human,
-            },
-            Err(_) => LockError::AlreadyRunningNoMeta,
+    match read_lock_metadata(&meta_path) {
+        Some(meta) => LockError::AlreadyRunning {
+            pid: meta.pid,
+            started_at: meta.started_at_human,
         },
-        Err(_) => LockError::AlreadyRunningNoMeta,
+        None => LockError::AlreadyRunningNoMeta,
     }
 }
 
@@ -487,6 +493,8 @@ mod tests {
 
     #[test]
     fn read_existing_lock_error_with_corrupt_meta() {
+        let _counter_guard = lock_metadata_counter_test_lock();
+        reset_lock_metadata_parse_drop_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("test.lock");
         let meta_path = metadata_path(&lock_path);
@@ -497,10 +505,13 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
+        assert_eq!(lock_metadata_parse_drop_count(), 1);
     }
 
     #[test]
     fn read_existing_lock_error_no_meta_file() {
+        let _counter_guard = lock_metadata_counter_test_lock();
+        reset_lock_metadata_parse_drop_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("test.lock");
 
@@ -508,6 +519,7 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
+        assert_eq!(lock_metadata_parse_drop_count(), 1);
     }
 
     #[test]
@@ -761,6 +773,8 @@ mod tests {
 
     #[test]
     fn read_existing_lock_error_empty_meta_file() {
+        let _counter_guard = lock_metadata_counter_test_lock();
+        reset_lock_metadata_parse_drop_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("empty.lock");
         let meta_path = metadata_path(&lock_path);
@@ -771,10 +785,13 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
+        assert_eq!(lock_metadata_parse_drop_count(), 1);
     }
 
     #[test]
     fn read_existing_lock_error_partial_json() {
+        let _counter_guard = lock_metadata_counter_test_lock();
+        reset_lock_metadata_parse_drop_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("partial.lock");
         let meta_path = metadata_path(&lock_path);
@@ -785,6 +802,7 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
+        assert_eq!(lock_metadata_parse_drop_count(), 1);
     }
 
     #[test]
@@ -823,15 +841,10 @@ mod tests {
 #[cfg(test)]
 mod metadata_parse_drop_tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
     use tempfile::TempDir;
 
-    static METADATA_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock() -> MutexGuard<'static, ()> {
-        METADATA_DROP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        lock_metadata_counter_test_lock()
     }
 
     fn well_formed_metadata() -> LockMetadata {
