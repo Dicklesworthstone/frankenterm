@@ -750,7 +750,10 @@ impl WaylandWindowInner {
     }
 
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
-        let wayland_conn = Connection::get().unwrap().wayland();
+        let Some(connection) = Connection::get() else {
+            bail!("cannot enable OpenGL: Wayland connection unavailable");
+        };
+        let wayland_conn = connection.wayland();
         let mut wegl_surface = None;
 
         log::trace!("Enable opengl");
