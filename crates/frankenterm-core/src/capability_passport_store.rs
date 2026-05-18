@@ -29,7 +29,7 @@
 //! state by itself.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -94,29 +94,25 @@ impl PassportStore {
     /// before insert if validation is required.
     pub fn insert(&self, passport: CapabilityPassport) -> Option<CapabilityPassport> {
         let key = PassportKey::from(&passport);
-        let Ok(mut inner) = self.inner.write() else {
-            return None;
-        };
-        inner.insert(key, passport)
+        self.write_inner().insert(key, passport)
     }
 
     /// Get a snapshot clone of the passport at `key`, if present.
     #[must_use]
     pub fn get(&self, key: &PassportKey) -> Option<CapabilityPassport> {
-        let inner = self.inner.read().ok()?;
+        let inner = self.read_inner();
         inner.get(key).cloned()
     }
 
     /// Remove the passport at `key`, returning it if present.
     pub fn remove(&self, key: &PassportKey) -> Option<CapabilityPassport> {
-        let mut inner = self.inner.write().ok()?;
-        inner.remove(key)
+        self.write_inner().remove(key)
     }
 
     /// Number of passports currently held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.read().map(|i| i.len()).unwrap_or(0)
+        self.read_inner().len()
     }
 
     /// True iff the store holds no passports.
@@ -129,19 +125,35 @@ impl PassportStore {
     /// iteration without holding the read lock.
     #[must_use]
     pub fn keys(&self) -> Vec<PassportKey> {
-        self.inner
-            .read()
-            .map(|i| i.keys().cloned().collect())
-            .unwrap_or_default()
+        self.read_inner().keys().cloned().collect()
     }
 
     /// Snapshot of all passports currently held. Allocates `O(N)`.
     #[must_use]
     pub fn snapshot(&self) -> Vec<CapabilityPassport> {
-        self.inner
-            .read()
-            .map(|i| i.values().cloned().collect())
-            .unwrap_or_default()
+        self.read_inner().values().cloned().collect()
+    }
+
+    fn read_inner(&self) -> RwLockReadGuard<'_, HashMap<PassportKey, CapabilityPassport>> {
+        match self.inner.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.inner.clear_poison();
+                guard
+            }
+        }
+    }
+
+    fn write_inner(&self) -> RwLockWriteGuard<'_, HashMap<PassportKey, CapabilityPassport>> {
+        match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.inner.clear_poison();
+                guard
+            }
+        }
     }
 }
 
@@ -416,6 +428,24 @@ mod tests {
         let s2 = s1.clone();
         s1.insert(make_passport("cc1", Some(9), 1));
         assert_eq!(s2.len(), 1, "Arc<RwLock<...>> shares state across clones");
+    }
+
+    #[test]
+    fn store_recovers_after_poisoned_write_lock() {
+        let store = PassportStore::new();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.inner.write().expect("initial write lock");
+            panic!("poison passport store");
+        }));
+        assert!(poisoned.is_err());
+        assert!(store.inner.is_poisoned());
+
+        let p = make_passport("cc1", Some(42), 1);
+        assert!(store.insert(p.clone()).is_none());
+
+        assert!(!store.inner.is_poisoned());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(&PassportKey::pane("cc1", 42)), Some(p));
     }
 
     // ── PassportValidator ──────────────────────────────────────────────────
