@@ -71,9 +71,8 @@
 //!   property-based but not full Loom state-space; that's the
 //!   `BR-RC-FOUNDATION.G8.2` cross-link.
 
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +154,23 @@ impl<T: Send + Sync + 'static> TripleBuffer<T> {
         }
     }
 
+    fn lock_slot(&self, slot_index: u8) -> MutexGuard<'_, Arc<T>> {
+        let slot = &self.slots[slot_index as usize];
+        match slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    slot_index,
+                    reason_code = "triple_buffer.slot_lock_poisoned",
+                    "recovering poisoned triple-buffer slot"
+                );
+                let guard = poisoned.into_inner();
+                slot.clear_poison();
+                guard
+            }
+        }
+    }
+
     /// Publish a new value. Never blocks; if the reader hasn't
     /// caught up since the last `publish`, increments
     /// `writer_overruns_total` and overwrites the oldest unread
@@ -207,9 +223,7 @@ impl<T: Send + Sync + 'static> TripleBuffer<T> {
             // Write the new Arc into the writer slot (under its
             // mutex; nanoseconds).
             {
-                let mut slot = self.slots[w as usize]
-                    .lock()
-                    .expect("triple-buffer slot poisoned");
+                let mut slot = self.lock_slot(w);
                 *slot = Arc::clone(&arc);
             }
 
@@ -248,9 +262,7 @@ impl<T: Send + Sync + 'static> TripleBuffer<T> {
                 // No new data since the last acquire — return the
                 // current reader slot's snapshot.
                 self.acquires_total.fetch_add(1, Ordering::Relaxed);
-                let slot = self.slots[r as usize]
-                    .lock()
-                    .expect("triple-buffer slot poisoned");
+                let slot = self.lock_slot(r);
                 return Arc::clone(&slot);
             }
             // Swap reader ↔ presented; clear dirty.
@@ -261,9 +273,7 @@ impl<T: Send + Sync + 'static> TripleBuffer<T> {
                 .is_ok()
             {
                 self.acquires_total.fetch_add(1, Ordering::Relaxed);
-                let slot = self.slots[p as usize]
-                    .lock()
-                    .expect("triple-buffer slot poisoned");
+                let slot = self.lock_slot(p);
                 return Arc::clone(&slot);
             }
         }
@@ -493,6 +503,15 @@ pub fn parse_events_jsonl(jsonl: &str) -> Result<Vec<TripleBufferEvent>, serde_j
 mod tests {
     use super::*;
 
+    fn poison_slot<T: Send + Sync + 'static>(tb: &TripleBuffer<T>, slot_index: u8) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tb.slots[slot_index as usize].lock().unwrap();
+            panic!("poison triple-buffer slot for regression coverage");
+        }));
+        assert!(result.is_err());
+        assert!(tb.slots[slot_index as usize].is_poisoned());
+    }
+
     #[test]
     fn pack_unpack_roundtrip() {
         for w in 0..3u8 {
@@ -536,6 +555,41 @@ mod tests {
         let outcome = tb.publish(2);
         assert!(!outcome.overrun);
         let snap = tb.acquire();
+        assert_eq!(*snap, 2);
+    }
+
+    #[test]
+    fn publish_recovers_poisoned_writer_slot() {
+        let tb: TripleBuffer<u32> = TripleBuffer::new(1);
+        poison_slot(&tb, 0);
+
+        let outcome = tb.publish(2);
+
+        assert!(!outcome.overrun);
+        assert!(!tb.slots[0].is_poisoned());
+        assert_eq!(*tb.acquire(), 2);
+    }
+
+    #[test]
+    fn acquire_recovers_poisoned_clean_reader_slot() {
+        let tb: TripleBuffer<u32> = TripleBuffer::new(42);
+        poison_slot(&tb, 2);
+
+        let snap = tb.acquire();
+
+        assert!(!tb.slots[2].is_poisoned());
+        assert_eq!(*snap, 42);
+    }
+
+    #[test]
+    fn acquire_recovers_poisoned_dirty_presented_slot() {
+        let tb: TripleBuffer<u32> = TripleBuffer::new(1);
+        tb.publish(2);
+        poison_slot(&tb, 0);
+
+        let snap = tb.acquire();
+
+        assert!(!tb.slots[0].is_poisoned());
         assert_eq!(*snap, 2);
     }
 
