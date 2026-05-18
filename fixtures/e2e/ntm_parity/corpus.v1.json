@@ -13,7 +13,7 @@
       "ft_command": "ft robot --format json state",
       "success_assertions": [
         { "path": "$.ok", "op": "eq", "value": true },
-        { "path": "$.data.panes", "op": "is_array" }
+        { "path": "$.data", "op": "is_array" }
       ],
       "failure_assertions": [],
       "artifact_key": "state_snapshot"

@@ -200,7 +200,7 @@ robot_state() {
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    pane_id="$(printf '%s' "$out" | jq -r '.data.panes[0].pane_id // empty')"
+    pane_id="$(printf '%s' "$out" | jq -r 'if (.data | type) == "array" then (.data[0].pane_id // empty) else (.data.panes[0].pane_id // empty) end')"
   else
     pane_id="$(printf '%s' "$out" | sed -n 's/.*"pane_id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
   fi

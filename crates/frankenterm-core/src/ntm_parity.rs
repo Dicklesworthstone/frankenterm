@@ -703,7 +703,7 @@ mod tests {
                     value: Some(json!(true)),
                 },
                 NtmParityAssertion {
-                    path: "$.data.panes".to_string(),
+                    path: "$.data".to_string(),
                     op: NtmParityAssertionOp::IsArray,
                     value: None,
                 },
@@ -731,7 +731,7 @@ mod tests {
         let scenario = sample_scenario();
         let output = sample_output(json!({
             "ok": true,
-            "data": { "panes": [] }
+            "data": []
         }));
 
         let result = evaluate_scenario(

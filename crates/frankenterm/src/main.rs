@@ -19846,13 +19846,15 @@ async fn resolve_ntm_parity_pane_id(
     let value: serde_json::Value = serde_json::from_str(payload).map_err(|err| {
         anyhow::anyhow!("failed to parse `ft robot state` while resolving pane id: {err}")
     })?;
-    let panes = value
-        .get("data")
-        .and_then(|data| data.get("panes"))
-        .and_then(serde_json::Value::as_array)
+    let data = value.get("data").ok_or_else(|| {
+        anyhow::anyhow!("failed to auto-resolve pane id for parity run: missing `data` field")
+    })?;
+    let panes = data
+        .as_array()
+        .or_else(|| data.get("panes").and_then(serde_json::Value::as_array))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "failed to auto-resolve pane id for parity run: missing `data.panes` array"
+                "failed to auto-resolve pane id for parity run: `data` is neither a pane array nor an object with a `panes` array"
             )
         })?;
     let pane_id = panes
