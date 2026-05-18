@@ -442,7 +442,10 @@ impl WindowOps for WaylandWindow {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
         promise::spawn::spawn(async move {
-            if let Some(handle) = Connection::get().unwrap().wayland().window_by_id(window) {
+            let Some(conn) = Connection::get() else {
+                bail!("cannot enable OpenGL: Wayland connection unavailable");
+            };
+            if let Some(handle) = conn.wayland().window_by_id(window) {
                 let mut inner = handle.borrow_mut();
                 inner.enable_opengl()
             } else {
