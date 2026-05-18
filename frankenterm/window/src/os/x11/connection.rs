@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use x11::xlib;
 use xcb::x::Atom;
 use xcb::{dri2, Raw, Xid};
@@ -460,6 +460,16 @@ fn compute_default_dpi(xrm: &HashMap<String, String>, xsettings: &XSettingsMap) 
     }
 }
 
+fn lock_window_inner<'a>(
+    window: &'a Arc<Mutex<XWindowInner>>,
+    context: &str,
+) -> MutexGuard<'a, XWindowInner> {
+    window.lock().unwrap_or_else(|poisoned| {
+        log::warn!("recovering poisoned X11 window lock while {context}");
+        poisoned.into_inner()
+    })
+}
+
 impl XConnection {
     pub(crate) fn update_xrm(&self) {
         match read_xsettings(
@@ -531,7 +541,7 @@ impl XConnection {
 
     pub(crate) fn advise_of_appearance_change(&self, appearance: crate::Appearance) {
         for win in self.windows.borrow().values() {
-            win.lock().unwrap().appearance_changed(appearance);
+            lock_window_inner(win, "applying appearance change").appearance_changed(appearance);
         }
     }
 
@@ -638,7 +648,7 @@ impl XConnection {
             if let Some((mods, leds)) = self.keyboard.process_xkb_event(&self.conn, event)? {
                 // route changed state to the window with focus
                 for window in self.windows.borrow().values() {
-                    let mut window = window.lock().unwrap();
+                    let mut window = lock_window_inner(window, "routing XKB modifier update");
                     if window.has_focus == Some(true) {
                         window
                             .events
@@ -664,7 +674,7 @@ impl XConnection {
 
     fn dispatch_pending_events(&self) -> anyhow::Result<()> {
         for window in self.windows.borrow().values() {
-            let mut inner = window.lock().unwrap();
+            let mut inner = lock_window_inner(window, "dispatching pending X11 events");
             inner.dispatch_pending_events()?;
         }
 
@@ -677,11 +687,11 @@ impl XConnection {
         event: &xcb::Event,
     ) -> anyhow::Result<()> {
         if let Some(window) = self.window_by_id(window_id) {
-            let mut inner = window.lock().unwrap();
+            let mut inner = lock_window_inner(&window, "dispatching X11 window event");
             inner.dispatch_event(event)?;
         } else if let Some(parent_id) = self.parent_id_by_child_id(window_id) {
             if let Some(window) = self.window_by_id(parent_id) {
-                let mut inner = window.lock().unwrap();
+                let mut inner = lock_window_inner(&window, "dispatching child X11 window event");
                 inner.dispatch_event(event)?;
             }
         }
@@ -914,7 +924,7 @@ impl XConnection {
                 .borrow_mut()
                 .set_commit_string_cb(move |window_id, input| {
                     if let Some(window) = conn.window_by_id(window_id) {
-                        let mut inner = window.lock().unwrap();
+                        let mut inner = lock_window_inner(&window, "dispatching X11 IME text");
                         inner.dispatch_ime_text(input);
                     }
                 });
@@ -926,7 +936,8 @@ impl XConnection {
                 .borrow_mut()
                 .set_preedit_draw_cb(move |window_id, info| {
                     if let Some(window) = conn.window_by_id(window_id) {
-                        let mut inner = window.lock().unwrap();
+                        let mut inner =
+                            lock_window_inner(&window, "dispatching X11 IME preedit draw");
 
                         let text = info.text();
                         let status = DeadKeyStatus::Composing(text);
@@ -941,7 +952,8 @@ impl XConnection {
                 .borrow_mut()
                 .set_preedit_done_cb(move |window_id| {
                     if let Some(window) = conn.window_by_id(window_id) {
-                        let mut inner = window.lock().unwrap();
+                        let mut inner =
+                            lock_window_inner(&window, "dispatching X11 IME preedit done");
                         inner.dispatch_ime_compose_status(DeadKeyStatus::None);
                     }
                 });
@@ -1037,8 +1049,13 @@ impl XConnection {
         let (mut prom, future) = new_window_op_promise();
 
         promise::spawn::spawn_into_main_thread(async move {
-            if let Some(handle) = Connection::get().unwrap().x11().window_by_id(window) {
-                let mut inner = handle.lock().unwrap();
+            let Some(connection) = Connection::get() else {
+                prom.err(anyhow!("X11 connection is unavailable"));
+                return;
+            };
+
+            if let Some(handle) = connection.x11().window_by_id(window) {
+                let mut inner = lock_window_inner(&handle, "running X11 window operation");
                 if inner.window_id != window {
                     fail_window_op_for_destroyed_window(&mut prom, "X11", window.resource_id());
                 } else {
