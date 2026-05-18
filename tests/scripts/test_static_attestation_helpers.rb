@@ -1,0 +1,111 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "stringio"
+
+root = File.expand_path("../..", __dir__)
+ENV["FRANKENTERM_REPO_ROOT"] = root
+
+require_relative "static_attestation_helpers"
+
+def check(name)
+  yield
+  puts "ok - #{name}"
+rescue StandardError => error
+  warn "not ok - #{name}: #{error.class}: #{error.message}"
+  raise
+end
+
+def expect_failure
+  yield
+rescue StaticAttestation::Failure
+  return true
+end
+
+StaticAttestation.configure(log_io: StringIO.new, log_enabled: true)
+
+check("repo-relative path guard rejects absolute and parent traversal") do
+  StaticAttestation.repo_relative_path!("docs/security/passive-watch-attestation.json")
+  raise "absolute path passed" unless expect_failure { StaticAttestation.repo_relative_path!("/tmp/nope") }
+  raise "parent traversal passed" unless expect_failure { StaticAttestation.repo_relative_path!("docs/../secret") }
+end
+
+check("multi-word expected strings remain whole strings") do
+  terms = StaticAttestation.expected_strings(
+    "Zero outbound mutating IPC",
+    "Zero non-capture storage",
+  )
+  raise "expected two whole phrases" unless terms == ["Zero outbound mutating IPC", "Zero non-capture storage"]
+  raise "split words falsely satisfied the phrase" unless expect_failure do
+    StaticAttestation.require_terms!(
+      "Zero\noutbound\nmutating\nIPC\nZero\nnon-capture\nstorage\n",
+      ["Zero outbound mutating IPC"],
+      source: "inline-regression",
+    )
+  end
+end
+
+check("structured logs contain check input expected actual status and reason") do
+  log_io = StringIO.new
+  StaticAttestation.configure(log_io: log_io, log_enabled: true)
+  StaticAttestation.require_terms!(
+    "alpha beta",
+    ["alpha beta"],
+    source: "inline-log-source",
+    check: "log_shape",
+  )
+  record = JSON.parse(log_io.string.lines.last)
+  %w[check input_path expected actual status].each do |field|
+    raise "missing log field #{field}" unless record.key?(field)
+  end
+  raise "unexpected check" unless record["check"] == "log_shape"
+  raise "unexpected expected" unless record["expected"] == "alpha beta"
+  raise "unexpected status" unless record["status"] == "pass"
+end
+
+check("passive-watch source documents and multi-word audit phrases are preserved") do
+  attestation = StaticAttestation.read_json!("docs/security/passive-watch-attestation.json")
+  StaticAttestation.require_source_documents!(attestation.fetch("source_documents"))
+  StaticAttestation.require_file_terms!(
+    "docs/security/passive-watch-attestation.md",
+    [
+      "Zero outbound mutating IPC",
+      "Zero non-capture storage",
+      "cargo-fuzz target",
+      "docs/security/passive-watch-attestation.json",
+    ],
+  )
+end
+
+check("passive-watch seed corpus names and byte sizes match the attestation") do
+  attestation = StaticAttestation.read_json!("docs/security/passive-watch-attestation.json")
+  seed_section = attestation.fetch("seed_corpus")
+  summary = StaticAttestation.require_seed_corpus!(
+    "fuzz/corpus/passive_watch_invariant",
+    seeds: seed_section.fetch("seeds"),
+  )
+  raise "seed count drifted" unless summary.fetch(:seed_count) == seed_section.fetch("seed_count")
+  raise "total bytes drifted" unless summary.fetch(:total_bytes) == seed_section.fetch("total_bytes")
+end
+
+check("direct-exec script helper pins shebang executable bit and strict mode") do
+  StaticAttestation.require_direct_exec_script!("tests/e2e/test_passive_watch_attestation_manifest.sh")
+end
+
+check("shell helper exposes the expected sourceable API") do
+  shell_helper = StaticAttestation.read_text!("tests/scripts/static_attestation_helpers.sh")
+  StaticAttestation.require_terms!(
+    shell_helper,
+    [
+      "static_attestation_require_command",
+      "static_attestation_require_file",
+      "static_attestation_require_repo_relative_path",
+      "static_attestation_require_executable_script",
+      "static_attestation_run_ruby",
+    ],
+    source: "tests/scripts/static_attestation_helpers.sh",
+  )
+end
+
+puts "static-attestation helpers: self-test passed"
