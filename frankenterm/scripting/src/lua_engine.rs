@@ -11,7 +11,7 @@ use mlua::{FromLua, Lua};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 struct LuaEngineState {
     lua: Option<Lua>,
@@ -60,6 +60,16 @@ impl LuaEngine {
             state: Mutex::new(state),
         }
     }
+
+    fn state_guard(&self) -> MutexGuard<'_, LuaEngineState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.state.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
 }
 
 impl ScriptingEngine for LuaEngine {
@@ -86,20 +96,14 @@ impl ScriptingEngine for LuaEngine {
             .context("Config::check_consistency")?;
         let cfg = cfg.compute_extra_defaults(Some(path));
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("lua engine state lock poisoned"))?;
+        let mut state = self.state_guard();
         state.lua = Some(lua);
 
         Ok(cfg.to_dynamic())
     }
 
     fn register_hook(&self, event: &str, handler: HookHandler) -> Result<HookId> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("lua engine state lock poisoned"))?;
+        let mut state = self.state_guard();
         let hook_id = state.next_hook_id;
         state.next_hook_id = state.next_hook_id.saturating_add(1);
         state.hooks.insert(hook_id, (event.to_string(), handler));
@@ -107,28 +111,23 @@ impl ScriptingEngine for LuaEngine {
     }
 
     fn unregister_hook(&self, id: HookId) -> Result<()> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow!("lua engine state lock poisoned"))?
-            .hooks
-            .remove(&id);
+        self.state_guard().hooks.remove(&id);
         Ok(())
     }
 
     fn fire_event(&self, event: &str, payload: &Value) -> Result<Vec<Action>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("lua engine state lock poisoned"))?;
-
-        let mut handlers = state
-            .hooks
-            .values()
-            .filter(|(registered_event, handler)| {
-                registered_event == event && handler.matches_event(event)
-            })
-            .map(|(_, handler)| handler.clone())
-            .collect::<Vec<_>>();
+        let (mut handlers, lua) = {
+            let state = self.state_guard();
+            let handlers = state
+                .hooks
+                .values()
+                .filter(|(registered_event, handler)| {
+                    registered_event == event && handler.matches_event(event)
+                })
+                .map(|(_, handler)| handler.clone())
+                .collect::<Vec<_>>();
+            (handlers, state.lua.clone())
+        };
         handlers.sort_by_key(|handler| handler.priority);
 
         let mut actions = Vec::new();
@@ -137,7 +136,7 @@ impl ScriptingEngine for LuaEngine {
             actions.append(&mut from_handler);
         }
 
-        if let Some(lua) = state.lua.as_ref() {
+        if let Some(lua) = lua.as_ref() {
             let lua_payload = dynamic_to_lua_value(lua, payload.clone())
                 .context("converting fire_event payload to lua value")?;
             let result = emit_sync_callback(lua, (event.to_string(), (lua_payload,)))
@@ -171,10 +170,7 @@ impl ScriptingEngine for LuaEngine {
         let source = fs::read_to_string(&path)
             .with_context(|| format!("failed to read extension script {}", path.display()))?;
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("lua engine state lock poisoned"))?;
+        let mut state = self.state_guard();
         if state.lua.is_none() {
             state.lua =
                 Some(make_lua_context(&path).with_context(|| {
@@ -200,12 +196,7 @@ impl ScriptingEngine for LuaEngine {
     }
 
     fn unload_extension(&self, id: ExtensionId) -> Result<()> {
-        let removed = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("lua engine state lock poisoned"))?
-            .extensions
-            .remove(&id);
+        let removed = self.state_guard().extensions.remove(&id);
         if removed.is_none() {
             bail!("unknown extension id {id}");
         }
@@ -308,6 +299,63 @@ mod tests {
     }
 
     #[test]
+    fn state_recovers_after_poisoned_hook_lifecycle() {
+        let engine = LuaEngine::new();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.state.lock().unwrap();
+            panic!("poison Lua engine state");
+        }));
+        assert!(poison_result.is_err());
+        assert!(engine.state.is_poisoned());
+
+        let hook_id = engine
+            .register_hook(
+                "evt",
+                HookHandler::new(0, Some("evt".to_string()), |_event, _payload| {
+                    Ok(vec![Action::Custom {
+                        name: "recovered".to_string(),
+                        payload: Value::Bool(true),
+                    }])
+                }),
+            )
+            .unwrap();
+        assert!(!engine.state.is_poisoned());
+
+        let actions = engine.fire_event("evt", &Value::Null).unwrap();
+        assert_eq!(actions.len(), 1);
+
+        engine.unregister_hook(hook_id).unwrap();
+        let actions_after_unreg = engine.fire_event("evt", &Value::Null).unwrap();
+        assert!(actions_after_unreg.is_empty());
+    }
+
+    #[test]
+    fn fire_event_drops_state_lock_before_calling_handlers() {
+        let engine = std::sync::Arc::new(LuaEngine::new());
+        let engine_for_handler = std::sync::Arc::clone(&engine);
+
+        engine
+            .register_hook(
+                "evt",
+                HookHandler::new(0, Some("evt".to_string()), move |_event, _payload| {
+                    let _guard = engine_for_handler
+                        .state
+                        .try_lock()
+                        .expect("fire_event must not hold engine state while invoking handlers");
+                    Ok(vec![Action::Custom {
+                        name: "unlocked".to_string(),
+                        payload: Value::Null,
+                    }])
+                }),
+            )
+            .unwrap();
+
+        let actions = engine.fire_event("evt", &Value::Null).unwrap();
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
     fn eval_config_loads_fixture_config() {
         let engine = LuaEngine::new();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -367,6 +415,34 @@ wezterm.on('extension-event', function() end)
             .unwrap();
 
         assert_eq!(extension_id, 1);
+        engine.unload_extension(extension_id).unwrap();
+    }
+
+    #[test]
+    fn state_recovers_after_poisoned_extension_lifecycle() {
+        let tempdir = tempdir().unwrap();
+        let script_path = tempdir.path().join("extension.lua");
+        std::fs::write(&script_path, "local recovered = true").unwrap();
+
+        let engine = LuaEngine::new();
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.state.lock().unwrap();
+            panic!("poison Lua engine state");
+        }));
+        assert!(poison_result.is_err());
+        assert!(engine.state.is_poisoned());
+
+        let extension_id = engine
+            .load_extension(&ExtensionManifest {
+                id: "lua-ext".to_string(),
+                version: "0.1.0".to_string(),
+                entrypoint: Some(script_path.to_string_lossy().into_owned()),
+                metadata: Value::Null,
+            })
+            .unwrap();
+        assert!(!engine.state.is_poisoned());
+        assert_eq!(extension_id, 1);
+
         engine.unload_extension(extension_id).unwrap();
     }
 
