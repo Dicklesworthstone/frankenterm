@@ -26,6 +26,8 @@ source "${ROOT_DIR}/tests/scripts/static_attestation_helpers.sh"
 
 record_command "ruby static E2E shell script contract verifier"
 static_attestation_run_ruby - "${STRUCTURED_LOG}" "${SUMMARY_FILE}" "${ROOT_DIR}" <<'RUBY'
+require "open3"
+
 structured_log_path = ARGV.fetch(0)
 summary_path = ARGV.fetch(1)
 root = ARGV.fetch(2)
@@ -81,6 +83,118 @@ begin
     input_path: "README.md",
     expected: "#{scripts.length} shell E2E scripts",
     actual: readme.include?("# #{scripts.length} shell E2E scripts") ? "present" : "missing",
+  )
+
+  counts_snapshot_path = "docs/attestations/doctrine/agents-md-counts.json"
+  counts_snapshot = StaticAttestation.read_json!(
+    counts_snapshot_path,
+    check: "e2e_script_contract.agents_md_counts.snapshot_json",
+  )
+  StaticAttestation.assert!(
+    counts_snapshot.dig("source", "count_source") == "head",
+    "agents-md-counts snapshot must be generated from committed HEAD",
+    check: "e2e_script_contract.agents_md_counts.source_mode",
+    input_path: counts_snapshot_path,
+    expected: "head",
+    actual: counts_snapshot.dig("source", "count_source"),
+  )
+
+  e2e_count_entry = counts_snapshot.fetch("counts", []).find { |entry| entry["name"] == "e2e_scripts" }
+  StaticAttestation.assert!(
+    !e2e_count_entry.nil?,
+    "agents-md-counts snapshot missing e2e_scripts entry",
+    check: "e2e_script_contract.agents_md_counts.e2e_entry_present",
+    input_path: counts_snapshot_path,
+    expected: "e2e_scripts",
+    actual: counts_snapshot.fetch("counts", []).map { |entry| entry["name"] },
+  )
+  readme_e2e_doc = e2e_count_entry.fetch("documents", []).find do |document|
+    document["path"] == "README.md" && document["placeholder_present"] == true
+  end
+  StaticAttestation.assert!(
+    !readme_e2e_doc.nil?,
+    "agents-md-counts snapshot missing README e2e_scripts document entry",
+    check: "e2e_script_contract.agents_md_counts.e2e_readme_entry_present",
+    input_path: counts_snapshot_path,
+    expected: "README.md",
+    actual: e2e_count_entry.fetch("documents", []).map { |document| document["path"] },
+  )
+  StaticAttestation.assert!(
+    e2e_count_entry.fetch("live_value") == scripts.length,
+    "agents-md-counts E2E script value is stale",
+    check: "e2e_script_contract.agents_md_counts.e2e_value",
+    input_path: counts_snapshot_path,
+    expected: scripts.length,
+    actual: e2e_count_entry.fetch("live_value"),
+  )
+  StaticAttestation.assert!(
+    readme_e2e_doc.fetch("documented_value") == scripts.length,
+    "agents-md-counts E2E documented value is stale",
+    check: "e2e_script_contract.agents_md_counts.e2e_documented_value",
+    input_path: counts_snapshot_path,
+    expected: scripts.length,
+    actual: readme_e2e_doc.fetch("documented_value"),
+  )
+  StaticAttestation.assert!(
+    readme_e2e_doc.fetch("live_value") == scripts.length,
+    "agents-md-counts README E2E live value is stale",
+    check: "e2e_script_contract.agents_md_counts.e2e_readme_live_value",
+    input_path: counts_snapshot_path,
+    expected: scripts.length,
+    actual: readme_e2e_doc.fetch("live_value"),
+  )
+  StaticAttestation.assert!(
+    e2e_count_entry.fetch("command").include?("git ls-tree -r --name-only HEAD tests/e2e"),
+    "agents-md-counts E2E command must read committed HEAD",
+    check: "e2e_script_contract.agents_md_counts.e2e_head_command",
+    input_path: counts_snapshot_path,
+    expected: "git ls-tree -r --name-only HEAD tests/e2e",
+    actual: e2e_count_entry.fetch("command"),
+  )
+
+  generated_stdout, generated_stderr, generated_status = Open3.capture3(
+    "bash",
+    "scripts/stamp-readme-counts.sh",
+    "--source=head",
+    "--json",
+    chdir: root,
+  )
+  StaticAttestation.assert!(
+    generated_status.success?,
+    "failed to generate head-sourced agents-md-counts snapshot",
+    check: "e2e_script_contract.agents_md_counts.generate_head_snapshot",
+    input_path: "scripts/stamp-readme-counts.sh",
+    expected: "success",
+    actual: {
+      "exitstatus" => generated_status.exitstatus,
+      "stderr" => generated_stderr,
+    },
+  )
+  begin
+    generated_snapshot = JSON.parse(generated_stdout)
+  rescue JSON::ParserError => error
+    StaticAttestation.fail!(
+      "generated head-sourced agents-md-counts snapshot is not valid JSON",
+      check: "e2e_script_contract.agents_md_counts.generated_json",
+      input_path: "scripts/stamp-readme-counts.sh",
+      expected: "valid_json",
+      actual: error.message,
+    )
+  end
+  normalize_counts_snapshot = lambda do |payload|
+    normalized = JSON.parse(JSON.generate(payload))
+    normalized.delete("generated_at")
+    normalized
+  end
+  normalized_counts_snapshot = normalize_counts_snapshot.call(counts_snapshot)
+  normalized_generated_snapshot = normalize_counts_snapshot.call(generated_snapshot)
+  StaticAttestation.assert!(
+    normalized_counts_snapshot == normalized_generated_snapshot,
+    "checked-in agents-md-counts snapshot drifted from head-sourced generator output",
+    check: "e2e_script_contract.agents_md_counts.normalized_snapshot",
+    input_path: counts_snapshot_path,
+    expected: Digest::SHA256.hexdigest(JSON.generate(normalized_generated_snapshot)),
+    actual: Digest::SHA256.hexdigest(JSON.generate(normalized_counts_snapshot)),
   )
 
   unknown_exceptions = exceptions.keys - scripts
@@ -177,6 +291,8 @@ begin
     "scenario_id" => "e2e_shell_script_contract",
     "status" => "passed",
     "script_count" => scripts.length,
+    "agents_md_counts_snapshot_checked" => true,
+    "agents_md_counts_source" => counts_snapshot.dig("source", "count_source"),
     "shebang_checked_count" => scripts.length,
     "direct_exec_required_count" => direct_exec_required,
     "direct_exec_exception_count" => direct_exec_exceptions,
