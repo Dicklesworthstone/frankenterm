@@ -188,8 +188,10 @@ impl CursorInfo {
         }
     }
 
-    fn conn(&self) -> Rc<XConnection> {
-        self.conn.upgrade().expect("XConnection to be alive")
+    fn conn(&self) -> anyhow::Result<Rc<XConnection>> {
+        self.conn
+            .upgrade()
+            .context("XConnection is unavailable for cursor update")
     }
 
     pub fn set_cursor(
@@ -201,7 +203,7 @@ impl CursorInfo {
             return Ok(());
         }
 
-        let conn = self.conn();
+        let conn = self.conn()?;
 
         let cursor_id = match self.cursors.get(&cursor) {
             Some(cursor) => cursor.id,
@@ -258,11 +260,15 @@ impl CursorInfo {
 
         conn.send_request(&xcb::x::FreeGc { gc });
 
+        let pict_format_id = self
+            .pict_format_id
+            .context("missing ARGB32 X render pictformat for blank cursor")?;
+
         let pic = conn.generate_id();
         conn.send_request_no_reply(&xcb::render::CreatePicture {
             pid: pic,
             drawable: xcb::x::Drawable::Pixmap(pixmap),
-            format: self.pict_format_id.unwrap(),
+            format: pict_format_id,
             value_list: &[],
         })
         .context("create_picture")?;
@@ -594,11 +600,15 @@ impl CursorInfo {
 
         conn.send_request_no_reply(&xcb::x::FreeGc { gc })?;
 
+        let pict_format_id = self
+            .pict_format_id
+            .context("missing ARGB32 X render pictformat for themed cursor")?;
+
         let pic = conn.generate_id();
         conn.send_request_no_reply(&xcb::render::CreatePicture {
             pid: pic,
             drawable: xcb::x::Drawable::Pixmap(pixmap),
-            format: self.pict_format_id.unwrap(),
+            format: pict_format_id,
             value_list: &[],
         })
         .context("create_picture")?;
