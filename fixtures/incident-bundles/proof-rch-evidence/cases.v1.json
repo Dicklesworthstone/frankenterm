@@ -1,0 +1,329 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.incident_bundle.proof_rch_evidence.fixtures.v1",
+  "producing_bead": "ft-ig6bv",
+  "related_bead": "ft-zh4t3",
+  "purpose": "Static golden fixture corpus for the incident-bundle proof_rch_evidence source before the blocked Rust collector can close with RCH proof.",
+  "golden_confidence": {
+    "artifact_kind": "structural_json_golden",
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 3,
+    "strategy": "Structural validation with scrubbed worker ids, target dirs, run ids, and artifact paths."
+  },
+  "source_policy": {
+    "launches_new_proof_allowed": false,
+    "mutates_rch_allowed": false,
+    "worker_mutation_allowed": false,
+    "build_cancellation_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "sync_chatter_counts_as_proof": false,
+    "queue_chatter_counts_as_proof": false,
+    "setup_chatter_counts_as_proof": false,
+    "remote_artifact_required_for_pass": true,
+    "destructive_cleanup_allowed": false
+  },
+  "required_cases": [
+    "passed-remote-proof",
+    "no-admissible-workers",
+    "local-fallback-rejected",
+    "transport-failure",
+    "missing-artifact"
+  ],
+  "cases": [
+    {
+      "case_id": "passed-remote-proof",
+      "title": "Remote material proof passed with retained artifacts",
+      "source_name": "proof_rch_evidence",
+      "source_surface": "retained_rch_artifact_index",
+      "allowed_source_commands": [
+        "read retained RCH summary artifact",
+        "read retained proof ledger entry",
+        "read artifact manifest"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": []
+      },
+      "proof": {
+        "verdict": "passed",
+        "reason_category": "result",
+        "material_command_reached": true,
+        "remote_cargo_reached": true,
+        "remote_test_binary_reached": true,
+        "local_cargo_detected": false,
+        "local_fallback_detected": false,
+        "sync_chatter_only": false,
+        "queue_chatter_only": false,
+        "setup_chatter_only": false,
+        "launches_new_proof": false,
+        "artifact_posture": "retained",
+        "artifact_paths": [
+          "tests/e2e/artifacts/[RUN]/summary.json",
+          "tests/e2e/artifacts/[RUN]/rch.log"
+        ],
+        "reason_codes": [
+          "rch.remote_cargo_reached",
+          "rch.material_command_passed",
+          "rch.artifact_retained"
+        ]
+      },
+      "safe_next_action": "record_passed_remote_proof_artifacts",
+      "forbidden_actions": [
+        "run new cargo",
+        "run local cargo as proof",
+        "restart rch",
+        "mutate rch worker",
+        "cancel build",
+        "delete files",
+        "count sync chatter as proof"
+      ]
+    },
+    {
+      "case_id": "no-admissible-workers",
+      "title": "RCH selected no worker before Cargo",
+      "source_name": "proof_rch_evidence",
+      "source_surface": "retained_rch_attempt_metadata",
+      "allowed_source_commands": [
+        "read retained RCH summary artifact",
+        "read retained proof ledger entry",
+        "read artifact manifest"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "proof-rch.no-admissible-workers"
+        ]
+      },
+      "proof": {
+        "verdict": "blocked",
+        "reason_category": "no_worker",
+        "material_command_reached": false,
+        "remote_cargo_reached": false,
+        "remote_test_binary_reached": false,
+        "local_cargo_detected": false,
+        "local_fallback_detected": false,
+        "sync_chatter_only": false,
+        "queue_chatter_only": false,
+        "setup_chatter_only": false,
+        "launches_new_proof": false,
+        "artifact_posture": "attempt_metadata_only",
+        "artifact_paths": [
+          "tests/e2e/artifacts/[RUN]/rch-preflight.json"
+        ],
+        "reason_codes": [
+          "rch.no_admissible_workers",
+          "rch.remote_cargo_reached_false",
+          "rch.local_fallback_refused"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "proof-rch.no-admissible-workers",
+          "severity": "high",
+          "reason_code": "rch.no_admissible_workers",
+          "message": "Worker selection failed before Cargo; this is proof-substrate evidence, not source proof."
+        }
+      ],
+      "safe_next_action": "record_rch_worker_selection_blocker",
+      "forbidden_actions": [
+        "run new cargo",
+        "run local cargo as proof",
+        "restart rch",
+        "mutate rch worker",
+        "cancel build",
+        "delete files",
+        "count sync chatter as proof"
+      ]
+    },
+    {
+      "case_id": "local-fallback-rejected",
+      "title": "Remote-required local fallback was refused",
+      "source_name": "proof_rch_evidence",
+      "source_surface": "retained_rch_attempt_metadata",
+      "allowed_source_commands": [
+        "read retained RCH summary artifact",
+        "read retained proof ledger entry",
+        "read artifact manifest"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "mixed",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "proof-rch.local-fallback-rejected"
+        ]
+      },
+      "proof": {
+        "verdict": "blocked",
+        "reason_category": "local_fallback",
+        "material_command_reached": false,
+        "remote_cargo_reached": false,
+        "remote_test_binary_reached": false,
+        "local_cargo_detected": false,
+        "local_fallback_detected": true,
+        "sync_chatter_only": false,
+        "queue_chatter_only": false,
+        "setup_chatter_only": false,
+        "launches_new_proof": false,
+        "artifact_posture": "attempt_metadata_only",
+        "artifact_paths": [
+          "tests/e2e/artifacts/[RUN]/rch-local-fallback-refused.log"
+        ],
+        "reason_codes": [
+          "rch.remote_required",
+          "rch.local_fallback_refused",
+          "rch.remote_cargo_reached_false"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "proof-rch.local-fallback-rejected",
+          "severity": "high",
+          "reason_code": "rch.local_fallback_refused",
+          "message": "Local fallback was refused in remote-required mode; no local Cargo output may be counted as proof."
+        }
+      ],
+      "safe_next_action": "record_remote_required_fallback_refusal",
+      "forbidden_actions": [
+        "run new cargo",
+        "run local cargo as proof",
+        "restart rch",
+        "mutate rch worker",
+        "cancel build",
+        "delete files",
+        "count sync chatter as proof"
+      ]
+    },
+    {
+      "case_id": "transport-failure",
+      "title": "Transport failed before material command result",
+      "source_name": "proof_rch_evidence",
+      "source_surface": "retained_rch_attempt_metadata",
+      "allowed_source_commands": [
+        "read retained RCH summary artifact",
+        "read retained proof ledger entry",
+        "read artifact manifest"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "mixed",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "proof-rch.transport-failure"
+        ]
+      },
+      "proof": {
+        "verdict": "blocked",
+        "reason_category": "transport",
+        "material_command_reached": false,
+        "remote_cargo_reached": false,
+        "remote_test_binary_reached": false,
+        "local_cargo_detected": false,
+        "local_fallback_detected": false,
+        "sync_chatter_only": true,
+        "queue_chatter_only": false,
+        "setup_chatter_only": true,
+        "launches_new_proof": false,
+        "artifact_posture": "partial_attempt_metadata",
+        "artifact_paths": [
+          "tests/e2e/artifacts/[RUN]/rch-transport.log"
+        ],
+        "reason_codes": [
+          "rch.transport_failed",
+          "rch.setup_chatter_not_proof",
+          "rch.remote_cargo_reached_false"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "proof-rch.transport-failure",
+          "severity": "high",
+          "reason_code": "rch.transport_failed",
+          "message": "Transport or wrapper failure happened before material command completion; sync/setup chatter is not source proof."
+        }
+      ],
+      "safe_next_action": "record_transport_failure_without_source_verdict",
+      "forbidden_actions": [
+        "run new cargo",
+        "run local cargo as proof",
+        "restart rch",
+        "mutate rch worker",
+        "cancel build",
+        "delete files",
+        "count sync chatter as proof"
+      ]
+    },
+    {
+      "case_id": "missing-artifact",
+      "title": "Material command result lacks retained artifact",
+      "source_name": "proof_rch_evidence",
+      "source_surface": "retained_rch_artifact_index",
+      "allowed_source_commands": [
+        "read retained RCH summary artifact",
+        "read retained proof ledger entry",
+        "read artifact manifest"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "stale",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "proof-rch.missing-artifact"
+        ]
+      },
+      "proof": {
+        "verdict": "blocked",
+        "reason_category": "missing_artifact",
+        "material_command_reached": true,
+        "remote_cargo_reached": true,
+        "remote_test_binary_reached": true,
+        "local_cargo_detected": false,
+        "local_fallback_detected": false,
+        "sync_chatter_only": false,
+        "queue_chatter_only": false,
+        "setup_chatter_only": false,
+        "launches_new_proof": false,
+        "artifact_posture": "missing_required_artifact",
+        "artifact_paths": [],
+        "reason_codes": [
+          "rch.material_command_reached",
+          "rch.required_artifact_missing",
+          "rch.proof_not_retainable"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "proof-rch.missing-artifact",
+          "severity": "medium",
+          "reason_code": "rch.required_artifact_missing",
+          "message": "The material command may have run, but the required retained artifact is missing, so the proof cannot be cited."
+        }
+      ],
+      "safe_next_action": "record_missing_required_proof_artifact",
+      "forbidden_actions": [
+        "run new cargo",
+        "run local cargo as proof",
+        "restart rch",
+        "mutate rch worker",
+        "cancel build",
+        "delete files",
+        "count sync chatter as proof"
+      ]
+    }
+  ]
+}
