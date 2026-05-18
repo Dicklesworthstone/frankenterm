@@ -13,7 +13,7 @@ use std::path::Path;
 #[cfg(feature = "async-asupersync")]
 use std::pin::Pin;
 #[cfg(feature = "async-asupersync")]
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 #[cfg(feature = "async-asupersync")]
 use std::task::{Context, Poll, Waker};
 #[cfg(feature = "async-asupersync")]
@@ -109,6 +109,19 @@ fn fallback_rewake_loop(rx: mpsc::Receiver<Waker>) {
         waker.wake();
         while let Ok(waker) = rx.try_recv() {
             waker.wake();
+        }
+    }
+}
+
+#[cfg(feature = "async-asupersync")]
+fn lock_registration_mutex(
+    registration: &Mutex<Option<IoRegistration>>,
+) -> MutexGuard<'_, Option<IoRegistration>> {
+    match registration.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            registration.clear_poison();
+            poisoned.into_inner()
         }
     }
 }
@@ -268,12 +281,8 @@ impl UnixStream {
     }
 
     #[cfg(feature = "async-asupersync")]
-    fn lock_registration(
-        &self,
-    ) -> std::io::Result<std::sync::MutexGuard<'_, Option<IoRegistration>>> {
-        self.registration
-            .lock()
-            .map_err(|_| std::io::Error::other("async registration lock poisoned"))
+    fn lock_registration(&self) -> MutexGuard<'_, Option<IoRegistration>> {
+        lock_registration_mutex(&self.registration)
     }
 
     #[cfg(feature = "async-asupersync")]
@@ -290,7 +299,7 @@ impl UnixStream {
     fn register_interest(&self, cx: &Context<'_>, interest: Interest) -> std::io::Result<()> {
         self.inner.set_nonblocking(true)?;
 
-        let mut registration = self.lock_registration()?;
+        let mut registration = self.lock_registration();
         if let Some(existing) = registration.as_mut() {
             match existing.rearm(interest, cx.waker()) {
                 Ok(true) => return Ok(()),
@@ -620,6 +629,27 @@ mod tests {
             .build()
             .expect("failed to build frankenterm-uds asupersync runtime")
             .block_on(future)
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn registration_lock_recovers_after_poison() {
+        let registration = Mutex::new(None::<IoRegistration>);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registration.lock().unwrap();
+            panic!("simulate UDS registration lock poison");
+        }));
+
+        assert!(poisoned.is_err());
+        assert!(registration.is_poisoned());
+
+        {
+            let guard = lock_registration_mutex(&registration);
+            assert!(guard.is_none());
+        }
+
+        assert!(!registration.is_poisoned());
     }
 
     #[cfg(feature = "async-asupersync")]
