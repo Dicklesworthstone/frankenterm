@@ -1,0 +1,419 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.incident_bundle.tailer_capture_health.fixtures.v1",
+  "producing_bead": "ft-6y66m",
+  "related_bead": "ft-4ta2y",
+  "purpose": "Static golden fixture corpus for the incident-bundle tailer_capture_health source before the blocked Rust collector can close with RCH proof.",
+  "golden_confidence": {
+    "artifact_kind": "structural_json_golden",
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 3,
+    "strategy": "Structural validation with scrubbed timestamps, pane ids, scheduler counters, and capture lag measurements."
+  },
+  "source_policy": {
+    "read_only_source_required": true,
+    "starts_capture_allowed": false,
+    "mutates_runtime_allowed": false,
+    "mutates_rch_allowed": false,
+    "service_restart_allowed": false,
+    "destructive_cleanup_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "unavailable_counts_as_green": false,
+    "stale_counts_as_green": false,
+    "synthetic_green_health_allowed": false
+  },
+  "required_cases": [
+    "healthy-measured",
+    "warning-bearing",
+    "stale-lagging",
+    "unavailable-snapshot"
+  ],
+  "cases": [
+    {
+      "case_id": "healthy-measured",
+      "title": "Fresh measured tailer and scheduler health",
+      "source_name": "tailer_capture_health",
+      "source_surface": "StreamingHealth::get_global + HealthSnapshot.scheduler",
+      "allowed_source_commands": [
+        "read StreamingHealth::get_global",
+        "read HealthSnapshot.scheduler",
+        "read retained tailer_capture_health artifact"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "none",
+        "privacy_tier": "metadata_only",
+        "warning_ids": []
+      },
+      "capture": {
+        "status": "healthy",
+        "evidence_state": "measured",
+        "freshness": {
+          "generated_at_ms": 181000,
+          "max_age_ms": 30000,
+          "age_ms": 420,
+          "fresh": true
+        },
+        "streaming_health": {
+          "mode": "Streaming",
+          "events_processed": 18421,
+          "dirty_ranges_total": 921,
+          "dirty_rows_total": 4219,
+          "gaps_emitted": 0,
+          "fallback_count": 0,
+          "active_panes": 24
+        },
+        "scheduler": {
+          "budget_active": true,
+          "max_captures_per_sec": 120,
+          "max_bytes_per_sec": 10485760,
+          "captures_remaining": 82,
+          "bytes_remaining": 8388608,
+          "total_rate_limited": 0,
+          "total_byte_budget_exceeded": 0,
+          "total_throttle_events": 0,
+          "tracked_panes": 24,
+          "pane_rows_total": 24,
+          "pane_rows_truncated": false,
+          "panes": [
+            {
+              "pane_id": "[PANE_ID]",
+              "priority": 50,
+              "tier": "Interactive",
+              "mode": "Polling",
+              "stale": false,
+              "last_successful_capture_age_ms": 280,
+              "last_poll_age_ms": 260,
+              "current_interval_ms": 1000,
+              "last_reason_code": "Selected",
+              "selection_opportunities": 43,
+              "selected_count": 43,
+              "skipped_count": 0,
+              "consecutive_backpressure": 0,
+              "overflow_gap_pending": false,
+              "starvation_warning": "None"
+            }
+          ],
+          "tiers": [
+            {
+              "tier": "Interactive",
+              "selection_opportunities": 43,
+              "selected_count": 43,
+              "skipped_count": 0
+            }
+          ]
+        },
+        "lag_counters": {
+          "max_capture_lag_ms": 420,
+          "stale_pane_count": 0,
+          "gap_events_total": 0,
+          "scheduler_tick_age_ms": 260
+        },
+        "reason_codes": [
+          "tailer_capture_health.ok",
+          "tailer_capture_health.fresh"
+        ]
+      },
+      "safe_next_action": "record_tailer_capture_health_measured",
+      "forbidden_actions": [
+        "delete files",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "start capture",
+        "synthesize green capture health",
+        "treat stale capture as healthy"
+      ]
+    },
+    {
+      "case_id": "warning-bearing",
+      "title": "Measured health includes gaps and fallback warnings",
+      "source_name": "tailer_capture_health",
+      "source_surface": "StreamingHealth::get_global + HealthSnapshot.scheduler",
+      "allowed_source_commands": [
+        "read StreamingHealth::get_global",
+        "read HealthSnapshot.scheduler",
+        "read retained tailer_capture_health artifact"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "mixed",
+        "mutates_state": false,
+        "redaction": "none",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "tailer-capture-health.gaps-emitted",
+          "tailer-capture-health.polling-fallback"
+        ]
+      },
+      "capture": {
+        "status": "warning",
+        "evidence_state": "mixed",
+        "freshness": {
+          "generated_at_ms": 182000,
+          "max_age_ms": 30000,
+          "age_ms": 1300,
+          "fresh": true
+        },
+        "streaming_health": {
+          "mode": "Streaming",
+          "events_processed": 15009,
+          "dirty_ranges_total": 811,
+          "dirty_rows_total": 3100,
+          "gaps_emitted": 3,
+          "fallback_count": 2,
+          "active_panes": 17
+        },
+        "scheduler": {
+          "budget_active": true,
+          "max_captures_per_sec": 120,
+          "max_bytes_per_sec": 10485760,
+          "captures_remaining": 28,
+          "bytes_remaining": 3145728,
+          "total_rate_limited": 4,
+          "total_byte_budget_exceeded": 1,
+          "total_throttle_events": 5,
+          "tracked_panes": 17,
+          "pane_rows_total": 17,
+          "pane_rows_truncated": false,
+          "panes": [
+            {
+              "pane_id": "[PANE_ID]",
+              "priority": 100,
+              "tier": "Background",
+              "mode": "Polling",
+              "stale": false,
+              "last_successful_capture_age_ms": 1250,
+              "last_poll_age_ms": 900,
+              "current_interval_ms": 1000,
+              "last_reason_code": "SendBackpressure",
+              "selection_opportunities": 31,
+              "selected_count": 27,
+              "skipped_count": 4,
+              "consecutive_backpressure": 2,
+              "overflow_gap_pending": false,
+              "starvation_warning": "None"
+            }
+          ],
+          "tiers": [
+            {
+              "tier": "Background",
+              "selection_opportunities": 31,
+              "selected_count": 27,
+              "skipped_count": 4
+            }
+          ]
+        },
+        "lag_counters": {
+          "max_capture_lag_ms": 1550,
+          "stale_pane_count": 0,
+          "gap_events_total": 3,
+          "scheduler_tick_age_ms": 900
+        },
+        "reason_codes": [
+          "tailer_capture_health.gaps_emitted",
+          "tailer_capture_health.polling_fallback"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "tailer-capture-health.gaps-emitted",
+          "severity": "medium",
+          "reason_code": "tailer_capture_health.gaps_emitted",
+          "message": "Streaming bridge emitted capture gaps during the sampled window."
+        },
+        {
+          "id": "tailer-capture-health.polling-fallback",
+          "severity": "medium",
+          "reason_code": "tailer_capture_health.polling_fallback",
+          "message": "Streaming bridge fell back to polling, so evidence is mixed."
+        }
+      ],
+      "safe_next_action": "record_tailer_capture_health_warning",
+      "forbidden_actions": [
+        "delete files",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "start capture",
+        "synthesize green capture health",
+        "treat stale capture as healthy"
+      ]
+    },
+    {
+      "case_id": "stale-lagging",
+      "title": "Scheduler reports stale pane capture lag",
+      "source_name": "tailer_capture_health",
+      "source_surface": "StreamingHealth::get_global + HealthSnapshot.scheduler",
+      "allowed_source_commands": [
+        "read StreamingHealth::get_global",
+        "read HealthSnapshot.scheduler",
+        "read retained tailer_capture_health artifact"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "stale",
+        "mutates_state": false,
+        "redaction": "none",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "tailer-capture-health.stale-capture"
+        ]
+      },
+      "capture": {
+        "status": "stale",
+        "evidence_state": "stale",
+        "freshness": {
+          "generated_at_ms": 180000,
+          "max_age_ms": 30000,
+          "age_ms": 65000,
+          "fresh": false
+        },
+        "streaming_health": {
+          "mode": "Polling",
+          "events_processed": 4200,
+          "dirty_ranges_total": 220,
+          "dirty_rows_total": 930,
+          "gaps_emitted": 9,
+          "fallback_count": 8,
+          "active_panes": 31
+        },
+        "scheduler": {
+          "budget_active": true,
+          "max_captures_per_sec": 80,
+          "max_bytes_per_sec": 4194304,
+          "captures_remaining": 0,
+          "bytes_remaining": 0,
+          "total_rate_limited": 191,
+          "total_byte_budget_exceeded": 34,
+          "total_throttle_events": 225,
+          "tracked_panes": 31,
+          "pane_rows_total": 31,
+          "pane_rows_truncated": true,
+          "panes": [
+            {
+              "pane_id": "[PANE_ID]",
+              "priority": 100,
+              "tier": "Background",
+              "mode": "Polling",
+              "stale": true,
+              "last_successful_capture_age_ms": 65000,
+              "last_poll_age_ms": 64000,
+              "current_interval_ms": 1000,
+              "last_reason_code": "GlobalCaptureBudgetExhausted",
+              "selection_opportunities": 120,
+              "selected_count": 7,
+              "skipped_count": 113,
+              "consecutive_backpressure": 6,
+              "overflow_gap_pending": true,
+              "starvation_warning": "BenchmarkTargetMissed"
+            }
+          ],
+          "tiers": [
+            {
+              "tier": "Background",
+              "selection_opportunities": 120,
+              "selected_count": 7,
+              "skipped_count": 113
+            }
+          ]
+        },
+        "lag_counters": {
+          "max_capture_lag_ms": 65000,
+          "stale_pane_count": 4,
+          "gap_events_total": 9,
+          "scheduler_tick_age_ms": 64000
+        },
+        "reason_codes": [
+          "tailer_capture_health.stale_capture",
+          "tailer_capture_health.scheduler_budget_exhausted"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "tailer-capture-health.stale-capture",
+          "severity": "high",
+          "reason_code": "tailer_capture_health.stale_capture",
+          "message": "One or more pane capture rows exceeded the freshness budget."
+        }
+      ],
+      "safe_next_action": "record_tailer_capture_health_stale",
+      "forbidden_actions": [
+        "delete files",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "start capture",
+        "synthesize green capture health",
+        "treat stale capture as healthy"
+      ]
+    },
+    {
+      "case_id": "unavailable-snapshot",
+      "title": "No streaming or scheduler snapshot was published",
+      "source_name": "tailer_capture_health",
+      "source_surface": "StreamingHealth::get_global + HealthSnapshot.scheduler",
+      "allowed_source_commands": [
+        "read StreamingHealth::get_global",
+        "read HealthSnapshot.scheduler",
+        "read retained tailer_capture_health artifact"
+      ],
+      "bundle_entry": {
+        "status": "unavailable",
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "redaction": "not_applicable",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "tailer-capture-health.snapshot-unavailable"
+        ]
+      },
+      "capture": {
+        "status": "unavailable",
+        "evidence_state": "unavailable",
+        "freshness": {
+          "generated_at_ms": null,
+          "max_age_ms": 30000,
+          "age_ms": null,
+          "fresh": false
+        },
+        "streaming_health": null,
+        "scheduler": null,
+        "lag_counters": {
+          "max_capture_lag_ms": null,
+          "stale_pane_count": 0,
+          "gap_events_total": null,
+          "scheduler_tick_age_ms": null
+        },
+        "reason_codes": [
+          "tailer_capture_health.snapshot_unavailable"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "tailer-capture-health.snapshot-unavailable",
+          "severity": "high",
+          "reason_code": "tailer_capture_health.snapshot_unavailable",
+          "message": "No streaming tailer or scheduler health snapshot was available to the bundle collector."
+        }
+      ],
+      "safe_next_action": "record_tailer_capture_health_unavailable",
+      "forbidden_actions": [
+        "delete files",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "start capture",
+        "synthesize green capture health",
+        "treat stale capture as healthy"
+      ]
+    }
+  ]
+}
