@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_approval.v1",
+  "generated_at_ms": 1770003600000,
+  "approval_id": "live-use-unknown",
+  "source_bead": "ft-5xwsu.2",
+  "evidence_contract_id": "ft.rch_worker_pressure.inventory.v1",
+  "evidence_artifact_path": "artifacts/rch-worker-pressure/20260518T030000Z/live-use-unknown-inventory.json",
+  "evidence_artifact_sha256": "4545454545454545454545454545454545454545454545454545454545454545",
+  "approval_decision": "live_use_unknown",
+  "destructive_recovery_allowed": false,
+  "explicit_human_approval_required": true,
+  "approval_record": {
+    "approver_identity": "operator:jemanuel",
+    "approval_reference": "approval://ft-5xwsu.2/live-use-unknown",
+    "approved_at_ms": 1770000000000,
+    "expires_at_ms": 1770007200000,
+    "approval_scope": "Approval held pending live-use classification.",
+    "approval_text_sha256": "5656565656565656565656565656565656565656565656565656565656565656"
+  },
+  "requested_path_set_sha256": "6767676767676767676767676767676767676767676767676767676767676767",
+  "approved_path_set_sha256": "6767676767676767676767676767676767676767676767676767676767676767",
+  "requested_paths": [
+    {
+      "path": "/tmp/rch-target/frankenterm/live-use-unknown",
+      "path_sha256": "7878787878787878787878787878787878787878787878787878787878787878",
+      "requested_operation": "move_to_quarantine",
+      "classification": "live_use_unknown",
+      "live_use_state": "unknown",
+      "inventory_evidence_path": "artifacts/rch-worker-pressure/20260518T030000Z/live-use-unknown-du.json",
+      "inventory_evidence_sha256": "8989898989898989898989898989898989898989898989898989898989898989",
+      "approval_match": "exact",
+      "protected_reason": "unknown_live_use",
+      "notes": [
+        "The retained scan cannot prove the path is not in use by an active RCH build."
+      ]
+    }
+  ],
+  "allowed_operations": [],
+  "forbidden_operations": [
+    "delete_unlisted_path",
+    "wildcard_path_expansion",
+    "rm_rf_parent",
+    "protected_path_cleanup",
+    "live_unknown_cleanup",
+    "stale_evidence_cleanup",
+    "missing_hash_cleanup",
+    "expired_approval_cleanup",
+    "restart_agent_mail",
+    "repair_agent_mail_db",
+    "restart_rch_daemon",
+    "mutate_worker_mirror",
+    "cancel_build",
+    "run_local_cargo_as_proof",
+    "destructive_git",
+    "proceed_without_human_approval"
+  ],
+  "protected_path_policy": {
+    "fail_closed": true,
+    "exact_path_match_required": true,
+    "hash_required": true,
+    "approval_expiration_required": true,
+    "live_use_unknown_action": "deny",
+    "protected_globs": [
+      "/Users/jemanuel/projects/frankenterm/**",
+      "/Users/jemanuel/projects/frankenterm/.git/**",
+      "/Users/jemanuel/projects/frankenterm/crates/frankenterm-core/**",
+      "/var/run/**",
+      "/private/tmp/agent-mail/**",
+      "/tmp/am-*/**"
+    ],
+    "allowed_source_evidence": [
+      "retained_inventory_artifact",
+      "explicit_human_approval",
+      "post_action_rch_admission_proof"
+    ]
+  },
+  "expiration": {
+    "checked_at_ms": 1770003600000,
+    "expires_at_ms": 1770007200000,
+    "expired": false,
+    "max_age_ms": 7200000
+  },
+  "rollback_or_restore_notes": [
+    "Collect fresh read-only live-use evidence before requesting a new approval."
+  ],
+  "post_action_verification": {
+    "required": true,
+    "remote_required_rch": true,
+    "commands": [
+      "RCH_REQUIRE_REMOTE=1 rch exec --no-self-healing -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core output_gate --lib -- --nocapture"
+    ],
+    "evidence_required": [
+      "fresh live-use status",
+      "exact approved path-set hash",
+      "br dep cycles --json"
+    ],
+    "beads_to_update": [
+      "ft-5xwsu.3",
+      "ft-4tp7g"
+    ]
+  },
+  "review_notes": [
+    "Unknown live-use state fails closed even with matching approval and evidence hash."
+  ]
+}

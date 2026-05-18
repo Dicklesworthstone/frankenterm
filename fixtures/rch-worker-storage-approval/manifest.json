@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_approval.fixture_manifest.v1",
+  "bead": "ft-5xwsu.2",
+  "schema": "docs/json-schema/ft-rch-worker-storage-approval.json",
+  "contract": "docs/robot-contracts/rch-worker-storage-approval.md",
+  "valid": [
+    "fixtures/rch-worker-storage-approval/valid/approved-candidate.json",
+    "fixtures/rch-worker-storage-approval/valid/expired-approval.json",
+    "fixtures/rch-worker-storage-approval/valid/path-mismatch.json",
+    "fixtures/rch-worker-storage-approval/valid/protected-path.json",
+    "fixtures/rch-worker-storage-approval/valid/missing-evidence-hash.json",
+    "fixtures/rch-worker-storage-approval/valid/live-use-unknown.json"
+  ],
+  "invalid": [],
+  "verification": [
+    "jq empty docs/json-schema/ft-rch-worker-storage-approval.json fixtures/rch-worker-storage-approval/manifest.json fixtures/rch-worker-storage-approval/valid/*.json",
+    "bash tests/e2e/test_rch_worker_storage_approval_contract.sh"
+  ]
+}

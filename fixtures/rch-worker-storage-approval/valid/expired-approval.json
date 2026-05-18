@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_approval.v1",
+  "generated_at_ms": 1770003600000,
+  "approval_id": "expired-approval",
+  "source_bead": "ft-5xwsu.2",
+  "evidence_contract_id": "ft.rch_worker_pressure.inventory.v1",
+  "evidence_artifact_path": "artifacts/rch-worker-pressure/20260518T000000Z/complete-inventory.json",
+  "evidence_artifact_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "approval_decision": "expired",
+  "destructive_recovery_allowed": false,
+  "explicit_human_approval_required": true,
+  "approval_record": {
+    "approver_identity": "operator:jemanuel",
+    "approval_reference": "approval://ft-5xwsu.2/expired-approval",
+    "approved_at_ms": 1769990000000,
+    "expires_at_ms": 1769993600000,
+    "approval_scope": "Expired retained target recovery request.",
+    "approval_text_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "requested_path_set_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "approved_path_set_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "requested_paths": [
+    {
+      "path": "/tmp/rch-target/frankenterm/expired-run",
+      "path_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "requested_operation": "move_to_quarantine",
+      "classification": "candidate",
+      "live_use_state": "inactive",
+      "inventory_evidence_path": "artifacts/rch-worker-pressure/20260518T000000Z/expired-run-du.json",
+      "inventory_evidence_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "approval_match": "exact",
+      "protected_reason": "none",
+      "notes": [
+        "Approval expired before the checked_at timestamp."
+      ]
+    }
+  ],
+  "allowed_operations": [],
+  "forbidden_operations": [
+    "delete_unlisted_path",
+    "wildcard_path_expansion",
+    "rm_rf_parent",
+    "protected_path_cleanup",
+    "live_unknown_cleanup",
+    "stale_evidence_cleanup",
+    "missing_hash_cleanup",
+    "expired_approval_cleanup",
+    "restart_agent_mail",
+    "repair_agent_mail_db",
+    "restart_rch_daemon",
+    "mutate_worker_mirror",
+    "cancel_build",
+    "run_local_cargo_as_proof",
+    "destructive_git",
+    "proceed_without_human_approval"
+  ],
+  "protected_path_policy": {
+    "fail_closed": true,
+    "exact_path_match_required": true,
+    "hash_required": true,
+    "approval_expiration_required": true,
+    "live_use_unknown_action": "deny",
+    "protected_globs": [
+      "/Users/jemanuel/projects/frankenterm/**",
+      "/Users/jemanuel/projects/frankenterm/.git/**",
+      "/Users/jemanuel/projects/frankenterm/crates/frankenterm-core/**",
+      "/var/run/**",
+      "/private/tmp/agent-mail/**",
+      "/tmp/am-*/**"
+    ],
+    "allowed_source_evidence": [
+      "retained_inventory_artifact",
+      "explicit_human_approval",
+      "post_action_rch_admission_proof"
+    ]
+  },
+  "expiration": {
+    "checked_at_ms": 1770003600000,
+    "expires_at_ms": 1769993600000,
+    "expired": true,
+    "max_age_ms": 7200000
+  },
+  "rollback_or_restore_notes": [
+    "Do not act on expired approval; request a new exact-path approval."
+  ],
+  "post_action_verification": {
+    "required": true,
+    "remote_required_rch": true,
+    "commands": [
+      "RCH_REQUIRE_REMOTE=1 rch exec --no-self-healing -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core output_gate --lib -- --nocapture"
+    ],
+    "evidence_required": [
+      "new approval reference",
+      "fresh retained inventory evidence",
+      "br dep cycles --json"
+    ],
+    "beads_to_update": [
+      "ft-5xwsu.3",
+      "ft-4tp7g"
+    ]
+  },
+  "review_notes": [
+    "Expired approvals fail closed even when the path and evidence hash match."
+  ]
+}

@@ -1,0 +1,471 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-rch-worker-storage-approval.json",
+  "title": "FrankenTerm RCH Worker Storage Approval",
+  "description": "Operator approval contract for any RCH worker storage recovery. Inventory evidence is not cleanup authority; this contract records the exact approved path set, allowed operation, expiration, rollback notes, and post-action verification gate.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "approval_id",
+    "source_bead",
+    "evidence_contract_id",
+    "evidence_artifact_path",
+    "evidence_artifact_sha256",
+    "approval_decision",
+    "destructive_recovery_allowed",
+    "explicit_human_approval_required",
+    "approval_record",
+    "requested_path_set_sha256",
+    "approved_path_set_sha256",
+    "requested_paths",
+    "allowed_operations",
+    "forbidden_operations",
+    "protected_path_policy",
+    "expiration",
+    "rollback_or_restore_notes",
+    "post_action_verification",
+    "review_notes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.rch_worker_storage_approval.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "approval_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_bead": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
+    },
+    "evidence_contract_id": {
+      "type": "string",
+      "enum": [
+        "ft.rch_worker_pressure.inventory.v1",
+        "ft.rch_worker_storage_inventory.v1"
+      ]
+    },
+    "evidence_artifact_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_artifact_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "approval_decision": {
+      "$ref": "#/$defs/approval_decision"
+    },
+    "destructive_recovery_allowed": {
+      "type": "boolean"
+    },
+    "explicit_human_approval_required": {
+      "type": "boolean",
+      "const": true
+    },
+    "approval_record": {
+      "$ref": "#/$defs/approval_record"
+    },
+    "requested_path_set_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "approved_path_set_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "requested_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/path_request"
+      }
+    },
+    "allowed_operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/recovery_operation"
+      },
+      "uniqueItems": true
+    },
+    "forbidden_operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_operation"
+      },
+      "uniqueItems": true
+    },
+    "protected_path_policy": {
+      "$ref": "#/$defs/protected_path_policy"
+    },
+    "expiration": {
+      "$ref": "#/$defs/expiration"
+    },
+    "rollback_or_restore_notes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "post_action_verification": {
+      "$ref": "#/$defs/post_action_verification"
+    },
+    "review_notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "approval_decision": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "expired",
+        "path_mismatch",
+        "protected_path",
+        "missing_evidence_hash",
+        "live_use_unknown",
+        "denied"
+      ]
+    },
+    "recovery_operation": {
+      "type": "string",
+      "enum": [
+        "move_to_quarantine",
+        "delete_file",
+        "delete_directory",
+        "clean_target_directory",
+        "no_op"
+      ]
+    },
+    "forbidden_operation": {
+      "type": "string",
+      "enum": [
+        "delete_unlisted_path",
+        "wildcard_path_expansion",
+        "rm_rf_parent",
+        "protected_path_cleanup",
+        "live_unknown_cleanup",
+        "stale_evidence_cleanup",
+        "missing_hash_cleanup",
+        "expired_approval_cleanup",
+        "restart_agent_mail",
+        "repair_agent_mail_db",
+        "restart_rch_daemon",
+        "mutate_worker_mirror",
+        "cancel_build",
+        "run_local_cargo_as_proof",
+        "destructive_git",
+        "proceed_without_human_approval"
+      ]
+    },
+    "path_classification": {
+      "type": "string",
+      "enum": [
+        "approved_candidate",
+        "candidate",
+        "protected_path",
+        "live_use_unknown",
+        "stale_evidence",
+        "path_mismatch",
+        "missing_evidence_hash"
+      ]
+    },
+    "live_use_state": {
+      "type": "string",
+      "enum": [
+        "inactive",
+        "active",
+        "unknown"
+      ]
+    },
+    "approval_match": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "mismatch",
+        "absent"
+      ]
+    },
+    "protected_reason": {
+      "type": "string",
+      "enum": [
+        "none",
+        "source_checkout",
+        "git_metadata",
+        "agent_mail_state",
+        "rch_daemon_state",
+        "active_build",
+        "unknown_live_use",
+        "protected_parent",
+        "missing_evidence"
+      ]
+    },
+    "approval_record": {
+      "type": "object",
+      "required": [
+        "approver_identity",
+        "approval_reference",
+        "approved_at_ms",
+        "expires_at_ms",
+        "approval_scope",
+        "approval_text_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "approver_identity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "approval_reference": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "approved_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "expires_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "approval_scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "approval_text_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "path_request": {
+      "type": "object",
+      "required": [
+        "path",
+        "path_sha256",
+        "requested_operation",
+        "classification",
+        "live_use_state",
+        "inventory_evidence_path",
+        "inventory_evidence_sha256",
+        "approval_match",
+        "protected_reason",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "requested_operation": {
+          "$ref": "#/$defs/recovery_operation"
+        },
+        "classification": {
+          "$ref": "#/$defs/path_classification"
+        },
+        "live_use_state": {
+          "$ref": "#/$defs/live_use_state"
+        },
+        "inventory_evidence_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inventory_evidence_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "approval_match": {
+          "$ref": "#/$defs/approval_match"
+        },
+        "protected_reason": {
+          "$ref": "#/$defs/protected_reason"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "protected_path_policy": {
+      "type": "object",
+      "required": [
+        "fail_closed",
+        "exact_path_match_required",
+        "hash_required",
+        "approval_expiration_required",
+        "live_use_unknown_action",
+        "protected_globs",
+        "allowed_source_evidence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fail_closed": {
+          "type": "boolean",
+          "const": true
+        },
+        "exact_path_match_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "hash_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "approval_expiration_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "live_use_unknown_action": {
+          "type": "string",
+          "const": "deny"
+        },
+        "protected_globs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "allowed_source_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "retained_inventory_artifact",
+              "explicit_human_approval",
+              "post_action_rch_admission_proof"
+            ]
+          }
+        }
+      }
+    },
+    "expiration": {
+      "type": "object",
+      "required": [
+        "checked_at_ms",
+        "expires_at_ms",
+        "expired",
+        "max_age_ms"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "checked_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expires_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "expired": {
+          "type": "boolean"
+        },
+        "max_age_ms": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "post_action_verification": {
+      "type": "object",
+      "required": [
+        "required",
+        "remote_required_rch",
+        "commands",
+        "evidence_required",
+        "beads_to_update"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "const": true
+        },
+        "remote_required_rch": {
+          "type": "boolean",
+          "const": true
+        },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "evidence_required": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "beads_to_update": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
+          }
+        }
+      }
+    }
+  }
+}
