@@ -78,3 +78,21 @@ When the demo runner later wires this contract into `ft demo`, validation
 failure should surface as a typed machine-readable error. It should not fall
 back to a marketing demo, ignore missing artifacts, or count local Cargo output
 as RCH proof.
+
+## Negative Fixtures
+
+The retained negative fragment corpus lives at
+`fixtures/demo-lab/invalid/manifest-fragments.v1.json`. It is parseable JSON
+that the static verifier must reject by contract shape rather than by syntax.
+The required cases are:
+
+- `unsupported-schema-version`
+- `absolute-scenario-path`
+- `parent-relative-artifact-path`
+- `missing-degradation-reason`
+- `duplicate-scenario-id`
+- `target-class-proof-overclaim`
+
+These fragments prove that the demo-lab contract stays fail-closed for version
+drift, path escape, incomplete degradation guidance, unstable scenario identity,
+and inflated production-capacity claims.

@@ -6,12 +6,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 MANIFEST="fixtures/demo-lab/manifest.v1.json"
+INVALID_FIXTURES="fixtures/demo-lab/invalid/manifest-fragments.v1.json"
 REQUIRED_SCENARIOS=(quickstart usage_limit compaction)
 REQUIRED_DEGRADATIONS=(
   "agent_mail_unavailable"
   "disabled_feature"
   "rch_proof_unavailable"
   "unsupported_platform"
+)
+REQUIRED_INVALID_CASES=(
+  "unsupported-schema-version"
+  "absolute-scenario-path"
+  "parent-relative-artifact-path"
+  "missing-degradation-reason"
+  "duplicate-scenario-id"
+  "target-class-proof-overclaim"
 )
 
 fail() {
@@ -44,12 +53,13 @@ require_command jq
 require_command ruby
 require_command shasum
 require_file "${MANIFEST}"
+require_file "${INVALID_FIXTURES}"
 
 mapfile -t scenario_paths < <(jq -r '.scenarios[].scenario_path' "${MANIFEST}")
 mapfile -t json_golden_paths < <(jq -r '.scenarios[].expected_artifacts[] | select(.kind == "golden_json") | .path' "${MANIFEST}")
 mapfile -t toon_golden_paths < <(jq -r '.scenarios[].expected_artifacts[] | select(.kind == "golden_toon") | .path' "${MANIFEST}")
 
-all_json=("${MANIFEST}" "${json_golden_paths[@]}")
+all_json=("${MANIFEST}" "${INVALID_FIXTURES}" "${json_golden_paths[@]}")
 for path in "${all_json[@]}" "${scenario_paths[@]}" "${toon_golden_paths[@]}"; do
   require_repo_relative_path "${path}"
 done
@@ -90,6 +100,61 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_SCENARIOS[@]}" | jq -R . |
     )
   )
 ' "${MANIFEST}" >/dev/null || fail "manifest top-level contract is incomplete"
+
+jq -e '
+  .schema_version == "ft.demo.scenario-manifest.invalid-fragments.v1"
+  and .contract_id == "ft.demo.scenario-manifest.invalid-fragments.v1"
+  and .manifest_path == "fixtures/demo-lab/manifest.v1.json"
+  and .contract_doc == "docs/demo-scenarios.md"
+  and .source_bead == "ft-lecbn.8"
+  and (.verification | index("bash tests/e2e/test_demo_lab_fixture_manifest.sh") != null)
+  and (.cases | length >= 6)
+  and all(.cases[];
+    (.case_id | type == "string" and length > 0)
+    and (.expected_failure | type == "string" and length > 0)
+    and (.reason_codes | type == "array" and length > 0)
+    and all(.reason_codes[]; type == "string" and contains("."))
+    and (.invalid_fragment | type == "object")
+  )
+' "${INVALID_FIXTURES}" >/dev/null || fail "invalid fixture metadata is incomplete"
+
+for case_id in "${REQUIRED_INVALID_CASES[@]}"; do
+  jq -e --arg case_id "${case_id}" '
+    any(.cases[]; .case_id == $case_id)
+  ' "${INVALID_FIXTURES}" >/dev/null || fail "missing invalid case ${case_id}"
+  [[ "$(cat docs/demo-scenarios.md)" == *"${case_id}"* ]] || fail "docs missing invalid case ${case_id}"
+done
+
+jq -e '
+  def case($id): .cases[] | select(.case_id == $id);
+
+  ([.cases[].case_id] | length == (unique | length))
+  and (case("unsupported-schema-version")
+    | .expected_failure == "unsupported_schema_version"
+    and (.reason_codes | index("demo.unsupported_schema_version") != null)
+    and .invalid_fragment.schema_version == "ft.demo.scenario-manifest.v2")
+  and (case("absolute-scenario-path")
+    | .expected_failure == "scenario_path_must_be_repo_relative"
+    and (.reason_codes | index("demo.absolute_path_forbidden") != null)
+    and (.invalid_fragment.scenario.scenario_path | startswith("/")))
+  and (case("parent-relative-artifact-path")
+    | .expected_failure == "artifact_path_must_not_escape_repo"
+    and (.reason_codes | index("demo.parent_relative_path_forbidden") != null)
+    and any(.invalid_fragment.expected_artifacts[]; (.path | contains("../") or startswith("../"))))
+  and (case("missing-degradation-reason")
+    | .expected_failure == "required_degradation_reason_missing"
+    and (.reason_codes | index("demo.required_degradation_missing") != null)
+    and .invalid_fragment.missing_reason == "rch_proof_unavailable"
+    and ([.invalid_fragment.scenario.degradation[].reason] | index("rch_proof_unavailable") == null))
+  and (case("duplicate-scenario-id")
+    | .expected_failure == "scenario_ids_must_be_unique"
+    and (.reason_codes | index("demo.duplicate_scenario_id") != null)
+    and ([.invalid_fragment.scenarios[].id] | length != (unique | length)))
+  and (case("target-class-proof-overclaim")
+    | .expected_failure == "proof_boundary_must_not_claim_target_class_capacity"
+    and (.reason_codes | index("demo.target_class_overclaim_forbidden") != null)
+    and (.invalid_fragment.proof_boundary | test("target-class|200\\+ panes|64-core|256 GiB"; "i")))
+' "${INVALID_FIXTURES}" >/dev/null || fail "invalid fixtures do not cover required fail-closed cases"
 
 for scenario_id in "${REQUIRED_SCENARIOS[@]}"; do
   scenario_path="$(jq -r --arg id "${scenario_id}" '.scenarios[] | select(.id == $id) | .scenario_path' "${MANIFEST}")"
@@ -179,5 +244,7 @@ if rg -n --hidden --glob '!*.md' \
   fail "secret-shaped strings found in demo-lab fixtures"
 fi
 
-printf 'demo-lab fixture manifest: static verifier passed (%d scenarios, %d json goldens, %d toon goldens)\n' \
-  "${#REQUIRED_SCENARIOS[@]}" "${#json_golden_paths[@]}" "${#toon_golden_paths[@]}"
+invalid_case_count="$(jq '.cases | length' "${INVALID_FIXTURES}")"
+
+printf 'demo-lab fixture manifest: static verifier passed (%d scenarios, %d json goldens, %d toon goldens, %d invalid cases)\n' \
+  "${#REQUIRED_SCENARIOS[@]}" "${#json_golden_paths[@]}" "${#toon_golden_paths[@]}" "${invalid_case_count}"

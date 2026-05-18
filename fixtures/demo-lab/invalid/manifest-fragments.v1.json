@@ -1,0 +1,104 @@
+{
+  "schema_version": "ft.demo.scenario-manifest.invalid-fragments.v1",
+  "contract_id": "ft.demo.scenario-manifest.invalid-fragments.v1",
+  "manifest_path": "fixtures/demo-lab/manifest.v1.json",
+  "contract_doc": "docs/demo-scenarios.md",
+  "source_bead": "ft-lecbn.8",
+  "verification": [
+    "jq empty fixtures/demo-lab/manifest.v1.json fixtures/demo-lab/invalid/manifest-fragments.v1.json fixtures/demo-lab/golden/*.json",
+    "ruby -ryaml -e 'ARGV.each { |path| YAML.safe_load(File.read(path), permitted_classes: [], aliases: false); }' fixtures/demo-lab/scenarios/*.yaml",
+    "bash tests/e2e/test_demo_lab_fixture_manifest.sh"
+  ],
+  "cases": [
+    {
+      "case_id": "unsupported-schema-version",
+      "expected_failure": "unsupported_schema_version",
+      "reason_codes": [
+        "demo.unsupported_schema_version"
+      ],
+      "invalid_fragment": {
+        "schema_version": "ft.demo.scenario-manifest.v2"
+      }
+    },
+    {
+      "case_id": "absolute-scenario-path",
+      "expected_failure": "scenario_path_must_be_repo_relative",
+      "reason_codes": [
+        "demo.absolute_path_forbidden"
+      ],
+      "invalid_fragment": {
+        "scenario": {
+          "id": "absolute-path",
+          "scenario_path": "/tmp/frankenterm-demo.yaml"
+        }
+      }
+    },
+    {
+      "case_id": "parent-relative-artifact-path",
+      "expected_failure": "artifact_path_must_not_escape_repo",
+      "reason_codes": [
+        "demo.parent_relative_path_forbidden"
+      ],
+      "invalid_fragment": {
+        "expected_artifacts": [
+          {
+            "id": "escaped-golden",
+            "kind": "golden_json",
+            "path": "../outside-demo-lab.json"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "missing-degradation-reason",
+      "expected_failure": "required_degradation_reason_missing",
+      "reason_codes": [
+        "demo.required_degradation_missing"
+      ],
+      "invalid_fragment": {
+        "missing_reason": "rch_proof_unavailable",
+        "scenario": {
+          "id": "missing-rch-degradation",
+          "degradation": [
+            {
+              "reason": "agent_mail_unavailable"
+            },
+            {
+              "reason": "disabled_feature"
+            },
+            {
+              "reason": "unsupported_platform"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "duplicate-scenario-id",
+      "expected_failure": "scenario_ids_must_be_unique",
+      "reason_codes": [
+        "demo.duplicate_scenario_id"
+      ],
+      "invalid_fragment": {
+        "scenarios": [
+          {
+            "id": "quickstart"
+          },
+          {
+            "id": "quickstart"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "target-class-proof-overclaim",
+      "expected_failure": "proof_boundary_must_not_claim_target_class_capacity",
+      "reason_codes": [
+        "demo.target_class_overclaim_forbidden"
+      ],
+      "invalid_fragment": {
+        "proof_boundary": "Demo fixtures prove target-class 200+ panes on 64-core / 256 GiB operators."
+      }
+    }
+  ]
+}
