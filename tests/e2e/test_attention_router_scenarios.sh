@@ -84,9 +84,10 @@ jq -e '
     "stale-in-progress-candidate",
     "dirty-overlap-active-owner",
     "closed-local-not-pushed",
+    "bv-stale-bd-command-hints",
     "docs-only-ready-while-proof-blocked"
   ]))
-  and (.scenarios | length >= 7)
+  and (.scenarios | length >= 8)
 ' "${INVENTORY}" >/dev/null || fail "top-level inventory contract is incomplete"
 
 jq -e '
@@ -183,6 +184,40 @@ jq -e '
     and (.forbidden_actions | index("commit_another_agents_closeout") != null)
     and (.forbidden_actions | index("stage_unowned_tracker_changes") != null)
 ' "${INVENTORY}" >/dev/null || fail "closed-local/not-pushed coordination scenario drifted"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "bv-stale-bd-command-hints")
+  | ([.source_fixture_requirements[].source_id] | sort) == [
+      "beads-authoritative-show",
+      "beads-ready-reconciliation",
+      "bv-command-hints",
+      "external-tool-defect-note"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "bv-command-hints")
+      | (.required_reason_codes | index("bv.stale_command_hints") != null)
+      and (.required_reason_codes | index("bv.uses_legacy_bd") != null)
+      and (.required_reason_codes | index("bv.claim_hint_present") != null)
+      and (.required_subjects | index("bd update <candidate> --status=in_progress") != null)
+      and (.required_subjects | index("bd show <candidate>") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "beads-authoritative-show")
+      | (.required_reason_codes | index("beads.status_blocked_or_unready") != null)
+      and (.required_reason_codes | index("beads.command_surface_br") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "beads-ready-reconciliation")
+      | (.required_reason_codes | index("beads.candidate_absent_from_ready") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "external-tool-defect-note")
+      | .command_or_api == "docs/proposals/ft-htcwc-bv-stale-availability-followup.md"
+      and (.required_reason_codes | index("docs.external_tool_defect_recorded") != null)
+      and (.required_reason_codes | index("docs.frankenterm_reconciler_already_fail_closed") != null))
+    and .expected.classification == "do_not_touch"
+    and .expected.recommended_safe_action == "ignore_bv_command_hints_use_br_json_state"
+    and (.expected.explanation_must_include | index("bv command hints are advisory text, not claim authority") != null)
+    and (.expected.explanation_must_include | index("bd command hints are stale in this repository") != null)
+    and (.expected.explanation_must_include | index("br JSON state decides whether a candidate is claimable") != null)
+    and (.forbidden_actions | index("run_bd_claim_command") != null)
+    and (.forbidden_actions | index("run_bv_claim_hint_without_br_reconciliation") != null)
+    and (.forbidden_actions | index("auto_claim_bv_pick") != null)
+' "${INVENTORY}" >/dev/null || fail "BV stale bd command-hints scenario drifted"
 
 grep -Fq "The claimability check must treat \`bv --robot-triage\` and \`bv --robot-next\` as" \
   "${BLOCKER_RADAR_CONTRACT}" || fail "blocker-radar contract no longer treats BV as advisory"

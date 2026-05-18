@@ -348,6 +348,70 @@
       }
     },
     {
+      "scenario_id": "bv-stale-bd-command-hints",
+      "title": "BV emits stale legacy command hints for an unclaimable candidate",
+      "summary": "The router must ignore `bv` command hints that still reference the legacy tracker CLI or imply claimability before reconciling with authoritative `br` JSON state.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "bv-command-hints",
+          "command_or_api": "bv --robot-triage or bv --robot-next",
+          "required_reason_codes": [
+            "bv.stale_command_hints",
+            "bv.uses_legacy_bd",
+            "bv.claim_hint_present"
+          ],
+          "required_subjects": [
+            "bd update <candidate> --status=in_progress",
+            "bd show <candidate>"
+          ]
+        },
+        {
+          "source_id": "beads-authoritative-show",
+          "command_or_api": "br show <candidate> --json",
+          "required_reason_codes": [
+            "beads.status_blocked_or_unready",
+            "beads.command_surface_br"
+          ]
+        },
+        {
+          "source_id": "beads-ready-reconciliation",
+          "command_or_api": "br ready --json",
+          "required_reason_codes": [
+            "beads.candidate_absent_from_ready"
+          ]
+        },
+        {
+          "source_id": "external-tool-defect-note",
+          "command_or_api": "docs/proposals/ft-htcwc-bv-stale-availability-followup.md",
+          "required_reason_codes": [
+            "docs.external_tool_defect_recorded",
+            "docs.frankenterm_reconciler_already_fail_closed"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "do_not_touch",
+        "recommended_safe_action": "ignore_bv_command_hints_use_br_json_state",
+        "confidence": "high",
+        "explanation_must_include": [
+          "bv command hints are advisory text, not claim authority",
+          "bd command hints are stale in this repository",
+          "br JSON state decides whether a candidate is claimable"
+        ]
+      },
+      "forbidden_actions": [
+        "run_bd_claim_command",
+        "run_bv_claim_hint_without_br_reconciliation",
+        "auto_claim_bv_pick",
+        "treat_bd_hint_as_repo_cli",
+        "claim_blocked_candidate"
+      ],
+      "volatility": {
+        "level": 4,
+        "strategy": "scrub generated scores, timestamps, and emoji prefixes while preserving command strings, candidate id, tracker status, and reason codes"
+      }
+    },
+    {
       "scenario_id": "docs-only-ready-while-proof-blocked",
       "title": "Docs-only or fixture-only ready slice while code proof is blocked",
       "summary": "The router must allow a static docs/fixture task when RCH blocks code proof lanes and the edit surface is disjoint from active dirty work.",
@@ -412,7 +476,8 @@
       "RCH degraded state recommends service mutation or build cancellation",
       "dirty overlap recommends stashing, reverting, or staging another agent's work",
       "stale-claim detection force-releases without status-check evidence",
-      "local closed tracker state is treated as durable before commit and remote publication"
+      "local closed tracker state is treated as durable before commit and remote publication",
+      "stale bv command hints are executed or trusted without br reconciliation"
     ],
     "proof_policy": "RCH-only for Rust/e2e harness execution after code exists; static jq and diff checks are sufficient for this inventory."
   }
