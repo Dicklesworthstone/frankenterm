@@ -9,7 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 pub mod dispatch;
 pub mod local;
@@ -80,10 +80,31 @@ impl LiveScrollbackSpillSink {
 
     #[cfg(test)]
     fn physical_scrollback_bytes(&self) -> u64 {
-        self.store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned")
+        self.lock_store("physical_scrollback_bytes")
             .file_bytes(self.pane_id)
+    }
+
+    fn lock_state(&self, context: &str) -> MutexGuard<'_, LiveScrollbackSpillState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                log::error!("live scrollback spill state mutex poisoned during {context}");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn lock_store(
+        &self,
+        context: &str,
+    ) -> MutexGuard<'_, frankenterm_core::storage::mmap_store::MmapScrollbackStore> {
+        match self.store.lock() {
+            Ok(store) => store,
+            Err(poisoned) => {
+                log::error!("live scrollback spill store mutex poisoned during {context}");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -185,43 +206,44 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return false;
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .expect("live scrollback spill state mutex poisoned");
-        let initial = *state.initial_stable_row.get_or_insert(stable_row);
-        if stable_row < initial {
-            return false;
+        {
+            let mut state = self.lock_state("store_scrollback_line initial row");
+            let initial = *state.initial_stable_row.get_or_insert(stable_row);
+            if stable_row < initial {
+                return false;
+            }
         }
 
         let Some(record) = encode_scrollback_line_record(line, &self.redactor) else {
             return false;
         };
-        let mut store = self
-            .store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned");
-        if store.append_line(self.pane_id, &record).is_err() {
-            return false;
+
+        {
+            let mut store = self.lock_store("store_scrollback_line append");
+            if store.append_line(self.pane_id, &record).is_err() {
+                return false;
+            }
+
+            let retained = store.line_count(self.pane_id);
+            if retained > max_retained_rows {
+                let oldest_seq = store.oldest_seq(self.pane_id).unwrap_or(0);
+                let drop_count = retained - max_retained_rows;
+                let prune_before_seq =
+                    oldest_seq.saturating_add(u64::try_from(drop_count).unwrap_or(u64::MAX));
+                if store.prune_before(self.pane_id, prune_before_seq).is_err() {
+                    return false;
+                }
+                if store
+                    .compact_pane_if_stale(self.pane_id, LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES)
+                    .is_err()
+                {
+                    return false;
+                }
+            }
         }
 
-        state.max_retained_rows = max_retained_rows;
-        let retained = store.line_count(self.pane_id);
-        if retained > max_retained_rows {
-            let oldest_seq = store.oldest_seq(self.pane_id).unwrap_or(0);
-            let drop_count = retained - max_retained_rows;
-            let prune_before_seq =
-                oldest_seq.saturating_add(u64::try_from(drop_count).unwrap_or(u64::MAX));
-            if store.prune_before(self.pane_id, prune_before_seq).is_err() {
-                return false;
-            }
-            if store
-                .compact_pane_if_stale(self.pane_id, LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES)
-                .is_err()
-            {
-                return false;
-            }
-        }
+        self.lock_state("store_scrollback_line retention")
+            .max_retained_rows = max_retained_rows;
 
         true
     }
@@ -231,18 +253,14 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         stable_row: wezterm_term::StableRowIndex,
     ) -> Option<wezterm_term::Line> {
         let initial = self
-            .state
-            .lock()
-            .expect("live scrollback spill state mutex poisoned")
+            .lock_state("load_scrollback_line initial row")
             .initial_stable_row?;
         if stable_row < initial {
             return None;
         }
         let seq = u64::try_from(stable_row - initial).ok()?;
         let record = self
-            .store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned")
+            .lock_store("load_scrollback_line read")
             .line_at(self.pane_id, seq)
             .ok()
             .flatten()?;
@@ -253,14 +271,10 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
     }
 
     fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
-        let state = self
-            .state
-            .lock()
-            .expect("live scrollback spill state mutex poisoned");
-        let initial = state.initial_stable_row?;
-        self.store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned")
+        let initial = self
+            .lock_state("oldest_scrollback_row initial row")
+            .initial_stable_row?;
+        self.lock_store("oldest_scrollback_row oldest seq")
             .oldest_seq(self.pane_id)
             .and_then(|seq| {
                 wezterm_term::StableRowIndex::try_from(seq)
@@ -270,31 +284,21 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
     }
 
     fn retained_scrollback_rows(&self) -> usize {
-        self.store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned")
+        self.lock_store("retained_scrollback_rows")
             .line_count(self.pane_id)
     }
 
     fn retained_scrollback_bytes(&self) -> usize {
-        self.store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned")
+        self.lock_store("retained_scrollback_bytes")
             .retained_bytes(self.pane_id)
             .try_into()
             .unwrap_or(usize::MAX)
     }
 
     fn clear_scrollback(&self) {
-        *self
-            .state
-            .lock()
-            .expect("live scrollback spill state mutex poisoned") =
-            LiveScrollbackSpillState::default();
+        *self.lock_state("clear_scrollback state reset") = LiveScrollbackSpillState::default();
         let _ = self
-            .store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned")
+            .lock_store("clear_scrollback store reset")
             .clear_pane(self.pane_id);
     }
 }
@@ -592,6 +596,49 @@ mod tests {
                 .as_ref(),
             "after-clear"
         );
+    }
+
+    #[test]
+    fn live_scrollback_spill_sink_recovers_poisoned_locks() {
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 11,
+            domain_id: 3,
+            command_description: "poisoned-lock-shell".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create live spill sink");
+        let attrs = CellAttributes::blank();
+        let first = Line::from_text("before-poison", &attrs, 1, None);
+        let second = Line::from_text("after-poison", &attrs, 2, None);
+
+        let state_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = sink.state.lock().expect("state lock for poison test");
+            panic!("poison state lock for regression coverage");
+        }));
+        assert!(state_poisoned.is_err());
+        assert!(sink.store_scrollback_line(0, &first, 8));
+        assert!(sink.load_scrollback_line(0).is_some());
+
+        let store_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = sink.store.lock().expect("store lock for poison test");
+            panic!("poison store lock for regression coverage");
+        }));
+        assert!(store_poisoned.is_err());
+        assert_eq!(sink.retained_scrollback_rows(), 1);
+        assert!(sink.store_scrollback_line(1, &second, 8));
+        assert_eq!(sink.retained_scrollback_rows(), 2);
+        assert_eq!(
+            sink.load_scrollback_line(1)
+                .expect("row stored after poison should hydrate")
+                .as_str()
+                .as_ref(),
+            "after-poison"
+        );
+
+        sink.clear_scrollback();
+        assert_eq!(sink.retained_scrollback_rows(), 0);
+        assert_eq!(sink.oldest_scrollback_row(), None);
     }
 
     #[test]
