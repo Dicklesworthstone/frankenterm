@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_inventory.v1",
+  "generated_at_ms": 1779049200000,
+  "source": "fixture:healthy-complete",
+  "source_bead": "ft-5xwsu.1",
+  "inventory_status": "complete",
+  "read_only": true,
+  "collection_scope": {
+    "source_status": "retained_complete",
+    "commands": [
+      "rch status --workers --json",
+      "timeout 15s df -B1 / /tmp /data/projects/frankenterm",
+      "timeout 15s find /tmp -maxdepth 2 -type d -name 'ft-*' -prune -print",
+      "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target"
+    ],
+    "paths": [
+      "/",
+      "/tmp",
+      "/data/projects/frankenterm",
+      "/data/projects/frankenterm/target"
+    ],
+    "timeout_ms": 30000,
+    "partial_allowed": true,
+    "side_effect_policy": {
+      "read_only": true,
+      "agent_mail_repaired": false,
+      "agent_mail_restarted": false,
+      "rch_daemon_restarted": false,
+      "worker_mutated": false,
+      "build_cancelled": false,
+      "files_deleted": false,
+      "local_cargo_counted_as_proof": false
+    }
+  },
+  "summary": {
+    "workers_total": 2,
+    "workers_sampled": 2,
+    "worker_ids": [
+      "vmi1227854",
+      "vmi1227855"
+    ],
+    "workers_with_critical_pressure": 0,
+    "workers_with_telemetry_gap": 0,
+    "workers_with_partial_output": 0,
+    "pressure_reasons": [
+      "none"
+    ]
+  },
+  "worker_inventories": [
+    {
+      "worker_id": "vmi1227854",
+      "host_label": "rch-worker-a",
+      "telemetry_status": "fresh",
+      "pressure_reason": "none",
+      "df_samples": [
+        {
+          "path": "/",
+          "sampled_at_ms": 1779049200000,
+          "source_command": "timeout 15s df -B1 / /tmp /data/projects/frankenterm",
+          "freshness": "fresh",
+          "status": "ok",
+          "available_bytes": 53687091200,
+          "used_bytes": 75161927680,
+          "capacity_bytes": 128849018880,
+          "used_percent": 58.3,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
+          "notes": [
+            "Root filesystem had sufficient retained headroom."
+          ]
+        }
+      ],
+      "shallow_scans": [
+        {
+          "path": "/tmp",
+          "scan_kind": "tmp_shallow",
+          "depth_limit": 2,
+          "timeout_ms": 15000,
+          "timeout_state": "complete",
+          "partial_output": false,
+          "sampled_at_ms": 1779049200000,
+          "source_command": "timeout 15s find /tmp -maxdepth 2 -type d -name 'ft-*' -prune -print",
+          "freshness": "fresh",
+          "status": "ok",
+          "total_bytes": 3221225472,
+          "entry_count": 7,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-tmp-shallow.json",
+          "notes": [
+            "Shallow temp scan completed before timeout."
+          ]
+        },
+        {
+          "path": "/data/projects/frankenterm/target",
+          "scan_kind": "target_shallow",
+          "depth_limit": 2,
+          "timeout_ms": 15000,
+          "timeout_state": "complete",
+          "partial_output": false,
+          "sampled_at_ms": 1779049200000,
+          "source_command": "timeout 15s find /data/projects/frankenterm/target -maxdepth 2 -type d -prune -print",
+          "freshness": "fresh",
+          "status": "ok",
+          "total_bytes": 8589934592,
+          "entry_count": 5,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-target-shallow.json",
+          "notes": [
+            "Target scan remained bounded to two directory levels."
+          ]
+        }
+      ],
+      "project_du_samples": [
+        {
+          "path": "/data/projects/frankenterm/target",
+          "scan_kind": "project_du_bounded",
+          "depth_limit": 1,
+          "timeout_ms": 20000,
+          "timeout_state": "complete",
+          "partial_output": false,
+          "sampled_at_ms": 1779049200000,
+          "source_command": "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target",
+          "freshness": "fresh",
+          "status": "ok",
+          "total_bytes": 8589934592,
+          "entry_count": 5,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-project-du.json",
+          "notes": [
+            "Bounded project du sample completed with no cleanup action."
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-tmp-shallow.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-target-shallow.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-project-du.json"
+      ],
+      "notes": [
+        "Fixture covers a complete healthy retained inventory."
+      ]
+    },
+    {
+      "worker_id": "vmi1227855",
+      "host_label": "rch-worker-b",
+      "telemetry_status": "fresh",
+      "pressure_reason": "none",
+      "df_samples": [
+        {
+          "path": "/",
+          "sampled_at_ms": 1779049200000,
+          "source_command": "timeout 15s df -B1 / /tmp /data/projects/frankenterm",
+          "freshness": "fresh",
+          "status": "ok",
+          "available_bytes": 42949672960,
+          "used_bytes": 85899345920,
+          "capacity_bytes": 128849018880,
+          "used_percent": 66.7,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-df.json",
+          "notes": [
+            "Root filesystem stayed below critical pressure."
+          ]
+        }
+      ],
+      "shallow_scans": [
+        {
+          "path": "/tmp",
+          "scan_kind": "tmp_shallow",
+          "depth_limit": 2,
+          "timeout_ms": 15000,
+          "timeout_state": "complete",
+          "partial_output": false,
+          "sampled_at_ms": 1779049200000,
+          "source_command": "timeout 15s find /tmp -maxdepth 2 -type d -name 'ft-*' -prune -print",
+          "freshness": "fresh",
+          "status": "ok",
+          "total_bytes": 2147483648,
+          "entry_count": 4,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-tmp-shallow.json",
+          "notes": [
+            "No temp pressure was retained."
+          ]
+        }
+      ],
+      "project_du_samples": [
+        {
+          "path": "/data/projects/frankenterm/target",
+          "scan_kind": "project_du_bounded",
+          "depth_limit": 1,
+          "timeout_ms": 20000,
+          "timeout_state": "complete",
+          "partial_output": false,
+          "sampled_at_ms": 1779049200000,
+          "source_command": "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target",
+          "freshness": "fresh",
+          "status": "ok",
+          "total_bytes": 6442450944,
+          "entry_count": 4,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-project-du.json",
+          "notes": [
+            "Project du stayed within retained target size expectations."
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-df.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-tmp-shallow.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-project-du.json"
+      ],
+      "notes": [
+        "Second worker verifies multi-worker complete inventory shape."
+      ]
+    }
+  ],
+  "artifact_paths": [
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-tmp-shallow.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-target-shallow.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-project-du.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-df.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-tmp-shallow.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-project-du.json"
+  ],
+  "forbidden_actions": [
+    "run_local_cargo_as_proof",
+    "restart_agent_mail",
+    "repair_agent_mail_db",
+    "restart_rch_daemon",
+    "mutate_rch_worker",
+    "cancel_other_agent_build",
+    "delete_files_without_approval",
+    "treat_dry_run_as_compile_proof",
+    "treat_inventory_as_cleanup_authorization"
+  ],
+  "notes": [
+    "This fixture is retained diagnostic evidence only; it does not prove Cargo or authorize cleanup."
+  ]
+}

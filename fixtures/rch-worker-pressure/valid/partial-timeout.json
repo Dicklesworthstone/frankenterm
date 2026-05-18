@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_inventory.v1",
+  "generated_at_ms": 1779049800000,
+  "source": "fixture:partial-timeout",
+  "source_bead": "ft-5xwsu.1",
+  "inventory_status": "partial",
+  "read_only": true,
+  "collection_scope": {
+    "source_status": "retained_partial",
+    "commands": [
+      "rch status --workers --json",
+      "timeout 15s df -B1 / /tmp /data/projects/frankenterm",
+      "timeout 15s find /data/projects/frankenterm/target -maxdepth 2 -type d -prune -print",
+      "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target"
+    ],
+    "paths": [
+      "/",
+      "/tmp",
+      "/data/projects/frankenterm/target"
+    ],
+    "timeout_ms": 30000,
+    "partial_allowed": true,
+    "side_effect_policy": {
+      "read_only": true,
+      "agent_mail_repaired": false,
+      "agent_mail_restarted": false,
+      "rch_daemon_restarted": false,
+      "worker_mutated": false,
+      "build_cancelled": false,
+      "files_deleted": false,
+      "local_cargo_counted_as_proof": false
+    }
+  },
+  "summary": {
+    "workers_total": 1,
+    "workers_sampled": 1,
+    "worker_ids": [
+      "vmi1227860"
+    ],
+    "workers_with_critical_pressure": 1,
+    "workers_with_telemetry_gap": 0,
+    "workers_with_partial_output": 1,
+    "pressure_reasons": [
+      "scan_timeout"
+    ]
+  },
+  "worker_inventories": [
+    {
+      "worker_id": "vmi1227860",
+      "host_label": "rch-worker-timeout",
+      "telemetry_status": "fresh",
+      "pressure_reason": "scan_timeout",
+      "df_samples": [
+        {
+          "path": "/",
+          "sampled_at_ms": 1779049800000,
+          "source_command": "timeout 15s df -B1 / /tmp /data/projects/frankenterm",
+          "freshness": "fresh",
+          "status": "ok",
+          "available_bytes": 17179869184,
+          "used_bytes": 111669149696,
+          "capacity_bytes": 128849018880,
+          "used_percent": 86.7,
+          "pressure_reason": "none",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-df.json",
+          "notes": [
+            "Df sample completed; follow-on scans timed out."
+          ]
+        }
+      ],
+      "shallow_scans": [
+        {
+          "path": "/data/projects/frankenterm/target",
+          "scan_kind": "target_shallow",
+          "depth_limit": 2,
+          "timeout_ms": 15000,
+          "timeout_state": "partial_timeout",
+          "partial_output": true,
+          "sampled_at_ms": 1779049800000,
+          "source_command": "timeout 15s find /data/projects/frankenterm/target -maxdepth 2 -type d -prune -print",
+          "freshness": "fresh",
+          "status": "timeout",
+          "total_bytes": null,
+          "entry_count": 214,
+          "pressure_reason": "scan_timeout",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-target-shallow.partial.json",
+          "notes": [
+            "Target shallow scan retained partial output and timeout marker."
+          ]
+        }
+      ],
+      "project_du_samples": [
+        {
+          "path": "/data/projects/frankenterm/target",
+          "scan_kind": "project_du_bounded",
+          "depth_limit": 1,
+          "timeout_ms": 20000,
+          "timeout_state": "partial_timeout",
+          "partial_output": true,
+          "sampled_at_ms": 1779049800000,
+          "source_command": "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target",
+          "freshness": "fresh",
+          "status": "timeout",
+          "total_bytes": null,
+          "entry_count": 43,
+          "pressure_reason": "scan_timeout",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-project-du.partial.json",
+          "notes": [
+            "Bounded du retained partial rows; no cleanup was attempted."
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-df.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-target-shallow.partial.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-project-du.partial.json"
+      ],
+      "notes": [
+        "Partial output must stay explicit so operators do not mistake it for a complete inventory."
+      ]
+    }
+  ],
+  "artifact_paths": [
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-df.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-target-shallow.partial.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-project-du.partial.json"
+  ],
+  "forbidden_actions": [
+    "run_local_cargo_as_proof",
+    "restart_agent_mail",
+    "repair_agent_mail_db",
+    "restart_rch_daemon",
+    "mutate_rch_worker",
+    "cancel_other_agent_build",
+    "delete_files_without_approval",
+    "treat_dry_run_as_compile_proof",
+    "treat_inventory_as_cleanup_authorization"
+  ],
+  "notes": [
+    "A partial timeout inventory is diagnostic evidence only; it blocks cleanup assumptions."
+  ]
+}

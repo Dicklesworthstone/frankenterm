@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_inventory.v1",
+  "generated_at_ms": 1779050400000,
+  "source": "fixture:telemetry-gap",
+  "source_bead": "ft-5xwsu.1",
+  "inventory_status": "telemetry_gap",
+  "read_only": true,
+  "collection_scope": {
+    "source_status": "telemetry_gap",
+    "commands": [
+      "rch status --workers --json",
+      "timeout 15s df -B1 / /tmp /data/projects/frankenterm"
+    ],
+    "paths": [
+      "/",
+      "/tmp",
+      "/data/projects/frankenterm"
+    ],
+    "timeout_ms": 30000,
+    "partial_allowed": true,
+    "side_effect_policy": {
+      "read_only": true,
+      "agent_mail_repaired": false,
+      "agent_mail_restarted": false,
+      "rch_daemon_restarted": false,
+      "worker_mutated": false,
+      "build_cancelled": false,
+      "files_deleted": false,
+      "local_cargo_counted_as_proof": false
+    }
+  },
+  "summary": {
+    "workers_total": 2,
+    "workers_sampled": 1,
+    "worker_ids": [
+      "vmi1227870"
+    ],
+    "workers_with_critical_pressure": 1,
+    "workers_with_telemetry_gap": 1,
+    "workers_with_partial_output": 0,
+    "pressure_reasons": [
+      "telemetry_gap",
+      "disk_critical_without_fresh_telemetry"
+    ]
+  },
+  "worker_inventories": [
+    {
+      "worker_id": "vmi1227870",
+      "host_label": "rch-worker-stale",
+      "telemetry_status": "stale",
+      "pressure_reason": "disk_critical_without_fresh_telemetry",
+      "df_samples": [
+        {
+          "path": "/",
+          "sampled_at_ms": 1779046800000,
+          "source_command": "rch status --workers --json",
+          "freshness": "stale",
+          "status": "unavailable",
+          "available_bytes": null,
+          "used_bytes": null,
+          "capacity_bytes": null,
+          "used_percent": null,
+          "pressure_reason": "disk_critical_without_fresh_telemetry",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-status-stale.json",
+          "notes": [
+            "RCH worker status carried stale storage telemetry; no worker probe was forced."
+          ]
+        }
+      ],
+      "shallow_scans": [
+        {
+          "path": "/data/projects/frankenterm/target",
+          "scan_kind": "target_shallow",
+          "depth_limit": 2,
+          "timeout_ms": 15000,
+          "timeout_state": "not_run",
+          "partial_output": false,
+          "sampled_at_ms": 1779050400000,
+          "source_command": "rch status --workers --json",
+          "freshness": "missing",
+          "status": "unavailable",
+          "total_bytes": null,
+          "entry_count": null,
+          "pressure_reason": "telemetry_gap",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-target-not-run.json",
+          "notes": [
+            "Target scan was not run because fresh worker telemetry was unavailable."
+          ]
+        }
+      ],
+      "project_du_samples": [
+        {
+          "path": "/data/projects/frankenterm/target",
+          "scan_kind": "project_du_bounded",
+          "depth_limit": 1,
+          "timeout_ms": 20000,
+          "timeout_state": "not_run",
+          "partial_output": false,
+          "sampled_at_ms": 1779050400000,
+          "source_command": "rch status --workers --json",
+          "freshness": "missing",
+          "status": "unavailable",
+          "total_bytes": null,
+          "entry_count": null,
+          "pressure_reason": "telemetry_gap",
+          "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-project-du-not-run.json",
+          "notes": [
+            "Bounded du was not run; stale telemetry is retained as the diagnosis."
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-status-stale.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-target-not-run.json",
+        "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-project-du-not-run.json"
+      ],
+      "notes": [
+        "Telemetry gaps stay explicit and must not trigger service repair."
+      ]
+    }
+  ],
+  "artifact_paths": [
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-status-stale.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-target-not-run.json",
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-project-du-not-run.json"
+  ],
+  "forbidden_actions": [
+    "run_local_cargo_as_proof",
+    "restart_agent_mail",
+    "repair_agent_mail_db",
+    "restart_rch_daemon",
+    "mutate_rch_worker",
+    "cancel_other_agent_build",
+    "delete_files_without_approval",
+    "treat_dry_run_as_compile_proof",
+    "treat_inventory_as_cleanup_authorization"
+  ],
+  "notes": [
+    "Telemetry-gap inventory is retained evidence only; normal agents must not repair shared services or mutate workers."
+  ]
+}

@@ -1,0 +1,530 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-rch-worker-storage-inventory.json",
+  "title": "FrankenTerm RCH Worker Storage Inventory",
+  "description": "Read-only retained inventory contract for diagnosing RCH worker storage pressure without authorizing cleanup, service repair, worker mutation, or local Cargo proof fallback.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source",
+    "source_bead",
+    "inventory_status",
+    "read_only",
+    "collection_scope",
+    "summary",
+    "worker_inventories",
+    "artifact_paths",
+    "forbidden_actions",
+    "notes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.rch_worker_storage_inventory.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_bead": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
+    },
+    "inventory_status": {
+      "$ref": "#/$defs/inventory_status"
+    },
+    "read_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "collection_scope": {
+      "$ref": "#/$defs/collection_scope"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "worker_inventories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/worker_inventory"
+      }
+    },
+    "artifact_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "inventory_status": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "telemetry_gap",
+        "blocked"
+      ]
+    },
+    "freshness": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "stale",
+        "missing"
+      ]
+    },
+    "pressure_reason": {
+      "type": "string",
+      "enum": [
+        "none",
+        "disk_critical_without_fresh_telemetry",
+        "disk_ratio_below_critical",
+        "project_path_pressure",
+        "cache_path_pressure",
+        "telemetry_gap",
+        "scan_timeout",
+        "unknown"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "run_local_cargo_as_proof",
+        "restart_agent_mail",
+        "repair_agent_mail_db",
+        "restart_rch_daemon",
+        "mutate_rch_worker",
+        "cancel_other_agent_build",
+        "delete_files_without_approval",
+        "treat_dry_run_as_compile_proof",
+        "treat_inventory_as_cleanup_authorization"
+      ]
+    },
+    "collection_scope": {
+      "type": "object",
+      "required": [
+        "source_status",
+        "commands",
+        "paths",
+        "timeout_ms",
+        "partial_allowed",
+        "side_effect_policy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_status": {
+          "type": "string",
+          "enum": [
+            "retained_complete",
+            "retained_partial",
+            "telemetry_gap"
+          ]
+        },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "partial_allowed": {
+          "type": "boolean"
+        },
+        "side_effect_policy": {
+          "$ref": "#/$defs/side_effect_policy"
+        }
+      }
+    },
+    "side_effect_policy": {
+      "type": "object",
+      "required": [
+        "read_only",
+        "agent_mail_repaired",
+        "agent_mail_restarted",
+        "rch_daemon_restarted",
+        "worker_mutated",
+        "build_cancelled",
+        "files_deleted",
+        "local_cargo_counted_as_proof"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "read_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "agent_mail_repaired": {
+          "type": "boolean",
+          "const": false
+        },
+        "agent_mail_restarted": {
+          "type": "boolean",
+          "const": false
+        },
+        "rch_daemon_restarted": {
+          "type": "boolean",
+          "const": false
+        },
+        "worker_mutated": {
+          "type": "boolean",
+          "const": false
+        },
+        "build_cancelled": {
+          "type": "boolean",
+          "const": false
+        },
+        "files_deleted": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_cargo_counted_as_proof": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "workers_total",
+        "workers_sampled",
+        "worker_ids",
+        "workers_with_critical_pressure",
+        "workers_with_telemetry_gap",
+        "workers_with_partial_output",
+        "pressure_reasons"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "workers_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "workers_sampled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "worker_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "workers_with_critical_pressure": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "workers_with_telemetry_gap": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "workers_with_partial_output": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pressure_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/pressure_reason"
+          }
+        }
+      }
+    },
+    "worker_inventory": {
+      "type": "object",
+      "required": [
+        "worker_id",
+        "host_label",
+        "telemetry_status",
+        "pressure_reason",
+        "df_samples",
+        "shallow_scans",
+        "project_du_samples",
+        "artifact_paths",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "worker_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "telemetry_status": {
+          "$ref": "#/$defs/freshness"
+        },
+        "pressure_reason": {
+          "$ref": "#/$defs/pressure_reason"
+        },
+        "df_samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/df_sample"
+          }
+        },
+        "shallow_scans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bounded_scan"
+          }
+        },
+        "project_du_samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bounded_scan"
+          }
+        },
+        "artifact_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "df_sample": {
+      "type": "object",
+      "required": [
+        "path",
+        "sampled_at_ms",
+        "source_command",
+        "freshness",
+        "status",
+        "available_bytes",
+        "used_bytes",
+        "capacity_bytes",
+        "used_percent",
+        "pressure_reason",
+        "artifact_path",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sampled_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "freshness": {
+          "$ref": "#/$defs/freshness"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "warning",
+            "critical",
+            "unavailable"
+          ]
+        },
+        "available_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "used_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "capacity_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "used_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "pressure_reason": {
+          "$ref": "#/$defs/pressure_reason"
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "bounded_scan": {
+      "type": "object",
+      "required": [
+        "path",
+        "scan_kind",
+        "depth_limit",
+        "timeout_ms",
+        "timeout_state",
+        "partial_output",
+        "sampled_at_ms",
+        "source_command",
+        "freshness",
+        "status",
+        "total_bytes",
+        "entry_count",
+        "pressure_reason",
+        "artifact_path",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scan_kind": {
+          "type": "string",
+          "enum": [
+            "target_shallow",
+            "tmp_shallow",
+            "project_du_bounded"
+          ]
+        },
+        "depth_limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeout_state": {
+          "type": "string",
+          "enum": [
+            "complete",
+            "partial_timeout",
+            "not_run"
+          ]
+        },
+        "partial_output": {
+          "type": "boolean"
+        },
+        "sampled_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "freshness": {
+          "$ref": "#/$defs/freshness"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "warning",
+            "critical",
+            "timeout",
+            "unavailable"
+          ]
+        },
+        "total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "entry_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "pressure_reason": {
+          "$ref": "#/$defs/pressure_reason"
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

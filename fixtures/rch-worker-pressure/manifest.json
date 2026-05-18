@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_inventory.fixture_manifest.v1",
+  "bead": "ft-5xwsu.1",
+  "schema": "docs/json-schema/ft-rch-worker-storage-inventory.json",
+  "valid": [
+    "fixtures/rch-worker-pressure/valid/healthy-complete.json",
+    "fixtures/rch-worker-pressure/valid/partial-timeout.json",
+    "fixtures/rch-worker-pressure/valid/telemetry-gap.json"
+  ],
+  "invalid": [],
+  "verification": [
+    "jq empty docs/json-schema/ft-rch-worker-storage-inventory.json fixtures/rch-worker-pressure/manifest.json fixtures/rch-worker-pressure/valid/*.json",
+    "bash tests/e2e/test_rch_worker_storage_inventory_contract.sh"
+  ]
+}
