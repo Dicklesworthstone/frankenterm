@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover_completion_audit.v1",
+  "bead": "ft-5lsqo.6",
+  "source_epic": "ft-5lsqo",
+  "proof_kind": "static-completion-audit",
+  "contract_document": "docs/robot-contracts/agent-mail-failover-completion-audit.md",
+  "verifier": "tests/e2e/test_agent_mail_failover_completion_audit.sh",
+  "runtime_command_shipped": false,
+  "latest_fallback_snapshot": {
+    "command": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+    "mode": "agent_mail_unavailable_beads_only",
+    "agent_mail_status": "unavailable",
+    "reason_codes": [
+      "agent_mail.unavailable_after_retry",
+      "fallback.beads_only"
+    ]
+  },
+  "graph_evidence": {
+    "dep_cycles_command": "br dep cycles --json",
+    "dep_cycles_count": 0,
+    "robot_command": "bv --robot-triage --robot-next",
+    "robot_selected_id": "ft-4tp7g",
+    "robot_selected_blocked_by": "ft-5xwsu.3"
+  },
+  "side_effect_policy": {
+    "agent_mail_repair_allowed": false,
+    "agent_mail_restart_allowed": false,
+    "agent_mail_reconstruct_allowed": false,
+    "process_kill_allowed": false,
+    "destructive_git_allowed": false,
+    "file_deletion_allowed": false,
+    "worker_mutation_allowed": false,
+    "build_cancellation_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "required_dependency_edges": [
+    "ft-5lsqo",
+    "ft-5lsqo.1",
+    "ft-5lsqo.2",
+    "ft-5lsqo.3",
+    "ft-5lsqo.4",
+    "ft-5lsqo.5"
+  ],
+  "required_closeout_commands": [
+    "br dep cycles --json",
+    "bv --robot-triage --robot-next",
+    "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+  ],
+  "children": [
+    {
+      "id": "ft-5lsqo.1",
+      "title": "Fallback snapshot schema and retained fixture corpus",
+      "expected_status": "closed",
+      "proof_level": "static",
+      "blocker": "none",
+      "safety_posture": "No service repair, restart, process kill, deletion, worker mutation, or local Cargo proof.",
+      "artifacts": [
+        "docs/robot-contracts/agent-mail-failover-snapshot.md",
+        "fixtures/agent-mail-failover/fallback-snapshot.schema.json",
+        "fixtures/agent-mail-failover/manifest.json",
+        "fixtures/agent-mail-failover/valid/*.json",
+        "tests/e2e/test_agent_mail_failover_snapshot_contract.sh"
+      ],
+      "verifiers": [
+        "bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh"
+      ]
+    },
+    {
+      "id": "ft-5lsqo.2",
+      "title": "Retry classifier and no-repair reason codes",
+      "expected_status": "closed",
+      "proof_level": "static",
+      "blocker": "none",
+      "safety_posture": "Classifier emits fallback reason codes without repair or restart guidance.",
+      "artifacts": [
+        "scripts/agent-mail-failover-classifier.sh",
+        "scripts/swarm-tick.sh",
+        "fixtures/agent-mail-failover/retry-classifier-cases.json",
+        "tests/e2e/test_agent_mail_retry_classifier_contract.sh"
+      ],
+      "verifiers": [
+        "bash tests/e2e/test_agent_mail_retry_classifier_contract.sh"
+      ]
+    },
+    {
+      "id": "ft-5lsqo.3",
+      "title": "Stale-reopen guard and dirty-tree overlap policy",
+      "expected_status": "closed",
+      "proof_level": "static",
+      "blocker": "none",
+      "safety_posture": "Clean stale work is status-check-only; dirty overlap stays do_not_reopen.",
+      "artifacts": [
+        "docs/robot-contracts/agent-mail-stale-reopen-policy.md",
+        "fixtures/agent-mail-stale-reopen/policy.v1.json",
+        "fixtures/agent-mail-stale-reopen/verify-policy.sh"
+      ],
+      "verifiers": [
+        "bash fixtures/agent-mail-stale-reopen/verify-policy.sh"
+      ]
+    },
+    {
+      "id": "ft-5lsqo.4",
+      "title": "No-service-action E2E and forbidden-command gate",
+      "expected_status": "closed",
+      "proof_level": "static",
+      "blocker": "none",
+      "safety_posture": "Positive guidance passes while repair/restart/kill/destructive/local-Cargo negative cases fail.",
+      "artifacts": [
+        "fixtures/agent-mail-failover/no-service-action-gate.json",
+        "tests/e2e/test_agent_mail_no_service_action_gate.sh"
+      ],
+      "verifiers": [
+        "bash tests/e2e/test_agent_mail_no_service_action_gate.sh"
+      ]
+    },
+    {
+      "id": "ft-5lsqo.5",
+      "title": "Operator runbook and recovery handoff wording",
+      "expected_status": "closed",
+      "proof_level": "static",
+      "blocker": "none",
+      "safety_posture": "Runbook separates communication outage, source defects, RCH pressure, and dirty-tree contamination.",
+      "artifacts": [
+        "docs/robot-contracts/agent-mail-failover-runbook.md",
+        "tests/e2e/test_agent_mail_failover_runbook_contract.sh"
+      ],
+      "verifiers": [
+        "bash tests/e2e/test_agent_mail_failover_runbook_contract.sh"
+      ]
+    }
+  ]
+}
