@@ -1,0 +1,666 @@
+{
+  "schema_version": "ft.operating_envelope.proof_calendar.fixtures.v1",
+  "contract_id": "ft.operating_envelope.proof_calendar.fixture_manifest.v1",
+  "schema_path": "docs/json-schema/ft-operating-envelope-proof-calendar.json",
+  "contract_doc": "docs/robot-contracts/operating-envelope.md",
+  "source_bead": "ft-booek.8",
+  "verification": [
+    "jq empty docs/json-schema/ft-operating-envelope-proof-calendar.json fixtures/operating-envelope/proof-calendar/cases.v1.json",
+    "bash tests/e2e/test_operating_envelope_fixture_manifest.sh"
+  ],
+  "required_work_classes": [
+    "static_docs_fixture_verifier",
+    "shell_jq_contract",
+    "rch_required_unit_integration",
+    "target_class_hardware_proof",
+    "operator_only_recovery",
+    "forbidden_mutation"
+  ],
+  "required_forbidden_actions": [
+    "agent_mail_service_repair",
+    "build_cancellation",
+    "delete_files",
+    "destructive_filesystem",
+    "destructive_git",
+    "local_cargo_proof",
+    "local_heavy_cargo_fallback",
+    "rch_daemon_restart",
+    "rch_service_repair",
+    "service_mutation",
+    "worker_mutation"
+  ],
+  "toon_columns": [
+    "case_id",
+    "lane",
+    "work_class",
+    "recommendation",
+    "confidence",
+    "reason"
+  ],
+  "cases": [
+    {
+      "case_id": "rch-unavailable",
+      "required_reason_code": "rch.unavailable",
+      "expected_now_recommendation": "run_now",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.operating_envelope.proof_calendar.v1",
+        "generated_at_ms": 1779091200000,
+        "source_bead": "ft-booek.8",
+        "dry_run": true,
+        "read_only": true,
+        "calendar_id": "proof-calendar-rch-unavailable",
+        "planning_window": {
+          "window_id": "window-rch-unavailable",
+          "starts_at_ms": 1779091200000,
+          "expires_at_ms": 1779094800000,
+          "deterministic_ordering": "lane_then_sort_key_then_entry_id"
+        },
+        "input_summary": {
+          "beads_state": "available",
+          "rch_state": "unavailable",
+          "agent_mail_state": "available",
+          "git_state": "available",
+          "proof_artifact_state": "unavailable",
+          "publication_state": "published",
+          "target_hardware_state": "unknown"
+        },
+        "work_classes": [
+          {
+            "work_class": "static_docs_fixture_verifier",
+            "proof_requirement": "static_shell_jq",
+            "requires_rch": false,
+            "requires_target_hardware": false,
+            "recommendation": "run_now",
+            "reason_codes": [
+              "calendar.static_safe"
+            ]
+          },
+          {
+            "work_class": "shell_jq_contract",
+            "proof_requirement": "static_shell_jq",
+            "requires_rch": false,
+            "requires_target_hardware": false,
+            "recommendation": "run_next",
+            "reason_codes": [
+              "calendar.shell_jq_safe"
+            ]
+          },
+          {
+            "work_class": "rch_required_unit_integration",
+            "proof_requirement": "remote_cargo",
+            "requires_rch": true,
+            "requires_target_hardware": false,
+            "recommendation": "wait",
+            "reason_codes": [
+              "rch.unavailable"
+            ]
+          },
+          {
+            "work_class": "target_class_hardware_proof",
+            "proof_requirement": "target_class_remote_proof",
+            "requires_rch": true,
+            "requires_target_hardware": true,
+            "recommendation": "wait",
+            "reason_codes": [
+              "target_hardware.proof_waits_on_rch"
+            ]
+          },
+          {
+            "work_class": "operator_only_recovery",
+            "proof_requirement": "operator_approval",
+            "requires_rch": false,
+            "requires_target_hardware": false,
+            "recommendation": "require_operator_approval",
+            "reason_codes": [
+              "operator.recovery_only"
+            ]
+          },
+          {
+            "work_class": "forbidden_mutation",
+            "proof_requirement": "forbidden",
+            "requires_rch": false,
+            "requires_target_hardware": false,
+            "recommendation": "block",
+            "reason_codes": [
+              "mutation.forbidden"
+            ]
+          }
+        ],
+        "source_snapshots": [
+          {
+            "source_kind": "beads",
+            "state": "available",
+            "freshness_state": "fresh",
+            "command_or_api": "br ready --json",
+            "raw_pane_content_stored": false,
+            "reason_codes": [
+              "beads.ready_static_work"
+            ],
+            "artifact_paths": [
+              "fixtures/operating-envelope/proof-calendar/cases.v1.json"
+            ]
+          },
+          {
+            "source_kind": "rch",
+            "state": "blocked",
+            "freshness_state": "fresh",
+            "command_or_api": "rch admission artifact",
+            "raw_pane_content_stored": false,
+            "reason_codes": [
+              "rch.unavailable",
+              "rch.remote_cargo_reached_false"
+            ],
+            "artifact_paths": [
+              "fixtures/operating-envelope/proof-calendar/cases.v1.json"
+            ]
+          },
+          {
+            "source_kind": "agent_mail",
+            "state": "available",
+            "freshness_state": "fresh",
+            "command_or_api": "file_reservation summary without message bodies",
+            "raw_pane_content_stored": false,
+            "reason_codes": [
+              "agent_mail.available"
+            ],
+            "artifact_paths": [
+              "fixtures/operating-envelope/proof-calendar/cases.v1.json"
+            ]
+          },
+          {
+            "source_kind": "git",
+            "state": "available",
+            "freshness_state": "fresh",
+            "command_or_api": "git status --short",
+            "raw_pane_content_stored": false,
+            "reason_codes": [
+              "git.clean_for_scope",
+              "publication.published"
+            ],
+            "artifact_paths": [
+              "fixtures/operating-envelope/proof-calendar/cases.v1.json"
+            ]
+          },
+          {
+            "source_kind": "proof_artifact",
+            "state": "unavailable",
+            "freshness_state": "unknown",
+            "command_or_api": "retained proof lookup",
+            "raw_pane_content_stored": false,
+            "reason_codes": [
+              "proof.remote_unavailable"
+            ],
+            "artifact_paths": [
+              "fixtures/operating-envelope/proof-calendar/cases.v1.json"
+            ]
+          }
+        ],
+        "calendar_entries": [
+          {
+            "entry_id": "no-workers-now-static",
+            "lane": "now",
+            "sort_key": 10,
+            "work_class": "static_docs_fixture_verifier",
+            "recommendation": "run_now",
+            "candidate_bead_ids": [
+              "ft-booek.8"
+            ],
+            "requires_rch": false,
+            "requires_target_hardware": false,
+            "requires_operator_approval": false,
+            "confidence": "medium",
+            "blockers": [
+              "rch.unavailable"
+            ],
+            "reason_codes": [
+              "calendar.static_safe"
+            ],
+            "permitted_action_classes": [
+              "read_status",
+              "claim_bead",
+              "edit_files",
+              "run_static_check"
+            ],
+            "forbidden_action_classes": [
+              "agent_mail_service_repair",
+              "build_cancellation",
+              "delete_files",
+              "destructive_filesystem",
+              "destructive_git",
+              "local_cargo_proof",
+              "local_heavy_cargo_fallback",
+              "rch_daemon_restart",
+              "rch_service_repair",
+              "service_mutation",
+              "worker_mutation"
+            ]
+          },
+          {
+            "entry_id": "no-workers-next-shell",
+            "lane": "next",
+            "sort_key": 20,
+            "work_class": "shell_jq_contract",
+            "recommendation": "run_next",
+            "candidate_bead_ids": [
+              "ft-booek.8"
+            ],
+            "requires_rch": false,
+            "requires_target_hardware": false,
+            "requires_operator_approval": false,
+            "confidence": "medium",
+            "blockers": [
+              "rch.unavailable"
+            ],
+            "reason_codes": [
+              "calendar.shell_jq_safe"
+            ],
+            "permitted_action_classes": [
+              "read_status",
+              "run_static_check"
+            ],
+            "forbidden_action_classes": [
+              "agent_mail_service_repair",
+              "build_cancellation",
+              "delete_files",
+              "destructive_filesystem",
+              "destructive_git",
+              "local_cargo_proof",
+              "local_heavy_cargo_fallback",
+              "rch_daemon_restart",
+              "rch_service_repair",
+              "service_mutation",
+              "worker_mutation"
+            ]
+          },
+          {
+            "entry_id": "no-workers-wait-rch",
+            "lane": "wait",
+            "sort_key": 30,
+            "work_class": "rch_required_unit_integration",
+            "recommendation": "wait",
+            "candidate_bead_ids": [
+              "ft-4tp7g"
+            ],
+            "requires_rch": true,
+            "requires_target_hardware": false,
+            "requires_operator_approval": false,
+            "confidence": "none",
+            "blockers": [
+              "rch.unavailable",
+              "proof.remote_required"
+            ],
+            "reason_codes": [
+              "calendar.wait_remote_cargo"
+            ],
+            "permitted_action_classes": [
+              "read_status",
+              "wait"
+            ],
+            "forbidden_action_classes": [
+              "agent_mail_service_repair",
+              "build_cancellation",
+              "delete_files",
+              "destructive_filesystem",
+              "destructive_git",
+              "local_cargo_proof",
+              "local_heavy_cargo_fallback",
+              "rch_daemon_restart",
+              "rch_service_repair",
+              "service_mutation",
+              "worker_mutation"
+            ]
+          }
+        ],
+        "proof_policy": {
+          "rch_sync_chatter_counts_as_remote_proof": false,
+          "dry_run_interception_counts_as_remote_proof": false,
+          "local_shell_success_counts_as_remote_cargo_proof": false,
+          "local_cargo_fallback_allowed": false,
+          "remote_cargo_proof_requires_retained_artifact": true
+        },
+        "side_effect_policy": {
+          "dry_run_only": true,
+          "read_only": true,
+          "service_mutation_allowed": false,
+          "worker_mutation_allowed": false,
+          "deletion_allowed": false,
+          "local_heavy_cargo_allowed": false
+        },
+        "redaction_policy": {
+          "raw_pane_content_allowed": false,
+          "mail_body_storage_allowed": false,
+          "secret_material_allowed": false
+        },
+        "forbidden_actions": [
+          "agent_mail_service_repair",
+          "build_cancellation",
+          "delete_files",
+          "destructive_filesystem",
+          "destructive_git",
+          "local_cargo_proof",
+          "local_heavy_cargo_fallback",
+          "rch_daemon_restart",
+          "rch_service_repair",
+          "service_mutation",
+          "worker_mutation"
+        ],
+        "reason_codes": [
+          "rch.unavailable",
+          "calendar.static_safe"
+        ],
+        "artifact_paths": [
+          "docs/json-schema/ft-operating-envelope-proof-calendar.json",
+          "fixtures/operating-envelope/proof-calendar/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "lane",
+            "work_class",
+            "recommendation",
+            "confidence",
+            "reason"
+          ],
+          "rows": [
+            [
+              "rch-unavailable",
+              "now",
+              "static_docs_fixture_verifier",
+              "run_now",
+              "medium",
+              "calendar.static_safe"
+            ],
+            [
+              "rch-unavailable",
+              "next",
+              "shell_jq_contract",
+              "run_next",
+              "medium",
+              "calendar.shell_jq_safe"
+            ],
+            [
+              "rch-unavailable",
+              "wait",
+              "rch_required_unit_integration",
+              "wait",
+              "none",
+              "calendar.wait_remote_cargo"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "no-admissible-workers",
+      "required_reason_code": "rch.no_admissible_workers",
+      "expected_now_recommendation": "run_now",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.operating_envelope.proof_calendar.v1",
+        "generated_at_ms": 1779091260000,
+        "source_bead": "ft-booek.8",
+        "dry_run": true,
+        "read_only": true,
+        "calendar_id": "proof-calendar-no-admissible-workers",
+        "planning_window": {"window_id": "window-no-admissible-workers", "starts_at_ms": 1779091260000, "expires_at_ms": 1779094860000, "deterministic_ordering": "lane_then_sort_key_then_entry_id"},
+        "input_summary": {"beads_state": "available", "rch_state": "blocked", "agent_mail_state": "available", "git_state": "available", "proof_artifact_state": "unavailable", "publication_state": "published", "target_hardware_state": "unknown"},
+        "work_classes": [
+          {"work_class": "static_docs_fixture_verifier", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_now", "reason_codes": ["calendar.static_safe"]},
+          {"work_class": "shell_jq_contract", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_next", "reason_codes": ["calendar.shell_jq_safe"]},
+          {"work_class": "rch_required_unit_integration", "proof_requirement": "remote_cargo", "requires_rch": true, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["rch.no_admissible_workers"]},
+          {"work_class": "target_class_hardware_proof", "proof_requirement": "target_class_remote_proof", "requires_rch": true, "requires_target_hardware": true, "recommendation": "wait", "reason_codes": ["target_hardware.proof_waits_on_rch"]},
+          {"work_class": "operator_only_recovery", "proof_requirement": "operator_approval", "requires_rch": false, "requires_target_hardware": false, "recommendation": "require_operator_approval", "reason_codes": ["operator.recovery_only"]},
+          {"work_class": "forbidden_mutation", "proof_requirement": "forbidden", "requires_rch": false, "requires_target_hardware": false, "recommendation": "block", "reason_codes": ["mutation.forbidden"]}
+        ],
+        "source_snapshots": [
+          {"source_kind": "beads", "state": "available", "freshness_state": "fresh", "command_or_api": "br ready --json", "raw_pane_content_stored": false, "reason_codes": ["beads.ready_static_work"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "rch", "state": "blocked", "freshness_state": "fresh", "command_or_api": "rch admission artifact", "raw_pane_content_stored": false, "reason_codes": ["rch.no_admissible_workers", "rch.remote_cargo_reached_false"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "agent_mail", "state": "available", "freshness_state": "fresh", "command_or_api": "reservation summary", "raw_pane_content_stored": false, "reason_codes": ["agent_mail.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "git", "state": "available", "freshness_state": "fresh", "command_or_api": "git status --short", "raw_pane_content_stored": false, "reason_codes": ["git.clean_for_scope", "publication.published"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "proof_artifact", "state": "unavailable", "freshness_state": "unknown", "command_or_api": "retained proof lookup", "raw_pane_content_stored": false, "reason_codes": ["proof.remote_unavailable"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]}
+        ],
+        "calendar_entries": [
+          {"entry_id": "no-workers-now-static", "lane": "now", "sort_key": 10, "work_class": "static_docs_fixture_verifier", "recommendation": "run_now", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["rch.no_admissible_workers"], "reason_codes": ["calendar.static_safe"], "permitted_action_classes": ["read_status", "claim_bead", "edit_files", "run_static_check"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "no-workers-next-shell", "lane": "next", "sort_key": 20, "work_class": "shell_jq_contract", "recommendation": "run_next", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["rch.no_admissible_workers"], "reason_codes": ["calendar.shell_jq_safe"], "permitted_action_classes": ["read_status", "run_static_check"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "no-workers-wait-rch", "lane": "wait", "sort_key": 30, "work_class": "rch_required_unit_integration", "recommendation": "wait", "candidate_bead_ids": ["ft-4tp7g"], "requires_rch": true, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "none", "blockers": ["rch.no_admissible_workers", "proof.remote_required"], "reason_codes": ["calendar.wait_remote_cargo"], "permitted_action_classes": ["read_status", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]}
+        ],
+        "proof_policy": {"rch_sync_chatter_counts_as_remote_proof": false, "dry_run_interception_counts_as_remote_proof": false, "local_shell_success_counts_as_remote_cargo_proof": false, "local_cargo_fallback_allowed": false, "remote_cargo_proof_requires_retained_artifact": true},
+        "side_effect_policy": {"dry_run_only": true, "read_only": true, "service_mutation_allowed": false, "worker_mutation_allowed": false, "deletion_allowed": false, "local_heavy_cargo_allowed": false},
+        "redaction_policy": {"raw_pane_content_allowed": false, "mail_body_storage_allowed": false, "secret_material_allowed": false},
+        "forbidden_actions": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"],
+        "reason_codes": ["rch.no_admissible_workers", "calendar.static_safe"],
+        "artifact_paths": ["docs/json-schema/ft-operating-envelope-proof-calendar.json", "fixtures/operating-envelope/proof-calendar/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "lane", "work_class", "recommendation", "confidence", "reason"], "rows": [["no-admissible-workers", "now", "static_docs_fixture_verifier", "run_now", "medium", "calendar.static_safe"], ["no-admissible-workers", "next", "shell_jq_contract", "run_next", "medium", "calendar.shell_jq_safe"], ["no-admissible-workers", "wait", "rch_required_unit_integration", "wait", "none", "calendar.wait_remote_cargo"]]}
+      }
+    },
+    {
+      "case_id": "static-only-ready",
+      "required_reason_code": "calendar.static_only_ready",
+      "expected_now_recommendation": "run_now",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.operating_envelope.proof_calendar.v1",
+        "generated_at_ms": 1779091320000,
+        "source_bead": "ft-booek.8",
+        "dry_run": true,
+        "read_only": true,
+        "calendar_id": "proof-calendar-static-only-ready",
+        "planning_window": {
+          "window_id": "window-static-only-ready",
+          "starts_at_ms": 1779091320000,
+          "expires_at_ms": 1779094920000,
+          "deterministic_ordering": "lane_then_sort_key_then_entry_id"
+        },
+        "input_summary": {
+          "beads_state": "available",
+          "rch_state": "degraded",
+          "agent_mail_state": "available",
+          "git_state": "available",
+          "proof_artifact_state": "unknown",
+          "publication_state": "published",
+          "target_hardware_state": "unknown"
+        },
+        "work_classes": [
+          {"work_class": "static_docs_fixture_verifier", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_now", "reason_codes": ["calendar.static_only_ready"]},
+          {"work_class": "shell_jq_contract", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_now", "reason_codes": ["calendar.shell_jq_safe"]},
+          {"work_class": "rch_required_unit_integration", "proof_requirement": "remote_cargo", "requires_rch": true, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["rch.degraded"]},
+          {"work_class": "target_class_hardware_proof", "proof_requirement": "target_class_remote_proof", "requires_rch": true, "requires_target_hardware": true, "recommendation": "wait", "reason_codes": ["target_hardware.proof_waits_on_rch"]},
+          {"work_class": "operator_only_recovery", "proof_requirement": "operator_approval", "requires_rch": false, "requires_target_hardware": false, "recommendation": "require_operator_approval", "reason_codes": ["operator.recovery_only"]},
+          {"work_class": "forbidden_mutation", "proof_requirement": "forbidden", "requires_rch": false, "requires_target_hardware": false, "recommendation": "block", "reason_codes": ["mutation.forbidden"]}
+        ],
+        "source_snapshots": [
+          {"source_kind": "beads", "state": "available", "freshness_state": "fresh", "command_or_api": "br ready --json", "raw_pane_content_stored": false, "reason_codes": ["beads.ready_static_work"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "rch", "state": "degraded", "freshness_state": "fresh", "command_or_api": "rch admission artifact", "raw_pane_content_stored": false, "reason_codes": ["rch.degraded", "rch.remote_cargo_not_retained"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "agent_mail", "state": "available", "freshness_state": "fresh", "command_or_api": "reservation summary", "raw_pane_content_stored": false, "reason_codes": ["agent_mail.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "git", "state": "available", "freshness_state": "fresh", "command_or_api": "git status --short", "raw_pane_content_stored": false, "reason_codes": ["git.clean_for_scope", "publication.published"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "proof_artifact", "state": "unknown", "freshness_state": "unknown", "command_or_api": "retained proof lookup", "raw_pane_content_stored": false, "reason_codes": ["proof.remote_not_required_for_static"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]}
+        ],
+        "calendar_entries": [
+          {"entry_id": "static-only-now-docs", "lane": "now", "sort_key": 10, "work_class": "static_docs_fixture_verifier", "recommendation": "run_now", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "high", "blockers": ["calendar.no_remote_proof_required"], "reason_codes": ["calendar.static_only_ready"], "permitted_action_classes": ["read_status", "claim_bead", "edit_files", "run_static_check"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "static-only-next-shell", "lane": "next", "sort_key": 20, "work_class": "shell_jq_contract", "recommendation": "run_now", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "high", "blockers": ["calendar.no_remote_proof_required"], "reason_codes": ["calendar.shell_jq_safe"], "permitted_action_classes": ["read_status", "run_static_check"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "static-only-wait-rch", "lane": "wait", "sort_key": 30, "work_class": "rch_required_unit_integration", "recommendation": "wait", "candidate_bead_ids": ["ft-4tp7g"], "requires_rch": true, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "none", "blockers": ["proof.remote_required"], "reason_codes": ["calendar.wait_remote_cargo"], "permitted_action_classes": ["read_status", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]}
+        ],
+        "proof_policy": {"rch_sync_chatter_counts_as_remote_proof": false, "dry_run_interception_counts_as_remote_proof": false, "local_shell_success_counts_as_remote_cargo_proof": false, "local_cargo_fallback_allowed": false, "remote_cargo_proof_requires_retained_artifact": true},
+        "side_effect_policy": {"dry_run_only": true, "read_only": true, "service_mutation_allowed": false, "worker_mutation_allowed": false, "deletion_allowed": false, "local_heavy_cargo_allowed": false},
+        "redaction_policy": {"raw_pane_content_allowed": false, "mail_body_storage_allowed": false, "secret_material_allowed": false},
+        "forbidden_actions": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"],
+        "reason_codes": ["calendar.static_only_ready", "calendar.static_safe"],
+        "artifact_paths": ["docs/json-schema/ft-operating-envelope-proof-calendar.json", "fixtures/operating-envelope/proof-calendar/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "lane", "work_class", "recommendation", "confidence", "reason"], "rows": [["static-only-ready", "now", "static_docs_fixture_verifier", "run_now", "high", "calendar.static_only_ready"], ["static-only-ready", "next", "shell_jq_contract", "run_now", "high", "calendar.shell_jq_safe"], ["static-only-ready", "wait", "rch_required_unit_integration", "wait", "none", "calendar.wait_remote_cargo"]]}
+      }
+    },
+    {
+      "case_id": "local-closed-not-published",
+      "required_reason_code": "publication.local_closed_not_published",
+      "expected_now_recommendation": "wait",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.operating_envelope.proof_calendar.v1",
+        "generated_at_ms": 1779091380000,
+        "source_bead": "ft-booek.8",
+        "dry_run": true,
+        "read_only": true,
+        "calendar_id": "proof-calendar-local-closed-not-published",
+        "planning_window": {"window_id": "window-local-closed-not-published", "starts_at_ms": 1779091380000, "expires_at_ms": 1779094980000, "deterministic_ordering": "lane_then_sort_key_then_entry_id"},
+        "input_summary": {"beads_state": "available", "rch_state": "available", "agent_mail_state": "available", "git_state": "available", "proof_artifact_state": "available", "publication_state": "local_closed_not_published", "target_hardware_state": "unknown"},
+        "work_classes": [
+          {"work_class": "static_docs_fixture_verifier", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["publication.local_closed_not_published"]},
+          {"work_class": "shell_jq_contract", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["publication.local_closed_not_published"]},
+          {"work_class": "rch_required_unit_integration", "proof_requirement": "remote_cargo", "requires_rch": true, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["publication.local_closed_not_published"]},
+          {"work_class": "target_class_hardware_proof", "proof_requirement": "target_class_remote_proof", "requires_rch": true, "requires_target_hardware": true, "recommendation": "wait", "reason_codes": ["target_hardware.proof_waits_on_publication"]},
+          {"work_class": "operator_only_recovery", "proof_requirement": "operator_approval", "requires_rch": false, "requires_target_hardware": false, "recommendation": "require_operator_approval", "reason_codes": ["operator.recovery_only"]},
+          {"work_class": "forbidden_mutation", "proof_requirement": "forbidden", "requires_rch": false, "requires_target_hardware": false, "recommendation": "block", "reason_codes": ["mutation.forbidden"]}
+        ],
+        "source_snapshots": [
+          {"source_kind": "beads", "state": "available", "freshness_state": "fresh", "command_or_api": "br show closed bead --json", "raw_pane_content_stored": false, "reason_codes": ["beads.closed_local"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "rch", "state": "available", "freshness_state": "fresh", "command_or_api": "rch retained proof lookup", "raw_pane_content_stored": false, "reason_codes": ["rch.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "agent_mail", "state": "available", "freshness_state": "fresh", "command_or_api": "publish handoff summary", "raw_pane_content_stored": false, "reason_codes": ["agent_mail.owner_handoff_needed"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "git", "state": "available", "freshness_state": "fresh", "command_or_api": "git log and remote ref comparison", "raw_pane_content_stored": false, "reason_codes": ["publication.local_closed_not_published"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "proof_artifact", "state": "available", "freshness_state": "within_budget", "command_or_api": "retained proof lookup", "raw_pane_content_stored": false, "reason_codes": ["proof.present_but_unpublished"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]}
+        ],
+        "calendar_entries": [
+          {"entry_id": "local-unpublished-now-wait", "lane": "now", "sort_key": 10, "work_class": "static_docs_fixture_verifier", "recommendation": "wait", "candidate_bead_ids": ["ft-auy2g.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["publication.local_closed_not_published"], "reason_codes": ["calendar.wait_publication"], "permitted_action_classes": ["read_status", "add_beads_comment", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "local-unpublished-next-refresh", "lane": "next", "sort_key": 20, "work_class": "shell_jq_contract", "recommendation": "wait", "candidate_bead_ids": ["ft-auy2g.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["publication.local_closed_not_published"], "reason_codes": ["calendar.refresh_after_publication"], "permitted_action_classes": ["read_status", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "local-unpublished-wait-remote", "lane": "wait", "sort_key": 30, "work_class": "rch_required_unit_integration", "recommendation": "wait", "candidate_bead_ids": ["ft-auy2g.8"], "requires_rch": true, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "none", "blockers": ["publication.local_closed_not_published"], "reason_codes": ["calendar.wait_publication"], "permitted_action_classes": ["read_status", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]}
+        ],
+        "proof_policy": {"rch_sync_chatter_counts_as_remote_proof": false, "dry_run_interception_counts_as_remote_proof": false, "local_shell_success_counts_as_remote_cargo_proof": false, "local_cargo_fallback_allowed": false, "remote_cargo_proof_requires_retained_artifact": true},
+        "side_effect_policy": {"dry_run_only": true, "read_only": true, "service_mutation_allowed": false, "worker_mutation_allowed": false, "deletion_allowed": false, "local_heavy_cargo_allowed": false},
+        "redaction_policy": {"raw_pane_content_allowed": false, "mail_body_storage_allowed": false, "secret_material_allowed": false},
+        "forbidden_actions": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"],
+        "reason_codes": ["publication.local_closed_not_published", "calendar.wait_publication"],
+        "artifact_paths": ["docs/json-schema/ft-operating-envelope-proof-calendar.json", "fixtures/operating-envelope/proof-calendar/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "lane", "work_class", "recommendation", "confidence", "reason"], "rows": [["local-closed-not-published", "now", "static_docs_fixture_verifier", "wait", "medium", "calendar.wait_publication"], ["local-closed-not-published", "next", "shell_jq_contract", "wait", "medium", "calendar.refresh_after_publication"], ["local-closed-not-published", "wait", "rch_required_unit_integration", "wait", "none", "calendar.wait_publication"]]}
+      }
+    },
+    {
+      "case_id": "dirty-overlap",
+      "required_reason_code": "dirty_overlap.active_owner",
+      "expected_now_recommendation": "wait",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.operating_envelope.proof_calendar.v1",
+        "generated_at_ms": 1779091440000,
+        "source_bead": "ft-booek.8",
+        "dry_run": true,
+        "read_only": true,
+        "calendar_id": "proof-calendar-dirty-overlap",
+        "planning_window": {"window_id": "window-dirty-overlap", "starts_at_ms": 1779091440000, "expires_at_ms": 1779095040000, "deterministic_ordering": "lane_then_sort_key_then_entry_id"},
+        "input_summary": {"beads_state": "blocked", "rch_state": "available", "agent_mail_state": "available", "git_state": "blocked", "proof_artifact_state": "unknown", "publication_state": "published", "target_hardware_state": "unknown"},
+        "work_classes": [
+          {"work_class": "static_docs_fixture_verifier", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["dirty_overlap.active_owner"]},
+          {"work_class": "shell_jq_contract", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["dirty_overlap.active_owner"]},
+          {"work_class": "rch_required_unit_integration", "proof_requirement": "remote_cargo", "requires_rch": true, "requires_target_hardware": false, "recommendation": "wait", "reason_codes": ["dirty_overlap.active_owner"]},
+          {"work_class": "target_class_hardware_proof", "proof_requirement": "target_class_remote_proof", "requires_rch": true, "requires_target_hardware": true, "recommendation": "wait", "reason_codes": ["target_hardware.proof_waits_on_clean_scope"]},
+          {"work_class": "operator_only_recovery", "proof_requirement": "operator_approval", "requires_rch": false, "requires_target_hardware": false, "recommendation": "require_operator_approval", "reason_codes": ["operator.recovery_only"]},
+          {"work_class": "forbidden_mutation", "proof_requirement": "forbidden", "requires_rch": false, "requires_target_hardware": false, "recommendation": "block", "reason_codes": ["mutation.forbidden"]}
+        ],
+        "source_snapshots": [
+          {"source_kind": "beads", "state": "blocked", "freshness_state": "fresh", "command_or_api": "br list --status in_progress --json", "raw_pane_content_stored": false, "reason_codes": ["assignee_overlap.active"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "rch", "state": "available", "freshness_state": "fresh", "command_or_api": "rch admission artifact", "raw_pane_content_stored": false, "reason_codes": ["rch.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "agent_mail", "state": "available", "freshness_state": "fresh", "command_or_api": "file_reservation_paths summary", "raw_pane_content_stored": false, "reason_codes": ["agent_mail.reservation_conflict"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "git", "state": "blocked", "freshness_state": "fresh", "command_or_api": "git status --short", "raw_pane_content_stored": false, "reason_codes": ["dirty_overlap.active_owner"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "proof_artifact", "state": "unknown", "freshness_state": "unknown", "command_or_api": "retained proof lookup", "raw_pane_content_stored": false, "reason_codes": ["proof.not_safe_with_dirty_overlap"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]}
+        ],
+        "calendar_entries": [
+          {"entry_id": "dirty-overlap-now-wait", "lane": "now", "sort_key": 10, "work_class": "static_docs_fixture_verifier", "recommendation": "wait", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["dirty_overlap.active_owner"], "reason_codes": ["calendar.wait_owner"], "permitted_action_classes": ["read_status", "add_beads_comment", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "dirty-overlap-next-nonoverlap", "lane": "next", "sort_key": 20, "work_class": "shell_jq_contract", "recommendation": "wait", "candidate_bead_ids": ["non_overlapping_static_work"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "low", "blockers": ["dirty_overlap.active_owner"], "reason_codes": ["calendar.choose_non_overlapping_work"], "permitted_action_classes": ["read_status", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "dirty-overlap-wait-rch", "lane": "wait", "sort_key": 30, "work_class": "rch_required_unit_integration", "recommendation": "wait", "candidate_bead_ids": ["ft-4tp7g"], "requires_rch": true, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "none", "blockers": ["dirty_overlap.active_owner"], "reason_codes": ["calendar.wait_clean_scope"], "permitted_action_classes": ["read_status", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]}
+        ],
+        "proof_policy": {"rch_sync_chatter_counts_as_remote_proof": false, "dry_run_interception_counts_as_remote_proof": false, "local_shell_success_counts_as_remote_cargo_proof": false, "local_cargo_fallback_allowed": false, "remote_cargo_proof_requires_retained_artifact": true},
+        "side_effect_policy": {"dry_run_only": true, "read_only": true, "service_mutation_allowed": false, "worker_mutation_allowed": false, "deletion_allowed": false, "local_heavy_cargo_allowed": false},
+        "redaction_policy": {"raw_pane_content_allowed": false, "mail_body_storage_allowed": false, "secret_material_allowed": false},
+        "forbidden_actions": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"],
+        "reason_codes": ["dirty_overlap.active_owner", "calendar.wait_owner"],
+        "artifact_paths": ["docs/json-schema/ft-operating-envelope-proof-calendar.json", "fixtures/operating-envelope/proof-calendar/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "lane", "work_class", "recommendation", "confidence", "reason"], "rows": [["dirty-overlap", "now", "static_docs_fixture_verifier", "wait", "medium", "calendar.wait_owner"], ["dirty-overlap", "next", "shell_jq_contract", "wait", "low", "calendar.choose_non_overlapping_work"], ["dirty-overlap", "wait", "rch_required_unit_integration", "wait", "none", "calendar.wait_clean_scope"]]}
+      }
+    },
+    {
+      "case_id": "stale-proof-artifact",
+      "required_reason_code": "proof.stale_artifact",
+      "expected_now_recommendation": "run_now",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.operating_envelope.proof_calendar.v1",
+        "generated_at_ms": 1779091500000,
+        "source_bead": "ft-booek.8",
+        "dry_run": true,
+        "read_only": true,
+        "calendar_id": "proof-calendar-stale-proof-artifact",
+        "planning_window": {"window_id": "window-stale-proof-artifact", "starts_at_ms": 1779091500000, "expires_at_ms": 1779095100000, "deterministic_ordering": "lane_then_sort_key_then_entry_id"},
+        "input_summary": {"beads_state": "available", "rch_state": "available", "agent_mail_state": "available", "git_state": "available", "proof_artifact_state": "stale", "publication_state": "published", "target_hardware_state": "unknown"},
+        "work_classes": [
+          {"work_class": "static_docs_fixture_verifier", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_now", "reason_codes": ["calendar.static_safe"]},
+          {"work_class": "shell_jq_contract", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_next", "reason_codes": ["calendar.shell_jq_safe"]},
+          {"work_class": "rch_required_unit_integration", "proof_requirement": "remote_cargo", "requires_rch": true, "requires_target_hardware": false, "recommendation": "defer", "reason_codes": ["proof.stale_artifact"]},
+          {"work_class": "target_class_hardware_proof", "proof_requirement": "target_class_remote_proof", "requires_rch": true, "requires_target_hardware": true, "recommendation": "defer", "reason_codes": ["proof.stale_artifact"]},
+          {"work_class": "operator_only_recovery", "proof_requirement": "operator_approval", "requires_rch": false, "requires_target_hardware": false, "recommendation": "require_operator_approval", "reason_codes": ["operator.recovery_only"]},
+          {"work_class": "forbidden_mutation", "proof_requirement": "forbidden", "requires_rch": false, "requires_target_hardware": false, "recommendation": "block", "reason_codes": ["mutation.forbidden"]}
+        ],
+        "source_snapshots": [
+          {"source_kind": "beads", "state": "available", "freshness_state": "fresh", "command_or_api": "br ready --json", "raw_pane_content_stored": false, "reason_codes": ["beads.ready_available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "rch", "state": "available", "freshness_state": "fresh", "command_or_api": "rch admission artifact", "raw_pane_content_stored": false, "reason_codes": ["rch.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "agent_mail", "state": "available", "freshness_state": "fresh", "command_or_api": "reservation summary", "raw_pane_content_stored": false, "reason_codes": ["agent_mail.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "git", "state": "available", "freshness_state": "fresh", "command_or_api": "git status --short", "raw_pane_content_stored": false, "reason_codes": ["git.clean_for_scope", "publication.published"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "proof_artifact", "state": "stale", "freshness_state": "stale", "command_or_api": "retained proof lookup", "raw_pane_content_stored": false, "reason_codes": ["proof.stale_artifact"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]}
+        ],
+        "calendar_entries": [
+          {"entry_id": "stale-proof-now-static", "lane": "now", "sort_key": 10, "work_class": "static_docs_fixture_verifier", "recommendation": "run_now", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["proof.stale_artifact"], "reason_codes": ["calendar.static_safe"], "permitted_action_classes": ["read_status", "claim_bead", "edit_files", "run_static_check"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "stale-proof-next-shell", "lane": "next", "sort_key": 20, "work_class": "shell_jq_contract", "recommendation": "run_next", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["proof.stale_artifact"], "reason_codes": ["calendar.shell_jq_safe"], "permitted_action_classes": ["read_status", "run_static_check"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "stale-proof-wait-refresh", "lane": "wait", "sort_key": 30, "work_class": "rch_required_unit_integration", "recommendation": "defer", "candidate_bead_ids": ["remote_proof_beads"], "requires_rch": true, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "low", "blockers": ["proof.stale_artifact"], "reason_codes": ["calendar.request_fresh_remote_proof"], "permitted_action_classes": ["read_status", "run_rch_proof"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]}
+        ],
+        "proof_policy": {"rch_sync_chatter_counts_as_remote_proof": false, "dry_run_interception_counts_as_remote_proof": false, "local_shell_success_counts_as_remote_cargo_proof": false, "local_cargo_fallback_allowed": false, "remote_cargo_proof_requires_retained_artifact": true},
+        "side_effect_policy": {"dry_run_only": true, "read_only": true, "service_mutation_allowed": false, "worker_mutation_allowed": false, "deletion_allowed": false, "local_heavy_cargo_allowed": false},
+        "redaction_policy": {"raw_pane_content_allowed": false, "mail_body_storage_allowed": false, "secret_material_allowed": false},
+        "forbidden_actions": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"],
+        "reason_codes": ["proof.stale_artifact", "calendar.static_safe"],
+        "artifact_paths": ["docs/json-schema/ft-operating-envelope-proof-calendar.json", "fixtures/operating-envelope/proof-calendar/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "lane", "work_class", "recommendation", "confidence", "reason"], "rows": [["stale-proof-artifact", "now", "static_docs_fixture_verifier", "run_now", "medium", "calendar.static_safe"], ["stale-proof-artifact", "next", "shell_jq_contract", "run_next", "medium", "calendar.shell_jq_safe"], ["stale-proof-artifact", "wait", "rch_required_unit_integration", "defer", "low", "calendar.request_fresh_remote_proof"]]}
+      }
+    },
+    {
+      "case_id": "target-hardware-unavailable",
+      "required_reason_code": "target_hardware.unavailable",
+      "expected_now_recommendation": "run_now",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.operating_envelope.proof_calendar.v1",
+        "generated_at_ms": 1779091560000,
+        "source_bead": "ft-booek.8",
+        "dry_run": true,
+        "read_only": true,
+        "calendar_id": "proof-calendar-target-hardware-unavailable",
+        "planning_window": {"window_id": "window-target-hardware-unavailable", "starts_at_ms": 1779091560000, "expires_at_ms": 1779095160000, "deterministic_ordering": "lane_then_sort_key_then_entry_id"},
+        "input_summary": {"beads_state": "available", "rch_state": "available", "agent_mail_state": "available", "git_state": "available", "proof_artifact_state": "available", "publication_state": "published", "target_hardware_state": "unavailable"},
+        "work_classes": [
+          {"work_class": "static_docs_fixture_verifier", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_now", "reason_codes": ["calendar.static_safe"]},
+          {"work_class": "shell_jq_contract", "proof_requirement": "static_shell_jq", "requires_rch": false, "requires_target_hardware": false, "recommendation": "run_next", "reason_codes": ["calendar.shell_jq_safe"]},
+          {"work_class": "rch_required_unit_integration", "proof_requirement": "remote_cargo", "requires_rch": true, "requires_target_hardware": false, "recommendation": "run_next", "reason_codes": ["rch.available"]},
+          {"work_class": "target_class_hardware_proof", "proof_requirement": "target_class_remote_proof", "requires_rch": true, "requires_target_hardware": true, "recommendation": "wait", "reason_codes": ["target_hardware.unavailable"]},
+          {"work_class": "operator_only_recovery", "proof_requirement": "operator_approval", "requires_rch": false, "requires_target_hardware": false, "recommendation": "require_operator_approval", "reason_codes": ["operator.recovery_only"]},
+          {"work_class": "forbidden_mutation", "proof_requirement": "forbidden", "requires_rch": false, "requires_target_hardware": false, "recommendation": "block", "reason_codes": ["mutation.forbidden"]}
+        ],
+        "source_snapshots": [
+          {"source_kind": "beads", "state": "available", "freshness_state": "fresh", "command_or_api": "br ready --json", "raw_pane_content_stored": false, "reason_codes": ["beads.ready_available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "rch", "state": "available", "freshness_state": "fresh", "command_or_api": "rch admission artifact", "raw_pane_content_stored": false, "reason_codes": ["rch.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "agent_mail", "state": "available", "freshness_state": "fresh", "command_or_api": "reservation summary", "raw_pane_content_stored": false, "reason_codes": ["agent_mail.available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "git", "state": "available", "freshness_state": "fresh", "command_or_api": "git status --short", "raw_pane_content_stored": false, "reason_codes": ["git.clean_for_scope", "publication.published"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]},
+          {"source_kind": "proof_artifact", "state": "available", "freshness_state": "within_budget", "command_or_api": "retained proof lookup", "raw_pane_content_stored": false, "reason_codes": ["proof.remote_available"], "artifact_paths": ["fixtures/operating-envelope/proof-calendar/cases.v1.json"]}
+        ],
+        "calendar_entries": [
+          {"entry_id": "target-missing-now-static", "lane": "now", "sort_key": 10, "work_class": "static_docs_fixture_verifier", "recommendation": "run_now", "candidate_bead_ids": ["ft-booek.8"], "requires_rch": false, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["target_hardware.unavailable"], "reason_codes": ["calendar.static_safe"], "permitted_action_classes": ["read_status", "claim_bead", "edit_files", "run_static_check"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "target-missing-next-rch", "lane": "next", "sort_key": 20, "work_class": "rch_required_unit_integration", "recommendation": "run_next", "candidate_bead_ids": ["remote_non_target_proof"], "requires_rch": true, "requires_target_hardware": false, "requires_operator_approval": false, "confidence": "medium", "blockers": ["target_hardware.unavailable"], "reason_codes": ["calendar.rch_non_target_allowed"], "permitted_action_classes": ["read_status", "run_rch_proof"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]},
+          {"entry_id": "target-missing-wait-target", "lane": "wait", "sort_key": 30, "work_class": "target_class_hardware_proof", "recommendation": "wait", "candidate_bead_ids": ["target_hardware_beads"], "requires_rch": true, "requires_target_hardware": true, "requires_operator_approval": false, "confidence": "none", "blockers": ["target_hardware.unavailable"], "reason_codes": ["calendar.wait_target_hardware"], "permitted_action_classes": ["read_status", "wait"], "forbidden_action_classes": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"]}
+        ],
+        "proof_policy": {"rch_sync_chatter_counts_as_remote_proof": false, "dry_run_interception_counts_as_remote_proof": false, "local_shell_success_counts_as_remote_cargo_proof": false, "local_cargo_fallback_allowed": false, "remote_cargo_proof_requires_retained_artifact": true},
+        "side_effect_policy": {"dry_run_only": true, "read_only": true, "service_mutation_allowed": false, "worker_mutation_allowed": false, "deletion_allowed": false, "local_heavy_cargo_allowed": false},
+        "redaction_policy": {"raw_pane_content_allowed": false, "mail_body_storage_allowed": false, "secret_material_allowed": false},
+        "forbidden_actions": ["agent_mail_service_repair", "build_cancellation", "delete_files", "destructive_filesystem", "destructive_git", "local_cargo_proof", "local_heavy_cargo_fallback", "rch_daemon_restart", "rch_service_repair", "service_mutation", "worker_mutation"],
+        "reason_codes": ["target_hardware.unavailable", "calendar.static_safe"],
+        "artifact_paths": ["docs/json-schema/ft-operating-envelope-proof-calendar.json", "fixtures/operating-envelope/proof-calendar/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "lane", "work_class", "recommendation", "confidence", "reason"], "rows": [["target-hardware-unavailable", "now", "static_docs_fixture_verifier", "run_now", "medium", "calendar.static_safe"], ["target-hardware-unavailable", "next", "rch_required_unit_integration", "run_next", "medium", "calendar.rch_non_target_allowed"], ["target-hardware-unavailable", "wait", "target_class_hardware_proof", "wait", "none", "calendar.wait_target_hardware"]]}
+      }
+    }
+  ]
+}

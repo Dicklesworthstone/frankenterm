@@ -82,3 +82,52 @@ Fixtures live under `fixtures/operating-envelope/`:
 
 The negative fixtures are intentionally parseable JSON that must fail the schema
 or the equivalent static contract checks.
+
+## Proof-Calendar Fixture Contract
+
+`ft-booek.8` adds a nested read-only proof-calendar fixture contract for RCH
+outages and target-class proof gaps. The schema is
+`docs/json-schema/ft-operating-envelope-proof-calendar.json`; the retained
+golden corpus is
+`fixtures/operating-envelope/proof-calendar/cases.v1.json`.
+
+The proof-calendar contract id is
+`ft.operating_envelope.proof_calendar.v1`. It classifies candidate work into:
+
+- `static_docs_fixture_verifier`
+- `shell_jq_contract`
+- `rch_required_unit_integration`
+- `target_class_hardware_proof`
+- `operator_only_recovery`
+- `forbidden_mutation`
+
+The golden cases are:
+
+- `rch-unavailable`
+- `no-admissible-workers`
+- `static-only-ready`
+- `local-closed-not-published`
+- `dirty-overlap`
+- `stale-proof-artifact`
+- `target-hardware-unavailable`
+
+Every case emits deterministic `now`, `next`, and `wait` lanes with stable
+reason codes, source snapshots for Beads/RCH/Agent Mail/git/proof-artifact
+freshness, a TOON-ready row projection, and the same fail-closed proof policy:
+
+- `rch_sync_chatter_counts_as_remote_proof: false`
+- `dry_run_interception_counts_as_remote_proof: false`
+- `local_shell_success_counts_as_remote_cargo_proof: false`
+- `local_cargo_fallback_allowed: false`
+- `remote_cargo_proof_requires_retained_artifact: true`
+
+The no-service-action guarantee is explicit. Proof-calendar artifacts must
+forbid `agent_mail_service_repair`, `build_cancellation`, `delete_files`,
+`destructive_filesystem`, `destructive_git`, `local_cargo_proof`,
+`local_heavy_cargo_fallback`, `rch_daemon_restart`, `rch_service_repair`,
+`service_mutation`, and `worker_mutation` at both the artifact root and every
+calendar entry.
+
+The static verifier is `bash tests/e2e/test_operating_envelope_fixture_manifest.sh`.
+Use `--json` for machine-readable summary output that includes the base fixture
+counts and the proof-calendar case count.

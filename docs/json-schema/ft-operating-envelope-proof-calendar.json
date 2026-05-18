@@ -1,0 +1,591 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-operating-envelope-proof-calendar.json",
+  "title": "FrankenTerm Operating Envelope Proof Calendar",
+  "description": "Read-only proof-calendar contract for scheduling static-safe work while RCH or target-class proof infrastructure is degraded.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source_bead",
+    "dry_run",
+    "read_only",
+    "calendar_id",
+    "planning_window",
+    "input_summary",
+    "work_classes",
+    "source_snapshots",
+    "calendar_entries",
+    "proof_policy",
+    "side_effect_policy",
+    "redaction_policy",
+    "forbidden_actions",
+    "reason_codes",
+    "artifact_paths",
+    "toon_projection"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.operating_envelope.proof_calendar.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_bead": {
+      "type": "string",
+      "const": "ft-booek.8"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "const": true
+    },
+    "read_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "calendar_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "planning_window": {
+      "$ref": "#/$defs/planning_window"
+    },
+    "input_summary": {
+      "$ref": "#/$defs/input_summary"
+    },
+    "work_classes": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "$ref": "#/$defs/work_class_decision"
+      }
+    },
+    "source_snapshots": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "$ref": "#/$defs/source_snapshot"
+      }
+    },
+    "calendar_entries": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "$ref": "#/$defs/calendar_entry"
+      }
+    },
+    "proof_policy": {
+      "$ref": "#/$defs/proof_policy"
+    },
+    "side_effect_policy": {
+      "$ref": "#/$defs/side_effect_policy"
+    },
+    "redaction_policy": {
+      "$ref": "#/$defs/redaction_policy"
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "reason_codes": {
+      "$ref": "#/$defs/reason_codes"
+    },
+    "artifact_paths": {
+      "$ref": "#/$defs/repo_paths"
+    },
+    "toon_projection": {
+      "$ref": "#/$defs/toon_projection"
+    }
+  },
+  "$defs": {
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+"
+    },
+    "repo_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/repo_path"
+      }
+    },
+    "reason_code": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/reason_code"
+      }
+    },
+    "planning_window": {
+      "type": "object",
+      "required": [
+        "window_id",
+        "starts_at_ms",
+        "expires_at_ms",
+        "deterministic_ordering"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "window_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "starts_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "expires_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "deterministic_ordering": {
+          "type": "string",
+          "const": "lane_then_sort_key_then_entry_id"
+        }
+      }
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "available",
+        "degraded",
+        "unavailable",
+        "blocked",
+        "stale",
+        "unknown",
+        "not_collected"
+      ]
+    },
+    "freshness_state": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "within_budget",
+        "stale",
+        "unknown",
+        "not_collected"
+      ]
+    },
+    "publication_state": {
+      "type": "string",
+      "enum": [
+        "published",
+        "local_closed_not_published",
+        "unpublished",
+        "unknown"
+      ]
+    },
+    "input_summary": {
+      "type": "object",
+      "required": [
+        "beads_state",
+        "rch_state",
+        "agent_mail_state",
+        "git_state",
+        "proof_artifact_state",
+        "publication_state",
+        "target_hardware_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "beads_state": {
+          "$ref": "#/$defs/state"
+        },
+        "rch_state": {
+          "$ref": "#/$defs/state"
+        },
+        "agent_mail_state": {
+          "$ref": "#/$defs/state"
+        },
+        "git_state": {
+          "$ref": "#/$defs/state"
+        },
+        "proof_artifact_state": {
+          "$ref": "#/$defs/state"
+        },
+        "publication_state": {
+          "$ref": "#/$defs/publication_state"
+        },
+        "target_hardware_state": {
+          "$ref": "#/$defs/state"
+        }
+      }
+    },
+    "work_class": {
+      "type": "string",
+      "enum": [
+        "static_docs_fixture_verifier",
+        "shell_jq_contract",
+        "rch_required_unit_integration",
+        "target_class_hardware_proof",
+        "operator_only_recovery",
+        "forbidden_mutation"
+      ]
+    },
+    "recommendation": {
+      "type": "string",
+      "enum": [
+        "run_now",
+        "run_next",
+        "wait",
+        "defer",
+        "block",
+        "require_operator_approval"
+      ]
+    },
+    "work_class_decision": {
+      "type": "object",
+      "required": [
+        "work_class",
+        "proof_requirement",
+        "requires_rch",
+        "requires_target_hardware",
+        "recommendation",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "work_class": {
+          "$ref": "#/$defs/work_class"
+        },
+        "proof_requirement": {
+          "type": "string",
+          "enum": [
+            "static_shell_jq",
+            "remote_cargo",
+            "target_class_remote_proof",
+            "operator_approval",
+            "forbidden"
+          ]
+        },
+        "requires_rch": {
+          "type": "boolean"
+        },
+        "requires_target_hardware": {
+          "type": "boolean"
+        },
+        "recommendation": {
+          "$ref": "#/$defs/recommendation"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        }
+      }
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "beads",
+        "rch",
+        "agent_mail",
+        "git",
+        "proof_artifact",
+        "target_hardware"
+      ]
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": [
+        "source_kind",
+        "state",
+        "freshness_state",
+        "command_or_api",
+        "raw_pane_content_stored",
+        "reason_codes",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_kind": {
+          "$ref": "#/$defs/source_kind"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "freshness_state": {
+          "$ref": "#/$defs/freshness_state"
+        },
+        "command_or_api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_pane_content_stored": {
+          "type": "boolean",
+          "const": false
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/repo_paths"
+        }
+      }
+    },
+    "lane": {
+      "type": "string",
+      "enum": [
+        "now",
+        "next",
+        "wait",
+        "blocked"
+      ]
+    },
+    "calendar_entry": {
+      "type": "object",
+      "required": [
+        "entry_id",
+        "lane",
+        "sort_key",
+        "work_class",
+        "recommendation",
+        "candidate_bead_ids",
+        "requires_rch",
+        "requires_target_hardware",
+        "requires_operator_approval",
+        "confidence",
+        "blockers",
+        "reason_codes",
+        "permitted_action_classes",
+        "forbidden_action_classes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "entry_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lane": {
+          "$ref": "#/$defs/lane"
+        },
+        "sort_key": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "work_class": {
+          "$ref": "#/$defs/work_class"
+        },
+        "recommendation": {
+          "$ref": "#/$defs/recommendation"
+        },
+        "candidate_bead_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "requires_rch": {
+          "type": "boolean"
+        },
+        "requires_target_hardware": {
+          "type": "boolean"
+        },
+        "requires_operator_approval": {
+          "type": "boolean"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low",
+            "none"
+          ]
+        },
+        "blockers": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "permitted_action_classes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/permitted_action"
+          }
+        },
+        "forbidden_action_classes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/forbidden_action"
+          }
+        }
+      }
+    },
+    "permitted_action": {
+      "type": "string",
+      "enum": [
+        "read_status",
+        "claim_bead",
+        "add_beads_comment",
+        "edit_files",
+        "run_static_check",
+        "run_rch_proof",
+        "request_approval",
+        "wait"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "agent_mail_service_repair",
+        "build_cancellation",
+        "delete_files",
+        "destructive_filesystem",
+        "destructive_git",
+        "local_cargo_proof",
+        "local_heavy_cargo_fallback",
+        "rch_daemon_restart",
+        "rch_service_repair",
+        "service_mutation",
+        "worker_mutation"
+      ]
+    },
+    "proof_policy": {
+      "type": "object",
+      "required": [
+        "rch_sync_chatter_counts_as_remote_proof",
+        "dry_run_interception_counts_as_remote_proof",
+        "local_shell_success_counts_as_remote_cargo_proof",
+        "local_cargo_fallback_allowed",
+        "remote_cargo_proof_requires_retained_artifact"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "rch_sync_chatter_counts_as_remote_proof": {
+          "type": "boolean",
+          "const": false
+        },
+        "dry_run_interception_counts_as_remote_proof": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_shell_success_counts_as_remote_cargo_proof": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_cargo_fallback_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "remote_cargo_proof_requires_retained_artifact": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "side_effect_policy": {
+      "type": "object",
+      "required": [
+        "dry_run_only",
+        "read_only",
+        "service_mutation_allowed",
+        "worker_mutation_allowed",
+        "deletion_allowed",
+        "local_heavy_cargo_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "dry_run_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "read_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "service_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "worker_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "deletion_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_heavy_cargo_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "raw_pane_content_allowed",
+        "mail_body_storage_allowed",
+        "secret_material_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "mail_body_storage_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "secret_material_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "toon_projection": {
+      "type": "object",
+      "required": [
+        "columns",
+        "rows"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "type": "array",
+          "minItems": 6,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 6,
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}
