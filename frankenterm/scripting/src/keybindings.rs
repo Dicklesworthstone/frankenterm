@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use frankenterm_dynamic::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Opaque handle for a registered keybinding.
 pub type KeybindingId = u64;
@@ -141,6 +141,24 @@ impl KeybindingRegistry {
         Self::default()
     }
 
+    fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                mutex.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn bindings_guard(&self) -> MutexGuard<'_, Vec<RegisteredBinding>> {
+        Self::lock_or_recover(&self.bindings)
+    }
+
+    fn lookup_guard(&self) -> MutexGuard<'_, HashMap<String, Vec<KeybindingId>>> {
+        Self::lock_or_recover(&self.lookup)
+    }
+
     /// Register a keybinding for an extension.
     pub fn register<F>(&self, combo: KeyCombo, extension_id: &str, handler: F) -> KeybindingId
     where
@@ -156,28 +174,23 @@ impl KeybindingRegistry {
             handler: Arc::new(handler),
         };
 
-        if let Ok(mut bindings) = self.bindings.lock() {
-            bindings.push(binding);
-        }
-
-        if let Ok(mut lookup) = self.lookup.lock() {
-            lookup.entry(canonical).or_default().push(id);
-        }
+        self.bindings_guard().push(binding);
+        self.lookup_guard().entry(canonical).or_default().push(id);
 
         id
     }
 
     /// Unregister a keybinding by handle.
     pub fn unregister(&self, id: KeybindingId) -> bool {
-        let removed = if let Ok(mut bindings) = self.bindings.lock() {
+        let removed = {
+            let mut bindings = self.bindings_guard();
             let len_before = bindings.len();
             bindings.retain(|b| b.id != id);
             bindings.len() < len_before
-        } else {
-            return false;
         };
 
-        if removed && let Ok(mut lookup) = self.lookup.lock() {
+        if removed {
+            let mut lookup = self.lookup_guard();
             for ids in lookup.values_mut() {
                 ids.retain(|&i| i != id);
             }
@@ -191,7 +204,8 @@ impl KeybindingRegistry {
     pub fn unregister_extension(&self, extension_id: &str) -> usize {
         let mut removed_ids = Vec::new();
 
-        if let Ok(mut bindings) = self.bindings.lock() {
+        {
+            let mut bindings = self.bindings_guard();
             bindings.retain(|b| {
                 if b.extension_id == extension_id {
                     removed_ids.push(b.id);
@@ -202,9 +216,8 @@ impl KeybindingRegistry {
             });
         }
 
-        if !removed_ids.is_empty()
-            && let Ok(mut lookup) = self.lookup.lock()
-        {
+        if !removed_ids.is_empty() {
+            let mut lookup = self.lookup_guard();
             for ids in lookup.values_mut() {
                 ids.retain(|id| !removed_ids.contains(id));
             }
@@ -218,20 +231,17 @@ impl KeybindingRegistry {
     pub fn dispatch(&self, combo: &KeyCombo, payload: &Value) -> Result<Vec<Action>> {
         let canonical = combo.to_string_repr();
 
-        let handlers: Vec<Arc<KeyHandlerFn>> = {
-            let lookup = self
-                .lookup
-                .lock()
-                .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let ids = {
+            let lookup = self.lookup_guard();
             let ids = match lookup.get(&canonical) {
                 Some(ids) => ids.clone(),
                 None => return Ok(vec![]),
             };
+            ids
+        };
 
-            let bindings = self
-                .bindings
-                .lock()
-                .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let handlers: Vec<Arc<KeyHandlerFn>> = {
+            let bindings = self.bindings_guard();
             ids.iter()
                 .filter_map(|id| {
                     bindings
@@ -252,15 +262,12 @@ impl KeybindingRegistry {
 
     /// Number of registered bindings.
     pub fn count(&self) -> usize {
-        self.bindings.lock().map(|b| b.len()).unwrap_or(0)
+        self.bindings_guard().len()
     }
 
     /// List all key combos currently bound.
     pub fn bound_combos(&self) -> Vec<String> {
-        self.lookup
-            .lock()
-            .map(|l| l.keys().cloned().collect())
-            .unwrap_or_default()
+        self.lookup_guard().keys().cloned().collect()
     }
 }
 
@@ -377,6 +384,54 @@ mod tests {
 
         let actions = registry.dispatch(&combo, &Value::Null).unwrap();
         assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn registry_recovers_poisoned_bindings_lock() {
+        let registry = KeybindingRegistry::new();
+        let combo = KeyCombo::parse("ctrl+p").unwrap();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.bindings.lock().unwrap();
+            panic!("simulate keybinding bindings lock poison");
+        }));
+
+        assert!(poisoned.is_err());
+        assert!(registry.bindings.is_poisoned());
+
+        registry.register(combo.clone(), "ext", |_| {
+            Ok(vec![Action::Log {
+                level: crate::types::LogLevel::Info,
+                message: "recovered binding".to_string(),
+            }])
+        });
+
+        assert!(!registry.bindings.is_poisoned());
+        assert_eq!(registry.count(), 1);
+        let actions = registry.dispatch(&combo, &Value::Null).unwrap();
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn registry_recovers_poisoned_lookup_lock() {
+        let registry = KeybindingRegistry::new();
+        let combo = KeyCombo::parse("ctrl+l").unwrap();
+        let id = registry.register(combo.clone(), "ext", |_| Ok(vec![]));
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.lookup.lock().unwrap();
+            panic!("simulate keybinding lookup lock poison");
+        }));
+
+        assert!(poisoned.is_err());
+        assert!(registry.lookup.is_poisoned());
+
+        assert_eq!(registry.bound_combos(), vec!["ctrl+l".to_string()]);
+        assert!(!registry.lookup.is_poisoned());
+        assert!(registry.dispatch(&combo, &Value::Null).unwrap().is_empty());
+
+        assert!(registry.unregister(id));
+        assert!(registry.bound_combos().is_empty());
     }
 
     // ===================================================================
