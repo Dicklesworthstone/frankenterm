@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-rch-worker-storage-recovery-proof.json",
+  "title": "FrankenTerm RCH Worker Storage Recovery Proof",
+  "description": "Post-recovery RCH admission proof gate for operator-approved worker storage recovery. The gate proves that remote-required RCH reaches remote Cargo again or records a precise stable blocker; it does not authorize cleanup, service repair, worker mutation, or local Cargo fallback.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "proof_id",
+    "source_bead",
+    "approval_contract_id",
+    "approval_artifact_path",
+    "approval_artifact_sha256",
+    "operator_recovery_reference",
+    "gate_result",
+    "admission_recovered",
+    "ft4tp7g_closeout_allowed",
+    "stable_reason_code",
+    "agent_side_effect_policy",
+    "rch_status",
+    "remote_required_dry_run",
+    "remote_required_smoke",
+    "br_dep_cycles",
+    "artifact_paths",
+    "forbidden_actions",
+    "notes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.rch_worker_storage_recovery_proof.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "proof_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_bead": {
+      "type": "string",
+      "const": "ft-5xwsu.3"
+    },
+    "approval_contract_id": {
+      "type": "string",
+      "const": "ft.rch_worker_storage_approval.v1"
+    },
+    "approval_artifact_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "approval_artifact_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "operator_recovery_reference": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "gate_result": {
+      "$ref": "#/$defs/gate_result"
+    },
+    "admission_recovered": {
+      "type": "boolean"
+    },
+    "ft4tp7g_closeout_allowed": {
+      "type": "boolean"
+    },
+    "stable_reason_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "agent_side_effect_policy": {
+      "$ref": "#/$defs/agent_side_effect_policy"
+    },
+    "rch_status": {
+      "$ref": "#/$defs/rch_status"
+    },
+    "remote_required_dry_run": {
+      "$ref": "#/$defs/rch_probe"
+    },
+    "remote_required_smoke": {
+      "$ref": "#/$defs/rch_probe"
+    },
+    "br_dep_cycles": {
+      "$ref": "#/$defs/br_dep_cycles"
+    },
+    "artifact_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      },
+      "uniqueItems": true
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gate_result": {
+      "type": "string",
+      "enum": [
+        "passed_remote_smoke",
+        "blocked_no_admissible_worker",
+        "blocked_new_reason",
+        "failed_remote_smoke",
+        "invalid_missing_approval"
+      ]
+    },
+    "daemon_posture": {
+      "type": "string",
+      "enum": [
+        "healthy",
+        "degraded",
+        "unreachable"
+      ]
+    },
+    "transfer_state": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "skipped_no_worker",
+        "skipped_dry_run_only",
+        "failed",
+        "not_attempted"
+      ]
+    },
+    "remote_execution_state": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "failed",
+        "skipped_no_worker",
+        "skipped_dry_run_only",
+        "not_attempted"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "run_local_cargo_as_proof",
+        "restart_agent_mail",
+        "repair_agent_mail_db",
+        "restart_rch_daemon",
+        "mutate_rch_worker",
+        "cancel_other_agent_build",
+        "delete_files_without_approval",
+        "run_agent_cleanup",
+        "mutate_remote_mirror",
+        "destructive_git",
+        "close_ft4tp7g_without_remote_evidence"
+      ]
+    },
+    "agent_side_effect_policy": {
+      "type": "object",
+      "required": [
+        "read_only_evidence_collection",
+        "agent_performed_recovery",
+        "agent_mail_repaired",
+        "agent_mail_restarted",
+        "rch_daemon_restarted",
+        "worker_mutated_by_agent",
+        "build_cancelled",
+        "files_deleted_by_agent",
+        "remote_mirror_mutated",
+        "local_cargo_counted_as_proof"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "read_only_evidence_collection": {
+          "type": "boolean",
+          "const": true
+        },
+        "agent_performed_recovery": {
+          "type": "boolean",
+          "const": false
+        },
+        "agent_mail_repaired": {
+          "type": "boolean",
+          "const": false
+        },
+        "agent_mail_restarted": {
+          "type": "boolean",
+          "const": false
+        },
+        "rch_daemon_restarted": {
+          "type": "boolean",
+          "const": false
+        },
+        "worker_mutated_by_agent": {
+          "type": "boolean",
+          "const": false
+        },
+        "build_cancelled": {
+          "type": "boolean",
+          "const": false
+        },
+        "files_deleted_by_agent": {
+          "type": "boolean",
+          "const": false
+        },
+        "remote_mirror_mutated": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_cargo_counted_as_proof": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "rch_status": {
+      "type": "object",
+      "required": [
+        "command",
+        "rch_version",
+        "daemon_posture",
+        "workers_total",
+        "workers_healthy",
+        "available_slots",
+        "active_builds",
+        "queued_builds",
+        "critical_pressure_workers",
+        "telemetry_gap_workers",
+        "artifact_path",
+        "artifact_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "string",
+          "const": "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs"
+        },
+        "rch_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "daemon_posture": {
+          "$ref": "#/$defs/daemon_posture"
+        },
+        "workers_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "workers_healthy": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "available_slots": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "active_builds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queued_builds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "critical_pressure_workers": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "telemetry_gap_workers": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "rch_probe": {
+      "type": "object",
+      "required": [
+        "required",
+        "command",
+        "target_dir",
+        "classification",
+        "would_intercept",
+        "selected_worker",
+        "selection_reason",
+        "transfer_state",
+        "remote_execution_state",
+        "exit_status",
+        "artifact_path",
+        "artifact_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_dir": {
+          "type": "string",
+          "pattern": "^/tmp/ft-[a-z0-9-]+$"
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "cargo_test",
+            "cargo_check",
+            "cargo_clippy",
+            "status_only"
+          ]
+        },
+        "would_intercept": {
+          "type": "boolean",
+          "const": true
+        },
+        "selected_worker": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "selection_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "transfer_state": {
+          "$ref": "#/$defs/transfer_state"
+        },
+        "remote_execution_state": {
+          "$ref": "#/$defs/remote_execution_state"
+        },
+        "exit_status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "br_dep_cycles": {
+      "type": "object",
+      "required": [
+        "command",
+        "count",
+        "artifact_path",
+        "artifact_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "string",
+          "const": "br dep cycles --json"
+        },
+        "count": {
+          "type": "integer",
+          "const": 0
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

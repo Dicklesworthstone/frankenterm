@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_recovery_proof.fixture_manifest.v1",
+  "bead": "ft-5xwsu.3",
+  "schema": "docs/json-schema/ft-rch-worker-storage-recovery-proof.json",
+  "contract": "docs/robot-contracts/rch-worker-storage-recovery-proof.md",
+  "valid": [
+    "fixtures/rch-worker-storage-recovery-proof/valid/passed-remote-smoke.json",
+    "fixtures/rch-worker-storage-recovery-proof/valid/blocked-no-admissible-worker.json",
+    "fixtures/rch-worker-storage-recovery-proof/valid/blocked-new-reason.json",
+    "fixtures/rch-worker-storage-recovery-proof/valid/failed-remote-smoke.json"
+  ],
+  "invalid": [],
+  "verification": [
+    "jq empty docs/json-schema/ft-rch-worker-storage-recovery-proof.json fixtures/rch-worker-storage-recovery-proof/manifest.json fixtures/rch-worker-storage-recovery-proof/valid/*.json",
+    "bash tests/e2e/test_rch_worker_storage_recovery_proof_contract.sh"
+  ]
+}

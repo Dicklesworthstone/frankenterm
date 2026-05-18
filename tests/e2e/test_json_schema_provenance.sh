@@ -23,10 +23,11 @@ require_file() {
 }
 
 require_command jq
+require_command git
 require_command ruby
 require_file "${PROVENANCE}"
 
-mapfile -t schema_paths < <(find "${SCHEMA_DIR}" -maxdepth 1 -type f -name '*.json' | sort)
+mapfile -t schema_paths < <(git ls-files --cached "${SCHEMA_DIR}/*.json" | sort)
 ((${#schema_paths[@]} > 0)) || fail "no schema files found under ${SCHEMA_DIR}"
 
 jq empty "${schema_paths[@]}"
@@ -42,11 +43,17 @@ def fail!(message)
   exit 1
 end
 
-schema_files = Dir[File.join(SCHEMA_DIR, "*.json")].map { |path| File.basename(path) }.sort
+schema_files = IO.popen(["git", "ls-files", "--cached", "#{SCHEMA_DIR}/*.json"], &:read)
+  .lines
+  .map { |path| File.basename(path.chomp) }
+  .sort
 fail!("no schema files found under #{SCHEMA_DIR}") if schema_files.empty?
 
 rows = []
-File.readlines(PROVENANCE, chomp: true).each_with_index do |line, index|
+provenance_text = IO.popen(["git", "show", ":#{PROVENANCE}"], &:read)
+fail!("could not read staged #{PROVENANCE}") if provenance_text.nil? || provenance_text.empty?
+
+provenance_text.lines(chomp: true).each_with_index do |line, index|
   next unless line =~ /^\|\s*`([^`]+\.json)`\s*\|/
 
   columns = line.split("|", -1).map(&:strip)

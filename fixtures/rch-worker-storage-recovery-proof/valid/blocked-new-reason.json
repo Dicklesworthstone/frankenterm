@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_recovery_proof.v1",
+  "generated_at_ms": 1770010800000,
+  "proof_id": "blocked-new-reason",
+  "source_bead": "ft-5xwsu.3",
+  "approval_contract_id": "ft.rch_worker_storage_approval.v1",
+  "approval_artifact_path": "artifacts/rch-worker-storage-approval/20260518T040000Z/approved-candidate.json",
+  "approval_artifact_sha256": "7171717171717171717171717171717171717171717171717171717171717171",
+  "operator_recovery_reference": "operator://jemanuel/rch-worker-storage/20260518T050000Z",
+  "gate_result": "blocked_new_reason",
+  "admission_recovered": false,
+  "ft4tp7g_closeout_allowed": false,
+  "stable_reason_code": "ssh_unreachable=vmi1156319",
+  "agent_side_effect_policy": {
+    "read_only_evidence_collection": true,
+    "agent_performed_recovery": false,
+    "agent_mail_repaired": false,
+    "agent_mail_restarted": false,
+    "rch_daemon_restarted": false,
+    "worker_mutated_by_agent": false,
+    "build_cancelled": false,
+    "files_deleted_by_agent": false,
+    "remote_mirror_mutated": false,
+    "local_cargo_counted_as_proof": false
+  },
+  "rch_status": {
+    "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs",
+    "rch_version": "1.0.26",
+    "daemon_posture": "degraded",
+    "workers_total": 8,
+    "workers_healthy": 4,
+    "available_slots": 44,
+    "active_builds": 0,
+    "queued_builds": 0,
+    "critical_pressure_workers": 0,
+    "telemetry_gap_workers": 1,
+    "artifact_path": "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/status-workers-jobs.json",
+    "artifact_sha256": "7272727272727272727272727272727272727272727272727272727272727272"
+  },
+  "remote_required_dry_run": {
+    "required": true,
+    "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch diagnose --json --dry-run -- env CARGO_TARGET_DIR=/tmp/ft-rch-recovery-proof-dryrun CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core-replay-types -- --nocapture",
+    "target_dir": "/tmp/ft-rch-recovery-proof-dryrun",
+    "classification": "cargo_test",
+    "would_intercept": true,
+    "selected_worker": null,
+    "selection_reason": "no_admissible_workers=ssh_unreachable=vmi1156319",
+    "transfer_state": "skipped_no_worker",
+    "remote_execution_state": "skipped_no_worker",
+    "exit_status": null,
+    "artifact_path": "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/dry-run.json",
+    "artifact_sha256": "7373737373737373737373737373737373737373737373737373737373737373"
+  },
+  "remote_required_smoke": {
+    "required": false,
+    "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec --no-self-healing -- env CARGO_TARGET_DIR=/tmp/ft-rch-recovery-proof-smoke CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core-replay-types -- --nocapture",
+    "target_dir": "/tmp/ft-rch-recovery-proof-smoke",
+    "classification": "cargo_test",
+    "would_intercept": true,
+    "selected_worker": null,
+    "selection_reason": "skipped because dry-run selected no admissible worker",
+    "transfer_state": "skipped_no_worker",
+    "remote_execution_state": "skipped_no_worker",
+    "exit_status": null,
+    "artifact_path": "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/remote-smoke-skipped.json",
+    "artifact_sha256": "7474747474747474747474747474747474747474747474747474747474747474"
+  },
+  "br_dep_cycles": {
+    "command": "br dep cycles --json",
+    "count": 0,
+    "artifact_path": "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/br-dep-cycles.json",
+    "artifact_sha256": "7575757575757575757575757575757575757575757575757575757575757575"
+  },
+  "artifact_paths": [
+    "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/status-workers-jobs.json",
+    "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/dry-run.json",
+    "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/remote-smoke-skipped.json",
+    "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/br-dep-cycles.json"
+  ],
+  "forbidden_actions": [
+    "run_local_cargo_as_proof",
+    "restart_agent_mail",
+    "repair_agent_mail_db",
+    "restart_rch_daemon",
+    "mutate_rch_worker",
+    "cancel_other_agent_build",
+    "delete_files_without_approval",
+    "run_agent_cleanup",
+    "mutate_remote_mirror",
+    "destructive_git",
+    "close_ft4tp7g_without_remote_evidence"
+  ],
+  "notes": [
+    "Negative fixture: storage pressure is no longer the selected reason, but admission is still blocked by a new stable reason code."
+  ]
+}
