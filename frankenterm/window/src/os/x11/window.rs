@@ -1,14 +1,14 @@
 use super::*;
 use crate::bitmaps::*;
 use crate::connection::ConnectionOps;
-use crate::os::{xkeysyms, Connection, Window};
+use crate::os::{Connection, Window, xkeysyms};
 use crate::{
     Appearance, Clipboard, DeadKeyStatus, Dimensions, MouseButtons, MouseCursor, MouseEvent,
     MouseEventKind, MousePress, Point, Rect, RequestedWindowGeometry, ResizeIncrement,
     ResolvedGeometry, ScreenPoint, ScreenRect, WindowDecorations, WindowEvent, WindowEventSender,
     WindowOps, WindowState,
 };
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
@@ -781,8 +781,8 @@ impl XWindowInner {
             }
             Event::X(xcb::x::Event::ClientMessage(msg)) => {
                 let type_atom_name = conn.atom_name(msg.r#type());
-                use xcb::x::ClientMessageData;
                 use xcb::XidNew;
+                use xcb::x::ClientMessageData;
                 let xdnd_msgtype_atoms = [
                     conn.atom_xdndenter,
                     conn.atom_xdndposition,
@@ -1583,9 +1583,7 @@ impl XWindow {
             data: &[5u32],
         })?;
 
-        window
-            .lock()
-            .map_err(|_| anyhow!("X11 window lock poisoned"))?
+        super::connection::lock_window_inner(&window, "adjusting initial X11 decorations")
             .adjust_decorations(config.window_decorations)?;
 
         let window_handle = Window::X11(XWindow::from_id(window_id));
@@ -2002,7 +2000,8 @@ impl HasWindowHandle for XWindow {
             return Err(HandleError::Unavailable);
         };
 
-        let inner = handle.lock().map_err(|_| HandleError::Unavailable)?;
+        let inner =
+            super::connection::lock_window_inner(&handle, "borrowing X11 raw window handle");
         let handle = inner.window_handle()?;
         unsafe { Ok(WindowHandle::borrow_raw(handle.as_raw())) }
     }
@@ -2018,9 +2017,8 @@ impl WindowOps for XWindow {
             };
 
             if let Some(handle) = connection.x11().window_by_id(window) {
-                let mut inner = handle
-                    .lock()
-                    .map_err(|_| anyhow!("X11 window lock poisoned"))?;
+                let mut inner =
+                    super::connection::lock_window_inner(&handle, "enabling OpenGL for X11 window");
                 inner.enable_opengl()
             } else {
                 anyhow::bail!("invalid window");
@@ -2332,11 +2330,7 @@ enum NetWmStateAction {
 
 impl NetWmStateAction {
     fn with_bool(enable: bool) -> Self {
-        if enable {
-            Self::Add
-        } else {
-            Self::Remove
-        }
+        if enable { Self::Add } else { Self::Remove }
     }
 }
 

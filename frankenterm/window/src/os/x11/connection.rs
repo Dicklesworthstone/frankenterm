@@ -1,19 +1,19 @@
 use super::keyboard::{Keyboard, KeyboardWithFallback};
 use crate::connection::{
-    fail_window_op_for_destroyed_window, new_window_op_promise, ConnectionOps,
+    ConnectionOps, fail_window_op_for_destroyed_window, new_window_op_promise,
 };
+use crate::os::Connection;
 use crate::os::x11::window::XWindowInner;
 use crate::os::x11::xsettings::*;
-use crate::os::Connection;
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
 use crate::{Appearance, DeadKeyStatus, ScreenRect};
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{Context as _, anyhow, bail};
 // br-ft-kxopr: layering inverted; sub-crate extracted under
 // `frankenterm-core-x11-resize-types` so this import points
 // DOWN into a leaf sub-crate instead of UP into frankenterm-core.
 use frankenterm_core_x11_resize_types::{
-    classify_x11_window_manager, LiveResizeAtomSupport, X11WindowManager,
+    LiveResizeAtomSupport, X11WindowManager, classify_x11_window_manager,
 };
 use mio::event::Source;
 use mio::unix::SourceFd;
@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use x11::xlib;
 use xcb::x::Atom;
-use xcb::{dri2, Raw, Xid};
+use xcb::{Raw, Xid, dri2};
 
 enum ScreenResources {
     Current(xcb::randr::GetScreenResourcesCurrentReply),
@@ -52,6 +52,32 @@ impl ScreenResources {
             Self::Current(cur) => cur.modes(),
             Self::All(all) => all.modes(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn lock_poison_recovering_clears_poisoned_mutex() {
+        let lock = Mutex::new(Vec::from([1_u8]));
+
+        let poison_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lock.lock().expect("initial lock for poison test");
+            panic!("poison X11 helper lock");
+        }));
+        assert!(poison_result.is_err());
+        assert!(lock.is_poisoned());
+
+        {
+            let mut guard = lock_poison_recovering(&lock, "unit test recovery");
+            guard.push(2);
+        }
+
+        assert!(!lock.is_poisoned());
+        assert_eq!(*lock.lock().expect("lock after clear_poison"), vec![1, 2]);
     }
 }
 
@@ -460,14 +486,19 @@ fn compute_default_dpi(xrm: &HashMap<String, String>, xsettings: &XSettingsMap) 
     }
 }
 
-fn lock_window_inner<'a>(
+fn lock_poison_recovering<'a, T>(lock: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        log::warn!("recovering poisoned X11 window lock while {context}");
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+pub(super) fn lock_window_inner<'a>(
     window: &'a Arc<Mutex<XWindowInner>>,
     context: &str,
 ) -> MutexGuard<'a, XWindowInner> {
-    window.lock().unwrap_or_else(|poisoned| {
-        log::warn!("recovering poisoned X11 window lock while {context}");
-        poisoned.into_inner()
-    })
+    lock_poison_recovering(window, context)
 }
 
 impl XConnection {
