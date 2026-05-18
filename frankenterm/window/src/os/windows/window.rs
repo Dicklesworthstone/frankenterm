@@ -7,7 +7,7 @@ use crate::{
     RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations,
     WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use frankenterm_font::FontConfiguration;
@@ -590,11 +590,12 @@ impl Window {
             invalidated: true,
         }));
 
+        let conn = Connection::get().ok_or_else(|| {
+            anyhow!("new_window must be called after Connection::init has succeeded")
+        })?;
+
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
         let raw = rc_to_pointer(&inner);
-
-        let conn = Connection::get().expect("Connection::init was not called");
-
         let geometry = conn.resolve_geometry(geometry);
 
         let hwnd = match Self::create_window(config, class_name, name, geometry, raw) {
