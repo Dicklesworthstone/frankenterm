@@ -1132,7 +1132,11 @@ impl WaylandWindowInner {
     }
 
     fn set_text_cursor_position(&mut self, rect: Rect) {
-        let conn = WaylandConnection::get().unwrap().wayland();
+        let Some(conn) = WaylandConnection::get() else {
+            log::debug!("Dropping Wayland text cursor update: connection unavailable");
+            return;
+        };
+        let conn = conn.wayland();
         let state = conn.wayland_state.borrow();
         let surface = self.surface().clone();
         let active_surface_id = state.active_surface_id.borrow();
