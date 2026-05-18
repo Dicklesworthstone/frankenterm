@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail};
 use smithay_client_toolkit as toolkit;
-use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::io::{ErrorKind, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 use toolkit::data_device_manager::data_offer::SelectionOffer;
 use toolkit::data_device_manager::{ReadPipe, WritePipe};
@@ -114,15 +114,40 @@ pub(super) fn write_selection_to_pipe(fd: WritePipe, text: &str) {
     }
 }
 
-fn write_pipe_with_timeout(mut file: WritePipe, data: &[u8]) -> anyhow::Result<()> {
-    // set non-blocking I/O on the pipe
-    // (adapted from FileDescriptor::set_non_blocking_impl in /filedescriptor/src/unix.rs)
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
-        bail!(
-            "failed to change non-blocking mode: {}",
-            std::io::Error::last_os_error()
-        )
+pub(super) fn set_pipe_nonblocking(fd: RawFd) -> anyhow::Result<()> {
+    let flags = loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags != -1 {
+            break flags;
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        bail!("failed to read pipe status flags: {err}");
+    };
+
+    if flags & libc::O_NONBLOCK != 0 {
+        return Ok(());
     }
+
+    loop {
+        let status = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if status != -1 {
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        bail!("failed to change non-blocking mode: {err}");
+    }
+}
+
+fn write_pipe_with_timeout(mut file: WritePipe, data: &[u8]) -> anyhow::Result<()> {
+    set_pipe_nonblocking(file.as_raw_fd())?;
 
     let mut pfd = libc::pollfd {
         fd: file.as_raw_fd(),
@@ -133,18 +158,33 @@ fn write_pipe_with_timeout(mut file: WritePipe, data: &[u8]) -> anyhow::Result<(
     let mut buf = data;
 
     while !buf.is_empty() {
-        if unsafe { libc::poll(&mut pfd, 1, 3000) == 1 } {
-            match file.write(buf) {
-                Ok(size) if size == 0 => {
-                    bail!("zero byte write");
-                }
-                Ok(size) => {
-                    buf = &buf[size..];
-                }
-                Err(e) => bail!("error writing to pipe: {}", e),
+        pfd.revents = 0;
+        let poll_result = unsafe { libc::poll(&mut pfd, 1, 3000) };
+        if poll_result > 0 {
+            let unavailable = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            if pfd.revents & unavailable != 0 {
+                bail!("write pipe became unavailable: revents={:#x}", pfd.revents);
             }
-        } else {
+            if pfd.revents & libc::POLLOUT == 0 {
+                continue;
+            }
+
+            match file.write(buf) {
+                Ok(0) => bail!("zero byte write"),
+                Ok(size) => buf = &buf[size..],
+                Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
+                    continue;
+                }
+                Err(e) => bail!("error writing to pipe: {e}"),
+            }
+        } else if poll_result == 0 {
             bail!("timed out writing to pipe");
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            bail!("error polling write pipe: {err}");
         }
     }
 
@@ -191,5 +231,56 @@ impl PrimarySelectionSourceHandler for WaylandState {
     ) {
         self.primary_selection_source.take();
         source.destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{set_pipe_nonblocking, write_pipe_with_timeout};
+    use smithay_client_toolkit::data_device_manager::WritePipe;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+    fn pipe_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn set_pipe_nonblocking_preserves_existing_status_flags() {
+        let (_read_fd, write_fd) = pipe_pair();
+        let fd = write_fd.as_raw_fd();
+        let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_ne!(original, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, original | libc::O_APPEND) },
+            0
+        );
+
+        set_pipe_nonblocking(fd).unwrap();
+
+        let updated = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_ne!(updated, -1);
+        assert_ne!(updated & libc::O_NONBLOCK, 0);
+        assert_ne!(updated & libc::O_APPEND, 0);
+    }
+
+    #[test]
+    fn write_pipe_with_timeout_writes_large_payload() {
+        let (read_fd, write_fd) = pipe_pair();
+        let reader = std::thread::spawn(move || {
+            let mut file = File::from(read_fd);
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let payload = vec![b'x'; 128 * 1024];
+        let write_pipe = unsafe { WritePipe::from_raw_fd(write_fd.into_raw_fd()) };
+
+        write_pipe_with_timeout(write_pipe, &payload).unwrap();
+
+        assert_eq!(reader.join().unwrap(), payload);
     }
 }

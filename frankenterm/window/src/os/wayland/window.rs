@@ -2,7 +2,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::max;
 use std::convert::TryInto;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::num::NonZeroU32;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -80,7 +80,7 @@ impl WaylandDimensions for Dimensions {
     }
 }
 
-use super::copy_and_paste::CopyAndPaste;
+use super::copy_and_paste::{set_pipe_nonblocking, CopyAndPaste};
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
@@ -598,14 +598,7 @@ pub(crate) struct PendingEvent {
 pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<String> {
     let mut result = Vec::new();
 
-    // set non-blocking I/O on the pipe
-    // (adapted from FileDescriptor::set_non_blocking_impl in /filedescriptor/src/unix.rs)
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
-        bail!(
-            "failed to change non-blocking mode: {}",
-            std::io::Error::last_os_error()
-        )
-    }
+    set_pipe_nonblocking(file.as_raw_fd())?;
 
     let mut pfd = libc::pollfd {
         fd: file.as_raw_fd(),
@@ -616,7 +609,19 @@ pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<Strin
     let mut buf = [0u8; 8192];
 
     loop {
-        if unsafe { libc::poll(&mut pfd, 1, 3000) == 1 } {
+        pfd.revents = 0;
+        let poll_result = unsafe { libc::poll(&mut pfd, 1, 3000) };
+        if poll_result > 0 {
+            if pfd.revents & libc::POLLNVAL != 0 {
+                bail!("read pipe became invalid: revents={:#x}", pfd.revents);
+            }
+            if pfd.revents & libc::POLLIN == 0 {
+                if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                    break;
+                }
+                continue;
+            }
+
             match file.read(&mut buf) {
                 Ok(size) if size == 0 => {
                     break;
@@ -624,10 +629,19 @@ pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<Strin
                 Ok(size) => {
                     result.extend_from_slice(&buf[..size]);
                 }
-                Err(e) => bail!("error reading from pipe: {}", e),
+                Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
+                    continue;
+                }
+                Err(e) => bail!("error reading from pipe: {e}"),
             }
-        } else {
+        } else if poll_result == 0 {
             bail!("timed out reading from pipe");
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            bail!("error polling read pipe: {err}");
         }
     }
 
@@ -1421,11 +1435,23 @@ impl WaylandWindowInner {
 
 #[cfg(test)]
 mod tests {
-    use super::{new_pending_first_configure, resolve_pending_first_configure};
+    use super::{
+        new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
+    };
     use promise::BrokenPromise;
+    use smithay_client_toolkit::data_device_manager::ReadPipe;
+    use std::fs::File;
     use std::future::Future as StdFuture;
+    use std::io::Write;
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
+
+    fn pipe_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
 
     #[test]
     fn pending_first_configure_future_resolves_after_notification() {
@@ -1484,6 +1510,23 @@ mod tests {
             }
             other => panic!("expected Ready(Err(BrokenPromise)), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_pipe_with_timeout_reads_large_payload() {
+        let (read_fd, write_fd) = pipe_pair();
+        let payload = vec![b'y'; 128 * 1024];
+        let writer_payload = payload.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = File::from(write_fd);
+            file.write_all(&writer_payload).unwrap();
+        });
+        let read_pipe = unsafe { ReadPipe::from_raw_fd(read_fd.into_raw_fd()) };
+
+        let text = read_pipe_with_timeout(read_pipe).unwrap();
+
+        writer.join().unwrap();
+        assert_eq!(text.as_bytes(), payload);
     }
 }
 
