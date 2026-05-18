@@ -7,7 +7,7 @@
 //! - [`ReplayError`] — Structured error type with event context.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 // ============================================================================
 // FailureMode — deterministic failure semantics
@@ -291,11 +291,24 @@ impl ReplayCheckpointer {
         )
     }
 
+    fn lock_inner(&self) -> MutexGuard<'_, CheckpointerInner> {
+        match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => {
+                tracing::warn!(
+                    replay_run_id = %self.replay_run_id,
+                    "replay checkpointer mutex poisoned; recovering owned checkpoint state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Record a successfully processed event.
     ///
     /// Returns whether a checkpoint was triggered.
     pub fn advance(&self, virtual_clock_ms: u64, wall_clock_ms: u64) -> ProcessResult {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         if inner.halted {
             return ProcessResult::Halted("replay already halted".into());
         }
@@ -330,19 +343,19 @@ impl ReplayCheckpointer {
 
     /// Record a decision.
     pub fn record_decision(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.state.decisions_made += 1;
     }
 
     /// Record a side effect logged.
     pub fn record_effect(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.state.effects_logged += 1;
     }
 
     /// Record an anomaly.
     pub fn record_anomaly(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.state.anomalies_detected += 1;
     }
 
@@ -350,7 +363,7 @@ impl ReplayCheckpointer {
     ///
     /// Behavior depends on the configured failure mode.
     pub fn handle_error(&self, error: ReplayError, wall_clock_ms: u64) -> ProcessResult {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.errors.push(error.clone());
 
         match self.failure_mode {
@@ -379,50 +392,50 @@ impl ReplayCheckpointer {
 
     /// Mark replay as complete.
     pub fn complete(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.completed = true;
     }
 
     /// Whether replay has been halted.
     #[must_use]
     pub fn is_halted(&self) -> bool {
-        self.inner.lock().unwrap().halted
+        self.lock_inner().halted
     }
 
     /// Whether replay has completed successfully.
     #[must_use]
     pub fn is_completed(&self) -> bool {
-        self.inner.lock().unwrap().completed
+        self.lock_inner().completed
     }
 
     /// Get the current state (snapshot).
     #[must_use]
     pub fn current_state(&self) -> CheckpointState {
-        self.inner.lock().unwrap().state.clone()
+        self.lock_inner().state.clone()
     }
 
     /// Get all saved checkpoints.
     #[must_use]
     pub fn checkpoints(&self) -> Vec<CheckpointState> {
-        self.inner.lock().unwrap().checkpoints.clone()
+        self.lock_inner().checkpoints.clone()
     }
 
     /// Number of checkpoints written.
     #[must_use]
     pub fn checkpoint_count(&self) -> usize {
-        self.inner.lock().unwrap().checkpoints.len()
+        self.lock_inner().checkpoints.len()
     }
 
     /// Get all errors encountered.
     #[must_use]
     pub fn errors(&self) -> Vec<ReplayError> {
-        self.inner.lock().unwrap().errors.clone()
+        self.lock_inner().errors.clone()
     }
 
     /// Get the last checkpoint (for resume).
     #[must_use]
     pub fn last_checkpoint(&self) -> Option<CheckpointState> {
-        self.inner.lock().unwrap().checkpoints.last().cloned()
+        self.lock_inner().checkpoints.last().cloned()
     }
 
     /// Resume from a checkpoint state.
@@ -453,7 +466,7 @@ impl ReplayCheckpointer {
                 actual: checkpoint.replay_run_id.clone(),
             });
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.state = checkpoint.clone();
         inner.events_since_checkpoint = 0;
         inner.last_checkpoint_wall_ms = checkpoint.checkpoint_created_ms;
@@ -471,7 +484,7 @@ impl ReplayCheckpointer {
     /// Generate a replay report.
     #[must_use]
     pub fn report(&self, total_events: u64, wall_duration_ms: u64) -> ReplayReport {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         ReplayReport {
             replay_run_id: self.replay_run_id.clone(),
             total_events,
@@ -493,7 +506,7 @@ impl ReplayCheckpointer {
 
     /// Set the effect log hash (called when log is serialized).
     pub fn set_effect_log_hash(&self, hash: String) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.state.effect_log_hash = hash;
     }
 }
@@ -917,6 +930,35 @@ mod tests {
         let ckpt = ReplayCheckpointer::with_defaults("run_hash".into());
         ckpt.set_effect_log_hash("abc123".into());
         assert_eq!(ckpt.current_state().effect_log_hash, "abc123");
+    }
+
+    #[test]
+    fn checkpointer_recovers_after_poisoned_inner_lock() {
+        let ckpt = ReplayCheckpointer::with_defaults("run_poison".into());
+        ckpt.advance(10, 100);
+
+        let poison_result = std::panic::catch_unwind(|| {
+            let _guard = ckpt.inner.lock().unwrap();
+            panic!("poison replay checkpoint state for regression coverage");
+        });
+        assert!(poison_result.is_err());
+
+        ckpt.record_decision();
+        ckpt.record_effect();
+        ckpt.record_anomaly();
+        ckpt.complete();
+
+        let state = ckpt.current_state();
+        assert_eq!(state.event_position, 1);
+        assert_eq!(state.decisions_made, 1);
+        assert_eq!(state.effects_logged, 1);
+        assert_eq!(state.anomalies_detected, 1);
+        assert!(ckpt.is_completed());
+
+        let report = ckpt.report(1, 50);
+        assert!(report.is_success());
+        assert_eq!(report.events_replayed, 1);
+        assert_eq!(report.decisions_made, 1);
     }
 
     // ── Serde ────────────────────────────────────────────────────────
