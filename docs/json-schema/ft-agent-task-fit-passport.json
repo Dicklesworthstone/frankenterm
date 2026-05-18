@@ -1,0 +1,626 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-agent-task-fit-passport.json",
+  "title": "FrankenTerm Agent Task-Fit Passport",
+  "description": "Read-only mission-planner contract for explaining agent/task assignment fit from redacted outcomes, availability, proof, and ownership evidence.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source_bead",
+    "dry_run",
+    "read_only",
+    "planner_context",
+    "agent_identity",
+    "claimed_domains",
+    "evidence",
+    "fit_summary",
+    "recommendation",
+    "decay_policy",
+    "safeguards",
+    "forbidden_actions",
+    "artifact_paths",
+    "toon_projection"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.agent_task_fit_passport.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_bead": {
+      "type": "string",
+      "const": "ft-auy2g.9"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "const": true
+    },
+    "read_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "planner_context": {
+      "$ref": "#/$defs/planner_context"
+    },
+    "agent_identity": {
+      "$ref": "#/$defs/agent_identity"
+    },
+    "claimed_domains": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/claimed_domain"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/evidence_row"
+      }
+    },
+    "fit_summary": {
+      "$ref": "#/$defs/fit_summary"
+    },
+    "recommendation": {
+      "$ref": "#/$defs/recommendation"
+    },
+    "decay_policy": {
+      "$ref": "#/$defs/decay_policy"
+    },
+    "safeguards": {
+      "$ref": "#/$defs/safeguards"
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "artifact_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "toon_projection": {
+      "$ref": "#/$defs/toon_projection"
+    }
+  },
+  "$defs": {
+    "planner_context": {
+      "type": "object",
+      "required": [
+        "objective_id",
+        "task_bead_id",
+        "task_domain",
+        "work_class",
+        "proof_requirement",
+        "mission_objective_plan_ref"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "objective_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_bead_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "work_class": {
+          "$ref": "#/$defs/work_class"
+        },
+        "proof_requirement": {
+          "$ref": "#/$defs/proof_requirement"
+        },
+        "mission_objective_plan_ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "agent_identity": {
+      "type": "object",
+      "required": [
+        "agent_id",
+        "program",
+        "model",
+        "active_role",
+        "identity_source",
+        "human_subject",
+        "redaction_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "program": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "identity_source": {
+          "type": "string",
+          "enum": [
+            "agent_mail_profile",
+            "beads_assignee",
+            "robot_inventory",
+            "manual_redacted_fixture"
+          ]
+        },
+        "human_subject": {
+          "type": "boolean",
+          "const": false
+        },
+        "redaction_state": {
+          "$ref": "#/$defs/redaction_state"
+        }
+      }
+    },
+    "claimed_domain": {
+      "type": "object",
+      "required": [
+        "domain",
+        "ownership_state",
+        "source_artifact",
+        "freshness_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownership_state": {
+          "type": "string",
+          "enum": [
+            "none",
+            "claimed",
+            "reserved",
+            "active_conflict",
+            "stale_claim"
+          ]
+        },
+        "source_artifact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "freshness_state": {
+          "$ref": "#/$defs/freshness_state"
+        }
+      }
+    },
+    "evidence_row": {
+      "type": "object",
+      "required": [
+        "evidence_id",
+        "source_kind",
+        "category",
+        "quality",
+        "freshness_state",
+        "redaction_state",
+        "confidence",
+        "source_artifact",
+        "summary",
+        "raw_pane_content_stored",
+        "mail_body_stored",
+        "secret_material_stored",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_kind": {
+          "type": "string",
+          "enum": [
+            "beads_closeout",
+            "rch_proof",
+            "agent_mail_handoff",
+            "pane_runtime_state",
+            "git_publication",
+            "manual_fixture"
+          ]
+        },
+        "category": {
+          "$ref": "#/$defs/evidence_category"
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "strong",
+            "usable",
+            "weak",
+            "missing",
+            "contradictory",
+            "stale"
+          ]
+        },
+        "freshness_state": {
+          "$ref": "#/$defs/freshness_state"
+        },
+        "redaction_state": {
+          "$ref": "#/$defs/redaction_state"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "source_artifact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_pane_content_stored": {
+          "type": "boolean",
+          "const": false
+        },
+        "mail_body_stored": {
+          "type": "boolean",
+          "const": false
+        },
+        "secret_material_stored": {
+          "type": "boolean",
+          "const": false
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        }
+      }
+    },
+    "fit_summary": {
+      "type": "object",
+      "required": [
+        "capability",
+        "availability",
+        "attention",
+        "reliability",
+        "overall_fit",
+        "confidence",
+        "explanation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/fit_level"
+        },
+        "availability": {
+          "$ref": "#/$defs/fit_level"
+        },
+        "attention": {
+          "$ref": "#/$defs/fit_level"
+        },
+        "reliability": {
+          "$ref": "#/$defs/fit_level"
+        },
+        "overall_fit": {
+          "$ref": "#/$defs/fit_level"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "explanation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "required": [
+        "action",
+        "assignable",
+        "requires_approval",
+        "reason_codes",
+        "why_this_agent",
+        "why_not_others",
+        "missing_evidence",
+        "safe_fallback"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "assign",
+            "wait_for_owner",
+            "request_fresh_evidence",
+            "avoid_assignment",
+            "require_operator_approval"
+          ]
+        },
+        "assignable": {
+          "type": "boolean"
+        },
+        "requires_approval": {
+          "type": "boolean"
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        },
+        "why_this_agent": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "why_not_others": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "missing_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence_category"
+          }
+        },
+        "safe_fallback": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "decay_policy": {
+      "type": "object",
+      "required": [
+        "success_half_life_hours",
+        "failure_half_life_hours",
+        "stale_after_hours",
+        "reset_after_success_count",
+        "old_outcomes_do_not_permanently_bias"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "success_half_life_hours": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "failure_half_life_hours": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stale_after_hours": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reset_after_success_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "old_outcomes_do_not_permanently_bias": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "safeguards": {
+      "type": "object",
+      "required": [
+        "human_performance_scoring_forbidden",
+        "raw_pane_content_forbidden",
+        "mail_body_storage_forbidden",
+        "auto_reassignment_forbidden",
+        "secret_material_forbidden",
+        "approval_required_for_reassignment"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "human_performance_scoring_forbidden": {
+          "type": "boolean",
+          "const": true
+        },
+        "raw_pane_content_forbidden": {
+          "type": "boolean",
+          "const": true
+        },
+        "mail_body_storage_forbidden": {
+          "type": "boolean",
+          "const": true
+        },
+        "auto_reassignment_forbidden": {
+          "type": "boolean",
+          "const": true
+        },
+        "secret_material_forbidden": {
+          "type": "boolean",
+          "const": true
+        },
+        "approval_required_for_reassignment": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "toon_projection": {
+      "type": "object",
+      "required": [
+        "columns",
+        "rows"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "type": "array",
+          "minItems": 6,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 6,
+            "items": {
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "work_class": {
+      "type": "string",
+      "enum": [
+        "static_contract",
+        "rust_unit",
+        "rch_integration",
+        "target_hardware",
+        "operator_recovery",
+        "planning_only"
+      ]
+    },
+    "proof_requirement": {
+      "type": "string",
+      "enum": [
+        "none",
+        "static_shell_jq",
+        "rch_required",
+        "target_hardware_required",
+        "operator_approval"
+      ]
+    },
+    "evidence_category": {
+      "type": "string",
+      "enum": [
+        "recent_successful_proof",
+        "recent_failure_class",
+        "beads_closeout_quality",
+        "rch_proof_quality",
+        "agent_mail_handoff_quality",
+        "pane_runtime_availability",
+        "git_publication_status",
+        "active_owner_conflict",
+        "stale_or_blocked_state",
+        "missing_evidence",
+        "privacy_redaction"
+      ]
+    },
+    "freshness_state": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "within_budget",
+        "stale",
+        "missing",
+        "unknown"
+      ]
+    },
+    "redaction_state": {
+      "type": "string",
+      "enum": [
+        "redacted_summary",
+        "metadata_only",
+        "privacy_redacted",
+        "raw_forbidden"
+      ]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low",
+        "none"
+      ]
+    },
+    "fit_level": {
+      "type": "string",
+      "enum": [
+        "strong",
+        "adequate",
+        "weak",
+        "blocked",
+        "unknown"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "human_performance_scoreboard",
+        "raw_pane_text_storage",
+        "mail_body_storage",
+        "secret_material_storage",
+        "auto_reassignment",
+        "beads_mutation",
+        "agent_mail_mutation",
+        "pane_mutation",
+        "service_mutation",
+        "local_cargo_proof"
+      ]
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "fit.strong_capability",
+        "fit.good_availability",
+        "fit.good_attention",
+        "fit.good_reliability",
+        "fit.poor_capability",
+        "fit.agent_unavailable",
+        "fit.attention_blocked",
+        "fit.reliability_uncertain",
+        "fit.active_owner_conflict",
+        "fit.missing_proof",
+        "fit.recent_failure",
+        "fit.stale_evidence",
+        "fit.privacy_redacted",
+        "fit.requires_approval",
+        "safety.read_only",
+        "safety.no_raw_pane_content",
+        "safety.no_mail_body_storage",
+        "safety.no_auto_reassignment",
+        "safety.no_human_scoreboard",
+        "planner.mission_objective_ref"
+      ]
+    }
+  }
+}

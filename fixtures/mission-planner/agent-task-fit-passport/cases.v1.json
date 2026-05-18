@@ -1,0 +1,524 @@
+{
+  "schema_version": "ft.agent_task_fit_passport.fixtures.v1",
+  "contract_id": "ft.agent_task_fit_passport.fixture_manifest.v1",
+  "schema_path": "docs/json-schema/ft-agent-task-fit-passport.json",
+  "contract_doc": "docs/robot-contracts/agent-task-fit-passport.md",
+  "source_bead": "ft-auy2g.9",
+  "verification": [
+    "jq empty docs/json-schema/ft-agent-task-fit-passport.json fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+    "bash tests/e2e/test_agent_task_fit_passport_contract.sh"
+  ],
+  "required_forbidden_actions": [
+    "human_performance_scoreboard",
+    "raw_pane_text_storage",
+    "mail_body_storage",
+    "secret_material_storage",
+    "auto_reassignment",
+    "beads_mutation",
+    "agent_mail_mutation",
+    "pane_mutation",
+    "service_mutation",
+    "local_cargo_proof"
+  ],
+  "toon_columns": [
+    "case_id",
+    "agent_id",
+    "task_domain",
+    "overall_fit",
+    "recommendation",
+    "reason"
+  ],
+  "cases": [
+    {
+      "case_id": "good-fit",
+      "expected_recommendation": "assign",
+      "required_reason_code": "fit.strong_capability",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.task-fit.static-001",
+          "task_bead_id": "ft-auy2g.9",
+          "task_domain": "mission-planner",
+          "work_class": "static_contract",
+          "proof_requirement": "static_shell_jq",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "agent_identity": {
+          "agent_id": "agent.fixture-emerald",
+          "program": "codex-cli",
+          "model": "gpt-5",
+          "active_role": "mission-planner static contract author",
+          "identity_source": "agent_mail_profile",
+          "human_subject": false,
+          "redaction_state": "redacted_summary"
+        },
+        "claimed_domains": [
+          {
+            "domain": "mission-planner",
+            "ownership_state": "reserved",
+            "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+            "freshness_state": "fresh"
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "good-fit-beads-closeout",
+            "source_kind": "beads_closeout",
+            "category": "beads_closeout_quality",
+            "quality": "strong",
+            "freshness_state": "fresh",
+            "redaction_state": "redacted_summary",
+            "confidence": "high",
+            "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+            "summary": "Recent closeout included exact static verifier commands and publication evidence.",
+            "raw_pane_content_stored": false,
+            "mail_body_stored": false,
+            "secret_material_stored": false,
+            "reason_codes": [
+              "fit.strong_capability",
+              "fit.good_reliability"
+            ]
+          },
+          {
+            "evidence_id": "good-fit-rch-proof",
+            "source_kind": "rch_proof",
+            "category": "rch_proof_quality",
+            "quality": "usable",
+            "freshness_state": "within_budget",
+            "redaction_state": "metadata_only",
+            "confidence": "medium",
+            "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+            "summary": "RCH-heavy lanes are not required for this static task; prior remote proof quality is metadata only.",
+            "raw_pane_content_stored": false,
+            "mail_body_stored": false,
+            "secret_material_stored": false,
+            "reason_codes": [
+              "fit.good_reliability"
+            ]
+          },
+          {
+            "evidence_id": "good-fit-recent-success",
+            "source_kind": "beads_closeout",
+            "category": "recent_successful_proof",
+            "quality": "strong",
+            "freshness_state": "fresh",
+            "redaction_state": "redacted_summary",
+            "confidence": "high",
+            "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+            "summary": "Recent successful proof evidence is retained as summary metadata rather than transcript content.",
+            "raw_pane_content_stored": false,
+            "mail_body_stored": false,
+            "secret_material_stored": false,
+            "reason_codes": [
+              "fit.strong_capability",
+              "fit.good_reliability"
+            ]
+          },
+          {
+            "evidence_id": "good-fit-runtime",
+            "source_kind": "pane_runtime_state",
+            "category": "pane_runtime_availability",
+            "quality": "strong",
+            "freshness_state": "fresh",
+            "redaction_state": "metadata_only",
+            "confidence": "high",
+            "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+            "summary": "Runtime metadata shows the agent is available and not blocked on another owned slice.",
+            "raw_pane_content_stored": false,
+            "mail_body_stored": false,
+            "secret_material_stored": false,
+            "reason_codes": [
+              "fit.good_availability",
+              "fit.good_attention"
+            ]
+          },
+          {
+            "evidence_id": "good-fit-git",
+            "source_kind": "git_publication",
+            "category": "git_publication_status",
+            "quality": "strong",
+            "freshness_state": "fresh",
+            "redaction_state": "metadata_only",
+            "confidence": "high",
+            "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+            "summary": "Recent owned commit reached main and mirror refs.",
+            "raw_pane_content_stored": false,
+            "mail_body_stored": false,
+            "secret_material_stored": false,
+            "reason_codes": [
+              "fit.good_reliability"
+            ]
+          }
+        ],
+        "fit_summary": {
+          "capability": "strong",
+          "availability": "strong",
+          "attention": "strong",
+          "reliability": "strong",
+          "overall_fit": "strong",
+          "confidence": "high",
+          "explanation": "The task is static, the agent has fresh domain evidence, and no ownership conflict is present."
+        },
+        "recommendation": {
+          "action": "assign",
+          "assignable": true,
+          "requires_approval": false,
+          "reason_codes": [
+            "fit.strong_capability",
+            "fit.good_availability",
+            "fit.good_attention",
+            "fit.good_reliability",
+            "safety.read_only",
+            "safety.no_raw_pane_content",
+            "safety.no_mail_body_storage",
+            "safety.no_auto_reassignment",
+            "safety.no_human_scoreboard",
+            "planner.mission_objective_ref"
+          ],
+          "why_this_agent": [
+            "Fresh static-contract closeout evidence matches the task domain.",
+            "No active owner conflict is visible for the reserved paths."
+          ],
+          "why_not_others": [
+            "Other agents may be busy or lack fresh domain evidence."
+          ],
+          "missing_evidence": [],
+          "safe_fallback": "If any reservation conflict appears, wait for owner instead of assigning."
+        },
+        "decay_policy": {
+          "success_half_life_hours": 72,
+          "failure_half_life_hours": 24,
+          "stale_after_hours": 12,
+          "reset_after_success_count": 3,
+          "old_outcomes_do_not_permanently_bias": true
+        },
+        "safeguards": {
+          "human_performance_scoring_forbidden": true,
+          "raw_pane_content_forbidden": true,
+          "mail_body_storage_forbidden": true,
+          "auto_reassignment_forbidden": true,
+          "secret_material_forbidden": true,
+          "approval_required_for_reassignment": true
+        },
+        "forbidden_actions": [
+          "human_performance_scoreboard",
+          "raw_pane_text_storage",
+          "mail_body_storage",
+          "secret_material_storage",
+          "auto_reassignment",
+          "beads_mutation",
+          "agent_mail_mutation",
+          "pane_mutation",
+          "service_mutation",
+          "local_cargo_proof"
+        ],
+        "artifact_paths": [
+          "docs/json-schema/ft-agent-task-fit-passport.json",
+          "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "agent_id",
+            "task_domain",
+            "overall_fit",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "good-fit",
+              "agent.fixture-emerald",
+              "mission-planner",
+              "strong",
+              "assign",
+              "fit.strong_capability"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "poor-fit",
+      "expected_recommendation": "avoid_assignment",
+      "required_reason_code": "fit.poor_capability",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.task-fit.rch-001",
+          "task_bead_id": "ft-4tp7g",
+          "task_domain": "rch",
+          "work_class": "rch_integration",
+          "proof_requirement": "rch_required",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "agent_identity": {"agent_id": "agent.fixture-static-only", "program": "codex-cli", "model": "gpt-5", "active_role": "docs-only reviewer", "identity_source": "agent_mail_profile", "human_subject": false, "redaction_state": "redacted_summary"},
+        "claimed_domains": [{"domain": "docs", "ownership_state": "none", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "fresh"}],
+        "evidence": [
+          {"evidence_id": "poor-fit-proof-gap", "source_kind": "beads_closeout", "category": "beads_closeout_quality", "quality": "weak", "freshness_state": "fresh", "redaction_state": "redacted_summary", "confidence": "medium", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "Recent evidence is limited to docs-only work, while the requested task requires RCH scheduler diagnosis.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.poor_capability"]}
+        ],
+        "fit_summary": {"capability": "weak", "availability": "adequate", "attention": "adequate", "reliability": "unknown", "overall_fit": "weak", "confidence": "medium", "explanation": "The known evidence does not match the requested RCH integration task."},
+        "recommendation": {"action": "avoid_assignment", "assignable": false, "requires_approval": false, "reason_codes": ["fit.poor_capability", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": [], "why_not_others": ["Prefer an agent with fresh RCH proof and scheduler evidence."], "missing_evidence": ["rch_proof_quality"], "safe_fallback": "Choose a better-matched RCH owner or request fresh evidence."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["poor-fit", "agent.fixture-static-only", "rch", "weak", "avoid_assignment", "fit.poor_capability"]]}
+      }
+    },
+    {
+      "case_id": "stale-evidence",
+      "expected_recommendation": "request_fresh_evidence",
+      "required_reason_code": "fit.stale_evidence",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {"objective_id": "objective.task-fit.stale-001", "task_bead_id": "ft-stale", "task_domain": "renderer", "work_class": "rch_integration", "proof_requirement": "rch_required", "mission_objective_plan_ref": "ft.mission_objective_plan.v1"},
+        "agent_identity": {"agent_id": "agent.fixture-stale", "program": "codex-cli", "model": "gpt-5", "active_role": "renderer proof runner", "identity_source": "beads_assignee", "human_subject": false, "redaction_state": "metadata_only"},
+        "claimed_domains": [{"domain": "renderer", "ownership_state": "claimed", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "stale"}],
+        "evidence": [{"evidence_id": "stale-proof", "source_kind": "rch_proof", "category": "rch_proof_quality", "quality": "stale", "freshness_state": "stale", "redaction_state": "metadata_only", "confidence": "low", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "Last proof is outside the freshness budget.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.stale_evidence"]}],
+        "fit_summary": {"capability": "adequate", "availability": "unknown", "attention": "unknown", "reliability": "weak", "overall_fit": "unknown", "confidence": "low", "explanation": "Old success evidence is decayed and cannot justify assignment."},
+        "recommendation": {"action": "request_fresh_evidence", "assignable": false, "requires_approval": false, "reason_codes": ["fit.stale_evidence", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": [], "why_not_others": ["Fresh evidence is required before comparing agents."], "missing_evidence": ["rch_proof_quality", "pane_runtime_availability"], "safe_fallback": "Refresh status and proof metadata without assigning."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["stale-evidence", "agent.fixture-stale", "renderer", "unknown", "request_fresh_evidence", "fit.stale_evidence"]]}
+      }
+    },
+    {
+      "case_id": "active-owner-conflict",
+      "expected_recommendation": "wait_for_owner",
+      "required_reason_code": "fit.active_owner_conflict",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {"objective_id": "objective.task-fit.owner-001", "task_bead_id": "ft-booek.8", "task_domain": "operating-envelope", "work_class": "static_contract", "proof_requirement": "static_shell_jq", "mission_objective_plan_ref": "ft.mission_objective_plan.v1"},
+        "agent_identity": {"agent_id": "agent.fixture-waiter", "program": "codex-cli", "model": "gpt-5", "active_role": "available helper", "identity_source": "agent_mail_profile", "human_subject": false, "redaction_state": "metadata_only"},
+        "claimed_domains": [{"domain": "operating-envelope", "ownership_state": "active_conflict", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "fresh"}],
+        "evidence": [
+          {"evidence_id": "active-owner", "source_kind": "agent_mail_handoff", "category": "active_owner_conflict", "quality": "strong", "freshness_state": "fresh", "redaction_state": "metadata_only", "confidence": "high", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "Another agent currently owns the tracker and provenance surfaces.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.active_owner_conflict"]},
+          {"evidence_id": "active-owner-handoff-quality", "source_kind": "agent_mail_handoff", "category": "agent_mail_handoff_quality", "quality": "strong", "freshness_state": "fresh", "redaction_state": "metadata_only", "confidence": "high", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "The handoff metadata is fresh enough to justify waiting without storing any message body.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.active_owner_conflict"]}
+        ],
+        "fit_summary": {"capability": "adequate", "availability": "blocked", "attention": "blocked", "reliability": "adequate", "overall_fit": "blocked", "confidence": "high", "explanation": "The agent could help, but the path ownership conflict blocks assignment."},
+        "recommendation": {"action": "wait_for_owner", "assignable": false, "requires_approval": false, "reason_codes": ["fit.active_owner_conflict", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": [], "why_not_others": ["The current owner should finish or hand off explicitly."], "missing_evidence": [], "safe_fallback": "Stand down or ask for a handoff; do not auto-reassign."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["active-owner-conflict", "agent.fixture-waiter", "operating-envelope", "blocked", "wait_for_owner", "fit.active_owner_conflict"]]}
+      }
+    },
+    {
+      "case_id": "missing-proof",
+      "expected_recommendation": "request_fresh_evidence",
+      "required_reason_code": "fit.missing_proof",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {"objective_id": "objective.task-fit.proof-001", "task_bead_id": "ft-proof", "task_domain": "runtime", "work_class": "rust_unit", "proof_requirement": "rch_required", "mission_objective_plan_ref": "ft.mission_objective_plan.v1"},
+        "agent_identity": {"agent_id": "agent.fixture-missing-proof", "program": "codex-cli", "model": "gpt-5", "active_role": "runtime editor", "identity_source": "beads_assignee", "human_subject": false, "redaction_state": "redacted_summary"},
+        "claimed_domains": [{"domain": "runtime", "ownership_state": "none", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "fresh"}],
+        "evidence": [{"evidence_id": "missing-proof-row", "source_kind": "rch_proof", "category": "missing_evidence", "quality": "missing", "freshness_state": "missing", "redaction_state": "metadata_only", "confidence": "none", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "No retained RCH proof is available for the requested code path.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.missing_proof"]}],
+        "fit_summary": {"capability": "unknown", "availability": "adequate", "attention": "adequate", "reliability": "unknown", "overall_fit": "unknown", "confidence": "none", "explanation": "The passport cannot compare assignment fit without proof evidence."},
+        "recommendation": {"action": "request_fresh_evidence", "assignable": false, "requires_approval": false, "reason_codes": ["fit.missing_proof", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": [], "why_not_others": ["All candidates lacking proof should be treated as unknown."], "missing_evidence": ["rch_proof_quality", "recent_successful_proof"], "safe_fallback": "Collect retained RCH proof metadata before assignment."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["missing-proof", "agent.fixture-missing-proof", "runtime", "unknown", "request_fresh_evidence", "fit.missing_proof"]]}
+      }
+    },
+    {
+      "case_id": "recent-failed-closeout",
+      "expected_recommendation": "avoid_assignment",
+      "required_reason_code": "fit.recent_failure",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {"objective_id": "objective.task-fit.failure-001", "task_bead_id": "ft-failed", "task_domain": "mcp", "work_class": "rch_integration", "proof_requirement": "rch_required", "mission_objective_plan_ref": "ft.mission_objective_plan.v1"},
+        "agent_identity": {"agent_id": "agent.fixture-recent-failure", "program": "codex-cli", "model": "gpt-5", "active_role": "mcp proof runner", "identity_source": "beads_assignee", "human_subject": false, "redaction_state": "redacted_summary"},
+        "claimed_domains": [{"domain": "mcp", "ownership_state": "none", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "fresh"}],
+        "evidence": [{"evidence_id": "recent-failure", "source_kind": "beads_closeout", "category": "recent_failure_class", "quality": "weak", "freshness_state": "fresh", "redaction_state": "redacted_summary", "confidence": "high", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "Recent closeout was marked no-verdict because proof did not reach the test binary.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.recent_failure"]}],
+        "fit_summary": {"capability": "adequate", "availability": "adequate", "attention": "adequate", "reliability": "weak", "overall_fit": "weak", "confidence": "medium", "explanation": "A fresh failed closeout should decay before assigning similar proof-heavy work."},
+        "recommendation": {"action": "avoid_assignment", "assignable": false, "requires_approval": false, "reason_codes": ["fit.recent_failure", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": [], "why_not_others": ["Pick an agent with a recent successful proof in the same work class."], "missing_evidence": ["recent_successful_proof"], "safe_fallback": "Wait for decay/reset or assign static-only work."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["recent-failed-closeout", "agent.fixture-recent-failure", "mcp", "weak", "avoid_assignment", "fit.recent_failure"]]}
+      }
+    },
+    {
+      "case_id": "agent-unavailable",
+      "expected_recommendation": "request_fresh_evidence",
+      "required_reason_code": "fit.agent_unavailable",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {"objective_id": "objective.task-fit.unavailable-001", "task_bead_id": "ft-unavailable", "task_domain": "search", "work_class": "static_contract", "proof_requirement": "static_shell_jq", "mission_objective_plan_ref": "ft.mission_objective_plan.v1"},
+        "agent_identity": {"agent_id": "agent.fixture-unavailable", "program": "codex-cli", "model": "gpt-5", "active_role": "search helper", "identity_source": "robot_inventory", "human_subject": false, "redaction_state": "metadata_only"},
+        "claimed_domains": [{"domain": "search", "ownership_state": "none", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "unknown"}],
+        "evidence": [{"evidence_id": "unavailable-runtime", "source_kind": "pane_runtime_state", "category": "pane_runtime_availability", "quality": "missing", "freshness_state": "unknown", "redaction_state": "metadata_only", "confidence": "none", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "Runtime inventory does not confirm that the agent is currently reachable.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.agent_unavailable"]}],
+        "fit_summary": {"capability": "adequate", "availability": "unknown", "attention": "unknown", "reliability": "unknown", "overall_fit": "unknown", "confidence": "none", "explanation": "An unavailable agent cannot be assigned until fresh runtime evidence exists."},
+        "recommendation": {"action": "request_fresh_evidence", "assignable": false, "requires_approval": false, "reason_codes": ["fit.agent_unavailable", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": [], "why_not_others": ["Prefer an agent with fresh runtime availability."], "missing_evidence": ["pane_runtime_availability"], "safe_fallback": "Refresh robot inventory or choose another active agent."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["agent-unavailable", "agent.fixture-unavailable", "search", "unknown", "request_fresh_evidence", "fit.agent_unavailable"]]}
+      }
+    },
+    {
+      "case_id": "operator-approval-needed",
+      "expected_recommendation": "require_operator_approval",
+      "required_reason_code": "fit.requires_approval",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {"objective_id": "objective.task-fit.approval-001", "task_bead_id": "ft-reassign", "task_domain": "beads", "work_class": "operator_recovery", "proof_requirement": "operator_approval", "mission_objective_plan_ref": "ft.mission_objective_plan.v1"},
+        "agent_identity": {"agent_id": "agent.fixture-approval", "program": "codex-cli", "model": "gpt-5", "active_role": "operator-approved recovery candidate", "identity_source": "manual_redacted_fixture", "human_subject": false, "redaction_state": "redacted_summary"},
+        "claimed_domains": [{"domain": "beads", "ownership_state": "stale_claim", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "stale"}],
+        "evidence": [{"evidence_id": "approval-reassignment", "source_kind": "beads_closeout", "category": "stale_or_blocked_state", "quality": "usable", "freshness_state": "stale", "redaction_state": "metadata_only", "confidence": "medium", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "The only useful next action would reassign work from a stale owner.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.requires_approval"]}],
+        "fit_summary": {"capability": "adequate", "availability": "adequate", "attention": "adequate", "reliability": "adequate", "overall_fit": "blocked", "confidence": "medium", "explanation": "Reassignment is outside the read-only planner authority."},
+        "recommendation": {"action": "require_operator_approval", "assignable": false, "requires_approval": true, "reason_codes": ["fit.requires_approval", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": ["The agent could perform the work after approval."], "why_not_others": ["No agent should auto-reassign active work."], "missing_evidence": [], "safe_fallback": "Request operator approval or wait for explicit handoff."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["operator-approval-needed", "agent.fixture-approval", "beads", "blocked", "require_operator_approval", "fit.requires_approval"]]}
+      }
+    },
+    {
+      "case_id": "privacy-redacted",
+      "expected_recommendation": "request_fresh_evidence",
+      "required_reason_code": "fit.privacy_redacted",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.agent_task_fit_passport.v1",
+        "generated_at_ms": 1778915400000,
+        "source_bead": "ft-auy2g.9",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {"objective_id": "objective.task-fit.privacy-001", "task_bead_id": "ft-private", "task_domain": "policy", "work_class": "planning_only", "proof_requirement": "none", "mission_objective_plan_ref": "ft.mission_objective_plan.v1"},
+        "agent_identity": {"agent_id": "agent.fixture-private", "program": "codex-cli", "model": "gpt-5", "active_role": "policy planner", "identity_source": "agent_mail_profile", "human_subject": false, "redaction_state": "privacy_redacted"},
+        "claimed_domains": [{"domain": "policy", "ownership_state": "none", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "freshness_state": "fresh"}],
+        "evidence": [{"evidence_id": "privacy-row", "source_kind": "agent_mail_handoff", "category": "privacy_redaction", "quality": "weak", "freshness_state": "fresh", "redaction_state": "privacy_redacted", "confidence": "low", "source_artifact": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json", "summary": "The available handoff is redacted too heavily to compare task fit.", "raw_pane_content_stored": false, "mail_body_stored": false, "secret_material_stored": false, "reason_codes": ["fit.privacy_redacted"]}],
+        "fit_summary": {"capability": "unknown", "availability": "adequate", "attention": "unknown", "reliability": "unknown", "overall_fit": "unknown", "confidence": "low", "explanation": "Privacy redaction prevents a reliable assignment comparison."},
+        "recommendation": {"action": "request_fresh_evidence", "assignable": false, "requires_approval": false, "reason_codes": ["fit.privacy_redacted", "safety.read_only", "safety.no_raw_pane_content", "safety.no_mail_body_storage", "safety.no_auto_reassignment", "safety.no_human_scoreboard", "planner.mission_objective_ref"], "why_this_agent": [], "why_not_others": ["No agent should be selected from privacy-redacted evidence alone."], "missing_evidence": ["agent_mail_handoff_quality", "privacy_redaction"], "safe_fallback": "Request a redacted summary that preserves reason codes without message bodies."},
+        "decay_policy": {"success_half_life_hours": 72, "failure_half_life_hours": 24, "stale_after_hours": 12, "reset_after_success_count": 3, "old_outcomes_do_not_permanently_bias": true},
+        "safeguards": {"human_performance_scoring_forbidden": true, "raw_pane_content_forbidden": true, "mail_body_storage_forbidden": true, "auto_reassignment_forbidden": true, "secret_material_forbidden": true, "approval_required_for_reassignment": true},
+        "forbidden_actions": ["human_performance_scoreboard", "raw_pane_text_storage", "mail_body_storage", "secret_material_storage", "auto_reassignment", "beads_mutation", "agent_mail_mutation", "pane_mutation", "service_mutation", "local_cargo_proof"],
+        "artifact_paths": ["docs/json-schema/ft-agent-task-fit-passport.json", "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"],
+        "toon_projection": {"columns": ["case_id", "agent_id", "task_domain", "overall_fit", "recommendation", "reason"], "rows": [["privacy-redacted", "agent.fixture-private", "policy", "unknown", "request_fresh_evidence", "fit.privacy_redacted"]]}
+      }
+    }
+  ],
+  "mixed_swarm_dry_run": {
+    "scenario_id": "mixed-swarm-static-assignment",
+    "objective_id": "objective.task-fit.mixed-swarm-001",
+    "contract_id": "ft.agent_task_fit_passport.mixed_swarm_dry_run.v1",
+    "dry_run": true,
+    "read_only": true,
+    "mission_objective_plan_ref": "ft.mission_objective_plan.v1",
+    "candidate_agents": [
+      {
+        "rank": 1,
+        "agent_id": "agent.fixture-emerald",
+        "case_id": "good-fit",
+        "overall_fit": "strong",
+        "recommendation": "assign",
+        "reason": "fit.strong_capability"
+      },
+      {
+        "rank": 2,
+        "agent_id": "agent.fixture-stale",
+        "case_id": "stale-evidence",
+        "overall_fit": "unknown",
+        "recommendation": "request_fresh_evidence",
+        "reason": "fit.stale_evidence"
+      },
+      {
+        "rank": 3,
+        "agent_id": "agent.fixture-waiter",
+        "case_id": "active-owner-conflict",
+        "overall_fit": "blocked",
+        "recommendation": "wait_for_owner",
+        "reason": "fit.active_owner_conflict"
+      },
+      {
+        "rank": 4,
+        "agent_id": "agent.fixture-recent-failure",
+        "case_id": "recent-failed-closeout",
+        "overall_fit": "weak",
+        "recommendation": "avoid_assignment",
+        "reason": "fit.recent_failure"
+      }
+    ],
+    "selected_agent_id": "agent.fixture-emerald",
+    "selected_case_id": "good-fit",
+    "assignment_action": "assign",
+    "explanation": {
+      "why_this_agent": [
+        "The selected agent has fresh static-contract evidence, a matching mission-planner domain, and publication metadata."
+      ],
+      "why_not_others": [
+        "One candidate needs fresh evidence, one must wait for the active owner, and one has a recent no-verdict closeout."
+      ],
+      "missing_evidence": [
+        "fresh rch proof for stale candidates",
+        "handoff release for active-owner conflicts"
+      ],
+      "safe_fallback": "If the selected agent loses its reservation or freshness budget, request fresh evidence instead of auto-reassigning."
+    },
+    "forbidden_actions": [
+      "human_performance_scoreboard",
+      "raw_pane_text_storage",
+      "mail_body_storage",
+      "secret_material_storage",
+      "auto_reassignment",
+      "beads_mutation",
+      "agent_mail_mutation",
+      "pane_mutation",
+      "service_mutation",
+      "local_cargo_proof"
+    ],
+    "raw_pane_content_stored": false,
+    "mail_body_stored": false,
+    "secret_material_stored": false
+  }
+}
