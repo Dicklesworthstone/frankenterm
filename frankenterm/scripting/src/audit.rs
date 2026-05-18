@@ -126,7 +126,12 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        let mut truncated = s[..max_len].to_string();
+        let mut boundary = max_len;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+
+        let mut truncated = s[..boundary].to_string();
         truncated.push_str("...");
         truncated
     }
@@ -228,6 +233,20 @@ mod tests {
         let recent = trail.recent(1);
         assert!(recent[0].args_summary.len() < 300);
         assert!(recent[0].args_summary.ends_with("..."));
+    }
+
+    #[test]
+    fn args_truncation_respects_utf8_boundaries() {
+        let trail = AuditTrail::new(10);
+        let long_args = "€".repeat(100);
+        trail.record("ext", "fn", &long_args, AuditOutcome::Ok);
+
+        let recent = trail.recent(1);
+        assert!(recent[0].args_summary.ends_with("..."));
+        assert!(recent[0].args_summary.len() <= 259);
+        let truncated = recent[0].args_summary.strip_suffix("...").unwrap();
+        assert_eq!(truncated.len(), 255);
+        assert!(truncated.chars().all(|ch| ch == '€'));
     }
 
     #[test]
