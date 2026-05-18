@@ -1096,7 +1096,11 @@ impl WaylandWindowInner {
             return;
         }
 
-        let conn = Connection::get().unwrap().wayland();
+        let Some(conn) = Connection::get() else {
+            log::debug!("Dropping Wayland cursor update: connection unavailable");
+            return;
+        };
+        let conn = conn.wayland();
         let state = conn.wayland_state.borrow_mut();
         let pointer = match &state.pointer {
             Some(pointer) => pointer,
@@ -1456,7 +1460,11 @@ impl WaylandWindowInner {
     }
 
     fn update_window_background_blur(&self) {
-        let conn = WaylandConnection::get().unwrap().wayland();
+        let Some(conn) = WaylandConnection::get() else {
+            log::debug!("Dropping Wayland background blur update: connection unavailable");
+            return;
+        };
+        let conn = conn.wayland();
         let qh = conn.event_queue.borrow().handle();
         let wayland_state = conn.wayland_state.borrow();
         if let Some(manager) = &wayland_state.kde_blur_manager {
