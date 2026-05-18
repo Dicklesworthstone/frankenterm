@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -264,10 +264,7 @@ impl std::fmt::Debug for SemanticShockResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SemanticShockResponder")
             .field("config", &self.config)
-            .field(
-                "panes_tracked",
-                &self.panes.read().map(|p| p.len()).unwrap_or(0),
-            )
+            .field("panes_tracked", &self.read_panes().len())
             .finish()
     }
 }
@@ -297,6 +294,28 @@ impl SemanticShockResponder {
     /// Get a metrics snapshot.
     pub fn metrics_snapshot(&self) -> ShockResponseMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    fn read_panes(&self) -> RwLockReadGuard<'_, HashMap<u64, PaneShockState>> {
+        match self.panes.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.panes.clear_poison();
+                guard
+            }
+        }
+    }
+
+    fn write_panes(&self) -> RwLockWriteGuard<'_, HashMap<u64, PaneShockState>> {
+        match self.panes.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.panes.clear_poison();
+                guard
+            }
+        }
     }
 
     /// Process a detection event from the EventBus.
@@ -357,7 +376,7 @@ impl SemanticShockResponder {
         let cooldown = std::time::Duration::from_secs(self.config.notification_cooldown_seconds);
         let auto_clear_ms = self.config.auto_clear_seconds * 1000;
 
-        let mut panes = self.panes.write().ok()?;
+        let mut panes = self.write_panes();
         let state = panes.entry(pane_id).or_insert_with(PaneShockState::new);
 
         // Auto-clear expired shocks.
@@ -419,10 +438,9 @@ impl SemanticShockResponder {
     /// Returns a decision with `should_intervene = true` if the pane is paused.
     pub fn trauma_decision_for_pane(&self, pane_id: u64) -> TraumaDecision {
         let paused = self
-            .panes
-            .read()
-            .ok()
-            .and_then(|panes| panes.get(&pane_id).map(|s| s.paused))
+            .read_panes()
+            .get(&pane_id)
+            .map(|state| state.paused)
             .unwrap_or(false);
 
         if paused {
@@ -446,49 +464,40 @@ impl SemanticShockResponder {
 
     /// Check if a pane is currently paused due to semantic shocks.
     pub fn is_pane_paused(&self, pane_id: u64) -> bool {
-        self.panes
-            .read()
-            .ok()
-            .and_then(|panes| panes.get(&pane_id).map(|s| s.paused))
+        self.read_panes()
+            .get(&pane_id)
+            .map(|state| state.paused)
             .unwrap_or(false)
     }
 
     /// Get summary for a specific pane.
     pub fn pane_summary(&self, pane_id: u64) -> Option<PaneShockSummary> {
-        self.panes
-            .read()
-            .ok()
-            .and_then(|panes| panes.get(&pane_id).map(|s| s.summary(pane_id)))
+        self.read_panes()
+            .get(&pane_id)
+            .map(|state| state.summary(pane_id))
     }
 
     /// Get summaries for all panes with active shocks.
     pub fn all_summaries(&self) -> Vec<PaneShockSummary> {
-        self.panes
-            .read()
-            .ok()
-            .map(|panes| {
-                panes
-                    .iter()
-                    .filter(|(_, s)| !s.shocks.is_empty())
-                    .map(|(&pid, s)| s.summary(pid))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.read_panes()
+            .iter()
+            .filter(|(_, s)| !s.shocks.is_empty())
+            .map(|(&pid, s)| s.summary(pid))
+            .collect()
     }
 
     /// Clear all shocks for a pane (operator review complete).
     ///
     /// Returns `true` if the pane was found and cleared.
     pub fn clear_pane(&self, pane_id: u64) -> bool {
-        if let Ok(mut panes) = self.panes.write() {
-            if let Some(state) = panes.get_mut(&pane_id) {
-                state.shocks.clear();
-                if state.paused {
-                    state.paused = false;
-                    self.metrics.panes_cleared.fetch_add(1, Ordering::Relaxed);
-                }
-                return true;
+        let mut panes = self.write_panes();
+        if let Some(state) = panes.get_mut(&pane_id) {
+            state.shocks.clear();
+            if state.paused {
+                state.paused = false;
+                self.metrics.panes_cleared.fetch_add(1, Ordering::Relaxed);
             }
+            return true;
         }
         false
     }
@@ -496,16 +505,15 @@ impl SemanticShockResponder {
     /// Clear all shocks for all panes.
     pub fn clear_all(&self) -> usize {
         let mut cleared = 0;
-        if let Ok(mut panes) = self.panes.write() {
-            for state in panes.values_mut() {
-                if !state.shocks.is_empty() || state.paused {
-                    state.shocks.clear();
-                    if state.paused {
-                        state.paused = false;
-                        self.metrics.panes_cleared.fetch_add(1, Ordering::Relaxed);
-                    }
-                    cleared += 1;
+        let mut panes = self.write_panes();
+        for state in panes.values_mut() {
+            if !state.shocks.is_empty() || state.paused {
+                state.shocks.clear();
+                if state.paused {
+                    state.paused = false;
+                    self.metrics.panes_cleared.fetch_add(1, Ordering::Relaxed);
                 }
+                cleared += 1;
             }
         }
         cleared
@@ -513,16 +521,12 @@ impl SemanticShockResponder {
 
     /// Number of panes currently tracked.
     pub fn tracked_pane_count(&self) -> usize {
-        self.panes.read().ok().map(|p| p.len()).unwrap_or(0)
+        self.read_panes().len()
     }
 
     /// Number of panes currently paused.
     pub fn paused_pane_count(&self) -> usize {
-        self.panes
-            .read()
-            .ok()
-            .map(|panes| panes.values().filter(|s| s.paused).count())
-            .unwrap_or(0)
+        self.read_panes().values().filter(|s| s.paused).count()
     }
 
     /// Run auto-clear on all panes, removing expired shocks.
@@ -533,10 +537,9 @@ impl SemanticShockResponder {
         }
         let now_ms = u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut total = 0;
-        if let Ok(mut panes) = self.panes.write() {
-            for state in panes.values_mut() {
-                total += state.auto_clear(auto_clear_ms, now_ms);
-            }
+        let mut panes = self.write_panes();
+        for state in panes.values_mut() {
+            total += state.auto_clear(auto_clear_ms, now_ms);
         }
         if total > 0 {
             self.metrics
@@ -739,6 +742,37 @@ mod tests {
         let r = SemanticShockResponder::new(SemanticShockConfig::default());
         let dbg = format!("{r:?}");
         assert!(dbg.contains("SemanticShockResponder"));
+    }
+
+    #[test]
+    fn responder_recovers_from_poisoned_panes_lock() {
+        let config = SemanticShockConfig {
+            action: ShockAction::Pause,
+            notification_cooldown_seconds: 0,
+            ..Default::default()
+        };
+        let r = SemanticShockResponder::new(config);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = r.panes.write().unwrap();
+            panic!("poison semantic shock panes lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(r.panes.is_poisoned());
+
+        let det = make_semantic_detection(0.001, 0.95);
+        let notif = r
+            .handle_detection(7, &det)
+            .expect("poisoned panes lock should recover and record the shock");
+
+        assert!(notif.paused);
+        assert!(!r.panes.is_poisoned());
+        assert_eq!(r.tracked_pane_count(), 1);
+        assert!(r.is_pane_paused(7));
+        assert_eq!(r.pane_summary(7).unwrap().active_count, 1);
+        assert!(r.trauma_decision_for_pane(7).should_intervene);
+        assert!(r.clear_pane(7));
+        assert!(!r.is_pane_paused(7));
     }
 
     // =========================================================================
