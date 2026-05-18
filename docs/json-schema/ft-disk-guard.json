@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-disk-guard.json",
+  "title": "FrankenTerm Disk Guard",
+  "description": "Read-only disk and writeability preflight contract for repo, Beads, Agent Mail, RCH, and external scratch safety.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "guard_id",
+    "workspace_root",
+    "decision",
+    "side_effect_policy",
+    "probes",
+    "reason_codes",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.disk_guard.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "guard_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "proceed",
+        "static_only",
+        "external_scratch_only",
+        "block",
+        "unknown"
+      ]
+    },
+    "side_effect_policy": {
+      "$ref": "#/$defs/side_effect_policy"
+    },
+    "probes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/probe"
+      }
+    },
+    "reason_codes": {
+      "$ref": "#/$defs/reason_codes"
+    },
+    "artifact_paths": {
+      "$ref": "#/$defs/paths"
+    }
+  },
+  "$defs": {
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+      }
+    },
+    "paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "side_effect_policy": {
+      "type": "object",
+      "required": [
+        "read_only",
+        "cleanup_requires_operator_approval",
+        "performed_actions",
+        "forbidden_actions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "read_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "cleanup_requires_operator_approval": {
+          "type": "boolean",
+          "const": true
+        },
+        "performed_actions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "stat_filesystem",
+              "bounded_write_probe",
+              "read_status",
+              "read_retained_artifact",
+              "not_collected"
+            ]
+          }
+        },
+        "forbidden_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "delete_file",
+              "delete_directory",
+              "clean_target",
+              "repair_agent_mail",
+              "restart_agent_mail",
+              "restart_rch",
+              "mutate_worker_mirror",
+              "cancel_build",
+              "run_local_cargo_proof",
+              "destructive_git"
+            ]
+          }
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "required": [
+        "probe_id",
+        "source",
+        "sampled_at_ms",
+        "state",
+        "severity",
+        "reason_codes",
+        "next_safe_action"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "probe_id": {
+          "type": "string",
+          "enum": [
+            "system_data_volume",
+            "private_tmp",
+            "repo_write_probe",
+            "beads_db_writeability",
+            "beads_jsonl_exportability",
+            "agent_mail_db_open",
+            "rch_cache_writeability",
+            "external_scratch"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sampled_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "warn",
+            "fail",
+            "blocked",
+            "degraded",
+            "unavailable",
+            "skipped",
+            "unknown"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "green",
+            "yellow",
+            "red",
+            "black",
+            "unknown"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "free_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "threshold_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "probe_result": {
+          "type": "string",
+          "minLength": 1
+        },
+        "error_category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/paths"
+        },
+        "next_safe_action": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

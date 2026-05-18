@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.disk_guard.v1",
+  "generated_at_ms": 1779014102000,
+  "guard_id": "ft-fyk4x.1-healthy-fixture",
+  "workspace_root": "/repo/frankenterm",
+  "decision": "proceed",
+  "side_effect_policy": {
+    "read_only": true,
+    "cleanup_requires_operator_approval": true,
+    "performed_actions": [
+      "stat_filesystem",
+      "bounded_write_probe",
+      "read_status"
+    ],
+    "forbidden_actions": [
+      "delete_file",
+      "delete_directory",
+      "clean_target",
+      "repair_agent_mail",
+      "restart_agent_mail",
+      "restart_rch",
+      "mutate_worker_mirror",
+      "cancel_build",
+      "run_local_cargo_proof",
+      "destructive_git"
+    ]
+  },
+  "probes": [
+    {
+      "probe_id": "system_data_volume",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "disk.system_data_volume.healthy"
+      ],
+      "next_safe_action": "Proceed within normal proof and edit policy."
+    },
+    {
+      "probe_id": "private_tmp",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "disk.private_tmp.healthy"
+      ],
+      "next_safe_action": "Temporary target creation is allowed within normal policy."
+    },
+    {
+      "probe_id": "repo_write_probe",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "write_probe.repo.pass"
+      ],
+      "next_safe_action": "Repository writes are allowed within owned paths."
+    },
+    {
+      "probe_id": "beads_db_writeability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "beads.db.writeable"
+      ],
+      "next_safe_action": "Use normal Beads coordination."
+    },
+    {
+      "probe_id": "beads_jsonl_exportability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "beads.jsonl.export_clean"
+      ],
+      "next_safe_action": "Auto-flush is healthy."
+    },
+    {
+      "probe_id": "agent_mail_db_open",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "agent_mail.db.open"
+      ],
+      "next_safe_action": "Use Agent Mail plus Beads coordination."
+    },
+    {
+      "probe_id": "rch_cache_writeability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "rch.cache.writeable"
+      ],
+      "next_safe_action": "RCH proof lanes may be admitted when worker selection also passes."
+    },
+    {
+      "probe_id": "external_scratch",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "external_scratch.available"
+      ],
+      "next_safe_action": "External scratch is available for retained artifacts."
+    }
+  ],
+  "reason_codes": [
+    "disk.guard.healthy",
+    "policy.cleanup_requires_operator_approval"
+  ],
+  "artifact_paths": [
+    "fixtures/disk-guard/valid/healthy.json"
+  ]
+}

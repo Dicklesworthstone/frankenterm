@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.disk_guard.v1",
+  "generated_at_ms": 1779014102000,
+  "guard_id": "ft-fyk4x.1-20260517T1035Z-current-eno-space",
+  "workspace_root": "/Users/jemanuel/projects/frankenterm",
+  "decision": "external_scratch_only",
+  "side_effect_policy": {
+    "read_only": true,
+    "cleanup_requires_operator_approval": true,
+    "performed_actions": [
+      "stat_filesystem",
+      "read_status",
+      "read_retained_artifact"
+    ],
+    "forbidden_actions": [
+      "delete_file",
+      "delete_directory",
+      "clean_target",
+      "repair_agent_mail",
+      "restart_agent_mail",
+      "restart_rch",
+      "mutate_worker_mirror",
+      "cancel_build",
+      "run_local_cargo_proof",
+      "destructive_git"
+    ]
+  },
+  "probes": [
+    {
+      "probe_id": "system_data_volume",
+      "source": "df -k /System/Volumes/Data",
+      "sampled_at_ms": 1779014102000,
+      "state": "fail",
+      "severity": "black",
+      "path": "/System/Volumes/Data",
+      "free_bytes": 279506944,
+      "total_bytes": 1995218165760,
+      "threshold_bytes": 1073741824,
+      "probe_result": "below recovery helper floor",
+      "reason_codes": [
+        "disk.system_data_volume.below_floor"
+      ],
+      "artifact_paths": [
+        "/Volumes/USB_NVME/frankenterm-recovery-index-20260517.md"
+      ],
+      "next_safe_action": "Use external scratch artifacts or obtain explicit operator cleanup approval before applying repo patches."
+    },
+    {
+      "probe_id": "private_tmp",
+      "source": "df -k /private/tmp",
+      "sampled_at_ms": 1779014102000,
+      "state": "fail",
+      "severity": "black",
+      "path": "/private/tmp",
+      "free_bytes": 279506944,
+      "total_bytes": 1995218165760,
+      "threshold_bytes": 1073741824,
+      "probe_result": "below recovery helper floor",
+      "reason_codes": [
+        "disk.private_tmp.below_floor"
+      ],
+      "artifact_paths": [
+        "/Volumes/USB_NVME/frankenterm-cleanup-options-matrix-20260517.md"
+      ],
+      "next_safe_action": "Do not launch write-heavy proof lanes; keep work to Beads or retained external artifacts."
+    },
+    {
+      "probe_id": "repo_write_probe",
+      "source": "git status --short plus current patch attempt posture",
+      "sampled_at_ms": 1779014102000,
+      "state": "warn",
+      "severity": "yellow",
+      "path": "/Users/jemanuel/projects/frankenterm",
+      "probe_result": "small tracker/doc writes are possible but recovery helper remains gated",
+      "reason_codes": [
+        "write_probe.repo.partial"
+      ],
+      "artifact_paths": [
+        "/Volumes/USB_NVME/frankenterm-active-goal-audit-20260517.md"
+      ],
+      "next_safe_action": "Avoid broad patches and generated artifacts until the disk floor is restored."
+    },
+    {
+      "probe_id": "beads_db_writeability",
+      "source": "br sync --status --json",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "probe_result": "Beads DB and JSONL are internally synchronized",
+      "reason_codes": [
+        "beads.sync.clean"
+      ],
+      "next_safe_action": "Use Beads as the coordination surface while Agent Mail is degraded."
+    },
+    {
+      "probe_id": "beads_jsonl_exportability",
+      "source": "br sync --status --json",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "probe_result": "dirty_count=0 db_newer=false jsonl_newer=false",
+      "reason_codes": [
+        "beads.jsonl.export_clean"
+      ],
+      "next_safe_action": "Continue normal br comments and updates; do not bundle unrelated dirty files."
+    },
+    {
+      "probe_id": "agent_mail_db_open",
+      "source": "MCP Agent Mail health_check and macro_start_session retry",
+      "sampled_at_ms": 1779014102000,
+      "state": "degraded",
+      "severity": "red",
+      "probe_result": "health responds but bootstrap reports automatic recovery retry loop",
+      "error_category": "database_corruption_detected",
+      "reason_codes": [
+        "agent_mail.degraded_read_only",
+        "agent_mail.bootstrap_unavailable"
+      ],
+      "next_safe_action": "Do not repair or restart Agent Mail; use Beads-only fallback coordination."
+    },
+    {
+      "probe_id": "rch_cache_writeability",
+      "source": "rch --json status --workers",
+      "sampled_at_ms": 1779014102000,
+      "state": "degraded",
+      "severity": "red",
+      "probe_result": "RCH reachable but workers remain under pressure policy",
+      "reason_codes": [
+        "rch.reachable_degraded",
+        "rch.worker_pressure"
+      ],
+      "next_safe_action": "Do not count RCH status as proof; run only dry-run admission checks until worker selection recovers."
+    },
+    {
+      "probe_id": "external_scratch",
+      "source": "df -k /Volumes/USB_NVME",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "path": "/Volumes/USB_NVME",
+      "free_bytes": 1023599978496,
+      "total_bytes": 2000125296640,
+      "probe_result": "external scratch volume available",
+      "reason_codes": [
+        "external_scratch.available"
+      ],
+      "artifact_paths": [
+        "/Volumes/USB_NVME/frankenterm-operator-recovery-handoff-20260517.md"
+      ],
+      "next_safe_action": "Retain recovery artifacts on the external volume until local disk cleanup is explicitly approved and completed."
+    }
+  ],
+  "reason_codes": [
+    "disk.system_data_volume.below_floor",
+    "disk.private_tmp.below_floor",
+    "write_probe.repo.partial",
+    "beads.sync.clean",
+    "agent_mail.bootstrap_unavailable",
+    "rch.reachable_degraded",
+    "external_scratch.available",
+    "policy.cleanup_requires_operator_approval"
+  ],
+  "artifact_paths": [
+    "docs/json-schema/ft-disk-guard.json",
+    "docs/robot-contracts/disk-guard.md",
+    "fixtures/disk-guard/manifest.json",
+    "fixtures/disk-guard/valid/current-eno-space.json"
+  ]
+}

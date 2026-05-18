@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.disk_guard.v1",
+  "generated_at_ms": 1779014102000,
+  "guard_id": "ft-fyk4x.1-fatal-write-probe-failed-fixture",
+  "workspace_root": "/repo/frankenterm",
+  "decision": "block",
+  "side_effect_policy": {
+    "read_only": true,
+    "cleanup_requires_operator_approval": true,
+    "performed_actions": [
+      "stat_filesystem",
+      "bounded_write_probe",
+      "read_status"
+    ],
+    "forbidden_actions": [
+      "delete_file",
+      "delete_directory",
+      "clean_target",
+      "repair_agent_mail",
+      "restart_agent_mail",
+      "restart_rch",
+      "mutate_worker_mirror",
+      "cancel_build",
+      "run_local_cargo_proof",
+      "destructive_git"
+    ]
+  },
+  "probes": [
+    {
+      "probe_id": "system_data_volume",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "fail",
+      "severity": "black",
+      "reason_codes": [
+        "disk.system_data_volume.fatal"
+      ],
+      "next_safe_action": "Stop local write-heavy work and request operator cleanup approval."
+    },
+    {
+      "probe_id": "private_tmp",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "fail",
+      "severity": "black",
+      "reason_codes": [
+        "disk.private_tmp.fatal"
+      ],
+      "next_safe_action": "Do not create target dirs or temp proof artifacts."
+    },
+    {
+      "probe_id": "repo_write_probe",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "fail",
+      "severity": "black",
+      "probe_result": "bounded write probe failed",
+      "error_category": "eno_space",
+      "reason_codes": [
+        "write_probe.repo.failed",
+        "write_probe.repo.eno_space"
+      ],
+      "next_safe_action": "Use external scratch only; do not apply patches in the shared checkout."
+    },
+    {
+      "probe_id": "beads_db_writeability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "blocked",
+      "severity": "black",
+      "reason_codes": [
+        "beads.db.write_blocked"
+      ],
+      "next_safe_action": "Do not rely on DB-only tracker updates until sync recovers."
+    },
+    {
+      "probe_id": "beads_jsonl_exportability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "blocked",
+      "severity": "black",
+      "reason_codes": [
+        "beads.jsonl.export_blocked"
+      ],
+      "next_safe_action": "Record handoff externally until JSONL export is healthy."
+    },
+    {
+      "probe_id": "agent_mail_db_open",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "degraded",
+      "severity": "red",
+      "reason_codes": [
+        "agent_mail.degraded_read_only"
+      ],
+      "next_safe_action": "Use Beads or external handoff; do not repair Agent Mail."
+    },
+    {
+      "probe_id": "rch_cache_writeability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "blocked",
+      "severity": "black",
+      "reason_codes": [
+        "rch.cache.write_blocked"
+      ],
+      "next_safe_action": "Do not launch material RCH proof lanes."
+    },
+    {
+      "probe_id": "external_scratch",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "external_scratch.available"
+      ],
+      "next_safe_action": "Retain recovery artifacts outside the full local volume."
+    }
+  ],
+  "reason_codes": [
+    "disk.guard.blocked",
+    "write_probe.repo.failed",
+    "fail_closed.write_precondition_failed",
+    "policy.cleanup_requires_operator_approval"
+  ],
+  "artifact_paths": [
+    "fixtures/disk-guard/valid/fatal-write-probe-failed.json"
+  ]
+}

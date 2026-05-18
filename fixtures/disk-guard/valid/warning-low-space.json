@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.disk_guard.v1",
+  "generated_at_ms": 1779014102000,
+  "guard_id": "ft-fyk4x.1-warning-low-space-fixture",
+  "workspace_root": "/repo/frankenterm",
+  "decision": "static_only",
+  "side_effect_policy": {
+    "read_only": true,
+    "cleanup_requires_operator_approval": true,
+    "performed_actions": [
+      "stat_filesystem",
+      "bounded_write_probe",
+      "read_status"
+    ],
+    "forbidden_actions": [
+      "delete_file",
+      "delete_directory",
+      "clean_target",
+      "repair_agent_mail",
+      "restart_agent_mail",
+      "restart_rch",
+      "mutate_worker_mirror",
+      "cancel_build",
+      "run_local_cargo_proof",
+      "destructive_git"
+    ]
+  },
+  "probes": [
+    {
+      "probe_id": "system_data_volume",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "warn",
+      "severity": "yellow",
+      "reason_codes": [
+        "disk.system_data_volume.warning"
+      ],
+      "next_safe_action": "Prefer docs and static checks; avoid large generated artifacts."
+    },
+    {
+      "probe_id": "private_tmp",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "warn",
+      "severity": "yellow",
+      "reason_codes": [
+        "disk.private_tmp.warning"
+      ],
+      "next_safe_action": "Use explicit target dirs and keep proof lanes narrow."
+    },
+    {
+      "probe_id": "repo_write_probe",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "write_probe.repo.pass"
+      ],
+      "next_safe_action": "Small owned-file edits are allowed."
+    },
+    {
+      "probe_id": "beads_db_writeability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "beads.db.writeable"
+      ],
+      "next_safe_action": "Use normal Beads comments."
+    },
+    {
+      "probe_id": "beads_jsonl_exportability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "beads.jsonl.export_clean"
+      ],
+      "next_safe_action": "Auto-flush is healthy."
+    },
+    {
+      "probe_id": "agent_mail_db_open",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "agent_mail.db.open"
+      ],
+      "next_safe_action": "Use normal Agent Mail coordination."
+    },
+    {
+      "probe_id": "rch_cache_writeability",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "warn",
+      "severity": "yellow",
+      "reason_codes": [
+        "rch.cache.warning"
+      ],
+      "next_safe_action": "Run dry-run admission checks before material RCH proof."
+    },
+    {
+      "probe_id": "external_scratch",
+      "source": "fixture",
+      "sampled_at_ms": 1779014102000,
+      "state": "pass",
+      "severity": "green",
+      "reason_codes": [
+        "external_scratch.available"
+      ],
+      "next_safe_action": "Retain bulky artifacts on external scratch."
+    }
+  ],
+  "reason_codes": [
+    "disk.guard.static_only",
+    "disk.system_data_volume.warning",
+    "policy.cleanup_requires_operator_approval"
+  ],
+  "artifact_paths": [
+    "fixtures/disk-guard/valid/warning-low-space.json"
+  ]
+}
