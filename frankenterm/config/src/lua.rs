@@ -14,7 +14,7 @@ use ordered_float::NotNan;
 use portable_pty::CommandBuilder;
 use std::convert::TryFrom;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 pub use mlua;
 
@@ -26,8 +26,23 @@ lazy_static::lazy_static! {
     static ref SETUP_FUNCS: Mutex<Vec<SetupFunc>> = Mutex::new(vec![]);
 }
 
+fn setup_funcs_lock() -> MutexGuard<'static, Vec<SetupFunc>> {
+    match SETUP_FUNCS.lock() {
+        Ok(funcs) => funcs,
+        Err(poisoned) => {
+            log::warn!("recovering poisoned Lua SETUP_FUNCS mutex");
+            SETUP_FUNCS.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn setup_funcs_snapshot() -> Vec<SetupFunc> {
+    setup_funcs_lock().clone()
+}
+
 pub fn add_context_setup_func(func: SetupFunc) {
-    SETUP_FUNCS.lock().unwrap().push(func);
+    setup_funcs_lock().push(func);
 }
 
 pub fn get_or_create_module<'lua>(lua: &'lua Lua, name: &str) -> anyhow::Result<mlua::Table<'lua>> {
@@ -381,7 +396,7 @@ end
             .context("assign package.path")?;
     }
 
-    for func in SETUP_FUNCS.lock().unwrap().iter() {
+    for func in setup_funcs_snapshot() {
         func(&lua).context("calling SETUP_FUNCS")?;
     }
 
@@ -893,6 +908,20 @@ pub fn add_to_config_reload_watch_list<'lua>(
 mod test {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn setup_funcs_recover_after_poisoned_lock() {
+        let _env = crate::test_env_lock();
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SETUP_FUNCS.lock().unwrap();
+            panic!("poison Lua setup funcs");
+        }));
+        assert!(poison.is_err());
+
+        add_context_setup_func(|_| Ok(()));
+        make_lua_context(Path::new("testing")).expect("poisoned setup lock should recover");
+    }
 
     #[test]
     fn can_register_and_emit_multiple_events() -> anyhow::Result<()> {

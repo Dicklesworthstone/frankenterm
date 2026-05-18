@@ -15,8 +15,8 @@
 //! to Lua config or defaults.
 
 use crate::{
-    frankenterm_config_dirs, merge_dynamic_overrides, toml_to_dynamic, LoadedConfig,
-    CONFIG_FILE_OVERRIDE, HOME_DIR,
+    config_file_override_snapshot, frankenterm_config_dirs, merge_dynamic_overrides,
+    toml_to_dynamic, LoadedConfig, HOME_DIR,
 };
 use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
@@ -68,7 +68,7 @@ fn is_toml_path(path: &Path) -> bool {
 }
 
 fn explicit_config_file_override_path() -> Option<PathBuf> {
-    CONFIG_FILE_OVERRIDE.lock().unwrap().clone()
+    config_file_override_snapshot()
 }
 
 fn explicit_toml_config_path_from_env() -> Option<PathBuf> {

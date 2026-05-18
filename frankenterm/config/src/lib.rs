@@ -41,7 +41,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 #[cfg(all(feature = "lua", feature = "no-lua"))]
@@ -127,6 +127,37 @@ lazy_static! {
         Mutex::new(Some(|e| log::error!("{}", e)));
     static ref LUA_PIPE: LuaPipe = LuaPipe::new();
     pub static ref COLOR_SCHEMES: HashMap<String, Palette> = build_default_schemes();
+}
+
+fn recover_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("recovering poisoned config mutex: {name}");
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn config_file_override_lock() -> MutexGuard<'static, Option<PathBuf>> {
+    recover_mutex(&CONFIG_FILE_OVERRIDE, "CONFIG_FILE_OVERRIDE")
+}
+
+pub(crate) fn config_file_override_snapshot() -> Option<PathBuf> {
+    config_file_override_lock().clone()
+}
+
+fn config_overrides_lock() -> MutexGuard<'static, Vec<(String, String)>> {
+    recover_mutex(&CONFIG_OVERRIDES, "CONFIG_OVERRIDES")
+}
+
+pub(crate) fn config_overrides_snapshot() -> Vec<(String, String)> {
+    config_overrides_lock().clone()
+}
+
+fn show_error_lock() -> MutexGuard<'static, Option<ErrorCallback>> {
+    recover_mutex(&SHOW_ERROR, "SHOW_ERROR")
 }
 
 thread_local! {
@@ -427,12 +458,12 @@ pub fn common_init(
 }
 
 pub fn assign_error_callback(cb: ErrorCallback) {
-    let mut factory = SHOW_ERROR.lock().unwrap();
+    let mut factory = show_error_lock();
     factory.replace(cb);
 }
 
 pub fn show_error(err: &str) {
-    let factory = SHOW_ERROR.lock().unwrap();
+    let factory = show_error_lock();
     if let Some(cb) = factory.as_ref() {
         cb(err)
     }
@@ -487,14 +518,11 @@ fn config_dirs() -> Vec<PathBuf> {
 }
 
 pub fn set_config_file_override(path: &Path) {
-    CONFIG_FILE_OVERRIDE
-        .lock()
-        .unwrap()
-        .replace(path.to_path_buf());
+    config_file_override_lock().replace(path.to_path_buf());
 }
 
 pub fn set_config_overrides(items: &[(String, String)]) -> anyhow::Result<()> {
-    *CONFIG_OVERRIDES.lock().unwrap() = items.to_vec();
+    *config_overrides_lock() = items.to_vec();
 
     let _ = default_config_with_overrides_applied()?;
     Ok(())
@@ -502,8 +530,8 @@ pub fn set_config_overrides(items: &[(String, String)]) -> anyhow::Result<()> {
 
 pub fn is_config_overridden() -> bool {
     CONFIG_SKIP.load(Ordering::Relaxed)
-        || !CONFIG_OVERRIDES.lock().unwrap().is_empty()
-        || CONFIG_FILE_OVERRIDE.lock().unwrap().is_some()
+        || !config_overrides_lock().is_empty()
+        || config_file_override_lock().is_some()
 }
 
 /// Discard the current configuration and replace it with
@@ -823,9 +851,13 @@ impl Configuration {
         }
     }
 
+    fn inner_lock(&self) -> MutexGuard<'_, ConfigInner> {
+        recover_mutex(&self.inner, "Configuration::inner")
+    }
+
     /// Returns the effective configuration.
     pub fn get(&self) -> ConfigHandle {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner_lock();
         ConfigHandle {
             config: Arc::clone(&inner.config),
             generation: inner.generation,
@@ -837,54 +869,54 @@ impl Configuration {
     where
         F: Fn() -> bool + 'static + Send,
     {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.subscribe(subscriber)
     }
 
     fn unsub(&self, sub_id: usize) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.unsub(sub_id);
     }
 
     /// Reset the configuration to defaults
     pub fn use_defaults(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.use_defaults();
     }
 
     fn use_this_config(&self, cfg: Config) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.use_this_config(cfg);
     }
 
     fn overridden(&self, overrides: &frankenterm_dynamic::Value) -> Result<ConfigHandle, Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.overridden(overrides)
     }
 
     /// Use a config that doesn't depend on the user's
     /// environment and is suitable for unit testing
     pub fn use_test(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.use_test();
     }
 
     /// Reload the configuration
     pub fn reload(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.reload();
     }
 
     /// Returns a copy of any captured error message.
     /// The error message is not cleared.
     pub fn get_error(&self) -> Option<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner_lock();
         inner.error.as_ref().cloned()
     }
 
     pub fn get_warnings_and_errors(&self) -> Vec<String> {
         let mut result = vec![];
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner_lock();
         if let Some(error) = &inner.error {
             result.push(error.clone());
         }
@@ -898,7 +930,7 @@ impl Configuration {
     /// it from the config state.
     #[allow(dead_code)]
     pub fn clear_error(&self) -> Option<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner_lock();
         inner.error.take()
     }
 }
@@ -972,6 +1004,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::AssertUnwindSafe;
 
     #[test]
     fn toml_table_numeric_keys_with_all_numeric() {
@@ -1005,6 +1038,57 @@ mod tests {
         table.insert("-1".to_string(), toml::Value::Integer(10));
         table.insert("-99".to_string(), toml::Value::Integer(20));
         assert!(toml_table_has_numeric_keys(&table));
+    }
+
+    #[test]
+    fn global_config_locks_recover_after_poison() {
+        let _env = test_env_lock();
+
+        let file_poison = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = CONFIG_FILE_OVERRIDE.lock().unwrap();
+            panic!("poison config file override");
+        }));
+        assert!(file_poison.is_err());
+        set_config_file_override(Path::new("poisoned.toml"));
+        assert_eq!(
+            config_file_override_snapshot().as_deref(),
+            Some(Path::new("poisoned.toml"))
+        );
+        *config_file_override_lock() = None;
+
+        let overrides_poison = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = CONFIG_OVERRIDES.lock().unwrap();
+            panic!("poison config overrides");
+        }));
+        assert!(overrides_poison.is_err());
+        set_config_overrides(&[]).expect("poisoned overrides lock should recover");
+        assert!(!is_config_overridden());
+
+        static ERROR_CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn count_error_callback(_: &str) {
+            ERROR_CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        fn default_error_callback(err: &str) {
+            log::error!("{}", err);
+        }
+
+        ERROR_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        let show_error_poison = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = SHOW_ERROR.lock().unwrap();
+            panic!("poison error callback");
+        }));
+        assert!(show_error_poison.is_err());
+        assign_error_callback(count_error_callback);
+        show_error("after poison");
+        assert_eq!(ERROR_CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        *show_error_lock() = Some(default_error_callback);
+
+        let config_poison = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = CONFIG.inner.lock().unwrap();
+            panic!("poison configuration state");
+        }));
+        assert!(config_poison.is_err());
+        let _ = CONFIG.get();
     }
 
     #[test]
