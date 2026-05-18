@@ -6,7 +6,9 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+
+type ExtensionCache = HashMap<String, HashMap<String, Vec<u8>>>;
 
 /// Per-extension key-value store backed by a directory of files.
 ///
@@ -15,7 +17,7 @@ use std::sync::Mutex;
 pub struct ExtensionStorage {
     base_dir: PathBuf,
     /// In-memory cache per extension: extension_id → (key → value)
-    cache: Mutex<HashMap<String, HashMap<String, Vec<u8>>>>,
+    cache: Mutex<ExtensionCache>,
 }
 
 impl ExtensionStorage {
@@ -30,15 +32,26 @@ impl ExtensionStorage {
         })
     }
 
+    fn cache_guard(&self) -> MutexGuard<'_, ExtensionCache> {
+        match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.cache.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Get a value for an extension.
     pub fn get(&self, extension_id: &str, key: &str) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
 
         // Check memory cache first
-        if let Ok(cache) = self.cache.lock()
-            && let Some(value) = cache.get(extension_id).and_then(|ec| ec.get(key))
         {
-            return Ok(Some(value.clone()));
+            let cache = self.cache_guard();
+            if let Some(value) = cache.get(extension_id).and_then(|ec| ec.get(key)) {
+                return Ok(Some(value.clone()));
+            }
         }
 
         // Fall through to disk
@@ -51,12 +64,10 @@ impl ExtensionStorage {
             std::fs::read(&path).with_context(|| format!("failed to read storage key '{key}'"))?;
 
         // Populate cache
-        if let Ok(mut cache) = self.cache.lock() {
-            cache
-                .entry(extension_id.to_string())
-                .or_default()
-                .insert(key.to_string(), data.clone());
-        }
+        self.cache_guard()
+            .entry(extension_id.to_string())
+            .or_default()
+            .insert(key.to_string(), data.clone());
 
         Ok(Some(data))
     }
@@ -78,12 +89,10 @@ impl ExtensionStorage {
             .with_context(|| format!("failed to write storage key '{key}'"))?;
 
         // Update cache
-        if let Ok(mut cache) = self.cache.lock() {
-            cache
-                .entry(extension_id.to_string())
-                .or_default()
-                .insert(key.to_string(), value.to_vec());
-        }
+        self.cache_guard()
+            .entry(extension_id.to_string())
+            .or_default()
+            .insert(key.to_string(), value.to_vec());
 
         Ok(())
     }
@@ -101,9 +110,7 @@ impl ExtensionStorage {
         }
 
         // Remove from cache
-        if let Ok(mut cache) = self.cache.lock()
-            && let Some(ext_cache) = cache.get_mut(extension_id)
-        {
+        if let Some(ext_cache) = self.cache_guard().get_mut(extension_id) {
             ext_cache.remove(key);
         }
 
@@ -141,18 +148,14 @@ impl ExtensionStorage {
             })?;
         }
 
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.remove(extension_id);
-        }
+        self.cache_guard().remove(extension_id);
 
         Ok(())
     }
 
     /// Clear the in-memory cache (does not affect disk).
     pub fn clear_cache(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear();
-        }
+        self.cache_guard().clear();
     }
 
     fn key_path(&self, extension_id: &str, key: &str) -> PathBuf {
@@ -175,15 +178,21 @@ fn validate_key(key: &str) -> Result<()> {
 
 /// Encode a key as a safe filename (percent-encode unsafe bytes).
 fn encode_filename(key: &str) -> String {
-    let mut result = String::with_capacity(key.len());
-    for byte in key.bytes() {
+    let mut result = encode_path_component(key);
+    result.push_str(".dat");
+    result
+}
+
+/// Encode an arbitrary string as a collision-resistant path component.
+fn encode_path_component(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
         if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
             result.push(byte as char);
         } else {
             result.push_str(&format!("%{byte:02x}"));
         }
     }
-    result.push_str(".dat");
     result
 }
 
@@ -209,16 +218,7 @@ fn decode_filename(name: &str) -> Option<String> {
 
 /// Convert an extension ID to a safe directory name.
 fn safe_dirname(extension_id: &str) -> String {
-    extension_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    encode_path_component(extension_id)
 }
 
 #[cfg(test)]
@@ -315,6 +315,26 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_extension_ids_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ExtensionStorage::new(dir.path().to_path_buf()).unwrap();
+
+        storage.set("ext/one", "key", b"slash").unwrap();
+        storage.set("ext_one", "key", b"underscore").unwrap();
+        storage.clear_cache();
+
+        assert_eq!(
+            storage.get("ext/one", "key").unwrap().as_deref(),
+            Some(b"slash".as_slice())
+        );
+        assert_eq!(
+            storage.get("ext_one", "key").unwrap().as_deref(),
+            Some(b"underscore".as_slice())
+        );
+        assert_ne!(safe_dirname("ext/one"), safe_dirname("ext_one"));
+    }
+
+    #[test]
     fn clear_extension() {
         let dir = tempfile::tempdir().unwrap();
         let storage = ExtensionStorage::new(dir.path().to_path_buf()).unwrap();
@@ -368,6 +388,29 @@ mod tests {
         // Should still load from disk
         let val = storage.get("ext", "key").unwrap();
         assert_eq!(val.as_deref(), Some(b"value".as_slice()));
+    }
+
+    #[test]
+    fn cache_recovers_after_poisoned_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ExtensionStorage::new(dir.path().to_path_buf()).unwrap();
+        storage.set("ext", "key", b"before").unwrap();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = storage.cache.lock().unwrap();
+            panic!("poison extension storage cache");
+        }));
+        assert!(poison_result.is_err());
+        assert!(storage.cache.is_poisoned());
+
+        storage.set("ext", "key", b"after").unwrap();
+        assert!(!storage.cache.is_poisoned());
+
+        let val = storage.get("ext", "key").unwrap();
+        assert_eq!(val.as_deref(), Some(b"after".as_slice()));
+
+        storage.clear_cache();
+        assert!(!storage.cache.is_poisoned());
     }
 
     #[test]
@@ -444,7 +487,7 @@ mod tests {
             let dirname = safe_dirname(&input);
             for ch in dirname.chars() {
                 prop_assert!(
-                    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_',
+                    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '%',
                     "unsafe char '{}' in dirname", ch
                 );
             }

@@ -8,9 +8,10 @@
 //! Cache location: `~/.cache/frankenterm/wasm/<sha256>.cwasm`
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use wasmtime::{Engine, Module};
 
 /// Module cache with in-memory LRU and optional disk persistence.
@@ -34,6 +35,16 @@ impl ModuleCache {
         })
     }
 
+    fn memory_cache_guard(&self) -> MutexGuard<'_, HashMap<[u8; 32], Module>> {
+        match self.memory_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.memory_cache.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Load or compile a WASM module from raw bytes.
     ///
     /// Checks in order: memory cache → disk cache → compile from source.
@@ -42,17 +53,16 @@ impl ModuleCache {
         let hash = sha256(wasm_bytes);
 
         // Check memory cache
-        if let Ok(cache) = self.memory_cache.lock()
-            && let Some(module) = cache.get(&hash)
         {
-            return Ok(module.clone());
+            let cache = self.memory_cache_guard();
+            if let Some(module) = cache.get(&hash) {
+                return Ok(module.clone());
+            }
         }
 
         // Check disk cache
         if let Some(module) = self.load_from_disk(&hash)? {
-            if let Ok(mut cache) = self.memory_cache.lock() {
-                cache.insert(hash, module.clone());
-            }
+            self.memory_cache_guard().insert(hash, module.clone());
             return Ok(module);
         }
 
@@ -64,9 +74,7 @@ impl ModuleCache {
         self.save_to_disk(&hash, &module)?;
 
         // Cache in memory
-        if let Ok(mut cache) = self.memory_cache.lock() {
-            cache.insert(hash, module.clone());
-        }
+        self.memory_cache_guard().insert(hash, module.clone());
 
         Ok(module)
     }
@@ -80,14 +88,12 @@ impl ModuleCache {
 
     /// Evict all entries from the memory cache.
     pub fn clear_memory_cache(&self) {
-        if let Ok(mut cache) = self.memory_cache.lock() {
-            cache.clear();
-        }
+        self.memory_cache_guard().clear();
     }
 
     /// Number of modules currently in memory cache.
     pub fn memory_cache_size(&self) -> usize {
-        self.memory_cache.lock().map(|c| c.len()).unwrap_or(0)
+        self.memory_cache_guard().len()
     }
 
     fn disk_path(&self, hash: &[u8; 32]) -> Option<PathBuf> {
@@ -137,25 +143,9 @@ impl ModuleCache {
 
 /// Compute SHA-256 hash of bytes.
 fn sha256(data: &[u8]) -> [u8; 32] {
-    use std::hash::{DefaultHasher, Hasher};
-    // Use a simple hash for cache keying. In production we'd use sha2 crate,
-    // but for now DefaultHasher is sufficient for cache invalidation
-    // (collision just means recompile, not a security issue).
-    let mut hasher = DefaultHasher::new();
-    hasher.write(data);
-    let h1 = hasher.finish();
-    hasher.write(data);
-    let h2 = hasher.finish();
-    hasher.write(&h1.to_le_bytes());
-    let h3 = hasher.finish();
-    hasher.write(&h2.to_le_bytes());
-    let h4 = hasher.finish();
-    let mut out = [0u8; 32];
-    out[..8].copy_from_slice(&h1.to_le_bytes());
-    out[8..16].copy_from_slice(&h2.to_le_bytes());
-    out[16..24].copy_from_slice(&h3.to_le_bytes());
-    out[24..32].copy_from_slice(&h4.to_le_bytes());
-    out
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -197,6 +187,15 @@ mod tests {
     }
 
     #[test]
+    fn sha256_matches_known_digest() {
+        let digest = sha256(b"hello world");
+        assert_eq!(
+            hex_encode(&digest),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
     fn sha256_different_inputs() {
         let h1 = sha256(b"hello");
         let h2 = sha256(b"world");
@@ -220,6 +219,25 @@ mod tests {
         // Cleanup
         drop(cache);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_cache_recovers_after_poisoned_lock() {
+        let engine = test_engine();
+        let cache = ModuleCache::new(engine, None).unwrap();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.memory_cache.lock().unwrap();
+            panic!("poison WASM module cache");
+        }));
+        assert!(poison_result.is_err());
+        assert!(cache.memory_cache.is_poisoned());
+
+        assert_eq!(cache.memory_cache_size(), 0);
+        assert!(!cache.memory_cache.is_poisoned());
+
+        cache.clear_memory_cache();
+        assert!(!cache.memory_cache.is_poisoned());
     }
 
     // ===================================================================
