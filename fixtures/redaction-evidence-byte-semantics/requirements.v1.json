@@ -1,0 +1,468 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.redaction_evidence.byte_semantics_conformance.v1",
+  "producing_bead": "ft-khxlh",
+  "source_design_bead": "ft-wjjkp.2",
+  "target_implementation_bead": "ft-wjjkp.3",
+  "source_document": "docs/security/redaction-evidence-byte-semantics.md",
+  "matrix_document": "docs/security/redaction-evidence-byte-semantics-conformance.md",
+  "proof_kind": "static-pre-code",
+  "runtime_conformance_claimed": false,
+  "privacy_policy": {
+    "raw_input_bytes_allowed": false,
+    "redacted_output_text_allowed": false,
+    "matched_secret_snippets_allowed": false,
+    "prefix_suffix_context_allowed": false,
+    "byte_offsets_allowed": false,
+    "secret_material_hashes_allowed": false,
+    "pane_context_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false
+  },
+  "evidence_fields": [
+    "replacement_count",
+    "original_input_bytes",
+    "decoded_input_text_bytes",
+    "redacted_output_bytes",
+    "secret_input_bytes_replaced",
+    "lossy_input_bytes",
+    "lossy_replacement_count"
+  ],
+  "derived_values": [
+    "decode_was_lossy",
+    "text_length_delta",
+    "original_to_output_delta"
+  ],
+  "forbidden_legacy_names": [
+    "matches",
+    "bytes_replaced"
+  ],
+  "requirements": [
+    {
+      "id": "REQ-FIELD-001",
+      "level": "MUST",
+      "category": "field",
+      "statement": "replacement_count is the number of non-overlapping redactor spans replaced.",
+      "source": "Proposed Schema",
+      "verification": "assert exact replacement_count for replacement and mmap header cases",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs",
+        "crates/frankenterm-core/src/scrollback_mmap_writer.rs"
+      ]
+    },
+    {
+      "id": "REQ-FIELD-002",
+      "level": "MUST",
+      "category": "field",
+      "statement": "original_input_bytes is the exact source byte count represented by the returned result, with streaming pending bytes counted only when emitted or finished.",
+      "source": "Proposed Schema; Streaming Accounting",
+      "verification": "assert emitted-result source byte ownership for non-streaming and streaming cases",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-FIELD-003",
+      "level": "MUST",
+      "category": "field",
+      "statement": "decoded_input_text_bytes is the UTF-8 byte length of the lossy-decoded text scanned before redaction.",
+      "source": "Proposed Schema",
+      "verification": "assert lossy-decoded text byte accounting for invalid UTF-8 cases",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-FIELD-004",
+      "level": "MUST",
+      "category": "field",
+      "statement": "redacted_output_bytes is the UTF-8 byte length of the emitted redacted output bytes.",
+      "source": "Proposed Schema",
+      "verification": "assert output byte accounting when replacement markers grow the output and when streaming emits later",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-FIELD-005",
+      "level": "MUST",
+      "category": "field",
+      "statement": "secret_input_bytes_replaced is the exact original source byte count covered by replacement spans.",
+      "source": "Proposed Schema",
+      "verification": "assert replaced source bytes independently from lossy bytes and output bytes",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-LOSSY-001",
+      "level": "MUST",
+      "category": "lossy-decode",
+      "statement": "lossy_input_bytes counts original input bytes represented by lossy replacement characters.",
+      "source": "Proposed Schema",
+      "verification": "assert lossy original-byte accounting for invalid UTF-8 with and without replacement",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-LOSSY-002",
+      "level": "MUST",
+      "category": "lossy-decode",
+      "statement": "lossy_replacement_count counts U+FFFD replacement characters inserted into the scanned text before redaction.",
+      "source": "Proposed Schema",
+      "verification": "assert replacement-character counts for invalid UTF-8 and split streaming boundaries",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-DERIVED-001",
+      "level": "MUST",
+      "category": "derived-values",
+      "statement": "decode_was_lossy, text_length_delta, and original_to_output_delta remain derived and are not stored evidence fields.",
+      "source": "Proposed Schema",
+      "verification": "assert derived values are absent from evidence_fields and computed by tests from explicit counts",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-STREAM-001",
+      "level": "MUST",
+      "category": "streaming",
+      "statement": "Streaming redaction uses mapped decoded text with spans preserving text ranges, original byte counts, and lossy state.",
+      "source": "Streaming Accounting",
+      "verification": "assert split invalid UTF-8 and split replacement cases retain exact span accounting",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-STREAM-002",
+      "level": "MUST",
+      "category": "streaming",
+      "statement": "A streaming call that buffers a partial value and emits no bytes reports zero original_input_bytes and zero redacted_output_bytes for that call.",
+      "source": "Streaming Accounting",
+      "verification": "assert no-emission calls report zero byte ownership and later emission counts once",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-MERGE-001",
+      "level": "MUST",
+      "category": "merge",
+      "statement": "Merged redaction results saturating-add every evidence count while preserving output concatenation semantics.",
+      "source": "Migration Checklist For ft-wjjkp.3",
+      "verification": "assert every explicit field saturating-adds across forced overflow emissions",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs"
+      ]
+    },
+    {
+      "id": "REQ-COLD-001",
+      "level": "MUST",
+      "category": "cold-tier",
+      "statement": "Cold-tier RedactionEvidence mirrors and preserves every byte-evidence field.",
+      "source": "Cold Tier",
+      "verification": "assert From<BytesRedactionEvidence> preserves every explicit count",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/scrollback_cold_tier_pipeline.rs",
+        "docs/security/scrollback-cold-tier-pipeline.md"
+      ]
+    },
+    {
+      "id": "REQ-MMAP-001",
+      "level": "MUST",
+      "category": "mmap",
+      "statement": "Mmap append reports carry the new evidence schema, and header redaction accounting uses replacement_count.",
+      "source": "Mmap Scrollback",
+      "verification": "assert MmapAppendReport evidence fields and ScrollbackHeader redactions_applied increments from replacement_count",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/scrollback_mmap_writer.rs"
+      ]
+    },
+    {
+      "id": "REQ-PRIV-001",
+      "level": "MUST",
+      "category": "privacy",
+      "statement": "Evidence and fixtures retain counts, booleans, labels, and requirement ids only; no raw bytes, output text, snippets, context, offsets, or hashes of secret material.",
+      "source": "Privacy Constraints",
+      "verification": "assert privacy flags and retained_material fields are all false",
+      "target_surfaces": [
+        "docs/security/redaction-evidence-byte-semantics.md",
+        "fixtures/redaction-evidence-byte-semantics/requirements.v1.json"
+      ]
+    },
+    {
+      "id": "REQ-COMPAT-001",
+      "level": "MUST",
+      "category": "legacy-name",
+      "statement": "The legacy bytes_replaced field name does not survive as a compatibility alias in first-party evidence structs.",
+      "source": "Proposed Schema; Migration Checklist For ft-wjjkp.3",
+      "verification": "assert forbidden legacy names are listed and absent from evidence_fields",
+      "target_surfaces": [
+        "crates/frankenterm-core/src/redactor.rs",
+        "crates/frankenterm-core/src/scrollback_cold_tier_pipeline.rs",
+        "crates/frankenterm-core/src/scrollback_mmap_writer.rs"
+      ]
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "FIX-VALID-UTF8-ONE-REPLACEMENT",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "valid UTF-8 with one replacement",
+      "covers": [
+        "REQ-FIELD-001",
+        "REQ-FIELD-002",
+        "REQ-FIELD-005",
+        "REQ-PRIV-001"
+      ],
+      "expected_relationships": [
+        "replacement_count is one",
+        "original_input_bytes equals the emitted source byte count",
+        "secret_input_bytes_replaced equals the replaced source byte count"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-VALID-UTF8-MARKER-LONGER",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "valid UTF-8 with marker longer than replaced text",
+      "covers": [
+        "REQ-FIELD-004",
+        "REQ-DERIVED-001"
+      ],
+      "expected_relationships": [
+        "redacted_output_bytes may exceed decoded_input_text_bytes",
+        "text_length_delta is derived and may be negative",
+        "legacy saturated bytes_replaced semantics are not used"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-INVALID-UTF8-NO-REPLACEMENT",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "invalid UTF-8 with no replacement",
+      "covers": [
+        "REQ-FIELD-003",
+        "REQ-LOSSY-001",
+        "REQ-LOSSY-002"
+      ],
+      "expected_relationships": [
+        "replacement_count is zero",
+        "lossy_input_bytes is greater than zero",
+        "lossy_replacement_count is greater than zero"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-INVALID-UTF8-ADJACENT-REPLACEMENT",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "invalid UTF-8 adjacent to a replacement",
+      "covers": [
+        "REQ-FIELD-003",
+        "REQ-FIELD-005",
+        "REQ-LOSSY-001"
+      ],
+      "expected_relationships": [
+        "decoded_input_text_bytes reflects lossy-decoded text",
+        "secret_input_bytes_replaced excludes unrelated lossy bytes",
+        "lossy_input_bytes excludes valid replaced source bytes"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-INVALID-UTF8-SPLIT-STREAM",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "invalid UTF-8 split across streaming chunk boundaries",
+      "covers": [
+        "REQ-LOSSY-001",
+        "REQ-LOSSY-002",
+        "REQ-STREAM-001",
+        "REQ-STREAM-002"
+      ],
+      "expected_relationships": [
+        "pending decoded spans preserve original byte counts across chunk boundaries",
+        "no-emission calls report zero original_input_bytes and zero redacted_output_bytes",
+        "emitted results count retained bytes exactly once"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-STREAM-SECRET-SPLIT",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "replacement target split across streaming chunk boundaries",
+      "covers": [
+        "REQ-FIELD-002",
+        "REQ-FIELD-004",
+        "REQ-STREAM-001",
+        "REQ-STREAM-002"
+      ],
+      "expected_relationships": [
+        "partial replacement target remains pending until enough text is available",
+        "no-emission call owns zero source and output bytes",
+        "later emission owns the full represented byte count once"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-MERGE-OVERFLOW-EMISSIONS",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "multiple forced-overflow emissions merged into one result",
+      "covers": [
+        "REQ-MERGE-001"
+      ],
+      "expected_relationships": [
+        "replacement_count saturating-adds",
+        "all u64 byte counters saturating-add",
+        "output concatenation semantics remain separate from retained evidence"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-COLD-TIER-CONVERSION",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "cold-tier conversion preserving every evidence field",
+      "covers": [
+        "REQ-COLD-001"
+      ],
+      "expected_relationships": [
+        "cold-tier RedactionEvidence exposes the same evidence_fields set",
+        "From<BytesRedactionEvidence> preserves every explicit count",
+        "PipelineHealth applied/not-applied privacy invariant remains boolean"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-MMAP-APPEND-HEADER",
+      "fixture_kind": "planned-runtime-test",
+      "implementation_status": "planned",
+      "scenario": "mmap append report and header accounting using replacement counts",
+      "covers": [
+        "REQ-FIELD-001",
+        "REQ-MMAP-001"
+      ],
+      "expected_relationships": [
+        "MmapAppendReport carries the full explicit evidence schema",
+        "ScrollbackHeader redactions_applied increments from replacement_count",
+        "header accounting does not depend on retired matches"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    },
+    {
+      "id": "FIX-LEGACY-FIELD-ABSENT",
+      "fixture_kind": "static-guard",
+      "implementation_status": "planned",
+      "scenario": "legacy evidence-name retirement",
+      "covers": [
+        "REQ-PRIV-001",
+        "REQ-COMPAT-001"
+      ],
+      "expected_relationships": [
+        "bytes_replaced is listed as a forbidden legacy name",
+        "matches is listed as a forbidden legacy evidence field",
+        "neither legacy name appears in evidence_fields"
+      ],
+      "retained_material": {
+        "raw_input_bytes": false,
+        "redacted_output_text": false,
+        "matched_secret_snippets": false,
+        "prefix_suffix_context": false,
+        "byte_offsets": false,
+        "secret_material_hashes": false,
+        "pane_context": false
+      }
+    }
+  ],
+  "coverage_matrix": {
+    "must_requirement_count": 15,
+    "must_requirement_fixture_covered_count": 15,
+    "fixture_count": 10,
+    "runtime_implementation_status": "pending-ft-wjjkp.3",
+    "static_verifier": "fixtures/redaction-evidence-byte-semantics/verify-requirements.sh"
+  }
+}
