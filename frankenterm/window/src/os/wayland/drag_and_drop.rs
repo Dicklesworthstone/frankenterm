@@ -67,7 +67,11 @@ impl DragAndDrop {
 
     pub(super) fn dispatch_dropped_files(window_id: usize, paths: Vec<PathBuf>) {
         promise::spawn::spawn_into_main_thread(async move {
-            let conn = WaylandConnection::get().unwrap().wayland();
+            let Some(conn) = WaylandConnection::get() else {
+                log::warn!("Wayland connection is unavailable while dispatching dropped files");
+                return;
+            };
+            let conn = conn.wayland();
             if let Some(handle) = conn.window_by_id(window_id) {
                 let mut inner = handle.borrow_mut();
                 inner.dispatch_dropped_files(paths);

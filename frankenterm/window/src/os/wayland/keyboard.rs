@@ -59,14 +59,28 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 *state.key_repeat_delay.borrow_mut() = *delay;
             }
             WlKeyboardEvent::Keymap { format, fd, size } => {
-                match format.into_result().unwrap() {
+                let format = match format.into_result() {
+                    Ok(format) => format,
+                    Err(raw_format) => {
+                        log::warn!("Ignoring Wayland keymap with unknown format: {raw_format:?}");
+                        return;
+                    }
+                };
+
+                match format {
                     KeymapFormat::XkbV1 => {
                         // In later protocol versions, the fd must be privately mmap'd.
                         // We let xkb handle this and then turn it back into a string.
                         #[allow(unused_unsafe)] // Upstream release will change this
                         match unsafe {
                             let context = xkb::Context::new(CONTEXT_NO_FLAGS);
-                            let cloned_fd = fd.try_clone().expect("Couldn't clone owned fd");
+                            let cloned_fd = match fd.try_clone() {
+                                Ok(fd) => fd,
+                                Err(err) => {
+                                    log::error!("Could not clone Wayland keymap fd: {err:#}");
+                                    return;
+                                }
+                            };
                             xkb::Keymap::new_from_fd(
                                 &context,
                                 cloned_fd,
