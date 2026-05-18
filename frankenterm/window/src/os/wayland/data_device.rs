@@ -130,7 +130,14 @@ impl DataDeviceHandler for WaylandState {
             }
 
             if let Some(copy_and_paste) = self.resolve_copy_and_paste() {
-                copy_and_paste.lock().unwrap().confirm_selection(offer);
+                match copy_and_paste.lock() {
+                    Ok(mut copy_and_paste) => copy_and_paste.confirm_selection(offer),
+                    Err(_) => {
+                        log::error!(
+                            "Wayland copy-and-paste lock was poisoned during data-device selection"
+                        );
+                    }
+                }
             }
         }
     }

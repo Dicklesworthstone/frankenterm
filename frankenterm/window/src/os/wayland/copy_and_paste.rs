@@ -102,9 +102,27 @@ impl CopyAndPaste {
 impl WaylandState {
     pub(super) fn resolve_copy_and_paste(&mut self) -> Option<Arc<Mutex<CopyAndPaste>>> {
         let active_surface_id = self.active_surface_id.borrow();
-        let active_surface_id = active_surface_id.as_ref()?;
-        let pending = self.surface_to_pending.get(&active_surface_id)?;
-        Some(Arc::clone(&pending.lock().unwrap().copy_and_paste))
+        let Some(active_surface_id) = active_surface_id.as_ref() else {
+            log::warn!("Wayland clipboard selection arrived without an active surface");
+            return None;
+        };
+        let Some(pending) = self.surface_to_pending.get(active_surface_id) else {
+            log::warn!(
+                "Wayland clipboard selection arrived without pending surface state for {:?}",
+                active_surface_id
+            );
+            return None;
+        };
+
+        match pending.lock() {
+            Ok(pending) => Some(Arc::clone(&pending.copy_and_paste)),
+            Err(_) => {
+                log::error!(
+                    "Wayland pending surface lock was poisoned while resolving clipboard selection"
+                );
+                None
+            }
+        }
     }
 }
 
