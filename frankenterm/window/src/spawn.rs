@@ -115,7 +115,8 @@ impl SpawnQueue {
     fn new_impl() -> anyhow::Result<Self> {
         let spawned_funcs = Mutex::new(VecDeque::new());
         let spawned_funcs_low_pri = Mutex::new(VecDeque::new());
-        let event_handle = EventHandle::new_manual_reset().expect("EventHandle creation failed");
+        let event_handle = EventHandle::new_manual_reset()
+            .map_err(|err| anyhow::anyhow!("EventHandle creation failed: {err:#}"))?;
         Ok(Self {
             spawned_funcs,
             spawned_funcs_low_pri,
