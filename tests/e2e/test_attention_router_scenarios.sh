@@ -135,6 +135,16 @@ jq -e '
 ' "${INVENTORY}" >/dev/null || fail "scenario entries are incomplete"
 
 jq -e '
+  def unique_ids:
+    length == (unique | length);
+
+  ([.scenarios[].scenario_id] | unique_ids)
+  and all(.scenarios[];
+    ([.source_fixture_requirements[].source_id] | unique_ids)
+  )
+' "${INVENTORY}" >/dev/null || fail "scenario ids and per-scenario source ids must be unique"
+
+jq -e '
   .scenarios[]
   | select(.scenario_id == "empty-ready-bv-blocked-recommendation")
   | ([.source_fixture_requirements[].command_or_api] | sort) == [
