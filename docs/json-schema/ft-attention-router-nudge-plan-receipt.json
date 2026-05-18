@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-attention-router-nudge-plan-receipt.json",
+  "title": "FrankenTerm Attention Router Nudge Plan Receipts",
+  "description": "Static side-effect-free receipt contract for attention-router nudge recommendations.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "producing_bead",
+    "parent_bead",
+    "purpose",
+    "side_effect_policy",
+    "action_vocabulary",
+    "receipts"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.attention_router.nudge_plan_receipts.v1"
+    },
+    "producing_bead": {
+      "type": "string",
+      "const": "ft-x3nsb.5.1"
+    },
+    "parent_bead": {
+      "type": "string",
+      "const": "ft-x3nsb.5"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "side_effect_policy": {
+      "$ref": "#/$defs/side_effect_policy"
+    },
+    "action_vocabulary": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/nudge_kind"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "const": "acknowledge_request"
+          }
+        },
+        {
+          "contains": {
+            "const": "reply_to_thread"
+          }
+        },
+        {
+          "contains": {
+            "const": "status_check"
+          }
+        },
+        {
+          "contains": {
+            "const": "handoff_request"
+          }
+        },
+        {
+          "contains": {
+            "const": "force_release_review"
+          }
+        },
+        {
+          "contains": {
+            "const": "no_action"
+          }
+        }
+      ]
+    },
+    "receipts": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/receipt"
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "hyphen_identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9]+(?:\\.[0-9]+)*$"
+    },
+    "non_empty_string_array": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+      }
+    },
+    "side_effect_policy": {
+      "type": "object",
+      "required": [
+        "auto_send_mail_allowed",
+        "auto_acknowledge_allowed",
+        "auto_comment_beads_allowed",
+        "auto_release_reservations_allowed",
+        "auto_force_release_allowed",
+        "service_mutation_allowed",
+        "build_cancellation_allowed",
+        "worker_mutation_allowed",
+        "destructive_actions_allowed",
+        "dirty_overlap_mutation_allowed",
+        "local_cargo_proof_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "auto_send_mail_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "auto_acknowledge_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "auto_comment_beads_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "auto_release_reservations_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "auto_force_release_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "service_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "build_cancellation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "worker_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "destructive_actions_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "dirty_overlap_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_cargo_proof_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "classification": {
+      "type": "string",
+      "enum": [
+        "waiting_comm",
+        "stale_claim",
+        "dirty_overlap",
+        "do_not_touch"
+      ]
+    },
+    "nudge_kind": {
+      "type": "string",
+      "enum": [
+        "acknowledge_request",
+        "reply_to_thread",
+        "status_check",
+        "handoff_request",
+        "force_release_review",
+        "no_action"
+      ]
+    },
+    "urgency": {
+      "type": "string",
+      "enum": [
+        "low",
+        "normal",
+        "high",
+        "urgent"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "bead",
+            "thread",
+            "operator",
+            "none"
+          ]
+        },
+        "agent_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "thread_ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "sources_checked",
+        "reason_codes",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "sources_checked": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "subjects": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "minimum_source_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "escalation": {
+      "type": "object",
+      "required": [
+        "status_check_before_force_release",
+        "elapsed_time_alone_sufficient",
+        "human_review_required_for_mutation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status_check_before_force_release": {
+          "type": "boolean",
+          "const": true
+        },
+        "elapsed_time_alone_sufficient": {
+          "type": "boolean",
+          "const": false
+        },
+        "human_review_required_for_mutation": {
+          "type": "boolean",
+          "const": true
+        },
+        "minimum_evidence_sources": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimum_wait_minutes_after_status_check": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "required": [
+        "body_handling",
+        "raw_pane_text_allowed",
+        "full_message_body_allowed",
+        "secret_material_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "body_handling": {
+          "type": "string",
+          "enum": [
+            "metadata_only",
+            "summarized"
+          ]
+        },
+        "raw_pane_text_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "full_message_body_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "secret_material_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "required": [
+        "receipt_id",
+        "scenario_id",
+        "trigger_classification",
+        "target",
+        "evidence",
+        "nudge",
+        "escalation",
+        "redaction",
+        "forbidden_actions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "receipt_id": {
+          "$ref": "#/$defs/hyphen_identifier"
+        },
+        "scenario_id": {
+          "$ref": "#/$defs/hyphen_identifier"
+        },
+        "trigger_classification": {
+          "$ref": "#/$defs/classification"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        },
+        "nudge": {
+          "type": "object",
+          "required": [
+            "kind",
+            "command_hint",
+            "urgency",
+            "mutates",
+            "review_required"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/nudge_kind"
+            },
+            "command_hint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "urgency": {
+              "$ref": "#/$defs/urgency"
+            },
+            "mutates": {
+              "type": "boolean",
+              "const": false
+            },
+            "review_required": {
+              "type": "boolean"
+            }
+          }
+        },
+        "escalation": {
+          "$ref": "#/$defs/escalation"
+        },
+        "redaction": {
+          "$ref": "#/$defs/redaction"
+        },
+        "forbidden_actions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/hyphen_identifier"
+          }
+        }
+      }
+    }
+  }
+}

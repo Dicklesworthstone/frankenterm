@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.attention_router.nudge_plan_receipts.v1",
+  "producing_bead": "ft-x3nsb.5.1",
+  "parent_bead": "ft-x3nsb.5",
+  "purpose": "Static receipt inventory for side-effect-free attention-router nudge recommendations.",
+  "side_effect_policy": {
+    "auto_send_mail_allowed": false,
+    "auto_acknowledge_allowed": false,
+    "auto_comment_beads_allowed": false,
+    "auto_release_reservations_allowed": false,
+    "auto_force_release_allowed": false,
+    "service_mutation_allowed": false,
+    "build_cancellation_allowed": false,
+    "worker_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "dirty_overlap_mutation_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "action_vocabulary": [
+    "acknowledge_request",
+    "reply_to_thread",
+    "status_check",
+    "handoff_request",
+    "force_release_review",
+    "no_action"
+  ],
+  "receipts": [
+    {
+      "receipt_id": "ack-required-direct-request",
+      "scenario_id": "agent-mail-ack-required",
+      "trigger_classification": "waiting_comm",
+      "target": {
+        "kind": "thread",
+        "thread_ref": "[THREAD_ID]"
+      },
+      "evidence": {
+        "sources_checked": [
+          "agent_mail.inbox"
+        ],
+        "reason_codes": [
+          "agent_mail.ack_required_present",
+          "coordination.direct_request"
+        ],
+        "subjects": [
+          "[MESSAGE_ID]"
+        ],
+        "minimum_source_count": 1,
+        "summary": "A direct ack-required message is present; acknowledge or reply before claiming unrelated work."
+      },
+      "nudge": {
+        "kind": "acknowledge_request",
+        "command_hint": "acknowledge_message(project_key, agent_name, message_id)",
+        "urgency": "high",
+        "mutates": false,
+        "review_required": false
+      },
+      "escalation": {
+        "status_check_before_force_release": true,
+        "elapsed_time_alone_sufficient": false,
+        "human_review_required_for_mutation": true,
+        "minimum_evidence_sources": 1,
+        "minimum_wait_minutes_after_status_check": 0
+      },
+      "redaction": {
+        "body_handling": "metadata_only",
+        "raw_pane_text_allowed": false,
+        "full_message_body_allowed": false,
+        "secret_material_allowed": false
+      },
+      "forbidden_actions": [
+        "ignore-ack-required-message",
+        "auto-send-reply",
+        "agent-mail-repair",
+        "claim-conflicting-bead-before-ack"
+      ]
+    },
+    {
+      "receipt_id": "stale-claim-status-check",
+      "scenario_id": "stale-in-progress-candidate",
+      "trigger_classification": "stale_claim",
+      "target": {
+        "kind": "bead",
+        "bead_id": "ft-x3nsb.5"
+      },
+      "evidence": {
+        "sources_checked": [
+          "beads.in_progress",
+          "git.history",
+          "agent_mail.search"
+        ],
+        "reason_codes": [
+          "beads.in_progress_present",
+          "beads.no_recent_update",
+          "git.no_recent_owner_commit",
+          "agent_mail.no_recent_owner_message_or_unavailable"
+        ],
+        "subjects": [
+          "ft-x3nsb.5"
+        ],
+        "minimum_source_count": 3,
+        "summary": "A claim looks stale across tracker, git, and mail evidence, but the receipt still recommends a status-check before any takeover review."
+      },
+      "nudge": {
+        "kind": "status_check",
+        "command_hint": "br comment ft-x3nsb.5 'status check: still active?'",
+        "urgency": "normal",
+        "mutates": false,
+        "review_required": true
+      },
+      "escalation": {
+        "status_check_before_force_release": true,
+        "elapsed_time_alone_sufficient": false,
+        "human_review_required_for_mutation": true,
+        "minimum_evidence_sources": 3,
+        "minimum_wait_minutes_after_status_check": 30
+      },
+      "redaction": {
+        "body_handling": "summarized",
+        "raw_pane_text_allowed": false,
+        "full_message_body_allowed": false,
+        "secret_material_allowed": false
+      },
+      "forbidden_actions": [
+        "force-release-without-status-check",
+        "treat-idle-placeholder-as-stuck",
+        "touch-owned-dirty-paths",
+        "reassign-human-owned-work"
+      ]
+    },
+    {
+      "receipt_id": "dirty-overlap-handoff",
+      "scenario_id": "dirty-overlap-active-owner",
+      "trigger_classification": "dirty_overlap",
+      "target": {
+        "kind": "agent",
+        "agent_name": "[OWNER_AGENT]"
+      },
+      "evidence": {
+        "sources_checked": [
+          "git.status",
+          "agent_mail.reservations",
+          "beads.owner_state"
+        ],
+        "reason_codes": [
+          "git.dirty_paths_present",
+          "git.dirty_overlap_risk",
+          "reservation.owner_present_or_dirty_owner_inferred",
+          "beads.owner_active_or_recent"
+        ],
+        "subjects": [
+          "[PATH_PATTERN]"
+        ],
+        "minimum_source_count": 3,
+        "summary": "Dirty paths overlap an active owner or reservation; the only safe recommendation is a handoff request or disjoint work."
+      },
+      "nudge": {
+        "kind": "handoff_request",
+        "command_hint": "send_message(owner, subject='handoff request', body='Can you confirm path ownership?')",
+        "urgency": "normal",
+        "mutates": false,
+        "review_required": true
+      },
+      "escalation": {
+        "status_check_before_force_release": true,
+        "elapsed_time_alone_sufficient": false,
+        "human_review_required_for_mutation": true,
+        "minimum_evidence_sources": 3,
+        "minimum_wait_minutes_after_status_check": 0
+      },
+      "redaction": {
+        "body_handling": "summarized",
+        "raw_pane_text_allowed": false,
+        "full_message_body_allowed": false,
+        "secret_material_allowed": false
+      },
+      "forbidden_actions": [
+        "stash-unrelated-changes",
+        "revert-unrelated-changes",
+        "stage-unowned-dirty-files",
+        "edit-reserved-paths"
+      ]
+    },
+    {
+      "receipt_id": "force-release-review-only",
+      "scenario_id": "stale-in-progress-candidate",
+      "trigger_classification": "stale_claim",
+      "target": {
+        "kind": "operator"
+      },
+      "evidence": {
+        "sources_checked": [
+          "beads.in_progress",
+          "agent_mail.search",
+          "git.history",
+          "pane_state.optional"
+        ],
+        "reason_codes": [
+          "beads.in_progress_present",
+          "beads.no_recent_update",
+          "agent_mail.status_check_sent",
+          "git.no_recent_owner_commit",
+          "pane.idle_placeholder_not_stuck_evidence"
+        ],
+        "subjects": [
+          "ft-x3nsb.5"
+        ],
+        "minimum_source_count": 4,
+        "summary": "Even after a status-check, the router may only recommend force-release review; it does not release reservations or reopen work."
+      },
+      "nudge": {
+        "kind": "force_release_review",
+        "command_hint": "prepare evidence for operator review; do not run force-release automatically",
+        "urgency": "high",
+        "mutates": false,
+        "review_required": true
+      },
+      "escalation": {
+        "status_check_before_force_release": true,
+        "elapsed_time_alone_sufficient": false,
+        "human_review_required_for_mutation": true,
+        "minimum_evidence_sources": 4,
+        "minimum_wait_minutes_after_status_check": 60
+      },
+      "redaction": {
+        "body_handling": "summarized",
+        "raw_pane_text_allowed": false,
+        "full_message_body_allowed": false,
+        "secret_material_allowed": false
+      },
+      "forbidden_actions": [
+        "auto-force-release",
+        "auto-reopen-bead",
+        "release-reservations-without-owner-evidence",
+        "use-elapsed-time-alone"
+      ]
+    }
+  ]
+}
