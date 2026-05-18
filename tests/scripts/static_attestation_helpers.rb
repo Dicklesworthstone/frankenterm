@@ -60,6 +60,28 @@ module StaticAttestation
     )
   end
 
+  def expect_failure!(description, check:)
+    yield
+  rescue Failure => error
+    log_check(
+      check,
+      input_path: description,
+      expected: "StaticAttestation::Failure",
+      actual: error.class.name,
+      status: "pass",
+      reason: error.reason,
+    )
+    error
+  else
+    fail!(
+      "expected static attestation failure did not occur: #{description}",
+      check: check,
+      input_path: description,
+      expected: "StaticAttestation::Failure",
+      actual: "no_failure",
+    )
+  end
+
   def log_check(check, input_path:, expected:, actual:, status:, reason: nil)
     return unless @log_enabled
 

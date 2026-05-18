@@ -2,68 +2,74 @@
 # Static verifier for the adversarial contract-fuzz manifest and CI matrix.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "${ROOT}"
+ROOT="${FRANKENTERM_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+export FRANKENTERM_REPO_ROOT="$ROOT"
+cd "$ROOT"
 
-MANIFEST="docs/security/adversarial-contract-fuzz.json"
-WORKFLOW=".github/workflows/adversarial-contract-fuzz.yml"
-FUZZ_CARGO="fuzz/Cargo.toml"
+source "tests/scripts/static_attestation_helpers.sh"
 
-fail() {
-  printf 'adversarial contract-fuzz manifest: %s\n' "$*" >&2
-  exit 1
-}
+static_attestation_require_executable_script "tests/e2e/test_adversarial_contract_fuzz_manifest.sh"
 
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"
-}
-
-require_file() {
-  local path="$1"
-  [[ -f "${path}" ]] || fail "missing file: ${path}"
-}
-
-require_command jq
-require_command ruby
-
-require_file "${MANIFEST}"
-require_file "${WORKFLOW}"
-require_file "${FUZZ_CARGO}"
-
-mapfile -t referenced_schemas < <(jq -r '.targets[].schema' "${MANIFEST}" | sort -u)
-for schema in "${referenced_schemas[@]}"; do
-  require_file "${schema}"
-done
-
-jq empty "${MANIFEST}" "${referenced_schemas[@]}"
-
-ruby <<'RUBY'
-require "json"
+static_attestation_run_ruby - <<'RUBY'
 require "yaml"
 
 MANIFEST = "docs/security/adversarial-contract-fuzz.json"
 WORKFLOW = ".github/workflows/adversarial-contract-fuzz.yml"
 FUZZ_CARGO = "fuzz/Cargo.toml"
 
-def fail!(message)
-  warn "adversarial contract-fuzz manifest: #{message}"
-  exit 1
+def assert_ok(condition, message, check:, input_path: nil, expected: true, actual: condition)
+  StaticAttestation.assert!(
+    condition,
+    message,
+    check: check,
+    input_path: input_path,
+    expected: expected,
+    actual: actual,
+  )
 end
 
-def repo_relative_path!(path, field)
-  fail!("#{field} is empty") unless path.is_a?(String) && !path.empty?
-  fail!("#{field} must be repo-relative: #{path}") if path.start_with?("/")
-  fail!("#{field} must not contain parent traversal: #{path}") if path.split("/").include?("..")
-  path
+def expect_equal(actual, expected, message, check:, input_path: nil)
+  assert_ok(
+    actual == expected,
+    message,
+    check: check,
+    input_path: input_path,
+    expected: expected,
+    actual: actual,
+  )
+end
+
+def checked_repo_relative_path(path, field, check:)
+  StaticAttestation.repo_relative_path!(path, field: field, check: check)
 end
 
 def normalize_dir(path)
   path.sub(%r{/+\z}, "")
 end
 
-def parse_fuzz_bins
+def require_directory!(path, check:)
+  candidate = StaticAttestation.repo_path(path)
+  actual = if File.directory?(candidate)
+    "directory"
+  elsif File.exist?(candidate)
+    "not_directory"
+  else
+    "missing"
+  end
+  assert_ok(
+    File.directory?(candidate),
+    "missing directory: #{path}",
+    check: check,
+    input_path: path,
+    expected: "directory",
+    actual: actual,
+  )
+  candidate
+end
+
+def parse_fuzz_bins(toml)
   bins = {}
-  File.read(FUZZ_CARGO).split(/^\[\[bin\]\]\s*$/).drop(1).each do |section|
+  toml.split(/^\[\[bin\]\]\s*$/).drop(1).each do |section|
     name = section[/^\s*name\s*=\s*"([^"]+)"/, 1]
     path = section[/^\s*path\s*=\s*"([^"]+)"/, 1]
     next if name.nil? || path.nil?
@@ -76,72 +82,236 @@ def parse_fuzz_bins
   bins
 end
 
-manifest = JSON.parse(File.read(MANIFEST))
-workflow = YAML.load_file(WORKFLOW)
-workflow_text = File.read(WORKFLOW)
-fuzz_bins = parse_fuzz_bins
+def validate_privacy!(privacy, manifest_path)
+  %w[raw_context_content_stored raw_pane_content_stored raw_content_allowed].each do |field|
+    expect_equal(
+      privacy[field],
+      false,
+      "privacy_invariant.#{field} must be false",
+      check: "adversarial.privacy.#{field}",
+      input_path: manifest_path,
+    )
+  end
+  assertion = privacy["assertion"]
+  assert_ok(
+    assertion.is_a?(String) && assertion.include?("raw_"),
+    "privacy assertion is empty",
+    check: "adversarial.privacy.assertion",
+    input_path: manifest_path,
+    expected: "string containing raw_",
+    actual: assertion,
+  )
+end
 
-fail!("schema_version must be 1") unless manifest["schema_version"] == 1
-fail!("unexpected contract_id") unless manifest["contract_id"] == "security.adversarial_contract_fuzz.v1"
-fail!("status must be harness_and_ci_wired") unless manifest["status"] == "harness_and_ci_wired"
-fail!("release_bundle_artifact drift") unless manifest["release_bundle_artifact"] == "security/adversarial-contract-fuzz.json"
+def validate_target!(target, fuzz_bins)
+  family = target.fetch("family")
+  cargo_target = target.fetch("cargo_fuzz_target")
+  path = checked_repo_relative_path(
+    target.fetch("path"),
+    "#{cargo_target}.path",
+    check: "adversarial.target.path",
+  )
+  schema = checked_repo_relative_path(
+    target.fetch("schema"),
+    "#{cargo_target}.schema",
+    check: "adversarial.target.schema",
+  )
+  seed_corpus = normalize_dir(checked_repo_relative_path(
+    target.fetch("seed_corpus"),
+    "#{cargo_target}.seed_corpus",
+    check: "adversarial.target.seed_corpus",
+  ))
+  entry_points = target.fetch("production_entry_points")
+
+  assert_ok(
+    family.match?(/\A[a-z][a-z0-9_]*\z/),
+    "#{cargo_target} family is malformed",
+    check: "adversarial.target.family",
+    input_path: MANIFEST,
+    expected: "lower_snake_case",
+    actual: family,
+  )
+  expect_equal(
+    cargo_target,
+    "contract_#{family}",
+    "#{cargo_target} must use contract_ family prefix",
+    check: "adversarial.target.name",
+    input_path: MANIFEST,
+  )
+
+  StaticAttestation.require_file!(path, check: "adversarial.target.file")
+  StaticAttestation.require_file!(schema, check: "adversarial.target.schema_file")
+  seed_path = require_directory!(seed_corpus, check: "adversarial.target.seed_dir")
+  assert_ok(
+    !Dir.children(seed_path.to_s).empty?,
+    "#{cargo_target} seed corpus is empty",
+    check: "adversarial.target.seed_dir_nonempty",
+    input_path: seed_corpus,
+    expected: "non-empty",
+    actual: Dir.children(seed_path.to_s).length,
+  )
+  assert_ok(
+    entry_points.is_a?(Array) && entry_points.any?,
+    "#{cargo_target} production entry points empty",
+    check: "adversarial.target.entry_points",
+    input_path: MANIFEST,
+    expected: "non-empty array",
+    actual: entry_points,
+  )
+  assert_ok(
+    entry_points.all? { |entry| entry.is_a?(String) && entry.include?("::") },
+    "#{cargo_target} production entry point is malformed",
+    check: "adversarial.target.entry_point_shape",
+    input_path: MANIFEST,
+    expected: "Rust path strings",
+    actual: entry_points,
+  )
+
+  cargo_bin = fuzz_bins[cargo_target]
+  assert_ok(
+    !cargo_bin.nil?,
+    "#{cargo_target} missing [[bin]] in #{FUZZ_CARGO}",
+    check: "adversarial.target.cargo_bin",
+    input_path: FUZZ_CARGO,
+    expected: cargo_target,
+    actual: fuzz_bins.keys,
+  )
+  expect_equal(
+    File.join("fuzz", cargo_bin.fetch(:path)),
+    path,
+    "#{cargo_target} Cargo.toml path mismatch",
+    check: "adversarial.target.cargo_path",
+    input_path: FUZZ_CARGO,
+  )
+  StaticAttestation.require_terms!(
+    cargo_bin.fetch(:section),
+    StaticAttestation.expected_strings('"core-fuzz-targets"'),
+    source: "#{FUZZ_CARGO}:#{cargo_target}",
+    check: "adversarial.target.cargo_features",
+  )
+
+  source = StaticAttestation.read_text!(path, check: "adversarial.target.source")
+  StaticAttestation.require_terms!(
+    source,
+    StaticAttestation.expected_strings(
+      "fuzz_target!",
+      "compile_schema",
+      schema,
+      "assert_no_raw_content_flags",
+      "../contract_fuzz_common.rs",
+    ),
+    source: path,
+    check: "adversarial.target.source_terms",
+  )
+
+  schema_doc = StaticAttestation.read_json!(schema, check: "adversarial.target.schema_json")
+  assert_ok(
+    schema_doc.fetch("$id").end_with?("/#{File.basename(schema)}"),
+    "#{cargo_target} schema id must end with schema file",
+    check: "adversarial.target.schema_id",
+    input_path: schema,
+    expected: File.basename(schema),
+    actual: schema_doc.fetch("$id"),
+  )
+
+  [cargo_target, seed_corpus]
+end
+
+def validate_local_proof!(local_proof, target_names, manifest_path)
+  expect_equal(
+    local_proof["cargo_execution_policy"],
+    "run through rch only",
+    "local_proof must require RCH for Cargo",
+    check: "adversarial.local_proof.cargo_policy",
+    input_path: manifest_path,
+  )
+  commands = local_proof.fetch("commands")
+  assert_ok(
+    commands.is_a?(Array),
+    "local_proof.commands must be an array",
+    check: "adversarial.local_proof.commands_shape",
+    input_path: manifest_path,
+    expected: "array",
+    actual: commands,
+  )
+  rch_command = commands.map { |row| row["command"] }.find { |command| command.to_s.include?("rch exec") }
+  assert_ok(
+    !rch_command.nil?,
+    "local_proof missing RCH compile command",
+    check: "adversarial.local_proof.rch_command",
+    input_path: manifest_path,
+    expected: "rch exec command",
+    actual: commands,
+  )
+  target_names.each do |target_name|
+    StaticAttestation.require_terms!(
+      rch_command,
+      StaticAttestation.expected_strings("--bin #{target_name}"),
+      source: "#{manifest_path}:local_proof.commands",
+      check: "adversarial.local_proof.rch_targets",
+    )
+  end
+end
+
+StaticAttestation.require_direct_exec_script!(
+  "tests/e2e/test_adversarial_contract_fuzz_manifest.sh",
+  check: "adversarial.verifier_shape",
+)
+
+manifest = StaticAttestation.read_json!(MANIFEST, check: "adversarial.manifest_json")
+workflow_text = StaticAttestation.read_text!(WORKFLOW, check: "adversarial.workflow_text")
+workflow = YAML.safe_load(workflow_text, aliases: true)
+fuzz_toml = StaticAttestation.read_text!(FUZZ_CARGO, check: "adversarial.fuzz_cargo")
+fuzz_bins = parse_fuzz_bins(fuzz_toml)
+
+expect_equal(manifest["schema_version"], 1, "schema_version must be 1", check: "adversarial.schema_version", input_path: MANIFEST)
+expect_equal(manifest["contract_id"], "security.adversarial_contract_fuzz.v1", "unexpected contract_id", check: "adversarial.contract_id", input_path: MANIFEST)
+expect_equal(manifest["status"], "harness_and_ci_wired", "status must be harness_and_ci_wired", check: "adversarial.status", input_path: MANIFEST)
+expect_equal(manifest["release_bundle_artifact"], "security/adversarial-contract-fuzz.json", "release_bundle_artifact drift", check: "adversarial.release_bundle", input_path: MANIFEST)
 
 privacy = manifest.fetch("privacy_invariant")
-%w[raw_context_content_stored raw_pane_content_stored raw_content_allowed].each do |field|
-  fail!("privacy_invariant.#{field} must be false") unless privacy[field] == false
+validate_privacy!(privacy, MANIFEST)
+StaticAttestation.expect_failure!("raw-content privacy negative fixture", check: "adversarial.negative.privacy") do
+  validate_privacy!(privacy.merge("raw_content_allowed" => true), MANIFEST)
 end
-fail!("privacy assertion is empty") unless privacy["assertion"].is_a?(String) && privacy["assertion"].include?("raw_")
 
 targets = manifest.fetch("targets")
-fail!("must retain at least five contract fuzz targets") unless targets.length >= 5
+assert_ok(
+  targets.length >= 5,
+  "must retain at least five contract fuzz targets",
+  check: "adversarial.targets.count",
+  input_path: MANIFEST,
+  expected: ">= 5",
+  actual: targets.length,
+)
 
 families = targets.map { |target| target["family"] }
 target_names = targets.map { |target| target["cargo_fuzz_target"] }
-fail!("duplicate target families") unless families.uniq.length == families.length
-fail!("duplicate cargo_fuzz_target names") unless target_names.uniq.length == target_names.length
+expect_equal(families.uniq.length, families.length, "duplicate target families", check: "adversarial.targets.unique_families", input_path: MANIFEST)
+expect_equal(target_names.uniq.length, target_names.length, "duplicate cargo_fuzz_target names", check: "adversarial.targets.unique_names", input_path: MANIFEST)
 
 manifest_pairs = []
 targets.each do |target|
-  family = target.fetch("family")
-  cargo_target = target.fetch("cargo_fuzz_target")
-  path = repo_relative_path!(target.fetch("path"), "#{cargo_target}.path")
-  schema = repo_relative_path!(target.fetch("schema"), "#{cargo_target}.schema")
-  seed_corpus = normalize_dir(repo_relative_path!(target.fetch("seed_corpus"), "#{cargo_target}.seed_corpus"))
-  entry_points = target.fetch("production_entry_points")
-
-  fail!("#{cargo_target} family is malformed") unless family.match?(/\A[a-z][a-z0-9_]*\z/)
-  fail!("#{cargo_target} must use contract_ family prefix") unless cargo_target == "contract_#{family}"
-  fail!("#{cargo_target} target file missing: #{path}") unless File.file?(path)
-  fail!("#{cargo_target} schema missing: #{schema}") unless File.file?(schema)
-  fail!("#{cargo_target} seed corpus missing: #{seed_corpus}") unless File.directory?(seed_corpus)
-  fail!("#{cargo_target} seed corpus is empty") if Dir.children(seed_corpus).empty?
-  fail!("#{cargo_target} production entry points empty") unless entry_points.is_a?(Array) && entry_points.any?
-  fail!("#{cargo_target} production entry point is malformed") unless entry_points.all? { |entry| entry.is_a?(String) && entry.include?("::") }
-
-  cargo_bin = fuzz_bins[cargo_target]
-  fail!("#{cargo_target} missing [[bin]] in #{FUZZ_CARGO}") if cargo_bin.nil?
-  fail!("#{cargo_target} Cargo.toml path mismatch") unless File.join("fuzz", cargo_bin[:path]) == path
-  fail!("#{cargo_target} must require core-fuzz-targets") unless cargo_bin[:section].include?('"core-fuzz-targets"')
-
-  source = File.read(path)
-  fail!("#{cargo_target} target must use libfuzzer fuzz_target!") unless source.include?("fuzz_target!")
-  fail!("#{cargo_target} target must compile its declared schema") unless source.include?("compile_schema") && source.include?(schema)
-  fail!("#{cargo_target} target must assert no raw content flags") unless source.include?("assert_no_raw_content_flags")
-  fail!("#{cargo_target} target must share contract_fuzz_common") unless source.include?("../contract_fuzz_common.rs")
-
-  schema_doc = JSON.parse(File.read(schema))
-  fail!("#{cargo_target} schema id must end with schema file") unless schema_doc.fetch("$id").end_with?("/#{File.basename(schema)}")
-
-  manifest_pairs << [cargo_target, seed_corpus]
+  manifest_pairs << validate_target!(target, fuzz_bins)
+end
+StaticAttestation.expect_failure!("absolute target path negative fixture", check: "adversarial.negative.target_path") do
+  validate_target!(targets.first.merge("path" => "/tmp/contract.rs"), fuzz_bins)
 end
 
 ci = manifest.fetch("ci")
-fail!("ci.workflow must point at workflow file") unless ci["workflow"] == WORKFLOW
-fail!("PR fuzz seconds must remain 1800") unless ci["pull_request_seconds_per_target"] == 1800
-fail!("release fuzz seconds must remain 86400") unless ci["release_seconds_per_target"] == 86_400
+expect_equal(ci["workflow"], WORKFLOW, "ci.workflow must point at workflow file", check: "adversarial.ci.workflow", input_path: MANIFEST)
+expect_equal(ci["pull_request_seconds_per_target"], 1800, "PR fuzz seconds must remain 1800", check: "adversarial.ci.pr_seconds", input_path: MANIFEST)
+expect_equal(ci["release_seconds_per_target"], 86_400, "release fuzz seconds must remain 86400", check: "adversarial.ci.release_seconds", input_path: MANIFEST)
 
 workflow_events = workflow["on"] || workflow[true]
-fail!("workflow event block missing") unless workflow_events.is_a?(Hash)
+assert_ok(
+  workflow_events.is_a?(Hash),
+  "workflow event block missing",
+  check: "adversarial.workflow.events",
+  input_path: WORKFLOW,
+  expected: "hash",
+  actual: workflow_events,
+)
 paths = workflow_events.fetch("pull_request").fetch("paths")
 [
   "crates/frankenterm-core/**",
@@ -150,7 +320,14 @@ paths = workflow_events.fetch("pull_request").fetch("paths")
   "fuzz/**",
   WORKFLOW,
 ].each do |path|
-  fail!("workflow pull_request paths missing #{path}") unless paths.include?(path)
+  assert_ok(
+    paths.include?(path),
+    "workflow pull_request paths missing #{path}",
+    check: "adversarial.workflow.pr_paths",
+    input_path: WORKFLOW,
+    expected: path,
+    actual: paths,
+  )
 end
 
 jobs = workflow.fetch("jobs")
@@ -161,17 +338,26 @@ jobs = workflow.fetch("jobs")
   job = jobs.fetch(job_name)
   matrix = job.fetch("strategy").fetch("matrix").fetch("include")
   matrix_pairs = matrix.map { |row| [row.fetch("target"), normalize_dir(row.fetch("corpus"))] }.sort
-  fail!("#{job_name} matrix does not match manifest targets") unless matrix_pairs == manifest_pairs.sort
-  fail!("#{job_name} timeout command missing max_total_time=#{expected_seconds}") unless workflow_text.include?("-max_total_time=#{expected_seconds}")
+  expect_equal(
+    matrix_pairs,
+    manifest_pairs.sort,
+    "#{job_name} matrix does not match manifest targets",
+    check: "adversarial.workflow.#{job_name}.matrix",
+    input_path: WORKFLOW,
+  )
+  StaticAttestation.require_terms!(
+    workflow_text,
+    StaticAttestation.expected_strings("-max_total_time=#{expected_seconds}"),
+    source: WORKFLOW,
+    check: "adversarial.workflow.#{job_name}.timeout",
+  )
 end
 
 local_proof = manifest.fetch("local_proof")
-fail!("local_proof must require RCH for Cargo") unless local_proof["cargo_execution_policy"] == "run through rch only"
-rch_command = local_proof.fetch("commands").map { |row| row["command"] }.find { |command| command.to_s.include?("rch exec") }
-fail!("local_proof missing RCH compile command") if rch_command.nil?
-target_names.each do |target_name|
-  fail!("local_proof RCH command missing #{target_name}") unless rch_command.include?("--bin #{target_name}")
+validate_local_proof!(local_proof, target_names, MANIFEST)
+StaticAttestation.expect_failure!("local proof policy negative fixture", check: "adversarial.negative.local_proof_policy") do
+  validate_local_proof!(local_proof.merge("cargo_execution_policy" => "run locally"), target_names, MANIFEST)
 end
 
-puts "adversarial contract-fuzz manifest: static verifier passed (#{targets.length} targets)"
+puts "adversarial contract-fuzz manifest: static-only verifier passed (#{targets.length} targets; RCH compile proof remains separately required)"
 RUBY

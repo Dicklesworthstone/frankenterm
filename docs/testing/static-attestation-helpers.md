@@ -41,6 +41,9 @@ Primary entry points:
   sizes against the corpus directory.
 - `StaticAttestation.require_direct_exec_script!` verifies a script has a
   shebang, executable bit, and `set -euo pipefail`.
+- `StaticAttestation.expect_failure!` records negative static fixtures that must
+  fail helper validation, such as absolute paths, raw-content privacy flags, or
+  local-Cargo proof claims.
 
 Each helper emits one JSONL record per check to stderr unless
 `STATIC_ATTESTATION_LOGS=0` is set. Log rows include `check`, `input_path`,
@@ -68,6 +71,13 @@ Available functions:
 `static_attestation_run_ruby` sets the Ruby load path so inline Ruby checks can
 use `StaticAttestation` without duplicating helper bootstrapping.
 
+## Adopted Verifiers
+
+| Verifier | Helper coverage | Proof boundary |
+|---|---|---|
+| `tests/e2e/test_passive_watch_attestation_manifest.sh` | Direct-exec shape, source-document existence, seed corpus names and byte sizes, exact audit/source terms. | Static artifact consistency only; the targeted unit proof remains RCH-gated by the attestation status. |
+| `tests/e2e/test_adversarial_contract_fuzz_manifest.sh` | Direct-exec shape, repo-relative target/schema/corpus paths, JSON schema parsing, workflow matrix parity, source-term checks, negative privacy/path/local-proof fixtures. | Static manifest and CI-contract consistency only; Cargo/fuzz compilation remains the separate `rch exec` proof named in `local_proof.commands`. |
+
 ## Proof Boundary
 
 These checks are static proof only:
@@ -78,6 +88,7 @@ These checks are static proof only:
 - Seed corpus file name and byte-size consistency.
 - Direct-exec, shebang, and strict-mode script shape.
 - Multi-word expected phrase preservation.
+- Negative fixture behavior for malformed static contracts.
 
 These checks require downstream RCH-backed proof before a bead can claim runtime
 behavior:

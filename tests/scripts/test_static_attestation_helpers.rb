@@ -17,18 +17,16 @@ rescue StandardError => error
   raise
 end
 
-def expect_failure
-  yield
-rescue StaticAttestation::Failure
-  return true
-end
-
 StaticAttestation.configure(log_io: StringIO.new, log_enabled: true)
 
 check("repo-relative path guard rejects absolute and parent traversal") do
   StaticAttestation.repo_relative_path!("docs/security/passive-watch-attestation.json")
-  raise "absolute path passed" unless expect_failure { StaticAttestation.repo_relative_path!("/tmp/nope") }
-  raise "parent traversal passed" unless expect_failure { StaticAttestation.repo_relative_path!("docs/../secret") }
+  StaticAttestation.expect_failure!("absolute path guard", check: "test.negative.absolute_path") do
+    StaticAttestation.repo_relative_path!("/tmp/nope")
+  end
+  StaticAttestation.expect_failure!("parent traversal guard", check: "test.negative.parent_traversal") do
+    StaticAttestation.repo_relative_path!("docs/../secret")
+  end
 end
 
 check("multi-word expected strings remain whole strings") do
@@ -37,7 +35,7 @@ check("multi-word expected strings remain whole strings") do
     "Zero non-capture storage",
   )
   raise "expected two whole phrases" unless terms == ["Zero outbound mutating IPC", "Zero non-capture storage"]
-  raise "split words falsely satisfied the phrase" unless expect_failure do
+  StaticAttestation.expect_failure!("split words do not satisfy whole phrase", check: "test.negative.split_phrase") do
     StaticAttestation.require_terms!(
       "Zero\noutbound\nmutating\nIPC\nZero\nnon-capture\nstorage\n",
       ["Zero outbound mutating IPC"],
@@ -62,6 +60,25 @@ check("structured logs contain check input expected actual status and reason") d
   raise "unexpected check" unless record["check"] == "log_shape"
   raise "unexpected expected" unless record["expected"] == "alpha beta"
   raise "unexpected status" unless record["status"] == "pass"
+end
+
+check("negative expectation helper records expected failures") do
+  log_io = StringIO.new
+  StaticAttestation.configure(log_io: log_io, log_enabled: true)
+  error = StaticAttestation.expect_failure!("missing phrase fixture", check: "test.expect_failure") do
+    StaticAttestation.require_terms!(
+      "alpha beta",
+      ["gamma delta"],
+      source: "inline-negative-fixture",
+      check: "test.expect_failure.inner",
+    )
+  end
+  raise "wrong error type" unless error.is_a?(StaticAttestation::Failure)
+
+  record = JSON.parse(log_io.string.lines.last)
+  raise "expected pass record" unless record["status"] == "pass"
+  raise "wrong check" unless record["check"] == "test.expect_failure"
+  raise "missing failure reason" unless record["failure_reason"].to_s.include?("gamma delta")
 end
 
 check("passive-watch source documents and multi-word audit phrases are preserved") do
