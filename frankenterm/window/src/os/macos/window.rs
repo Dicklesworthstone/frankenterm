@@ -528,7 +528,9 @@ impl Window {
             None => config::configuration(),
         };
 
-        let conn = Connection::get().expect("new_window called on gui thread");
+        let conn = Connection::get().ok_or_else(|| {
+            anyhow!("new_window must be called after Connection::init has succeeded")
+        })?;
         let ResolvedGeometry {
             width,
             height,
@@ -556,8 +558,6 @@ impl Window {
                 NSPoint::new(0., 0.),
                 NSSize::new(width as f64, height as f64),
             );
-
-            let conn = Connection::get().expect("Connection::init has not been called");
 
             let window_id = conn.next_window_id();
             let events = WindowEventSender::new(event_handler);
