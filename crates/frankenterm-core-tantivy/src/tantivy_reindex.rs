@@ -19,12 +19,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::tantivy_ingest::{
-    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, frankensqlite_unsupported,
-    map_event_to_document,
+    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, map_event_to_document,
 };
 use frankenterm_core::recorder_storage::{
-    CheckpointConsumerId, EventCursorError, RecorderCheckpoint, RecorderEventCursor,
-    RecorderEventReader, RecorderOffset, RecorderSourceDescriptor, RecorderStorage,
+    CheckpointConsumerId, EventCursorError, FrankenSqliteEventReader, RecorderCheckpoint,
+    RecorderEventCursor, RecorderEventReader, RecorderOffset, RecorderSourceDescriptor,
+    RecorderStorage,
 };
 use frankenterm_core::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 
@@ -50,7 +50,14 @@ fn create_event_reader(
             );
             Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
         }
-        RecorderSourceDescriptor::FrankenSqlite { .. } => Err(frankensqlite_unsupported("reindex")),
+        RecorderSourceDescriptor::FrankenSqlite { db_path } => {
+            tracing::debug!(
+                reindex_source = %source,
+                db_path = %db_path.display(),
+                "creating frankensqlite event reader for reindex"
+            );
+            Ok(Box::new(FrankenSqliteEventReader::new(db_path.clone())))
+        }
     }
 }
 

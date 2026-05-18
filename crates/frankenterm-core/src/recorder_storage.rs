@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::Error as _};
 use thiserror::Error;
 
@@ -49,10 +50,7 @@ impl<'de> Deserialize<'de> for RecorderBackendKind {
     {
         match String::deserialize(deserializer)?.as_str() {
             "append_log" => Ok(Self::AppendLog),
-            "frankensqlite" | "franken_sqlite" => Err(D::Error::custom(
-                "frankensqlite recorder backend is not yet implemented; \
-                 select `append_log` instead",
-            )),
+            "frankensqlite" | "franken_sqlite" => Ok(Self::FrankenSqlite),
             other => Err(D::Error::unknown_variant(
                 other,
                 &["append_log", "frankensqlite"],
@@ -283,6 +281,9 @@ pub enum RecorderStorageError {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("SQLite error: {0}")]
+    Sqlite(String),
+
     #[error("backend {backend} unavailable: {message}")]
     BackendUnavailable {
         backend: RecorderBackendKind,
@@ -302,6 +303,7 @@ impl RecorderStorageError {
             Self::CorruptRecord { .. } => RecorderStorageErrorClass::Corruption,
             Self::Io(_) => RecorderStorageErrorClass::Retryable,
             Self::Json(_) => RecorderStorageErrorClass::TerminalData,
+            Self::Sqlite(_) => RecorderStorageErrorClass::Retryable,
             Self::BackendUnavailable { .. } => RecorderStorageErrorClass::DependencyUnavailable,
         }
     }
@@ -505,6 +507,61 @@ impl Default for AppendLogStorageConfig {
     }
 }
 
+/// FrankenSqlite recorder backend configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FrankenSqliteStorageConfig {
+    /// Path to the recorder SQLite database.
+    pub db_path: PathBuf,
+    /// Maximum concurrent append calls admitted.
+    pub queue_capacity: usize,
+    /// Maximum events accepted in a single batch.
+    pub max_batch_events: usize,
+    /// Maximum serialized payload bytes accepted in a single batch.
+    pub max_batch_bytes: usize,
+    /// Maximum idempotency entries retained in the batch cache table.
+    pub max_idempotency_entries: usize,
+}
+
+impl FrankenSqliteStorageConfig {
+    /// Validate config for runtime safety.
+    pub fn validate(&self) -> std::result::Result<(), RecorderStorageError> {
+        if self.queue_capacity == 0 {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "queue_capacity must be >= 1".to_string(),
+            });
+        }
+        if self.max_batch_events == 0 {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "max_batch_events must be >= 1".to_string(),
+            });
+        }
+        if self.max_batch_bytes == 0 {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "max_batch_bytes must be >= 1".to_string(),
+            });
+        }
+        if self.max_idempotency_entries == 0 {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "max_idempotency_entries must be >= 1".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for FrankenSqliteStorageConfig {
+    fn default() -> Self {
+        Self {
+            db_path: PathBuf::from(".ft/recorder-log/events.sqlite3"),
+            queue_capacity: 1024,
+            max_batch_events: 256,
+            max_batch_bytes: 256 * 1024,
+            max_idempotency_entries: 4096,
+        }
+    }
+}
+
 /// Startup-time recorder storage selector/config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -513,6 +570,8 @@ pub struct RecorderStorageConfig {
     pub backend: RecorderBackendKind,
     /// Append-log backend settings.
     pub append_log: AppendLogStorageConfig,
+    /// FrankenSqlite backend settings.
+    pub frankensqlite: FrankenSqliteStorageConfig,
 }
 
 impl Default for RecorderStorageConfig {
@@ -520,6 +579,7 @@ impl Default for RecorderStorageConfig {
         Self {
             backend: RecorderBackendKind::AppendLog,
             append_log: AppendLogStorageConfig::default(),
+            frankensqlite: FrankenSqliteStorageConfig::default(),
         }
     }
 }
@@ -528,18 +588,21 @@ impl Default for RecorderStorageConfig {
 #[derive(Debug)]
 pub enum RecorderStorageInstance {
     AppendLog(AppendLogRecorderStorage),
+    FrankenSqlite(FrankenSqliteRecorderStorage),
 }
 
 impl RecorderStorage for RecorderStorageInstance {
     fn backend_kind(&self) -> RecorderBackendKind {
         match self {
             Self::AppendLog(inner) => inner.backend_kind(),
+            Self::FrankenSqlite(inner) => inner.backend_kind(),
         }
     }
 
     fn append_log_data_path(&self) -> Option<&Path> {
         match self {
             Self::AppendLog(inner) => inner.append_log_data_path(),
+            Self::FrankenSqlite(inner) => inner.append_log_data_path(),
         }
     }
 
@@ -549,6 +612,7 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<AppendResponse, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.append_batch(req).await,
+            Self::FrankenSqlite(inner) => inner.append_batch(req).await,
         }
     }
 
@@ -558,6 +622,7 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<FlushStats, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.flush(mode).await,
+            Self::FrankenSqlite(inner) => inner.flush(mode).await,
         }
     }
 
@@ -567,6 +632,7 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.read_checkpoint(consumer).await,
+            Self::FrankenSqlite(inner) => inner.read_checkpoint(consumer).await,
         }
     }
 
@@ -576,18 +642,21 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.commit_checkpoint(checkpoint).await,
+            Self::FrankenSqlite(inner) => inner.commit_checkpoint(checkpoint).await,
         }
     }
 
     async fn health(&self) -> RecorderStorageHealth {
         match self {
             Self::AppendLog(inner) => inner.health().await,
+            Self::FrankenSqlite(inner) => inner.health().await,
         }
     }
 
     async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.lag_metrics().await,
+            Self::FrankenSqlite(inner) => inner.lag_metrics().await,
         }
     }
 }
@@ -608,10 +677,16 @@ pub fn bootstrap_recorder_storage(
             let storage = AppendLogRecorderStorage::open(config.append_log)?;
             Ok(RecorderStorageInstance::AppendLog(storage))
         }
-        RecorderBackendKind::FrankenSqlite => Err(RecorderStorageError::BackendUnavailable {
-            backend: RecorderBackendKind::FrankenSqlite,
-            message: "frankensqlite backend not yet implemented".to_string(),
-        }),
+        RecorderBackendKind::FrankenSqlite => {
+            tracing::info!(
+                target: "recorder::bootstrap",
+                backend = %RecorderBackendKind::FrankenSqlite,
+                db_path = %config.frankensqlite.db_path.display(),
+                "Bootstrapping recorder FrankenSqlite backend"
+            );
+            let storage = FrankenSqliteRecorderStorage::open(config.frankensqlite)?;
+            Ok(RecorderStorageInstance::FrankenSqlite(storage))
+        }
     }
 }
 
@@ -869,7 +944,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
             });
         }
 
-        let mut inner = self.inner.lock().await;
+        let inner = self.inner.lock().await;
         let AppendRequest {
             batch_id,
             events,
@@ -1107,11 +1182,812 @@ impl RecorderStorage for AppendLogRecorderStorage {
     }
 }
 
+/// SQLite-backed recorder storage and event reader.
+pub struct FrankenSqliteRecorderStorage {
+    config: FrankenSqliteStorageConfig,
+    in_flight: AtomicUsize,
+    inner: Arc<Mutex<FrankenSqliteInner>>,
+}
+
+struct FrankenSqliteInner {
+    conn: Connection,
+    last_error: Option<String>,
+}
+
+impl std::fmt::Debug for FrankenSqliteRecorderStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrankenSqliteRecorderStorage")
+            .field("db_path", &self.config.db_path)
+            .field("queue_capacity", &self.config.queue_capacity)
+            .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrankenSqliteRecorderStorage {
+    /// Open or create a FrankenSqlite recorder backend.
+    pub fn open(
+        config: FrankenSqliteStorageConfig,
+    ) -> std::result::Result<Self, RecorderStorageError> {
+        config.validate()?;
+        ensure_parent_dir(&config.db_path)?;
+        let conn = Connection::open(&config.db_path).map_err(sqlite_error)?;
+        initialize_frankensqlite_schema(&conn)?;
+        Ok(Self {
+            config,
+            in_flight: AtomicUsize::new(0),
+            inner: Arc::new(Mutex::new(FrankenSqliteInner {
+                conn,
+                last_error: None,
+            })),
+        })
+    }
+
+    /// Return a reader over this storage's event stream.
+    pub fn event_reader(&self) -> FrankenSqliteEventReader {
+        FrankenSqliteEventReader::new(self.config.db_path.clone())
+    }
+
+    fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
+        let current = self.in_flight.load(Ordering::Acquire);
+        if current >= self.config.queue_capacity {
+            return Err(RecorderStorageError::QueueFull {
+                capacity: self.config.queue_capacity,
+            });
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        Ok(InFlightGuard {
+            counter: &self.in_flight,
+        })
+    }
+
+    fn clear_last_error(inner: &mut FrankenSqliteInner) {
+        inner.last_error = None;
+    }
+
+    fn record_last_error(
+        inner: &mut FrankenSqliteInner,
+        operation: &'static str,
+        err: &RecorderStorageError,
+    ) {
+        inner.last_error = Some(format!(
+            "{operation} failed (class={:?}): {err}",
+            err.class()
+        ));
+    }
+
+    fn cached_response(
+        conn: &Connection,
+        batch_id: &str,
+    ) -> std::result::Result<Option<AppendResponse>, RecorderStorageError> {
+        let response_json = conn
+            .query_row(
+                "SELECT response_json FROM recorder_batches WHERE batch_id = ?1",
+                params![batch_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        response_json
+            .map(|json| serde_json::from_str::<AppendResponse>(&json).map_err(Into::into))
+            .transpose()
+    }
+
+    fn update_cached_response(
+        conn: &Connection,
+        batch_id: &str,
+        response: &AppendResponse,
+    ) -> std::result::Result<(), RecorderStorageError> {
+        let response_json = serde_json::to_string(response)?;
+        conn.execute(
+            "UPDATE recorder_batches
+             SET response_json = ?2, committed_at_ms = ?3
+             WHERE batch_id = ?1",
+            params![
+                batch_id,
+                response_json,
+                u64_to_sql_i64(response.committed_at_ms, "committed_at_ms")?,
+            ],
+        )
+        .map_err(sqlite_error)?;
+        Ok(())
+    }
+}
+
+impl RecorderStorage for FrankenSqliteRecorderStorage {
+    fn backend_kind(&self) -> RecorderBackendKind {
+        RecorderBackendKind::FrankenSqlite
+    }
+
+    async fn append_batch(
+        &self,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        let _slot = self.try_acquire_slot()?;
+
+        if req.batch_id.trim().is_empty() {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "batch_id must not be empty".to_string(),
+            });
+        }
+        if req.events.is_empty() {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: "events must not be empty".to_string(),
+            });
+        }
+        if req.events.len() > self.config.max_batch_events {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: format!(
+                    "batch event count {} exceeds max {}",
+                    req.events.len(),
+                    self.config.max_batch_events
+                ),
+            });
+        }
+
+        let AppendRequest {
+            batch_id,
+            events,
+            required_durability,
+            producer_ts_ms: _producer_ts_ms,
+        } = req;
+
+        let mut encoded = Vec::with_capacity(events.len());
+        let mut total_bytes = 0usize;
+        for event in events {
+            let payload = serde_json::to_string(&event)?;
+            total_bytes = total_bytes
+                .checked_add(payload.len().saturating_add(4))
+                .ok_or_else(|| RecorderStorageError::InvalidRequest {
+                    message: "batch byte size overflow".to_string(),
+                })?;
+            encoded.push((event, payload));
+        }
+        if total_bytes > self.config.max_batch_bytes {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: format!(
+                    "batch bytes {} exceeds max {}",
+                    total_bytes, self.config.max_batch_bytes
+                ),
+            });
+        }
+
+        let mut inner = self.inner.lock().await;
+        let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
+            if let Some(mut existing) = Self::cached_response(&inner.conn, &batch_id)? {
+                if !existing.committed_durability.satisfies(required_durability) {
+                    existing.committed_durability = required_durability;
+                    existing.committed_at_ms = crate::recording::epoch_ms_now();
+                    Self::update_cached_response(&inner.conn, &batch_id, &existing)?;
+                }
+                return Ok(existing);
+            }
+
+            let head = sqlite_head_offset(&inner.conn)?;
+            let tx = inner.conn.transaction().map_err(sqlite_error)?;
+            let first_offset = head.clone();
+            let mut next_ordinal = head.ordinal;
+            let mut next_byte_offset = head.byte_offset;
+            let mut last_offset = first_offset.clone();
+            let committed_at_ms = crate::recording::epoch_ms_now();
+
+            for (event, payload) in encoded {
+                let payload_bytes = payload.len() as u64;
+                let offset = RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: next_byte_offset,
+                    ordinal: next_ordinal,
+                };
+                tx.execute(
+                    "INSERT INTO recorder_events (
+                         ordinal, segment_id, byte_offset, payload_json, payload_bytes,
+                         event_id, pane_id, schema_version, recorded_at_ms, batch_id, inserted_at_ms
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        u64_to_sql_i64(offset.ordinal, "ordinal")?,
+                        u64_to_sql_i64(offset.segment_id, "segment_id")?,
+                        u64_to_sql_i64(offset.byte_offset, "byte_offset")?,
+                        payload,
+                        u64_to_sql_i64(payload_bytes, "payload_bytes")?,
+                        event.event_id.as_str(),
+                        u64_to_sql_i64(event.pane_id, "pane_id")?,
+                        event.schema_version.as_str(),
+                        u64_to_sql_i64(event.recorded_at_ms, "recorded_at_ms")?,
+                        batch_id.as_str(),
+                        u64_to_sql_i64(committed_at_ms, "inserted_at_ms")?,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+                last_offset = offset;
+                next_ordinal = next_ordinal.saturating_add(1);
+                next_byte_offset = next_byte_offset.saturating_add(payload_bytes.saturating_add(4));
+            }
+
+            let response = AppendResponse {
+                backend: RecorderBackendKind::FrankenSqlite,
+                accepted_count: last_offset
+                    .ordinal
+                    .saturating_sub(first_offset.ordinal)
+                    .saturating_add(1) as usize,
+                first_offset,
+                last_offset,
+                committed_durability: required_durability,
+                committed_at_ms,
+            };
+            let response_json = serde_json::to_string(&response)?;
+            tx.execute(
+                "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    batch_id.as_str(),
+                    response_json,
+                    u64_to_sql_i64(committed_at_ms, "committed_at_ms")?,
+                ],
+            )
+            .map_err(sqlite_error)?;
+            tx.execute(
+                "DELETE FROM recorder_batches
+                 WHERE batch_id IN (
+                     SELECT batch_id FROM recorder_batches
+                     ORDER BY committed_at_ms ASC, batch_id ASC
+                     LIMIT (
+                         SELECT CASE
+                             WHEN COUNT(*) > ?1 THEN COUNT(*) - ?1
+                             ELSE 0
+                         END
+                         FROM recorder_batches
+                     )
+                 )",
+                params![usize_to_sql_i64(
+                    self.config.max_idempotency_entries,
+                    "max_idempotency_entries"
+                )?],
+            )
+            .map_err(sqlite_error)?;
+            tx.commit().map_err(sqlite_error)?;
+            Ok(response)
+        })();
+
+        match result {
+            Ok(response) => {
+                Self::clear_last_error(&mut inner);
+                Ok(response)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "append_batch", &err);
+                Err(err)
+            }
+        }
+    }
+
+    async fn flush(
+        &self,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        let mut inner = self.inner.lock().await;
+        let result = (|| -> std::result::Result<FlushStats, RecorderStorageError> {
+            if mode == FlushMode::Durable {
+                inner
+                    .conn
+                    .execute_batch("PRAGMA wal_checkpoint(FULL);")
+                    .map_err(sqlite_error)?;
+            }
+            Ok(FlushStats {
+                backend: RecorderBackendKind::FrankenSqlite,
+                flushed_at_ms: crate::recording::epoch_ms_now(),
+                latest_offset: sqlite_latest_storage_offset(&inner.conn)?,
+            })
+        })();
+        match result {
+            Ok(stats) => {
+                Self::clear_last_error(&mut inner);
+                Ok(stats)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "flush", &err);
+                Err(err)
+            }
+        }
+    }
+
+    async fn read_checkpoint(
+        &self,
+        consumer: &CheckpointConsumerId,
+    ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+        let inner = self.inner.lock().await;
+        read_sqlite_checkpoint(&inner.conn, consumer)
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        let mut inner = self.inner.lock().await;
+        let result = (|| -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            let existing = read_sqlite_checkpoint(&inner.conn, &checkpoint.consumer)?;
+            let outcome = match existing {
+                Some(existing) if checkpoint.upto_offset.ordinal < existing.upto_offset.ordinal => {
+                    return Err(RecorderStorageError::CheckpointRegression {
+                        consumer: checkpoint.consumer.0.clone(),
+                        current_ordinal: existing.upto_offset.ordinal,
+                        attempted_ordinal: checkpoint.upto_offset.ordinal,
+                    });
+                }
+                Some(existing)
+                    if checkpoint.upto_offset.ordinal == existing.upto_offset.ordinal =>
+                {
+                    CheckpointCommitOutcome::NoopAlreadyAdvanced
+                }
+                _ => CheckpointCommitOutcome::Advanced,
+            };
+
+            if outcome == CheckpointCommitOutcome::Advanced {
+                inner
+                    .conn
+                    .execute(
+                        "INSERT INTO recorder_checkpoints (
+                             consumer, segment_id, byte_offset, ordinal,
+                             schema_version, committed_at_ms
+                         )
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         ON CONFLICT(consumer) DO UPDATE SET
+                             segment_id = excluded.segment_id,
+                             byte_offset = excluded.byte_offset,
+                             ordinal = excluded.ordinal,
+                             schema_version = excluded.schema_version,
+                             committed_at_ms = excluded.committed_at_ms",
+                        params![
+                            checkpoint.consumer.0,
+                            u64_to_sql_i64(checkpoint.upto_offset.segment_id, "segment_id")?,
+                            u64_to_sql_i64(checkpoint.upto_offset.byte_offset, "byte_offset")?,
+                            u64_to_sql_i64(checkpoint.upto_offset.ordinal, "ordinal")?,
+                            checkpoint.schema_version,
+                            u64_to_sql_i64(checkpoint.committed_at_ms, "committed_at_ms")?,
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+            }
+            Ok(outcome)
+        })();
+        match result {
+            Ok(outcome) => {
+                Self::clear_last_error(&mut inner);
+                Ok(outcome)
+            }
+            Err(err) => {
+                Self::record_last_error(&mut inner, "commit_checkpoint", &err);
+                Err(err)
+            }
+        }
+    }
+
+    async fn health(&self) -> RecorderStorageHealth {
+        let inner = self.inner.lock().await;
+        let latest_offset = match sqlite_latest_storage_offset(&inner.conn) {
+            Ok(offset) => offset,
+            Err(err) => {
+                return RecorderStorageHealth {
+                    backend: RecorderBackendKind::FrankenSqlite,
+                    degraded: true,
+                    queue_depth: self.in_flight.load(Ordering::Acquire),
+                    queue_capacity: self.config.queue_capacity,
+                    latest_offset: None,
+                    last_error: Some(err.to_string()),
+                };
+            }
+        };
+        RecorderStorageHealth {
+            backend: RecorderBackendKind::FrankenSqlite,
+            degraded: inner.last_error.is_some(),
+            queue_depth: self.in_flight.load(Ordering::Acquire),
+            queue_capacity: self.config.queue_capacity,
+            latest_offset,
+            last_error: inner.last_error.clone(),
+        }
+    }
+
+    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+        let inner = self.inner.lock().await;
+        let latest = sqlite_latest_storage_offset(&inner.conn)?;
+        let latest_ordinal = latest.as_ref().map_or(0, |o| o.ordinal);
+        let mut stmt = inner
+            .conn
+            .prepare(
+                "SELECT consumer, segment_id, byte_offset, ordinal, schema_version, committed_at_ms
+                 FROM recorder_checkpoints
+                 ORDER BY consumer ASC",
+            )
+            .map_err(sqlite_error)?;
+        let mut rows = stmt.query([]).map_err(sqlite_error)?;
+        let mut consumers = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let checkpoint = sqlite_checkpoint_from_row(row)?;
+            consumers.push(RecorderConsumerLag {
+                consumer: checkpoint.consumer,
+                offsets_behind: latest_ordinal.saturating_sub(checkpoint.upto_offset.ordinal),
+            });
+        }
+        Ok(RecorderStorageLag {
+            latest_offset: latest,
+            consumers,
+        })
+    }
+}
+
+/// Reader over a FrankenSqlite recorder event stream.
+#[derive(Debug, Clone)]
+pub struct FrankenSqliteEventReader {
+    db_path: PathBuf,
+}
+
+impl FrankenSqliteEventReader {
+    pub fn new(db_path: PathBuf) -> Self {
+        Self { db_path }
+    }
+
+    fn open_connection(&self) -> std::result::Result<Connection, EventCursorError> {
+        let conn = Connection::open(&self.db_path).map_err(|err| {
+            EventCursorError::Unavailable(format!(
+                "failed to open FrankenSqlite recorder DB {}: {err}",
+                self.db_path.display()
+            ))
+        })?;
+        initialize_frankensqlite_schema(&conn)
+            .map_err(|err| EventCursorError::Unavailable(err.to_string()))?;
+        Ok(conn)
+    }
+}
+
+impl RecorderEventReader for FrankenSqliteEventReader {
+    fn open_cursor(
+        &self,
+        from: RecorderOffset,
+    ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        self.open_cursor_at_ordinal(from.ordinal)
+    }
+
+    fn open_cursor_at_ordinal(
+        &self,
+        target_ordinal: u64,
+    ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        let conn = self.open_connection()?;
+        let start = sqlite_cursor_start(&conn, target_ordinal)?;
+        Ok(Box::new(FrankenSqliteCursor {
+            conn,
+            next_offset: start,
+        }))
+    }
+
+    fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError> {
+        let conn = self.open_connection()?;
+        sqlite_head_offset(&conn).map_err(|err| EventCursorError::Unavailable(err.to_string()))
+    }
+}
+
+struct FrankenSqliteCursor {
+    conn: Connection,
+    next_offset: RecorderOffset,
+}
+
+impl RecorderEventCursor for FrankenSqliteCursor {
+    fn next_batch(
+        &mut self,
+        max: usize,
+    ) -> std::result::Result<Vec<CursorRecord>, EventCursorError> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = usize_to_sql_i64(max, "cursor batch size")
+            .map_err(|err| EventCursorError::Unavailable(err.to_string()))?;
+        let start_ordinal = u64_to_sql_i64(self.next_offset.ordinal, "cursor ordinal")
+            .map_err(|err| EventCursorError::Unavailable(err.to_string()))?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ordinal, segment_id, byte_offset, payload_json, payload_bytes
+                 FROM recorder_events
+                 WHERE ordinal >= ?1
+                 ORDER BY ordinal ASC
+                 LIMIT ?2",
+            )
+            .map_err(|err| EventCursorError::Io(err.to_string()))?;
+        let mut rows = stmt
+            .query(params![start_ordinal, limit])
+            .map_err(|err| EventCursorError::Io(err.to_string()))?;
+        let mut batch = Vec::with_capacity(max.min(256));
+        while let Some(row) = rows
+            .next()
+            .map_err(|err| EventCursorError::Io(err.to_string()))?
+        {
+            let ordinal = sql_i64_to_u64(
+                row.get::<_, i64>(0)
+                    .map_err(|err| EventCursorError::Io(err.to_string()))?,
+                "recorder_events.ordinal",
+            )?;
+            let segment_id = sql_i64_to_u64(
+                row.get::<_, i64>(1)
+                    .map_err(|err| EventCursorError::Io(err.to_string()))?,
+                "recorder_events.segment_id",
+            )?;
+            let byte_offset = sql_i64_to_u64(
+                row.get::<_, i64>(2)
+                    .map_err(|err| EventCursorError::Io(err.to_string()))?,
+                "recorder_events.byte_offset",
+            )?;
+            let payload_json = row
+                .get::<_, String>(3)
+                .map_err(|err| EventCursorError::Io(err.to_string()))?;
+            let payload_bytes = sql_i64_to_u64(
+                row.get::<_, i64>(4)
+                    .map_err(|err| EventCursorError::Io(err.to_string()))?,
+                "recorder_events.payload_bytes",
+            )?;
+            let offset = RecorderOffset {
+                segment_id,
+                byte_offset,
+                ordinal,
+            };
+            let event = serde_json::from_str::<RecorderEvent>(&payload_json).map_err(|err| {
+                EventCursorError::Corrupt {
+                    offset: offset.clone(),
+                    reason: err.to_string(),
+                }
+            })?;
+            self.next_offset = RecorderOffset {
+                segment_id,
+                byte_offset: byte_offset.saturating_add(payload_bytes.saturating_add(4)),
+                ordinal: ordinal.saturating_add(1),
+            };
+            batch.push(CursorRecord { event, offset });
+        }
+        Ok(batch)
+    }
+
+    fn current_offset(&self) -> RecorderOffset {
+        self.next_offset.clone()
+    }
+}
+
 fn ensure_parent_dir(path: &Path) -> std::result::Result<(), RecorderStorageError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn sqlite_error(err: rusqlite::Error) -> RecorderStorageError {
+    RecorderStorageError::Sqlite(err.to_string())
+}
+
+fn u64_to_sql_i64(value: u64, field: &str) -> std::result::Result<i64, RecorderStorageError> {
+    i64::try_from(value).map_err(|_| RecorderStorageError::InvalidRequest {
+        message: format!("{field} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn usize_to_sql_i64(value: usize, field: &str) -> std::result::Result<i64, RecorderStorageError> {
+    i64::try_from(value).map_err(|_| RecorderStorageError::InvalidRequest {
+        message: format!("{field} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn sql_i64_to_u64(value: i64, field: &str) -> std::result::Result<u64, EventCursorError> {
+    u64::try_from(value).map_err(|_| EventCursorError::Corrupt {
+        offset: RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        },
+        reason: format!("{field} is negative: {value}"),
+    })
+}
+
+fn initialize_frankensqlite_schema(
+    conn: &Connection,
+) -> std::result::Result<(), RecorderStorageError> {
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS recorder_events (
+            ordinal INTEGER PRIMARY KEY,
+            segment_id INTEGER NOT NULL DEFAULT 0,
+            byte_offset INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_bytes INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            pane_id INTEGER NOT NULL,
+            schema_version TEXT NOT NULL,
+            recorded_at_ms INTEGER NOT NULL,
+            batch_id TEXT NOT NULL,
+            inserted_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorder_events_event_id
+            ON recorder_events(event_id);
+        CREATE INDEX IF NOT EXISTS idx_recorder_events_pane_ordinal
+            ON recorder_events(pane_id, ordinal);
+        CREATE TABLE IF NOT EXISTS recorder_batches (
+            batch_id TEXT PRIMARY KEY,
+            response_json TEXT NOT NULL,
+            committed_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS recorder_checkpoints (
+            consumer TEXT PRIMARY KEY,
+            segment_id INTEGER NOT NULL,
+            byte_offset INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            schema_version TEXT NOT NULL,
+            committed_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorder_checkpoints_ordinal
+            ON recorder_checkpoints(ordinal);
+        ",
+    )
+    .map_err(sqlite_error)
+}
+
+fn sqlite_head_offset(
+    conn: &Connection,
+) -> std::result::Result<RecorderOffset, RecorderStorageError> {
+    let row = conn
+        .query_row(
+            "SELECT ordinal, segment_id, byte_offset, payload_bytes
+             FROM recorder_events
+             ORDER BY ordinal DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((ordinal, segment_id, byte_offset, payload_bytes)) = row else {
+        return Ok(RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
+        });
+    };
+    let ordinal = u64::try_from(ordinal).map_err(|_| RecorderStorageError::CorruptRecord {
+        offset: 0,
+        reason: format!("recorder_events.ordinal is negative: {ordinal}"),
+    })?;
+    let segment_id =
+        u64::try_from(segment_id).map_err(|_| RecorderStorageError::CorruptRecord {
+            offset: 0,
+            reason: format!("recorder_events.segment_id is negative: {segment_id}"),
+        })?;
+    let byte_offset =
+        u64::try_from(byte_offset).map_err(|_| RecorderStorageError::CorruptRecord {
+            offset: 0,
+            reason: format!("recorder_events.byte_offset is negative: {byte_offset}"),
+        })?;
+    let payload_bytes =
+        u64::try_from(payload_bytes).map_err(|_| RecorderStorageError::CorruptRecord {
+            offset: byte_offset,
+            reason: format!("recorder_events.payload_bytes is negative: {payload_bytes}"),
+        })?;
+    Ok(RecorderOffset {
+        segment_id,
+        byte_offset: byte_offset.saturating_add(payload_bytes.saturating_add(4)),
+        ordinal: ordinal.saturating_add(1),
+    })
+}
+
+fn sqlite_latest_storage_offset(
+    conn: &Connection,
+) -> std::result::Result<Option<RecorderOffset>, RecorderStorageError> {
+    let head = sqlite_head_offset(conn)?;
+    if head.ordinal == 0 {
+        return Ok(None);
+    }
+    Ok(Some(RecorderOffset {
+        segment_id: head.segment_id,
+        byte_offset: head.byte_offset,
+        ordinal: head.ordinal - 1,
+    }))
+}
+
+fn sqlite_cursor_start(
+    conn: &Connection,
+    target_ordinal: u64,
+) -> std::result::Result<RecorderOffset, EventCursorError> {
+    let target = i64::try_from(target_ordinal).map_err(|_| {
+        EventCursorError::Unavailable(format!(
+            "target ordinal {target_ordinal} exceeds SQLite INTEGER range"
+        ))
+    })?;
+    let row = conn
+        .query_row(
+            "SELECT ordinal, segment_id, byte_offset
+             FROM recorder_events
+             WHERE ordinal >= ?1
+             ORDER BY ordinal ASC
+             LIMIT 1",
+            params![target],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| EventCursorError::Io(err.to_string()))?;
+    if let Some((ordinal, segment_id, byte_offset)) = row {
+        return Ok(RecorderOffset {
+            segment_id: sql_i64_to_u64(segment_id, "recorder_events.segment_id")?,
+            byte_offset: sql_i64_to_u64(byte_offset, "recorder_events.byte_offset")?,
+            ordinal: sql_i64_to_u64(ordinal, "recorder_events.ordinal")?,
+        });
+    }
+    sqlite_head_offset(conn).map_err(|err| EventCursorError::Unavailable(err.to_string()))
+}
+
+fn sqlite_checkpoint_from_row(
+    row: &rusqlite::Row<'_>,
+) -> std::result::Result<RecorderCheckpoint, RecorderStorageError> {
+    let consumer = row.get::<_, String>(0).map_err(sqlite_error)?;
+    let segment_id = row.get::<_, i64>(1).map_err(sqlite_error)?;
+    let byte_offset = row.get::<_, i64>(2).map_err(sqlite_error)?;
+    let ordinal = row.get::<_, i64>(3).map_err(sqlite_error)?;
+    let schema_version = row.get::<_, String>(4).map_err(sqlite_error)?;
+    let committed_at_ms = row.get::<_, i64>(5).map_err(sqlite_error)?;
+    Ok(RecorderCheckpoint {
+        consumer: CheckpointConsumerId(consumer),
+        upto_offset: RecorderOffset {
+            segment_id: u64::try_from(segment_id).map_err(|_| {
+                RecorderStorageError::CorruptRecord {
+                    offset: 0,
+                    reason: format!("checkpoint segment_id is negative: {segment_id}"),
+                }
+            })?,
+            byte_offset: u64::try_from(byte_offset).map_err(|_| {
+                RecorderStorageError::CorruptRecord {
+                    offset: 0,
+                    reason: format!("checkpoint byte_offset is negative: {byte_offset}"),
+                }
+            })?,
+            ordinal: u64::try_from(ordinal).map_err(|_| RecorderStorageError::CorruptRecord {
+                offset: 0,
+                reason: format!("checkpoint ordinal is negative: {ordinal}"),
+            })?,
+        },
+        schema_version,
+        committed_at_ms: u64::try_from(committed_at_ms).map_err(|_| {
+            RecorderStorageError::CorruptRecord {
+                offset: 0,
+                reason: format!("checkpoint committed_at_ms is negative: {committed_at_ms}"),
+            }
+        })?,
+    })
+}
+
+fn read_sqlite_checkpoint(
+    conn: &Connection,
+    consumer: &CheckpointConsumerId,
+) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT consumer, segment_id, byte_offset, ordinal, schema_version, committed_at_ms
+             FROM recorder_checkpoints
+             WHERE consumer = ?1",
+        )
+        .map_err(sqlite_error)?;
+    let mut rows = stmt
+        .query(params![consumer.0.as_str()])
+        .map_err(sqlite_error)?;
+    rows.next()
+        .map_err(sqlite_error)?
+        .map(sqlite_checkpoint_from_row)
+        .transpose()
 }
 
 fn load_persisted_state(path: &Path) -> std::result::Result<PersistedState, RecorderStorageError> {
@@ -1422,6 +2298,13 @@ mod tests {
         RecorderStorageConfig {
             backend: RecorderBackendKind::AppendLog,
             append_log: test_config(path),
+            frankensqlite: FrankenSqliteStorageConfig {
+                db_path: path.join("recorder.sqlite3"),
+                queue_capacity: 4,
+                max_batch_events: 256,
+                max_batch_bytes: 128 * 1024,
+                max_idempotency_entries: 8,
+            },
         }
     }
 
@@ -1434,23 +2317,13 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_frankensqlite_reports_dependency_unavailable() {
+    fn bootstrap_selects_frankensqlite_backend() {
         let dir = tempdir().unwrap();
         let mut config = recorder_test_config(dir.path());
         config.backend = RecorderBackendKind::FrankenSqlite;
 
-        let err = bootstrap_recorder_storage(config).unwrap_err();
-        assert!(matches!(
-            err,
-            RecorderStorageError::BackendUnavailable {
-                backend: RecorderBackendKind::FrankenSqlite,
-                ..
-            }
-        ));
-        assert_eq!(
-            err.class(),
-            RecorderStorageErrorClass::DependencyUnavailable
-        );
+        let storage = bootstrap_recorder_storage(config).unwrap();
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::FrankenSqlite);
     }
 
     #[test]
@@ -1460,14 +2333,8 @@ mod tests {
         config.backend = RecorderBackendKind::FrankenSqlite;
         config.append_log.queue_capacity = 0; // invalid for append-log
 
-        let err = bootstrap_recorder_storage(config).unwrap_err();
-        assert!(matches!(
-            err,
-            RecorderStorageError::BackendUnavailable {
-                backend: RecorderBackendKind::FrankenSqlite,
-                ..
-            }
-        ));
+        let storage = bootstrap_recorder_storage(config).unwrap();
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::FrankenSqlite);
     }
 
     #[test]
@@ -1491,12 +2358,137 @@ mod tests {
     fn recorder_storage_config_accepts_legacy_franken_sqlite_alias() {
         let value = serde_json::json!({
             "backend": "franken_sqlite",
-            "append_log": AppendLogStorageConfig::default()
+            "append_log": AppendLogStorageConfig::default(),
+            "frankensqlite": FrankenSqliteStorageConfig::default()
         });
-        let err = serde_json::from_value::<RecorderStorageConfig>(value)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("frankensqlite backend not yet implemented"));
+        let config = serde_json::from_value::<RecorderStorageConfig>(value).unwrap();
+        assert_eq!(config.backend, RecorderBackendKind::FrankenSqlite);
+    }
+
+    #[test]
+    fn frankensqlite_append_reader_seek_head_and_checkpoints() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = recorder_test_config(dir.path()).frankensqlite;
+            let storage = FrankenSqliteRecorderStorage::open(config).unwrap();
+            let events = vec![
+                sample_event("sql-0", 7, 0, "zero"),
+                sample_event("sql-1", 7, 1, "one"),
+                sample_event("sql-2", 9, 2, "two"),
+            ];
+
+            let response = storage
+                .append_batch(AppendRequest {
+                    batch_id: "sqlite-batch".to_string(),
+                    events: events.clone(),
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.backend, RecorderBackendKind::FrankenSqlite);
+            assert_eq!(response.accepted_count, 3);
+            assert_eq!(response.first_offset.ordinal, 0);
+            assert_eq!(response.last_offset.ordinal, 2);
+
+            let idempotent = storage
+                .append_batch(AppendRequest {
+                    batch_id: "sqlite-batch".to_string(),
+                    events,
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+            assert_eq!(idempotent.accepted_count, 3);
+            assert_eq!(idempotent.last_offset.ordinal, 2);
+            assert_eq!(idempotent.committed_durability, DurabilityLevel::Fsync);
+
+            let reader = storage.event_reader();
+            let head = reader.head_offset().unwrap();
+            assert_eq!(head.ordinal, 3);
+            assert!(head.byte_offset > response.last_offset.byte_offset);
+
+            let mut cursor = reader.open_cursor_at_ordinal(1).unwrap();
+            assert_eq!(cursor.current_offset().ordinal, 1);
+            let batch = cursor.next_batch(8).unwrap();
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch[0].event.event_id, "sql-1");
+            assert_eq!(batch[0].offset.ordinal, 1);
+            assert_eq!(batch[1].event.event_id, "sql-2");
+            assert_eq!(cursor.current_offset().ordinal, 3);
+            assert!(cursor.next_batch(8).unwrap().is_empty());
+
+            let checkpoint = RecorderCheckpoint {
+                consumer: CheckpointConsumerId("sqlite-indexer".to_string()),
+                upto_offset: batch[0].offset.clone(),
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                committed_at_ms: crate::recording::epoch_ms_now(),
+            };
+            let outcome = storage.commit_checkpoint(checkpoint.clone()).await.unwrap();
+            assert_eq!(outcome, CheckpointCommitOutcome::Advanced);
+            let reread = storage
+                .read_checkpoint(&CheckpointConsumerId("sqlite-indexer".to_string()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reread.upto_offset.ordinal, 1);
+
+            let regression = RecorderCheckpoint {
+                upto_offset: response.first_offset,
+                ..checkpoint
+            };
+            let err = storage.commit_checkpoint(regression).await.unwrap_err();
+            assert!(matches!(
+                err,
+                RecorderStorageError::CheckpointRegression { .. }
+            ));
+
+            let lag = storage.lag_metrics().await.unwrap();
+            assert_eq!(lag.latest_offset.unwrap().ordinal, 2);
+            assert_eq!(lag.consumers[0].offsets_behind, 1);
+        });
+    }
+
+    #[test]
+    fn frankensqlite_reader_reports_corrupt_payload_row() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("recorder.sqlite3");
+        let conn = Connection::open(&db_path).unwrap();
+        initialize_frankensqlite_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO recorder_events (
+                 ordinal, segment_id, byte_offset, payload_json, payload_bytes,
+                 event_id, pane_id, schema_version, recorded_at_ms, batch_id, inserted_at_ms
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                0_i64,
+                0_i64,
+                0_i64,
+                "{not-json",
+                9_i64,
+                "bad-event",
+                1_i64,
+                RECORDER_EVENT_SCHEMA_VERSION_V1,
+                1_i64,
+                "bad-batch",
+                1_i64,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reader = FrankenSqliteEventReader::new(db_path);
+        let mut cursor = reader.open_cursor_from_start().unwrap();
+        let err = cursor.next_batch(1).unwrap_err();
+        assert!(matches!(
+            err,
+            EventCursorError::Corrupt {
+                offset: RecorderOffset { ordinal: 0, .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2784,10 +3776,8 @@ mod tests {
         let json = serde_json::to_string(&RecorderBackendKind::AppendLog).unwrap();
         let back: RecorderBackendKind = serde_json::from_str(&json).unwrap();
         assert_eq!(back, RecorderBackendKind::AppendLog);
-        let err = serde_json::from_str::<RecorderBackendKind>("\"frankensqlite\"")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("frankensqlite backend not yet implemented"));
+        let back: RecorderBackendKind = serde_json::from_str("\"frankensqlite\"").unwrap();
+        assert_eq!(back, RecorderBackendKind::FrankenSqlite);
         // Verify snake_case rename
         assert!(json.contains("append_log"));
         let json = serde_json::to_string(&RecorderBackendKind::FrankenSqlite).unwrap();

@@ -836,9 +836,13 @@ impl IndexerConfig {
                 tracing::info!(
                     indexer_source = %self.source,
                     db_path = %db_path.display(),
-                    "frankensqlite event reader not yet implemented"
+                    "creating frankensqlite event reader"
                 );
-                Err(frankensqlite_unsupported("ingest"))
+                Ok(Box::new(
+                    frankenterm_core::recorder_storage::FrankenSqliteEventReader::new(
+                        db_path.clone(),
+                    ),
+                ))
             }
         }
     }
@@ -878,16 +882,6 @@ pub struct IndexerRunResult {
     pub final_ordinal: Option<u64>,
     /// Whether the run reached the current end of the log.
     pub caught_up: bool,
-}
-
-/// Consistent error for the not-yet-implemented frankensqlite event reader
-/// path (ft-lzbkn). Keep the message explicit about the missing reader so
-/// operators do not mistake this placeholder for a disabled cargo feature.
-pub(crate) fn frankensqlite_unsupported(context: &str) -> IndexerError {
-    IndexerError::Config(format!(
-        "frankensqlite event reader not yet implemented for {context}; \
-         follow ft-a4ugl for the real RecorderEventReader implementation"
-    ))
 }
 
 /// Error during an indexer run.
@@ -1613,7 +1607,7 @@ mod tests {
     use super::*;
     use frankenterm_core::recorder_storage::{
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
-        RecorderEventReader,
+        FrankenSqliteRecorderStorage, FrankenSqliteStorageConfig, RecorderEventReader,
     };
     use frankenterm_core::recording::{
         RecorderControlMarkerType, RecorderEventCausality, RecorderEventPayload,
@@ -1648,32 +1642,18 @@ mod tests {
     }
 
     #[test]
-    fn frankensqlite_unsupported_error_names_followup_and_context() {
-        // ft-lzbkn + ft-4qyqw: the runtime stub for
-        // frankensqlite-sourced events must cite the implementation bead
-        // rather than implying the existing feature flag enables support.
-        // Both ingest and reindex paths share this helper; the message must
-        // be identical across call sites except for the context label.
-        let ingest = frankensqlite_unsupported("ingest");
-        let reindex = frankensqlite_unsupported("reindex");
-        for (err, want_ctx) in [(&ingest, "ingest"), (&reindex, "reindex")] {
-            let IndexerError::Config(msg) = err else {
-                panic!("expected IndexerError::Config, got {err:?}");
-            };
-            assert!(msg.contains("ft-a4ugl"), "missing follow-up bead id: {msg}");
-            assert!(
-                msg.contains("not yet implemented"),
-                "missing stub marker: {msg}"
-            );
-            assert!(
-                !msg.contains("frankensqlite-recorder"),
-                "must not imply the existing feature flag enables support: {msg}"
-            );
-            assert!(
-                msg.contains(want_ctx),
-                "missing context `{want_ctx}`: {msg}"
-            );
-        }
+    fn indexer_config_create_event_reader_frankensqlite_opens_empty_reader() {
+        let dir = tempdir().unwrap();
+        let cfg = IndexerConfig {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+                db_path: dir.path().join("recorder.sqlite3"),
+            },
+            ..IndexerConfig::default()
+        };
+        let reader = cfg.create_event_reader().unwrap();
+        let head = reader.head_offset().unwrap();
+        assert_eq!(head.ordinal, 0);
+        assert_eq!(head.byte_offset, 0);
     }
 
     // -- test helpers --
@@ -1872,6 +1852,86 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    fn test_sqlite_config(path: &Path) -> FrankenSqliteStorageConfig {
+        FrankenSqliteStorageConfig {
+            db_path: path.join("recorder.sqlite3"),
+            queue_capacity: 4,
+            max_batch_events: 256,
+            max_batch_bytes: 1024 * 1024,
+            max_idempotency_entries: 64,
+        }
+    }
+
+    async fn populate_sqlite(storage: &FrankenSqliteRecorderStorage, events: Vec<RecorderEvent>) {
+        for (i, chunk) in events.chunks(4).enumerate() {
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: format!("sqlite-b-{i}"),
+                    events: chunk.to_vec(),
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1_700_000_000_000 + i as u64,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn frankensqlite_reader_incremental_indexer_resumes_from_checkpoint() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage = FrankenSqliteRecorderStorage::open(test_sqlite_config(dir.path()))
+                .expect("open sqlite recorder storage");
+            populate_sqlite(
+                &storage,
+                vec![
+                    sample_event("sql-index-0", 42, 0, "first"),
+                    sample_event("sql-index-1", 42, 1, "second"),
+                    sample_event("sql-index-2", 42, 2, "third"),
+                ],
+            )
+            .await;
+
+            let cfg = IndexerConfig {
+                source:
+                    frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+                        db_path: dir.path().join("recorder.sqlite3"),
+                    },
+                consumer_id: "sqlite-indexer-resume".to_string(),
+                batch_size: 2,
+                dedup_on_replay: true,
+                max_batches: 1,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            };
+            let reader = cfg.create_event_reader().unwrap();
+
+            let mut first = IncrementalIndexer::new(cfg.clone(), MockIndexWriter::new());
+            let first_result = first
+                .run_with_reader(&storage, reader.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(first_result.events_indexed, 2);
+            assert_eq!(first_result.final_ordinal, Some(1));
+            assert!(!first_result.caught_up);
+
+            let mut second = IncrementalIndexer::new(
+                IndexerConfig {
+                    max_batches: 0,
+                    ..cfg
+                },
+                MockIndexWriter::new(),
+            );
+            let second_result = second
+                .run_with_reader(&storage, reader.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(second_result.events_read, 1);
+            assert_eq!(second_result.events_indexed, 1);
+            assert_eq!(second_result.final_ordinal, Some(2));
+            assert!(second_result.caught_up);
+        });
     }
 
     // =========================================================================
@@ -4668,14 +4728,15 @@ mod tests {
     }
 
     #[test]
-    fn indexer_config_create_event_reader_frankensqlite_errors() {
+    fn indexer_config_create_event_reader_frankensqlite_returns_reader() {
+        let dir = tempdir().unwrap();
         let cfg = IndexerConfig {
             source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
-                db_path: PathBuf::from("/data/recorder.db"),
+                db_path: dir.path().join("recorder.db"),
             },
             ..IndexerConfig::default()
         };
         let result = cfg.create_event_reader();
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 }
