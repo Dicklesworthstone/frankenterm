@@ -1833,7 +1833,10 @@ impl SurfaceDataExt for SurfaceUserData {
 
 impl HasDisplayHandle for WaylandWindowInner {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-        let conn = WaylandConnection::get().unwrap().wayland();
+        let Some(conn) = WaylandConnection::get() else {
+            return Err(HandleError::Unavailable);
+        };
+        let conn = conn.wayland();
         let backend = conn.connection.backend();
         let handle = backend.display_handle()?;
         Ok(unsafe { DisplayHandle::borrow_raw(handle.as_raw()) })
@@ -1851,7 +1854,10 @@ impl HasWindowHandle for WaylandWindowInner {
 
 impl HasDisplayHandle for WaylandWindow {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-        let conn = WaylandConnection::get().unwrap().wayland();
+        let Some(conn) = WaylandConnection::get() else {
+            return Err(HandleError::Unavailable);
+        };
+        let conn = conn.wayland();
         let backend = conn.connection.backend();
         let handle = backend.display_handle()?;
         Ok(unsafe { DisplayHandle::borrow_raw(handle.as_raw()) })
@@ -1860,11 +1866,12 @@ impl HasDisplayHandle for WaylandWindow {
 
 impl HasWindowHandle for WaylandWindow {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let conn = Connection::get().expect("raw_window_handle only callable on main thread");
-        let handle = conn
-            .wayland()
-            .window_by_id(self.0)
-            .expect("window handle invalid!?");
+        let Some(conn) = Connection::get() else {
+            return Err(HandleError::Unavailable);
+        };
+        let Some(handle) = conn.wayland().window_by_id(self.0) else {
+            return Err(HandleError::Unavailable);
+        };
 
         let inner = handle.borrow();
         let handle = inner.window_handle()?;
