@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://frankenterm.io/schemas/perf/evidence-stream-schema.v1.json",
   "title": "FrankenTerm per-claim evidence-stream sample",
-  "description": "Canonical JSONL row shape for performance proof-gate evidence consumed by SPRT (G25 ft-tf6g3.10), conformal bands (G26 ft-tf6g3.11), Lindley/SNC latency bounds (G23 ft-tf6g3.8 / G38 ft-tf6g3.23), KL-divergence regime-shift detection (G42 ft-tf6g3.27), causal-DAG attribution (G43 ft-tf6g3.28), and headline-claim attestation (G19 ft-tf6g3.4 children). Source-of-truth Rust struct: crates/ft-perf-gate/src/lib.rs `EvidenceSample`. Schema-version constant: `EVIDENCE_SAMPLE_SCHEMA_VERSION` = `ft.perf.evidence-sample.v1`. Schema evolution notes: docs/perf/evidence-stream-evolution.md. Substrate for ft-tf6g3.32 (G47).",
+  "description": "Canonical JSONL row shape for performance proof-gate evidence consumed by SPRT (G25 ft-tf6g3.10), conformal bands (G26 ft-tf6g3.11), Lindley latency bounds (G23 ft-tf6g3.8), observed-delay heavy-tail quantile bounds (G38 ft-tf6g3.23), KL-divergence regime-shift detection (G42 ft-tf6g3.27), causal-DAG attribution (G43 ft-tf6g3.28), and headline-claim attestation (G19 ft-tf6g3.4 children). Source-of-truth Rust struct: crates/ft-perf-gate/src/lib.rs `EvidenceSample`. Schema-version constant: `EVIDENCE_SAMPLE_SCHEMA_VERSION` = `ft.perf.evidence-sample.v1`. Schema evolution notes: docs/perf/evidence-stream-evolution.md. Substrate for ft-tf6g3.32 (G47).",
   "type": "object",
   "required": [
     "schema_version",

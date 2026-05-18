@@ -376,7 +376,11 @@ mod tests {
     fn compute_snc_bound_signature_is_direct_delay_only() {
         let direct_delay_api: fn(&[crate::EvidenceSample], &SncConfig) -> SncBound =
             compute_snc_bound;
-        let _ = direct_delay_api;
+        let cfg = SncConfig::default();
+        assert!(matches!(
+            direct_delay_api(&[], &cfg),
+            SncBound::OutOfDomain { .. }
+        ));
     }
 
     #[test]
