@@ -1,8 +1,9 @@
 //! Rendering of Changes using terminfo
+use crate::Result;
 use crate::caps::{Capabilities, ColorLevel};
 use crate::cell::{AttributeChange, Blink, CellAttributes, Intensity, Underline};
 use crate::color::{ColorAttribute, ColorSpec};
-use crate::escape::csi::{Cursor, Edit, EraseInDisplay, EraseInLine, Sgr, CSI};
+use crate::escape::csi::{CSI, Cursor, Edit, EraseInDisplay, EraseInLine, Sgr};
 use crate::escape::esc::EscCode;
 use crate::escape::osc::OperatingSystemCommand;
 #[cfg(feature = "use_image")]
@@ -12,7 +13,6 @@ use crate::escape::{Esc, OneBased};
 use crate::image::{ImageData, ImageDataType, TextureCoordinate};
 use crate::render::RenderTty;
 use crate::surface::{Change, CursorShape, CursorVisibility, LineAttribute, Position};
-use crate::Result;
 use finl_unicode::grapheme_clusters::Graphemes;
 #[cfg(feature = "use_image")]
 use image::codecs::gif::GifEncoder;
@@ -24,7 +24,7 @@ use image::{
     Rgba, RgbaImage,
 };
 use std::io::Write;
-use terminfo::{capability as cap, Capability as TermInfoCapability};
+use terminfo::{Capability as TermInfoCapability, capability as cap};
 
 #[cfg(feature = "use_image")]
 fn is_full_image_region(top_left: TextureCoordinate, bottom_right: TextureCoordinate) -> bool {
@@ -996,16 +996,16 @@ impl TerminfoRenderer {
 #[cfg(all(test, unix))]
 mod test {
     use super::*;
-    use crate::bail;
     use crate::caps::ProbeHints;
     use crate::color::{AnsiColor, ColorAttribute};
+    use crate::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, XtermKeyModifierResource};
     #[cfg(feature = "use_image")]
     use crate::escape::osc::{ITermDimension, ITermProprietary, OperatingSystemCommand};
     use crate::escape::parser::Parser;
     use crate::escape::{Action, ControlCode, Esc, EscCode};
     use crate::input::InputEvent;
     use crate::terminal::unix::{Purge, SetAttributeWhen, UnixTerminal, UnixTty};
-    use crate::terminal::{cast, ScreenSize, Terminal, TerminalWaker};
+    use crate::terminal::{ScreenSize, Terminal, TerminalWaker, cast};
     #[cfg(feature = "use_image")]
     use crate::{image::ImageData, surface::Image};
     #[cfg(feature = "use_image")]
@@ -1016,8 +1016,8 @@ mod test {
     use std::mem;
     use std::os::fd::FromRawFd;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     };
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1236,7 +1236,10 @@ mod test {
 
     impl Read for FakeTty {
         fn read(&mut self, _buf: &mut [u8]) -> std::result::Result<usize, IoError> {
-            Err(IoError::new(ErrorKind::Other, "not implemented"))
+            Err(IoError::new(
+                ErrorKind::WouldBlock,
+                "fake terminal has no pending input",
+            ))
         }
     }
     impl Write for FakeTty {
@@ -1252,6 +1255,7 @@ mod test {
     struct FakeTerm {
         write: FakeTty,
         renderer: TerminfoRenderer,
+        in_alternate_screen: bool,
     }
 
     impl FakeTerm {
@@ -1262,30 +1266,83 @@ mod test {
         fn new_with_size(caps: Capabilities, width: usize, height: usize) -> Self {
             let write = FakeTty::new_with_size(width, height);
             let renderer = TerminfoRenderer::new(caps);
-            Self { write, renderer }
+            Self {
+                write,
+                renderer,
+                in_alternate_screen: false,
+            }
         }
 
         fn parse(&self) -> Vec<Action> {
             let mut p = Parser::new();
             p.parse_as_vec(&self.write.buf)
         }
+
+        fn set_dec_private_mode(&mut self, code: DecPrivateModeCode) -> Result<()> {
+            write!(
+                self.write,
+                "{}",
+                CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(code)))
+            )?;
+            Ok(())
+        }
+
+        fn reset_dec_private_mode(&mut self, code: DecPrivateModeCode) -> Result<()> {
+            write!(
+                self.write,
+                "{}",
+                CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(code)))
+            )?;
+            Ok(())
+        }
+
+        fn modify_other_keys(&mut self, level: i64) -> Result<()> {
+            write!(
+                self.write,
+                "{}",
+                CSI::Mode(Mode::XtermKeyMode {
+                    resource: XtermKeyModifierResource::OtherKeys,
+                    value: Some(level),
+                })
+            )?;
+            Ok(())
+        }
     }
 
     impl Terminal for FakeTerm {
         fn set_raw_mode(&mut self) -> Result<()> {
-            bail!("not implemented");
+            if self.renderer.caps.bracketed_paste() {
+                self.set_dec_private_mode(DecPrivateModeCode::BracketedPaste)?;
+            }
+            if self.renderer.caps.mouse_reporting() {
+                self.set_dec_private_mode(DecPrivateModeCode::AnyEventMouse)?;
+                self.set_dec_private_mode(DecPrivateModeCode::SGRMouse)?;
+            }
+            self.modify_other_keys(2)?;
+            self.write.flush()?;
+            Ok(())
         }
 
         fn set_cooked_mode(&mut self) -> Result<()> {
-            bail!("not implemented");
+            self.modify_other_keys(1)?;
+            self.write.flush()?;
+            Ok(())
         }
 
         fn enter_alternate_screen(&mut self) -> Result<()> {
-            bail!("not implemented");
+            if !self.in_alternate_screen {
+                self.set_dec_private_mode(DecPrivateModeCode::ClearAndEnableAlternateScreen)?;
+                self.in_alternate_screen = true;
+            }
+            Ok(())
         }
 
         fn exit_alternate_screen(&mut self) -> Result<()> {
-            bail!("not implemented");
+            if self.in_alternate_screen {
+                self.reset_dec_private_mode(DecPrivateModeCode::ClearAndEnableAlternateScreen)?;
+                self.in_alternate_screen = false;
+            }
+            Ok(())
         }
 
         fn render(&mut self, changes: &[Change]) -> Result<()> {
@@ -1318,7 +1375,7 @@ mod test {
         }
 
         fn poll_input(&mut self, _wait: Option<Duration>) -> Result<Option<InputEvent>> {
-            bail!("not implemented");
+            Ok(None)
         }
 
         fn waker(&self) -> TerminalWaker {
@@ -1340,14 +1397,15 @@ mod test {
         let parsed = out.parse();
         match parsed.as_slice() {
             [Action::OperatingSystemCommand(osc)]
-            | [Action::OperatingSystemCommand(osc), Action::Esc(Esc::Code(EscCode::StringTerminator))] => {
-                match osc.as_ref() {
-                    OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file)) => {
-                        (**file).clone()
-                    }
-                    other => panic!("expected iTerm file OSC, got {:?}", other),
+            | [
+                Action::OperatingSystemCommand(osc),
+                Action::Esc(Esc::Code(EscCode::StringTerminator)),
+            ] => match osc.as_ref() {
+                OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file)) => {
+                    (**file).clone()
                 }
-            }
+                other => panic!("expected iTerm file OSC, got {:?}", other),
+            },
             other => panic!("expected a single OSC action, got {:?}", other),
         }
     }
@@ -1373,6 +1431,25 @@ mod test {
         out.render(&[Change::Text("foo".into())]).unwrap();
         assert_eq!("foo", String::from_utf8(out.write.buf).unwrap());
         assert_eq!(out.renderer.current_attr, CellAttributes::default());
+    }
+
+    #[test]
+    fn fake_terminal_control_methods_are_deterministic() {
+        let mut out = FakeTerm::new(no_terminfo_all_enabled());
+
+        out.set_raw_mode().unwrap();
+        out.set_cooked_mode().unwrap();
+        out.enter_alternate_screen().unwrap();
+        out.enter_alternate_screen().unwrap();
+        out.exit_alternate_screen().unwrap();
+        out.exit_alternate_screen().unwrap();
+
+        assert_eq!(
+            String::from_utf8(out.write.buf.clone()).unwrap(),
+            "\u{1b}[?2004h\u{1b}[?1003h\u{1b}[?1006h\u{1b}[>4;2m\u{1b}[>4;1m\u{1b}[?1049h\u{1b}[?1049l"
+        );
+        assert_eq!(out.poll_input(Some(Duration::ZERO)).unwrap(), None);
+        out.waker().wake().unwrap();
     }
 
     #[test]
