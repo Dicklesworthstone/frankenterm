@@ -68,6 +68,34 @@ shapes. The static verifier
 `tests/e2e/test_rch_admission_contract.sh` checks that the schema enum, docs,
 fixtures, provenance row, and README E2E count remain synchronized.
 
+## No-Service-Action Golden Fixtures
+
+Retained no-service-action cases live in
+`fixtures/rch-admission/no-service-action-fixtures.json`. They are deterministic
+golden fixtures for the admission diagnoses that normal agents most often hit
+before an RCH proof lane can run:
+
+| Fixture | Diagnosis family | Reason code |
+|---|---|---|
+| `rch-e100-worker-unreachable` | RCH-E100 worker unreachable before transfer. | `telemetry_gap` |
+| `all-workers-offline` | No healthy workers are available. | `no_admissible_workers` |
+| `telemetry-gap` | Worker health or capability data is stale or missing. | `telemetry_gap` |
+| `critical-pressure` | Worker root, project, or cache pressure is critical. | `critical_pressure` |
+| `insufficient-slots` | The parsed Cargo job request needs more slots than workers can admit. | `insufficient_slots` |
+| `active-project-exclusion` | Another same-project build is already active. | `active_project_exclusion` |
+| `local-eno-space` | Local disk or cache write probes failed with ENOSPC. | `local_eno_space` |
+| `speedscore-parse-failure` | SpeedScore response shape could not be parsed. | `speedscore_response_shape` |
+| `dry-run-inconsistency` | Dry-run worker fields contradict each other. | `dry_run_inconsistent_worker` |
+
+The static verifier treats these as retained evidence, not live service proof.
+It validates that every case carries the standard `forbidden_actions`, that its
+recorded read-only commands do not contain service-restart, repair, worker
+mutation, build-cancel, or destructive filesystem command fragments, and that
+every collector side-effect flag is false. The verifier also emits ignored
+artifacts under `tests/e2e/artifacts/`: a JSONL `structured.log` plus a
+`summary.json`. Every emitted event must keep `service_actions_invoked`,
+`local_cargo_proof`, and `side_effects_executed` set to false.
+
 ## Read-only Collector Substrate
 
 `crates/frankenterm-core/src/rch_admission.rs` provides the pure normalization

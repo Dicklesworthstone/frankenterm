@@ -8,9 +8,14 @@ cd "${ROOT}"
 SCHEMA="docs/json-schema/ft-rch-admission.json"
 DOC="docs/rch-admission-contract.md"
 FIXTURES="fixtures/rch-admission/reason-code-fixtures.json"
+NO_SERVICE_FIXTURES="fixtures/rch-admission/no-service-action-fixtures.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 README="README.md"
 SOURCE="crates/frankenterm-core/src/rch_admission.rs"
+RUN_ID="${FT_RCH_ADMISSION_CONTRACT_RUN_ID:-static}"
+ARTIFACT_DIR="${FT_RCH_ADMISSION_CONTRACT_ARTIFACT_DIR:-tests/e2e/artifacts/static-proof/ft-69gwh.4/rch-admission-contract/${RUN_ID}}"
+STRUCTURED_LOG="${ARTIFACT_DIR}/structured.log"
+SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
 
 fail() {
   printf 'rch admission contract: %s\n' "$*" >&2
@@ -30,22 +35,31 @@ require_command ruby
 require_file "${SCHEMA}"
 require_file "${DOC}"
 require_file "${FIXTURES}"
+require_file "${NO_SERVICE_FIXTURES}"
 require_file "${PROVENANCE}"
 require_file "${README}"
 require_file "${SOURCE}"
 
-jq empty "${SCHEMA}" "${FIXTURES}"
+mkdir -p "${ARTIFACT_DIR}"
+export FT_RCH_ADMISSION_STRUCTURED_LOG="${STRUCTURED_LOG}"
+export FT_RCH_ADMISSION_SUMMARY_FILE="${SUMMARY_FILE}"
+
+jq empty "${SCHEMA}" "${FIXTURES}" "${NO_SERVICE_FIXTURES}"
 
 ruby <<'RUBY'
+require "fileutils"
 require "json"
 require "set"
 
 SCHEMA = "docs/json-schema/ft-rch-admission.json"
 DOC = "docs/rch-admission-contract.md"
 FIXTURES = "fixtures/rch-admission/reason-code-fixtures.json"
+NO_SERVICE_FIXTURES = "fixtures/rch-admission/no-service-action-fixtures.json"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 README = "README.md"
 SOURCE = "crates/frankenterm-core/src/rch_admission.rs"
+STRUCTURED_LOG = ENV.fetch("FT_RCH_ADMISSION_STRUCTURED_LOG")
+SUMMARY_FILE = ENV.fetch("FT_RCH_ADMISSION_SUMMARY_FILE")
 EXPECTED_CODES = %w[
   local_eno_space
   no_admissible_workers
@@ -79,6 +93,36 @@ EXPECTED_FORBIDDEN = %w[
   delete_files_without_approval
   treat_dry_run_as_compile_proof
 ].freeze
+EXPECTED_NO_SERVICE_CASE_IDS = %w[
+  rch-e100-worker-unreachable
+  all-workers-offline
+  telemetry-gap
+  critical-pressure
+  insufficient-slots
+  active-project-exclusion
+  local-eno-space
+  speedscore-parse-failure
+  dry-run-inconsistency
+].freeze
+EXPECTED_SIDE_EFFECT_FLAGS = %w[
+  agent_mail_repaired
+  agent_mail_restarted
+  rch_daemon_restarted
+  worker_mutated
+  build_cancelled
+  files_deleted
+  local_cargo_counted_as_proof
+].freeze
+REQUIRED_FORBIDDEN_COMMAND_FRAGMENTS = [
+  "am service restart",
+  "am doctor repair",
+  "rch daemon restart",
+  "rch workers disable",
+  "cancel build",
+  "git reset --hard",
+  "git clean -fd",
+  "rm -rf"
+].freeze
 
 def fail!(message)
   warn "rch admission contract: #{message}"
@@ -93,6 +137,7 @@ end
 
 schema = read_json(SCHEMA)
 fixtures = read_json(FIXTURES)
+no_service = read_json(NO_SERVICE_FIXTURES)
 doc = File.read(DOC)
 provenance = File.read(PROVENANCE)
 readme = File.read(README)
@@ -137,6 +182,62 @@ cases.each do |entry|
   fail!("payload #{code} has no recommendation for its reason code") unless rec_codes.include?(code)
 end
 
+fail!("no-service fixture schema_version drifted") unless no_service["schema_version"] == "ft.rch_admission.no_service_actions.v1"
+fail!("no-service fixture doc pointer drifted") unless no_service["contract_doc"] == DOC
+fail!("no-service fixture verifier pointer drifted") unless no_service["static_verifier"] == "tests/e2e/test_rch_admission_contract.sh"
+fail!("no-service required forbidden actions drifted") unless no_service.fetch("required_forbidden_actions").sort == EXPECTED_FORBIDDEN.sort
+forbidden_fragments = no_service.fetch("forbidden_command_fragments")
+REQUIRED_FORBIDDEN_COMMAND_FRAGMENTS.each do |fragment|
+  fail!("no-service forbidden fragment missing #{fragment}") unless forbidden_fragments.include?(fragment)
+end
+
+no_service_cases = no_service.fetch("cases")
+no_service_ids = no_service_cases.map { |entry| entry.fetch("fixture_id") }
+fail!("no-service case coverage drifted: #{no_service_ids.sort.inspect}") unless no_service_ids.sort == EXPECTED_NO_SERVICE_CASE_IDS.sort
+fail!("no-service fixture ids are not unique") unless no_service_ids.uniq.length == no_service_ids.length
+
+no_service_cases.each do |entry|
+  fixture_id = entry.fetch("fixture_id")
+  code = entry.fetch("reason_code")
+  fail!("no-service case #{fixture_id} has unknown reason code #{code}") unless EXPECTED_CODES.include?(code)
+  fail!("no-service case #{fixture_id} forbidden-actions drifted") unless entry.fetch("forbidden_actions").sort == EXPECTED_FORBIDDEN.sort
+
+  commands = entry.fetch("executed_read_only_commands")
+  fail!("no-service case #{fixture_id} has no retained read-only commands") if commands.empty?
+  commands.each do |command|
+    fail!("no-service case #{fixture_id} records direct local Cargo proof command: #{command}") if command.start_with?("cargo ")
+    forbidden_fragments.each do |fragment|
+      if command.downcase.include?(fragment.downcase)
+        fail!("no-service case #{fixture_id} command contains forbidden fragment #{fragment}: #{command}")
+      end
+    end
+  end
+
+  evidence = entry.fetch("retained_evidence")
+  fail!("no-service case #{fixture_id} has no retained evidence") if evidence.empty?
+  evidence.each do |record|
+    fail!("no-service case #{fixture_id} evidence missing kind") unless record.key?("kind")
+    fail!("no-service case #{fixture_id} evidence missing summary") unless record.key?("summary")
+  end
+
+  side_effects = entry.fetch("collector_side_effects")
+  fail!("no-service case #{fixture_id} side-effect keys drifted") unless side_effects.keys.sort == EXPECTED_SIDE_EFFECT_FLAGS.sort
+  side_effects.each do |flag, value|
+    fail!("no-service case #{fixture_id} side-effect flag #{flag} is not false") unless value == false
+  end
+
+  structured = entry.fetch("expected_structured_log")
+  %w[component fixture_id reason_code outcome service_actions_invoked local_cargo_proof side_effects_executed].each do |field|
+    fail!("no-service case #{fixture_id} structured log missing #{field}") unless structured.key?(field)
+  end
+  fail!("no-service case #{fixture_id} structured fixture_id drifted") unless structured["fixture_id"] == fixture_id
+  fail!("no-service case #{fixture_id} structured reason_code drifted") unless structured["reason_code"] == code
+  fail!("no-service case #{fixture_id} structured outcome invalid") unless %w[blocked advisory].include?(structured["outcome"])
+  fail!("no-service case #{fixture_id} invoked service action") unless structured["service_actions_invoked"] == false
+  fail!("no-service case #{fixture_id} counted local Cargo as proof") unless structured["local_cargo_proof"] == false
+  fail!("no-service case #{fixture_id} executed side effects") unless structured["side_effects_executed"] == false
+end
+
 EXPECTED_CODES.each do |code|
   fail!("doc missing reason code #{code}") unless doc.include?("`#{code}`")
 end
@@ -159,6 +260,19 @@ fail!("doc must reject dry-run as proof") unless doc.include?("dry-run") && doc.
 ].each do |term|
   fail!("doc missing cargo analyzer term #{term}") unless doc.include?(term)
 end
+EXPECTED_NO_SERVICE_CASE_IDS.each do |fixture_id|
+  fail!("doc missing no-service fixture #{fixture_id}") unless doc.include?("`#{fixture_id}`")
+end
+%w[
+  no-service-action-fixtures.json
+  structured.log
+  summary.json
+  service_actions_invoked
+  local_cargo_proof
+  side_effects_executed
+].each do |term|
+  fail!("doc missing no-service contract term #{term}") unless doc.include?(term)
+end
 %w[
   RchAdmissionCargoCommandAnalysis
   RchAdmissionCargoJobSource
@@ -177,5 +291,39 @@ live_e2e = Dir.glob("tests/e2e/**/*.sh").length
 fail!("README stamped E2E count stale") unless readme.include?("<!--count:e2e_scripts-->#{live_e2e}<!--/count-->")
 fail!("README tree E2E count stale") unless readme.include?("# #{live_e2e} shell E2E scripts")
 
-puts "rch admission contract: static verifier passed (#{cases.length} fixtures, #{EXPECTED_CODES.length} reason codes, #{live_e2e} E2E scripts)"
+FileUtils.mkdir_p(File.dirname(STRUCTURED_LOG))
+structured_events = no_service_cases.map do |entry|
+  entry.fetch("expected_structured_log").merge(
+    "contract_id" => "ft.rch_admission.v1",
+    "schema_version" => no_service.fetch("schema_version"),
+    "decision_path" => "no_service_actions.#{entry.fetch("fixture_id")}",
+    "artifact_path" => NO_SERVICE_FIXTURES,
+    "forbidden_actions" => entry.fetch("forbidden_actions"),
+    "read_only_command_count" => entry.fetch("executed_read_only_commands").length
+  )
+end
+File.write(STRUCTURED_LOG, structured_events.map { |event| JSON.generate(event) }.join("\n") + "\n")
+parsed_events = File.readlines(STRUCTURED_LOG, chomp: true).map { |line| JSON.parse(line) }
+fail!("structured log event count drifted") unless parsed_events.length == no_service_cases.length
+parsed_events.each do |event|
+  fail!("structured log event invoked service action") unless event.fetch("service_actions_invoked") == false
+  fail!("structured log event counted local Cargo proof") unless event.fetch("local_cargo_proof") == false
+  fail!("structured log event executed side effects") unless event.fetch("side_effects_executed") == false
+end
+
+summary = {
+  "contract_id" => "ft.rch_admission.v1",
+  "schema_version" => no_service.fetch("schema_version"),
+  "status" => "passed",
+  "reason_fixture_count" => cases.length,
+  "no_service_fixture_count" => no_service_cases.length,
+  "reason_code_count" => EXPECTED_CODES.length,
+  "forbidden_action_count" => EXPECTED_FORBIDDEN.length,
+  "structured_log" => STRUCTURED_LOG,
+  "summary_file" => SUMMARY_FILE
+}
+File.write(SUMMARY_FILE, JSON.pretty_generate(summary) + "\n")
+fail!("summary file is not JSON") unless read_json(SUMMARY_FILE).fetch("status") == "passed"
+
+puts "rch admission contract: static verifier passed (#{cases.length} reason fixtures, #{no_service_cases.length} no-service fixtures, #{EXPECTED_CODES.length} reason codes, #{live_e2e} E2E scripts; log #{STRUCTURED_LOG})"
 RUBY
