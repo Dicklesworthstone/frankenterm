@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use smithay_client_toolkit::compositor::SurfaceData;
@@ -28,12 +28,9 @@ impl PointerHandler for WaylandState {
         pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        let mut pstate = pointer
-            .data::<PointerUserData>()
-            .unwrap()
-            .state
-            .lock()
-            .unwrap();
+        let Some(mut pstate) = pointer_state_for_frame(pointer, "pointer_frame") else {
+            return;
+        };
 
         for evt in events {
             if let PointerEventKind::Enter { .. } = &evt.kind {
@@ -45,11 +42,15 @@ impl PointerHandler for WaylandState {
                 *self.last_serial.borrow_mut() = serial;
                 pstate.serial = serial;
             }
-            if let Some(pending) = self
-                .surface_to_pending
-                .get(&self.active_surface_id.borrow().as_ref().unwrap())
-            {
-                let mut pending = pending.lock().unwrap();
+            let Some(active_surface_id) = self.active_surface_id.borrow().as_ref().cloned() else {
+                log::trace!("Wayland pointer event arrived before an active surface was recorded");
+                continue;
+            };
+
+            if let Some(pending) = self.surface_to_pending.get(&active_surface_id) {
+                let Some(mut pending) = lock_pending_mouse(pending, "pointer_frame") else {
+                    continue;
+                };
                 if pending.queue(evt) {
                     WaylandConnection::with_window_inner(pending.window_id, move |inner| {
                         inner.dispatch_pending_mouse();
@@ -59,6 +60,24 @@ impl PointerHandler for WaylandState {
             }
         }
         self.pointer_window_frame(pointer, events);
+    }
+}
+
+fn pointer_state_for_frame<'a>(
+    pointer: &'a WlPointer,
+    event_name: &str,
+) -> Option<MutexGuard<'a, PointerState>> {
+    let Some(pointer_data) = pointer.data::<PointerUserData>() else {
+        log::warn!("Wayland pointer {event_name} event arrived without pointer user data");
+        return None;
+    };
+
+    match pointer_data.state.lock() {
+        Ok(state) => Some(state),
+        Err(poisoned) => {
+            log::error!("Wayland pointer state lock was poisoned during {event_name}");
+            Some(poisoned.into_inner())
+        }
     }
 }
 
@@ -97,6 +116,19 @@ pub struct PendingMouse {
     button: Vec<(MousePress, ButtonState)>,
     scroll: Option<(f64, f64)>,
     in_window: bool,
+}
+
+fn lock_pending_mouse<'a>(
+    pending: &'a Arc<Mutex<PendingMouse>>,
+    context: &str,
+) -> Option<MutexGuard<'a, PendingMouse>> {
+    match pending.lock() {
+        Ok(pending) => Some(pending),
+        Err(poisoned) => {
+            log::error!("Wayland pending mouse lock was poisoned during {context}");
+            Some(poisoned.into_inner())
+        }
+    }
 }
 
 impl PendingMouse {
@@ -169,7 +201,7 @@ impl PendingMouse {
     }
 
     pub(super) fn next_button(pending: &Arc<Mutex<Self>>) -> Option<(MousePress, ButtonState)> {
-        let mut pending = pending.lock().unwrap();
+        let mut pending = lock_pending_mouse(pending, "next_button")?;
         if pending.button.is_empty() {
             None
         } else {
@@ -178,15 +210,19 @@ impl PendingMouse {
     }
 
     pub(super) fn coords(pending: &Arc<Mutex<Self>>) -> Option<(f64, f64)> {
-        pending.lock().unwrap().surface_coords.take()
+        let mut pending = lock_pending_mouse(pending, "coords")?;
+        pending.surface_coords.take()
     }
 
     pub(super) fn scroll(pending: &Arc<Mutex<Self>>) -> Option<(f64, f64)> {
-        pending.lock().unwrap().scroll.take()
+        let mut pending = lock_pending_mouse(pending, "scroll")?;
+        pending.scroll.take()
     }
 
     pub(super) fn in_window(pending: &Arc<Mutex<Self>>) -> bool {
-        pending.lock().unwrap().in_window
+        lock_pending_mouse(pending, "in_window")
+            .map(|pending| pending.in_window)
+            .unwrap_or(false)
     }
 }
 
@@ -203,10 +239,18 @@ fn event_serial(event: &PointerEvent) -> Option<u32> {
 impl WaylandState {
     fn pointer_window_frame(&mut self, pointer: &WlPointer, events: &[PointerEvent]) {
         let windows = self.windows.borrow();
+        let Some(active_surface_id) = self.active_surface_id.borrow().as_ref().cloned() else {
+            if !events.is_empty() {
+                log::trace!(
+                    "Wayland pointer window-frame events arrived before an active surface was recorded"
+                );
+            }
+            return;
+        };
 
         for evt in events {
             let surface = &evt.surface;
-            if surface.id() == self.active_surface_id.borrow().as_ref().unwrap().clone() {
+            if surface.id() == active_surface_id {
                 let (x, y) = evt.position;
                 let parent_surface = match evt.surface.data::<SurfaceData>() {
                     Some(data) => match data.parent_surface() {
@@ -217,7 +261,13 @@ impl WaylandState {
                 };
 
                 let wid = SurfaceUserData::from_wl(parent_surface).window_id;
-                let mut inner = windows.get(&wid).unwrap().borrow_mut();
+                let Some(window) = windows.get(&wid) else {
+                    log::warn!(
+                        "Wayland pointer window-frame event referenced missing window {wid}"
+                    );
+                    continue;
+                };
+                let mut inner = window.borrow_mut();
 
                 match evt.kind {
                     PointerEventKind::Enter { .. } => {
