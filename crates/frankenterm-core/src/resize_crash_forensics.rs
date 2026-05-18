@@ -13,7 +13,7 @@
 //! by [`crate::crash::write_crash_bundle`].
 
 use std::collections::VecDeque;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,32 @@ use crate::resize_scheduler::{
 // ---------------------------------------------------------------------------
 
 static GLOBAL_RESIZE_CRASH_CTX: OnceLock<RwLock<Option<ResizeCrashContext>>> = OnceLock::new();
+
+fn resize_crash_context_lock() -> &'static RwLock<Option<ResizeCrashContext>> {
+    GLOBAL_RESIZE_CRASH_CTX.get_or_init(|| RwLock::new(None))
+}
+
+fn read_resize_crash_context() -> RwLockReadGuard<'static, Option<ResizeCrashContext>> {
+    let lock = resize_crash_context_lock();
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn write_resize_crash_context() -> RwLockWriteGuard<'static, Option<ResizeCrashContext>> {
+    let lock = resize_crash_context_lock();
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -57,25 +83,18 @@ pub struct ResizeCrashContext {
 impl ResizeCrashContext {
     /// Update the process-global crash context.
     pub fn update_global(ctx: Self) {
-        let lock = GLOBAL_RESIZE_CRASH_CTX.get_or_init(|| RwLock::new(None));
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(ctx);
-        }
+        *write_resize_crash_context() = Some(ctx);
     }
 
     /// Retrieve the current process-global crash context.
     #[must_use]
     pub fn get_global() -> Option<Self> {
-        let lock = GLOBAL_RESIZE_CRASH_CTX.get_or_init(|| RwLock::new(None));
-        lock.read().ok().and_then(|guard| guard.clone())
+        read_resize_crash_context().clone()
     }
 
     /// Clear the process-global crash context (useful in tests).
     pub fn clear_global() {
-        let lock = GLOBAL_RESIZE_CRASH_CTX.get_or_init(|| RwLock::new(None));
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
+        *write_resize_crash_context() = None;
     }
 
     /// Produce a compact one-line summary for structured log emission.
@@ -351,6 +370,42 @@ mod tests {
             ResizeCrashContext::get_global().is_none(),
             "global should be None after clear"
         );
+    }
+
+    #[test]
+    fn global_recovers_from_poisoned_lock() {
+        let poisoned_ctx = ResizeCrashContextBuilder::new(22222)
+            .gate(sample_gate())
+            .build();
+        let lock = resize_crash_context_lock();
+        let poisoner = std::thread::spawn(move || {
+            let mut guard = lock.write().expect("lock should be clean before poison");
+            *guard = Some(poisoned_ctx);
+            panic!("intentional resize crash context poison");
+        });
+        assert!(poisoner.join().is_err());
+
+        let replacement = ResizeCrashContextBuilder::new(33333)
+            .gate(sample_gate())
+            .add_in_flight(sample_in_flight())
+            .build();
+        let mut matched = false;
+        for _ in 0..8 {
+            ResizeCrashContext::update_global(replacement.clone());
+            if ResizeCrashContext::get_global()
+                .as_ref()
+                .is_some_and(|ctx| ctx.captured_at_ms == replacement.captured_at_ms)
+            {
+                matched = true;
+                break;
+            }
+        }
+
+        assert!(
+            matched,
+            "global crash context should update after recovering RwLock poison"
+        );
+        ResizeCrashContext::clear_global();
     }
 
     #[test]

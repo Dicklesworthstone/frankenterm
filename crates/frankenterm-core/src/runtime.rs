@@ -4833,7 +4833,8 @@ fn snapshot_trigger_from_event(event: &Event) -> Option<crate::snapshot_engine::
         Event::SegmentCaptured { .. }
         | Event::GapDetected { .. }
         | Event::WorkflowStarted { .. }
-        | Event::WorkflowStep { .. } => None,
+        | Event::WorkflowStep { .. }
+        | Event::MissionAudit { .. } => None,
     }
 }
 

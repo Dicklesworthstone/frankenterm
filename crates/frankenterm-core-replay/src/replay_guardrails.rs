@@ -7,8 +7,8 @@
 //! - [`WatchdogConfig`] — Stall detection and force-termination policy.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 // ============================================================================
 // SimulationGuard — process-visible simulation flag
@@ -198,6 +198,21 @@ struct TrackerInner {
     halted: bool,
 }
 
+fn lock_or_recover<'a, T>(
+    mutex: &'a Mutex<T>,
+    lock_name: &'static str,
+    context: &'static str,
+) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            lock_name = lock_name,
+            context = context,
+            "recovering poisoned replay guardrail mutex"
+        );
+        poisoned.into_inner()
+    })
+}
+
 /// Result of checking resource limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
@@ -225,6 +240,10 @@ impl ResourceTracker {
             event_count: AtomicU64::new(0),
             memory_warned: AtomicBool::new(false),
         }
+    }
+
+    fn lock_inner(&self, context: &'static str) -> MutexGuard<'_, TrackerInner> {
+        lock_or_recover(&self.inner, "resource_tracker", context)
     }
 
     /// Record an event and check limits.
@@ -257,7 +276,7 @@ impl ResourceTracker {
         }
 
         // Wall-clock check.
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner("record_event");
         if self.limits.max_wall_clock_ms > 0 {
             let elapsed = current_wall_ms.saturating_sub(inner.start_wall_ms);
             if elapsed > self.limits.max_wall_clock_ms {
@@ -279,7 +298,7 @@ impl ResourceTracker {
 
     /// Check watchdog: has there been progress recently?
     pub fn check_watchdog(&self, current_wall_ms: u64) -> CheckResult {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner("check_watchdog");
         if self.limits.watchdog_timeout_ms == 0 {
             return CheckResult::Ok;
         }
@@ -303,23 +322,23 @@ impl ResourceTracker {
     /// Whether the tracker has halted the run.
     #[must_use]
     pub fn is_halted(&self) -> bool {
-        self.inner.lock().unwrap().halted
+        self.lock_inner("is_halted").halted
     }
 
     /// Get all violations.
     #[must_use]
     pub fn violations(&self) -> Vec<LimitViolation> {
-        self.inner.lock().unwrap().violations.clone()
+        self.lock_inner("violations").violations.clone()
     }
 
     fn record_violation(&self, violation: LimitViolation) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner("record_violation");
         inner.violations.push(violation);
         inner.halted = true;
     }
 
     fn update_progress(&self, current_wall_ms: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner("update_progress");
         inner.last_progress_ms = current_wall_ms;
     }
 }
@@ -593,6 +612,37 @@ watchdog_timeout_ms = 5000
         let is_halt = matches!(result, CheckResult::Halt(LimitViolation::MaxEvents { .. }));
         assert!(is_halt);
         assert!(tracker.is_halted());
+    }
+
+    #[test]
+    fn tracker_recovers_after_poisoned_inner_lock() {
+        let limits = ResourceLimits {
+            max_events: 1,
+            watchdog_timeout_ms: 100,
+            ..non_interfering_limits()
+        };
+        let tracker = ResourceTracker::new(limits, 0);
+
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = tracker.inner.lock().unwrap();
+                panic!("poison resource tracker");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        assert!(tracker.inner.is_poisoned());
+        assert_eq!(tracker.record_event(0), CheckResult::Ok);
+        assert_eq!(tracker.event_count(), 1);
+
+        let result = tracker.record_event(1);
+        assert!(matches!(
+            result,
+            CheckResult::Halt(LimitViolation::MaxEvents { .. })
+        ));
+        assert!(tracker.is_halted());
+        assert_eq!(tracker.violations().len(), 1);
+        assert_eq!(tracker.check_watchdog(50), CheckResult::Ok);
     }
 
     #[test]

@@ -164,7 +164,7 @@ impl OpenSSLNetListener {
                                 continue;
                             }
                             spawn_into_main_thread(async move {
-                                log::error!("Making new AsyncSslStream");
+                                log::debug!("Making new AsyncSslStream");
                                 frankenterm_mux_server_impl::dispatch::process_with_config(
                                     AsyncSslStream::new(stream),
                                     dispatch_config,

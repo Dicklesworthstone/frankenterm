@@ -21,7 +21,7 @@
 //!
 //! | Field              | Type                    | Purpose                            |
 //! |--------------------|-------------------------|------------------------------------|
-//! | `timestamp_ms`     | `u64`                   | Epoch millis (monotonic-safe)      |
+//! | `timestamp_ms`     | `u64`                   | Wall-clock epoch millis            |
 //! | `component`        | `String`                | Emitting subsystem (dot-separated) |
 //! | `scope_id`         | `Option<String>`        | Scope tree node (e.g. `daemon:capture`) |
 //! | `event_kind`       | `RuntimeTelemetryKind`  | What happened                      |
@@ -89,9 +89,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::auto_tune::TuningDecisionRecord;
 use crate::connector_credential_broker::{CredentialAuditEvent, CredentialAuditType};
@@ -120,6 +120,54 @@ use crate::swarm_scheduler::{
 use crate::swarm_work_queue::QueueStats;
 use crate::telemetry::{Histogram, HistogramSummary};
 use frankenterm_core_connector_types::CredentialBrokerTelemetrySnapshot;
+
+const RUNTIME_TELEMETRY_CLOCK_ANOMALY_REASON: &str =
+    "runtime_telemetry.timestamp.clock_before_unix_epoch";
+
+static RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of runtime telemetry timestamp calls that observed a clock before the Unix epoch.
+#[must_use]
+pub fn runtime_telemetry_clock_anomaly_count() -> u64 {
+    RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn reset_runtime_telemetry_clock_anomaly_count_for_test() {
+    RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+static RUNTIME_TELEMETRY_CLOCK_ANOMALY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn runtime_telemetry_epoch_millis(now: SystemTime, context: &'static str) -> u64 {
+    match now.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        Err(err) => {
+            record_runtime_telemetry_clock_anomaly(context, err.duration());
+            0
+        }
+    }
+}
+
+fn record_runtime_telemetry_clock_anomaly(context: &'static str, skew: Duration) {
+    let anomaly_count = RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        })
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let clock_skew_ms = u64::try_from(skew.as_millis()).unwrap_or(u64::MAX);
+
+    tracing::warn!(
+        target: "frankenterm::runtime_telemetry",
+        reason_code = RUNTIME_TELEMETRY_CLOCK_ANOMALY_REASON,
+        context = context,
+        clock_skew_ms = clock_skew_ms,
+        anomaly_count = anomaly_count,
+        "runtime telemetry clock is before Unix epoch; preserving zero timestamp fallback"
+    );
+}
 
 // =============================================================================
 // Health tier (unified 4-tier pattern)
@@ -530,10 +578,7 @@ impl RuntimeTelemetryEvent {
     /// Current wall-clock epoch milliseconds.
     #[must_use]
     pub fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        runtime_telemetry_epoch_millis(SystemTime::now(), "runtime_event.now_ms")
     }
 }
 
@@ -1631,10 +1676,7 @@ impl UnifiedTelemetryRecord {
 
 impl From<&QueueStats> for UnifiedTelemetryRecord {
     fn from(stats: &QueueStats) -> Self {
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = runtime_telemetry_epoch_millis(SystemTime::now(), "queue_stats.adapter");
         Self::from_queue_stats(stats, now_ms)
     }
 }
@@ -1683,10 +1725,8 @@ impl From<&crate::policy_compliance::ComplianceSnapshot> for UnifiedTelemetryRec
 
 impl From<&SchedulerSnapshot> for UnifiedTelemetryRecord {
     fn from(snapshot: &SchedulerSnapshot) -> Self {
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms =
+            runtime_telemetry_epoch_millis(SystemTime::now(), "scheduler_snapshot.adapter");
         Self::from_scheduler_snapshot(snapshot, now_ms)
     }
 }
@@ -1700,10 +1740,7 @@ fn scheduler_counter_total<'a>(values: impl Iterator<Item = &'a u32>) -> u64 {
 #[cfg(all(feature = "vendored", unix))]
 impl From<&crate::vendored::MuxPoolStats> for UnifiedTelemetryRecord {
     fn from(stats: &crate::vendored::MuxPoolStats) -> Self {
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = runtime_telemetry_epoch_millis(SystemTime::now(), "mux_pool_stats.adapter");
         Self::from_mux_pool_stats(stats, now_ms)
     }
 }
@@ -19115,6 +19152,38 @@ mod tests {
 
         assert_eq!(event.failure_class, Some(FailureClass::Panic));
         assert_eq!(event.health_tier, HealthTier::Black);
+    }
+
+    #[test]
+    fn epoch_millis_from_post_epoch_clock_does_not_record_anomaly() {
+        let _guard = RUNTIME_TELEMETRY_CLOCK_ANOMALY_TEST_LOCK
+            .lock()
+            .expect("runtime telemetry clock anomaly test lock should not be poisoned");
+        reset_runtime_telemetry_clock_anomaly_count_for_test();
+
+        let timestamp_ms = runtime_telemetry_epoch_millis(
+            SystemTime::UNIX_EPOCH + Duration::from_millis(12_345),
+            "test.post_epoch",
+        );
+
+        assert_eq!(timestamp_ms, 12_345);
+        assert_eq!(runtime_telemetry_clock_anomaly_count(), 0);
+    }
+
+    #[test]
+    fn epoch_millis_from_pre_epoch_clock_records_anomaly() {
+        let _guard = RUNTIME_TELEMETRY_CLOCK_ANOMALY_TEST_LOCK
+            .lock()
+            .expect("runtime telemetry clock anomaly test lock should not be poisoned");
+        reset_runtime_telemetry_clock_anomaly_count_for_test();
+        let pre_epoch = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_millis(250))
+            .expect("Unix epoch minus 250ms should be representable");
+
+        let timestamp_ms = runtime_telemetry_epoch_millis(pre_epoch, "test.pre_epoch");
+
+        assert_eq!(timestamp_ms, 0);
+        assert_eq!(runtime_telemetry_clock_anomaly_count(), 1);
     }
 
     #[test]

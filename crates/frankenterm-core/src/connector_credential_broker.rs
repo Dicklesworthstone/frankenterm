@@ -156,6 +156,13 @@ impl CredentialScope {
     /// Check if this scope is a subset of `other` (i.e., `other` permits everything `self` needs).
     #[must_use]
     pub fn is_subset_of(&self, other: &Self) -> bool {
+        if self.provider.trim().is_empty()
+            || self.resource.trim().is_empty()
+            || self.operations.is_empty()
+            || self.operations.iter().any(|op| op.trim().is_empty())
+        {
+            return false;
+        }
         if self.provider != other.provider {
             return false;
         }
@@ -171,9 +178,10 @@ impl CredentialScope {
         if !resource_matches {
             return false;
         }
+        let other_allows_all_operations = other.operations.iter().any(|op| op == "*");
         self.operations
             .iter()
-            .all(|op| other.operations.contains(op) || other.operations.contains(&"*".to_string()))
+            .all(|op| other_allows_all_operations || other.operations.contains(op))
     }
 }
 
@@ -1298,6 +1306,19 @@ mod tests {
     }
 
     #[test]
+    fn request_lease_rejects_empty_operation_scope() {
+        let mut broker = setup_broker();
+        let scope = CredentialScope::new("github", "repos/foo", vec![]);
+        let err = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialBrokerError::NotAuthorized { .. }));
+        assert_eq!(broker.telemetry.access_denied, 1);
+        assert!(broker.active_leases_for_credential("cred-1").is_empty());
+    }
+
+    #[test]
     fn request_lease_max_leases_exceeded() {
         let mut broker = ConnectorCredentialBroker::new();
         broker
@@ -1571,6 +1592,29 @@ mod tests {
         let a = CredentialScope::new("github", "*", vec!["*".into()]);
         let b = CredentialScope::new("slack", "*", vec!["*".into()]);
         assert!(!a.is_subset_of(&b));
+    }
+
+    #[test]
+    fn scope_empty_requested_operations_not_subset() {
+        let wide = CredentialScope::new("github", "*", vec!["*".into()]);
+        let empty_ops = CredentialScope::new("github", "repos/foo", vec![]);
+        assert!(!empty_ops.is_subset_of(&wide));
+    }
+
+    #[test]
+    fn scope_blank_requested_operation_not_subset() {
+        let wide = CredentialScope::new("github", "*", vec!["*".into()]);
+        let blank_op = CredentialScope::new("github", "repos/foo", vec![" ".into()]);
+        assert!(!blank_op.is_subset_of(&wide));
+    }
+
+    #[test]
+    fn scope_blank_requested_provider_or_resource_not_subset() {
+        let wide = CredentialScope::new("github", "*", vec!["*".into()]);
+        let blank_provider = CredentialScope::new(" ", "repos/foo", vec!["read".into()]);
+        let blank_resource = CredentialScope::new("github", " ", vec!["read".into()]);
+        assert!(!blank_provider.is_subset_of(&wide));
+        assert!(!blank_resource.is_subset_of(&wide));
     }
 
     // ---- Sensitivity ordering ----

@@ -200,6 +200,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "rch_admission_cargo"
+path = "fuzz_targets/rch_admission_cargo.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "snapshot_deserialize"
 path = "fuzz_targets/snapshot_deserialize.rs"
 doc = false

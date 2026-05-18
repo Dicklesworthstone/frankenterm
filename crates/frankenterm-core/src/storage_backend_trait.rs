@@ -76,7 +76,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -679,8 +679,7 @@ pub enum BackendError {
     Connect(String),
     /// SQL syntax or constraint violation.
     Query(String),
-    /// Transaction was poisoned by a panic; subsequent operations
-    /// must abort.
+    /// Backend-specific unrecoverable transaction poison.
     TxPoisoned,
     /// Schema migration failure (e.g. unexpected user_version).
     Schema(String),
@@ -1004,6 +1003,17 @@ impl RusqliteBackend {
         }
     }
 
+    fn conn_guard(&self) -> MutexGuard<'_, rusqlite::Connection> {
+        match self.conn.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.conn.clear_poison();
+                guard
+            }
+        }
+    }
+
     /// Borrow the wrapped connection for legacy rusqlite-only helpers.
     ///
     /// Keep this crate-private: new storage call sites should use the
@@ -1012,7 +1022,7 @@ impl RusqliteBackend {
     where
         F: FnOnce(&rusqlite::Connection) -> R,
     {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         Ok(f(&conn))
     }
 
@@ -1075,25 +1085,25 @@ impl StorageBackendFactory for RusqliteBackend {
 
 impl StorageBackend for RusqliteBackend {
     fn execute(&self, sql: &str) -> Result<usize, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         conn.execute(sql, [])
             .map_err(|e| BackendError::Query(e.to_string()))
     }
 
     fn execute_batch(&self, sql: &str) -> Result<(), BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         conn.execute_batch(sql)
             .map_err(|e| BackendError::Query(e.to_string()))
     }
 
     fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<(), BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         conn.busy_timeout(timeout)
             .map_err(|e| BackendError::Query(format!("busy_timeout: {e}")))
     }
 
     fn query_scalar(&self, sql: &str) -> Result<Option<String>, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1129,7 +1139,7 @@ impl StorageBackend for RusqliteBackend {
     }
 
     fn user_version(&self) -> Result<u32, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| BackendError::Schema(e.to_string()))?;
@@ -1138,7 +1148,7 @@ impl StorageBackend for RusqliteBackend {
 
     fn set_user_version(&self, version: u32) -> Result<(), BackendError> {
         let version = sqlite_user_version_value(version)?;
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         conn.pragma_update(None, "user_version", version)
             .map_err(|e| BackendError::Schema(e.to_string()))
     }
@@ -1152,7 +1162,7 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[&str],
     ) -> Result<Option<Vec<String>>, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1185,7 +1195,7 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[&str],
     ) -> Result<Vec<Vec<String>>, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1225,7 +1235,7 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[ToSqlValue<'_>],
     ) -> Result<Option<Vec<String>>, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1257,7 +1267,7 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[ToSqlValue<'_>],
     ) -> Result<Vec<Vec<String>>, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1297,7 +1307,7 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[ToSqlValue<'_>],
     ) -> Result<Option<Vec<SqlCell>>, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1329,7 +1339,7 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[ToSqlValue<'_>],
     ) -> Result<Vec<Vec<SqlCell>>, BackendError> {
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1373,7 +1383,7 @@ impl StorageBackend for RusqliteBackend {
         if param_rows.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let conn = self.conn_guard();
         let mut stmt = conn
             .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -1753,6 +1763,46 @@ mod tests {
             .unwrap();
         let got = backend.query_scalar("PRAGMA busy_timeout").unwrap();
         assert_eq!(got.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn rusqlite_backend_recovers_poisoned_connection_lock() {
+        let backend = open_memory();
+        backend
+            .execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .conn
+                .lock()
+                .expect("connection lock should start clean");
+            panic!("poison backend connection lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(backend.conn.is_poisoned());
+
+        backend.execute("INSERT INTO t VALUES (2)").unwrap();
+        assert!(!backend.conn.is_poisoned());
+        let count = backend.query_scalar("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.as_deref(), Some("2"));
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .conn
+                .lock()
+                .expect("connection lock should be clean after recovery");
+            panic!("poison backend connection lock again");
+        }));
+        assert!(poisoned.is_err());
+        assert!(backend.conn.is_poisoned());
+
+        assert!(
+            backend
+                .with_connection(|conn| conn.is_autocommit())
+                .unwrap()
+        );
+        assert!(!backend.conn.is_poisoned());
     }
 
     #[test]

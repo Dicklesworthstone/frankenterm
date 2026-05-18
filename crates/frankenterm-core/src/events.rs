@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::events_dedup_cuckoo::{CuckooDedupVerdict, EventCuckooDedup, EventCuckooDedupSnapshot};
+use crate::mission_events::MissionEvent;
 use crate::patterns::Detection;
 use crate::policy::Redactor;
 use crate::runtime_async::broadcast;
@@ -203,6 +204,9 @@ pub enum Event {
         reason: Option<String>,
     },
 
+    /// Mission-loop audit event emitted by mission planning/dispatch surfaces.
+    MissionAudit { event: Box<MissionEvent> },
+
     /// User-var event received via IPC from shell hook
     UserVarReceived {
         pane_id: u64,
@@ -228,6 +232,7 @@ impl Event {
             Self::WorkflowStarted { .. } => "workflow_started",
             Self::WorkflowStep { .. } => "workflow_step",
             Self::WorkflowCompleted { .. } => "workflow_completed",
+            Self::MissionAudit { .. } => "mission_audit",
             Self::UserVarReceived { .. } => "user_var_received",
         }
     }
@@ -243,7 +248,9 @@ impl Event {
             | Self::PaneDisappeared { pane_id }
             | Self::WorkflowStarted { pane_id, .. }
             | Self::UserVarReceived { pane_id, .. } => Some(*pane_id),
-            Self::WorkflowStep { .. } | Self::WorkflowCompleted { .. } => None,
+            Self::WorkflowStep { .. }
+            | Self::WorkflowCompleted { .. }
+            | Self::MissionAudit { .. } => None,
         }
     }
 }
@@ -1208,6 +1215,7 @@ impl EventBus {
             | Event::WorkflowStarted { .. }
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
+            | Event::MissionAudit { .. }
             | Event::UserVarReceived { .. } => self.send_routed(
                 event,
                 &self.signal_sender,

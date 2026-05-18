@@ -283,9 +283,8 @@ pub struct LayoutSwapResult {
 /// 2. If the layout has a "main" slot, place the active pane there.
 /// 3. Assign remaining panes 1:1 to remaining slots.
 /// 4. If more panes than slots, stack overflow panes in the last slot.
-/// 5. If fewer panes than slots, leave extra slots with the last pane
-///    duplicated (shouldn't happen in practice — caller should ensure
-///    at least one pane per slot or handle empty slots).
+/// 5. If fewer panes than slots, prune empty slots so the resulting tree
+///    contains only pane-bearing leaves.
 ///
 /// Returns `None` if `panes` is empty.
 pub fn redistribute_panes(
@@ -345,11 +344,17 @@ pub fn redistribute_panes(
         slot_assignments[overflow_target].push(p);
     }
 
-    // Ensure every slot has at least one pane.
-    // For empty slots (more slots than panes), we can't create panes here —
-    // the caller must handle empty slots.  We'll track which slots are empty.
-    // For now, empty slots will produce leaves with a placeholder that the
-    // caller should handle.
+    let populated_slots: Vec<bool> = slot_assignments
+        .iter()
+        .map(|assignment| !assignment.is_empty())
+        .collect();
+    let mut prune_counter = 0;
+    let effective_arrangement =
+        prune_empty_slots(arrangement, &populated_slots, &mut prune_counter)?;
+    let compact_slot_assignments: Vec<Vec<Arc<dyn Pane>>> = slot_assignments
+        .into_iter()
+        .filter(|assignment| !assignment.is_empty())
+        .collect();
 
     // Build the tree and stacks.
     let mut stacks: HashMap<usize, PaneStack> = HashMap::new();
@@ -358,8 +363,8 @@ pub fn redistribute_panes(
     let mut leaf_counter = 0;
 
     let tree = build_tree_from_arrangement(
-        arrangement,
-        &slot_assignments,
+        &effective_arrangement,
+        &compact_slot_assignments,
         &mut slot_counter,
         &mut stacks,
         active_pane_id,
@@ -391,6 +396,51 @@ fn assign_slot_indices(
                 *main_idx = Some(*counter);
             }
             *counter += 1;
+        }
+    }
+}
+
+/// Return an arrangement that contains only populated slots.
+///
+/// Layout swaps can legitimately target a preset with more slots than the tab
+/// currently has panes. Keeping those missing slots as `Tree::Empty` branches
+/// leaves split nodes whose geometry no longer describes visible panes. Pruning
+/// them before tree construction lets the remaining split data be computed from
+/// the compact pane-bearing tree.
+fn prune_empty_slots(
+    arrangement: &LayoutArrangement,
+    populated_slots: &[bool],
+    counter: &mut usize,
+) -> Option<LayoutArrangement> {
+    match arrangement {
+        LayoutArrangement::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let first = prune_empty_slots(first, populated_slots, counter);
+            let second = prune_empty_slots(second, populated_slots, counter);
+
+            match (first, second) {
+                (Some(first), Some(second)) => Some(LayoutArrangement::Split {
+                    direction: *direction,
+                    ratio: *ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
+        }
+        LayoutArrangement::Slot { is_main } => {
+            let idx = *counter;
+            *counter += 1;
+            populated_slots
+                .get(idx)
+                .copied()
+                .unwrap_or(false)
+                .then_some(LayoutArrangement::Slot { is_main: *is_main })
         }
     }
 }
@@ -455,11 +505,6 @@ fn build_tree_from_arrangement(
             *leaf_counter += 1;
 
             let assigned = &slot_assignments[idx];
-            if assigned.is_empty() {
-                // Empty slot — return Tree::Empty.
-                // Caller should handle this (e.g. create a placeholder pane).
-                return bintree::Tree::Empty;
-            }
 
             let visible_pane = assigned[0].clone();
 
@@ -902,6 +947,68 @@ mod tests {
             second: Box::new(LayoutArrangement::Slot { is_main: false }),
         };
         assert!(!tree.has_main_slot());
+    }
+
+    #[test]
+    fn prune_empty_slots_collapses_single_populated_grid_slot() {
+        let layout = grid_4();
+        let populated = [true, false, false, false];
+        let mut counter = 0;
+        let pruned =
+            prune_empty_slots(&layout.arrangement, &populated, &mut counter).expect("one slot");
+
+        assert_eq!(counter, 4);
+        assert_eq!(pruned, LayoutArrangement::Slot { is_main: true });
+    }
+
+    #[test]
+    fn prune_empty_slots_preserves_split_between_populated_slots() {
+        let layout = grid_4();
+        let populated = [true, true, false, false];
+        let mut counter = 0;
+        let pruned =
+            prune_empty_slots(&layout.arrangement, &populated, &mut counter).expect("two slots");
+
+        assert_eq!(counter, 4);
+        assert_eq!(pruned.slot_count(), 2);
+        match pruned {
+            LayoutArrangement::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, SplitDirection::Horizontal);
+                assert_eq!(*first, LayoutArrangement::Slot { is_main: true });
+                assert_eq!(*second, LayoutArrangement::Slot { is_main: false });
+            }
+            other => panic!("expected split, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prune_empty_slots_collapses_nested_empty_branch() {
+        let layout = main_side();
+        let populated = [true, false, true];
+        let mut counter = 0;
+        let pruned =
+            prune_empty_slots(&layout.arrangement, &populated, &mut counter).expect("two slots");
+
+        assert_eq!(counter, 3);
+        assert_eq!(pruned.slot_count(), 2);
+        match pruned {
+            LayoutArrangement::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, SplitDirection::Horizontal);
+                assert_eq!(*first, LayoutArrangement::Slot { is_main: true });
+                assert_eq!(*second, LayoutArrangement::Slot { is_main: false });
+            }
+            other => panic!("expected split, got {:?}", other),
+        }
     }
 
     // --- main_bottom preset structure ---

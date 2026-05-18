@@ -18,7 +18,7 @@ use ft_perf_gate::causal_attribution::{
 };
 use ft_perf_gate::conformal::{SplitConformalConfig, audit_coverage, fit_split_conformal_band};
 use ft_perf_gate::regime_shift::{PageHinkleyKlConfig, detect_page_hinkley_kl};
-use ft_perf_gate::snc::{MgfServiceCurve, SncBound, SncConfig, compute_snc_bound, hill_estimate};
+use ft_perf_gate::snc::{SncBound, SncConfig, compute_snc_bound, hill_estimate};
 use ft_perf_gate::sprt::{
     AnytimeValidCiConfig, AnytimeValidTest, WaldSprtConfig, evaluate_anytime_valid_ci,
     evaluate_wald_sprt,
@@ -454,19 +454,12 @@ fn snc_hill_detects_heavy_tail_alpha_in_pareto_fixture() {
 #[test]
 fn snc_returns_heavy_tail_bound_for_pareto_fixture() {
     let samples = load_fixture("robot.p95", "heavy-tail");
-    // Choose a service rate that comfortably exceeds the fixture's mean
-    // (Pareto-1.5 mean is finite but heavy-tailed; service_rate=10 keeps
-    // utilization below 1).
-    let service = MgfServiceCurve {
-        rate: 10.0,
-        burst: 1.0,
-    };
     let cfg = SncConfig {
         confidence: 0.99,
         hill_k: 40,
         ..SncConfig::default()
     };
-    let bound = compute_snc_bound(&samples, &service, &cfg);
+    let bound = compute_snc_bound(&samples, &cfg);
     eprintln!("heavy-tail bound: {:?}", bound);
     match bound {
         SncBound::HeavyTailBound {
@@ -496,12 +489,8 @@ fn snc_returns_heavy_tail_bound_for_pareto_fixture() {
 #[test]
 fn snc_returns_lindley_domain_for_stationary_baseline() {
     let samples = load_fixture("robot.p95", "baseline-30d");
-    let service = MgfServiceCurve {
-        rate: 100.0,
-        burst: 1.0,
-    };
     let cfg = SncConfig::default();
-    let bound = compute_snc_bound(&samples, &service, &cfg);
+    let bound = compute_snc_bound(&samples, &cfg);
     eprintln!("baseline bound: {:?}", bound);
     // Gaussian baseline is light-tail; Hill on a Gaussian fixture sample
     // typically returns a large or even Inf alpha. The deriver should

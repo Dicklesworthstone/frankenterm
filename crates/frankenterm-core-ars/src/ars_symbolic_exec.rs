@@ -266,9 +266,9 @@ pub fn tokenize(input: &str) -> Vec<ShellToken> {
                 chars.next();
                 if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(ShellToken::Separator);
                 }
-                // Single & (background) — treat as separator.
+                // Single & (background) is also a command separator.
+                tokens.push(ShellToken::Separator);
             }
             // Redirects.
             '>' | '<' => {
@@ -1134,6 +1134,22 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_background_operator() {
+        let tokens = tokenize("echo ok & rm -rf /");
+        assert_eq!(
+            tokens,
+            vec![
+                ShellToken::Word("echo".into()),
+                ShellToken::Word("ok".into()),
+                ShellToken::Separator,
+                ShellToken::Word("rm".into()),
+                ShellToken::Word("-rf".into()),
+                ShellToken::Word("/".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn tokenize_semicolon() {
         let input = "cmd1 ; cmd2";
         let tokens = tokenize(input);
@@ -1219,6 +1235,17 @@ mod tests {
         let tokens = tokenize("mkdir build && cd build && cmake ..");
         let cmds = parse_commands(&tokens);
         assert_eq!(cmds.len(), 3);
+    }
+
+    #[test]
+    fn parse_background_commands() {
+        let tokens = tokenize("echo ok & rm -rf /");
+        let cmds = parse_commands(&tokens);
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].binary, "echo");
+        assert_eq!(cmds[0].args, vec!["ok"]);
+        assert_eq!(cmds[1].binary, "rm");
+        assert_eq!(cmds[1].args, vec!["-rf", "/"]);
     }
 
     #[test]
@@ -1516,6 +1543,22 @@ mod tests {
                 v.violations
                     .iter()
                     .any(|v| v.category == ViolationCategory::UnboundedDeletion)
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_backgrounded_rm_root() {
+        let exec = cwd_executor("/home/user/project");
+        let cmds = vec![make_cmd(0, "echo ok & rm -rf /")];
+        let verdict = exec.analyze(&cmds);
+        assert!(verdict.is_unsafe());
+        if let SafetyVerdict::Unsafe(v) = &verdict {
+            assert!(
+                v.violations
+                    .iter()
+                    .any(|v| v.category == ViolationCategory::UnboundedDeletion),
+                "backgrounded rm must remain a separate command"
             );
         }
     }

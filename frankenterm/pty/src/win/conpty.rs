@@ -3,7 +3,7 @@ use crate::win::psuedocon::PsuedoCon;
 use crate::{Child, MasterPty, PtyPair, PtySize, PtySystem, SlavePty};
 use anyhow::Error;
 use filedescriptor::{FileDescriptor, Pipe};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use winapi::um::wincon::COORD;
 
 #[derive(Default)]
@@ -50,6 +50,12 @@ struct Inner {
     size: PtySize,
 }
 
+fn lock_inner(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
+    inner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Inner {
     pub fn resize(
         &mut self,
@@ -83,24 +89,22 @@ pub struct ConPtySlavePty {
 
 impl MasterPty for ConPtyMasterPty {
     fn resize(&self, size: PtySize) -> anyhow::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_inner(&self.inner);
         inner.resize(size.rows, size.cols, size.pixel_width, size.pixel_height)
     }
 
     fn get_size(&self) -> Result<PtySize, Error> {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_inner(&self.inner);
         Ok(inner.size)
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
-        Ok(Box::new(self.inner.lock().unwrap().readable.try_clone()?))
+        Ok(Box::new(lock_inner(&self.inner).readable.try_clone()?))
     }
 
     fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
         Ok(Box::new(
-            self.inner
-                .lock()
-                .unwrap()
+            lock_inner(&self.inner)
                 .writable
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("writer already taken"))?,
@@ -110,7 +114,7 @@ impl MasterPty for ConPtyMasterPty {
 
 impl SlavePty for ConPtySlavePty {
     fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_inner(&self.inner);
         let child = inner.con.spawn_command(cmd)?;
         Ok(Box::new(child))
     }

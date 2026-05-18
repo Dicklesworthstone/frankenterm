@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
 pub struct SimpleTempDir {
@@ -42,12 +42,22 @@ impl SimpleTempDir {
         Ok(self.root.path().join(format!("{content_id}")))
     }
 
+    fn lock_refs(&self) -> MutexGuard<'_, HashMap<ContentId, usize>> {
+        match self.refs.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.refs.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     fn add_ref(&self, content_id: ContentId) {
-        *self.refs.lock().unwrap().entry(content_id).or_insert(0) += 1;
+        *self.lock_refs().entry(content_id).or_insert(0) += 1;
     }
 
     fn del_ref(&self, content_id: ContentId) {
-        let mut refs = self.refs.lock().unwrap();
+        let mut refs = self.lock_refs();
         match refs.get(&content_id).copied() {
             Some(1) => {
                 refs.remove(&content_id);
@@ -72,7 +82,7 @@ impl SimpleTempDir {
 
 impl BlobStorage for SimpleTempDir {
     fn store(&self, content_id: ContentId, data: &[u8], _lease_id: LeaseId) -> Result<(), Error> {
-        let mut refs = self.refs.lock().unwrap();
+        let mut refs = self.lock_refs();
 
         let path = self.path_for_content(content_id)?;
         let mut file = tempfile::Builder::new()
@@ -100,7 +110,7 @@ impl BlobStorage for SimpleTempDir {
     }
 
     fn get_data(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<Vec<u8>, Error> {
-        let _refs = self.refs.lock().unwrap();
+        let _refs = self.lock_refs();
 
         let path = self.path_for_content(content_id)?;
         std::fs::read(&path).map_err(|err| Error::StorageDirIoError(path, err))
@@ -288,7 +298,7 @@ mod tests {
 
         store.advise_lease_dropped(lease_id, content_id).unwrap();
         assert!(
-            !store.refs.lock().unwrap().contains_key(&content_id),
+            !store.lock_refs().contains_key(&content_id),
             "terminal ref entry should be removed instead of kept at 0"
         );
     }
@@ -305,7 +315,32 @@ mod tests {
         store.advise_lease_dropped(lease_id, content_id).unwrap();
         // Second drop for the same content should not underflow refcount.
         store.advise_lease_dropped(lease_id, content_id).unwrap();
-        assert!(!store.refs.lock().unwrap().contains_key(&content_id));
+        assert!(!store.lock_refs().contains_key(&content_id));
+    }
+
+    #[test]
+    fn ref_map_recovers_after_poisoned_lock() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"poison ref map");
+        let lease_id = LeaseId::new();
+        store
+            .store(content_id, b"poison ref map", lease_id)
+            .unwrap();
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _refs = store.refs.lock().unwrap();
+            panic!("poison ref map");
+        }));
+        assert!(poison.is_err());
+
+        let next_lease = LeaseId::new();
+        store.lease_by_content(content_id, next_lease).unwrap();
+        assert_eq!(
+            store.get_data(content_id, next_lease).unwrap(),
+            b"poison ref map"
+        );
+        store.advise_lease_dropped(next_lease, content_id).unwrap();
+        assert!(store.lock_refs().contains_key(&content_id));
     }
 
     #[test]

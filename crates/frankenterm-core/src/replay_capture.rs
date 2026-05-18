@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -108,24 +108,25 @@ impl CollectingCaptureSink {
         Self::default()
     }
 
+    fn lock_events(&self) -> MutexGuard<'_, Vec<(RecorderEvent, RecorderMergeKey)>> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Return a snapshot of all collected events.
     pub fn events(&self) -> Vec<(RecorderEvent, RecorderMergeKey)> {
-        self.events.lock().unwrap().clone()
+        self.lock_events().clone()
     }
 
     /// Return just the recorder events without merge keys.
     pub fn recorder_events(&self) -> Vec<RecorderEvent> {
-        self.events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(e, _)| e.clone())
-            .collect()
+        self.lock_events().iter().map(|(e, _)| e.clone()).collect()
     }
 
     /// Return the number of collected events.
     pub fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
+        self.lock_events().len()
     }
 
     /// Return true if no events have been collected.
@@ -135,13 +136,13 @@ impl CollectingCaptureSink {
 
     /// Clear all collected events.
     pub fn clear(&self) {
-        self.events.lock().unwrap().clear();
+        self.lock_events().clear();
     }
 }
 
 impl CaptureSink for CollectingCaptureSink {
     fn on_event(&self, event: RecorderEvent, merge_key: RecorderMergeKey) {
-        self.events.lock().unwrap().push((event, merge_key));
+        self.lock_events().push((event, merge_key));
     }
 }
 
@@ -1517,6 +1518,42 @@ mod tests {
         let events2 = sink.events();
         assert_eq!(events1.len(), events2.len());
         assert_eq!(events1[0].0.event_id, events2[0].0.event_id);
+    }
+
+    #[test]
+    fn collecting_sink_recovers_from_poisoned_events_lock() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(
+            sink.clone(),
+            CaptureConfig {
+                session_id: Some("test-session-sink-poison".into()),
+                ..Default::default()
+            },
+        );
+
+        let sink_for_poison = Arc::clone(&sink);
+        let poison = std::thread::spawn(move || {
+            let _guard = sink_for_poison
+                .events
+                .lock()
+                .expect("acquire fresh collecting sink lock to poison");
+            panic!("deliberately poisoning the collecting sink mutex");
+        });
+        let _ = poison.join();
+        assert!(
+            sink.events.is_poisoned(),
+            "spawned thread should have poisoned the collecting sink lock"
+        );
+
+        assert!(sink.is_empty(), "read helpers recover from poison");
+        adapter.capture_egress(&make_segment(1, "after-poison", 0));
+
+        assert_eq!(sink.len(), 1);
+        assert_eq!(sink.recorder_events().len(), 1);
+        assert_eq!(sink.events().len(), 1);
+
+        sink.clear();
+        assert!(sink.is_empty(), "clear recovers from poison too");
     }
 
     // --- Merge key ordering ---

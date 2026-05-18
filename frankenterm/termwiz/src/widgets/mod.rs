@@ -1,12 +1,12 @@
 // Ideally this would be scoped to WidgetId, but I can't seem to find the
 // right place for it to take effect
 #![allow(clippy::new_without_default)]
+use crate::Result;
 use crate::color::ColorAttribute;
 use crate::input::InputEvent;
 use crate::surface::{
     Change, CursorShape, CursorVisibility, DirtyRect, Position, SequenceNo, Surface,
 };
-use crate::Result;
 use fnv::FnvHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
@@ -821,15 +821,38 @@ impl<'widget> Ui<'widget> {
 
 fn update_global_render_upload_snapshot(snapshot: RenderUploadSnapshot) {
     let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
-        *guard = Some(snapshot);
-    }
+    let mut guard = render_upload_snapshot_write_guard(lock);
+    *guard = Some(snapshot);
 }
 
 /// Most recent render/upload snapshot recorded by any Ui in this process.
 pub fn global_render_upload_snapshot() -> Option<RenderUploadSnapshot> {
     let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
-    lock.read().ok().and_then(|guard| *guard)
+    *render_upload_snapshot_read_guard(lock)
+}
+
+fn render_upload_snapshot_read_guard(
+    lock: &RwLock<Option<RenderUploadSnapshot>>,
+) -> std::sync::RwLockReadGuard<'_, Option<RenderUploadSnapshot>> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn render_upload_snapshot_write_guard(
+    lock: &RwLock<Option<RenderUploadSnapshot>>,
+) -> std::sync::RwLockWriteGuard<'_, Option<RenderUploadSnapshot>> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1143,6 +1166,50 @@ mod test {
         );
         assert!(global.frame_regions >= 1);
         assert!(global.frame_cells >= 1);
+    }
+
+    #[test]
+    fn render_upload_snapshot_lock_helpers_recover_from_poison() {
+        let lock = RwLock::new(None);
+        let poisoned_snapshot = RenderUploadSnapshot {
+            mode: RenderUploadMode::Rects,
+            widget_regions: 1,
+            widget_cells: 4,
+            frame_regions: 2,
+            frame_cells: 8,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = lock.write().expect("test lock should start unpoisoned");
+            *guard = Some(poisoned_snapshot);
+            panic!("poison render upload snapshot read path");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            *render_upload_snapshot_read_guard(&lock),
+            Some(poisoned_snapshot)
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().expect("read helper should clear poison");
+            panic!("poison render upload snapshot write path");
+        }));
+        assert!(result.is_err());
+
+        let replacement = RenderUploadSnapshot {
+            mode: RenderUploadMode::Tiles {
+                tile_width: 2,
+                tile_height: 3,
+            },
+            widget_regions: 3,
+            widget_cells: 12,
+            frame_regions: 4,
+            frame_cells: 16,
+        };
+        let mut guard = render_upload_snapshot_write_guard(&lock);
+        *guard = Some(replacement);
+        drop(guard);
+        assert_eq!(*render_upload_snapshot_read_guard(&lock), Some(replacement));
     }
 
     #[test]

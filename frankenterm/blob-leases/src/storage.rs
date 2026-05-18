@@ -1,8 +1,10 @@
 use crate::{ContentId, Error, LeaseId};
 use std::io::{BufRead, Seek};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-static STORAGE: Mutex<Option<Arc<dyn BlobStorage + Send + Sync + 'static>>> = Mutex::new(None);
+type StorageSlot = Option<Arc<dyn BlobStorage + Send + Sync + 'static>>;
+
+static STORAGE: Mutex<StorageSlot> = Mutex::new(None);
 
 pub trait BufSeekRead: BufRead + Seek {}
 pub type BoxedReader = Box<dyn BufSeekRead + Send + Sync>;
@@ -53,21 +55,29 @@ pub trait BlobStorage {
 pub fn register_storage(
     storage: Arc<dyn BlobStorage + Send + Sync + 'static>,
 ) -> Result<(), Error> {
-    STORAGE.lock().unwrap().replace(storage);
+    let _previous = lock_storage().replace(storage);
     Ok(())
 }
 
 pub fn get_storage() -> Result<Arc<dyn BlobStorage + Send + Sync + 'static>, Error> {
-    STORAGE
-        .lock()
-        .unwrap()
+    lock_storage()
         .as_ref()
-        .map(|s| s.clone())
+        .cloned()
         .ok_or(Error::StorageNotInit)
 }
 
 pub fn clear_storage() {
-    STORAGE.lock().unwrap().take();
+    lock_storage().take();
+}
+
+fn lock_storage() -> MutexGuard<'static, StorageSlot> {
+    match STORAGE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            STORAGE.clear_poison();
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// Serialize all tests across modules that touch the global STORAGE.
@@ -204,6 +214,24 @@ mod tests {
         let s2 = Arc::new(InMemoryStorage::new());
         register_storage(s1).unwrap();
         register_storage(s2).unwrap();
+        assert!(get_storage().is_ok());
+        clear_storage();
+    }
+
+    #[test]
+    fn storage_registry_recovers_after_poisoned_lock() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+
+        let poison = std::panic::catch_unwind(|| {
+            let _guard = STORAGE.lock().unwrap();
+            panic!("poison storage registry");
+        });
+        assert!(poison.is_err());
+
+        assert!(get_storage().is_err());
+        let storage = Arc::new(InMemoryStorage::new());
+        register_storage(storage).unwrap();
         assert!(get_storage().is_ok());
         clear_storage();
     }

@@ -149,7 +149,11 @@ impl ArsSecretScanner {
         let mut patterns: Vec<&str> = BUILTIN_PATTERNS.iter().map(|(_, pat)| *pat).collect();
         let extra_offset = patterns.len();
 
-        for extra in &config.extra_patterns {
+        for extra in config
+            .extra_patterns
+            .iter()
+            .filter(|pat| !pat.trim().is_empty())
+        {
             patterns.push(extra.as_str());
         }
 
@@ -1104,6 +1108,44 @@ mod tests {
             Some(0),
         )];
         let verdict = scanner.scan_commands(&cmds);
+        assert!(verdict.is_contaminated());
+    }
+
+    #[test]
+    fn empty_extra_patterns_are_ignored() {
+        let config = ArsScanConfig {
+            extra_patterns: vec![String::new(), "   ".to_string()],
+            entropy_detection_enabled: false,
+            ..Default::default()
+        };
+        let scanner = ArsSecretScanner::new(config);
+        let cmds = vec![make_cmd(0, "cargo build --release", Some(0))];
+
+        let verdict = scanner.scan_commands(&cmds);
+
+        assert!(verdict.is_clean());
+    }
+
+    #[test]
+    fn mixed_empty_and_non_empty_extra_patterns_detect_non_empty_pattern() {
+        let config = ArsScanConfig {
+            extra_patterns: vec![
+                String::new(),
+                "CUSTOM_SECRET_PREFIX_".to_string(),
+                "   ".to_string(),
+            ],
+            entropy_detection_enabled: false,
+            ..Default::default()
+        };
+        let scanner = ArsSecretScanner::new(config);
+        let cmds = vec![make_cmd(
+            0,
+            "export KEY=CUSTOM_SECRET_PREFIX_abc123",
+            Some(0),
+        )];
+
+        let verdict = scanner.scan_commands(&cmds);
+
         assert!(verdict.is_contaminated());
     }
 

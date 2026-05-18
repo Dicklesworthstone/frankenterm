@@ -1,8 +1,8 @@
-use crate::runtime::channel::{bounded, Receiver, TryRecvError};
+use crate::runtime::channel::{Receiver, TryRecvError, bounded};
 use crate::session::{SessionRequest, SessionSender, SignalChannel};
 use crate::sessioninner::{ChannelId, ChannelInfo, DescriptorState};
 use crate::sessionwrap::SessionWrap;
-use filedescriptor::{socketpair, FileDescriptor};
+use filedescriptor::{FileDescriptor, socketpair};
 use portable_pty::{ExitStatus, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -11,7 +11,10 @@ use std::sync::{Mutex, MutexGuard};
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => {
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -421,10 +424,12 @@ mod tests {
             panic!("poison size");
         }));
 
+        assert!(pty.size.is_poisoned());
         assert_eq!(
             pty.get_size().expect("poisoned size should recover"),
             initial
         );
+        assert!(!pty.size.is_poisoned());
         pty.resize(resized).expect("resize should recover lock");
         assert_eq!(pty.get_size().expect("resized size"), resized);
 

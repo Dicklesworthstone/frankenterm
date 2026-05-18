@@ -11,7 +11,7 @@
 //!                                                      └──> PaneStepExecutor (real pane I/O)
 //! ```
 
-use crate::events::EventBus;
+use crate::events::{Event, EventBus};
 use crate::mission_events::{MissionEvent, MissionEventKind, MissionPhase};
 use crate::patterns::{AgentType, Detection, Severity};
 use crate::plan::MissionDispatchContract;
@@ -170,24 +170,13 @@ impl MissionDispatcher {
 
         tracing::info!(assignment_id, target_agent, "dispatching mission contract");
 
-        // Emit AssignmentEmitted audit event.
-        if event_bus.is_some() {
-            let event = self.make_event(
-                cycle_id,
-                now_ms,
-                MissionEventKind::AssignmentEmitted,
-                "dispatch_started",
-                assignment_id,
-                vec![
-                    (
-                        "assignment_id".to_string(),
-                        serde_json::json!(assignment_id),
-                    ),
-                    ("target_agent".to_string(), serde_json::json!(target_agent)),
-                ],
-            );
-            let _ = event; // MissionEvent persistence wiring lands separately.
-        }
+        self.publish_assignment_emitted_event(
+            event_bus,
+            cycle_id,
+            now_ms,
+            assignment_id,
+            target_agent,
+        );
 
         // Build synthetic detection for the workflow runner.
         let detection = self.build_detection(contract);
@@ -352,6 +341,37 @@ impl MissionDispatcher {
             workspace: self.config.workspace.clone(),
             track: self.config.track.clone(),
         }
+    }
+
+    /// Publish the mission audit event that marks an assignment as emitted.
+    fn publish_assignment_emitted_event(
+        &self,
+        event_bus: Option<&EventBus>,
+        cycle_id: u64,
+        timestamp_ms: i64,
+        assignment_id: &str,
+        target_agent: &str,
+    ) -> usize {
+        let Some(bus) = event_bus else {
+            return 0;
+        };
+        let event = self.make_event(
+            cycle_id,
+            timestamp_ms,
+            MissionEventKind::AssignmentEmitted,
+            "dispatch_started",
+            assignment_id,
+            vec![
+                (
+                    "assignment_id".to_string(),
+                    serde_json::json!(assignment_id),
+                ),
+                ("target_agent".to_string(), serde_json::json!(target_agent)),
+            ],
+        );
+        bus.publish(Event::MissionAudit {
+            event: Box::new(event),
+        })
     }
 
     /// Map a dispatch result to a workflow completion event.
@@ -668,6 +688,46 @@ mod tests {
         );
         assert_eq!(event.workspace, "ws-prod");
         assert_eq!(event.track, "fast-lane");
+    }
+
+    #[test]
+    fn assignment_emitted_event_is_published_to_event_bus() {
+        let config = MissionDispatcherConfig {
+            sequential: true,
+            workspace: "ws-prod".to_string(),
+            track: "fast-lane".to_string(),
+        };
+        let dispatcher = MissionDispatcher::new(config);
+        let bus = EventBus::new(8);
+        let mut subscriber = bus.subscribe_signals();
+
+        let delivered = dispatcher.publish_assignment_emitted_event(
+            Some(&bus),
+            42,
+            5000,
+            "assign-99",
+            "agent-alpha",
+        );
+
+        assert!(delivered > 0);
+        match subscriber
+            .try_recv()
+            .expect("signal subscriber receives mission audit event")
+            .expect("mission audit event is not lagged")
+        {
+            Event::MissionAudit { event } => {
+                assert_eq!(event.cycle_id, 42);
+                assert_eq!(event.timestamp_ms, 5000);
+                assert_eq!(event.kind, MissionEventKind::AssignmentEmitted);
+                assert_eq!(event.reason_code, "dispatch_started");
+                assert_eq!(event.correlation_id, "assign-99");
+                assert_eq!(event.workspace, "ws-prod");
+                assert_eq!(event.track, "fast-lane");
+                assert_eq!(event.details["assignment_id"], "assign-99");
+                assert_eq!(event.details["target_agent"], "agent-alpha");
+            }
+            other => panic!("expected mission audit event, got {other:?}"),
+        }
     }
 
     #[test]
