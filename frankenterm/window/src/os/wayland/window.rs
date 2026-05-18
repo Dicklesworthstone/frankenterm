@@ -1894,9 +1894,13 @@ impl HasDisplayHandle for WaylandWindowInner {
 
 impl HasWindowHandle for WaylandWindowInner {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let handle = WaylandWindowHandle::new(
-            NonNull::new(self.surface().id().as_ptr() as _).expect("non-null"),
-        );
+        let Some(window) = self.window.as_ref() else {
+            return Err(HandleError::Unavailable);
+        };
+        let Some(surface) = NonNull::new(window.wl_surface().id().as_ptr() as _) else {
+            return Err(HandleError::Unavailable);
+        };
+        let handle = WaylandWindowHandle::new(surface);
         unsafe { Ok(WindowHandle::borrow_raw(RawWindowHandle::Wayland(handle))) }
     }
 }
