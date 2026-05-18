@@ -1,0 +1,538 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.incident_bundle.resource_pressure_cockpit.fixtures.v1",
+  "producing_bead": "ft-40u85",
+  "related_bead": "ft-174s5",
+  "purpose": "Static golden fixture corpus for the incident-bundle resource_pressure_cockpit source before the blocked Rust collector can close with RCH proof.",
+  "golden_confidence": {
+    "artifact_kind": "structural_json_golden",
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 3,
+    "strategy": "Structural validation with scrubbed run ids, artifact paths, timestamps, and worker identities."
+  },
+  "source_policy": {
+    "launches_pressure_probe_allowed": false,
+    "mutates_runtime_allowed": false,
+    "mutates_rch_allowed": false,
+    "worker_mutation_allowed": false,
+    "service_restart_allowed": false,
+    "destructive_cleanup_allowed": false,
+    "target_class_skipped_counts_as_proof": false,
+    "unavailable_counts_as_green": false,
+    "local_cargo_proof_allowed": false,
+    "read_only_source_required": true
+  },
+  "required_domains": [
+    "action_receipts",
+    "capacity_admission",
+    "memory",
+    "pane_budget",
+    "queue_backpressure",
+    "resource_admission",
+    "rss_residency",
+    "storage_io",
+    "worker_pool"
+  ],
+  "required_cases": [
+    "healthy-measured",
+    "degraded-no-worker",
+    "target-class-skipped",
+    "unavailable-snapshot"
+  ],
+  "cases": [
+    {
+      "case_id": "healthy-measured",
+      "title": "Fresh measured cockpit reports no resource pressure",
+      "source_name": "resource_pressure_cockpit",
+      "source_surface": "HealthSnapshot pressure fields",
+      "allowed_source_commands": [
+        "read HealthSnapshot pressure fields",
+        "read SwarmResourceCockpitSnapshot",
+        "read retained resource cockpit artifact"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "none",
+        "privacy_tier": "metadata_only",
+        "warning_ids": []
+      },
+      "cockpit": {
+        "status": "ready",
+        "proof_gate": "healthy",
+        "evidence_state": "measured",
+        "freshness": {
+          "generated_at_ms": "[TS_MS]",
+          "freshness_ms": 250,
+          "max_age_ms": 30000,
+          "fresh": true
+        },
+        "run_identity": {
+          "run_id": "[RUN_ID]",
+          "evidence_level": "remote_reduced",
+          "proof_status": "proven_predicate_met",
+          "target_hardware": "not_required",
+          "target_hardware_skipped": false
+        },
+        "domains": {
+          "action_receipts": {
+            "pressure": "green",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.action_receipts.ok"
+            ]
+          },
+          "capacity_admission": {
+            "pressure": "normal",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.capacity_admission.ok"
+            ]
+          },
+          "memory": {
+            "pressure": "normal",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.memory.ok"
+            ]
+          },
+          "pane_budget": {
+            "pressure": "normal",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.pane_budget.ok"
+            ]
+          },
+          "queue_backpressure": {
+            "pressure": "green",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.queue_backpressure.ok"
+            ]
+          },
+          "resource_admission": {
+            "pressure": "normal",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.resource_admission.ok"
+            ]
+          },
+          "rss_residency": {
+            "pressure": "normal",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.rss_residency.ok"
+            ]
+          },
+          "storage_io": {
+            "pressure": "green",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.storage_io.ok"
+            ]
+          },
+          "worker_pool": {
+            "pressure": "normal",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.worker_pool.ok"
+            ]
+          }
+        },
+        "artifact_posture": "retained",
+        "artifact_paths": [
+          "tests/e2e/artifacts/resource-cockpit/[RUN]/summary.json"
+        ]
+      },
+      "safe_next_action": "record_measured_resource_cockpit",
+      "forbidden_actions": [
+        "delete files",
+        "launch pressure test",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "treat skipped target-class proof as production proof"
+      ]
+    },
+    {
+      "case_id": "degraded-no-worker",
+      "title": "RCH worker-pool pressure degrades the cockpit without source-code verdict",
+      "source_name": "resource_pressure_cockpit",
+      "source_surface": "HealthSnapshot pressure fields",
+      "allowed_source_commands": [
+        "read HealthSnapshot pressure fields",
+        "read SwarmResourceCockpitSnapshot",
+        "read retained resource cockpit artifact"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "mixed",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "resource-pressure.worker-pool-no-admissible-workers"
+        ]
+      },
+      "cockpit": {
+        "status": "violated",
+        "proof_gate": "degraded",
+        "evidence_state": "mixed",
+        "freshness": {
+          "generated_at_ms": "[TS_MS]",
+          "freshness_ms": 1200,
+          "max_age_ms": 30000,
+          "fresh": true
+        },
+        "run_identity": {
+          "run_id": "[RUN_ID]",
+          "evidence_level": "remote_reduced",
+          "proof_status": "blocked_no_admissible_workers",
+          "target_hardware": "not_required",
+          "target_hardware_skipped": false
+        },
+        "domains": {
+          "action_receipts": {
+            "pressure": "yellow",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.action_receipts.blocked"
+            ]
+          },
+          "capacity_admission": {
+            "pressure": "critical",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.capacity_admission.no_admissible_workers"
+            ]
+          },
+          "memory": {
+            "pressure": "elevated",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.memory.worker_pressure"
+            ]
+          },
+          "pane_budget": {
+            "pressure": "normal",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.pane_budget.ok"
+            ]
+          },
+          "queue_backpressure": {
+            "pressure": "yellow",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.queue_backpressure.worker_pool_blocked"
+            ]
+          },
+          "resource_admission": {
+            "pressure": "critical",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.resource_admission.no_admissible_workers"
+            ]
+          },
+          "rss_residency": {
+            "pressure": "elevated",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.rss_residency.worker_storage_pressure"
+            ]
+          },
+          "storage_io": {
+            "pressure": "yellow",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.storage_io.worker_storage_pressure"
+            ]
+          },
+          "worker_pool": {
+            "pressure": "critical",
+            "evidence_state": "measured",
+            "reason_codes": [
+              "resource.worker_pool.no_admissible_workers",
+              "resource.worker_pool.critical_pressure"
+            ]
+          }
+        },
+        "artifact_posture": "retained_blocker_metadata",
+        "artifact_paths": [
+          "tests/e2e/artifacts/resource-cockpit/[RUN]/rch-diagnose.json"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "resource-pressure.worker-pool-no-admissible-workers",
+          "severity": "high",
+          "reason_code": "resource.worker_pool.no_admissible_workers",
+          "message": "Worker-pool pressure blocked proof admission; this is resource substrate evidence, not a source-code verdict."
+        }
+      ],
+      "safe_next_action": "record_worker_pool_pressure_blocker",
+      "forbidden_actions": [
+        "delete files",
+        "launch pressure test",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "treat skipped target-class proof as production proof"
+      ]
+    },
+    {
+      "case_id": "target-class-skipped",
+      "title": "Target-class proof is skipped and cannot support production capacity claims",
+      "source_name": "resource_pressure_cockpit",
+      "source_surface": "retained target-class resource cockpit artifact",
+      "allowed_source_commands": [
+        "read HealthSnapshot pressure fields",
+        "read SwarmResourceCockpitSnapshot",
+        "read retained resource cockpit artifact"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "stale",
+        "mutates_state": false,
+        "redaction": "none",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "resource-pressure.target-class-skipped"
+        ]
+      },
+      "cockpit": {
+        "status": "unknown",
+        "proof_gate": "skipped_proof",
+        "evidence_state": "stale",
+        "freshness": {
+          "generated_at_ms": "[TS_MS]",
+          "freshness_ms": 86400000,
+          "max_age_ms": 30000,
+          "fresh": false
+        },
+        "run_identity": {
+          "run_id": "[RUN_ID]",
+          "evidence_level": "skipped_not_proven",
+          "proof_status": "skipped_not_proven",
+          "target_hardware": "skipped_not_proven",
+          "target_hardware_skipped": true
+        },
+        "domains": {
+          "action_receipts": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.action_receipts.target_class_skipped"
+            ]
+          },
+          "capacity_admission": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.capacity_admission.target_class_skipped"
+            ]
+          },
+          "memory": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.memory.target_class_skipped"
+            ]
+          },
+          "pane_budget": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.pane_budget.target_class_skipped"
+            ]
+          },
+          "queue_backpressure": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.queue_backpressure.target_class_skipped"
+            ]
+          },
+          "resource_admission": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.resource_admission.target_class_skipped"
+            ]
+          },
+          "rss_residency": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.rss_residency.target_class_skipped"
+            ]
+          },
+          "storage_io": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.storage_io.target_class_skipped"
+            ]
+          },
+          "worker_pool": {
+            "pressure": "unknown",
+            "evidence_state": "stale",
+            "reason_codes": [
+              "resource.worker_pool.target_class_skipped"
+            ]
+          }
+        },
+        "artifact_posture": "retained_skipped_not_proven",
+        "artifact_paths": [
+          "docs/attestations/proofs/resource-cockpit-target-class.json"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "resource-pressure.target-class-skipped",
+          "severity": "high",
+          "reason_code": "resource.target_class.skipped_not_proven",
+          "message": "Target-class resource cockpit proof was skipped; do not use this artifact for 200+ pane production capacity claims."
+        }
+      ],
+      "safe_next_action": "record_target_class_skipped_gate",
+      "forbidden_actions": [
+        "delete files",
+        "launch pressure test",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "treat skipped target-class proof as production proof"
+      ]
+    },
+    {
+      "case_id": "unavailable-snapshot",
+      "title": "No resource cockpit snapshot is available",
+      "source_name": "resource_pressure_cockpit",
+      "source_surface": "HealthSnapshot pressure fields",
+      "allowed_source_commands": [
+        "read HealthSnapshot pressure fields",
+        "read SwarmResourceCockpitSnapshot",
+        "read retained resource cockpit artifact"
+      ],
+      "bundle_entry": {
+        "status": "unavailable",
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "redaction": "not_applicable",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "resource-pressure.snapshot-unavailable"
+        ]
+      },
+      "cockpit": {
+        "status": "unavailable",
+        "proof_gate": "skipped_proof",
+        "evidence_state": "unavailable",
+        "freshness": {
+          "generated_at_ms": null,
+          "freshness_ms": null,
+          "max_age_ms": 30000,
+          "fresh": false
+        },
+        "run_identity": {
+          "run_id": null,
+          "evidence_level": "skipped_not_proven",
+          "proof_status": "unavailable",
+          "target_hardware": "not_required",
+          "target_hardware_skipped": false
+        },
+        "domains": {
+          "action_receipts": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.action_receipts.snapshot_unavailable"
+            ]
+          },
+          "capacity_admission": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.capacity_admission.snapshot_unavailable"
+            ]
+          },
+          "memory": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.memory.snapshot_unavailable"
+            ]
+          },
+          "pane_budget": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.pane_budget.snapshot_unavailable"
+            ]
+          },
+          "queue_backpressure": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.queue_backpressure.snapshot_unavailable"
+            ]
+          },
+          "resource_admission": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.resource_admission.snapshot_unavailable"
+            ]
+          },
+          "rss_residency": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.rss_residency.snapshot_unavailable"
+            ]
+          },
+          "storage_io": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.storage_io.snapshot_unavailable"
+            ]
+          },
+          "worker_pool": {
+            "pressure": "unknown",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "resource.worker_pool.snapshot_unavailable"
+            ]
+          }
+        },
+        "artifact_posture": "absent",
+        "artifact_paths": []
+      },
+      "warnings": [
+        {
+          "id": "resource-pressure.snapshot-unavailable",
+          "severity": "medium",
+          "reason_code": "resource_pressure_cockpit.snapshot_unavailable",
+          "message": "No resource cockpit snapshot was attached; unavailable resource evidence must not be interpreted as healthy."
+        }
+      ],
+      "safe_next_action": "record_resource_cockpit_unavailable",
+      "forbidden_actions": [
+        "delete files",
+        "launch pressure test",
+        "mutate rch worker",
+        "restart rch",
+        "restart service",
+        "run local cargo as proof",
+        "treat skipped target-class proof as production proof"
+      ]
+    }
+  ]
+}
