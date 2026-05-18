@@ -1,7 +1,8 @@
 # Robot Family Contract: `disk-guard`
 
 **Bead:** `ft-fyk4x.1`
-**Status:** planning contract only. No runtime collector command is shipped by
+**Status:** core collector normalizer shipped under
+`crates/frankenterm-core/src/disk_guard.rs`; no runtime CLI command is shipped by
 this document.
 
 ## Purpose
@@ -13,7 +14,10 @@ temporary target creation, Beads export, Agent Mail writes, and RCH cache writes
 fail after work has already entered a half-applied state.
 
 The output contract is `ft.disk_guard.v1`, defined in
-`docs/json-schema/ft-disk-guard.json`.
+`docs/json-schema/ft-disk-guard.json`. The core normalizer accepts read-only
+probe facts, fills any missing required probes as fail-closed
+`not_collected` entries, and emits the schema-shaped report without performing
+cleanup or service repair.
 
 ## Required Collectors
 
@@ -34,6 +38,12 @@ Every valid disk-guard artifact records these probes:
 Each probe records source, timestamp, severity, reason codes, threshold bytes
 when applicable, observed free bytes when applicable, probe result, error
 category, retained artifact paths, and the next safe action.
+
+The first implementation slice includes a bounded filesystem sampler using the
+platform filesystem-stat API for data-volume, private-tmp, and external-scratch
+paths. Repository, Beads, Agent Mail, and RCH write/status probes are normalized
+from externally collected facts; the normalizer does not create and then delete
+probe files.
 
 ## Side-Effect Policy
 
@@ -59,6 +69,11 @@ automatic behavior and require explicit operator approval outside this contract.
 
 Collectors fail closed. Missing or contradictory data lowers the decision and
 adds `source.*` or `fail_closed.*` reason codes.
+
+The normalizer keeps `external_scratch_only` distinct from `block`: local disk
+floors may fail while retained external artifacts remain usable, but repository,
+Beads, JSONL, or RCH-cache write-precondition failures still block material
+local work.
 
 ## Required Reason-Code Families
 

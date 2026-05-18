@@ -227,6 +227,8 @@ pub mod disjoint_intervals;
 #[cfg(feature = "disk-pressure")]
 pub mod disk_ballast;
 #[cfg(feature = "disk-pressure")]
+pub mod disk_guard;
+#[cfg(feature = "disk-pressure")]
 pub mod disk_pressure;
 #[cfg(feature = "disk-pressure")]
 pub mod disk_scoring;
