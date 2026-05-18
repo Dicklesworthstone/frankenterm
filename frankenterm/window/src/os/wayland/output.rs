@@ -9,7 +9,7 @@ use smithay_client_toolkit::reexports::protocols_wlr::output_management::v1::cli
 use wayland_client::{Dispatch, event_created_child, Proxy};
 use wayland_client::globals::{GlobalList, BindError};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_output::Transform;
 
@@ -83,7 +83,7 @@ impl OutputManagerState {
     }
 
     pub fn screens(&self) -> Option<Screens> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner("screen enumeration")?;
 
         let mut by_name = HashMap::new();
         let mut virtual_rect: ScreenRect = euclid::rect(0, 0, 0, 0);
@@ -157,6 +157,33 @@ impl OutputManagerState {
             virtual_rect,
         })
     }
+
+    fn lock_inner(&self, context: &str) -> Option<MutexGuard<'_, Inner>> {
+        match self.inner.lock() {
+            Ok(inner) => Some(inner),
+            Err(_) => {
+                log::error!(
+                    "Wayland output manager state lock was poisoned during {context}; \
+                     dropping output update"
+                );
+                None
+            }
+        }
+    }
+
+    fn lock_state_for_event<'a>(
+        state: &'a WaylandState,
+        context: &str,
+    ) -> Option<MutexGuard<'a, Inner>> {
+        let Some(output_manager) = state.output_manager.as_ref() else {
+            log::warn!(
+                "Wayland output manager event arrived without output manager state during {context}"
+            );
+            return None;
+        };
+
+        output_manager.lock_inner(context)
+    }
 }
 
 #[cfg(test)]
@@ -209,7 +236,11 @@ impl Dispatch<ZwlrOutputManagerV1, GlobalData, WaylandState> for OutputManagerSt
         _qhandle: &wayland_client::QueueHandle<WaylandState>,
     ) {
         log::debug!("handle_zwlr_output_event {event:?}");
-        let mut inner = state.output_manager.as_mut().unwrap().inner.lock().unwrap();
+        let Some(mut inner) =
+            OutputManagerState::lock_state_for_event(state, "zwlr output manager event")
+        else {
+            return;
+        };
 
         match event {
             ZwlrOutputEvent::Head { head } => {
@@ -235,7 +266,11 @@ impl Dispatch<ZwlrOutputHeadV1, OutputManagerData, WaylandState> for OutputManag
     ) {
         log::debug!("handle_zwlr_head_event {event:?}");
 
-        let mut inner = state.output_manager.as_mut().unwrap().inner.lock().unwrap();
+        let Some(mut inner) =
+            OutputManagerState::lock_state_for_event(state, "zwlr output head event")
+        else {
+            return;
+        };
         let id = head.id();
         let info = inner
             .zwlr_head_info
@@ -312,7 +347,11 @@ impl Dispatch<ZwlrOutputModeV1, OutputManagerData, WaylandState> for OutputManag
         _qhandle: &wayland_client::QueueHandle<WaylandState>,
     ) {
         log::debug!("handle_zwlr_mode_event {event:?}");
-        let mut inner = state.output_manager.as_mut().unwrap().inner.lock().unwrap();
+        let Some(mut inner) =
+            OutputManagerState::lock_state_for_event(state, "zwlr output mode event")
+        else {
+            return;
+        };
 
         let id = mode.id();
         let info = inner
