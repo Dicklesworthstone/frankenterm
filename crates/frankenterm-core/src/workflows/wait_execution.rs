@@ -17,7 +17,7 @@ use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
 use crate::runtime_async::{sleep, sleep_with_cx};
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// In-memory registry of named external signals (ft-6gqga).
 ///
@@ -35,33 +35,36 @@ impl ExternalSignalRegistry {
         Self::default()
     }
 
+    fn fired_guard(&self) -> MutexGuard<'_, HashSet<String>> {
+        match self.fired.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.fired.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Record that the named external signal has been raised.
     pub fn signal(&self, key: impl Into<String>) {
-        if let Ok(mut fired) = self.fired.lock() {
-            fired.insert(key.into());
-        }
+        self.fired_guard().insert(key.into());
     }
 
     /// Returns true once the named signal has been raised.
     #[must_use]
     pub fn is_signaled(&self, key: &str) -> bool {
-        self.fired
-            .lock()
-            .map(|fired| fired.contains(key))
-            .unwrap_or(false)
+        self.fired_guard().contains(key)
     }
 
     /// Clear a previously raised signal.
     pub fn clear(&self, key: &str) {
-        if let Ok(mut fired) = self.fired.lock() {
-            fired.remove(key);
-        }
+        self.fired_guard().remove(key);
     }
 
     /// Number of distinct fired signal keys.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.fired.lock().map(|fired| fired.len()).unwrap_or(0)
+        self.fired_guard().len()
     }
 
     /// Returns true when no signals are currently raised.
@@ -1375,6 +1378,32 @@ mod tests {
         assert!(!registry.is_signaled("build.ready"));
         assert!(registry.is_signaled("workflow.approved"));
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn external_signal_registry_recovers_from_poisoned_lock() {
+        let registry = ExternalSignalRegistry::new();
+        registry.signal("before");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut fired = registry
+                .fired
+                .lock()
+                .expect("test signal registry should start unpoisoned");
+            fired.insert("during".to_string());
+            panic!("poison external signal registry");
+        }));
+        assert!(result.is_err());
+
+        assert!(registry.is_signaled("before"));
+        assert!(registry.is_signaled("during"));
+        assert_eq!(registry.len(), 2);
+
+        registry.signal("after");
+        assert!(registry.is_signaled("after"));
+        registry.clear("during");
+        assert!(!registry.is_signaled("during"));
+        assert_eq!(registry.len(), 2);
     }
 
     #[test]

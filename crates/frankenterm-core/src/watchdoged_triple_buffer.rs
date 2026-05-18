@@ -40,13 +40,23 @@
 #![allow(dead_code)]
 
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::triple_buffer::{PublishOutcome, TripleBuffer, TripleBufferHealth};
 use crate::triple_buffer_watchdog::{
     TripleBufferWatchdog, WatchdogConfig, WatchdogDecision, WatchdogStats,
 };
+
+fn watchdog_guard(lock: &Mutex<TripleBufferWatchdog>) -> MutexGuard<'_, TripleBufferWatchdog> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
 
 // ============================================================================
 // Combined health payload
@@ -114,9 +124,7 @@ impl<T: Send + Sync + 'static> WatchdogedAcquireGuard<T> {
     /// (e.g. early exit from the paint loop).
     pub fn release(&mut self) {
         if !self.released {
-            if let Ok(mut wd) = self.watchdog.lock() {
-                wd.record_release();
-            }
+            watchdog_guard(&self.watchdog).record_release();
             self.released = true;
         }
     }
@@ -162,14 +170,7 @@ impl<T: Send + Sync + 'static> Drop for WatchdogedAcquireGuard<T> {
         // Drop is the universal release path; `release()` short-
         // circuits this when the caller already released explicitly.
         if !self.released {
-            if let Ok(mut wd) = self.watchdog.lock() {
-                wd.record_release();
-            }
-            // If the lock is poisoned, the renderer is already
-            // in a panic-unwind path — silently swallow rather than
-            // panic-on-panic. The watchdog stats may diverge but
-            // the integration's `force_recycle` path doesn't depend
-            // on perfect counter accuracy across panics.
+            watchdog_guard(&self.watchdog).record_release();
         }
     }
 }
@@ -267,9 +268,7 @@ impl<T: Send + Sync + 'static> WatchdogedTripleBuffer<T> {
     /// time.
     pub fn acquire(&self, now: Instant) -> WatchdogedAcquireGuard<T> {
         let snapshot = self.inner.acquire();
-        if let Ok(mut wd) = self.watchdog.lock() {
-            wd.record_acquire(now);
-        }
+        watchdog_guard(&self.watchdog).record_acquire(now);
         WatchdogedAcquireGuard {
             snapshot,
             watchdog: Arc::clone(&self.watchdog),
@@ -290,10 +289,7 @@ impl<T: Send + Sync + 'static> WatchdogedTripleBuffer<T> {
     /// timer thread is just `let _ = wtb.poll(now);` — no chance of
     /// the integration forgetting to wire the force-recycle action.
     pub fn poll(&self, now: Instant) -> PolledDecision {
-        let decision = match self.watchdog.lock() {
-            Ok(mut wd) => wd.poll(now),
-            Err(_) => WatchdogDecision::NoOp,
-        };
+        let decision = watchdog_guard(&self.watchdog).poll(now);
         let force_recycled = matches!(decision, WatchdogDecision::ForceRecycle { .. });
         if force_recycled {
             self.inner.force_recycle();
@@ -316,10 +312,9 @@ impl<T: Send + Sync + 'static> WatchdogedTripleBuffer<T> {
     /// Combined health snapshot for `ft doctor`.
     pub fn health(&self) -> WatchdogedHealth {
         let triple_buffer = self.inner.health();
-        let (watchdog_stats, watchdog_active) = match self.watchdog.lock() {
-            Ok(wd) => (wd.stats().clone(), wd.is_active()),
-            Err(_) => (WatchdogStats::default(), false),
-        };
+        let wd = watchdog_guard(&self.watchdog);
+        let watchdog_stats = wd.stats().clone();
+        let watchdog_active = wd.is_active();
         WatchdogedHealth {
             triple_buffer,
             watchdog: watchdog_stats,
@@ -339,8 +334,8 @@ impl<T: Send + Sync + 'static> WatchdogedTripleBuffer<T> {
     pub fn reconfigure_watchdog(
         &self,
         new_config: WatchdogConfig,
-    ) -> Option<(WatchdogConfig, WatchdogStats)> {
-        let mut wd = self.watchdog.lock().ok()?;
+    ) -> (WatchdogConfig, WatchdogStats) {
+        let mut wd = watchdog_guard(&self.watchdog);
         let prev_config = *wd.config();
         let prev_stats = wd.stats().clone();
         // Reconfigures rebuild the state machine with the new
@@ -348,7 +343,7 @@ impl<T: Send + Sync + 'static> WatchdogedTripleBuffer<T> {
         // captures the pre-reset stats from the returned tuple
         // (no separate health() call needed — TOCTOU-free).
         *wd = TripleBufferWatchdog::with_config(new_config);
-        Some((prev_config, prev_stats))
+        (prev_config, prev_stats)
     }
 
     /// Read-only handle to the underlying `TripleBuffer`. Mostly for
@@ -367,6 +362,17 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    fn poison_watchdog_mutex<T: Send + Sync + 'static>(wtb: &WatchdogedTripleBuffer<T>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = wtb
+                .watchdog
+                .lock()
+                .expect("test watchdog mutex should start unpoisoned");
+            panic!("poison watchdog mutex");
+        }));
+        assert!(result.is_err());
     }
 
     // ----------------------------------------------------------------
@@ -418,6 +424,22 @@ mod tests {
             let _g = wtb.acquire(t0());
             assert!(wtb.health().watchdog_active);
         }
+        let h = wtb.health();
+        assert!(!h.watchdog_active);
+        assert_eq!(h.watchdog.releases_total, 1);
+    }
+
+    #[test]
+    fn watchdog_mutex_recovers_for_acquire_and_release() {
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::new(42);
+        poison_watchdog_mutex(&wtb);
+
+        let g = wtb.acquire(t0());
+        let h = wtb.health();
+        assert!(h.watchdog_active);
+        assert_eq!(h.watchdog.acquires_total, 1);
+
+        drop(g);
         let h = wtb.health();
         assert!(!h.watchdog_active);
         assert_eq!(h.watchdog.releases_total, 1);
@@ -537,6 +559,27 @@ mod tests {
     }
 
     #[test]
+    fn poll_recovers_poisoned_watchdog_mutex() {
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::with_watchdog_config(
+            0,
+            WatchdogConfig {
+                warn_after: Duration::from_millis(100),
+                force_recycle_after: Duration::from_millis(500),
+            },
+        );
+        let start = t0();
+        let _g = wtb.acquire(start);
+        poison_watchdog_mutex(&wtb);
+
+        let d = wtb.poll(start + Duration::from_millis(600));
+        assert!(matches!(d.watchdog, WatchdogDecision::ForceRecycle { .. }));
+        assert!(d.force_recycled);
+        let h = wtb.health();
+        assert_eq!(h.watchdog.force_recycle_invocations, 1);
+        assert!(h.triple_buffer.has_force_recycled());
+    }
+
+    #[test]
     fn poll_warn_only_fires_once_per_acquire() {
         let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::with_watchdog_config(
             0,
@@ -651,11 +694,10 @@ mod tests {
             force_recycle_after: Duration::from_millis(200),
         };
         let prev = wtb.reconfigure_watchdog(new_cfg);
-        assert!(prev.is_some());
         // Previous config was the default (1s / 5s); confirm the
         // returned previous config matches that. Tuple now also
         // carries prior stats — TOCTOU-free audit capture.
-        let (prev_config, prev_stats) = prev.unwrap();
+        let (prev_config, prev_stats) = prev;
         assert_eq!(prev_config.warn_after, Duration::from_secs(1));
         assert_eq!(prev_config.force_recycle_after, Duration::from_secs(5));
         // Default stats: nothing happened yet, all counters zero.
@@ -670,6 +712,26 @@ mod tests {
             matches!(d.watchdog, WatchdogDecision::Warn { .. }),
             "after reconfigure, 60ms acquire should breach the new 50ms warn threshold"
         );
+    }
+
+    #[test]
+    fn reconfigure_recovers_poisoned_watchdog_mutex() {
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::new(0);
+        poison_watchdog_mutex(&wtb);
+
+        let new_cfg = WatchdogConfig {
+            warn_after: Duration::from_millis(10),
+            force_recycle_after: Duration::from_millis(20),
+        };
+        let (prev_config, prev_stats) = wtb.reconfigure_watchdog(new_cfg);
+        assert_eq!(prev_config.warn_after, Duration::from_secs(1));
+        assert_eq!(prev_config.force_recycle_after, Duration::from_secs(5));
+        assert_eq!(prev_stats.acquires_total, 0);
+
+        let start = t0();
+        let _g = wtb.acquire(start);
+        let d = wtb.poll(start + Duration::from_millis(15));
+        assert!(matches!(d.watchdog, WatchdogDecision::Warn { .. }));
     }
 
     // ----------------------------------------------------------------

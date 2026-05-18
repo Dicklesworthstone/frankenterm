@@ -1956,7 +1956,7 @@ impl Default for StreamingBridge {
 }
 
 /// Health snapshot for streaming diagnostics.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StreamingHealth {
     /// Current capture mode.
     pub mode: TailerMode,
@@ -1974,20 +1974,43 @@ pub struct StreamingHealth {
     pub active_panes: usize,
 }
 
+fn streaming_health_read_guard(
+    lock: &StdRwLock<Option<StreamingHealth>>,
+) -> std::sync::RwLockReadGuard<'_, Option<StreamingHealth>> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn streaming_health_write_guard(
+    lock: &StdRwLock<Option<StreamingHealth>>,
+) -> std::sync::RwLockWriteGuard<'_, Option<StreamingHealth>> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            lock.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
 impl StreamingHealth {
     /// Update the latest global streaming health snapshot.
     pub fn update_global(snapshot: Self) {
         let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(snapshot);
-        }
+        let mut guard = streaming_health_write_guard(lock);
+        *guard = Some(snapshot);
     }
 
     /// Get the latest global streaming health snapshot.
     #[must_use]
     pub fn get_global() -> Option<Self> {
         let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));
-        lock.read().ok().and_then(|guard| guard.clone())
+        streaming_health_read_guard(lock).clone()
     }
 }
 
@@ -4607,6 +4630,54 @@ mod tests {
         assert_eq!(health.dirty_ranges_total, 0);
         assert_eq!(health.dirty_rows_total, 0);
         assert_eq!(health.active_panes, 0);
+    }
+
+    #[test]
+    fn streaming_health_lock_helpers_recover_from_poison() {
+        let lock = StdRwLock::new(None);
+        let poisoned_snapshot = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: 7,
+            dirty_ranges_total: 2,
+            dirty_rows_total: 8,
+            gaps_emitted: 1,
+            fallback_count: 0,
+            active_panes: 3,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = lock.write().expect("test lock should start unpoisoned");
+            *guard = Some(poisoned_snapshot.clone());
+            panic!("poison streaming health read path");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            streaming_health_read_guard(&lock).clone(),
+            Some(poisoned_snapshot)
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.write().expect("read helper should clear poison");
+            panic!("poison streaming health write path");
+        }));
+        assert!(result.is_err());
+
+        let replacement = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: 11,
+            dirty_ranges_total: 4,
+            dirty_rows_total: 16,
+            gaps_emitted: 2,
+            fallback_count: 1,
+            active_panes: 5,
+        };
+        let mut guard = streaming_health_write_guard(&lock);
+        *guard = Some(replacement.clone());
+        drop(guard);
+        assert_eq!(
+            streaming_health_read_guard(&lock).clone(),
+            Some(replacement)
+        );
     }
 
     // -----------------------------------------------------------------------
