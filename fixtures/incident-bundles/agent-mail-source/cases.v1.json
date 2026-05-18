@@ -1,0 +1,345 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.incident_bundle.agent_mail_source.fixtures.v1",
+  "producing_bead": "ft-hchro",
+  "related_bead": "ft-ye1oi",
+  "purpose": "Static golden fixture corpus for the incident-bundle agent_mail source before the blocked Rust collector can close with RCH proof.",
+  "golden_confidence": {
+    "artifact_kind": "structural_json_golden",
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 3,
+    "strategy": "Structural validation with scrubbed agent names, mailbox paths, diagnostic details, and fallback artifacts."
+  },
+  "source_policy": {
+    "health_check_allowed": true,
+    "list_agents_allowed": true,
+    "fetch_message_bodies_allowed": false,
+    "acknowledge_allowed": false,
+    "register_allowed": false,
+    "repair_allowed": false,
+    "restart_allowed": false,
+    "kill_allowed": false,
+    "service_mutation_allowed": false,
+    "fallback_allowed": true,
+    "local_cargo_proof_allowed": false,
+    "max_retries_allowed": 1
+  },
+  "required_cases": [
+    "available",
+    "unavailable-after-retry",
+    "database-error",
+    "fallback-only"
+  ],
+  "cases": [
+    {
+      "case_id": "available",
+      "title": "Agent Mail health and metadata are available",
+      "source_name": "agent_mail",
+      "source_surface": "agent_mail_health_and_metadata",
+      "allowed_source_commands": [
+        "Agent Mail health_check",
+        "Agent Mail list_agents metadata",
+        "Agent Mail fetch_inbox metadata only"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": []
+      },
+      "agent_mail": {
+        "service_status": "available",
+        "health_level": "healthy",
+        "semantic_readiness": "ready",
+        "api_reachable": true,
+        "database_open": true,
+        "attempt_count": 1,
+        "retry_count": 0,
+        "last_error_category": "none",
+        "inventory": {
+          "active_agent_count": 12,
+          "known_agent_count": 18,
+          "inbox_metadata_count": 4,
+          "message_body_count": 0,
+          "attachment_body_count": 0
+        },
+        "privacy": {
+          "message_bodies_included": false,
+          "attachments_included": false,
+          "secrets_redacted": true,
+          "raw_mailbox_paths_included": false
+        },
+        "safety": {
+          "mutates_state": false,
+          "repair_attempted": false,
+          "restart_attempted": false,
+          "kill_attempted": false,
+          "register_attempted": false,
+          "acknowledge_attempted": false,
+          "fetch_bodies_attempted": false
+        },
+        "fallback": {
+          "used": false,
+          "source": "none",
+          "counts_as_agent_mail_health": false
+        },
+        "reason_codes": [
+          "agent_mail.available",
+          "agent_mail.metadata_only"
+        ]
+      },
+      "safe_next_action": "record_agent_mail_health_metadata",
+      "forbidden_actions": [
+        "acknowledge messages",
+        "am doctor repair",
+        "am service restart",
+        "fetch message bodies",
+        "kill agent-mail",
+        "register agent",
+        "restart mcp-agent-mail"
+      ]
+    },
+    {
+      "case_id": "unavailable-after-retry",
+      "title": "Agent Mail API stayed unreachable after one retry",
+      "source_name": "agent_mail",
+      "source_surface": "agent_mail_health_retry",
+      "allowed_source_commands": [
+        "Agent Mail health_check",
+        "Agent Mail list_agents metadata",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "agent-mail.unavailable-after-retry"
+        ]
+      },
+      "agent_mail": {
+        "service_status": "unavailable",
+        "health_level": "unavailable",
+        "semantic_readiness": "fail",
+        "api_reachable": false,
+        "database_open": false,
+        "attempt_count": 2,
+        "retry_count": 1,
+        "last_error_category": "api_unreachable",
+        "inventory": {
+          "active_agent_count": 0,
+          "known_agent_count": 0,
+          "inbox_metadata_count": 0,
+          "message_body_count": 0,
+          "attachment_body_count": 0
+        },
+        "privacy": {
+          "message_bodies_included": false,
+          "attachments_included": false,
+          "secrets_redacted": true,
+          "raw_mailbox_paths_included": false
+        },
+        "safety": {
+          "mutates_state": false,
+          "repair_attempted": false,
+          "restart_attempted": false,
+          "kill_attempted": false,
+          "register_attempted": false,
+          "acknowledge_attempted": false,
+          "fetch_bodies_attempted": false
+        },
+        "fallback": {
+          "used": false,
+          "source": "none",
+          "counts_as_agent_mail_health": false
+        },
+        "reason_codes": [
+          "agent_mail.unavailable_after_retry",
+          "agent_mail.api_unreachable"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "agent-mail.unavailable-after-retry",
+          "severity": "high",
+          "reason_code": "agent_mail.unavailable_after_retry",
+          "message": "Agent Mail did not answer after the single allowed retry; record unavailable and continue with non-mutating fallback surfaces."
+        }
+      ],
+      "safe_next_action": "record_agent_mail_unavailable_after_retry",
+      "forbidden_actions": [
+        "acknowledge messages",
+        "am doctor repair",
+        "am service restart",
+        "fetch message bodies",
+        "kill agent-mail",
+        "register agent",
+        "restart mcp-agent-mail"
+      ]
+    },
+    {
+      "case_id": "database-error",
+      "title": "Agent Mail API answered but mailbox database could not open",
+      "source_name": "agent_mail",
+      "source_surface": "agent_mail_health_database_error",
+      "allowed_source_commands": [
+        "Agent Mail health_check",
+        "Agent Mail list_agents metadata",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "agent-mail.database-error"
+        ]
+      },
+      "agent_mail": {
+        "service_status": "unavailable",
+        "health_level": "degraded",
+        "semantic_readiness": "fail",
+        "api_reachable": true,
+        "database_open": false,
+        "attempt_count": 2,
+        "retry_count": 1,
+        "last_error_category": "database",
+        "inventory": {
+          "active_agent_count": 0,
+          "known_agent_count": 0,
+          "inbox_metadata_count": 0,
+          "message_body_count": 0,
+          "attachment_body_count": 0
+        },
+        "privacy": {
+          "message_bodies_included": false,
+          "attachments_included": false,
+          "secrets_redacted": true,
+          "raw_mailbox_paths_included": false
+        },
+        "safety": {
+          "mutates_state": false,
+          "repair_attempted": false,
+          "restart_attempted": false,
+          "kill_attempted": false,
+          "register_attempted": false,
+          "acknowledge_attempted": false,
+          "fetch_bodies_attempted": false
+        },
+        "fallback": {
+          "used": false,
+          "source": "none",
+          "counts_as_agent_mail_health": false
+        },
+        "reason_codes": [
+          "agent_mail.database_error",
+          "agent_mail.unavailable_after_retry"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "agent-mail.database-error",
+          "severity": "high",
+          "reason_code": "agent_mail.database_error",
+          "message": "Agent Mail database health failed; record the database reason and do not run repair commands."
+        }
+      ],
+      "safe_next_action": "record_agent_mail_database_error",
+      "forbidden_actions": [
+        "acknowledge messages",
+        "am doctor repair",
+        "am service restart",
+        "fetch message bodies",
+        "kill agent-mail",
+        "register agent",
+        "restart mcp-agent-mail"
+      ]
+    },
+    {
+      "case_id": "fallback-only",
+      "title": "Agent Mail is unavailable and only Beads fallback context is retained",
+      "source_name": "agent_mail",
+      "source_surface": "agent_mail_fallback_snapshot",
+      "allowed_source_commands": [
+        "Agent Mail health_check",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "mixed",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "warning_ids": [
+          "agent-mail.fallback-only"
+        ]
+      },
+      "agent_mail": {
+        "service_status": "unavailable",
+        "health_level": "unavailable",
+        "semantic_readiness": "skipped",
+        "api_reachable": false,
+        "database_open": false,
+        "attempt_count": 2,
+        "retry_count": 1,
+        "last_error_category": "fallback_only",
+        "inventory": {
+          "active_agent_count": 0,
+          "known_agent_count": 0,
+          "inbox_metadata_count": 0,
+          "message_body_count": 0,
+          "attachment_body_count": 0
+        },
+        "privacy": {
+          "message_bodies_included": false,
+          "attachments_included": false,
+          "secrets_redacted": true,
+          "raw_mailbox_paths_included": false
+        },
+        "safety": {
+          "mutates_state": false,
+          "repair_attempted": false,
+          "restart_attempted": false,
+          "kill_attempted": false,
+          "register_attempted": false,
+          "acknowledge_attempted": false,
+          "fetch_bodies_attempted": false
+        },
+        "fallback": {
+          "used": true,
+          "source": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+          "counts_as_agent_mail_health": false
+        },
+        "reason_codes": [
+          "agent_mail.fallback_only",
+          "agent_mail.health_unavailable"
+        ]
+      },
+      "warnings": [
+        {
+          "id": "agent-mail.fallback-only",
+          "severity": "medium",
+          "reason_code": "agent_mail.fallback_only",
+          "message": "Fallback context was retained, but it is not Agent Mail health evidence and must not be reported as service recovery."
+        }
+      ],
+      "safe_next_action": "record_agent_mail_fallback_only_context",
+      "forbidden_actions": [
+        "acknowledge messages",
+        "am doctor repair",
+        "am service restart",
+        "fetch message bodies",
+        "kill agent-mail",
+        "register agent",
+        "restart mcp-agent-mail"
+      ]
+    }
+  ]
+}
