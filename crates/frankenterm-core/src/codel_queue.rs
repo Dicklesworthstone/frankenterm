@@ -250,9 +250,13 @@ impl CodelQueue {
             drop_count: self.drop_count,
             target_ms: self.config.target_ms,
             interval_ms: self.config.interval_ms,
-            last_sojourn_ms: self.last_sojourn.map(|d| d.as_millis() as u64),
+            last_sojourn_ms: self.last_sojourn.map(duration_millis_saturating),
         }
     }
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// br-ft-codel: serde snapshot for telemetry.
@@ -382,6 +386,16 @@ mod tests {
         assert_eq!(snap.target_ms, 5);
         assert_eq!(snap.interval_ms, 100);
         assert_eq!(snap.last_sojourn_ms, Some(20));
+    }
+
+    #[test]
+    fn snapshot_saturates_unrepresentable_sojourn_millis() {
+        let overflowing = Duration::from_millis(u64::MAX)
+            .checked_add(Duration::from_millis(1))
+            .expect("duration addition should fit");
+        let mut q = CodelQueue::default();
+        q.record_sojourn(overflowing, Instant::now());
+        assert_eq!(q.snapshot().last_sojourn_ms, Some(u64::MAX));
     }
 
     #[test]
