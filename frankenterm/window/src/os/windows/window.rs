@@ -99,6 +99,18 @@ lazy_static! {
     static ref TITLE_FONT: Mutex<Option<parameters::FontAndSize>> = Mutex::new(None);
 }
 
+fn lock_title_font_cache(
+    action: &str,
+) -> std::sync::MutexGuard<'static, Option<parameters::FontAndSize>> {
+    match TITLE_FONT.lock() {
+        Ok(font) => font,
+        Err(poisoned) => {
+            log::error!("TITLE_FONT lock poisoned while {action}; recovering cached value");
+            poisoned.into_inner()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub(crate) struct HWindow(HWND);
 unsafe impl Send for HWindow {}
@@ -1065,7 +1077,7 @@ impl WindowOps for Window {
         let is_resize = config.window_decorations == WindowDecorations::RESIZE;
 
         let title_font = {
-            let font = TITLE_FONT.lock().expect("locking title_font");
+            let font = lock_title_font_cache("reading title font parameters");
             (*font).clone()
         };
 
@@ -1127,7 +1139,7 @@ unsafe fn update_title_font(hwnd: HWND) {
         return;
     }
 
-    let mut font = TITLE_FONT.lock().expect("locking title_font");
+    let mut font = lock_title_font_cache("updating title font parameters");
     if let Some(lf) = get_title_log_font(hwnd, hdc) {
         *font = frankenterm_font::locator::gdi::parse_log_font(&lf, hdc).ok();
     }
