@@ -1810,7 +1810,14 @@ impl Keyboard {
 
 impl Inner {
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
-        let view = self.view_id.as_ref().unwrap().load();
+        let Some(view_id) = self.view_id.as_ref() else {
+            bail!("cannot enable OpenGL: macOS window view unavailable");
+        };
+        let view = view_id.load();
+        if view.is_null() {
+            bail!("cannot enable OpenGL: macOS window view was destroyed");
+        }
+
         let glium_context = GlContextPair::create(*view)?;
 
         self.gl_context_pair.replace(glium_context.clone());
