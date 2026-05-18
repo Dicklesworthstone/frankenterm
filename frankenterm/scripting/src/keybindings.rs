@@ -31,18 +31,24 @@ impl Modifiers {
     };
 
     /// Parse a modifier string like "ctrl+shift" or "alt".
-    pub fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Result<Self> {
         let mut mods = Self::NONE;
+        if s.trim().is_empty() {
+            return Ok(mods);
+        }
+
         for part in s.split('+') {
-            match part.trim().to_lowercase().as_str() {
+            let token = part.trim().to_lowercase();
+            match token.as_str() {
+                "" => bail!("empty keybinding modifier"),
                 "ctrl" | "control" => mods.ctrl = true,
                 "shift" => mods.shift = true,
                 "alt" | "opt" | "option" => mods.alt = true,
                 "super" | "cmd" | "command" | "meta" => mods.super_key = true,
-                _ => {}
+                _ => bail!("unknown keybinding modifier '{token}'"),
             }
         }
-        mods
+        Ok(mods)
     }
 
     /// Convert to a canonical string representation.
@@ -93,7 +99,7 @@ impl KeyCombo {
 
         Ok(Self {
             key,
-            modifiers: Modifiers::parse(&mod_str),
+            modifiers: Modifiers::parse(&mod_str)?,
         })
     }
 
@@ -305,9 +311,33 @@ mod tests {
 
     #[test]
     fn modifiers_parse_aliases() {
-        let mods = Modifiers::parse("cmd+opt");
+        let mods = Modifiers::parse("cmd+opt").unwrap();
         assert!(mods.super_key);
         assert!(mods.alt);
+    }
+
+    #[test]
+    fn parse_unknown_modifier_fails() {
+        let err = KeyCombo::parse("ctrl+typo+t").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown keybinding modifier"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_empty_interior_modifier_fails() {
+        let err = KeyCombo::parse("ctrl++t").unwrap_err();
+        assert!(
+            err.to_string().contains("empty keybinding modifier"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_empty_modifier_string_is_none() {
+        assert_eq!(Modifiers::parse("").unwrap(), Modifiers::NONE);
+        assert_eq!(Modifiers::parse("   ").unwrap(), Modifiers::NONE);
     }
 
     #[test]
@@ -453,7 +483,7 @@ mod tests {
         ) {
             let mods = Modifiers { ctrl, shift, alt, super_key };
             let repr = mods.to_string_repr();
-            let reparsed = Modifiers::parse(&repr);
+            let reparsed = Modifiers::parse(&repr).unwrap();
             prop_assert_eq!(reparsed.ctrl, mods.ctrl);
             prop_assert_eq!(reparsed.shift, mods.shift);
             prop_assert_eq!(reparsed.alt, mods.alt);
@@ -485,7 +515,7 @@ mod tests {
             // cmd, command, meta all map to super_key
             let aliases = ["cmd", "command", "meta", "super"];
             for alias in &aliases {
-                let mods = Modifiers::parse(alias);
+                let mods = Modifiers::parse(alias).unwrap();
                 prop_assert!(mods.super_key, "alias '{alias}' should set super_key");
                 prop_assert!(!mods.ctrl);
                 prop_assert!(!mods.shift);
@@ -494,13 +524,13 @@ mod tests {
             // opt, option map to alt
             let alt_aliases = ["alt", "opt", "option"];
             for alias in &alt_aliases {
-                let mods = Modifiers::parse(alias);
+                let mods = Modifiers::parse(alias).unwrap();
                 prop_assert!(mods.alt, "alias '{alias}' should set alt");
             }
             // ctrl, control
             let ctrl_aliases = ["ctrl", "control"];
             for alias in &ctrl_aliases {
-                let mods = Modifiers::parse(alias);
+                let mods = Modifiers::parse(alias).unwrap();
                 prop_assert!(mods.ctrl, "alias '{alias}' should set ctrl");
             }
         }

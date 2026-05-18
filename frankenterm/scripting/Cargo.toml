@@ -7,13 +7,13 @@ publish = false
 [features]
 default = []
 lua = ["dep:config", "dep:luahelper", "dep:mlua", "dep:promise", "config/lua"]
-wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:log", "dep:serde_json"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:serde_json"]
 
 [dependencies]
 anyhow.workspace = true
 config = { workspace = true, optional = true }
 frankenterm-dynamic.workspace = true
-log = { workspace = true, optional = true }
+log.workspace = true
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true }
 toml.workspace = true
