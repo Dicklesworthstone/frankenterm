@@ -3,6 +3,7 @@
   "contract_id": "ft.rch_worker_storage_inventory.fixture_manifest.v1",
   "bead": "ft-5xwsu.1",
   "schema": "docs/json-schema/ft-rch-worker-storage-inventory.json",
+  "contract": "tests/e2e/test_rch_worker_storage_inventory_contract.sh",
   "valid": [
     "fixtures/rch-worker-pressure/valid/healthy-complete.json",
     "fixtures/rch-worker-pressure/valid/partial-timeout.json",
