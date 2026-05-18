@@ -95,7 +95,7 @@ ft doctor          # environment check — exits non-zero on missing prerequisit
 
 ### 2 · See the fleet (1 minute, no daemon yet)
 
-`ft robot state` gives an AI-readable snapshot of every pane the mux can see, *without* starting a long-running daemon. This is the call a meta-agent makes when it wants a one-shot view. The full `RobotResponse` envelope wraps every response with `ok`, `data`, `elapsed_ms`, `version`, `now`, and `mcp_version`; `data` for the `state` endpoint is a bare array of pane records (truncated below for clarity):
+`ft robot state` gives an AI-readable snapshot of every pane the mux can see, *without* starting a long-running daemon. This is the call a meta-agent makes when it wants a one-shot view. The full `RobotResponse` envelope wraps every response with `ok`, `data`, `elapsed_ms`, `version`, `now`, and `schema_version` (the MCP transport adds `mcp_version` on top of that); `data` for the `state` endpoint is a bare array of pane records (truncated below for clarity):
 
 ```bash
 $ ft robot state
@@ -109,7 +109,7 @@ $ ft robot state
   "elapsed_ms": 4,
   "version": "0.2.0",
   "now": 1747371642000,
-  "mcp_version": "v1"
+  "schema_version": 1
 }
 ```
 
@@ -151,7 +151,7 @@ $ ft robot events --limit 5                     # recent pattern-triggered detec
   "elapsed_ms": 3,
   "version": "0.2.0",
   "now": 1747371643000,
-  "mcp_version": "v1"
+  "schema_version": 1
 }
 ```
 
@@ -180,7 +180,7 @@ $ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
   "elapsed_ms": 4829,
   "version": "0.2.0",
   "now": 1747371646829,
-  "mcp_version": "v1"
+  "schema_version": 1
 }
 ```
 
@@ -197,7 +197,7 @@ When `ok=false`, the error fields live at the top level of the envelope (not nes
   "elapsed_ms": 1,
   "version": "0.2.0",
   "now": 1747371646830,
-  "mcp_version": "v1"
+  "schema_version": 1
 }
 ```
 
@@ -228,7 +228,7 @@ $ ft robot search "error: compilation failed" --limit 3
   "elapsed_ms": 7,
   "version": "0.2.0",
   "now": 1747371700000,
-  "mcp_version": "v1"
+  "schema_version": 1
 }
 ```
 
