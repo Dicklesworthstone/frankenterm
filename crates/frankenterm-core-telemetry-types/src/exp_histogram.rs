@@ -112,7 +112,7 @@ impl ExpHistogram {
         }
 
         self.count = self.count.saturating_add(n);
-        self.sum += value * n as f64;
+        self.sum = value.mul_add(n as f64, self.sum);
         if value < self.min {
             self.min = value;
         }
@@ -539,8 +539,9 @@ mod tests {
         let mut h = ExpHistogram::power_of_two(10);
         h.record(1.5);
         let p0 = h.percentile(0.0).unwrap();
-        assert_eq!(p0, 2.0);
-        assert_eq!(h.percentile(1.0), Some(2.0));
+        assert!((p0 - 2.0).abs() < f64::EPSILON);
+        let p1 = h.percentile(1.0).unwrap();
+        assert!((p1 - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -724,7 +725,7 @@ mod tests {
         h.record(f64::NEG_INFINITY);
 
         assert_eq!(h.count(), 0);
-        assert_eq!(h.sum(), 0.0);
+        assert!(h.sum().abs() < f64::EPSILON);
         assert_eq!(h.min(), None);
         assert_eq!(h.max(), None);
         assert_eq!(h.underflow(), 0);

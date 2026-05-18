@@ -14,6 +14,7 @@ type SharedEmbedder = Arc<dyn Embedder>;
 static EMBEDDER_CACHE_LOCK_POISONED: AtomicU64 = AtomicU64::new(0);
 
 /// Number of times an embedder cache lock was poisoned and recovered.
+#[cfg(test)]
 pub fn embedder_cache_lock_poisoned_count() -> u64 {
     EMBEDDER_CACHE_LOCK_POISONED.load(Ordering::Relaxed)
 }

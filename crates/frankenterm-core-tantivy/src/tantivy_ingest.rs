@@ -881,13 +881,12 @@ pub struct IndexerRunResult {
 }
 
 /// Consistent error for the not-yet-implemented frankensqlite event reader
-/// path (ft-lzbkn). Mirrors the config-parse gate added in fe0e2ca3 so
-/// downstream call-sites surface a discoverable message that names the
-/// `frankensqlite-recorder` cargo feature.
+/// path (ft-lzbkn). Keep the message explicit about the missing reader so
+/// operators do not mistake this placeholder for a disabled cargo feature.
 pub(crate) fn frankensqlite_unsupported(context: &str) -> IndexerError {
     IndexerError::Config(format!(
         "frankensqlite event reader not yet implemented for {context}; \
-         enable cargo feature `frankensqlite-recorder` once support lands"
+         follow ft-a4ugl for the real RecorderEventReader implementation"
     ))
 }
 
@@ -1649,25 +1648,26 @@ mod tests {
     }
 
     #[test]
-    fn frankensqlite_unsupported_error_names_feature_flag_and_context() {
-        // ft-lzbkn: the runtime stub for frankensqlite-sourced events must
-        // cite the cargo feature flag so operators know how to enable
-        // support once it lands. Both ingest and reindex paths share this
-        // helper; the message must be identical across call sites except
-        // for the caller-supplied context label.
+    fn frankensqlite_unsupported_error_names_followup_and_context() {
+        // ft-lzbkn + ft-4qyqw: the runtime stub for
+        // frankensqlite-sourced events must cite the implementation bead
+        // rather than implying the existing feature flag enables support.
+        // Both ingest and reindex paths share this helper; the message must
+        // be identical across call sites except for the context label.
         let ingest = frankensqlite_unsupported("ingest");
         let reindex = frankensqlite_unsupported("reindex");
         for (err, want_ctx) in [(&ingest, "ingest"), (&reindex, "reindex")] {
             let IndexerError::Config(msg) = err else {
                 panic!("expected IndexerError::Config, got {err:?}");
             };
-            assert!(
-                msg.contains("frankensqlite-recorder"),
-                "missing feature flag name: {msg}"
-            );
+            assert!(msg.contains("ft-a4ugl"), "missing follow-up bead id: {msg}");
             assert!(
                 msg.contains("not yet implemented"),
                 "missing stub marker: {msg}"
+            );
+            assert!(
+                !msg.contains("frankensqlite-recorder"),
+                "must not imply the existing feature flag enables support: {msg}"
             );
             assert!(
                 msg.contains(want_ctx),

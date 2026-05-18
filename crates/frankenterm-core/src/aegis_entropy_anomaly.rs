@@ -173,8 +173,20 @@ pub struct EProcess {
 }
 
 impl EProcess {
-    /// Create a new e-process with the given significance level.
+    /// Create a new e-process with the given false alarm rate `alpha`.
     pub fn new(alpha: f64, decay: f64, max_e: f64) -> Self {
+        assert!(
+            alpha.is_finite() && (0.0..1.0).contains(&alpha),
+            "alpha must be finite and in (0, 1)"
+        );
+        assert!(
+            decay.is_finite() && (0.0..=1.0).contains(&decay),
+            "decay must be finite and in [0, 1]"
+        );
+        assert!(
+            max_e.is_finite() && max_e > 0.0,
+            "max_e must be finite and positive"
+        );
         Self {
             e_value: 1.0,
             n_observations: 0,
