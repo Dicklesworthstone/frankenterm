@@ -19,7 +19,10 @@ struct Core<T> {
 fn lock_core<T>(core: &Mutex<Core<T>>) -> MutexGuard<'_, Core<T>> {
     match core.lock() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => {
+            core.clear_poison();
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -359,6 +362,29 @@ mod tests {
     }
 
     #[test]
+    fn promise_clears_core_poison_after_recovery() {
+        let mut p: Promise<i32> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = p.core.lock().unwrap();
+            panic!("simulate promise core lock poison");
+        }));
+        assert!(poisoned.is_err());
+        assert!(p.core.is_poisoned());
+
+        assert!(p.ok(42));
+        assert!(!p.core.is_poisoned());
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, 42),
+            other => panic!("{}", format!("expected Ready(Ok(42)), got {other:?}")),
+        }
+    }
+
+    #[test]
     fn resolve_before_poll_does_not_panic_without_waker() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -649,7 +675,7 @@ mod tests {
         let mut p: Promise<i32> = Promise::new();
         let fut = p.get_future().unwrap();
         drop(fut); // drop future before resolving
-                   // Promise can still be resolved without panic
+        // Promise can still be resolved without panic
         assert!(p.ok(42));
     }
 
@@ -718,8 +744,8 @@ mod tests {
 
     #[test]
     fn waker_replaced_on_each_pending_poll() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Track how many times the waker is woken
         let wake_count = Arc::new(AtomicUsize::new(0));
@@ -848,8 +874,8 @@ mod tests {
 
     #[test]
     fn promise_ok_wakes_stored_waker() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let woken = Arc::new(AtomicBool::new(false));
         let woken_clone = Arc::clone(&woken);
@@ -883,8 +909,8 @@ mod tests {
 
     #[test]
     fn promise_err_wakes_stored_waker() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let woken = Arc::new(AtomicBool::new(false));
         let woken_clone = Arc::clone(&woken);
