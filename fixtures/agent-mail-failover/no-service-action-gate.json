@@ -31,6 +31,7 @@
     "cancel RCH build"
   ],
   "scan_paths": [
+    "docs/robot-contracts/agent-mail-failover-runbook.md",
     "docs/robot-contracts/agent-mail-failover-snapshot.md",
     "docs/robot-contracts/agent-mail-stale-reopen-policy.md",
     "fixtures/agent-mail-failover/fallback-snapshot.schema.json",

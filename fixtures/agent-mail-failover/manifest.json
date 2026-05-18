@@ -17,11 +17,13 @@
   ],
   "classifier_cases": "fixtures/agent-mail-failover/retry-classifier-cases.json",
   "no_service_action_gate": "fixtures/agent-mail-failover/no-service-action-gate.json",
+  "runbook": "docs/robot-contracts/agent-mail-failover-runbook.md",
   "invalid": [],
   "verification": [
     "jq empty fixtures/agent-mail-failover/fallback-snapshot.schema.json fixtures/agent-mail-failover/manifest.json fixtures/agent-mail-failover/retry-classifier-cases.json fixtures/agent-mail-failover/no-service-action-gate.json fixtures/agent-mail-failover/valid/*.json",
     "bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh",
     "bash tests/e2e/test_agent_mail_retry_classifier_contract.sh",
-    "bash tests/e2e/test_agent_mail_no_service_action_gate.sh"
+    "bash tests/e2e/test_agent_mail_no_service_action_gate.sh",
+    "bash tests/e2e/test_agent_mail_failover_runbook_contract.sh"
   ]
 }

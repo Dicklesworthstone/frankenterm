@@ -10,6 +10,7 @@ DOC="docs/robot-contracts/agent-mail-failover-snapshot.md"
 MANIFEST="fixtures/agent-mail-failover/manifest.json"
 CLASSIFIER_CASES="fixtures/agent-mail-failover/retry-classifier-cases.json"
 NO_SERVICE_GATE="fixtures/agent-mail-failover/no-service-action-gate.json"
+RUNBOOK="docs/robot-contracts/agent-mail-failover-runbook.md"
 
 fail() {
   printf 'agent mail failover snapshot contract: %s\n' "$*" >&2
@@ -31,6 +32,7 @@ require_file "${DOC}"
 require_file "${MANIFEST}"
 require_file "${CLASSIFIER_CASES}"
 require_file "${NO_SERVICE_GATE}"
+require_file "${RUNBOOK}"
 
 jq empty "${SCHEMA}" "${MANIFEST}" "${CLASSIFIER_CASES}" "${NO_SERVICE_GATE}" fixtures/agent-mail-failover/valid/*.json
 
@@ -43,6 +45,7 @@ DOC = "docs/robot-contracts/agent-mail-failover-snapshot.md"
 MANIFEST = "fixtures/agent-mail-failover/manifest.json"
 CLASSIFIER_CASES = "fixtures/agent-mail-failover/retry-classifier-cases.json"
 NO_SERVICE_GATE = "fixtures/agent-mail-failover/no-service-action-gate.json"
+RUNBOOK = "docs/robot-contracts/agent-mail-failover-runbook.md"
 EXPECTED_FIXTURE_IDS = %w[
   healthy-agent-mail
   unavailable-after-retry
@@ -133,6 +136,7 @@ fail!("manifest classifier verifier missing") unless manifest.fetch("verificatio
 fail!("manifest no-service verifier missing") unless manifest.fetch("verification").include?("bash tests/e2e/test_agent_mail_no_service_action_gate.sh")
 fail!("manifest classifier cases pointer drifted") unless manifest["classifier_cases"] == CLASSIFIER_CASES
 fail!("manifest no-service gate pointer drifted") unless manifest["no_service_action_gate"] == NO_SERVICE_GATE
+fail!("manifest runbook pointer drifted") unless manifest["runbook"] == RUNBOOK
 fail!("classifier cases bead drifted") unless classifier_cases["source_bead"] == "ft-5lsqo.2"
 fail!("no-service gate bead drifted") unless no_service_gate["source_bead"] == "ft-5lsqo.4"
 
@@ -242,6 +246,7 @@ fail!("untracked fixture must do_not_reopen") unless untracked.dig("beads", "sta
   registration-failed
   contact-permission-failed
   no-service-action-gate
+  agent-mail-failover-runbook
   Local Cargo
 ].each do |needle|
   fail!("doc missing #{needle}") unless doc.include?(needle)

@@ -94,6 +94,13 @@ The gate must fail on service repair/restart commands, process-kill guidance,
 destructive git cleanup, deletion guidance, worker mutation, build
 cancellation, or local Cargo-as-proof language.
 
+## Operator Runbook
+
+The operator sequence and recovery handoff templates live at
+`docs/robot-contracts/agent-mail-failover-runbook.md`. The runbook separates
+Agent Mail communication outage handling from source defects, dirty-tree
+ownership, and RCH fleet pressure.
+
 ## Proof Posture
 
 This is a static contract slice. Validation is:
@@ -103,7 +110,8 @@ jq empty fixtures/agent-mail-failover/fallback-snapshot.schema.json fixtures/age
 bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh
 bash tests/e2e/test_agent_mail_retry_classifier_contract.sh
 bash tests/e2e/test_agent_mail_no_service_action_gate.sh
-git diff --check -- docs/robot-contracts/agent-mail-failover-snapshot.md fixtures/agent-mail-failover scripts/agent-mail-failover-classifier.sh scripts/swarm-tick.sh tests/e2e/test_agent_mail_failover_snapshot_contract.sh tests/e2e/test_agent_mail_retry_classifier_contract.sh tests/e2e/test_agent_mail_no_service_action_gate.sh
+bash tests/e2e/test_agent_mail_failover_runbook_contract.sh
+git diff --check -- docs/robot-contracts/agent-mail-failover-snapshot.md docs/robot-contracts/agent-mail-failover-runbook.md fixtures/agent-mail-failover scripts/agent-mail-failover-classifier.sh scripts/swarm-tick.sh tests/e2e/test_agent_mail_failover_snapshot_contract.sh tests/e2e/test_agent_mail_retry_classifier_contract.sh tests/e2e/test_agent_mail_no_service_action_gate.sh tests/e2e/test_agent_mail_failover_runbook_contract.sh
 br dep cycles --json
 ```
 
