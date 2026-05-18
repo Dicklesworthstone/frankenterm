@@ -5,7 +5,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{VecStorage, VecStorageIter};
-use crate::{Change, SequenceNo, SEQ_ZERO};
+use crate::{Change, SEQ_ZERO, SequenceNo};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -1051,11 +1051,12 @@ impl Line {
 
         let def_attr = CellAttributes::blank();
         let cells = self.coerce_vec_storage();
-        if let Some(end_idx) = cells
+        let new_len = cells
             .iter()
             .rposition(|c| c.str() != " " || c.attrs() != &def_attr)
-        {
-            cells.resize_with(end_idx + 1, Cell::blank);
+            .map_or(0, |end_idx| end_idx + 1);
+        if new_len < cells.len() {
+            cells.resize_with(new_len, Cell::blank);
             self.update_last_change_seqno(seqno);
             self.invalidate_zones();
         }
@@ -2776,6 +2777,28 @@ mod tests {
     }
 
     #[test]
+    fn line_prune_trailing_blanks_clears_all_default_blanks() {
+        let mut line = Line::with_width(10, SEQ_ZERO);
+        line.prune_trailing_blanks(1);
+        assert_eq!(line.len(), 0);
+        assert_eq!(line.as_str().as_ref(), "");
+        assert_eq!(line.current_seqno(), 1);
+    }
+
+    #[test]
+    fn line_prune_trailing_blanks_preserves_non_default_blank_cells() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_semantic_type(SemanticType::Prompt);
+        let mut line = Line::with_width_and_cell(3, Cell::blank_with_attrs(attrs), SEQ_ZERO);
+
+        line.prune_trailing_blanks(1);
+
+        assert_eq!(line.len(), 3);
+        assert_eq!(line.as_str().as_ref(), "   ");
+        assert_eq!(line.current_seqno(), SEQ_ZERO);
+    }
+
+    #[test]
     fn line_fill_range() {
         let mut line = Line::with_width(5, SEQ_ZERO);
         let cell = Cell::new('X', CellAttributes::default());
@@ -2822,9 +2845,7 @@ mod tests {
         let first = line.visible_cells().next().expect("wide first cell");
         assert_eq!(first.width(), 2);
 
-        let r = line.compute_double_click_range(1, |s| {
-            s.chars().all(|c| c.is_alphanumeric())
-        });
+        let r = line.compute_double_click_range(1, |s| s.chars().all(|c| c.is_alphanumeric()));
         assert_eq!(r, DoubleClickRange::Range(1..1));
     }
 
