@@ -8,6 +8,7 @@ cd "${ROOT}"
 SCHEMA="docs/json-schema/ft-agent-task-fit-passport.json"
 DOC="docs/robot-contracts/agent-task-fit-passport.md"
 FIXTURES="fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"
+INVALID_FIXTURES="fixtures/mission-planner/agent-task-fit-passport/invalid/fragments.v1.json"
 REQUIRED_CASES=(
   "good-fit"
   "poor-fit"
@@ -69,6 +70,14 @@ REQUIRED_EVIDENCE_CATEGORIES=(
   "missing_evidence"
   "privacy_redaction"
 )
+REQUIRED_INVALID_CASES=(
+  "human-subject-true"
+  "raw-pane-content-stored"
+  "mail-body-stored"
+  "auto-reassignment-permitted"
+  "assign-with-stale-evidence"
+  "toon-row-width-mismatch"
+)
 
 fail() {
   printf 'agent task-fit passport contract: %s\n' "$*" >&2
@@ -90,8 +99,9 @@ require_command rg
 require_file "${SCHEMA}"
 require_file "${DOC}"
 require_file "${FIXTURES}"
+require_file "${INVALID_FIXTURES}"
 
-jq empty "${SCHEMA}" "${FIXTURES}"
+jq empty "${SCHEMA}" "${FIXTURES}" "${INVALID_FIXTURES}"
 
 ruby <<'RUBY'
 require "json"
@@ -100,6 +110,7 @@ require "set"
 SCHEMA = "docs/json-schema/ft-agent-task-fit-passport.json"
 DOC = "docs/robot-contracts/agent-task-fit-passport.md"
 FIXTURES = "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json"
+INVALID_FIXTURES = "fixtures/mission-planner/agent-task-fit-passport/invalid/fragments.v1.json"
 REQUIRED_CASES = %w[
   good-fit
   poor-fit
@@ -161,6 +172,14 @@ REQUIRED_EVIDENCE_CATEGORIES = %w[
   missing_evidence
   privacy_redaction
 ].freeze
+REQUIRED_INVALID_CASES = %w[
+  human-subject-true
+  raw-pane-content-stored
+  mail-body-stored
+  auto-reassignment-permitted
+  assign-with-stale-evidence
+  toon-row-width-mismatch
+].freeze
 FAIL_CLOSED_ACTIONS = %w[
   wait_for_owner
   request_fresh_evidence
@@ -189,6 +208,7 @@ end
 
 schema = read_json(SCHEMA)
 fixtures = read_json(FIXTURES)
+invalid_fixtures = read_json(INVALID_FIXTURES)
 doc = File.read(DOC)
 
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-agent-task-fit-passport.json")
@@ -216,10 +236,65 @@ fail!("fixture verifier missing") unless fixtures.fetch("verification").include?
 fail!("fixture forbidden actions drifted") unless fixtures.fetch("required_forbidden_actions").sort == REQUIRED_FORBIDDEN.sort
 fail!("toon columns too sparse") unless fixtures.fetch("toon_columns").length >= 6
 
+fail!("invalid fixture schema version drifted") unless invalid_fixtures["schema_version"] == "ft.agent_task_fit_passport.invalid_fragments.v1"
+fail!("invalid fixture contract id drifted") unless invalid_fixtures["contract_id"] == "ft.agent_task_fit_passport.invalid_fragments.v1"
+fail!("invalid fixture schema pointer drifted") unless invalid_fixtures["schema_path"] == SCHEMA
+fail!("invalid fixture valid fixture pointer drifted") unless invalid_fixtures["valid_fixture"] == FIXTURES
+fail!("invalid fixture doc pointer drifted") unless invalid_fixtures["contract_doc"] == DOC
+fail!("invalid fixture source bead drifted") unless invalid_fixtures["source_bead"] == "ft-auy2g.10"
+fail!("invalid fixture verifier missing") unless invalid_fixtures.fetch("verification").include?("bash tests/e2e/test_agent_task_fit_passport_contract.sh")
+
 cases = fixtures.fetch("cases")
 case_ids = cases.map { |entry| entry.fetch("case_id") }
 fail!("case coverage drifted: #{case_ids.sort.inspect}") unless case_ids.sort == REQUIRED_CASES.sort
 fail!("case ids are not unique") unless case_ids.uniq.length == case_ids.length
+
+invalid_cases = invalid_fixtures.fetch("cases")
+invalid_case_ids = invalid_cases.map { |entry| entry.fetch("case_id") }
+fail!("invalid case coverage drifted: #{invalid_case_ids.sort.inspect}") unless invalid_case_ids.sort == REQUIRED_INVALID_CASES.sort
+fail!("invalid case ids are not unique") unless invalid_case_ids.uniq.length == invalid_case_ids.length
+
+invalid_by_id = invalid_cases.to_h { |entry| [entry.fetch("case_id"), entry] }
+invalid_cases.each do |entry|
+  %w[case_id expected_failure reason_codes invalid_fragment].each do |field|
+    fail!("invalid case #{entry["case_id"] || "(missing)"} lacks #{field}") unless entry.key?(field)
+  end
+  fail!("invalid case #{entry.fetch("case_id")} has no reason codes") if entry.fetch("reason_codes").empty?
+end
+
+human_subject = invalid_by_id.fetch("human-subject-true")
+fail!("human-subject case expected failure drifted") unless human_subject.fetch("expected_failure") == "agent_identity_human_subject_must_be_false"
+fail!("human-subject case reason drifted") unless human_subject.fetch("reason_codes").include?("safety.human_subject_forbidden")
+fail!("human-subject fragment drifted") unless human_subject.dig("invalid_fragment", "agent_identity", "human_subject") == true
+
+raw_pane = invalid_by_id.fetch("raw-pane-content-stored")
+fail!("raw-pane case expected failure drifted") unless raw_pane.fetch("expected_failure") == "evidence_must_not_store_raw_pane_content"
+fail!("raw-pane case reason drifted") unless raw_pane.fetch("reason_codes").include?("safety.raw_pane_content_forbidden")
+fail!("raw-pane fragment drifted") unless raw_pane.dig("invalid_fragment", "evidence", 0, "raw_pane_content_stored") == true
+
+mail_body = invalid_by_id.fetch("mail-body-stored")
+fail!("mail-body case expected failure drifted") unless mail_body.fetch("expected_failure") == "evidence_must_not_store_mail_bodies"
+fail!("mail-body case reason drifted") unless mail_body.fetch("reason_codes").include?("safety.mail_body_storage_forbidden")
+fail!("mail-body fragment drifted") unless mail_body.dig("invalid_fragment", "evidence", 0, "mail_body_stored") == true
+
+auto_reassignment = invalid_by_id.fetch("auto-reassignment-permitted")
+fail!("auto-reassignment expected failure drifted") unless auto_reassignment.fetch("expected_failure") == "auto_reassignment_must_stay_forbidden"
+fail!("auto-reassignment reason drifted") unless auto_reassignment.fetch("reason_codes").include?("safety.auto_reassignment_forbidden")
+fail!("auto-reassignment missing action marker drifted") unless auto_reassignment.dig("invalid_fragment", "missing_forbidden_action") == "auto_reassignment"
+fail!("auto-reassignment forbidden list should omit auto_reassignment") if auto_reassignment.dig("invalid_fragment", "forbidden_actions").include?("auto_reassignment")
+
+stale_assign = invalid_by_id.fetch("assign-with-stale-evidence")
+fail!("stale assign expected failure drifted") unless stale_assign.fetch("expected_failure") == "assign_requires_fresh_evidence"
+fail!("stale assign reason drifted") unless stale_assign.fetch("reason_codes").include?("fit.stale_evidence")
+fail!("stale assign action drifted") unless stale_assign.dig("invalid_fragment", "recommendation", "action") == "assign"
+fail!("stale assign evidence drifted") unless stale_assign.dig("invalid_fragment", "evidence", 0, "freshness_state") == "stale"
+
+toon_width = invalid_by_id.fetch("toon-row-width-mismatch")
+fail!("toon width expected failure drifted") unless toon_width.fetch("expected_failure") == "toon_rows_must_match_declared_columns"
+fail!("toon width reason drifted") unless toon_width.fetch("reason_codes").include?("toon.row_width_mismatch")
+toon_columns = toon_width.dig("invalid_fragment", "toon_projection", "columns")
+toon_rows = toon_width.dig("invalid_fragment", "toon_projection", "rows")
+fail!("toon width fragment drifted") unless toon_rows.any? { |row| row.length != toon_columns.length }
 
 recommendations_seen = Set.new
 reasons_seen = Set.new
@@ -417,13 +492,16 @@ fail!("mixed swarm fallback must forbid auto reassignment") unless explanation.f
 ].each do |needle|
   fail!("doc missing #{needle}") unless doc.include?(needle)
 end
+REQUIRED_INVALID_CASES.each do |needle|
+  fail!("doc missing invalid case #{needle}") unless doc.include?(needle)
+end
 
-puts "agent task-fit passport contract: static verifier passed (#{cases.length} cases, #{recommendations_seen.length} recommendations)"
+puts "agent task-fit passport contract: static verifier passed (#{cases.length} cases, #{recommendations_seen.length} recommendations, #{invalid_cases.length} invalid cases)"
 RUBY
 
 if rg -n --hidden --glob '!*.md' \
   '(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|Bearer [A-Za-z0-9._-]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
-  "${FIXTURES}" >/tmp/ft-agent-task-fit-passport-secret-scan.txt; then
+  "${FIXTURES}" "${INVALID_FIXTURES}" >/tmp/ft-agent-task-fit-passport-secret-scan.txt; then
   cat /tmp/ft-agent-task-fit-passport-secret-scan.txt >&2
   fail "secret-shaped strings found in agent task-fit passport fixtures"
 fi

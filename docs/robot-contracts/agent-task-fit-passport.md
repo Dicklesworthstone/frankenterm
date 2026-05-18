@@ -95,3 +95,21 @@ only shell, `jq`, `rg`, and Ruby.
 
 Any future Rust implementation or compiled planner proof must run through RCH.
 Local Cargo output is not accepted as proof for this surface.
+
+## Negative Fixtures
+
+The retained negative fragment corpus lives at
+`fixtures/mission-planner/agent-task-fit-passport/invalid/fragments.v1.json`.
+It is parseable JSON that the static verifier must reject by contract shape
+rather than by syntax. The required cases are:
+
+- `human-subject-true`
+- `raw-pane-content-stored`
+- `mail-body-stored`
+- `auto-reassignment-permitted`
+- `assign-with-stale-evidence`
+- `toon-row-width-mismatch`
+
+These fragments prove that the passport contract stays fail-closed for human
+subject scoring, raw pane or mail-body retention, automatic reassignment,
+assignment from stale evidence, and malformed TOON projections.

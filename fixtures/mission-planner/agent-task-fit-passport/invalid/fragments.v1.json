@@ -1,0 +1,125 @@
+{
+  "schema_version": "ft.agent_task_fit_passport.invalid_fragments.v1",
+  "contract_id": "ft.agent_task_fit_passport.invalid_fragments.v1",
+  "schema_path": "docs/json-schema/ft-agent-task-fit-passport.json",
+  "valid_fixture": "fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+  "contract_doc": "docs/robot-contracts/agent-task-fit-passport.md",
+  "source_bead": "ft-auy2g.10",
+  "verification": [
+    "jq empty docs/json-schema/ft-agent-task-fit-passport.json fixtures/mission-planner/agent-task-fit-passport/cases.v1.json fixtures/mission-planner/agent-task-fit-passport/invalid/fragments.v1.json",
+    "bash tests/e2e/test_agent_task_fit_passport_contract.sh"
+  ],
+  "cases": [
+    {
+      "case_id": "human-subject-true",
+      "expected_failure": "agent_identity_human_subject_must_be_false",
+      "reason_codes": [
+        "safety.human_subject_forbidden"
+      ],
+      "invalid_fragment": {
+        "agent_identity": {
+          "agent_id": "agent.fixture-human-subject",
+          "human_subject": true
+        }
+      }
+    },
+    {
+      "case_id": "raw-pane-content-stored",
+      "expected_failure": "evidence_must_not_store_raw_pane_content",
+      "reason_codes": [
+        "safety.raw_pane_content_forbidden"
+      ],
+      "invalid_fragment": {
+        "evidence": [
+          {
+            "evidence_id": "raw-pane-row",
+            "raw_pane_content_stored": true
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "mail-body-stored",
+      "expected_failure": "evidence_must_not_store_mail_bodies",
+      "reason_codes": [
+        "safety.mail_body_storage_forbidden"
+      ],
+      "invalid_fragment": {
+        "evidence": [
+          {
+            "evidence_id": "mail-body-row",
+            "mail_body_stored": true
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "auto-reassignment-permitted",
+      "expected_failure": "auto_reassignment_must_stay_forbidden",
+      "reason_codes": [
+        "safety.auto_reassignment_forbidden"
+      ],
+      "invalid_fragment": {
+        "missing_forbidden_action": "auto_reassignment",
+        "forbidden_actions": [
+          "human_performance_scoreboard",
+          "raw_pane_text_storage",
+          "mail_body_storage",
+          "secret_material_storage",
+          "beads_mutation",
+          "agent_mail_mutation",
+          "pane_mutation",
+          "service_mutation",
+          "local_cargo_proof"
+        ]
+      }
+    },
+    {
+      "case_id": "assign-with-stale-evidence",
+      "expected_failure": "assign_requires_fresh_evidence",
+      "reason_codes": [
+        "fit.stale_evidence"
+      ],
+      "invalid_fragment": {
+        "recommendation": {
+          "action": "assign",
+          "assignable": true
+        },
+        "evidence": [
+          {
+            "evidence_id": "stale-but-assigned",
+            "freshness_state": "stale"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "toon-row-width-mismatch",
+      "expected_failure": "toon_rows_must_match_declared_columns",
+      "reason_codes": [
+        "toon.row_width_mismatch"
+      ],
+      "invalid_fragment": {
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "agent_id",
+            "task_domain",
+            "overall_fit",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "toon-row-width-mismatch",
+              "agent.fixture-bad-toon",
+              "runtime",
+              "unknown",
+              "request_fresh_evidence"
+            ]
+          ]
+        }
+      }
+    }
+  ]
+}
