@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_stale_reopen_policy.v1",
+  "bead": "ft-5lsqo.3",
+  "source_epic": "ft-5lsqo",
+  "source_snapshot_contract": "ft.agent_mail_failover_snapshot.v1",
+  "source_snapshot_document": "docs/robot-contracts/agent-mail-failover-snapshot.md",
+  "policy_document": "docs/robot-contracts/agent-mail-stale-reopen-policy.md",
+  "proof_kind": "static-policy",
+  "runtime_command_shipped": false,
+  "default_stale_threshold_seconds": 7200,
+  "default_action": "do_not_reopen",
+  "allowed_actions": [
+    "do_not_reopen",
+    "wait_for_owner",
+    "comment_status_check",
+    "continue_disjoint_ready_bead",
+    "verify_br_show_then_do_not_claim"
+  ],
+  "side_effect_policy": {
+    "agent_mail_repair_allowed": false,
+    "agent_mail_restart_allowed": false,
+    "agent_mail_reconstruct_allowed": false,
+    "process_kill_allowed": false,
+    "destructive_git_allowed": false,
+    "file_deletion_allowed": false,
+    "worker_mutation_allowed": false,
+    "build_cancellation_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "immediate_reopen_without_status_check_allowed": false
+  },
+  "overlap_categories": [
+    {
+      "id": "none",
+      "severity": "low",
+      "default_action": "comment_status_check",
+      "meaning": "No dirty or reserved path overlaps the stale candidate domain."
+    },
+    {
+      "id": "tracked_overlap_risk",
+      "severity": "high",
+      "default_action": "do_not_reopen",
+      "meaning": "A tracked dirty path may belong to another active pane or owner."
+    },
+    {
+      "id": "untracked_review_required",
+      "severity": "medium",
+      "default_action": "do_not_reopen",
+      "meaning": "An untracked path may be a draft and must not be overwritten or staged until ownership is clear."
+    },
+    {
+      "id": "reserved_path_overlap",
+      "severity": "high",
+      "default_action": "do_not_reopen",
+      "meaning": "Agent Mail or fallback evidence shows another agent holds an active reservation for a relevant path."
+    },
+    {
+      "id": "tracker_only_mismatch",
+      "severity": "medium",
+      "default_action": "verify_br_show_then_do_not_claim",
+      "meaning": "Robot graph output reports work that Beads does not currently expose as claimable."
+    }
+  ],
+  "rules": [
+    {
+      "id": "RULE-EMPTY-IN-PROGRESS",
+      "level": "MUST",
+      "statement": "When no in-progress Beads exist, no stale reopen is possible; agents should use br ready or stay idle when no ready work exists.",
+      "decision": "continue_disjoint_ready_bead",
+      "required_evidence": [
+        "br list --status in_progress --json",
+        "br ready --json"
+      ]
+    },
+    {
+      "id": "RULE-ACTIVE-NOT-STALE",
+      "level": "MUST",
+      "statement": "An in-progress bead below the stale threshold, or with recent owner evidence, is active and must not be reopened.",
+      "decision": "wait_for_owner",
+      "required_evidence": [
+        "age_seconds",
+        "last_owner_signal_at",
+        "assignee"
+      ]
+    },
+    {
+      "id": "RULE-CLEAN-STALE",
+      "level": "MUST",
+      "statement": "A clean stale candidate can receive only a status-check comment before any reopen decision.",
+      "decision": "comment_status_check",
+      "required_evidence": [
+        "candidate_bead_id",
+        "threshold_seconds",
+        "age_seconds",
+        "clean_dirty_path_scan"
+      ],
+      "required_comment_template": "Status check before stale reopen: candidate appears older than threshold and no dirty overlap is visible. Please reply or refresh ownership before reopen."
+    },
+    {
+      "id": "RULE-DIRTY-TRACKED",
+      "level": "MUST",
+      "statement": "Dirty tracked overlap keeps the decision at do_not_reopen unless the owner explicitly clears the overlap.",
+      "decision": "do_not_reopen",
+      "required_evidence": [
+        "dirty_tracked_paths",
+        "overlap_category",
+        "candidate_bead_id"
+      ]
+    },
+    {
+      "id": "RULE-UNTRACKED-REVIEW",
+      "level": "MUST",
+      "statement": "Relevant untracked files with unclear ownership require review and block stale reopen.",
+      "decision": "do_not_reopen",
+      "required_evidence": [
+        "untracked_paths",
+        "ownership_unknown"
+      ]
+    },
+    {
+      "id": "RULE-ASSIGNEE-RECENCY",
+      "level": "MUST",
+      "statement": "Recent Beads comments, Agent Mail handoffs, or file reservations from the assignee make the bead active even when wall-clock age exceeds the threshold.",
+      "decision": "wait_for_owner",
+      "required_evidence": [
+        "recent_beads_comment",
+        "recent_agent_mail_handoff",
+        "active_file_reservation"
+      ]
+    },
+    {
+      "id": "RULE-BR-EMPTY-BV-BLOCKED",
+      "level": "MUST",
+      "statement": "If br in-progress is empty but bv reports blocked actionable work, inspect the exact bead with br show and do not claim it unless Beads marks it ready or safely reopenable.",
+      "decision": "verify_br_show_then_do_not_claim",
+      "required_evidence": [
+        "bv_robot_triage_reference",
+        "br_show_status",
+        "dependency_state"
+      ]
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "CASE-EMPTY-IN-PROGRESS",
+      "description": "No in-progress Beads exist and no stale reopen candidates exist.",
+      "covers": [
+        "RULE-EMPTY-IN-PROGRESS"
+      ],
+      "input_summary": {
+        "in_progress_count": 0,
+        "ready_count": 1,
+        "dirty_category": "none"
+      },
+      "expected_action": "continue_disjoint_ready_bead",
+      "immediate_reopen_allowed": false,
+      "status_check_comment_required": false,
+      "required_evidence": [
+        "br list --status in_progress --json",
+        "br ready --json"
+      ]
+    },
+    {
+      "id": "CASE-ACTIVE-IN-PROGRESS",
+      "description": "An in-progress bead is below threshold or has recent owner evidence.",
+      "covers": [
+        "RULE-ACTIVE-NOT-STALE",
+        "RULE-ASSIGNEE-RECENCY"
+      ],
+      "input_summary": {
+        "in_progress_count": 1,
+        "age_seconds": 1200,
+        "recent_owner_signal": true,
+        "dirty_category": "none"
+      },
+      "expected_action": "wait_for_owner",
+      "immediate_reopen_allowed": false,
+      "status_check_comment_required": false,
+      "required_evidence": [
+        "age_seconds",
+        "last_owner_signal_at",
+        "assignee"
+      ]
+    },
+    {
+      "id": "CASE-CLEAN-STALE",
+      "description": "A stale candidate is above threshold, has no dirty overlap, and has no active owner evidence.",
+      "covers": [
+        "RULE-CLEAN-STALE"
+      ],
+      "input_summary": {
+        "in_progress_count": 1,
+        "age_seconds": 9000,
+        "recent_owner_signal": false,
+        "dirty_category": "none"
+      },
+      "expected_action": "comment_status_check",
+      "immediate_reopen_allowed": false,
+      "status_check_comment_required": true,
+      "required_evidence": [
+        "candidate_bead_id",
+        "threshold_seconds",
+        "age_seconds",
+        "clean_dirty_path_scan"
+      ],
+      "required_comment_template_id": "RULE-CLEAN-STALE"
+    },
+    {
+      "id": "CASE-DIRTY-TRACKED-OVERLAP",
+      "description": "A stale candidate has dirty tracked paths in the same likely work surface.",
+      "covers": [
+        "RULE-DIRTY-TRACKED"
+      ],
+      "input_summary": {
+        "in_progress_count": 1,
+        "age_seconds": 9200,
+        "dirty_category": "tracked_overlap_risk",
+        "tracked_dirty_count": 1
+      },
+      "expected_action": "do_not_reopen",
+      "immediate_reopen_allowed": false,
+      "status_check_comment_required": false,
+      "required_evidence": [
+        "dirty_tracked_paths",
+        "overlap_category",
+        "candidate_bead_id"
+      ]
+    },
+    {
+      "id": "CASE-UNTRACKED-REVIEW-REQUIRED",
+      "description": "A stale candidate or adjacent work surface has relevant untracked files with unclear ownership.",
+      "covers": [
+        "RULE-UNTRACKED-REVIEW"
+      ],
+      "input_summary": {
+        "in_progress_count": 1,
+        "age_seconds": 9300,
+        "dirty_category": "untracked_review_required",
+        "untracked_dirty_count": 1
+      },
+      "expected_action": "do_not_reopen",
+      "immediate_reopen_allowed": false,
+      "status_check_comment_required": false,
+      "required_evidence": [
+        "untracked_paths",
+        "ownership_unknown"
+      ]
+    },
+    {
+      "id": "CASE-BR-EMPTY-BV-BLOCKED",
+      "description": "br shows no in-progress work while bv reports blocked actionable work.",
+      "covers": [
+        "RULE-BR-EMPTY-BV-BLOCKED"
+      ],
+      "input_summary": {
+        "in_progress_count": 0,
+        "br_ready_count": 0,
+        "bv_reports_blocked_work": true,
+        "dirty_category": "tracker_only_mismatch"
+      },
+      "expected_action": "verify_br_show_then_do_not_claim",
+      "immediate_reopen_allowed": false,
+      "status_check_comment_required": false,
+      "required_evidence": [
+        "bv_robot_triage_reference",
+        "br_show_status",
+        "dependency_state"
+      ]
+    }
+  ],
+  "coverage": {
+    "rule_count": 7,
+    "must_rule_count": 7,
+    "fixture_count": 6,
+    "dirty_overlap_cases": 2,
+    "status_check_only_cases": 1,
+    "default_action": "do_not_reopen"
+  }
+}
