@@ -68,12 +68,16 @@ impl ExpHistogram {
     ///
     /// # Panics
     ///
-    /// Panics if `base <= 1.0` or `max_exp <= min_exp`.
+    /// Panics if `base` is non-finite, `base <= 1.0`, or `max_exp <= min_exp`.
     #[must_use]
     pub fn new(base: f64, min_exp: i32, max_exp: i32) -> Self {
-        assert!(base > 1.0, "base must be > 1.0");
+        assert!(
+            base.is_finite() && base > 1.0,
+            "base must be > 1.0 and finite"
+        );
         assert!(max_exp > min_exp, "max_exp must be > min_exp");
-        let num_buckets = (max_exp - min_exp) as usize;
+        let num_buckets = usize::try_from(i64::from(max_exp) - i64::from(min_exp))
+            .expect("histogram bucket count must fit usize");
         Self {
             buckets: vec![0; num_buckets],
             base,
@@ -98,8 +102,17 @@ impl ExpHistogram {
 
     /// Record a value.
     pub fn record(&mut self, value: f64) {
-        self.count += 1;
-        self.sum += value;
+        self.record_n(value, 1);
+    }
+
+    /// Record multiple occurrences of the same value.
+    pub fn record_n(&mut self, value: f64, n: u64) {
+        if n == 0 || !value.is_finite() {
+            return;
+        }
+
+        self.count = self.count.saturating_add(n);
+        self.sum += value * n as f64;
         if value < self.min {
             self.min = value;
         }
@@ -108,28 +121,24 @@ impl ExpHistogram {
         }
 
         if value <= 0.0 {
-            self.underflow += 1;
+            self.underflow = self.underflow.saturating_add(n);
             return;
         }
 
         let exp = value.log(self.base).floor() as i32;
-        let bucket_idx = exp - self.min_exp;
+        let bucket_idx = i64::from(exp) - i64::from(self.min_exp);
 
         if bucket_idx < 0 {
-            self.underflow += 1;
-        } else if bucket_idx >= self.num_buckets as i32 {
-            self.overflow += 1;
+            self.underflow = self.underflow.saturating_add(n);
+        } else if let Ok(bucket_idx) = usize::try_from(bucket_idx) {
+            if bucket_idx >= self.num_buckets {
+                self.overflow = self.overflow.saturating_add(n);
+                return;
+            }
+            let bucket = &mut self.buckets[bucket_idx];
+            *bucket = bucket.saturating_add(n);
         } else {
-            self.buckets[bucket_idx as usize] += 1;
-        }
-    }
-
-    /// Record multiple occurrences of the same value.
-    pub fn record_n(&mut self, value: f64, n: u64) {
-        // Cap iterations to avoid near-infinite loops for very large n
-        let capped = n.min(10_000_000);
-        for _ in 0..capped {
-            self.record(value);
+            self.overflow = self.overflow.saturating_add(n);
         }
     }
 
@@ -142,7 +151,11 @@ impl ExpHistogram {
         if self.count == 0 {
             return None;
         }
-        let target = (p * self.count as f64).ceil() as u64;
+        if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            return None;
+        }
+
+        let target = ((p * self.count as f64).ceil() as u64).max(1);
         let mut cumulative = self.underflow;
 
         if cumulative >= target {
@@ -525,11 +538,28 @@ mod tests {
     fn percentile_boundaries() {
         let mut h = ExpHistogram::power_of_two(10);
         h.record(1.5);
-        // p(0.0): ceil(0) = 0, underflow=0 doesn't reach target, bucket 0 has it → upper=2.0
-        // But ceil(0.0 * 1) = 0, and 0 >= 0 is true for underflow check
         let p0 = h.percentile(0.0).unwrap();
-        assert!(p0 <= 2.0, "p0={p0}");
+        assert_eq!(p0, 2.0);
         assert_eq!(h.percentile(1.0), Some(2.0));
+    }
+
+    #[test]
+    fn percentile_zero_uses_first_recorded_bucket() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record(8.0);
+
+        assert_eq!(h.percentile(0.0), Some(16.0));
+    }
+
+    #[test]
+    fn percentile_rejects_invalid_inputs() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record(1.5);
+
+        assert_eq!(h.percentile(-0.1), None);
+        assert_eq!(h.percentile(1.1), None);
+        assert_eq!(h.percentile(f64::NAN), None);
+        assert_eq!(h.percentile(f64::INFINITY), None);
     }
 
     // -- Custom base ------------------------------------------------------------
@@ -651,6 +681,12 @@ mod tests {
         let _ = ExpHistogram::new(2.0, 5, 5);
     }
 
+    #[test]
+    #[should_panic(expected = "base must be > 1.0")]
+    fn infinite_base_panics() {
+        let _ = ExpHistogram::new(f64::INFINITY, 0, 10);
+    }
+
     // -- record_n ---------------------------------------------------------------
 
     #[test]
@@ -659,6 +695,40 @@ mod tests {
         h.record_n(5.0, 100);
         assert_eq!(h.count(), 100);
         assert!((h.sum() - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_n_records_all_occurrences_without_cap() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record_n(5.0, 10_000_001);
+
+        assert_eq!(h.count(), 10_000_001);
+        assert_eq!(h.buckets[2], 10_000_001);
+        assert!((h.sum() - 50_000_005.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_n_zero_is_noop() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record_n(5.0, 0);
+
+        assert_eq!(h.count(), 0);
+        assert_eq!(h.mean(), None);
+    }
+
+    #[test]
+    fn non_finite_records_are_ignored() {
+        let mut h = ExpHistogram::power_of_two(10);
+        h.record(f64::NAN);
+        h.record(f64::INFINITY);
+        h.record(f64::NEG_INFINITY);
+
+        assert_eq!(h.count(), 0);
+        assert_eq!(h.sum(), 0.0);
+        assert_eq!(h.min(), None);
+        assert_eq!(h.max(), None);
+        assert_eq!(h.underflow(), 0);
+        assert_eq!(h.overflow(), 0);
     }
 
     // -- Batch: DarkBadger wa-1u90p.7.1 ----------------------------------------
