@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-provider-quota-assignment.json",
+  "title": "FrankenTerm Provider Quota Assignment",
+  "description": "Read-only mission-planner contract for assigning swarm work with provider quota, reset-window, rate-limit, and cost evidence.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source_bead",
+    "dry_run",
+    "read_only",
+    "planner_context",
+    "evidence",
+    "recommendation",
+    "reason_codes",
+    "forbidden_actions",
+    "artifact_paths",
+    "toon_projection"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.provider_quota_assignment.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_bead": {
+      "type": "string",
+      "const": "ft-auy2g.8"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "const": true
+    },
+    "read_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "planner_context": {
+      "$ref": "#/$defs/planner_context"
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/provider_evidence"
+      }
+    },
+    "recommendation": {
+      "$ref": "#/$defs/recommendation"
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/reason_code"
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "artifact_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "toon_projection": {
+      "$ref": "#/$defs/toon_projection"
+    }
+  },
+  "$defs": {
+    "planner_context": {
+      "type": "object",
+      "required": [
+        "objective_id",
+        "task_urgency",
+        "proof_criticality",
+        "expected_token_class",
+        "expected_cost_class",
+        "required_model_class",
+        "mission_objective_plan_ref"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "objective_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_urgency": {
+          "type": "string",
+          "enum": [
+            "low",
+            "normal",
+            "high",
+            "critical"
+          ]
+        },
+        "proof_criticality": {
+          "type": "string",
+          "enum": [
+            "not_required",
+            "static_only",
+            "rch_required",
+            "target_hardware_required"
+          ]
+        },
+        "expected_token_class": {
+          "type": "string",
+          "enum": [
+            "small",
+            "medium",
+            "large",
+            "extra_large"
+          ]
+        },
+        "expected_cost_class": {
+          "$ref": "#/$defs/cost_class"
+        },
+        "required_model_class": {
+          "type": "string",
+          "enum": [
+            "economy",
+            "standard",
+            "frontier",
+            "any"
+          ]
+        },
+        "mission_objective_plan_ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "provider_evidence": {
+      "type": "object",
+      "required": [
+        "evidence_id",
+        "provider",
+        "model_class",
+        "account_class",
+        "quota_remaining",
+        "quota_window_reset_ms",
+        "observed_rate_limit_state",
+        "marginal_cost_class",
+        "confidence",
+        "freshness_state",
+        "source_artifact",
+        "redaction_state",
+        "provider_available"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_class": {
+          "type": "string",
+          "enum": [
+            "economy",
+            "standard",
+            "frontier"
+          ]
+        },
+        "account_class": {
+          "type": "string",
+          "enum": [
+            "free",
+            "pro",
+            "team",
+            "enterprise",
+            "unknown"
+          ]
+        },
+        "quota_remaining": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "quota_window_reset_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "observed_rate_limit_state": {
+          "type": "string",
+          "enum": [
+            "clear",
+            "near_limit",
+            "hard_limited",
+            "unknown"
+          ]
+        },
+        "marginal_cost_class": {
+          "$ref": "#/$defs/cost_class"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low",
+            "none"
+          ]
+        },
+        "freshness_state": {
+          "type": "string",
+          "enum": [
+            "fresh",
+            "near_stale",
+            "stale",
+            "unknown"
+          ]
+        },
+        "source_artifact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "redaction_state": {
+          "type": "string",
+          "enum": [
+            "redacted_summary",
+            "privacy_redacted",
+            "raw_forbidden"
+          ]
+        },
+        "provider_available": {
+          "type": "boolean"
+        }
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "required": [
+        "action",
+        "target_provider",
+        "target_model_class",
+        "requires_approval",
+        "operator_message",
+        "fallback_action"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "assign",
+            "defer",
+            "degrade_model_class",
+            "require_approval",
+            "request_fresh_quota_evidence"
+          ]
+        },
+        "target_provider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "target_model_class": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "economy",
+            "standard",
+            "frontier",
+            null
+          ]
+        },
+        "requires_approval": {
+          "type": "boolean"
+        },
+        "operator_message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fallback_action": {
+          "type": "string",
+          "enum": [
+            "defer",
+            "request_fresh_quota_evidence",
+            "require_approval"
+          ]
+        }
+      }
+    },
+    "toon_projection": {
+      "type": "object",
+      "required": [
+        "columns",
+        "rows"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "type": "array",
+          "minItems": 6,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 6,
+            "items": {
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "cost_class": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ]
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "quota.healthy",
+        "quota.near_reset",
+        "quota.hard_rate_limit",
+        "quota.unknown",
+        "quota.conflicting_evidence",
+        "quota.high_cost_requires_approval",
+        "quota.stale_evidence",
+        "quota.privacy_redacted",
+        "quota.provider_unavailable",
+        "planner.read_only",
+        "planner.no_provider_api_call",
+        "planner.no_credential_mutation",
+        "planner.no_account_rotation"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "provider_api_call",
+        "credential_mutation",
+        "account_rotation",
+        "hidden_spend_decision",
+        "service_mutation",
+        "local_cargo_proof",
+        "raw_secret_storage"
+      ]
+    }
+  }
+}

@@ -1,0 +1,838 @@
+{
+  "schema_version": "ft.provider_quota_assignment.fixtures.v1",
+  "contract_id": "ft.provider_quota_assignment.fixture_manifest.v1",
+  "schema_path": "docs/json-schema/ft-provider-quota-assignment.json",
+  "contract_doc": "docs/robot-contracts/provider-quota-assignment.md",
+  "source_bead": "ft-auy2g.8",
+  "verification": [
+    "jq empty docs/json-schema/ft-provider-quota-assignment.json fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+    "bash tests/e2e/test_provider_quota_assignment_contract.sh"
+  ],
+  "required_forbidden_actions": [
+    "provider_api_call",
+    "credential_mutation",
+    "account_rotation",
+    "hidden_spend_decision",
+    "service_mutation",
+    "local_cargo_proof",
+    "raw_secret_storage"
+  ],
+  "toon_columns": [
+    "case_id",
+    "provider",
+    "model_class",
+    "quota_remaining",
+    "rate_limit_state",
+    "recommendation",
+    "reason"
+  ],
+  "cases": [
+    {
+      "case_id": "healthy-quota",
+      "expected_recommendation": "assign",
+      "required_reason_code": "quota.healthy",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.static-docs-contract",
+          "task_urgency": "normal",
+          "proof_criticality": "static_only",
+          "expected_token_class": "medium",
+          "expected_cost_class": "low",
+          "required_model_class": "standard",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-healthy",
+            "provider": "openai",
+            "model_class": "standard",
+            "account_class": "team",
+            "quota_remaining": 800000,
+            "quota_window_reset_ms": 1779090600000,
+            "observed_rate_limit_state": "clear",
+            "marginal_cost_class": "low",
+            "confidence": "high",
+            "freshness_state": "fresh",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "assign",
+          "target_provider": "openai",
+          "target_model_class": "standard",
+          "requires_approval": false,
+          "operator_message": "Quota is fresh and sufficient for standard static contract work.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.healthy",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "healthy-quota",
+              "openai",
+              "standard",
+              800000,
+              "clear",
+              "assign",
+              "quota.healthy"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "near-reset-degrade",
+      "expected_recommendation": "degrade_model_class",
+      "required_reason_code": "quota.near_reset",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.review-static-fixture",
+          "task_urgency": "normal",
+          "proof_criticality": "static_only",
+          "expected_token_class": "large",
+          "expected_cost_class": "medium",
+          "required_model_class": "any",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-near-reset",
+            "provider": "anthropic",
+            "model_class": "frontier",
+            "account_class": "pro",
+            "quota_remaining": 12000,
+            "quota_window_reset_ms": 1779087600000,
+            "observed_rate_limit_state": "near_limit",
+            "marginal_cost_class": "medium",
+            "confidence": "medium",
+            "freshness_state": "near_stale",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "degrade_model_class",
+          "target_provider": "anthropic",
+          "target_model_class": "standard",
+          "requires_approval": false,
+          "operator_message": "Quota is near reset; use standard class or wait for reset.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.near_reset",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "near-reset-degrade",
+              "anthropic",
+              "frontier",
+              12000,
+              "near_limit",
+              "degrade_model_class",
+              "quota.near_reset"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "hard-rate-limit",
+      "expected_recommendation": "defer",
+      "required_reason_code": "quota.hard_rate_limit",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.rch-proof-required",
+          "task_urgency": "high",
+          "proof_criticality": "rch_required",
+          "expected_token_class": "large",
+          "expected_cost_class": "medium",
+          "required_model_class": "frontier",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-hard-limit",
+            "provider": "gemini",
+            "model_class": "frontier",
+            "account_class": "pro",
+            "quota_remaining": 0,
+            "quota_window_reset_ms": 1779120000000,
+            "observed_rate_limit_state": "hard_limited",
+            "marginal_cost_class": "medium",
+            "confidence": "high",
+            "freshness_state": "fresh",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "defer",
+          "target_provider": null,
+          "target_model_class": null,
+          "requires_approval": false,
+          "operator_message": "Provider is hard-limited; defer until reset or fresh capacity appears.",
+          "fallback_action": "request_fresh_quota_evidence"
+        },
+        "reason_codes": [
+          "quota.hard_rate_limit",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "hard-rate-limit",
+              "gemini",
+              "frontier",
+              0,
+              "hard_limited",
+              "defer",
+              "quota.hard_rate_limit"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "unknown-quota",
+      "expected_recommendation": "request_fresh_quota_evidence",
+      "required_reason_code": "quota.unknown",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.unknown-provider",
+          "task_urgency": "normal",
+          "proof_criticality": "static_only",
+          "expected_token_class": "medium",
+          "expected_cost_class": "unknown",
+          "required_model_class": "any",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-unknown",
+            "provider": "openai",
+            "model_class": "standard",
+            "account_class": "unknown",
+            "quota_remaining": null,
+            "quota_window_reset_ms": null,
+            "observed_rate_limit_state": "unknown",
+            "marginal_cost_class": "unknown",
+            "confidence": "none",
+            "freshness_state": "unknown",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "request_fresh_quota_evidence",
+          "target_provider": null,
+          "target_model_class": null,
+          "requires_approval": false,
+          "operator_message": "Quota is unknown; request fresh redacted quota evidence before assignment.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.unknown",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "unknown-quota",
+              "openai",
+              "standard",
+              null,
+              "unknown",
+              "request_fresh_quota_evidence",
+              "quota.unknown"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "conflicting-account-evidence",
+      "expected_recommendation": "request_fresh_quota_evidence",
+      "required_reason_code": "quota.conflicting_evidence",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.conflicting-quota",
+          "task_urgency": "high",
+          "proof_criticality": "rch_required",
+          "expected_token_class": "large",
+          "expected_cost_class": "medium",
+          "required_model_class": "frontier",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-conflict-a",
+            "provider": "anthropic",
+            "model_class": "frontier",
+            "account_class": "team",
+            "quota_remaining": 500000,
+            "quota_window_reset_ms": 1779090600000,
+            "observed_rate_limit_state": "clear",
+            "marginal_cost_class": "medium",
+            "confidence": "medium",
+            "freshness_state": "fresh",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          },
+          {
+            "evidence_id": "quota-evidence-conflict-b",
+            "provider": "anthropic",
+            "model_class": "frontier",
+            "account_class": "team",
+            "quota_remaining": 0,
+            "quota_window_reset_ms": 1779090600000,
+            "observed_rate_limit_state": "hard_limited",
+            "marginal_cost_class": "medium",
+            "confidence": "medium",
+            "freshness_state": "fresh",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "request_fresh_quota_evidence",
+          "target_provider": null,
+          "target_model_class": null,
+          "requires_approval": false,
+          "operator_message": "Provider evidence conflicts; request fresh evidence before assignment.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.conflicting_evidence",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "conflicting-account-evidence",
+              "anthropic",
+              "frontier",
+              "conflict",
+              "mixed",
+              "request_fresh_quota_evidence",
+              "quota.conflicting_evidence"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "high-cost-requires-approval",
+      "expected_recommendation": "require_approval",
+      "required_reason_code": "quota.high_cost_requires_approval",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.high-cost-frontier",
+          "task_urgency": "critical",
+          "proof_criticality": "target_hardware_required",
+          "expected_token_class": "extra_large",
+          "expected_cost_class": "high",
+          "required_model_class": "frontier",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-high-cost",
+            "provider": "openai",
+            "model_class": "frontier",
+            "account_class": "enterprise",
+            "quota_remaining": 900000,
+            "quota_window_reset_ms": 1779090600000,
+            "observed_rate_limit_state": "clear",
+            "marginal_cost_class": "high",
+            "confidence": "high",
+            "freshness_state": "fresh",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "require_approval",
+          "target_provider": "openai",
+          "target_model_class": "frontier",
+          "requires_approval": true,
+          "operator_message": "High-cost frontier work requires explicit approval before assignment.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.high_cost_requires_approval",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "high-cost-requires-approval",
+              "openai",
+              "frontier",
+              900000,
+              "clear",
+              "require_approval",
+              "quota.high_cost_requires_approval"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "stale-evidence",
+      "expected_recommendation": "request_fresh_quota_evidence",
+      "required_reason_code": "quota.stale_evidence",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.stale-quota",
+          "task_urgency": "normal",
+          "proof_criticality": "static_only",
+          "expected_token_class": "medium",
+          "expected_cost_class": "medium",
+          "required_model_class": "standard",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-stale",
+            "provider": "openai",
+            "model_class": "standard",
+            "account_class": "team",
+            "quota_remaining": 600000,
+            "quota_window_reset_ms": 1779090600000,
+            "observed_rate_limit_state": "clear",
+            "marginal_cost_class": "medium",
+            "confidence": "medium",
+            "freshness_state": "stale",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "request_fresh_quota_evidence",
+          "target_provider": null,
+          "target_model_class": null,
+          "requires_approval": false,
+          "operator_message": "Quota evidence is stale; request fresh evidence before assignment.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.stale_evidence",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "stale-evidence",
+              "openai",
+              "standard",
+              600000,
+              "clear",
+              "request_fresh_quota_evidence",
+              "quota.stale_evidence"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "privacy-redacted-evidence",
+      "expected_recommendation": "request_fresh_quota_evidence",
+      "required_reason_code": "quota.privacy_redacted",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.privacy-redacted-quota",
+          "task_urgency": "normal",
+          "proof_criticality": "static_only",
+          "expected_token_class": "medium",
+          "expected_cost_class": "unknown",
+          "required_model_class": "any",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-privacy-redacted",
+            "provider": "anthropic",
+            "model_class": "standard",
+            "account_class": "unknown",
+            "quota_remaining": null,
+            "quota_window_reset_ms": null,
+            "observed_rate_limit_state": "unknown",
+            "marginal_cost_class": "unknown",
+            "confidence": "low",
+            "freshness_state": "fresh",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "privacy_redacted",
+            "provider_available": true
+          }
+        ],
+        "recommendation": {
+          "action": "request_fresh_quota_evidence",
+          "target_provider": null,
+          "target_model_class": null,
+          "requires_approval": false,
+          "operator_message": "Quota details are privacy-redacted; request an approved redacted summary.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.privacy_redacted",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "privacy-redacted-evidence",
+              "anthropic",
+              "standard",
+              null,
+              "unknown",
+              "request_fresh_quota_evidence",
+              "quota.privacy_redacted"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "provider-unavailable",
+      "expected_recommendation": "request_fresh_quota_evidence",
+      "required_reason_code": "quota.provider_unavailable",
+      "artifact": {
+        "schema_version": 1,
+        "contract_id": "ft.provider_quota_assignment.v1",
+        "generated_at_ms": 1779087000000,
+        "source_bead": "ft-auy2g.8",
+        "dry_run": true,
+        "read_only": true,
+        "planner_context": {
+          "objective_id": "objective.provider-unavailable",
+          "task_urgency": "high",
+          "proof_criticality": "rch_required",
+          "expected_token_class": "large",
+          "expected_cost_class": "unknown",
+          "required_model_class": "frontier",
+          "mission_objective_plan_ref": "ft.mission_objective_plan.v1"
+        },
+        "evidence": [
+          {
+            "evidence_id": "quota-evidence-provider-unavailable",
+            "provider": "gemini",
+            "model_class": "frontier",
+            "account_class": "unknown",
+            "quota_remaining": null,
+            "quota_window_reset_ms": null,
+            "observed_rate_limit_state": "unknown",
+            "marginal_cost_class": "unknown",
+            "confidence": "none",
+            "freshness_state": "unknown",
+            "source_artifact": "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+            "redaction_state": "redacted_summary",
+            "provider_available": false
+          }
+        ],
+        "recommendation": {
+          "action": "request_fresh_quota_evidence",
+          "target_provider": null,
+          "target_model_class": null,
+          "requires_approval": false,
+          "operator_message": "Provider is unavailable; request fresh provider health and quota evidence.",
+          "fallback_action": "defer"
+        },
+        "reason_codes": [
+          "quota.provider_unavailable",
+          "planner.read_only",
+          "planner.no_provider_api_call",
+          "planner.no_credential_mutation",
+          "planner.no_account_rotation"
+        ],
+        "forbidden_actions": [
+          "provider_api_call",
+          "credential_mutation",
+          "account_rotation",
+          "hidden_spend_decision",
+          "service_mutation",
+          "local_cargo_proof",
+          "raw_secret_storage"
+        ],
+        "artifact_paths": [
+          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
+        ],
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "provider",
+            "model_class",
+            "quota_remaining",
+            "rate_limit_state",
+            "recommendation",
+            "reason"
+          ],
+          "rows": [
+            [
+              "provider-unavailable",
+              "gemini",
+              "frontier",
+              null,
+              "unknown",
+              "request_fresh_quota_evidence",
+              "quota.provider_unavailable"
+            ]
+          ]
+        }
+      }
+    }
+  ]
+}
