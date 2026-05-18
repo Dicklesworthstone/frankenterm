@@ -229,6 +229,60 @@
       }
     },
     {
+      "fixture_id": "critical-pressure-current-fleet",
+      "reason_code": "critical_pressure",
+      "diagnosis_family": "current FrankenTerm critical-pressure no-worker dry-run",
+      "target_command": "cargo check -p frankenterm-core --lib",
+      "executed_read_only_commands": [
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- cargo check -p frankenterm-core --lib",
+        "br ready --json"
+      ],
+      "retained_evidence": [
+        {
+          "kind": "status_snapshot",
+          "summary": "RCH status reported degraded posture with 5/8 healthy workers and 54/54 available slots, but the healthy workers remained under critical pressure."
+        },
+        {
+          "kind": "command_output",
+          "summary": "The dry-run classified the command as cargo_check and would_intercept=true, then selected no worker with no_admissible_workers=critical_pressure=5 before transfer or remote execution."
+        },
+        {
+          "kind": "beads_snapshot",
+          "summary": "br ready --json was empty; the blocked proof lane must remain blocked instead of falling back to host-side Cargo."
+        }
+      ],
+      "forbidden_actions": [
+        "run_local_cargo_as_proof",
+        "restart_agent_mail",
+        "repair_agent_mail_db",
+        "restart_rch_daemon",
+        "mutate_rch_worker",
+        "cancel_other_agent_build",
+        "delete_files_without_approval",
+        "treat_dry_run_as_compile_proof"
+      ],
+      "collector_side_effects": {
+        "agent_mail_repaired": false,
+        "agent_mail_restarted": false,
+        "rch_daemon_restarted": false,
+        "worker_mutated": false,
+        "build_cancelled": false,
+        "files_deleted": false,
+        "local_cargo_counted_as_proof": false
+      },
+      "expected_structured_log": {
+        "component": "rch_admission_contract_static",
+        "fixture_id": "critical-pressure-current-fleet",
+        "reason_code": "critical_pressure",
+        "outcome": "blocked",
+        "service_actions_invoked": false,
+        "local_cargo_proof": false,
+        "side_effects_executed": false
+      }
+    },
+    {
       "fixture_id": "insufficient-slots",
       "reason_code": "insufficient_slots",
       "diagnosis_family": "insufficient worker slots",

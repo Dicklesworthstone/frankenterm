@@ -98,6 +98,7 @@ EXPECTED_NO_SERVICE_CASE_IDS = %w[
   all-workers-offline
   telemetry-gap
   critical-pressure
+  critical-pressure-current-fleet
   insufficient-slots
   active-project-exclusion
   local-eno-space
