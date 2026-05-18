@@ -18,8 +18,8 @@ use crate::types::{
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
@@ -121,6 +121,25 @@ impl WasmEngine {
         store.set_fuel(self.config.fuel_per_call).ok();
         store
     }
+
+    fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, registry: &str) -> MutexGuard<'a, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("recovering poisoned WASM engine {registry} registry lock");
+                mutex.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn hooks_guard(&self) -> MutexGuard<'_, HashMap<HookId, (String, HookHandler)>> {
+        Self::lock_or_recover(&self.hooks, "hook")
+    }
+
+    fn extensions_guard(&self) -> MutexGuard<'_, HashMap<ExtensionId, LoadedModule>> {
+        Self::lock_or_recover(&self.extensions, "extension")
+    }
 }
 
 impl ScriptingEngine for WasmEngine {
@@ -210,35 +229,30 @@ impl ScriptingEngine for WasmEngine {
 
     fn register_hook(&self, event: &str, handler: HookHandler) -> Result<HookId> {
         let id = self.next_hook_id.fetch_add(1, Ordering::Relaxed);
-        self.hooks
-            .lock()
-            .map_err(|_| anyhow!("hook registry lock poisoned"))?
-            .insert(id, (event.to_string(), handler));
+        self.hooks_guard().insert(id, (event.to_string(), handler));
         Ok(id)
     }
 
     fn unregister_hook(&self, id: HookId) -> Result<()> {
-        self.hooks
-            .lock()
-            .map_err(|_| anyhow!("hook registry lock poisoned"))?
-            .remove(&id);
+        self.hooks_guard().remove(&id);
         Ok(())
     }
 
     fn fire_event(&self, event: &str, payload: &frankenterm_dynamic::Value) -> Result<Vec<Action>> {
-        let hooks = self
-            .hooks
-            .lock()
-            .map_err(|_| anyhow!("hook registry lock poisoned"))?;
-        let mut sorted: Vec<_> = hooks.values().collect();
-        sorted.sort_by_key(|(_, handler)| handler.priority);
+        let mut sorted = self
+            .hooks_guard()
+            .values()
+            .filter(|(registered_event, handler)| {
+                registered_event == event && handler.matches_event(event)
+            })
+            .map(|(_, handler)| handler.clone())
+            .collect::<Vec<_>>();
+        sorted.sort_by_key(|handler| handler.priority);
 
         let mut actions = Vec::new();
-        for (registered_event, handler) in sorted {
-            if registered_event == event && handler.matches_event(event) {
-                let mut from_handler = handler.call(event, payload)?;
-                actions.append(&mut from_handler);
-            }
+        for handler in sorted {
+            let mut from_handler = handler.call(event, payload)?;
+            actions.append(&mut from_handler);
         }
         Ok(actions)
     }
@@ -255,16 +269,13 @@ impl ScriptingEngine for WasmEngine {
         let module = self.compile_module(&bytes)?;
         let id = self.next_extension_id.fetch_add(1, Ordering::Relaxed);
 
-        self.extensions
-            .lock()
-            .map_err(|_| anyhow!("extension registry lock poisoned"))?
-            .insert(
-                id,
-                LoadedModule {
-                    module,
-                    manifest: manifest.clone(),
-                },
-            );
+        self.extensions_guard().insert(
+            id,
+            LoadedModule {
+                module,
+                manifest: manifest.clone(),
+            },
+        );
 
         log::info!(
             "loaded WASM extension {}@{} (id={id})",
@@ -275,11 +286,7 @@ impl ScriptingEngine for WasmEngine {
     }
 
     fn unload_extension(&self, id: ExtensionId) -> Result<()> {
-        let removed = self
-            .extensions
-            .lock()
-            .map_err(|_| anyhow!("extension registry lock poisoned"))?
-            .remove(&id);
+        let removed = self.extensions_guard().remove(&id);
 
         match removed {
             Some(loaded) => {
@@ -403,6 +410,66 @@ mod tests {
     }
 
     #[test]
+    fn hook_registry_recovers_after_poisoned_lock() {
+        let engine = WasmEngine::with_defaults().unwrap();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.hooks.lock().unwrap();
+            panic!("poison WASM hook registry");
+        }));
+        assert!(poison_result.is_err());
+        assert!(engine.hooks.is_poisoned());
+
+        let handler = HookHandler::new(0, Some("test-event".to_string()), |_event, _payload| {
+            Ok(vec![Action::Log {
+                level: crate::types::LogLevel::Info,
+                message: "recovered".to_string(),
+            }])
+        });
+
+        let hook_id = engine.register_hook("test-event", handler).unwrap();
+        assert!(!engine.hooks.is_poisoned());
+
+        let actions = engine
+            .fire_event("test-event", &frankenterm_dynamic::Value::Null)
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+
+        engine.unregister_hook(hook_id).unwrap();
+        let actions_after_unreg = engine
+            .fire_event("test-event", &frankenterm_dynamic::Value::Null)
+            .unwrap();
+        assert!(actions_after_unreg.is_empty());
+    }
+
+    #[test]
+    fn fire_event_drops_hook_registry_lock_before_calling_handlers() {
+        let engine = std::sync::Arc::new(WasmEngine::with_defaults().unwrap());
+        let engine_for_handler = std::sync::Arc::clone(&engine);
+
+        let handler = HookHandler::new(
+            0,
+            Some("test-event".to_string()),
+            move |_event, _payload| {
+                let _guard = engine_for_handler
+                    .hooks
+                    .try_lock()
+                    .expect("fire_event must not hold hook registry while invoking handlers");
+                Ok(vec![Action::Log {
+                    level: crate::types::LogLevel::Info,
+                    message: "unlocked".to_string(),
+                }])
+            },
+        );
+
+        engine.register_hook("test-event", handler).unwrap();
+        let actions = engine
+            .fire_event("test-event", &frankenterm_dynamic::Value::Null)
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
     fn eval_config_rejects_nonexistent_path() {
         let engine = WasmEngine::with_defaults().unwrap();
         let result = engine.eval_config(Path::new("/tmp/nonexistent_wasm_config_12345.wasm"));
@@ -451,6 +518,35 @@ mod tests {
         };
         let result = engine.load_extension(&manifest);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extension_registry_recovers_after_poisoned_lock() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("empty.wasm");
+        std::fs::write(&wasm_path, b"\0asm\x01\0\0\0").unwrap();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.extensions.lock().unwrap();
+            panic!("poison WASM extension registry");
+        }));
+        assert!(poison_result.is_err());
+        assert!(engine.extensions.is_poisoned());
+
+        let manifest = ExtensionManifest {
+            id: "recovered".to_string(),
+            version: "1.0.0".to_string(),
+            entrypoint: Some(wasm_path.to_string_lossy().into_owned()),
+            metadata: frankenterm_dynamic::Value::Null,
+        };
+
+        let extension_id = engine.load_extension(&manifest).unwrap();
+        assert!(!engine.extensions.is_poisoned());
+        assert_eq!(engine.extensions.lock().unwrap().len(), 1);
+
+        engine.unload_extension(extension_id).unwrap();
+        assert!(engine.extensions.lock().unwrap().is_empty());
     }
 
     #[test]
