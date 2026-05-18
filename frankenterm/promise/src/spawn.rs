@@ -36,7 +36,10 @@ static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => {
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -456,6 +459,21 @@ mod tests {
         drop(task);
 
         set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
+    }
+
+    #[test]
+    fn recovered_scheduler_lock_clears_poison() {
+        let _lock = TEST_LOCK.lock().unwrap();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ON_MAIN_THREAD.lock().unwrap();
+            panic!("poison scheduler lock for recovery regression");
+        }));
+        assert!(poisoned.is_err());
+        assert!(ON_MAIN_THREAD.is_poisoned());
+
+        set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
+        assert!(!ON_MAIN_THREAD.is_poisoned());
     }
 
     #[test]
