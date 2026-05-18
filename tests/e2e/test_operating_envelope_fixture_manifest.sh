@@ -212,6 +212,18 @@ jq -e '
   and .properties.read_only.const == true
 ' "${PROOF_CALENDAR_SCHEMA}" >/dev/null || fail "proof-calendar schema root contract drifted"
 
+jq -e '
+  def unique_values:
+    length == (unique | length);
+
+  ([.cases[].case_id] | unique_values)
+  and all(.cases[];
+    ([.artifact.calendar_entries[].entry_id] | unique_values)
+    and ([.artifact.source_snapshots[].source_kind] | unique_values)
+    and ([.artifact.work_classes[].work_class] | unique_values)
+  )
+' "${PROOF_CALENDAR_FIXTURES}" >/dev/null || fail "proof-calendar case ids and per-case artifact ids must be unique"
+
 for case_id in "${PROOF_CALENDAR_REQUIRED_CASES[@]}"; do
   jq -e --arg case_id "${case_id}" '
     any(.cases[]; .case_id == $case_id)
