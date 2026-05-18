@@ -1011,7 +1011,7 @@ impl BackpressureManager {
         let entered = state.entered_at;
         let now_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(duration_millis_saturating)
             .unwrap_or(0);
 
         BackpressureSnapshot {
@@ -1021,11 +1021,15 @@ impl BackpressureManager {
             capture_capacity: depths.capture_capacity,
             write_depth: depths.write_depth,
             write_capacity: depths.write_capacity,
-            duration_in_tier_ms: u64::try_from(entered.elapsed().as_millis()).unwrap_or(u64::MAX),
+            duration_in_tier_ms: duration_millis_saturating(entered.elapsed()),
             transitions: self.transition_count.load(Ordering::Relaxed),
             paused_panes: self.paused_pane_ids(),
         }
     }
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -1825,6 +1829,15 @@ mod tests {
         assert!(snap.paused_panes.is_empty());
         assert_eq!(snap.transitions, 0);
         assert!(snap.timestamp_epoch_ms > 0);
+    }
+
+    #[test]
+    fn duration_millis_saturating_caps_unrepresentable_millis() {
+        let overflowing = Duration::from_millis(u64::MAX)
+            .checked_add(Duration::from_millis(1))
+            .expect("duration addition should fit");
+        assert_eq!(duration_millis_saturating(overflowing), u64::MAX);
+        assert_eq!(duration_millis_saturating(Duration::from_millis(42)), 42);
     }
 
     #[test]
