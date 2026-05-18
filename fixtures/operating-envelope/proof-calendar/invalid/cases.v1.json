@@ -1,0 +1,118 @@
+{
+  "schema_version": "ft.operating_envelope.proof_calendar.invalid_fixtures.v1",
+  "contract_id": "ft.operating_envelope.proof_calendar.invalid_fixture_manifest.v1",
+  "schema_path": "docs/json-schema/ft-operating-envelope-proof-calendar.json",
+  "valid_fixture": "fixtures/operating-envelope/proof-calendar/cases.v1.json",
+  "contract_doc": "docs/robot-contracts/operating-envelope.md",
+  "source_bead": "ft-booek.9",
+  "verification": [
+    "jq empty docs/json-schema/ft-operating-envelope-proof-calendar.json fixtures/operating-envelope/proof-calendar/cases.v1.json fixtures/operating-envelope/proof-calendar/invalid/cases.v1.json",
+    "bash tests/e2e/test_operating_envelope_fixture_manifest.sh"
+  ],
+  "cases": [
+    {
+      "case_id": "local-cargo-fallback-allowed",
+      "expected_failure": "local_cargo_fallback_allowed_must_be_false",
+      "reason_codes": [
+        "proof.local_cargo_fallback_forbidden"
+      ],
+      "invalid_fragment": {
+        "proof_policy": {
+          "local_cargo_fallback_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "raw-pane-content-allowed",
+      "expected_failure": "raw_pane_content_must_not_be_stored_or_allowed",
+      "reason_codes": [
+        "redaction.raw_pane_content_forbidden"
+      ],
+      "invalid_fragment": {
+        "redaction_policy": {
+          "raw_pane_content_allowed": true
+        },
+        "source_snapshots": [
+          {
+            "source_kind": "agent_mail",
+            "raw_pane_content_stored": true
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "absolute-artifact-path",
+      "expected_failure": "artifact_paths_must_be_repo_relative",
+      "reason_codes": [
+        "artifact.absolute_path_forbidden"
+      ],
+      "invalid_fragment": {
+        "artifact_paths": [
+          "/tmp/frankenterm-proof-calendar.json"
+        ]
+      }
+    },
+    {
+      "case_id": "missing-required-forbidden-action",
+      "expected_failure": "all_required_forbidden_actions_must_be_retained",
+      "reason_codes": [
+        "policy.required_forbidden_action_missing"
+      ],
+      "invalid_fragment": {
+        "missing_forbidden_action": "worker_mutation",
+        "forbidden_actions": [
+          "agent_mail_service_repair",
+          "build_cancellation",
+          "delete_files",
+          "destructive_filesystem",
+          "destructive_git",
+          "local_cargo_proof",
+          "local_heavy_cargo_fallback",
+          "rch_daemon_restart",
+          "rch_service_repair",
+          "service_mutation"
+        ]
+      }
+    },
+    {
+      "case_id": "toon-row-width-mismatch",
+      "expected_failure": "toon_rows_must_match_declared_columns",
+      "reason_codes": [
+        "toon.row_width_mismatch"
+      ],
+      "invalid_fragment": {
+        "toon_projection": {
+          "columns": [
+            "case_id",
+            "lane",
+            "work_class",
+            "recommendation",
+            "confidence",
+            "reason"
+          ],
+          "rows": [
+            [
+              "toon-row-width-mismatch",
+              "now",
+              "static_docs_fixture_verifier",
+              "run_now",
+              "medium"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "service-mutation-permitted",
+      "expected_failure": "service_mutation_allowed_must_be_false",
+      "reason_codes": [
+        "policy.service_mutation_forbidden"
+      ],
+      "invalid_fragment": {
+        "side_effect_policy": {
+          "service_mutation_allowed": true
+        }
+      }
+    }
+  ]
+}

@@ -111,6 +111,17 @@ The golden cases are:
 - `stale-proof-artifact`
 - `target-hardware-unavailable`
 
+The negative proof-calendar corpus is
+`fixtures/operating-envelope/proof-calendar/invalid/cases.v1.json`. It retains
+parseable JSON fragments that the static verifier must reject as unsafe:
+
+- `local-cargo-fallback-allowed`
+- `raw-pane-content-allowed`
+- `absolute-artifact-path`
+- `missing-required-forbidden-action`
+- `toon-row-width-mismatch`
+- `service-mutation-permitted`
+
 Every case emits deterministic `now`, `next`, and `wait` lanes with stable
 reason codes, source snapshots for Beads/RCH/Agent Mail/git/proof-artifact
 freshness, a TOON-ready row projection, and the same fail-closed proof policy:
@@ -130,4 +141,4 @@ calendar entry.
 
 The static verifier is `bash tests/e2e/test_operating_envelope_fixture_manifest.sh`.
 Use `--json` for machine-readable summary output that includes the base fixture
-counts and the proof-calendar case count.
+counts, proof-calendar case count, and proof-calendar invalid case count.

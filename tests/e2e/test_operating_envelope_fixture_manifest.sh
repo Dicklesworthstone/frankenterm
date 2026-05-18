@@ -20,6 +20,7 @@ MANIFEST="fixtures/operating-envelope/manifest.json"
 CONTRACT_DOC="docs/robot-contracts/operating-envelope.md"
 PROOF_CALENDAR_SCHEMA="docs/json-schema/ft-operating-envelope-proof-calendar.json"
 PROOF_CALENDAR_FIXTURES="fixtures/operating-envelope/proof-calendar/cases.v1.json"
+PROOF_CALENDAR_INVALID_FIXTURES="fixtures/operating-envelope/proof-calendar/invalid/cases.v1.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 REQUIRED_FORBIDDEN_ACTION_CLASSES=(
   "agent_mail_repair"
@@ -69,6 +70,14 @@ PROOF_CALENDAR_REQUIRED_SOURCE_KINDS=(
   "git"
   "proof_artifact"
 )
+PROOF_CALENDAR_REQUIRED_INVALID_CASES=(
+  "local-cargo-fallback-allowed"
+  "raw-pane-content-allowed"
+  "absolute-artifact-path"
+  "missing-required-forbidden-action"
+  "toon-row-width-mismatch"
+  "service-mutation-permitted"
+)
 
 fail() {
   if [[ "${OUTPUT_FORMAT}" == "json" ]] && command -v jq >/dev/null 2>&1; then
@@ -97,6 +106,7 @@ require_file "${MANIFEST}"
 require_file "${CONTRACT_DOC}"
 require_file "${PROOF_CALENDAR_SCHEMA}"
 require_file "${PROOF_CALENDAR_FIXTURES}"
+require_file "${PROOF_CALENDAR_INVALID_FIXTURES}"
 require_file "${PROVENANCE}"
 
 mapfile -t valid_paths < <(jq -r '.valid_fixtures[].path' "${MANIFEST}")
@@ -113,6 +123,7 @@ all_json=(
   "${MANIFEST}"
   "${PROOF_CALENDAR_SCHEMA}"
   "${PROOF_CALENDAR_FIXTURES}"
+  "${PROOF_CALENDAR_INVALID_FIXTURES}"
   "${valid_paths[@]}"
   "${invalid_paths[@]}"
   "${root_alias_paths[@]}"
@@ -205,6 +216,24 @@ jq -e '
 ' "${PROOF_CALENDAR_FIXTURES}" >/dev/null || fail "proof-calendar fixture metadata is incomplete"
 
 jq -e '
+  .schema_version == "ft.operating_envelope.proof_calendar.invalid_fixtures.v1"
+  and .contract_id == "ft.operating_envelope.proof_calendar.invalid_fixture_manifest.v1"
+  and .schema_path == "docs/json-schema/ft-operating-envelope-proof-calendar.json"
+  and .valid_fixture == "fixtures/operating-envelope/proof-calendar/cases.v1.json"
+  and .contract_doc == "docs/robot-contracts/operating-envelope.md"
+  and .source_bead == "ft-booek.9"
+  and (.verification | index("bash tests/e2e/test_operating_envelope_fixture_manifest.sh") != null)
+  and (.cases | length >= 6)
+  and all(.cases[];
+    (.case_id | type == "string" and length > 0)
+    and (.expected_failure | type == "string" and length > 0)
+    and (.reason_codes | type == "array" and length > 0)
+    and all(.reason_codes[]; type == "string" and contains("."))
+    and (.invalid_fragment | type == "object")
+  )
+' "${PROOF_CALENDAR_INVALID_FIXTURES}" >/dev/null || fail "proof-calendar invalid fixture metadata is incomplete"
+
+jq -e '
   .["$id"] == "https://frankenterm.dev/schemas/ft-operating-envelope-proof-calendar.json"
   and .properties.contract_id.const == "ft.operating_envelope.proof_calendar.v1"
   and .properties.source_bead.const == "ft-booek.8"
@@ -230,6 +259,46 @@ for case_id in "${PROOF_CALENDAR_REQUIRED_CASES[@]}"; do
   ' "${PROOF_CALENDAR_FIXTURES}" >/dev/null || fail "proof-calendar missing case ${case_id}"
   [[ "$(cat "${CONTRACT_DOC}")" == *"${case_id}"* ]] || fail "contract doc missing proof-calendar case ${case_id}"
 done
+
+for case_id in "${PROOF_CALENDAR_REQUIRED_INVALID_CASES[@]}"; do
+  jq -e --arg case_id "${case_id}" '
+    any(.cases[]; .case_id == $case_id)
+  ' "${PROOF_CALENDAR_INVALID_FIXTURES}" >/dev/null || fail "proof-calendar missing invalid case ${case_id}"
+  [[ "$(cat "${CONTRACT_DOC}")" == *"${case_id}"* ]] || fail "contract doc missing proof-calendar invalid case ${case_id}"
+done
+
+jq -e '
+  def case($id): .cases[] | select(.case_id == $id);
+
+  ([.cases[].case_id] | length == (unique | length))
+  and (case("local-cargo-fallback-allowed")
+    | .expected_failure == "local_cargo_fallback_allowed_must_be_false"
+    and (.reason_codes | index("proof.local_cargo_fallback_forbidden") != null)
+    and .invalid_fragment.proof_policy.local_cargo_fallback_allowed == true)
+  and (case("raw-pane-content-allowed")
+    | .expected_failure == "raw_pane_content_must_not_be_stored_or_allowed"
+    and (.reason_codes | index("redaction.raw_pane_content_forbidden") != null)
+    and .invalid_fragment.redaction_policy.raw_pane_content_allowed == true
+    and any(.invalid_fragment.source_snapshots[]; .raw_pane_content_stored == true))
+  and (case("absolute-artifact-path")
+    | .expected_failure == "artifact_paths_must_be_repo_relative"
+    and (.reason_codes | index("artifact.absolute_path_forbidden") != null)
+    and any(.invalid_fragment.artifact_paths[]; startswith("/")))
+  and (case("missing-required-forbidden-action")
+    | .expected_failure == "all_required_forbidden_actions_must_be_retained"
+    and (.reason_codes | index("policy.required_forbidden_action_missing") != null)
+    and .invalid_fragment.missing_forbidden_action == "worker_mutation"
+    and (.invalid_fragment.forbidden_actions | index("worker_mutation") == null))
+  and (case("toon-row-width-mismatch")
+    | .expected_failure == "toon_rows_must_match_declared_columns"
+    and (.reason_codes | index("toon.row_width_mismatch") != null)
+    and (.invalid_fragment.toon_projection.columns | length) as $width
+    | any(.invalid_fragment.toon_projection.rows[]; length != $width))
+  and (case("service-mutation-permitted")
+    | .expected_failure == "service_mutation_allowed_must_be_false"
+    and (.reason_codes | index("policy.service_mutation_forbidden") != null)
+    and .invalid_fragment.side_effect_policy.service_mutation_allowed == true)
+' "${PROOF_CALENDAR_INVALID_FIXTURES}" >/dev/null || fail "proof-calendar invalid fixtures do not cover required fail-closed cases"
 
 for work_class in "${PROOF_CALENDAR_REQUIRED_WORK_CLASSES[@]}"; do
   jq -e --arg work_class "${work_class}" '
@@ -319,6 +388,7 @@ done
   || fail "schema provenance missing operating-envelope verifier"
 
 proof_calendar_case_count="$(jq '.cases | length' "${PROOF_CALENDAR_FIXTURES}")"
+proof_calendar_invalid_case_count="$(jq '.cases | length' "${PROOF_CALENDAR_INVALID_FIXTURES}")"
 
 if [[ "${OUTPUT_FORMAT}" == "json" ]]; then
   jq -n \
@@ -328,6 +398,7 @@ if [[ "${OUTPUT_FORMAT}" == "json" ]]; then
     --argjson invalid_count "${#invalid_paths[@]}" \
     --argjson root_alias_count "${#root_alias_paths[@]}" \
     --argjson proof_calendar_case_count "${proof_calendar_case_count}" \
+    --argjson proof_calendar_invalid_case_count "${proof_calendar_invalid_case_count}" \
     '{
       ok: true,
       contract_id: $contract_id,
@@ -336,10 +407,11 @@ if [[ "${OUTPUT_FORMAT}" == "json" ]]; then
         valid_fixture_count: $valid_count,
         invalid_fixture_count: $invalid_count,
         root_alias_count: $root_alias_count,
-        proof_calendar_case_count: $proof_calendar_case_count
+        proof_calendar_case_count: $proof_calendar_case_count,
+        proof_calendar_invalid_case_count: $proof_calendar_invalid_case_count
       }
     }'
 else
-  printf 'operating-envelope fixture manifest: static verifier passed (%d valid, %d invalid, %d root aliases, %d proof-calendar cases)\n' \
-    "${#valid_paths[@]}" "${#invalid_paths[@]}" "${#root_alias_paths[@]}" "${proof_calendar_case_count}"
+  printf 'operating-envelope fixture manifest: static verifier passed (%d valid, %d invalid, %d root aliases, %d proof-calendar cases, %d proof-calendar invalid cases)\n' \
+    "${#valid_paths[@]}" "${#invalid_paths[@]}" "${#root_alias_paths[@]}" "${proof_calendar_case_count}" "${proof_calendar_invalid_case_count}"
 fi
