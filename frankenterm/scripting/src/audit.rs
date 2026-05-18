@@ -5,7 +5,7 @@
 //! function name, arguments summary, and result (ok/denied/error).
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 /// Outcome of a host function call.
@@ -51,6 +51,16 @@ impl AuditTrail {
         }
     }
 
+    fn entries_guard(&self) -> MutexGuard<'_, VecDeque<AuditEntry>> {
+        match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.entries.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Record a host function call.
     pub fn record(
         &self,
@@ -59,6 +69,10 @@ impl AuditTrail {
         args_summary: &str,
         outcome: AuditOutcome,
     ) {
+        if self.capacity == 0 {
+            return;
+        }
+
         let entry = AuditEntry {
             elapsed: self.epoch.elapsed(),
             extension_id: extension_id.to_string(),
@@ -67,49 +81,39 @@ impl AuditTrail {
             outcome,
         };
 
-        if let Ok(mut entries) = self.entries.lock() {
-            if entries.len() >= self.capacity {
-                entries.pop_front();
-            }
-            entries.push_back(entry);
+        let mut entries = self.entries_guard();
+        if entries.len() >= self.capacity {
+            entries.pop_front();
         }
+        entries.push_back(entry);
     }
 
     /// Retrieve recent audit entries (newest last).
     pub fn recent(&self, limit: usize) -> Vec<AuditEntry> {
-        let entries = match self.entries.lock() {
-            Ok(e) => e,
-            Err(_) => return vec![],
-        };
+        let entries = self.entries_guard();
         let skip = entries.len().saturating_sub(limit);
         entries.iter().skip(skip).cloned().collect()
     }
 
     /// Count entries matching the given extension id.
     pub fn count_for_extension(&self, extension_id: &str) -> usize {
-        match self.entries.lock() {
-            Ok(entries) => entries
-                .iter()
-                .filter(|e| e.extension_id == extension_id)
-                .count(),
-            Err(_) => 0,
-        }
+        self.entries_guard()
+            .iter()
+            .filter(|e| e.extension_id == extension_id)
+            .count()
     }
 
     /// Count denied calls.
     pub fn denied_count(&self) -> usize {
-        match self.entries.lock() {
-            Ok(entries) => entries
-                .iter()
-                .filter(|e| matches!(e.outcome, AuditOutcome::Denied(_)))
-                .count(),
-            Err(_) => 0,
-        }
+        self.entries_guard()
+            .iter()
+            .filter(|e| matches!(e.outcome, AuditOutcome::Denied(_)))
+            .count()
     }
 
     /// Total number of entries currently stored.
     pub fn len(&self) -> usize {
-        self.entries.lock().map(|e| e.len()).unwrap_or(0)
+        self.entries_guard().len()
     }
 
     /// Whether the audit trail is empty.
@@ -173,6 +177,16 @@ mod tests {
     }
 
     #[test]
+    fn zero_capacity_never_records_entries() {
+        let trail = AuditTrail::new(0);
+        trail.record("ext", "fn", "", AuditOutcome::Ok);
+        assert_eq!(trail.len(), 0);
+        assert!(trail.recent(10).is_empty());
+        assert_eq!(trail.count_for_extension("ext"), 0);
+        assert_eq!(trail.denied_count(), 0);
+    }
+
+    #[test]
     fn count_for_extension() {
         let trail = AuditTrail::new(100);
         trail.record("ext-a", "fn1", "", AuditOutcome::Ok);
@@ -222,6 +236,35 @@ mod tests {
         assert!(trail.is_empty());
         assert_eq!(trail.len(), 0);
         assert!(trail.recent(10).is_empty());
+    }
+
+    #[test]
+    fn entries_buffer_recovers_after_poisoned_lock() {
+        let trail = AuditTrail::new(10);
+        trail.record("ext-before", "fn", "", AuditOutcome::Ok);
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = trail.entries.lock().unwrap();
+            panic!("poison audit trail entries");
+        }));
+        assert!(poison_result.is_err());
+        assert!(trail.entries.is_poisoned());
+
+        trail.record(
+            "ext-after",
+            "ft_get_pane_text",
+            "0, 100",
+            AuditOutcome::Denied("no_pane_access".to_string()),
+        );
+        assert!(!trail.entries.is_poisoned());
+        assert_eq!(trail.len(), 2);
+        assert_eq!(trail.count_for_extension("ext-after"), 1);
+        assert_eq!(trail.denied_count(), 1);
+
+        let recent = trail.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].extension_id, "ext-before");
+        assert_eq!(recent[1].extension_id, "ext-after");
     }
 
     // ===================================================================
