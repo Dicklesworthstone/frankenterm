@@ -3,12 +3,13 @@ use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
 use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
 use smithay_client_toolkit::data_device_manager::WritePipe;
 use smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice;
+use std::sync::MutexGuard;
 use wayland_client::protocol::wl_data_device_manager::DndAction;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::Proxy;
 
 use crate::wayland::drag_and_drop::SurfaceAndOffer;
-use crate::wayland::pointer::PointerUserData;
+use crate::wayland::pointer::{PointerState, PointerUserData};
 use crate::wayland::SurfaceUserData;
 
 use super::copy_and_paste::write_selection_to_pipe;
@@ -17,6 +18,29 @@ use super::state::WaylandState;
 
 pub(super) const TEXT_MIME_TYPE: &str = "text/plain;charset=utf-8";
 pub(super) const URI_MIME_TYPE: &str = "text/uri-list";
+
+fn pointer_state_for_data_device<'a>(
+    state: &'a mut WaylandState,
+    event_name: &str,
+) -> Option<MutexGuard<'a, PointerState>> {
+    let Some(pointer) = state.pointer.as_mut() else {
+        log::warn!("Wayland data-device {event_name} event arrived without a pointer");
+        return None;
+    };
+
+    let Some(pointer_data) = pointer.pointer().data::<PointerUserData>() else {
+        log::warn!("Wayland data-device {event_name} event arrived without pointer user data");
+        return None;
+    };
+
+    match pointer_data.state.lock() {
+        Ok(state) => Some(state),
+        Err(poisoned) => {
+            log::error!("Wayland pointer state lock was poisoned during data-device {event_name}");
+            Some(poisoned.into_inner())
+        }
+    }
+}
 
 impl DataDeviceHandler for WaylandState {
     fn enter(
@@ -36,7 +60,10 @@ impl DataDeviceHandler for WaylandState {
             }
         };
 
-        let offer = data.drag_offer().unwrap();
+        let Some(offer) = data.drag_offer() else {
+            log::trace!("Wayland data-device enter without drag offer; ignoring internal drag");
+            return;
+        };
 
         offer.with_mime_types(|mime_types| {
             log::trace!(
@@ -52,14 +79,9 @@ impl DataDeviceHandler for WaylandState {
 
         offer.set_actions(DndAction::None | DndAction::Copy, DndAction::None);
 
-        let pointer = self.pointer.as_mut().unwrap();
-        let mut pstate = pointer
-            .pointer()
-            .data::<PointerUserData>()
-            .unwrap()
-            .state
-            .lock()
-            .unwrap();
+        let Some(mut pstate) = pointer_state_for_data_device(self, "enter") else {
+            return;
+        };
 
         let window_id = SurfaceUserData::from_wl(&offer.surface).window_id;
 
@@ -72,14 +94,9 @@ impl DataDeviceHandler for WaylandState {
         _qh: &wayland_client::QueueHandle<Self>,
         _data_device: &WlDataDevice,
     ) {
-        let pointer = self.pointer.as_mut().unwrap();
-        let mut pstate = pointer
-            .pointer()
-            .data::<PointerUserData>()
-            .unwrap()
-            .state
-            .lock()
-            .unwrap();
+        let Some(mut pstate) = pointer_state_for_data_device(self, "leave") else {
+            return;
+        };
         if let Some(SurfaceAndOffer { offer, .. }) = pstate.drag_and_drop.offer.take() {
             offer.destroy();
         }
@@ -124,14 +141,9 @@ impl DataDeviceHandler for WaylandState {
         _qh: &wayland_client::QueueHandle<Self>,
         _data_device: &WlDataDevice,
     ) {
-        let pointer = self.pointer.as_mut().unwrap();
-        let mut pstate = pointer
-            .pointer()
-            .data::<PointerUserData>()
-            .unwrap()
-            .state
-            .lock()
-            .unwrap();
+        let Some(mut pstate) = pointer_state_for_data_device(self, "drop_performed") else {
+            return;
+        };
         let drag_and_drop = &mut pstate.drag_and_drop;
         if let Some(SurfaceAndPipe { window_id, read }) = drag_and_drop.create_pipe_for_drop() {
             let spawn_result = std::thread::Builder::new()
