@@ -7,7 +7,7 @@ use frankenterm_dynamic::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 struct LoadedExtension {
     engine_index: usize,
@@ -60,6 +60,25 @@ impl ScriptingDispatcher {
         std::iter::once(self.config_engine)
             .chain((0..self.engines.len()).filter(move |idx| *idx != self.config_engine))
     }
+
+    fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, registry: &str) -> MutexGuard<'a, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("recovering poisoned scripting dispatcher {registry} registry lock");
+                mutex.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn hook_registrations_guard(&self) -> MutexGuard<'_, HashMap<HookId, Vec<(usize, HookId)>>> {
+        Self::lock_or_recover(&self.hook_registrations, "hook")
+    }
+
+    fn loaded_extensions_guard(&self) -> MutexGuard<'_, HashMap<ExtensionId, LoadedExtension>> {
+        Self::lock_or_recover(&self.loaded_extensions, "extension")
+    }
 }
 
 impl ScriptingEngine for ScriptingDispatcher {
@@ -101,20 +120,13 @@ impl ScriptingEngine for ScriptingDispatcher {
         }
 
         let hook_id = self.next_hook_id.fetch_add(1, Ordering::Relaxed);
-        self.hook_registrations
-            .lock()
-            .map_err(|_| anyhow!("hook registry lock poisoned"))?
+        self.hook_registrations_guard()
             .insert(hook_id, registrations);
         Ok(hook_id)
     }
 
     fn unregister_hook(&self, id: HookId) -> Result<()> {
-        let Some(registrations) = self
-            .hook_registrations
-            .lock()
-            .map_err(|_| anyhow!("hook registry lock poisoned"))?
-            .remove(&id)
-        else {
+        let Some(registrations) = self.hook_registrations_guard().remove(&id) else {
             return Ok(());
         };
 
@@ -161,16 +173,13 @@ impl ScriptingEngine for ScriptingDispatcher {
             match self.engines[idx].load_extension(manifest) {
                 Ok(engine_extension_id) => {
                     let extension_id = self.next_extension_id.fetch_add(1, Ordering::Relaxed);
-                    self.loaded_extensions
-                        .lock()
-                        .map_err(|_| anyhow!("extension registry lock poisoned"))?
-                        .insert(
-                            extension_id,
-                            LoadedExtension {
-                                engine_index: idx,
-                                engine_extension_id,
-                            },
-                        );
+                    self.loaded_extensions_guard().insert(
+                        extension_id,
+                        LoadedExtension {
+                            engine_index: idx,
+                            engine_extension_id,
+                        },
+                    );
                     return Ok(extension_id);
                 }
                 Err(err) => errors.push(format!("{}: {err:#}", self.engines[idx].engine_name())),
@@ -187,9 +196,7 @@ impl ScriptingEngine for ScriptingDispatcher {
 
     fn unload_extension(&self, id: ExtensionId) -> Result<()> {
         let loaded = self
-            .loaded_extensions
-            .lock()
-            .map_err(|_| anyhow!("extension registry lock poisoned"))?
+            .loaded_extensions_guard()
             .remove(&id)
             .ok_or_else(|| anyhow!("unknown extension id {id}"))?;
 
@@ -394,6 +401,44 @@ mod tests {
     }
 
     #[test]
+    fn hook_registry_recovers_after_poisoned_lock() {
+        let engine = Arc::new(MockEngine::new(
+            "mock",
+            Ok(Value::Null),
+            false,
+            EngineCapabilities::default(),
+        ));
+        let dispatcher = ScriptingDispatcher::new(vec![engine], 0).unwrap();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dispatcher.hook_registrations.lock().unwrap();
+            panic!("poison dispatcher hook registry");
+        }));
+        assert!(poison_result.is_err());
+        assert!(dispatcher.hook_registrations.is_poisoned());
+
+        let handler = HookHandler::new(0, Some("pane-output".to_string()), |_event, payload| {
+            Ok(vec![Action::Custom {
+                name: "recovered".to_string(),
+                payload: payload.clone(),
+            }])
+        });
+        let hook_id = dispatcher.register_hook("pane-output", handler).unwrap();
+        assert!(!dispatcher.hook_registrations.is_poisoned());
+
+        let actions = dispatcher
+            .fire_event("pane-output", &Value::String("line".to_string()))
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+
+        dispatcher.unregister_hook(hook_id).unwrap();
+        let actions_after_unreg = dispatcher
+            .fire_event("pane-output", &Value::String("line".to_string()))
+            .unwrap();
+        assert!(actions_after_unreg.is_empty());
+    }
+
+    #[test]
     fn load_extension_falls_back_when_primary_rejects() {
         let primary = Arc::new(MockEngine::new(
             "lua",
@@ -418,6 +463,35 @@ mod tests {
             .unwrap();
 
         dispatcher.unload_extension(extension_id).unwrap();
+    }
+
+    #[test]
+    fn extension_registry_recovers_after_poisoned_lock() {
+        let engine = Arc::new(MockEngine::new(
+            "mock",
+            Ok(Value::Null),
+            false,
+            EngineCapabilities::default(),
+        ));
+        let dispatcher = ScriptingDispatcher::new(vec![engine.clone()], 0).unwrap();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dispatcher.loaded_extensions.lock().unwrap();
+            panic!("poison dispatcher extension registry");
+        }));
+        assert!(poison_result.is_err());
+        assert!(dispatcher.loaded_extensions.is_poisoned());
+
+        let manifest = ExtensionManifest {
+            id: "example".to_string(),
+            version: "1.0.0".to_string(),
+            ..ExtensionManifest::default()
+        };
+        let extension_id = dispatcher.load_extension(&manifest).unwrap();
+        assert!(!dispatcher.loaded_extensions.is_poisoned());
+
+        dispatcher.unload_extension(extension_id).unwrap();
+        assert!(engine.loaded_extensions.lock().unwrap().is_empty());
     }
 
     #[test]
