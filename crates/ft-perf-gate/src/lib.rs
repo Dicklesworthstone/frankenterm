@@ -3,9 +3,9 @@
 //! This crate is intentionally small and leaf-clean. It supplies shared data
 //! contracts for the statistical proof gates tracked by `ft-tf6g3.30`:
 //! sequential regression decisions, conformal SLO bands, KL-divergence regime
-//! shift checks, and causal attribution. The downstream leaves can replace the
-//! placeholder algorithms with fuller implementations without changing the
-//! evidence stream or telemetry event shape.
+//! shift checks, and causal attribution. Downstream leaves can compose or
+//! extend the gate implementations without changing the evidence stream or
+//! telemetry event shape.
 //!
 //! ```
 //! use ft_perf_gate::{EvidenceSample, EvidenceStream, GateDecision, VecEvidenceStream};
