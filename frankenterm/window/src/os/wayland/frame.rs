@@ -4,14 +4,15 @@
 
 use crate::os::wayland::pointer::make_theme_manager;
 use config::{ConfigHandle, RgbaColor, WindowFrameConfig};
+use frankenterm_font::{FontConfiguration, FontMetrics, GlyphInfo, RasterizedGlyph};
 use smithay_client_toolkit::output::{add_output_listener, with_output_info, OutputListener};
 use smithay_client_toolkit::seat::pointer::{ThemeManager, ThemedPointer};
 use smithay_client_toolkit::shm::DoubleMemPool;
 use smithay_client_toolkit::window::{ButtonState, Frame, FrameRequest, State, WindowState};
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use tiny_skia::{
     ColorU8, FillRule, Paint, PathBuilder, PixmapMut, PixmapPaint, PixmapRef, Rect, Stroke,
     Transform,
@@ -22,7 +23,6 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Attached, DispatchData, Main};
 use wezterm_color_types::SrgbaTuple;
-use frankenterm_font::{FontConfiguration, FontMetrics, GlyphInfo, RasterizedGlyph};
 use wezterm_input_types::WindowDecorations;
 
 fn color_to_paint(c: RgbaColor) -> Paint<'static> {
@@ -128,13 +128,11 @@ impl SurfaceUserData {
             my_callback.set(|| cb.clone());
         }
         let listener = add_output_listener(&output, move |output, info, ddata| {
-            let mut user_data = my_surface
-                .as_ref()
-                .user_data()
-                .get::<Mutex<SurfaceUserData>>()
-                .unwrap()
-                .lock()
-                .unwrap();
+            let Some(mut user_data) =
+                lock_surface_user_data(my_surface.as_ref(), "updating output scale factor")
+            else {
+                return;
+            };
             // update the scale factor of the relevant output
             for (ref o, ref mut factor, _) in user_data.outputs.iter_mut() {
                 if o.as_ref().equals(output.as_ref()) {
@@ -187,17 +185,28 @@ impl SurfaceUserData {
 }
 
 /// Returns the current suggested scale factor of a surface.
-///
-/// Panics if the surface was not created using `create_surface`
 fn get_surface_scale_factor(surface: &wl_surface::WlSurface) -> i32 {
-    surface
-        .as_ref()
-        .user_data()
-        .get::<Mutex<SurfaceUserData>>()
-        .expect("SCTK: Surface was not created by SCTK.")
-        .lock()
-        .unwrap()
-        .scale_factor
+    lock_surface_user_data(surface, "reading surface scale factor")
+        .map(|user_data| user_data.scale_factor)
+        .unwrap_or(1)
+}
+
+fn lock_surface_user_data<'a>(
+    surface: &'a wl_surface::WlSurface,
+    context: &str,
+) -> Option<MutexGuard<'a, SurfaceUserData>> {
+    let Some(user_data) = surface.as_ref().user_data().get::<Mutex<SurfaceUserData>>() else {
+        log::warn!("Wayland frame surface user data missing while {context}");
+        return None;
+    };
+
+    match user_data.lock() {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            log::warn!("Wayland frame surface user data lock poisoned while {context}; recovering");
+            Some(err.into_inner())
+        }
+    }
 }
 
 fn setup_surface<F>(
@@ -209,13 +218,11 @@ where
 {
     let callback = callback.map(|c| Rc::new(RefCell::new(c)));
     surface.quick_assign(move |surface, event, ddata| {
-        let mut user_data = surface
-            .as_ref()
-            .user_data()
-            .get::<Mutex<SurfaceUserData>>()
-            .unwrap()
-            .lock()
-            .unwrap();
+        let Some(mut user_data) =
+            lock_surface_user_data(surface.as_ref(), "handling surface frame event")
+        else {
+            return;
+        };
         match event {
             wl_surface::Event::Enter { output } => {
                 // Passing the callback to be added to output listener
@@ -294,6 +301,49 @@ struct PointerUserData {
     location: Location,
     position: (f64, f64),
     seat: wl_seat::WlSeat,
+}
+
+fn pointer_user_data<'a>(
+    pointer: &'a ThemedPointer,
+    context: &str,
+) -> Option<&'a RefCell<PointerUserData>> {
+    let Some(user_data) = pointer
+        .as_ref()
+        .user_data()
+        .get::<RefCell<PointerUserData>>()
+    else {
+        log::warn!("Wayland frame pointer user data missing while {context}");
+        return None;
+    };
+    Some(user_data)
+}
+
+fn borrow_pointer_user_data<'a>(
+    user_data: &'a RefCell<PointerUserData>,
+    context: &str,
+) -> Option<Ref<'a, PointerUserData>> {
+    match user_data.try_borrow() {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            log::warn!(
+                "Wayland frame pointer user data already mutably borrowed while {context}: {err}"
+            );
+            None
+        }
+    }
+}
+
+fn borrow_pointer_user_data_mut<'a>(
+    user_data: &'a RefCell<PointerUserData>,
+    context: &str,
+) -> Option<RefMut<'a, PointerUserData>> {
+    match user_data.try_borrow_mut() {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            log::warn!("Wayland frame pointer user data already borrowed while {context}: {err}");
+            None
+        }
+    }
 }
 
 /*
@@ -582,9 +632,19 @@ impl Frame for ConceptFrame {
         let pointer = self.themer.theme_pointer_with_impl(
             seat,
             move |event, pointer: ThemedPointer, ddata: DispatchData| {
-                let data: &RefCell<PointerUserData> = pointer.as_ref().user_data().get().unwrap();
-                let mut data = data.borrow_mut();
-                let mut inner = inner.borrow_mut();
+                let Some(data) = pointer_user_data(&pointer, "handling themed pointer event")
+                else {
+                    return;
+                };
+                let Some(mut data) =
+                    borrow_pointer_user_data_mut(data, "handling themed pointer event")
+                else {
+                    return;
+                };
+                let Ok(mut inner) = inner.try_borrow_mut() else {
+                    log::warn!("Wayland frame inner state already borrowed while handling themed pointer event");
+                    return;
+                };
                 match event {
                     Event::Enter {
                         serial,
@@ -668,12 +728,15 @@ impl Frame for ConceptFrame {
 
     fn remove_seat(&mut self, seat: &wl_seat::WlSeat) {
         self.pointers.retain(|pointer| {
-            let user_data = pointer
-                .as_ref()
-                .user_data()
-                .get::<RefCell<PointerUserData>>()
-                .unwrap();
-            let guard = user_data.borrow_mut();
+            let Some(user_data) = pointer_user_data(pointer, "removing themed pointer seat") else {
+                pointer.release();
+                return false;
+            };
+            let Some(guard) =
+                borrow_pointer_user_data_mut(user_data, "removing themed pointer seat")
+            else {
+                return true;
+            };
             if &guard.seat == seat {
                 pointer.release();
                 false
@@ -893,14 +956,16 @@ impl Frame for ConceptFrame {
                         &self
                             .pointers
                             .iter()
-                            .flat_map(|p| {
-                                if p.as_ref().is_alive() {
-                                    let data: &RefCell<PointerUserData> =
-                                        p.as_ref().user_data().get().unwrap();
-                                    Some(data.borrow().location)
-                                } else {
-                                    None
+                            .filter_map(|p| {
+                                if !p.as_ref().is_alive() {
+                                    return None;
                                 }
+                                let data = pointer_user_data(p, "drawing Wayland frame buttons")?;
+                                let data = borrow_pointer_user_data(
+                                    data,
+                                    "drawing Wayland frame buttons",
+                                )?;
+                                Some(data.location)
                             })
                             .collect::<Vec<Location>>(),
                         &self.config,
