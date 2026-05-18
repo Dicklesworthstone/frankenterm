@@ -80,11 +80,12 @@ impl WglWrapper {
 
         let mut state = GlState::create_basic(WglWrapper::create()?, hwnd)?;
 
-        unsafe {
-            state.make_current();
-        }
+        state.make_current_checked()?;
 
-        let _ = state.wgl.as_mut().unwrap().load_ext();
+        let Some(wgl) = state.wgl.as_mut() else {
+            anyhow::bail!("WGL wrapper unavailable while probing extensions");
+        };
+        let _ = wgl.load_ext();
 
         state.make_not_current();
 
@@ -93,12 +94,16 @@ impl WglWrapper {
 
     fn create() -> anyhow::Result<Self> {
         if crate::configuration::prefer_swrast() {
-            let mesa_dir = std::env::current_exe()
-                .unwrap()
+            let exe_path = std::env::current_exe()
+                .map_err(|err| anyhow::anyhow!("failed to resolve current executable: {err}"))?;
+            let exe_dir = exe_path
                 .parent()
-                .unwrap()
-                .join("mesa");
-            let mesa_dir = wide_string(mesa_dir.to_str().unwrap());
+                .ok_or_else(|| anyhow::anyhow!("current executable has no parent directory"))?;
+            let mesa_dir = exe_dir.join("mesa");
+            let mesa_dir = mesa_dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Mesa DLL directory is not valid UTF-8"))?;
+            let mesa_dir = wide_string(mesa_dir);
 
             unsafe {
                 AddDllDirectory(mesa_dir.as_ptr());
@@ -181,6 +186,28 @@ fn current_client_rect(hdc: HDC) -> Option<RECT> {
     }
 }
 
+fn get_window_dc(window: HWND, operation: &str) -> anyhow::Result<HDC> {
+    let hdc = unsafe { GetDC(window) };
+    if hdc.is_null() {
+        anyhow::bail!(
+            "{operation}: GetDC returned null: {}",
+            IoError::last_os_error()
+        );
+    }
+    Ok(hdc)
+}
+
+fn wgl_extension_string(data: *const i8, operation: &str) -> String {
+    if data.is_null() {
+        log::warn!("{operation} returned a null WGL extension string");
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(data) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 impl GlState {
     fn into_wrapper(mut self) -> WglWrapper {
         self.delete();
@@ -191,17 +218,14 @@ impl GlState {
         let wgl = WglWrapper::load()?;
 
         if let Some(ext) = wgl.ext.as_ref() {
-            let hdc = unsafe { GetDC(window) };
-
-            fn cstr(data: *const i8) -> String {
-                let data = unsafe { CStr::from_ptr(data).to_bytes().to_vec() };
-                String::from_utf8(data).unwrap()
-            }
+            let hdc = get_window_dc(window, "querying WGL extensions")?;
 
             let extensions = if ext.GetExtensionsStringARB.is_loaded() {
-                unsafe { cstr(ext.GetExtensionsStringARB(hdc as *const _)) }
+                let data = unsafe { ext.GetExtensionsStringARB(hdc as *const _) };
+                wgl_extension_string(data, "wglGetExtensionsStringARB")
             } else if ext.GetExtensionsStringEXT.is_loaded() {
-                unsafe { cstr(ext.GetExtensionsStringEXT()) }
+                let data = unsafe { ext.GetExtensionsStringEXT() };
+                wgl_extension_string(data, "wglGetExtensionsStringEXT")
             } else {
                 "".to_owned()
             };
@@ -228,6 +252,10 @@ impl GlState {
 
     fn create_ext(wgl: WglWrapper, extensions: String, hdc: HDC) -> anyhow::Result<Self> {
         use ffiextra::*;
+        let ext = wgl
+            .ext
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WGL extension table unavailable"))?;
 
         let mut attribs: Vec<i32> = vec![
             DRAW_TO_WINDOW_ARB as i32,
@@ -268,7 +296,7 @@ impl GlState {
         let mut num_formats = 0;
 
         let res = unsafe {
-            wgl.ext.as_ref().unwrap().ChoosePixelFormatARB(
+            ext.ChoosePixelFormatARB(
                 hdc as _,
                 attribs.as_ptr(),
                 null(),
@@ -328,12 +356,7 @@ impl GlState {
         }
         attribs.push(0);
 
-        let rc = unsafe {
-            wgl.ext
-                .as_ref()
-                .unwrap()
-                .CreateContextAttribsARB(hdc as _, null(), attribs.as_ptr())
-        };
+        let rc = unsafe { ext.CreateContextAttribsARB(hdc as _, null(), attribs.as_ptr()) };
 
         if rc.is_null() {
             let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
@@ -344,19 +367,17 @@ impl GlState {
             );
         }
 
-        unsafe {
-            wgl.wgl.MakeCurrent(hdc as *mut _, rc);
-        }
-
-        Ok(Self {
+        let state = Self {
             wgl: Some(wgl),
             rc,
             hdc,
-        })
+        };
+        state.make_current_checked()?;
+        Ok(state)
     }
 
     fn create_basic(wgl: WglWrapper, window: HWND) -> anyhow::Result<Self> {
-        let hdc = unsafe { GetDC(window) };
+        let hdc = get_window_dc(window, "creating basic WGL context")?;
 
         let pfd = PIXELFORMATDESCRIPTOR {
             nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
@@ -387,20 +408,36 @@ impl GlState {
             dwDamageMask: 0,
         };
         let format = unsafe { ChoosePixelFormat(hdc, &pfd) };
-        unsafe {
-            SetPixelFormat(hdc, format, &pfd);
+        if format == 0 {
+            anyhow::bail!(
+                "ChoosePixelFormat failed while creating basic WGL context: {}",
+                IoError::last_os_error()
+            );
+        }
+
+        let res = unsafe { SetPixelFormat(hdc, format, &pfd) };
+        if res == 0 {
+            anyhow::bail!(
+                "SetPixelFormat failed while creating basic WGL context: {}",
+                IoError::last_os_error()
+            );
         }
 
         let rc = unsafe { wgl.wgl.CreateContext(hdc as *mut _) };
-        unsafe {
-            wgl.wgl.MakeCurrent(hdc as *mut _, rc);
+        if rc.is_null() {
+            anyhow::bail!(
+                "CreateContext failed while creating basic WGL context: {}",
+                IoError::last_os_error()
+            );
         }
 
-        Ok(Self {
+        let state = Self {
             wgl: Some(wgl),
             rc,
             hdc,
-        })
+        };
+        state.make_current_checked()?;
+        Ok(state)
     }
 
     fn make_not_current(&self) {
@@ -418,6 +455,17 @@ impl GlState {
                 wgl.wgl.DeleteContext(self.rc);
             }
         }
+    }
+
+    fn make_current_checked(&self) -> anyhow::Result<()> {
+        let Some(wgl) = self.wgl.as_ref() else {
+            anyhow::bail!("WGL wrapper unavailable while making context current");
+        };
+        let res = unsafe { wgl.wgl.MakeCurrent(self.hdc as *mut _, self.rc) };
+        if res == 0 {
+            anyhow::bail!("wglMakeCurrent failed: {}", IoError::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -449,22 +497,15 @@ unsafe impl glium::backend::Backend for GlState {
 
     unsafe fn get_proc_address(&self, symbol: &str) -> *const c_void {
         let sym_name = std::ffi::CString::new(symbol).expect("symbol to be cstring compatible");
-        if let Ok(sym) = self
-            .wgl
-            .as_ref()
-            .unwrap()
-            .lib
-            .get(sym_name.as_bytes_with_nul())
-        {
+        let Some(wgl) = self.wgl.as_ref() else {
+            log::error!("WGL wrapper unavailable while resolving {symbol}");
+            return null();
+        };
+        if let Ok(sym) = wgl.lib.get(sym_name.as_bytes_with_nul()) {
             //eprintln!("{} -> {:?}", symbol, sym);
             return *sym;
         }
-        let res = self
-            .wgl
-            .as_ref()
-            .unwrap()
-            .wgl
-            .GetProcAddress(sym_name.as_ptr()) as *const c_void;
+        let res = wgl.wgl.GetProcAddress(sym_name.as_ptr()) as *const c_void;
         // eprintln!("{} -> {:?}", symbol, res);
         res
     }
@@ -476,21 +517,24 @@ unsafe impl glium::backend::Backend for GlState {
     }
 
     fn is_current(&self) -> bool {
-        unsafe { self.wgl.as_ref().unwrap().wgl.GetCurrentContext() == self.rc }
+        self.wgl
+            .as_ref()
+            .map(|wgl| unsafe { wgl.wgl.GetCurrentContext() == self.rc })
+            .unwrap_or(false)
     }
 
     unsafe fn make_current(&self) {
-        self.wgl
-            .as_ref()
-            .unwrap()
-            .wgl
-            .MakeCurrent(self.hdc as *mut _, self.rc);
+        if let Err(err) = self.make_current_checked() {
+            log::error!("unable to make WGL context current: {err}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::client_rect_dimensions;
+    use super::{client_rect_dimensions, wgl_extension_string};
+    use std::ffi::CString;
+    use std::ptr::null;
     use winapi::shared::windef::RECT;
 
     #[test]
@@ -516,6 +560,20 @@ mod tests {
                 bottom: 1,
             }),
             (0, 0)
+        );
+    }
+
+    #[test]
+    fn wgl_extension_string_handles_null_pointer() {
+        assert_eq!(wgl_extension_string(null(), "test extension query"), "");
+    }
+
+    #[test]
+    fn wgl_extension_string_reads_valid_c_string() {
+        let extensions = CString::new("WGL_ARB_pixel_format WGL_EXT_framebuffer_sRGB").unwrap();
+        assert_eq!(
+            wgl_extension_string(extensions.as_ptr(), "test extension query"),
+            "WGL_ARB_pixel_format WGL_EXT_framebuffer_sRGB"
         );
     }
 }
