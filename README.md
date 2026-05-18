@@ -890,7 +890,7 @@ The mission objective planner reads the requested objective, queries the operati
 ft rules list                            # list detection rules
 ft rules test "Usage limit reached"      # test text against rules
 ft rules show codex.usage_reached        # show rule details
-ft rules lint --fixtures --strict        # validate the pack (naming + regex safety + fixture coverage)
+ft robot rules lint --fixtures --strict  # validate the pack (naming + regex safety + fixture coverage)
 ```
 
 ### Audit & approvals
@@ -1704,7 +1704,7 @@ text chunk
 
 - **Bloom prefilter rejects most chunks for zero cost.** A pack with 100 rules has 100–500 anchor strings; the Bloom filter computes ~8 hashes per chunk and rejects when none match.
 - **Aho-Corasick is O(n)** in chunk length regardless of pattern count. Anchors are exact substrings, so AC is the right tool; regexes are deferred to candidates only.
-- **Regex evaluation is per-rule, with timeout guards.** The substrate audit closed the regex-ReDoS class via `ft rules lint --strict`, which warns on nested wildcards, excessive length (>500 chars), and consecutive spaces.
+- **Regex evaluation is per-rule, with timeout guards.** The substrate audit closed the regex-ReDoS class via `ft robot rules lint --strict`, which warns on nested wildcards, excessive length (>500 chars), and consecutive spaces.
 - **Dedup context** prevents the same trigger from firing twice when output is repeated within a configurable window (the rate-limit retry-duration regex was recently tightened to anchor near rate-limit markers, reducing false positives; see CHANGELOG 2026-04-26).
 
 ### Cross-chunk subtlety
@@ -1720,11 +1720,11 @@ A "rule pack" is a versioned, named collection of detection rules. The default p
 - `pattern` (regex confirming the match; only run if anchors fire)
 - `severity` (info / warn / critical)
 - `agent_type` (codex / claude_code / gemini / wezterm / custom; must align with the `id` prefix)
-- `fixture_paths` (optional; corpus fixtures used by `ft rules lint --fixtures` to detect pack drift)
+- `fixture_paths` (optional; corpus fixtures used by `ft robot rules lint --fixtures` to detect pack drift)
 
 ### Linter checks
 
-`ft rules lint --fixtures --strict` enforces:
+`ft robot rules lint --fixtures --strict` enforces:
 
 - **Naming** — IDs start with `codex.`, `claude_code.`, `gemini.`, or `wezterm.`
 - **Agent-type alignment** — Rule ID prefix matches its `agent_type` field
@@ -3329,7 +3329,7 @@ Follow the rule-drift workflow:
 2. Add fixture under `crates/frankenterm-core/tests/corpus/<agent>/<event>.txt`
 3. `cargo test corpus_fixtures_match_expected` to see the diff
 4. Update rule anchors/regex
-5. `ft rules lint --fixtures --strict` to validate
+5. `ft robot rules lint --fixtures --strict` to validate
 6. Commit fixture + rule changes together
 
 ### "I need to swap to a different rule pack temporarily"
@@ -3415,7 +3415,7 @@ When agent output patterns change (new versions, updated prompts), follow this f
    ```
 3. **Test and iterate**: `cargo test corpus_fixtures_match_expected`
 4. **Update rule**: modify anchors/regex in the pack definition until the test passes
-5. **Validate**: `ft rules lint --fixtures --strict`
+5. **Validate**: `ft robot rules lint --fixtures --strict`
 6. **Ship**: commit the fixture and rule changes together
 
 ---
@@ -3944,7 +3944,7 @@ regex = "FATAL ERROR:.*"            # optional confirming regex
 description = "Application-level fatal error in agent output."
 ```
 
-Validate with `ft rules test "FATAL ERROR: database connection lost"` and lint with `ft rules lint --fixtures --strict`. See the [`crates/frankenterm-core/src/patterns.rs`](crates/frankenterm-core/src/patterns.rs) `RuleDef` struct for the full optional-field surface (`remediation`, `workflow`, `manual_fix`, `preview_command`, `learn_more_url`).
+Validate with `ft rules test "FATAL ERROR: database connection lost"` and lint with `ft robot rules lint --fixtures --strict`. See the [`crates/frankenterm-core/src/patterns.rs`](crates/frankenterm-core/src/patterns.rs) `RuleDef` struct for the full optional-field surface (`remediation`, `workflow`, `manual_fix`, `preview_command`, `learn_more_url`).
 
 ### What's the performance overhead?
 
