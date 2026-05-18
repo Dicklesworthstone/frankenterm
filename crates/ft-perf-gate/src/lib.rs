@@ -40,9 +40,7 @@ pub use causal_attribution::{
 };
 pub use conformal::{ConformalBand, ConformalConfig};
 pub use regime_shift::{RegimeShiftConfig, RegimeShiftReport};
-pub use snc::{
-    HillEstimate, MgfServiceCurve, SncBound, SncConfig, compute_snc_bound, hill_estimate,
-};
+pub use snc::{HillEstimate, SncBound, SncConfig, compute_snc_bound, hill_estimate};
 pub use sprt::{SprtConfig, SprtReport};
 
 /// Schema marker for per-claim evidence samples consumed by proof gates.

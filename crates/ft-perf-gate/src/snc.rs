@@ -1,18 +1,17 @@
-//! Stochastic Network Calculus (SNC) bounds for heavy-tail arrivals.
+//! Stochastic heavy-tail delay bounds for observed latency samples.
 //!
 //! G38 (`ft-tf6g3.23`). Classical deterministic network calculus (the
 //! Lindley-equation machinery in `latency_stages.rs` / `network_calculus_bound.rs`)
 //! produces vacuous bounds when arrivals are heavy-tail (Pareto α<2), because
-//! the moment-generating function of the arrival process is infinite. SNC
-//! (Jiang 2008; Ciucu 2007) extends to MGF-bounded envelopes that give
-//! finite probabilistic bounds in this regime.
+//! the moment-generating function of the arrival process is infinite. This
+//! module handles the already-observed latency-sample case by fitting a Pareto
+//! tail to the measured delays and returning the requested high quantile.
 //!
 //! This module provides:
 //!
-//! - [`HillEstimator`] for estimating the tail index α from a sample slice
-//! - [`MgfEnvelope`] and [`MgfServiceCurve`] for the MGF-based arrival /
-//!   service envelopes
-//! - [`compute_snc_bound`] computing a p-confidence end-to-end delay bound
+//! - [`HillEstimate`] and [`hill_estimate`] for estimating the tail index α
+//!   from a sample slice
+//! - [`compute_snc_bound`] for computing a p-confidence observed-delay bound
 //!
 //! For light-tail (α ≥ 2) inputs, the deriver returns
 //! [`SncBound::LindleyDomain`] so callers can fall back to the cheaper
@@ -99,24 +98,6 @@ pub fn hill_estimate(samples: &[f64], k: usize) -> HillEstimate {
     HillEstimate { alpha, k, stderr }
 }
 
-/// One-stage MGF-bounded service curve under SNC.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MgfServiceCurve {
-    /// Long-run service rate (units consistent with arrival).
-    pub rate: f64,
-    /// Service-curve burst tolerance.
-    pub burst: f64,
-}
-
-/// One-stage MGF-bounded arrival envelope under SNC.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MgfArrivalEnvelope {
-    /// Estimated long-run arrival rate.
-    pub rate: f64,
-    /// Estimated tail index alpha. Used to choose the MGF parameter.
-    pub tail_alpha: f64,
-}
-
 /// SNC bound output. Either a finite probabilistic bound or an
 /// out-of-domain marker that punts to the deterministic Lindley path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -167,11 +148,6 @@ pub struct SncConfig {
     /// heavy-tail vs known-light-tail discrimination at the bound-quality
     /// level (rather than routing-verdict level) the Hill α serves well.
     pub heavy_tail_alpha_threshold: f64,
-    /// Stability margin — currently unused in the v1 single-stage
-    /// observed-delay form (kept for serde compatibility + reserved for
-    /// the future multi-stage / queueing-composition variant of
-    /// `compute_snc_bound`).
-    pub stability_margin: f64,
 }
 
 impl Default for SncConfig {
@@ -180,7 +156,6 @@ impl Default for SncConfig {
             confidence: 0.9999,
             hill_k: 50,
             heavy_tail_alpha_threshold: 2.0,
-            stability_margin: 0.1,
         }
     }
 }
@@ -202,24 +177,14 @@ impl Default for SncConfig {
 /// since the deterministic Lindley path in `latency_stages.rs` is the
 /// right tool there.
 ///
-/// The [`MgfServiceCurve`] argument is currently a placeholder for
-/// future multi-stage / queueing composition (G38 follow-on). It is
-/// validated (rate > 0, finite) but its values do not modulate the
-/// returned quantile in the single-stage observed-delay form.
+/// This API deliberately does not accept a service curve. It does not compose
+/// arrival and service envelopes and must not be cited as proof of a
+/// queueing-service SNC bound.
 #[must_use]
-pub fn compute_snc_bound(
-    samples: &[EvidenceSample],
-    service: &MgfServiceCurve,
-    cfg: &SncConfig,
-) -> SncBound {
+pub fn compute_snc_bound(samples: &[EvidenceSample], cfg: &SncConfig) -> SncBound {
     if !(0.0..1.0).contains(&cfg.confidence) || cfg.confidence < 0.5 {
         return SncBound::OutOfDomain {
             reason: "snc confidence must be in (0.5, 1)".to_string(),
-        };
-    }
-    if service.rate <= 0.0 || !service.rate.is_finite() {
-        return SncBound::OutOfDomain {
-            reason: "snc service rate must be positive and finite".to_string(),
         };
     }
     // Clamp hill_k to match the internal floor in `hill_estimate`. Without
@@ -358,14 +323,8 @@ mod tests {
                 EvidenceSample::new("robot.p95", -u.ln() * 5.0, "ms", 1, i as u64)
             })
             .collect();
-        // Service rate must exceed mean arrival rate by stability_margin.
-        // Exponential -ln(u) * 5 has mean ~5, so service rate 100 is generous.
-        let service = MgfServiceCurve {
-            rate: 100.0,
-            burst: 1.0,
-        };
         let cfg = SncConfig::default();
-        let bound = compute_snc_bound(&samples, &service, &cfg);
+        let bound = compute_snc_bound(&samples, &cfg);
         // Exponential is light-tail; depending on Hill sample, alpha may be
         // above or below threshold. Either LindleyDomain or HeavyTailBound
         // is acceptable; OutOfDomain (non-finite alpha) is NOT.
@@ -387,12 +346,8 @@ mod tests {
                 EvidenceSample::new("robot.p95", v, "ms", 1, i as u64)
             })
             .collect();
-        let service = MgfServiceCurve {
-            rate: 100.0,
-            burst: 1.0,
-        };
         let cfg = SncConfig::default();
-        let bound = compute_snc_bound(&samples, &service, &cfg);
+        let bound = compute_snc_bound(&samples, &cfg);
         match bound {
             SncBound::HeavyTailBound {
                 confidence,
@@ -412,13 +367,16 @@ mod tests {
         let samples: Vec<EvidenceSample> = (0..10)
             .map(|i| EvidenceSample::new("robot.p95", 1.0, "ms", 1, i))
             .collect();
-        let service = MgfServiceCurve {
-            rate: 1.0,
-            burst: 0.0,
-        };
         let cfg = SncConfig::default();
-        let bound = compute_snc_bound(&samples, &service, &cfg);
+        let bound = compute_snc_bound(&samples, &cfg);
         assert!(matches!(bound, SncBound::OutOfDomain { .. }));
+    }
+
+    #[test]
+    fn compute_snc_bound_signature_is_direct_delay_only() {
+        let direct_delay_api: fn(&[crate::EvidenceSample], &SncConfig) -> SncBound =
+            compute_snc_bound;
+        let _ = direct_delay_api;
     }
 
     #[test]
