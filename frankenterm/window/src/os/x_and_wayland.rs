@@ -188,8 +188,11 @@ impl Window {
     where
         F: 'static + FnMut(WindowEvent, &Window),
     {
-        Connection::get()
-            .unwrap()
+        let Some(connection) = Connection::get() else {
+            anyhow::bail!("cannot create window: connection has not been initialized");
+        };
+
+        connection
             .new_window(
                 class_name,
                 name,
