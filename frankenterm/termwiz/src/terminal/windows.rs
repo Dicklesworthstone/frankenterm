@@ -38,6 +38,12 @@ use crate::surface::Change;
 use crate::terminal::{cast, ScreenSize, Terminal};
 
 const BUF_SIZE: usize = 128;
+const MAX_FINITE_WAIT_MS: u32 = INFINITE - 1;
+
+fn wait_timeout_millis(wait: Option<Duration>) -> u32 {
+    wait.map(|wait| wait.as_millis().min(MAX_FINITE_WAIT_MS as u128) as u32)
+        .unwrap_or(INFINITE)
+}
 
 enum Renderer {
     Terminfo(TerminfoRenderer),
@@ -1001,12 +1007,7 @@ impl Terminal for WindowsTerminal {
                     self.waker_handle.handle.as_raw_handle() as *mut _,
                 ];
                 let result = unsafe {
-                    WaitForMultipleObjects(
-                        2,
-                        handles.as_mut_ptr(),
-                        0,
-                        wait.map(|wait| wait.as_millis() as u32).unwrap_or(INFINITE),
-                    )
+                    WaitForMultipleObjects(2, handles.as_mut_ptr(), 0, wait_timeout_millis(wait))
                 };
                 if result == WAIT_OBJECT_0 + 0 {
                     pending = self.input_handle.get_number_of_input_events()?;
@@ -1077,6 +1078,25 @@ mod tests {
                 Y: buffer_rows,
             },
         }
+    }
+
+    #[test]
+    fn wait_timeout_none_preserves_infinite_sentinel() {
+        assert_eq!(wait_timeout_millis(None), INFINITE);
+    }
+
+    #[test]
+    fn wait_timeout_preserves_in_range_finite_wait() {
+        assert_eq!(
+            wait_timeout_millis(Some(Duration::from_millis(12_345))),
+            12_345
+        );
+    }
+
+    #[test]
+    fn wait_timeout_saturates_without_using_infinite_sentinel() {
+        let overflowing = Duration::from_millis(MAX_FINITE_WAIT_MS as u64 + 1);
+        assert_eq!(wait_timeout_millis(Some(overflowing)), MAX_FINITE_WAIT_MS);
     }
 
     #[test]
