@@ -4,7 +4,7 @@
   "generated_at_ms": 1770003600000,
   "approval_id": "missing-evidence-hash",
   "source_bead": "ft-5xwsu.2",
-  "evidence_contract_id": "ft.rch_worker_pressure.inventory.v1",
+  "evidence_contract_id": "ft.rch_worker_storage_inventory.v1",
   "evidence_artifact_path": "artifacts/rch-worker-pressure/20260518T030000Z/missing-hash-inventory.json",
   "evidence_artifact_sha256": null,
   "approval_decision": "missing_evidence_hash",

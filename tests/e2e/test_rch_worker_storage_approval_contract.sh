@@ -59,6 +59,7 @@ EXPECTED_DECISIONS = {
   "missing-evidence-hash" => "missing_evidence_hash",
   "live-use-unknown" => "live_use_unknown"
 }.freeze
+EXPECTED_EVIDENCE_CONTRACT_ID = "ft.rch_worker_storage_inventory.v1"
 EXPECTED_FORBIDDEN = %w[
   delete_unlisted_path
   wildcard_path_expansion
@@ -106,6 +107,7 @@ readme = File.read(README)
 
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-rch-worker-storage-approval.json")
 fail!("contract id const missing") unless schema.dig("properties", "contract_id", "const") == "ft.rch_worker_storage_approval.v1"
+fail!("evidence contract id const missing") unless schema.dig("properties", "evidence_contract_id", "const") == EXPECTED_EVIDENCE_CONTRACT_ID
 fail!("explicit human approval const missing") unless schema.dig("properties", "explicit_human_approval_required", "const") == true
 fail!("schema missing destructive recovery field") unless schema.fetch("required").include?("destructive_recovery_allowed")
 fail!("approval decision enum drifted") unless schema.dig("$defs", "approval_decision", "enum").sort.include?("approved")
@@ -127,6 +129,7 @@ payloads = fixture_paths.map { |path| [File.basename(path, ".json"), read_json(p
 payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} schema_version drifted") unless payload["schema_version"] == 1
   fail!("#{fixture_id} contract id drifted") unless payload["contract_id"] == "ft.rch_worker_storage_approval.v1"
+  fail!("#{fixture_id} evidence contract id drifted") unless payload["evidence_contract_id"] == EXPECTED_EVIDENCE_CONTRACT_ID
   fail!("#{fixture_id} source bead drifted") unless payload["source_bead"] == "ft-5xwsu.2"
   fail!("#{fixture_id} decision drifted") unless payload["approval_decision"] == EXPECTED_DECISIONS.fetch(fixture_id)
   fail!("#{fixture_id} explicit human approval flag drifted") unless payload["explicit_human_approval_required"] == true
@@ -201,6 +204,8 @@ unknown = payloads.fetch("live-use-unknown")
 fail!("live-use fixture lacks unknown state") unless unknown.fetch("requested_paths").any? { |path| path["live_use_state"] == "unknown" && path["protected_reason"] == "unknown_live_use" }
 
 fail!("doc missing schema path") unless doc.include?(SCHEMA)
+fail!("doc missing canonical evidence contract id") unless doc.include?("`ft.rch_worker_storage_inventory.v1`")
+fail!("doc still endorses pressure-named inventory id") if doc.include?("ft.rch_worker_pressure.inventory.v1")
 fail!("doc missing exact path rule") unless doc.include?("exact requested and approved path-set hashes")
 fail!("doc missing live-use fail-closed rule") unless doc.include?("live-use unknown must set")
 fail!("provenance missing approval schema row") unless provenance.include?("`ft-rch-worker-storage-approval.json`")

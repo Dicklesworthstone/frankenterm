@@ -63,6 +63,14 @@ Use the retained inventory contract for any worker storage evidence:
 - fixtures: `fixtures/rch-worker-pressure/manifest.json`
 - verifier: `tests/e2e/test_rch_worker_storage_inventory_contract.sh`
 
+`ft.rch_worker_storage_inventory.v1` is the canonical retained inventory
+contract id. The older retained local draft family
+`ft.rch_worker_pressure.inventory.v1` is superseded and must not be referenced
+by approval or post-recovery proof artifacts. If draft-only field coverage is
+promoted later, normalize it under the storage inventory schema, fixture
+manifest, provenance row, and static verifier instead of adding a parallel
+pressure-named inventory contract.
+
 Inventory rows must record source command, worker id, path, size, freshness,
 timeout state, partial-output marker, pressure reason, and retained artifact
 path. Partial, stale, or telemetry-gap evidence remains review input only.

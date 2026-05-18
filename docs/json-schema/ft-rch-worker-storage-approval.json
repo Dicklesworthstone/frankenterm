@@ -52,10 +52,7 @@
     },
     "evidence_contract_id": {
       "type": "string",
-      "enum": [
-        "ft.rch_worker_pressure.inventory.v1",
-        "ft.rch_worker_storage_inventory.v1"
-      ]
+      "const": "ft.rch_worker_storage_inventory.v1"
     },
     "evidence_artifact_path": {
       "type": "string",
