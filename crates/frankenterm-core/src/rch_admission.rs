@@ -881,12 +881,10 @@ pub fn build_rch_admission_report(input: &RchAdmissionCollectorInput) -> RchAdmi
         if let Some(reason_code) = observation.reason_code {
             reason_codes.insert(reason_code);
         }
-        if let Some(reason_code) = observation
-            .error_category
-            .as_deref()
-            .and_then(reason_code_from_error_category)
-        {
-            reason_codes.insert(reason_code);
+        if let Some(error_category) = observation.error_category.as_deref() {
+            for reason_code in reason_codes_from_error_category(error_category) {
+                reason_codes.insert(reason_code);
+            }
         }
         citations.push(citation_from_collector_observation(observation));
     }
@@ -1054,33 +1052,34 @@ fn citation_from_collector_observation(
     }
 }
 
-fn reason_code_from_error_category(error_category: &str) -> Option<RchAdmissionReasonCode> {
+fn reason_codes_from_error_category(error_category: &str) -> Vec<RchAdmissionReasonCode> {
     let normalized = error_category.to_ascii_lowercase();
+    let mut reason_codes = Vec::new();
     if looks_like_enospc(&normalized) || normalized.contains("cache.write_failed") {
-        return Some(RchAdmissionReasonCode::LocalEnoSpace);
+        reason_codes.push(RchAdmissionReasonCode::LocalEnoSpace);
     }
     if normalized.contains("no_admissible") || normalized.contains("worker=null") {
-        return Some(RchAdmissionReasonCode::NoAdmissibleWorkers);
+        reason_codes.push(RchAdmissionReasonCode::NoAdmissibleWorkers);
     }
     if normalized.contains("critical_pressure") || normalized.contains("pressure-critical") {
-        return Some(RchAdmissionReasonCode::CriticalPressure);
+        reason_codes.push(RchAdmissionReasonCode::CriticalPressure);
     }
     if normalized.contains("telemetry_gap") || normalized.contains("stale_telemetry") {
-        return Some(RchAdmissionReasonCode::TelemetryGap);
+        reason_codes.push(RchAdmissionReasonCode::TelemetryGap);
     }
     if normalized.contains("insufficient_slots") {
-        return Some(RchAdmissionReasonCode::InsufficientSlots);
+        reason_codes.push(RchAdmissionReasonCode::InsufficientSlots);
     }
     if normalized.contains("active_project_exclusion") {
-        return Some(RchAdmissionReasonCode::ActiveProjectExclusion);
+        reason_codes.push(RchAdmissionReasonCode::ActiveProjectExclusion);
     }
     if normalized.contains("speedscore") || normalized.contains("response_shape") {
-        return Some(RchAdmissionReasonCode::SpeedscoreResponseShape);
+        reason_codes.push(RchAdmissionReasonCode::SpeedscoreResponseShape);
     }
     if normalized.contains("dry_run") && normalized.contains("worker") {
-        return Some(RchAdmissionReasonCode::DryRunInconsistentWorker);
+        reason_codes.push(RchAdmissionReasonCode::DryRunInconsistentWorker);
     }
-    None
+    reason_codes
 }
 
 fn looks_like_enospc(value: &str) -> bool {
@@ -1468,6 +1467,37 @@ mod tests {
         assert!(citation.summary.contains("df -h /System/Volumes/Data"));
         assert!(citation.summary.contains("freshness_ms=1000"));
         assert!(citation.summary.contains("error_category=ENOSPC"));
+    }
+
+    #[test]
+    fn compound_error_category_preserves_all_blocking_reasons() {
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.compound_error_category",
+            intercepted_command(),
+        )
+        .with_collector_observation(
+            RchAdmissionCollectorObservation::new(
+                "rch.diagnose.worker_selection",
+                "rch diagnose --json --dry-run",
+                "worker selection skipped before transfer",
+            )
+            .error_category("no_admissible_workers=critical_pressure=5"),
+        );
+
+        let report = build_rch_admission_report(&input);
+
+        assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
     }
 
     #[test]
