@@ -45,7 +45,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -322,84 +322,61 @@ impl FaultInjector {
 
     /// Set a fault for a specific injection point.
     pub fn set_fault(&self, point: FaultPoint, mode: FaultMode) {
-        self.lock_faults_write().insert(point, mode);
+        if let Ok(mut faults) = self.faults.write() {
+            faults.insert(point, mode);
+        }
     }
 
     /// Remove a fault for a specific injection point.
     pub fn remove_fault(&self, point: FaultPoint) {
-        self.lock_faults_write().remove(&point);
+        if let Ok(mut faults) = self.faults.write() {
+            faults.remove(&point);
+        }
     }
 
     /// Clear all faults and the trigger log.
     pub fn clear_all(&self) {
-        self.lock_faults_write().clear();
-        self.lock_log().clear();
-        *self.lock_counter() = 0;
+        if let Ok(mut faults) = self.faults.write() {
+            faults.clear();
+        }
+        if let Ok(mut log) = self.log.lock() {
+            log.clear();
+        }
+        if let Ok(mut counter) = self.counter.lock() {
+            *counter = 0;
+        }
     }
 
     /// Get a copy of the trigger log.
     #[must_use]
     pub fn get_log(&self) -> Vec<FaultTrigger> {
-        self.lock_log().clone()
+        self.log.lock().map(|log| log.clone()).unwrap_or_default()
     }
 
     /// Drain and return the trigger log.
     pub fn drain_log(&self) -> Vec<FaultTrigger> {
-        std::mem::take(&mut *self.lock_log())
+        self.log
+            .lock()
+            .map(|mut log| std::mem::take(&mut *log))
+            .unwrap_or_default()
     }
 
     /// Count how many times a specific fault point fired.
     #[must_use]
     pub fn fired_count(&self, point: FaultPoint) -> usize {
-        self.lock_log()
-            .iter()
-            .filter(|t| t.point == point && t.fired)
-            .count()
+        self.log
+            .lock()
+            .map(|log| log.iter().filter(|t| t.point == point && t.fired).count())
+            .unwrap_or(0)
     }
 
     /// Count total fault triggers across all points.
     #[must_use]
     pub fn total_fired(&self) -> usize {
-        self.lock_log().iter().filter(|t| t.fired).count()
-    }
-
-    fn lock_faults_write(&self) -> RwLockWriteGuard<'_, HashMap<FaultPoint, FaultMode>> {
-        match self.faults.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                self.faults.clear_poison();
-                guard
-            }
-        }
-    }
-
-    fn lock_log(&self) -> MutexGuard<'_, Vec<FaultTrigger>> {
-        match self.log.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                self.log.clear_poison();
-                guard
-            }
-        }
-    }
-
-    fn lock_counter(&self) -> MutexGuard<'_, u64> {
-        match self.counter.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                self.counter.clear_poison();
-                guard
-            }
-        }
-    }
-
-    fn next_probability_counter(&self) -> u64 {
-        let mut counter = self.lock_counter();
-        *counter = counter.wrapping_add(1);
-        *counter
+        self.log
+            .lock()
+            .map(|log| log.iter().filter(|t| t.fired).count())
+            .unwrap_or(0)
     }
 
     /// Check a fault point (instance method).
@@ -413,7 +390,9 @@ impl FaultInjector {
             error: should_fail.clone(),
             timestamp_ms: epoch_ms(),
         };
-        self.lock_log().push(trigger);
+        if let Ok(mut log) = self.log.lock() {
+            log.push(trigger);
+        }
 
         match should_fail {
             Some(error_msg) => Err(chaos_fault_error(point, error_msg)),
@@ -424,7 +403,7 @@ impl FaultInjector {
     /// Evaluate whether a fault should fire.  Returns the error
     /// message if it should, or `None` if the call should succeed.
     fn evaluate_fault(&self, point: FaultPoint) -> Option<String> {
-        let mut faults = self.lock_faults_write();
+        let mut faults = self.faults.write().ok()?;
         let mode = faults.get_mut(&point)?;
 
         match mode {
@@ -458,7 +437,14 @@ impl FaultInjector {
                 }
 
                 // Deterministic pseudo-random based on counter
-                let counter = self.next_probability_counter();
+                let counter = self
+                    .counter
+                    .lock()
+                    .map(|mut c| {
+                        *c = c.wrapping_add(1);
+                        *c
+                    })
+                    .unwrap_or(0);
 
                 // Simple hash to get a value in [0, 1)
                 let hash = ((counter.wrapping_mul(6_364_136_223_846_793_005))
@@ -840,64 +826,6 @@ mod tests {
             assert!(injector.check_point(FaultPoint::DbWrite).is_err());
         }
         assert_eq!(injector.fired_count(FaultPoint::DbWrite), 32);
-    }
-
-    #[test]
-    fn fault_registry_recovers_after_poison() {
-        let injector = FaultInjector::new();
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = injector.faults.write().expect("initial faults write lock");
-            panic!("poison faults");
-        }));
-        assert!(poisoned.is_err());
-        assert!(injector.faults.is_poisoned());
-
-        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("recovered"));
-
-        assert!(!injector.faults.is_poisoned());
-        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
-        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 1);
-    }
-
-    #[test]
-    fn trigger_log_recovers_after_poison() {
-        let injector = FaultInjector::new();
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = injector.log.lock().expect("initial trigger log lock");
-            panic!("poison trigger log");
-        }));
-        assert!(poisoned.is_err());
-        assert!(injector.log.is_poisoned());
-
-        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("logged"));
-        assert!(injector.check_point(FaultPoint::DbWrite).is_err());
-
-        assert!(!injector.log.is_poisoned());
-        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 1);
-        assert_eq!(injector.get_log().len(), 1);
-    }
-
-    #[test]
-    fn probability_counter_recovers_after_poison() {
-        let injector = FaultInjector::new();
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = injector.counter.lock().expect("initial counter lock");
-            panic!("poison probability counter");
-        }));
-        assert!(poisoned.is_err());
-        assert!(injector.counter.is_poisoned());
-
-        injector.set_fault(
-            FaultPoint::DbWrite,
-            FaultMode::FailWithProbability {
-                probability: 0.5,
-                error: "maybe".to_string(),
-            },
-        );
-        let _ = injector.check_point(FaultPoint::DbWrite);
-
-        assert!(!injector.counter.is_poisoned());
-        assert_eq!(*injector.counter.lock().expect("counter recovered"), 1);
     }
 
     #[test]

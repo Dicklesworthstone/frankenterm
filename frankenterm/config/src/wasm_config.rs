@@ -16,9 +16,7 @@
 //! If no WASM config is found, returns `None` and the caller falls through
 //! to the next config format.
 
-use crate::{
-    config_file_override_snapshot, frankenterm_config_dirs, merge_dynamic_overrides, LoadedConfig,
-};
+use crate::{frankenterm_config_dirs, merge_dynamic_overrides, LoadedConfig, CONFIG_FILE_OVERRIDE};
 use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
@@ -83,7 +81,7 @@ fn is_wasm_path(path: &Path) -> bool {
 }
 
 fn explicit_config_file_override_path() -> Option<PathBuf> {
-    config_file_override_snapshot()
+    CONFIG_FILE_OVERRIDE.lock().unwrap().clone()
 }
 
 fn explicit_wasm_config_path_from_env() -> Option<PathBuf> {

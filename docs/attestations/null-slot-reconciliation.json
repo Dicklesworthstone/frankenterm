@@ -2,17 +2,17 @@
   "$schema": "https://frankenterm.dev/schemas/attestation/null-slot-reconciliation.v1.json",
   "schema_version": "1.0.0",
   "bead_id": "ft-e87u6.1",
-  "generated_at": "2026-05-18T12:47:50Z",
-  "generated_by": "Codex",
+  "generated_at": "2026-05-09T21:37:04Z",
+  "generated_by": "BluePike",
   "manifest": {
     "path": "docs/attestations/manifest.json",
-    "sha256": "a30cb1bbb647d9f55368825c3d1c55e0f0811e12b596d74d74d1a8f4c0daa062",
-    "null_slots_observed": 0
+    "sha256": "608ee741282e79dcf041e0efe49639f91200b17b3c594b7fc0cbbc96f9eb48a6",
+    "null_slots_observed": 9
   },
   "summary": {
-    "total_null_slots": 0,
-    "populate_from": 0,
-    "substrate_recovery": 0,
+    "total_null_slots": 9,
+    "populate_from": 3,
+    "substrate_recovery": 6,
     "deferred": 0,
     "slot_deletion": 0,
     "human_review_required": 0
@@ -23,5 +23,215 @@
     "deferred",
     "slot-deletion"
   ],
-  "slots": []
+  "slots": [
+    {
+      "category": "perf/headline-claims",
+      "produced_by_bead": "ft-syqcz.3",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "Headline-claim manifest + 5 must-prove benches (G3).",
+      "disposition": "populate-from",
+      "artifact_path": "docs/perf/headline-claims.json",
+      "artifact_media_type": "application/json",
+      "artifact_sha256": "86258aa186f50af2b417d3ccb1d0a4dbe13c658866ca2a337f656958d3bfd63b",
+      "artifact_size_bytes": 5985,
+      "follow_up_bead": null,
+      "reason_code": "artifact_found",
+      "evidence_commits": [
+        "f3e235393a68303c408efca22f9c0183354e123d"
+      ],
+      "evidence": [
+        "br show ft-syqcz.3 reports closed and cites docs/perf/headline-claims.json.",
+        "git show --name-only f3e235393a68303c408efca22f9c0183354e123d lists docs/perf/headline-claims.json.",
+        "jq parsed docs/perf/headline-claims.json as JSON."
+      ],
+      "notes": "The artifact names five headline claims and their bench/hardware baselines. It should be wired into docs/attestations/manifest.json by ft-e87u6.2."
+    },
+    {
+      "category": "perf/competitor-matrix",
+      "produced_by_bead": "ft-syqcz.4",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3).",
+      "disposition": "substrate-recovery",
+      "artifact_path": null,
+      "artifact_media_type": null,
+      "artifact_sha256": null,
+      "artifact_size_bytes": null,
+      "follow_up_bead": "ft-e87u6.9",
+      "reason_code": "closed_producer_without_manifest_compatible_artifact",
+      "evidence_commits": [
+        "43b5eaacd0142d0d662aaff0407fa44ed0eff4e0",
+        "07df024f8e86a1f55d04311e9ca9fbe119881877",
+        "836b9eb664c752b73e155567974f1f5887a0f8f3"
+      ],
+      "evidence": [
+        "git show --name-only 43b5eaacd0142d0d662aaff0407fa44ed0eff4e0 lists only network_calculus_bound.rs and lib.rs for ft-syqcz.4.",
+        "br show ft-syqcz.5 and br show ft-t101b identify the actual competitor matrix substrate and harness.",
+        "find docs/perf found docs/perf/competitor-resize-schema.json but no checked-in competitor-matrix or per-release resize snapshot JSON."
+      ],
+      "notes": "The manifest producer appears to point at the latency bead while the competitor work lives under ft-syqcz.5/ft-t101b. Recovery must publish a concrete JSON artifact or intentionally correct the manifest provenance."
+    },
+    {
+      "category": "tui/render-parity",
+      "produced_by_bead": "ft-35yac.2",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "ratatui<->ftui differential render parity report (G5).",
+      "disposition": "substrate-recovery",
+      "artifact_path": null,
+      "artifact_media_type": null,
+      "artifact_sha256": null,
+      "artifact_size_bytes": null,
+      "follow_up_bead": "ft-e87u6.10",
+      "reason_code": "closed_producer_without_manifest_compatible_artifact",
+      "evidence_commits": [
+        "e7af11df29c87031e439ea7e394d55d2c1fd93d4"
+      ],
+      "evidence": [
+        "git show --name-only e7af11df29c87031e439ea7e394d55d2c1fd93d4 lists ftui default cutover files and docs, not a render-parity JSON report.",
+        "docs/attestations/tui/render-parity-gpu.json is already a populated adjunct slot for ft-35yac.1.2 and explicitly says the full byte-level report remains separate.",
+        "find docs crates tests scripts found no full render-parity JSON artifact for ft-35yac.2."
+      ],
+      "notes": "Do not reuse the GPU adjunct to satisfy the full ratatui<->ftui slot; it is already represented by a separate populated manifest row."
+    },
+    {
+      "category": "security/passive-watch",
+      "produced_by_bead": "ft-x0666.1",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "Passive-watch read-only fuzz proof (G9).",
+      "disposition": "substrate-recovery",
+      "artifact_path": null,
+      "artifact_media_type": null,
+      "artifact_sha256": null,
+      "artifact_size_bytes": null,
+      "follow_up_bead": "ft-e87u6.11",
+      "reason_code": "closed_producer_without_manifest_compatible_artifact",
+      "evidence_commits": [
+        "b280143778eca77c385a202f37d4e262aa535171"
+      ],
+      "evidence": [
+        "git show --name-only b280143778eca77c385a202f37d4e262aa535171 lists passive_watch_invariant.rs, fuzz target, corpus, and docs/security/passive-watch-attestation.md.",
+        "docs/security/passive-watch-attestation.md states the production attestation surface dumps PassiveWatchHealth into a per-release JSON artifact.",
+        "find docs crates tests scripts found no passive-watch JSON artifact."
+      ],
+      "notes": "The markdown audit doc is useful evidence but does not satisfy the manifest media type."
+    },
+    {
+      "category": "security/redactor-coverage",
+      "produced_by_bead": "ft-x0666.2",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "Redactor recall/precision matrix vs gitleaks/trufflehog corpora (G10).",
+      "disposition": "populate-from",
+      "artifact_path": "docs/security/redactor-coverage.json",
+      "artifact_media_type": "application/json",
+      "artifact_sha256": "951c2461695a995027f09b90b0328aae56d811bebf49a19b45862258e4056fea",
+      "artifact_size_bytes": 2493,
+      "follow_up_bead": null,
+      "reason_code": "artifact_found",
+      "evidence_commits": [
+        "c3bf363cdbdec4fe5b11d677b47a7f8509f30aab"
+      ],
+      "evidence": [
+        "git show --name-only c3bf363cdbdec4fe5b11d677b47a7f8509f30aab lists docs/security/redactor-coverage.json.",
+        "jq parsed docs/security/redactor-coverage.json as JSON and found bead=ft-x0666.2.",
+        "The file contains overall and by_provider coverage fields plus recall_floor and vectors_total."
+      ],
+      "notes": "The artifact should be wired into docs/attestations/manifest.json by ft-e87u6.2."
+    },
+    {
+      "category": "security/distributed-threat-model",
+      "produced_by_bead": "ft-x0666.3",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "text/markdown",
+      "manifest_description": "Distributed wire-protocol threat model + diff fuzz (G11).",
+      "disposition": "populate-from",
+      "artifact_path": "docs/security/distributed-threat-model.md",
+      "artifact_media_type": "text/markdown",
+      "artifact_sha256": "29591922bb9b9ff6a46744a63c0b68c32ea7b0525fc6a5eb5f46f302029fcc53",
+      "artifact_size_bytes": 7050,
+      "follow_up_bead": null,
+      "reason_code": "artifact_found",
+      "evidence_commits": [
+        "974ed1af38ee1d20d8d00ed1b20f7bf655d00b67"
+      ],
+      "evidence": [
+        "git show --name-only 974ed1af38ee1d20d8d00ed1b20f7bf655d00b67 lists docs/security/distributed-threat-model.md.",
+        "The manifest media type for this slot is text/markdown, matching docs/security/distributed-threat-model.md.",
+        "The document names ft-x0666.3 and includes assets, threats, mitigations, proof cross-references, and pending items."
+      ],
+      "notes": "This is the only null slot whose manifest media type is markdown, so the checked-in threat model is directly compatible."
+    },
+    {
+      "category": "proofs/loom-runtime-async",
+      "produced_by_bead": "ft-syqcz.6",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "Loom proof for runtime_async primitives (G8).",
+      "disposition": "substrate-recovery",
+      "artifact_path": null,
+      "artifact_media_type": null,
+      "artifact_sha256": null,
+      "artifact_size_bytes": null,
+      "follow_up_bead": "ft-e87u6.12",
+      "reason_code": "closed_producer_without_manifest_compatible_artifact",
+      "evidence_commits": [
+        "7ff0f9e373ad8112d69c485a31d4a1c450ac1fc7"
+      ],
+      "evidence": [
+        "git show --name-only 7ff0f9e373ad8112d69c485a31d4a1c450ac1fc7 lists loom test files and docs/runtime/loom-conventions.md.",
+        "br show ft-syqcz.7 reports the exhaustive proof program complete and points to docs/runtime/mazurkiewicz-traces.md.",
+        "find docs crates tests found markdown and test files, but no loom-runtime-async JSON proof artifact."
+      ],
+      "notes": "The proof corpus exists, but the manifest requires a machine-readable JSON artifact for release bundles."
+    },
+    {
+      "category": "proofs/runtime-proof-trait",
+      "produced_by_bead": "ft-i2eni.1",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "RuntimeProof sealed trait + tokio type-level seal (G1).",
+      "disposition": "substrate-recovery",
+      "artifact_path": null,
+      "artifact_media_type": null,
+      "artifact_sha256": null,
+      "artifact_size_bytes": null,
+      "follow_up_bead": "ft-e87u6.13",
+      "reason_code": "closed_producer_without_manifest_compatible_artifact",
+      "evidence_commits": [
+        "34b447b44cb4f91909e9f4783ebf03e37e08d2cf"
+      ],
+      "evidence": [
+        "br show ft-i2eni.1 reports closed; its close note names a stale commit in this checkout, while git log shows 34b447b44 as the current commit that touched runtime_proof.rs and docs/runtime/runtime-proof-trait.md.",
+        "git show --name-only 34b447b44cb4f91909e9f4783ebf03e37e08d2cf lists runtime_proof.rs and docs/runtime/runtime-proof-trait.md.",
+        "crates/frankenterm-core/tests/runtime_proof_coverage_baseline.json exists for the later ft-3kv6e adoption ratchet, but no category-specific RuntimeProof seal attestation JSON exists."
+      ],
+      "notes": "The original epic body called this active, but live br state now reports ft-i2eni.1 closed. The slot should not be silently deferred; it needs a JSON attestation or an intentional manifest semantics change."
+    },
+    {
+      "category": "doctrine/agents-md-counts",
+      "produced_by_bead": "ft-i2eni.5",
+      "producing_bead_status": "closed",
+      "manifest_media_type": "application/json",
+      "manifest_description": "Auto-stamped README/AGENTS module/crate/test counts (G6).",
+      "disposition": "substrate-recovery",
+      "artifact_path": null,
+      "artifact_media_type": null,
+      "artifact_sha256": null,
+      "artifact_size_bytes": null,
+      "follow_up_bead": "ft-e87u6.14",
+      "reason_code": "closed_producer_without_manifest_compatible_artifact",
+      "evidence_commits": [
+        "f87686c79f26beeafd578de506bfcda7fee631e2"
+      ],
+      "evidence": [
+        "git show --name-only f87686c79f26beeafd578de506bfcda7fee631e2 lists scripts/stamp-readme-counts.sh, README.md, AGENTS.md, and docs/contributing/auto-stamped-counts.md.",
+        "scripts/stamp-readme-counts.sh defines a seven-entry MANIFEST and text-mode check/write behavior.",
+        "find docs crates tests scripts found no checked-in agents-md-counts JSON snapshot."
+      ],
+      "notes": "The stamper is the substrate. The release attestation bundle still needs a stable JSON snapshot artifact."
+    }
+  ]
 }

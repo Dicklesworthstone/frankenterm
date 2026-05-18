@@ -36,7 +36,7 @@ use serde_json::Value;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -209,16 +209,6 @@ impl TestLogger {
             .unwrap_or_else(|| PathBuf::from("target/test-logs"))
     }
 
-    fn sink_lock(&self) -> MutexGuard<'_, Box<dyn Write + Send>> {
-        match self.sink.lock() {
-            Ok(sink) => sink,
-            Err(poisoned) => {
-                self.sink.clear_poison();
-                poisoned.into_inner()
-            }
-        }
-    }
-
     /// Emit a row of arbitrary kind. Prefer the named helpers below.
     pub fn row(&self, kind: RowKind, payload: Value) -> Result<TestLogRow, TestLogError> {
         let row = TestLogRow {
@@ -231,7 +221,7 @@ impl TestLogger {
             run_id: self.run_id.clone(),
         };
         let line = serde_json::to_string(&row)?;
-        let mut sink = self.sink_lock();
+        let mut sink = self.sink.lock().expect("ft-test-log sink mutex poisoned");
         sink.write_all(line.as_bytes())?;
         sink.write_all(b"\n")?;
         Ok(row)
@@ -332,26 +322,6 @@ mod tests {
         logger.error("e", Value::Null).unwrap();
         logger.decision("d", Value::Null).unwrap();
         logger.evidence_emit("c", Value::Null).unwrap();
-    }
-
-    #[test]
-    fn row_recovers_after_poisoned_sink_lock() {
-        let logger = TestLogger::in_memory("a", "poisoned_sink");
-
-        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = logger.sink.lock().unwrap();
-            panic!("poison ft-test-log sink");
-        }));
-        assert!(poison.is_err());
-
-        let row = logger
-            .assertion("after poison", Value::Bool(true))
-            .expect("poisoned sink should recover");
-        assert_eq!(row.kind, RowKind::Assertion);
-
-        logger
-            .measurement("second row", Value::Null)
-            .expect("sink poison should be cleared");
     }
 
     #[test]

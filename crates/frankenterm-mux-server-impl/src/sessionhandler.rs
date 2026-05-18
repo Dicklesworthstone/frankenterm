@@ -178,42 +178,32 @@ fn maybe_push_pane_changes(
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
-    let render_changes = {
-        let mut per_pane = per_pane
-            .lock()
-            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
-        per_pane.compute_changes(pane, None)
-    };
-    if let Some(resp) = render_changes {
+    let mut per_pane = per_pane
+        .lock()
+        .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+    if let Some(resp) = per_pane.compute_changes(pane, None) {
         sender.send(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
         })?;
     }
 
-    let notifications = {
-        let mut per_pane = per_pane
-            .lock()
-            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
-        let config = config::configuration();
-        if per_pane.config_generation != config.generation() {
-            per_pane.config_generation = config.generation();
-            // If the config changed, it may have changed colors
-            // in the palette that we need to push down, so we
-            // synthesize a palette change notification to let
-            // the client know
-            per_pane.notifications.push(Alert::PaletteChanged);
-            per_pane.sent_initial_palette = true;
-        }
+    let config = config::configuration();
+    if per_pane.config_generation != config.generation() {
+        per_pane.config_generation = config.generation();
+        // If the config changed, it may have changed colors
+        // in the palette that we need to push down, so we
+        // synthesize a palette change notification to let
+        // the client know
+        per_pane.notifications.push(Alert::PaletteChanged);
+        per_pane.sent_initial_palette = true;
+    }
 
-        if !per_pane.sent_initial_palette {
-            per_pane.notifications.push(Alert::PaletteChanged);
-            per_pane.sent_initial_palette = true;
-        }
-        per_pane.notifications.drain(..).collect::<Vec<_>>()
-    };
-
-    for alert in notifications {
+    if !per_pane.sent_initial_palette {
+        per_pane.notifications.push(Alert::PaletteChanged);
+        per_pane.sent_initial_palette = true;
+    }
+    for alert in per_pane.notifications.drain(..) {
         match alert {
             Alert::PaletteChanged => {
                 sender.send(DecodedPdu {
@@ -887,13 +877,11 @@ impl SessionHandler {
                             // For a key press, we want to always send back the
                             // cursor position so that the predictive echo doesn't
                             // leave the cursor in the wrong place
-                            let render_changes = {
-                                let mut per_pane = per_pane.lock().map_err(|err| {
-                                    anyhow!("per-pane state lock poisoned: {err}")
-                                })?;
-                                per_pane.compute_changes(&pane, Some(input_serial))
-                            };
-                            if let Some(resp) = render_changes {
+                            let mut per_pane = per_pane
+                                .lock()
+                                .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+                            if let Some(resp) = per_pane.compute_changes(&pane, Some(input_serial))
+                            {
                                 sender.send(DecodedPdu {
                                     pdu: Pdu::GetPaneRenderChangesResponse(resp),
                                     serial: 0,
@@ -1653,7 +1641,6 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use termwiz::surface::Line;
     use wezterm_term::color::ColorPalette;
@@ -4033,33 +4020,6 @@ mod tests {
         // Modify one, verify the other is unaffected
         pp1.lock().unwrap().seqno = 42;
         assert_eq!(pp2.lock().unwrap().seqno, 0);
-    }
-
-    #[test]
-    fn maybe_push_pane_changes_drops_per_pane_lock_before_sending() {
-        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
-        let per_pane = Arc::new(Mutex::new(PerPane::default()));
-        let send_count = Arc::new(AtomicUsize::new(0));
-
-        let sender = PduSender::new({
-            let per_pane = Arc::clone(&per_pane);
-            let send_count = Arc::clone(&send_count);
-            move |_| {
-                assert!(
-                    per_pane.try_lock().is_ok(),
-                    "PduSender callback must not run while per-pane state is locked"
-                );
-                send_count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-        });
-
-        maybe_push_pane_changes(&pane, sender, per_pane).expect("pane changes should send");
-
-        assert!(
-            send_count.load(Ordering::Relaxed) >= 2,
-            "initial render and palette PDUs should both be sent"
-        );
     }
 
     #[test]

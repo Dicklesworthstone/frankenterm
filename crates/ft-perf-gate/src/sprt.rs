@@ -24,7 +24,7 @@ pub struct SprtConfig {
     pub relative_threshold: f64,
     /// Minimum sample count before a terminal decision is allowed.
     pub min_samples: usize,
-    /// Confidence value carried into terminal mean-threshold decisions.
+    /// Confidence value carried into terminal placeholder decisions.
     pub confidence: Option<f64>,
 }
 
@@ -41,7 +41,7 @@ impl SprtConfig {
     }
 }
 
-/// Summary of the samples consumed by the mean-threshold gate.
+/// Summary of the samples consumed by the placeholder gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SprtReport {
     /// Claim identifier being evaluated.

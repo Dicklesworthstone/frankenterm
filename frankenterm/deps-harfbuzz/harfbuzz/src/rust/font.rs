@@ -114,10 +114,7 @@ impl FontationsData<'_> {
             return;
         }
 
-        let _lock = self.mutex.lock().unwrap_or_else(|poisoned| {
-            self.mutex.clear_poison();
-            poisoned.into_inner()
-        });
+        let _lock = self.mutex.lock().unwrap();
 
         let mut x_scale: i32 = 0;
         let mut y_scale: i32 = 0;

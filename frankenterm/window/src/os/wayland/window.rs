@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
@@ -527,8 +527,7 @@ impl WindowOps for WaylandWindow {
             let spawn_result = std::thread::Builder::new()
                 .name("wayland-clipboard-read".to_string())
                 .spawn(move || {
-                    let mut promise =
-                        lock_or_recover(&promise_for_thread, "resolving clipboard read promise");
+                    let mut promise = promise_for_thread.lock().unwrap();
                     match read_pipe_with_timeout(read) {
                         Ok(result) => {
                             // Normalize the text to unix line endings, otherwise
@@ -543,8 +542,7 @@ impl WindowOps for WaylandWindow {
                     };
                 });
             if let Err(err) = spawn_result {
-                let mut promise =
-                    lock_or_recover(&promise, "recording clipboard reader thread spawn failure");
+                let mut promise = promise.lock().unwrap();
                 promise.err(anyhow!(
                     "unable to spawn Wayland clipboard reader thread: {err}"
                 ));
@@ -554,10 +552,7 @@ impl WindowOps for WaylandWindow {
         let promise_on_error = Arc::clone(&promise);
         promise::spawn::spawn(async move {
             if let Err(err) = window_future.await {
-                let mut promise = lock_or_recover(
-                    &promise_on_error,
-                    "recording Wayland clipboard read setup failure",
-                );
+                let mut promise = promise_on_error.lock().unwrap();
                 promise.err(err);
             }
         })
@@ -628,16 +623,6 @@ pub(crate) struct PendingEvent {
     pub(crate) window_configure: Option<WindowConfigure>,
     pub(crate) dpi: Option<i32>,
     pub(crate) window_state: Option<WindowState>,
-}
-
-fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            log::error!("Wayland mutex was poisoned while {context}; recovering inner state");
-            poisoned.into_inner()
-        }
-    }
 }
 
 pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<String> {
@@ -952,8 +937,7 @@ impl WaylandWindowInner {
     pub(crate) fn dispatch_pending_event(&mut self) {
         let mut pending;
         {
-            let mut pending_events =
-                lock_or_recover(&self.pending_event, "dispatching pending window events");
+            let mut pending_events = self.pending_event.lock().unwrap();
             pending = pending_events.clone();
             *pending_events = PendingEvent::default();
         }
@@ -1231,13 +1215,11 @@ impl WaylandWindowInner {
         // so we're going to fake one up, otherwise the window
         // contents don't reflect the real size until eg:
         // the focus is changed.
-        {
-            let mut pending_event =
-                lock_or_recover(&self.pending_event, "queueing synthetic configure event");
-            pending_event
-                .configure
-                .replace((surface_width, surface_height));
-        }
+        self.pending_event
+            .lock()
+            .unwrap()
+            .configure
+            .replace((surface_width, surface_height));
         // apply the synthetic configure event to the inner surfaces
         self.dispatch_pending_event();
 

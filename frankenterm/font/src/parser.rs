@@ -4,7 +4,7 @@ use config::{FontAttributes, FontStyle, FreeTypeLoadFlags, FreeTypeLoadTarget};
 pub use config::{FontStretch, FontWeight};
 use rangeset::RangeSet;
 use std::cmp::Ordering;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 #[derive(Debug)]
 pub enum MaybeShaped {
@@ -80,7 +80,7 @@ impl Clone for ParsedFont {
             assume_emoji_presentation: self.assume_emoji_presentation,
             handle: self.handle.clone(),
             cap_height: self.cap_height,
-            coverage: Mutex::new(self.lock_coverage().clone()),
+            coverage: Mutex::new(self.coverage.lock().unwrap().clone()),
             pixel_sizes: self.pixel_sizes.clone(),
             harfbuzz_features: self.harfbuzz_features.clone(),
             freetype_load_target: self.freetype_load_target,
@@ -268,20 +268,6 @@ impl Names {
 }
 
 impl ParsedFont {
-    fn lock_coverage(&self) -> MutexGuard<'_, RangeSet<u32>> {
-        match self.coverage.lock() {
-            Ok(coverage) => coverage,
-            Err(poisoned) => {
-                log::warn!(
-                    "recovering poisoned coverage cache for font {}",
-                    self.names.full_name
-                );
-                self.coverage.clear_poison();
-                poisoned.into_inner()
-            }
-        }
-    }
-
     pub fn from_locator(handle: &FontDataHandle) -> anyhow::Result<Self> {
         let lib = crate::ftwrap::Library::new()?;
         let face = lib.face_from_locator(handle)?;
@@ -544,7 +530,7 @@ impl ParsedFont {
     /// Computes the codepoint coverage for this font entry if we haven't
     /// already done so.
     pub fn coverage_intersection(&self, wanted: &RangeSet<u32>) -> anyhow::Result<RangeSet<u32>> {
-        let mut cov = self.lock_coverage();
+        let mut cov = self.coverage.lock().unwrap();
         if cov.is_empty() {
             let t = std::time::Instant::now();
             let lib = crate::ftwrap::Library::new()?;
@@ -889,80 +875,6 @@ pub(crate) fn load_built_in_fonts(font_info: &mut Vec<ParsedFont>) -> anyhow::Re
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    fn parsed_font_with_coverage() -> ParsedFont {
-        let mut coverage = RangeSet::new();
-        coverage.add_range(65..68);
-        coverage.add_range(97..100);
-
-        ParsedFont {
-            names: Names {
-                full_name: "Poison Coverage Test".to_string(),
-                family: "Poison Coverage".to_string(),
-                sub_family: Some("Regular".to_string()),
-                postscript_name: Some("PoisonCoverageTest-Regular".to_string()),
-                aliases: vec![],
-            },
-            weight: FontWeight::REGULAR,
-            stretch: FontStretch::Normal,
-            style: FontStyle::Normal,
-            cap_height: None,
-            handle: FontDataHandle {
-                source: FontDataSource::Memory {
-                    name: "poison-coverage-test".to_string(),
-                    data: Arc::new(Vec::<u8>::new().into_boxed_slice()),
-                },
-                index: 0,
-                variation: 0,
-                origin: FontOrigin::BuiltIn,
-                coverage: None,
-            },
-            coverage: Mutex::new(coverage),
-            synthesize_italic: false,
-            synthesize_bold: false,
-            synthesize_dim: false,
-            assume_emoji_presentation: false,
-            pixel_sizes: vec![],
-            is_built_in_fallback: false,
-            palettes: vec![],
-            harfbuzz_features: None,
-            freetype_load_target: None,
-            freetype_render_target: None,
-            freetype_load_flags: None,
-            scale: None,
-        }
-    }
-
-    #[test]
-    fn coverage_cache_recovers_after_poisoned_lock() {
-        let parsed = parsed_font_with_coverage();
-
-        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _coverage = parsed.coverage.lock().unwrap();
-            panic!("poison parsed font coverage");
-        }));
-        assert!(poison.is_err());
-
-        let cloned = parsed.clone();
-        let mut wanted = RangeSet::new();
-        wanted.add_range(64..66);
-        wanted.add_range(98..101);
-
-        let intersection = cloned
-            .coverage_intersection(&wanted)
-            .expect("prepopulated coverage should avoid font I/O");
-        assert!(intersection.contains(65));
-        assert!(!intersection.contains(66));
-        assert!(intersection.contains(98));
-        assert!(intersection.contains(99));
-        assert!(!intersection.contains(100));
-    }
 }
 
 pub fn best_matching_font(

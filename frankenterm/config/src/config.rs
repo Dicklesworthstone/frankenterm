@@ -4,8 +4,6 @@ use crate::color::{
     ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
 };
 use crate::daemon::DaemonOptions;
-#[cfg(feature = "lua")]
-use crate::default_config_with_overrides_applied;
 use crate::exec_domain::ExecDomain;
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
@@ -23,13 +21,16 @@ use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
-#[cfg(feature = "lua")]
-use crate::{config_file_override_snapshot, config_overrides_snapshot, CONFIG_SKIP, HOME_DIR};
 use crate::{
+    CONFIG_DIRS, CellWidth, GpuInfo, IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig,
+    MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop, WebGpuPowerPreference,
     default_one_point_oh, default_one_point_oh_f64, default_true,
-    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
-    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
-    WebGpuPowerPreference, CONFIG_DIRS,
+    default_win32_acrylic_accent_color,
+};
+#[cfg(feature = "lua")]
+use crate::{
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    default_config_with_overrides_applied,
 };
 use anyhow::Context;
 use frankenterm_bidi::ParagraphDirectionHint;
@@ -1205,7 +1206,7 @@ impl Config {
     pub fn update_ulimit(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (no_file_soft, no_file_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
@@ -1234,7 +1235,7 @@ impl Config {
 
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
@@ -1326,7 +1327,7 @@ impl Config {
             paths.insert(0, PathPossibility::required(path.into()));
         }
 
-        if let Some(path) = config_file_override_snapshot().as_ref() {
+        if let Some(path) = CONFIG_FILE_OVERRIDE.lock().unwrap().as_ref() {
             log::trace!("Note: config file override is set");
             paths.insert(0, PathPossibility::required(path.clone()));
         }
@@ -1491,8 +1492,8 @@ impl Config {
         lua: &'l mlua::Lua,
         mut config: mlua::Value<'l>,
     ) -> anyhow::Result<mlua::Value<'l>> {
-        let overrides = config_overrides_snapshot();
-        for (key, value) in &overrides {
+        let overrides = CONFIG_OVERRIDES.lock().unwrap();
+        for (key, value) in &*overrides {
             if value == "nil" {
                 // Literal nil as the value is the same as not specifying the value.
                 // We special case this here as we want to explicitly check for
@@ -3168,9 +3169,11 @@ mod tests {
 
     #[test]
     fn close_confirmation_does_not_skip_shells_by_default() {
-        assert!(Config::default_config()
-            .skip_close_confirmation_for_processes_named
-            .is_empty());
+        assert!(
+            Config::default_config()
+                .skip_close_confirmation_for_processes_named
+                .is_empty()
+        );
     }
 
     #[test]

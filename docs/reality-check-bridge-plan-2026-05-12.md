@@ -44,7 +44,7 @@ Velocity is converging — 871 closes wk of 4/27, 339 wk of 5/4, 35 so far this 
 | G35 | ft-tf6g3.20 | TLA+/Stateright state-space coverage measurement | 6 formal-method | Round 2 |
 | G36 | ft-tf6g3.21 | Continuous differential check against WezTerm upstream rendering | 9 differential | Round 2 |
 | G37 | ft-tf6g3.22 | Sigstore/cosign keyless signing for release attestation bundles | 10 cryptographic | Round 2 |
-| G38 | ft-tf6g3.23 | Observed-delay heavy-tail p99.99 quantile gate | 7 info-theoretic tail estimation | Round 3 |
+| G38 | ft-tf6g3.23 | Stochastic network calculus for p99.99 under heavy-tail arrivals | 8 network-calculus + 7 info-theoretic | Round 3 |
 | G39 | ft-tf6g3.24 | Persistent homology for SSIM-complement visual regression detection | **11 topological** (NEW) | Round 3 |
 | G40 | ft-tf6g3.25 | Submodular set-cover for benchmark corpus minimization | (infrastructure) | Round 3 |
 | G41 | ft-tf6g3.26 | PAC-Bayes generalization bound for semantic-search recall | 7 information-theoretic | Round 3 |
@@ -86,7 +86,7 @@ The release attestation bundle G16 (`ft-tf6g3.1`) blocks on G2, G3, G6, G8, G9, 
 
 ## Round-3 doctrine — the moat is the math
 
-Every Round-3 bead (G38–G44) introduces a mathematical technique that competitors do not use. The G38 implementation is the narrower observed-delay Pareto tail gate documented in `docs/perf/snc-observed-delay-derivation.md`, not a queueing service-curve composition. The remaining Round-3 lanes cover persistent homology for shape-aware visual regression, submodular optimization for bench-set minimization, PAC-Bayes for ML-claim generalization, KL-divergence regime-shift detection, causal DAG attribution, and mechanized soundness proofs. Each one turns a vibe into a falsifiable claim. The competitive moat for ft as a control plane for AI agents is exactly this: claims that an agent can *verify* offline against a signed bundle, with bounds that hold under adversarial inputs and regime shift.
+Every Round-3 bead (G38–G44) introduces a mathematical technique that competitors do not use. Stochastic network calculus for p99.99 bounds, persistent homology for shape-aware visual regression, submodular optimization for bench-set minimization, PAC-Bayes for ML-claim generalization, KL-divergence regime-shift detection, causal DAG attribution, mechanized soundness proofs. Each one turns a vibe into a falsifiable claim. The competitive moat for ft as a control plane for AI agents is exactly this: claims that an agent can *verify* offline against a signed bundle, with bounds that hold under adversarial inputs and regime shift.
 
 ## Predecessor + successor
 

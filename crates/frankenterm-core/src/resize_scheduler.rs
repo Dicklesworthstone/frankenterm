@@ -17,7 +17,7 @@
 //! - observability via scheduler metrics and snapshots
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{OnceLock, RwLock};
 
 use crate::resize_invariants::{
     ResizeInvariantReport, ResizeInvariantTelemetry, ResizePhase, check_lifecycle_event_invariants,
@@ -636,43 +636,20 @@ pub struct ResizeStalledTransaction {
 static GLOBAL_RESIZE_DEBUG_SNAPSHOT: OnceLock<RwLock<Option<ResizeSchedulerDebugSnapshot>>> =
     OnceLock::new();
 
-fn resize_debug_snapshot_lock() -> &'static RwLock<Option<ResizeSchedulerDebugSnapshot>> {
-    GLOBAL_RESIZE_DEBUG_SNAPSHOT.get_or_init(|| RwLock::new(None))
-}
-
-fn read_resize_debug_snapshot() -> RwLockReadGuard<'static, Option<ResizeSchedulerDebugSnapshot>> {
-    let lock = resize_debug_snapshot_lock();
-    match lock.read() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            lock.clear_poison();
-            poisoned.into_inner()
-        }
-    }
-}
-
-fn write_resize_debug_snapshot() -> RwLockWriteGuard<'static, Option<ResizeSchedulerDebugSnapshot>>
-{
-    let lock = resize_debug_snapshot_lock();
-    match lock.write() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            lock.clear_poison();
-            poisoned.into_inner()
-        }
-    }
-}
-
 impl ResizeSchedulerDebugSnapshot {
     /// Update the process-global debug snapshot used by introspection surfaces.
     pub fn update_global(snapshot: Self) {
-        *write_resize_debug_snapshot() = Some(snapshot);
+        let lock = GLOBAL_RESIZE_DEBUG_SNAPSHOT.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(snapshot);
+        }
     }
 
     /// Get the latest process-global resize control-plane debug snapshot.
     #[must_use]
     pub fn get_global() -> Option<Self> {
-        read_resize_debug_snapshot().clone()
+        let lock = GLOBAL_RESIZE_DEBUG_SNAPSHOT.get_or_init(|| RwLock::new(None));
+        lock.read().ok().and_then(|guard| guard.clone())
     }
 
     /// Derive stalled active transactions above `threshold_ms` age.
@@ -2367,45 +2344,6 @@ mod tests {
         assert!(
             matched,
             "global snapshot should include sentinel pane update"
-        );
-    }
-
-    #[test]
-    fn debug_snapshot_global_store_recovers_from_poisoned_lock() {
-        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
-        let _ = scheduler.submit_intent(intent(88, 1, ResizeWorkClass::Background, 2, 10));
-        let _ = scheduler.schedule_frame();
-
-        let poisoned = scheduler.debug_snapshot(16);
-        let lock = resize_debug_snapshot_lock();
-        let poisoner = std::thread::spawn(move || {
-            let mut guard = lock.write().expect("lock should be clean before poison");
-            *guard = Some(poisoned);
-            panic!("intentional resize debug snapshot poison");
-        });
-        assert!(poisoner.join().is_err());
-
-        let _ = scheduler.submit_intent(intent(89, 1, ResizeWorkClass::Interactive, 1, 11));
-        let expected = scheduler.debug_snapshot(16);
-        let mut matched = false;
-        for _ in 0..8 {
-            ResizeSchedulerDebugSnapshot::update_global(expected.clone());
-            let stored =
-                ResizeSchedulerDebugSnapshot::get_global().expect("global snapshot should be set");
-            if stored
-                .scheduler
-                .panes
-                .iter()
-                .any(|pane| pane.pane_id == 89 && pane.pending_seq == Some(1))
-            {
-                matched = true;
-                break;
-            }
-        }
-
-        assert!(
-            matched,
-            "global debug snapshot should update after recovering RwLock poison"
         );
     }
 

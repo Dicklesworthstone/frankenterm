@@ -36,8 +36,7 @@
 //! while preserving recent operator state.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 use rusqlite::{Connection, params};
 
@@ -51,25 +50,6 @@ use crate::capability_passport_store::PassportKey;
 /// special-casing in WHERE clauses. -1 is unreachable as a
 /// `Option<u64>` value, so it's safe as a sentinel.
 const AGENT_SCOPED_PANE_SENTINEL: i64 = -1;
-
-static DURABLE_PASSPORT_STORE_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Read the current count of recovered durable passport store
-/// connection-mutex poison events.
-#[must_use]
-pub fn durable_passport_store_lock_poisoned_count() -> u64 {
-    DURABLE_PASSPORT_STORE_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-fn reset_durable_passport_store_lock_poisoned_count_for_test() {
-    DURABLE_PASSPORT_STORE_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
-}
-
-fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
-    DURABLE_PASSPORT_STORE_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
-    poison.into_inner()
-}
 
 /// Errors from [`DurablePassportStore`].
 #[derive(Debug)]
@@ -160,7 +140,7 @@ impl DurablePassportStore {
     }
 
     fn initialize_schema(&self) -> Result<(), DurablePassportStoreError> {
-        let conn = self.lock_conn();
+        let conn = self.conn.lock().expect("connection mutex poisoned");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -179,10 +159,6 @@ impl DurablePassportStore {
                  ON passports(signed_at_ms);",
         )?;
         Ok(())
-    }
-
-    fn lock_conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(record_poison_and_recover)
     }
 
     fn pane_id_for_storage(pane_id: Option<u64>) -> Result<i64, DurablePassportStoreError> {
@@ -205,7 +181,7 @@ impl DurablePassportStore {
         let signed_at = i64::try_from(passport.signed_at_ms)
             .map_err(|_| DurablePassportStoreError::KeyOverflow)?;
 
-        let mut conn = self.lock_conn();
+        let mut conn = self.conn.lock().expect("connection mutex poisoned");
         let tx = conn.transaction()?;
 
         // Read current state inside the transaction.
@@ -265,7 +241,7 @@ impl DurablePassportStore {
         key: &PassportKey,
     ) -> Result<Option<CapabilityPassport>, DurablePassportStoreError> {
         let pane_id_storage = Self::pane_id_for_storage(key.pane_id)?;
-        let conn = self.lock_conn();
+        let conn = self.conn.lock().expect("connection mutex poisoned");
         let payload: Option<String> = conn
             .query_row(
                 "SELECT payload FROM passports WHERE agent_id = ?1 AND pane_id = ?2",
@@ -284,7 +260,7 @@ impl DurablePassportStore {
         &self,
         agent_id: &str,
     ) -> Result<Vec<CapabilityPassport>, DurablePassportStoreError> {
-        let conn = self.lock_conn();
+        let conn = self.conn.lock().expect("connection mutex poisoned");
         let mut stmt =
             conn.prepare("SELECT payload FROM passports WHERE agent_id = ?1 ORDER BY pane_id")?;
         let rows = stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))?;
@@ -304,7 +280,7 @@ impl DurablePassportStore {
         &self,
         class: &CapabilityClass,
     ) -> Result<Vec<CapabilityPassport>, DurablePassportStoreError> {
-        let conn = self.lock_conn();
+        let conn = self.conn.lock().expect("connection mutex poisoned");
         let mut stmt = conn.prepare("SELECT payload FROM passports")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut matches = Vec::new();
@@ -323,7 +299,7 @@ impl DurablePassportStore {
     pub fn prune_older_than(&self, cutoff_ms: u64) -> Result<usize, DurablePassportStoreError> {
         let cutoff_i64 =
             i64::try_from(cutoff_ms).map_err(|_| DurablePassportStoreError::KeyOverflow)?;
-        let conn = self.lock_conn();
+        let conn = self.conn.lock().expect("connection mutex poisoned");
         let n = conn.execute(
             "DELETE FROM passports WHERE signed_at_ms < ?1",
             params![cutoff_i64],
@@ -333,7 +309,7 @@ impl DurablePassportStore {
 
     /// Total row count (debug / observability helper).
     pub fn row_count(&self) -> Result<u64, DurablePassportStoreError> {
-        let conn = self.lock_conn();
+        let conn = self.conn.lock().expect("connection mutex poisoned");
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM passports", [], |row| row.get(0))?;
         Ok(n as u64)
     }
@@ -342,7 +318,7 @@ impl DurablePassportStore {
     /// true when a row was removed, false when no matching row.
     pub fn delete(&self, key: &PassportKey) -> Result<bool, DurablePassportStoreError> {
         let pane_id_storage = Self::pane_id_for_storage(key.pane_id)?;
-        let conn = self.lock_conn();
+        let conn = self.conn.lock().expect("connection mutex poisoned");
         let n = conn.execute(
             "DELETE FROM passports WHERE agent_id = ?1 AND pane_id = ?2",
             params![&key.agent_id, pane_id_storage],
@@ -355,7 +331,6 @@ impl DurablePassportStore {
 mod tests {
     use super::*;
     use crate::capability_passport::{CapabilityEntry, CapabilityVerification, RedactedProof};
-    use std::sync::Arc;
 
     fn passport(agent: &str, pane: Option<u64>, generation: u64) -> CapabilityPassport {
         CapabilityPassport {
@@ -559,37 +534,6 @@ mod tests {
     fn delete_returns_false_when_row_absent() {
         let s = store();
         assert!(!s.delete(&PassportKey::pane("nobody", 1)).unwrap());
-    }
-
-    #[test]
-    fn store_recovers_after_connection_mutex_poison() {
-        reset_durable_passport_store_lock_poisoned_count_for_test();
-        let s = Arc::new(store());
-
-        let poison_store = Arc::clone(&s);
-        let poison = std::thread::spawn(move || {
-            let _guard = poison_store
-                .conn
-                .lock()
-                .expect("acquire fresh durable passport connection lock to poison");
-            panic!("deliberately poisoning durable passport store connection lock");
-        });
-        let _ = poison.join();
-        assert!(
-            s.conn.is_poisoned(),
-            "spawned thread should have poisoned the connection lock"
-        );
-
-        let p = passport("agent-poison", Some(7), 1);
-        let key = PassportKey::from_passport(&p);
-
-        assert_eq!(s.upsert(&p).unwrap(), UpsertOutcome::Inserted);
-        assert_eq!(s.fetch_by_key(&key).unwrap(), Some(p));
-        assert_eq!(s.row_count().unwrap(), 1);
-        assert!(
-            durable_passport_store_lock_poisoned_count() >= 3,
-            "upsert, fetch, and row_count should each observe poison recovery"
-        );
     }
 
     // ── Concurrency-style smoke ─────────────────────────────────────────

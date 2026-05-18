@@ -542,15 +542,19 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
     Ok((server, client))
 }
 
+fn poll_timeout_millis(duration: Option<Duration>) -> libc::c_int {
+    duration
+        .map(|wait| wait.as_millis().min(libc::c_int::MAX as u128) as libc::c_int)
+        .unwrap_or(-1)
+}
+
 #[doc(hidden)]
 pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize> {
     let poll_result = unsafe {
         WSAPoll(
             pfd.as_mut_ptr(),
             pfd.len() as _,
-            duration
-                .map(|wait| wait.as_millis() as libc::c_int)
-                .unwrap_or(-1),
+            poll_timeout_millis(duration),
         )
     };
     if poll_result < 0 {
@@ -564,6 +568,29 @@ pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize
 mod test {
     use crate::AsRawSocketDescriptor;
     use std::io::{Read, Write};
+    use std::time::Duration;
+
+    #[test]
+    fn poll_timeout_none_preserves_infinite_wait_sentinel() {
+        assert_eq!(super::poll_timeout_millis(None), -1);
+    }
+
+    #[test]
+    fn poll_timeout_millis_converts_in_range_wait() {
+        assert_eq!(
+            super::poll_timeout_millis(Some(Duration::from_millis(12_345))),
+            12_345
+        );
+    }
+
+    #[test]
+    fn poll_timeout_millis_saturates_large_wait() {
+        let overflowing = Duration::from_millis(libc::c_int::MAX as u64 + 1);
+        assert_eq!(
+            super::poll_timeout_millis(Some(overflowing)),
+            libc::c_int::MAX
+        );
+    }
 
     #[test]
     fn socketpair() {

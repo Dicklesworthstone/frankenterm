@@ -45,10 +45,7 @@ Each scenario declares:
 - `proof_category`: `conformance`, `golden`, or `e2e`.
 - `max_output_bytes`: maximum total output budget.
 - `expected_artifacts`: bounded, relative artifact paths with per-artifact
-  byte budgets and content-hash requirements. Committed artifacts other than
-  the self-referential manifest entry must carry a pinned lowercase SHA-256
-  hash in `sha256`; the static verifier compares that pin to the file on disk.
-  Future retained proof artifacts may omit the pin until the artifact exists.
+  byte budgets and content-hash requirements.
 - `degradation`: explicit behavior for Agent Mail unavailable, disabled
   features, RCH proof unavailable, and unsupported platforms.
 

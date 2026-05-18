@@ -17,7 +17,7 @@
 use crate::{EvidenceSample, EvidenceStream, GateDecision};
 use serde::{Deserialize, Serialize};
 
-/// Configuration for the split-window divergence detector.
+/// Configuration for the placeholder divergence detector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegimeShiftConfig {
     /// Minimum samples in each side of the split window.

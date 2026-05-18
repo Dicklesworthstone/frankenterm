@@ -13681,7 +13681,7 @@ fn search_semantic_backend_with_scan_limit(
     scan_limit_rows: Option<usize>,
 ) -> Result<(Vec<SemanticSearchHit>, usize)> {
     if query_vector.is_empty() {
-        return Err(StorageError::Database("Query vector is empty".to_string()).into());
+        return Ok((Vec::new(), 0));
     }
     if query_vector.iter().any(|v| !v.is_finite()) {
         return Err(

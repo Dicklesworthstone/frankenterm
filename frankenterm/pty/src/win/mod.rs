@@ -3,7 +3,7 @@ use anyhow::Context as _;
 use std::io::{Error as IoError, Result as IoResult};
 use std::os::windows::io::AsRawHandle;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use winapi::shared::minwindef::DWORD;
 use winapi::um::minwinbase::STILL_ACTIVE;
@@ -17,12 +17,6 @@ mod psuedocon;
 
 use filedescriptor::OwnedHandle;
 
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 #[derive(Debug)]
 pub struct WinChild {
     proc: Mutex<OwnedHandle>,
@@ -32,7 +26,7 @@ pub struct WinChild {
 impl WinChild {
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
         let mut status: DWORD = 0;
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = self.proc.lock().unwrap().try_clone().unwrap();
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
             if status == STILL_ACTIVE {
@@ -46,7 +40,7 @@ impl WinChild {
     }
 
     fn do_kill(&mut self) -> IoResult<()> {
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = self.proc.lock().unwrap().try_clone().unwrap();
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         // TerminateProcess returns non-zero (TRUE) on success
         if res == 0 {
@@ -64,7 +58,7 @@ impl ChildKiller for WinChild {
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = self.proc.lock().unwrap().try_clone().unwrap();
         Box::new(WinChildKiller { proc })
     }
 }
@@ -100,7 +94,7 @@ impl Child for WinChild {
         if let Ok(Some(status)) = self.try_wait() {
             return Ok(status);
         }
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = self.proc.lock().unwrap().try_clone().unwrap();
         unsafe {
             WaitForSingleObject(proc.as_raw_handle() as _, INFINITE);
         }
@@ -114,12 +108,16 @@ impl Child for WinChild {
     }
 
     fn process_id(&self) -> Option<u32> {
-        let res = unsafe { GetProcessId(lock_or_recover(&self.proc).as_raw_handle() as _) };
-        if res == 0 { None } else { Some(res) }
+        let res = unsafe { GetProcessId(self.proc.lock().unwrap().as_raw_handle() as _) };
+        if res == 0 {
+            None
+        } else {
+            Some(res)
+        }
     }
 
     fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-        let proc = lock_or_recover(&self.proc);
+        let proc = self.proc.lock().unwrap();
         Some(proc.as_raw_handle())
     }
 }
@@ -136,13 +134,13 @@ impl std::future::Future for WinChild {
                 unsafe impl Send for PassHandleToWaiterThread {}
 
                 let spawn_error = {
-                    let mut waiter = lock_or_recover(&self.waiter);
+                    let mut waiter = self.waiter.lock().unwrap();
                     if let Some(waker_slot) = waiter.as_ref() {
-                        *lock_or_recover(waker_slot.as_ref()) = Some(cx.waker().clone());
+                        *waker_slot.lock().unwrap() = Some(cx.waker().clone());
                         None
                     } else {
                         let handle =
-                            PassHandleToWaiterThread(lock_or_recover(&self.proc).try_clone()?);
+                            PassHandleToWaiterThread(self.proc.lock().unwrap().try_clone()?);
                         let waker_slot = Arc::new(Mutex::new(Some(cx.waker().clone())));
                         let waiter_waker_slot = Arc::clone(&waker_slot);
                         let spawn_result = std::thread::Builder::new()
@@ -151,7 +149,11 @@ impl std::future::Future for WinChild {
                                 unsafe {
                                     WaitForSingleObject(handle.0.as_raw_handle() as _, INFINITE);
                                 }
-                                let waker = lock_or_recover(waiter_waker_slot.as_ref()).take();
+                                let waker = waiter_waker_slot
+                                    .lock()
+                                    .map(|mut waker| waker.take())
+                                    .ok()
+                                    .flatten();
                                 if let Some(waker) = waker {
                                     waker.wake();
                                 }

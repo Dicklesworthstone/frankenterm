@@ -582,15 +582,7 @@ impl ImageData {
     }
 
     pub fn data(&self) -> MutexGuard<'_, ImageDataType> {
-        self.data.lock().unwrap_or_else(|poisoned| {
-            #[cfg(feature = "use_image")]
-            log::warn!(
-                "recovering poisoned ImageData lock for image hash {:x?}",
-                self.hash
-            );
-            self.data.clear_poison();
-            poisoned.into_inner()
-        })
+        self.data.lock().unwrap()
     }
 
     pub fn hash(&self) -> [u8; 32] {
@@ -811,38 +803,6 @@ mod tests {
         let idt = ImageDataType::EncodedFile(vec![1, 2, 3, 4, 5]);
         let id = ImageData::with_data(idt);
         assert_eq!(id.len(), 5);
-    }
-
-    #[test]
-    fn image_data_recovers_after_poisoned_data_lock() {
-        let id = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
-            1,
-            1,
-            vec![1, 2, 3, 4],
-        )));
-        let poisoned = Arc::clone(&id);
-
-        let handle = std::thread::spawn(move || {
-            let _guard = poisoned.data.lock().unwrap();
-            panic!("simulate ImageData mutex poison");
-        });
-
-        assert!(handle.join().is_err());
-        assert_eq!(id.len(), 4);
-
-        let data = id.data();
-        match &*data {
-            ImageDataType::Rgba8 {
-                width,
-                height,
-                data,
-                ..
-            } => {
-                assert_eq!((*width, *height), (1, 1));
-                assert_eq!(data, &[1, 2, 3, 4]);
-            }
-            other => panic!("expected Rgba8 after poison recovery, got {other:?}"),
-        }
     }
 
     #[test]

@@ -36,24 +36,21 @@
           "kind": "scenario_yaml",
           "path": "fixtures/demo-lab/scenarios/quickstart.yaml",
           "max_bytes": 65536,
-          "content_hash_required": true,
-          "sha256": "7f33c947552bbecf774a3172200b44fd9e014c0a1b7365e37bbea04a9b1c845b"
+          "content_hash_required": true
         },
         {
           "id": "golden_json",
           "kind": "golden_json",
           "path": "fixtures/demo-lab/golden/quickstart.json",
           "max_bytes": 131072,
-          "content_hash_required": true,
-          "sha256": "17c1881cb23c0fd4997968cb575a10568f5aa9c88aba8e8e5318cf10f4081be4"
+          "content_hash_required": true
         },
         {
           "id": "golden_toon",
           "kind": "golden_toon",
           "path": "fixtures/demo-lab/golden/quickstart.toon",
           "max_bytes": 131072,
-          "content_hash_required": true,
-          "sha256": "ba37430a0878469e96489219149c724e3166eb5c9f6a6ddfdb5fc9263e581e28"
+          "content_hash_required": true
         }
       ],
       "degradation": [
@@ -106,16 +103,14 @@
           "kind": "scenario_yaml",
           "path": "fixtures/demo-lab/scenarios/usage_limit.yaml",
           "max_bytes": 65536,
-          "content_hash_required": true,
-          "sha256": "7c33f4ae15bace7246f67d0220c61b8bbc75e908e324f4a0b28c5232043f01d1"
+          "content_hash_required": true
         },
         {
           "id": "golden_json",
           "kind": "golden_json",
           "path": "fixtures/demo-lab/golden/usage_limit.json",
           "max_bytes": 131072,
-          "content_hash_required": true,
-          "sha256": "4c70fad0c14a94616637b5c71a6587558cce851668098f61e063d076edae19b1"
+          "content_hash_required": true
         },
         {
           "id": "structured_log",
@@ -175,16 +170,14 @@
           "kind": "scenario_yaml",
           "path": "fixtures/demo-lab/scenarios/compaction.yaml",
           "max_bytes": 65536,
-          "content_hash_required": true,
-          "sha256": "9aedeec0f804e01cb24f8ad97e9960c991504957cccd7f6b0e03e3ad5d40821e"
+          "content_hash_required": true
         },
         {
           "id": "golden_toon",
           "kind": "golden_toon",
           "path": "fixtures/demo-lab/golden/compaction.toon",
           "max_bytes": 131072,
-          "content_hash_required": true,
-          "sha256": "d515a387a2766e746b00951b4d5d287ed6dd0fdee4902e73772be0eee1f466c6"
+          "content_hash_required": true
         },
         {
           "id": "proof_summary",

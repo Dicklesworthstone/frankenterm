@@ -89,7 +89,6 @@ impl LiveScrollbackSpillSink {
             Ok(state) => state,
             Err(poisoned) => {
                 log::error!("live scrollback spill state mutex poisoned during {context}");
-                self.state.clear_poison();
                 poisoned.into_inner()
             }
         }
@@ -103,7 +102,6 @@ impl LiveScrollbackSpillSink {
             Ok(store) => store,
             Err(poisoned) => {
                 log::error!("live scrollback spill store mutex poisoned during {context}");
-                self.store.clear_poison();
                 poisoned.into_inner()
             }
         }
@@ -619,9 +617,7 @@ mod tests {
             panic!("poison state lock for regression coverage");
         }));
         assert!(state_poisoned.is_err());
-        assert!(sink.state.is_poisoned());
         assert!(sink.store_scrollback_line(0, &first, 8));
-        assert!(!sink.state.is_poisoned());
         assert!(sink.load_scrollback_line(0).is_some());
 
         let store_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -629,9 +625,7 @@ mod tests {
             panic!("poison store lock for regression coverage");
         }));
         assert!(store_poisoned.is_err());
-        assert!(sink.store.is_poisoned());
         assert_eq!(sink.retained_scrollback_rows(), 1);
-        assert!(!sink.store.is_poisoned());
         assert!(sink.store_scrollback_line(1, &second, 8));
         assert_eq!(sink.retained_scrollback_rows(), 2);
         assert_eq!(

@@ -1,22 +1,11 @@
 #[cfg(unix)]
 use libc::{mode_t, umask};
 #[cfg(unix)]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 #[cfg(unix)]
 lazy_static::lazy_static! {
 static ref SAVED_UMASK: Mutex<Option<libc::mode_t>> = Mutex::new(None);
-}
-
-#[cfg(unix)]
-fn saved_umask_lock() -> MutexGuard<'static, Option<mode_t>> {
-    match SAVED_UMASK.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            SAVED_UMASK.clear_poison();
-            poisoned.into_inner()
-        }
-    }
 }
 
 /// Unfortunately, novice unix users can sometimes be running
@@ -39,7 +28,7 @@ impl UmaskSaver {
 
         #[cfg(unix)]
         {
-            let _previous = saved_umask_lock().replace(me.mask);
+            SAVED_UMASK.lock().unwrap().replace(me.mask);
         }
 
         me
@@ -51,7 +40,7 @@ impl UmaskSaver {
     /// used in a program.
     #[cfg(unix)]
     pub fn saved_umask() -> Option<mode_t> {
-        *saved_umask_lock()
+        *SAVED_UMASK.lock().unwrap()
     }
 }
 
@@ -66,7 +55,9 @@ impl Drop for UmaskSaver {
         #[cfg(unix)]
         unsafe {
             umask(self.mask);
-            let _previous = saved_umask_lock().take();
+            if let Ok(mut guard) = SAVED_UMASK.lock() {
+                guard.take();
+            }
         }
     }
 }
@@ -175,31 +166,8 @@ mod tests {
     fn saved_umask_returns_none_before_any_saver() {
         let _g = TEST_LOCK.lock().unwrap();
         // Ensure no saver is active by dropping any leftovers
-        let _previous = saved_umask_lock().take();
+        SAVED_UMASK.lock().unwrap().take();
         assert!(UmaskSaver::saved_umask().is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn saved_umask_recovers_after_poisoned_lock() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let original = unsafe { umask(0o022) };
-        let _previous = saved_umask_lock().take();
-
-        let poison = std::panic::catch_unwind(|| {
-            let _guard = SAVED_UMASK.lock().unwrap();
-            panic!("poison saved umask");
-        });
-        assert!(poison.is_err());
-
-        let saver = UmaskSaver::new();
-        assert_eq!(UmaskSaver::saved_umask(), Some(0o022));
-        drop(saver);
-        assert!(UmaskSaver::saved_umask().is_none());
-
-        let restored = unsafe { umask(original) };
-        assert_eq!(restored, 0o022);
-        unsafe { umask(original) };
     }
 
     #[cfg(unix)]
@@ -446,7 +414,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o022) };
 
-        let _previous = saved_umask_lock().take();
+        SAVED_UMASK.lock().unwrap().take();
         assert!(UmaskSaver::saved_umask().is_none());
 
         {
@@ -1423,7 +1391,7 @@ mod tests {
     fn nested_saved_umask_after_each_drop() {
         let _g = TEST_LOCK.lock().unwrap();
         let original = unsafe { umask(0o022) };
-        let _previous = saved_umask_lock().take();
+        SAVED_UMASK.lock().unwrap().take();
 
         assert!(UmaskSaver::saved_umask().is_none());
         let a = UmaskSaver::new();

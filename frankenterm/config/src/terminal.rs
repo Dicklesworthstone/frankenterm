@@ -4,7 +4,7 @@ use crate::{configuration, ConfigHandle, NewlineCanon};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::{BidiMode, ScrollbackSpillSink};
 use frankenterm_term::MonospaceKpCostModel;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use termwiz::cell::UnicodeVersion;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,32 +22,19 @@ fn scrollback_spill_sink_factory() -> &'static Mutex<Option<Arc<ScrollbackSpillS
     FACTORY.get_or_init(|| Mutex::new(None))
 }
 
-fn lock_terminal_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            log::warn!("recovering poisoned {name} mutex");
-            mutex.clear_poison();
-            poisoned.into_inner()
-        }
-    }
-}
-
 pub fn set_scrollback_spill_sink_factory(factory: Option<Arc<ScrollbackSpillSinkFactory>>) {
-    *lock_terminal_mutex(
-        scrollback_spill_sink_factory(),
-        "scrollback spill sink factory",
-    ) = factory;
+    *scrollback_spill_sink_factory()
+        .lock()
+        .expect("scrollback spill sink factory mutex poisoned") = factory;
 }
 
 fn scrollback_spill_sink_for(
     context: ScrollbackSpillSinkContext,
 ) -> Option<Arc<dyn ScrollbackSpillSink>> {
-    let factory = lock_terminal_mutex(
-        scrollback_spill_sink_factory(),
-        "scrollback spill sink factory",
-    )
-    .clone();
+    let factory = scrollback_spill_sink_factory()
+        .lock()
+        .expect("scrollback spill sink factory mutex poisoned")
+        .clone();
     factory.and_then(|factory| factory(context))
 }
 
@@ -105,22 +92,17 @@ impl TermConfig {
     }
 
     pub fn set_config(&self, config: ConfigHandle) {
-        let _previous = lock_terminal_mutex(&self.config, "terminal config").replace(config);
+        self.config.lock().unwrap().replace(config);
     }
 
     pub fn set_client_palette(&self, palette: ColorPalette) {
-        let _previous =
-            lock_terminal_mutex(&self.client_palette, "terminal client palette").replace(palette);
+        self.client_palette.lock().unwrap().replace(palette);
     }
 
     fn configuration(&self) -> ConfigHandle {
-        if let Some(handle) = lock_terminal_mutex(&self.config, "terminal config")
-            .as_ref()
-            .cloned()
-        {
-            handle
-        } else {
-            configuration()
+        match self.config.lock().unwrap().as_ref() {
+            Some(h) => h.clone(),
+            None => configuration(),
         }
     }
 }
@@ -187,7 +169,7 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
     }
 
     fn color_palette(&self) -> ColorPalette {
-        let client_palette = lock_terminal_mutex(&self.client_palette, "terminal client palette");
+        let client_palette = self.client_palette.lock().unwrap();
         if let Some(p) = client_palette.as_ref().cloned() {
             return p;
         }
@@ -421,53 +403,6 @@ mod tests {
         assert_eq!(sink.retained_scrollback_rows(), 1);
 
         set_scrollback_spill_sink_factory(None);
-    }
-
-    #[test]
-    fn term_config_recovers_after_poisoned_locks() {
-        let _env_lock = crate::test_env_lock();
-
-        let factory_poisoned = std::panic::catch_unwind(|| {
-            let _factory = scrollback_spill_sink_factory()
-                .lock()
-                .expect("factory lock for poison test");
-            panic!("poison scrollback sink factory");
-        });
-        assert!(factory_poisoned.is_err());
-
-        set_scrollback_spill_sink_factory(Some(Arc::new(|_context| {
-            Some(Arc::new(TestScrollbackSpillSink))
-        })));
-        let term_config = TermConfig::new_for_pane(9, 4, "poisoned-shell");
-        assert!(term_config.scrollback_spill_sink().is_some());
-        set_scrollback_spill_sink_factory(None);
-
-        let term_config = TermConfig::new();
-        let config_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _config = term_config
-                .config
-                .lock()
-                .expect("config lock for poison test");
-            panic!("poison terminal config");
-        }));
-        assert!(config_poisoned.is_err());
-
-        let handle = ConfigHandle::default_config();
-        term_config.set_config(handle.clone());
-        assert_eq!(term_config.generation(), handle.generation());
-
-        let palette_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _palette = term_config
-                .client_palette
-                .lock()
-                .expect("client palette lock for poison test");
-            panic!("poison terminal client palette");
-        }));
-        assert!(palette_poisoned.is_err());
-
-        let palette = ColorPalette::default();
-        term_config.set_client_palette(palette.clone());
-        assert_eq!(term_config.color_palette(), palette);
     }
 
     #[test]

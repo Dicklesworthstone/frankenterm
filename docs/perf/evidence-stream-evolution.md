@@ -2,7 +2,7 @@
 
 Canonical record of changes to the per-claim evidence-stream JSONL row shape. The current schema lives at `docs/perf/evidence-stream-schema.json` and the Rust source-of-truth is `crates/ft-perf-gate/src/lib.rs` `EvidenceSample`.
 
-This doc is the home for migration notes that the proof-gate consumers (SPRT, conformal, Lindley latency bounds, observed-delay heavy-tail quantile bounds, regime-shift, causal-DAG, headline-claim attestation) must honor when reading older or newer rows.
+This doc is the home for migration notes that the proof-gate consumers (SPRT, conformal, Lindley/SNC, regime-shift, causal-DAG, headline-claim attestation) must honor when reading older or newer rows.
 
 ## Versioning rules
 

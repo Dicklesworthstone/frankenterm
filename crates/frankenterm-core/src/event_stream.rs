@@ -954,15 +954,13 @@ pub struct SubscriptionInfo {
     pub events_filtered_out: u64,
 }
 
-type SubscriptionMap = std::collections::HashMap<SubscriptionId, SubscriptionInfo>;
-
 /// Registry of active streaming subscriptions.
 ///
 /// Tracks all active subscriptions for introspection and management.
 /// Used by the robot API to expose subscription state.
 pub struct SubscriptionRegistry {
     next_id: AtomicU64,
-    subscriptions: std::sync::Mutex<SubscriptionMap>,
+    subscriptions: std::sync::Mutex<std::collections::HashMap<SubscriptionId, SubscriptionInfo>>,
 }
 
 impl Default for SubscriptionRegistry {
@@ -978,17 +976,6 @@ impl SubscriptionRegistry {
         Self {
             next_id: AtomicU64::new(1),
             subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    fn subscriptions(&self) -> std::sync::MutexGuard<'_, SubscriptionMap> {
-        match self.subscriptions.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                self.subscriptions.clear_poison();
-                guard
-            }
         }
     }
 
@@ -1008,40 +995,56 @@ impl SubscriptionRegistry {
             events_delivered: 0,
             events_filtered_out: 0,
         };
-        self.subscriptions().insert(id, info);
+        if let Ok(mut subs) = self.subscriptions.lock() {
+            subs.insert(id, info);
+        }
         id
     }
 
     /// Remove a subscription.
     pub fn unregister(&self, id: SubscriptionId) -> Option<SubscriptionInfo> {
-        self.subscriptions().remove(&id)
+        self.subscriptions
+            .lock()
+            .ok()
+            .and_then(|mut subs| subs.remove(&id))
     }
 
     /// Update telemetry for a subscription.
     pub fn update_telemetry(&self, id: SubscriptionId, telemetry: &StreamTelemetry) {
-        if let Some(info) = self.subscriptions().get_mut(&id) {
-            info.events_delivered = telemetry.delivered;
-            info.events_filtered_out = telemetry.filtered_out;
-            info.cursor.after_id = telemetry.cursor_position;
+        if let Ok(mut subs) = self.subscriptions.lock() {
+            if let Some(info) = subs.get_mut(&id) {
+                info.events_delivered = telemetry.delivered;
+                info.events_filtered_out = telemetry.filtered_out;
+                info.cursor.after_id = telemetry.cursor_position;
+            }
         }
     }
 
     /// List all active subscriptions.
     #[must_use]
     pub fn list(&self) -> Vec<SubscriptionInfo> {
-        self.subscriptions().values().cloned().collect()
+        self.subscriptions
+            .lock()
+            .map(|subs| subs.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Get a specific subscription.
     #[must_use]
     pub fn get(&self, id: SubscriptionId) -> Option<SubscriptionInfo> {
-        self.subscriptions().get(&id).cloned()
+        self.subscriptions
+            .lock()
+            .ok()
+            .and_then(|subs| subs.get(&id).cloned())
     }
 
     /// Number of active subscriptions.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.subscriptions().len()
+        self.subscriptions
+            .lock()
+            .map(|subs| subs.len())
+            .unwrap_or(0)
     }
 }
 
@@ -1524,51 +1527,6 @@ mod tests {
         );
         assert_ne!(id1, id2);
         assert_eq!(registry.count(), 2);
-    }
-
-    #[test]
-    fn registry_recovers_from_poisoned_subscription_lock() {
-        let registry = SubscriptionRegistry::new();
-        let id1 = registry.register(
-            EventStreamFilter::default(),
-            StreamCursor::from_beginning(),
-            1000,
-        );
-
-        let read_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = registry.subscriptions.lock().unwrap();
-            panic!("poison subscription registry lock before read");
-        }));
-        assert!(read_poison.is_err());
-        assert!(registry.subscriptions.is_poisoned());
-        assert_eq!(registry.list().len(), 1);
-        assert!(!registry.subscriptions.is_poisoned());
-
-        let write_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = registry.subscriptions.lock().unwrap();
-            panic!("poison subscription registry lock before write");
-        }));
-        assert!(write_poison.is_err());
-        assert!(registry.subscriptions.is_poisoned());
-
-        let id2 = registry.register(
-            EventStreamFilter::builder().pane_id(2).build(),
-            StreamCursor::after_id(10),
-            1001,
-        );
-        assert!(!registry.subscriptions.is_poisoned());
-        assert_eq!(registry.count(), 2);
-
-        let telemetry = StreamTelemetry {
-            delivered: 4,
-            filtered_out: 2,
-            cursor_position: 12,
-            correlation_id: None,
-        };
-        registry.update_telemetry(id2, &telemetry);
-        assert_eq!(registry.get(id2).unwrap().events_delivered, 4);
-        assert!(registry.unregister(id1).is_some());
-        assert_eq!(registry.count(), 1);
     }
 
     // --- SeverityLevel tests ---

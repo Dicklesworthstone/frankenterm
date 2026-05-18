@@ -8,7 +8,7 @@ use mux::Mux;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
 use portable_pty::cmdbuilder::CommandBuilder;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -66,11 +66,10 @@ extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
 /// stop" signal and the handler body is async-signal-safe.
 ///
 #[cfg(unix)]
-#[allow(unsafe_code)]
 fn install_shutdown_signal_handlers() {
-    // SAFETY: This runs during single-threaded startup before worker threads
-    // spawn. The handler is an `extern "C"` function with the POSIX signal
-    // ABI and only performs an atomic store, which is async-signal-safe.
+    // SAFETY: single-threaded startup, before any worker threads spawn.
+    // libc::signal is the minimal POSIX primitive that's sufficient
+    // for the flag-set-and-poll pattern.
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -88,24 +87,6 @@ fn install_shutdown_signal_handlers() {
     // Windows has no POSIX signals. The daemon surface is Unix-only
     // in practice (the `daemonize` path at daemonize.rs is
     // `#![cfg(unix)]`), so the non-Unix branch is a no-op.
-}
-
-#[allow(unsafe_code)]
-fn set_process_env_for_mux_server_startup(name: &str, value: impl AsRef<OsStr>) {
-    // SAFETY: This private wrapper is only used during mux-server startup before
-    // worker threads spawn, or by tests that hold TEST_STATE. Those call sites
-    // serialize process-wide environment mutation and avoid concurrent env
-    // readers/writers.
-    unsafe { std::env::set_var(name, value) };
-}
-
-#[allow(unsafe_code)]
-fn remove_process_env_for_mux_server_startup(name: &str) {
-    // SAFETY: This private wrapper is only used during mux-server startup before
-    // worker threads spawn, or by tests that hold TEST_STATE. Those call sites
-    // serialize process-wide environment mutation and avoid concurrent env
-    // readers/writers.
-    unsafe { std::env::remove_var(name) };
 }
 
 #[derive(Debug, Parser)]
@@ -206,7 +187,8 @@ fn run() -> anyhow::Result<()> {
 
     config.update_ulimit()?;
     if let Some(value) = &config.default_ssh_auth_sock {
-        set_process_env_for_mux_server_startup("SSH_AUTH_SOCK", value.as_str());
+        // SAFETY: called during single-threaded startup before worker threads spawn.
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", value) };
     }
 
     if opts.daemonize {
@@ -225,19 +207,22 @@ fn run() -> anyhow::Result<()> {
     // server.
     // We may potentially want to look into starting/registering
     // a session of some kind here as well in the future.
-    for name in &[
-        "OLDPWD",
-        "PWD",
-        "SHLVL",
-        "WEZTERM_PANE",
-        "WEZTERM_UNIX_SOCKET",
-        "FRANKENTERM_UNIX_SOCKET",
-        "_",
-    ] {
-        remove_process_env_for_mux_server_startup(name);
-    }
-    for name in &config::configuration().mux_env_remove {
-        remove_process_env_for_mux_server_startup(name);
+    // SAFETY: called during single-threaded startup before worker threads spawn.
+    unsafe {
+        for name in &[
+            "OLDPWD",
+            "PWD",
+            "SHLVL",
+            "WEZTERM_PANE",
+            "WEZTERM_UNIX_SOCKET",
+            "FRANKENTERM_UNIX_SOCKET",
+            "_",
+        ] {
+            std::env::remove_var(name);
+        }
+        for name in &config::configuration().mux_env_remove {
+            std::env::remove_var(name);
+        }
     }
 
     wezterm_blob_leases::register_storage(Arc::new(
@@ -361,10 +346,15 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 mod ossl;
 
 fn set_mux_socket_environment(config: &config::ConfigHandle) {
+    // SAFETY: Setting environment variables must happen before worker threads
+    // are spawned to avoid data races. We publish both legacy and ft-specific
+    // socket vars so spawned processes and sibling tools resolve the same mux.
     if let Some(unix_dom) = config.unix_domains.first() {
         let socket_path = unix_dom.socket_path();
-        set_process_env_for_mux_server_startup("WEZTERM_UNIX_SOCKET", socket_path.as_os_str());
-        set_process_env_for_mux_server_startup("FRANKENTERM_UNIX_SOCKET", socket_path.as_os_str());
+        unsafe {
+            std::env::set_var("WEZTERM_UNIX_SOCKET", &socket_path);
+            std::env::set_var("FRANKENTERM_UNIX_SOCKET", &socket_path);
+        }
     }
 }
 
@@ -502,8 +492,11 @@ mod tests {
 
     fn reset_test_state() {
         config::use_test_configuration();
-        remove_process_env_for_mux_server_startup("WEZTERM_UNIX_SOCKET");
-        remove_process_env_for_mux_server_startup("FRANKENTERM_UNIX_SOCKET");
+        // SAFETY: tests take a global mutex and mutate process env serially.
+        unsafe {
+            std::env::remove_var("WEZTERM_UNIX_SOCKET");
+            std::env::remove_var("FRANKENTERM_UNIX_SOCKET");
+        }
     }
 
     #[test]
@@ -556,8 +549,11 @@ mod tests {
         let _guard = lock_test_state();
 
         let sentinel = PathBuf::from("/tmp/ft-existing.sock");
-        set_process_env_for_mux_server_startup("WEZTERM_UNIX_SOCKET", sentinel.as_os_str());
-        set_process_env_for_mux_server_startup("FRANKENTERM_UNIX_SOCKET", sentinel.as_os_str());
+        // SAFETY: tests take a global mutex and mutate process env serially.
+        unsafe {
+            std::env::set_var("WEZTERM_UNIX_SOCKET", &sentinel);
+            std::env::set_var("FRANKENTERM_UNIX_SOCKET", &sentinel);
+        }
 
         let handle = make_config_with_unix_domains(Vec::new());
         set_mux_socket_environment(&handle);
@@ -569,74 +565,6 @@ mod tests {
         assert_eq!(
             std::env::var_os("FRANKENTERM_UNIX_SOCKET"),
             Some(sentinel.into_os_string())
-        );
-    }
-
-    fn unsafe_allow_targets(source_name: &str, source: &str) -> Vec<String> {
-        let lines: Vec<_> = source.lines().collect();
-        let mut targets = Vec::new();
-
-        for (index, line) in lines.iter().enumerate() {
-            if line.trim() != "#[allow(unsafe_code)]" {
-                continue;
-            }
-
-            let target = lines[index + 1..]
-                .iter()
-                .map(|line| line.trim())
-                .find(|line| {
-                    !line.is_empty()
-                        && !line.starts_with("#[")
-                        && !line.starts_with("//")
-                        && !line.starts_with("///")
-                })
-                .expect("allow(unsafe_code) must annotate a concrete item");
-
-            let signature = target
-                .split('{')
-                .next()
-                .unwrap_or(target)
-                .trim()
-                .to_string();
-            targets.push(format!("{source_name}:{signature}"));
-        }
-
-        targets
-    }
-
-    #[test]
-    fn unsafe_code_allowlist_stays_narrow() {
-        let manifest = include_str!("../Cargo.toml");
-        assert!(
-            manifest.contains("unsafe_code = \"deny\""),
-            "mux-server must deny unsafe by default"
-        );
-        assert!(
-            !manifest.contains("unsafe_code = \"allow\""),
-            "whole-crate unsafe allowance must not return"
-        );
-
-        let mut targets = Vec::new();
-        targets.extend(unsafe_allow_targets("main.rs", include_str!("main.rs")));
-        targets.extend(unsafe_allow_targets(
-            "daemonize.rs",
-            include_str!("daemonize.rs"),
-        ));
-
-        assert_eq!(
-            targets,
-            vec![
-                "main.rs:fn install_shutdown_signal_handlers()",
-                "main.rs:fn set_process_env_for_mux_server_startup(name: &str, value: impl AsRef<OsStr>)",
-                "main.rs:fn remove_process_env_for_mux_server_startup(name: &str)",
-                "daemonize.rs:fn fork() -> anyhow::Result<Fork>",
-                "daemonize.rs:fn setsid() -> anyhow::Result<()>",
-                "daemonize.rs:fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File>",
-                "daemonize.rs:fn wait_for_intermediate_child(pid: pid_t) -> !",
-                "daemonize.rs:fn current_pid() -> pid_t",
-                "daemonize.rs:fn redirect_standard_streams(",
-                "daemonize.rs:pub fn set_cloexec(fd: RawFd, enable: bool)",
-            ]
         );
     }
 

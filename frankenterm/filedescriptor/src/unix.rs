@@ -462,21 +462,50 @@ pub use libc::{pollfd, POLLERR, POLLHUP, POLLIN, POLLOUT};
 use std::time::Duration;
 
 #[cfg(not(target_os = "macos"))]
+fn poll_timeout_millis(duration: Option<Duration>) -> libc::c_int {
+    duration
+        .map(|wait| wait.as_millis().min(libc::c_int::MAX as u128) as libc::c_int)
+        .unwrap_or(-1)
+}
+
+#[cfg(not(target_os = "macos"))]
 #[doc(hidden)]
 pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize> {
     let poll_result = unsafe {
         libc::poll(
             pfd.as_mut_ptr(),
             pfd.len() as _,
-            duration
-                .map(|wait| wait.as_millis() as libc::c_int)
-                .unwrap_or(-1),
+            poll_timeout_millis(duration),
         )
     };
     if poll_result < 0 {
         Err(Error::Poll(std::io::Error::last_os_error()))
     } else {
         Ok(poll_result as usize)
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn poll_timeout_none_preserves_infinite_wait_sentinel() {
+        assert_eq!(poll_timeout_millis(None), -1);
+    }
+
+    #[test]
+    fn poll_timeout_millis_converts_in_range_wait() {
+        assert_eq!(
+            poll_timeout_millis(Some(Duration::from_millis(12_345))),
+            12_345
+        );
+    }
+
+    #[test]
+    fn poll_timeout_millis_saturates_large_wait() {
+        let overflowing = Duration::from_millis(libc::c_int::MAX as u64 + 1);
+        assert_eq!(poll_timeout_millis(Some(overflowing)), libc::c_int::MAX);
     }
 }
 
@@ -541,6 +570,23 @@ mod macos {
         set.as_ref().map(|s| s.contains(fd)).unwrap_or(false)
     }
 
+    fn timeval_from_duration(duration: Duration) -> timeval {
+        let max_secs = libc::time_t::MAX as u64;
+        let input_secs = duration.as_secs();
+        let seconds = input_secs.min(max_secs);
+        let micros =
+            if input_secs > max_secs || (input_secs == max_secs && duration.subsec_nanos() > 0) {
+                999_999
+            } else {
+                duration.subsec_micros()
+            };
+
+        timeval {
+            tv_sec: seconds as libc::time_t,
+            tv_usec: micros as _,
+        }
+    }
+
     pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize> {
         let mut read_set = None;
         let mut write_set = None;
@@ -561,10 +607,7 @@ mod macos {
             materialize(&mut exception_set).add(item.fd)?;
         }
 
-        let mut timeout = duration.map(|d| timeval {
-            tv_sec: d.as_secs() as _,
-            tv_usec: d.subsec_micros() as _,
-        });
+        let mut timeout = duration.map(timeval_from_duration);
 
         let res = unsafe {
             libc::select(
@@ -595,6 +638,33 @@ mod macos {
             }
 
             Ok(res as usize)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn timeval_preserves_in_range_duration() {
+            let timeout = timeval_from_duration(Duration::new(12, 345_000_000));
+            assert_eq!(timeout.tv_sec, 12);
+            assert_eq!(timeout.tv_usec, 345_000);
+        }
+
+        #[test]
+        fn timeval_preserves_exact_max_second_duration() {
+            let timeout = timeval_from_duration(Duration::from_secs(libc::time_t::MAX as u64));
+            assert_eq!(timeout.tv_sec, libc::time_t::MAX);
+            assert_eq!(timeout.tv_usec, 0);
+        }
+
+        #[test]
+        fn timeval_saturates_large_duration() {
+            let overflowing = Duration::from_secs((libc::time_t::MAX as u64).saturating_add(1));
+            let timeout = timeval_from_duration(overflowing);
+            assert_eq!(timeout.tv_sec, libc::time_t::MAX);
+            assert_eq!(timeout.tv_usec, 999_999);
         }
     }
 }

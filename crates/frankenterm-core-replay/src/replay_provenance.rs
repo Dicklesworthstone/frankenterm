@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 // ============================================================================
 // Verbosity levels
@@ -147,21 +147,6 @@ struct ProvenanceInner {
     next_position: u64,
 }
 
-fn lock_or_recover<'a, T>(
-    mutex: &'a Mutex<T>,
-    lock_name: &'static str,
-    context: &'static str,
-) -> MutexGuard<'a, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        tracing::warn!(
-            lock_name = lock_name,
-            context = context,
-            "recovering poisoned replay provenance mutex"
-        );
-        poisoned.into_inner()
-    })
-}
-
 impl ReplayProvenanceEmitter {
     /// Create a new emitter for the given replay run.
     #[must_use]
@@ -182,15 +167,11 @@ impl ReplayProvenanceEmitter {
         Self::new(replay_run_id, ProvenanceConfig::default())
     }
 
-    fn lock_inner(&self, context: &'static str) -> MutexGuard<'_, ProvenanceInner> {
-        lock_or_recover(&self.inner, "provenance_emitter", context)
-    }
-
     /// Record a replay decision.
     ///
     /// Returns the assigned event_position.
     pub fn record(&self, params: ProvenanceRecordParams) -> u64 {
-        let mut inner = self.lock_inner("record");
+        let mut inner = self.inner.lock().unwrap();
         let position = inner.next_position;
         inner.next_position += 1;
 
@@ -228,19 +209,19 @@ impl ReplayProvenanceEmitter {
     /// Get all recorded entries.
     #[must_use]
     pub fn entries(&self) -> Vec<ProvenanceEntry> {
-        self.lock_inner("entries").entries.clone()
+        self.inner.lock().unwrap().entries.clone()
     }
 
     /// Number of recorded entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock_inner("len").entries.len()
+        self.inner.lock().unwrap().entries.len()
     }
 
     /// Whether the log is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lock_inner("is_empty").entries.is_empty()
+        self.inner.lock().unwrap().entries.is_empty()
     }
 
     /// Get the replay run ID.
@@ -280,7 +261,7 @@ impl ReplayProvenanceEmitter {
 
     /// Drain all entries from the buffer, resetting it.
     pub fn drain(&self) -> Vec<ProvenanceEntry> {
-        let mut inner = self.lock_inner("drain");
+        let mut inner = self.inner.lock().unwrap();
         std::mem::take(&mut inner.entries)
     }
 
@@ -397,38 +378,36 @@ impl ExplanationTraceCollector {
 
     /// Add a trace.
     pub fn add(&self, trace: DecisionExplanationTrace) {
-        self.lock_traces("add").push(trace);
+        self.traces.lock().unwrap().push(trace);
     }
 
     /// Get all traces.
     #[must_use]
     pub fn traces(&self) -> Vec<DecisionExplanationTrace> {
-        self.lock_traces("traces").clone()
+        self.traces.lock().unwrap().clone()
     }
 
     /// Number of traces.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock_traces("len").len()
+        self.traces.lock().unwrap().len()
     }
 
     /// Whether the collector is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lock_traces("is_empty").is_empty()
+        self.traces.lock().unwrap().is_empty()
     }
 
     /// Count traces with counterfactual mismatches.
     #[must_use]
     pub fn counterfactual_count(&self) -> usize {
-        self.lock_traces("counterfactual_count")
+        self.traces
+            .lock()
+            .unwrap()
             .iter()
             .filter(|t| t.has_counterfactual)
             .count()
-    }
-
-    fn lock_traces(&self, context: &'static str) -> MutexGuard<'_, Vec<DecisionExplanationTrace>> {
-        lock_or_recover(&self.traces, "explanation_trace_collector", context)
     }
 }
 
@@ -529,7 +508,7 @@ impl ReplayAuditTrail {
     ///
     /// Returns the ordinal assigned to this entry.
     pub fn append(&self, params: AuditEntryParams) -> u64 {
-        let mut inner = self.lock_inner("append");
+        let mut inner = self.inner.lock().unwrap();
         let ordinal = inner.next_ordinal;
         inner.next_ordinal += 1;
 
@@ -555,31 +534,31 @@ impl ReplayAuditTrail {
     /// Get all entries.
     #[must_use]
     pub fn entries(&self) -> Vec<ReplayAuditEntry> {
-        self.lock_inner("entries").entries.clone()
+        self.inner.lock().unwrap().entries.clone()
     }
 
     /// Number of entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock_inner("len").entries.len()
+        self.inner.lock().unwrap().entries.len()
     }
 
     /// Whether the trail is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lock_inner("is_empty").entries.is_empty()
+        self.inner.lock().unwrap().entries.is_empty()
     }
 
     /// Get the hash of the last entry (or genesis hash).
     #[must_use]
     pub fn last_hash(&self) -> String {
-        self.lock_inner("last_hash").last_hash.clone()
+        self.inner.lock().unwrap().last_hash.clone()
     }
 
     /// Verify the integrity of the chain.
     #[must_use]
     pub fn verify(&self) -> AuditChainVerification {
-        let inner = self.lock_inner("verify");
+        let inner = self.inner.lock().unwrap();
         verify_chain(&inner.entries)
     }
 
@@ -604,10 +583,6 @@ impl ReplayAuditTrail {
                 serde_json::from_str(line).map_err(|e| format!("line {}: {}", i + 1, e))
             })
             .collect()
-    }
-
-    fn lock_inner(&self, context: &'static str) -> MutexGuard<'_, AuditTrailInner> {
-        lock_or_recover(&self.inner, "replay_audit_trail", context)
     }
 }
 
@@ -863,28 +838,6 @@ mod tests {
     }
 
     #[test]
-    fn emitter_recovers_after_poisoned_inner_lock() {
-        let emitter = ReplayProvenanceEmitter::with_defaults("run_poison".into());
-
-        std::thread::scope(|scope| {
-            let poisoner = scope.spawn(|| {
-                let _guard = emitter.inner.lock().unwrap();
-                panic!("poison provenance emitter");
-            });
-            assert!(poisoner.join().is_err());
-        });
-
-        assert!(emitter.inner.is_poisoned());
-        let position = emitter.record(make_params("e", DecisionType::PatternMatch, "r"));
-        assert_eq!(position, 0);
-        assert_eq!(emitter.len(), 1);
-        assert!(!emitter.is_empty());
-        assert_eq!(emitter.entries()[0].event_id, "e");
-        assert_eq!(emitter.drain().len(), 1);
-        assert!(emitter.is_empty());
-    }
-
-    #[test]
     fn emitter_fifo_eviction() {
         let config = ProvenanceConfig {
             verbosity: ProvenanceVerbosity::Minimal,
@@ -1024,33 +977,6 @@ mod tests {
         assert_eq!(collector.counterfactual_count(), 1);
     }
 
-    #[test]
-    fn trace_collector_recovers_after_poisoned_lock() {
-        let collector = ExplanationTraceCollector::new();
-
-        std::thread::scope(|scope| {
-            let poisoner = scope.spawn(|| {
-                let _guard = collector.traces.lock().unwrap();
-                panic!("poison trace collector");
-            });
-            assert!(poisoner.join().is_err());
-        });
-
-        assert!(collector.traces.is_poisoned());
-        collector.add(DecisionExplanationTrace::single(
-            0,
-            "e".into(),
-            "r".into(),
-            "h1".into(),
-            "h2".into(),
-            "diff".into(),
-        ));
-        assert_eq!(collector.len(), 1);
-        assert!(!collector.is_empty());
-        assert_eq!(collector.traces().len(), 1);
-        assert_eq!(collector.counterfactual_count(), 1);
-    }
-
     // ── ReplayAuditTrail ─────────────────────────────────────────────
 
     #[test]
@@ -1069,27 +995,6 @@ mod tests {
         let entries = trail.entries();
         assert_eq!(entries[0].prev_entry_hash, REPLAY_AUDIT_GENESIS);
         assert_eq!(entries[1].prev_entry_hash, entries[0].hash());
-    }
-
-    #[test]
-    fn audit_trail_recovers_after_poisoned_inner_lock() {
-        let trail = ReplayAuditTrail::new();
-
-        std::thread::scope(|scope| {
-            let poisoner = scope.spawn(|| {
-                let _guard = trail.inner.lock().unwrap();
-                panic!("poison replay audit trail");
-            });
-            assert!(poisoner.join().is_err());
-        });
-
-        assert!(trail.inner.is_poisoned());
-        assert_eq!(trail.append(make_audit_params("run_1")), 0);
-        assert_eq!(trail.len(), 1);
-        assert!(!trail.is_empty());
-        assert_ne!(trail.last_hash(), REPLAY_AUDIT_GENESIS);
-        assert_eq!(trail.entries()[0].replay_run_id, "run_1");
-        assert!(trail.verify().chain_intact);
     }
 
     #[test]

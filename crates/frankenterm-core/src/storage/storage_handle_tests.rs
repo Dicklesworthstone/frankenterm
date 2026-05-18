@@ -240,27 +240,6 @@ fn storage_handle_semantic_search_ranks_and_respects_filters() {
 }
 
 #[test]
-fn storage_handle_semantic_search_empty_query_vector_fails() {
-    run_async_test(async {
-        let db_path = temp_db_path();
-        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
-
-        let err = handle
-            .semantic_search("hash", &[], SearchOptions::default())
-            .await
-            .expect_err("direct semantic search must reject an empty query vector");
-
-        assert!(
-            err.to_string().contains("Query vector is empty"),
-            "unexpected error: {err:#}"
-        );
-
-        handle.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&db_path);
-    });
-}
-
-#[test]
 fn storage_handle_hybrid_search_blends_lexical_and_semantic() {
     run_async_test(async {
         let db_path = temp_db_path();

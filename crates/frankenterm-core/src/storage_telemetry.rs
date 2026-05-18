@@ -11,8 +11,8 @@
 //! - Instrumented storage wrapper (`InstrumentedStorage<S>`) via decorator pattern
 //! - Snapshot export for diagnostics and SLO dashboards
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -23,36 +23,6 @@ use crate::recorder_storage::{
     RecorderStorageError, RecorderStorageErrorClass, RecorderStorageHealth, RecorderStorageLag,
 };
 use crate::telemetry::{HistogramSummary, MetricRegistry};
-
-fn lock_recovering<T>(lock: &std::sync::Mutex<T>) -> MutexGuard<'_, T> {
-    match lock.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            lock.clear_poison();
-            poisoned.into_inner()
-        }
-    }
-}
-
-fn read_recovering<T>(lock: &std::sync::RwLock<T>) -> RwLockReadGuard<'_, T> {
-    match lock.read() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            lock.clear_poison();
-            poisoned.into_inner()
-        }
-    }
-}
-
-fn write_recovering<T>(lock: &std::sync::RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    match lock.write() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            lock.clear_poison();
-            poisoned.into_inner()
-        }
-    }
-}
 
 // =============================================================================
 // Configuration
@@ -391,7 +361,9 @@ impl StorageTelemetry {
 
         // Update rate EWMA
         let now_ms = self.created_at.elapsed().as_millis() as u64;
-        lock_recovering(&self.rate_ewma).observe(event_count as f64, now_ms);
+        if let Ok(mut ewma) = self.rate_ewma.lock() {
+            ewma.observe(event_count as f64, now_ms);
+        }
     }
 
     /// Record a flush operation.
@@ -490,18 +462,22 @@ impl StorageTelemetry {
 
     /// Update the last-observed health snapshot.
     pub fn update_health(&self, health: RecorderStorageHealth) {
-        *write_recovering(&self.last_health) = Some(health);
+        if let Ok(mut w) = self.last_health.write() {
+            *w = Some(health);
+        }
     }
 
     /// Update the last-observed lag snapshot.
     pub fn update_lag(&self, lag: RecorderStorageLag) {
-        *write_recovering(&self.last_lag) = Some(lag);
+        if let Ok(mut w) = self.last_lag.write() {
+            *w = Some(lag);
+        }
     }
 
     /// Current health tier based on last-observed health.
     #[must_use]
     pub fn current_tier(&self) -> StorageHealthTier {
-        let health = read_recovering(&self.last_health).clone();
+        let health = self.last_health.read().ok().and_then(|h| h.clone());
         match health {
             Some(h) => {
                 let ratio = if h.queue_capacity > 0 {
@@ -518,7 +494,7 @@ impl StorageTelemetry {
     /// Current EWMA-smoothed append rate (events per second).
     #[must_use]
     pub fn append_rate(&self) -> f64 {
-        lock_recovering(&self.rate_ewma).value()
+        self.rate_ewma.lock().ok().map(|e| e.value()).unwrap_or(0.0)
     }
 
     /// Produce a full diagnostic snapshot.
@@ -564,8 +540,8 @@ impl StorageTelemetry {
         StoragePipelineSnapshot {
             timestamp_ms: now_ms,
             health_tier: self.current_tier(),
-            health: read_recovering(&self.last_health).clone(),
-            lag: read_recovering(&self.last_lag).clone(),
+            health: self.last_health.read().ok().and_then(|h| h.clone()),
+            lag: self.last_lag.read().ok().and_then(|l| l.clone()),
             append_latency: append_summary,
             flush_latency: flush_summary,
             checkpoint_latency: find_summary(METRIC_CHECKPOINT_LATENCY_US),
@@ -631,8 +607,8 @@ impl StorageTelemetry {
         StoragePipelineSnapshot {
             timestamp_ms: now_ms,
             health_tier: self.current_tier(),
-            health: read_recovering(&self.last_health).clone(),
-            lag: read_recovering(&self.last_lag).clone(),
+            health: self.last_health.read().ok().and_then(|h| h.clone()),
+            lag: self.last_lag.read().ok().and_then(|l| l.clone()),
             append_latency: append_summary,
             flush_latency: flush_summary,
             checkpoint_latency: find_summary(METRIC_CHECKPOINT_LATENCY_US),
@@ -891,9 +867,7 @@ pub fn remediation_for_error(class: RecorderStorageErrorClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder_storage::{
-        CheckpointConsumerId, RecorderBackendKind, RecorderConsumerLag, RecorderOffset,
-    };
+    use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
 
     // -----------------------------------------------------------------------
     // StorageHealthTier
@@ -1090,16 +1064,6 @@ mod tests {
         }
     }
 
-    fn make_lag(latest_offset: u64, offsets_behind: u64) -> RecorderStorageLag {
-        RecorderStorageLag {
-            latest_offset: Some(RecorderOffset(latest_offset)),
-            consumers: vec![RecorderConsumerLag {
-                consumer: CheckpointConsumerId("test-consumer".to_string()),
-                offsets_behind,
-            }],
-        }
-    }
-
     #[test]
     fn update_health_changes_tier() {
         let telem = StorageTelemetry::with_defaults();
@@ -1229,71 +1193,6 @@ mod tests {
     fn append_rate_zero_initially() {
         let telem = StorageTelemetry::with_defaults();
         assert!(telem.append_rate().abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn telemetry_recovers_from_poisoned_health_lock() {
-        let telem = StorageTelemetry::with_defaults();
-        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = telem
-                .last_health
-                .write()
-                .expect("health lock should start clean");
-            panic!("intentional storage health poison");
-        }));
-        assert!(poison.is_err());
-
-        telem.update_health(make_health(4, 4, false));
-
-        assert_eq!(telem.current_tier(), StorageHealthTier::Black);
-        let snapshot = telem.snapshot();
-        assert_eq!(snapshot.health.map(|h| h.queue_depth), Some(4));
-        assert!(
-            telem.last_health.read().is_ok(),
-            "recovery should clear the health lock poison bit"
-        );
-    }
-
-    #[test]
-    fn telemetry_recovers_from_poisoned_lag_lock() {
-        let telem = StorageTelemetry::with_defaults();
-        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = telem.last_lag.write().expect("lag lock should start clean");
-            panic!("intentional storage lag poison");
-        }));
-        assert!(poison.is_err());
-
-        telem.update_lag(make_lag(12, 34));
-
-        let snapshot = telem.snapshot();
-        let lag = snapshot.lag.expect("lag snapshot should survive poison");
-        assert_eq!(lag.latest_offset, Some(RecorderOffset(12)));
-        assert_eq!(lag.consumers[0].offsets_behind, 34);
-        assert!(
-            telem.last_lag.read().is_ok(),
-            "recovery should clear the lag lock poison bit"
-        );
-    }
-
-    #[test]
-    fn telemetry_recovers_from_poisoned_rate_lock() {
-        let telem = StorageTelemetry::with_defaults();
-        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = telem
-                .rate_ewma
-                .lock()
-                .expect("rate lock should start clean");
-            panic!("intentional storage rate poison");
-        }));
-        assert!(poison.is_err());
-
-        telem.record_append(500.0, 100, 25_600, false);
-
-        assert!(telem.append_rate() > 0.0);
-        assert!(
-            telem.rate_ewma.lock().is_ok(),
-            "recovery should clear the EWMA lock poison bit"
-        );
     }
 
     // -----------------------------------------------------------------------

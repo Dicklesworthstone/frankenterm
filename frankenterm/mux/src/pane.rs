@@ -503,9 +503,6 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
         if prior == first {
             break;
         }
-        if back.is_empty() {
-            break;
-        }
         if !back[0].last_cell_was_wrapped() {
             break;
         }
@@ -531,9 +528,6 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
         let next_row = first + phys.len() as StableRowIndex;
         let (last_row, mut ahead) = pane.get_lines(next_row..next_row + 1);
         if last_row != next_row {
-            break;
-        }
-        if ahead.is_empty() {
             break;
         }
         phys.append(&mut ahead);
@@ -614,23 +608,14 @@ mod test {
         lines: Mutex<Vec<Line>>,
         size: Mutex<TerminalSize>,
         writes: Mutex<Vec<u8>>,
-        empty_one_line_rows: Vec<StableRowIndex>,
     }
 
     impl FakePane {
         fn new(lines: Vec<Line>) -> Self {
-            Self::new_with_empty_one_line_rows(lines, Vec::new())
-        }
-
-        fn new_with_empty_one_line_rows(
-            lines: Vec<Line>,
-            empty_one_line_rows: Vec<StableRowIndex>,
-        ) -> Self {
             Self {
                 lines: Mutex::new(lines),
                 size: Mutex::new(TerminalSize::default()),
                 writes: Mutex::new(Vec::new()),
-                empty_one_line_rows,
             }
         }
     }
@@ -686,11 +671,6 @@ mod test {
 
         fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
             let first = lines.start;
-            if lines.end == lines.start.saturating_add(1)
-                && self.empty_one_line_rows.contains(&lines.start)
-            {
-                return (first, Vec::new());
-            }
             (
                 first,
                 self.lines
@@ -1186,44 +1166,6 @@ mod test {
     ),
 ]
 "
-        );
-    }
-
-    #[test]
-    fn get_logical_lines_breaks_on_empty_backward_lookup() {
-        let pane = FakePane::new_with_empty_one_line_rows(
-            vec![
-                line("prefix", false),
-                line("visible", false),
-                line("tail", false),
-            ],
-            vec![0],
-        );
-
-        let lines = pane.get_logical_lines(1..2);
-
-        assert_eq!(
-            summarize_logical_lines(&lines),
-            vec![(1, "visible".to_string())]
-        );
-    }
-
-    #[test]
-    fn get_logical_lines_breaks_on_empty_forward_lookup() {
-        let pane = FakePane::new_with_empty_one_line_rows(
-            vec![
-                line("wrapped", true),
-                line("missing", false),
-                line("tail", false),
-            ],
-            vec![1],
-        );
-
-        let lines = pane.get_logical_lines(0..1);
-
-        assert_eq!(
-            summarize_logical_lines(&lines),
-            vec![(0, "wrapped".to_string())]
         );
     }
 

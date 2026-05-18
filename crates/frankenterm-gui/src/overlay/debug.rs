@@ -8,7 +8,7 @@ use mux::termwiztermtab::TermWizTerminal;
 use promise::spawn::block_on;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use termwiz::cell::{AttributeChange, CellAttributes, Intensity};
 use termwiz::color::AnsiColor;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent};
@@ -18,14 +18,6 @@ use termwiz::terminal::Terminal;
 
 lazy_static::lazy_static! {
     static ref LATEST_LOG_ENTRY: Mutex<Option<u64>> = Mutex::new(None);
-}
-
-fn lock_latest_log_entry(context: &str) -> MutexGuard<'static, Option<u64>> {
-    LATEST_LOG_ENTRY.lock().unwrap_or_else(|poisoned| {
-        log::warn!("recovering poisoned debug overlay log cursor while {context}");
-        LATEST_LOG_ENTRY.clear_poison();
-        poisoned.into_inner()
-    })
 }
 
 struct LuaReplHost {
@@ -197,11 +189,11 @@ pub fn show_debug_overlay(
     }
 
     fn print_new_log_entries(term: &mut TermWizTerminal) -> termwiz::Result<()> {
-        let latest_sequence = *lock_latest_log_entry("reading latest log cursor");
+        let latest_sequence = *LATEST_LOG_ENTRY.lock().unwrap();
         let entries = gui_debug_log::entries_after(latest_sequence);
 
         if entries.is_empty() {
-            let mut latest = lock_latest_log_entry("initializing latest log cursor");
+            let mut latest = LATEST_LOG_ENTRY.lock().unwrap();
             if latest.is_none() {
                 *latest = Some(0);
                 return print_empty_log_status(term);
@@ -214,7 +206,7 @@ pub fn show_debug_overlay(
             render_log_entry(&mut changes, entry);
         }
         if let Some(entry) = entries.last() {
-            lock_latest_log_entry("advancing latest log cursor").replace(entry.sequence);
+            LATEST_LOG_ENTRY.lock().unwrap().replace(entry.sequence);
         }
         term.render(&changes)
     }
@@ -267,36 +259,6 @@ pub fn show_debug_overlay(
         } else {
             return Ok(());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{LATEST_LOG_ENTRY, lock_latest_log_entry};
-
-    #[test]
-    fn latest_log_entry_recovers_after_poisoned_lock() {
-        {
-            let mut latest = lock_latest_log_entry("resetting test state");
-            *latest = None;
-        }
-
-        let handle = std::thread::spawn(|| {
-            let _guard = LATEST_LOG_ENTRY.lock().unwrap();
-            panic!("simulate debug overlay cursor poison");
-        });
-
-        assert!(handle.join().is_err());
-
-        {
-            let mut latest = lock_latest_log_entry("testing poison recovery");
-            latest.replace(42);
-        }
-
-        assert_eq!(
-            *lock_latest_log_entry("checking recovered cursor"),
-            Some(42)
-        );
     }
 }
 
