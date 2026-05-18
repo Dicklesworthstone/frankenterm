@@ -199,7 +199,7 @@ jq -e '
   )
 ' "${FIXTURE}" >/dev/null || fail "fallback-only case drifted"
 
-live_e2e="$(find tests/e2e -type f -name '*.sh' | wc -l | tr -d ' ')"
+live_e2e="$(git ls-files tests/e2e | awk '/\.sh$/ { count++ } END { print count + 0 }')"
 grep -q "<!--count:e2e_scripts-->${live_e2e}<!--/count-->" README.md \
   || fail "README stamped E2E count stale; expected ${live_e2e}"
 grep -q "# ${live_e2e} shell E2E scripts" README.md \

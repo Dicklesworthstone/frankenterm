@@ -1384,7 +1384,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
 ├── fuzz/                                 # 48 fuzz targets
 ├── docs/                                 # 428 Markdown documentation files
-├── tests/e2e/                            # 292 shell E2E scripts
+├── tests/e2e/                            # 251 shell E2E scripts
 └── fixtures/                             # Test fixtures (including operating-envelope goldens)
 ```
 
@@ -3777,7 +3777,7 @@ The project maintains extensive test coverage:
 |---|---|---|
 | Test annotations | <!--count:test_count-->55330<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
 | Core Rust test files | <!--count:core_rust_test_files-->952<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
-| E2E shell scripts | <!--count:e2e_scripts-->292<!--/count--> | Full-pipeline validation |
+| E2E shell scripts | <!--count:e2e_scripts-->251<!--/count--> | Full-pipeline validation |
 | Criterion bench files | <!--count:criterion_bench_files-->111<!--/count--> | Performance regression detection |
 | Fuzz targets | <!--count:fuzz_targets-->48<!--/count--> | Security / robustness |
 
@@ -4018,7 +4018,7 @@ Every numeric claim in this README is wrapped in `<!--count:* -->` markers and r
 | `<!--count:criterion_bench_files-->` | `find crates/frankenterm-core/benches -type f -name '*.rs' \| wc -l` |
 | `<!--count:fuzz_targets-->` | `find fuzz -type f -path '*/fuzz_targets/*.rs' \| wc -l` |
 | `<!--count:doc_markdown_files-->` | `find docs -type f -name '*.md' \| wc -l` |
-| `<!--count:e2e_scripts-->` | `find tests/e2e -type f -name '*.sh' \| wc -l` |
+| `<!--count:e2e_scripts-->` | `git ls-files tests/e2e \| awk '/\\.sh$/ { count++ } END { print count + 0 }'` |
 | `<!--count:core_loc-->` | LOC count across `crates/frankenterm-core/src/**/*.rs` |
 | `<!--count:test_count-->` | rough total of `#[test]` / `#[asupersync_test]` / etc. annotations |
 

@@ -34,7 +34,16 @@ log_io = File.open(structured_log_path, "a")
 StaticAttestation.configure(log_io: log_io, log_enabled: true)
 
 begin
-  scripts = Dir.glob("tests/e2e/**/*.sh").sort
+  git_ls_files = IO.popen(["git", "ls-files", "tests/e2e"], &:read)
+  StaticAttestation.assert!(
+    $?.success?,
+    "failed to enumerate tracked E2E scripts",
+    check: "e2e_script_contract.git_ls_files",
+    input_path: "tests/e2e",
+    expected: "success",
+    actual: $?.exitstatus,
+  )
+  scripts = git_ls_files.lines.map(&:chomp).select { |path| path.end_with?(".sh") }.sort
   readme = StaticAttestation.read_text!("README.md", check: "e2e_script_contract.readme")
 
   exceptions = {

@@ -92,7 +92,7 @@ that moved the count.
 | `criterion_bench_files` | Criterion bench files under `crates/frankenterm-core/benches/` |
 | `fuzz_targets` | cargo-fuzz target files under `fuzz/**/fuzz_targets/` |
 | `doc_markdown_files` | Markdown documentation files under `docs/` |
-| `e2e_scripts` | shell E2E scripts under `tests/e2e/` |
+| `e2e_scripts` | tracked shell E2E scripts under `tests/e2e/` |
 
 The list is intentionally short. Counts that are stable on the order
 of years (e.g. major version numbers) don't belong here; counts that

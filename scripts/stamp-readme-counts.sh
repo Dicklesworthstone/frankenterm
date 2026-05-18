@@ -72,7 +72,7 @@ MANIFEST=(
     "criterion_bench_files|find crates/frankenterm-core/benches -type f -name '*.rs' | wc -l"
     "fuzz_targets|find fuzz -type f -path '*/fuzz_targets/*.rs' | wc -l"
     "doc_markdown_files|find docs -type f -name '*.md' | wc -l"
-    "e2e_scripts|find tests/e2e -type f -name '*.sh' | wc -l"
+    "e2e_scripts|git ls-files tests/e2e | awk '/\\.sh$/ { count++ } END { print count + 0 }'"
 )
 
 DOCS=(README.md AGENTS.md)

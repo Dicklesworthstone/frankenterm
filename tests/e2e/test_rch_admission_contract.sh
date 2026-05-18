@@ -294,7 +294,9 @@ end
 fail!("provenance missing ft-rch-admission row") unless provenance.include?("`ft-rch-admission.json`")
 fail!("provenance row must cite static verifier") unless provenance.include?("bash tests/e2e/test_rch_admission_contract.sh")
 
-live_e2e = Dir.glob("tests/e2e/**/*.sh").length
+git_ls_files = IO.popen(["git", "ls-files", "tests/e2e"], &:read)
+fail!("failed to enumerate tracked E2E scripts") unless $?.success?
+live_e2e = git_ls_files.lines.count { |path| path.chomp.end_with?(".sh") }
 fail!("README stamped E2E count stale") unless readme.include?("<!--count:e2e_scripts-->#{live_e2e}<!--/count-->")
 fail!("README tree E2E count stale") unless readme.include?("# #{live_e2e} shell E2E scripts")
 

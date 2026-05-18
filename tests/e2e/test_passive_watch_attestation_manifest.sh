@@ -213,7 +213,9 @@ StaticAttestation.require_terms!(
 end
 assert_ok(!contract.include?("every_action_kind_has_a_classification"), "contract comments name nonexistent action-classification test", check: "passive_watch.contract_absence", input_path: contract_path, expected: "absent", actual: contract.include?("every_action_kind_has_a_classification") ? "present" : "absent")
 
-live_e2e = Dir.glob("tests/e2e/**/*.sh").length
+git_ls_files = IO.popen(["git", "ls-files", "tests/e2e"], &:read)
+assert_ok($?.success?, "failed to enumerate tracked E2E scripts", check: "passive_watch.git_ls_files", input_path: "tests/e2e", expected: "success", actual: $?.exitstatus)
+live_e2e = git_ls_files.lines.count { |path| path.chomp.end_with?(".sh") }
 StaticAttestation.require_terms!(
   readme,
   StaticAttestation.expected_strings(
