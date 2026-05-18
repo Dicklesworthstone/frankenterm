@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_storage_runbook.v1",
+  "source_bead": "ft-5xwsu.4",
+  "runbook": "docs/robot-contracts/rch-worker-storage-runbook.md",
+  "purpose": "Operator workflow for RCH worker storage pressure that binds read-only inventory, explicit approval, and post-recovery proof without granting agent cleanup authority.",
+  "required_sections": [
+    "Scope",
+    "Forbidden Actions",
+    "Read-Only Evidence Collection",
+    "Classification",
+    "Approval Request",
+    "Artifact Retention",
+    "Post-Recovery Proof",
+    "Failure Modes",
+    "Handoff Wording",
+    "Static Proof"
+  ],
+  "required_contracts": [
+    "docs/json-schema/ft-rch-worker-storage-inventory.json",
+    "docs/robot-contracts/rch-worker-storage-approval.md",
+    "docs/json-schema/ft-rch-worker-storage-approval.json",
+    "docs/robot-contracts/rch-worker-storage-recovery-proof.md",
+    "docs/json-schema/ft-rch-worker-storage-recovery-proof.json"
+  ],
+  "required_verifiers": [
+    "tests/e2e/test_rch_worker_storage_inventory_contract.sh",
+    "tests/e2e/test_rch_worker_storage_approval_contract.sh",
+    "tests/e2e/test_rch_worker_storage_recovery_proof_contract.sh",
+    "tests/e2e/test_rch_worker_storage_runbook_contract.sh"
+  ],
+  "read_only_commands": [
+    "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+    "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check",
+    "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- cargo check -p frankenterm-core --lib",
+    "br ready --json",
+    "br list --status in_progress --json",
+    "br dep cycles --json",
+    "git status --short"
+  ],
+  "post_recovery_commands": [
+    "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+    "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- cargo check -p frankenterm-core --lib",
+    "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> cargo check -p frankenterm-core --lib",
+    "br dep cycles --json"
+  ],
+  "forbidden_actions": [
+    "delete_files_without_approval",
+    "run_agent_cleanup",
+    "restart_agent_mail",
+    "repair_agent_mail_db",
+    "restart_rch_daemon",
+    "mutate_rch_worker",
+    "mutate_remote_mirror",
+    "cancel_other_agent_build",
+    "destructive_git",
+    "run_local_cargo_as_proof",
+    "close_ft4tp7g_without_remote_evidence"
+  ],
+  "artifact_layouts": [
+    "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/<run-id>/",
+    "tests/e2e/artifacts/retained/ft-5xwsu.2/rch-worker-storage-approval/<run-id>/",
+    "tests/e2e/artifacts/retained/ft-5xwsu.3/rch-worker-storage-recovery-proof/<run-id>/"
+  ],
+  "classification_streams": [
+    "source-code defects",
+    "RCH fleet pressure",
+    "dirty-tree contamination",
+    "Agent Mail outages",
+    "Beads tracker state"
+  ],
+  "ft4tp7g_closeout_rule": "ft-4tp7g can close only after ft.rch_worker_storage_recovery_proof.v1 records gate_result=passed_remote_smoke and admission_recovered=true.",
+  "local_cargo_policy": "Local Cargo output is never accepted as proof for recovery, source, or closeout.",
+  "approval_policy": "Inventory evidence alone is never approval; exact-path human approval must exist before any recovery operation."
+}
