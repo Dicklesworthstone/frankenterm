@@ -83,9 +83,10 @@ jq -e '
     "agent-mail-ack-required",
     "stale-in-progress-candidate",
     "dirty-overlap-active-owner",
+    "closed-local-not-pushed",
     "docs-only-ready-while-proof-blocked"
   ]))
-  and (.scenarios | length >= 6)
+  and (.scenarios | length >= 7)
 ' "${INVENTORY}" >/dev/null || fail "top-level inventory contract is incomplete"
 
 jq -e '
@@ -151,6 +152,37 @@ jq -e '
     and (.expected.explanation_must_include | index("ft-4tp7g remains blocked until RCH reaches remote Cargo proof") != null)
     and (.forbidden_actions | index("claim_ft_4tp7g") != null)
 ' "${INVENTORY}" >/dev/null || fail "empty-ready/BV-blocked reconciliation scenario drifted"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "closed-local-not-pushed")
+  | ([.source_fixture_requirements[].source_id] | sort) == [
+      "agent-mail-owner-context",
+      "beads-local-closeout",
+      "git-owned-closeout-diff",
+      "git-remote-closeout-state"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "beads-local-closeout")
+      | (.required_reason_codes | index("beads.status_closed") != null)
+      and (.required_reason_codes | index("beads.close_reason_present") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "git-owned-closeout-diff")
+      | (.required_reason_codes | index("git.tracker_dirty") != null)
+      and (.required_reason_codes | index("git.owned_paths_dirty") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "git-remote-closeout-state")
+      | .required_counters.origin_main_contains_closeout == 0
+      and .required_counters.legacy_mirror_contains_closeout == 0
+      and (.required_reason_codes | index("git.origin_main_missing_closeout") != null)
+      and (.required_reason_codes | index("git.legacy_mirror_missing_closeout") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "agent-mail-owner-context")
+      | (.required_reason_codes | index("agent_mail.active_owner_claim") != null)
+      and (.required_reason_codes | index("reservation.owner_present") != null))
+    and .expected.classification == "do_not_touch"
+    and .expected.recommended_safe_action == "notify_owner_wait_for_publish_or_pick_disjoint_work"
+    and (.expected.explanation_must_include | index("local tracker closed state is not durable until committed and pushed") != null)
+    and (.expected.explanation_must_include | index("do not stage or commit another agent'\''s closeout") != null)
+    and (.forbidden_actions | index("commit_another_agents_closeout") != null)
+    and (.forbidden_actions | index("stage_unowned_tracker_changes") != null)
+' "${INVENTORY}" >/dev/null || fail "closed-local/not-pushed coordination scenario drifted"
 
 grep -Fq "The claimability check must treat \`bv --robot-triage\` and \`bv --robot-next\` as" \
   "${BLOCKER_RADAR_CONTRACT}" || fail "blocker-radar contract no longer treats BV as advisory"

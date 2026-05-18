@@ -281,6 +281,73 @@
       }
     },
     {
+      "scenario_id": "closed-local-not-pushed",
+      "title": "Bead closed locally while publish steps are pending",
+      "summary": "The router must treat local Beads closed state as non-durable until the owning agent commits the closeout, pushes origin/main, and updates the legacy mirror ref.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "beads-local-closeout",
+          "command_or_api": "br show <bead> --json",
+          "required_reason_codes": [
+            "beads.status_closed",
+            "beads.close_reason_present"
+          ],
+          "required_subjects": [
+            "<bead>"
+          ]
+        },
+        {
+          "source_id": "git-owned-closeout-diff",
+          "command_or_api": "git status --short -- .beads/issues.jsonl <owned paths>",
+          "required_reason_codes": [
+            "git.tracker_dirty",
+            "git.owned_paths_dirty"
+          ]
+        },
+        {
+          "source_id": "git-remote-closeout-state",
+          "command_or_api": "git rev-parse HEAD && git ls-remote origin refs/heads/main refs/heads/<legacy-mirror>",
+          "required_reason_codes": [
+            "git.origin_main_missing_closeout",
+            "git.legacy_mirror_missing_closeout"
+          ],
+          "required_counters": {
+            "origin_main_contains_closeout": 0,
+            "legacy_mirror_contains_closeout": 0
+          }
+        },
+        {
+          "source_id": "agent-mail-owner-context",
+          "command_or_api": "fetch_inbox or search_messages for <bead> plus file reservation snapshot",
+          "required_reason_codes": [
+            "agent_mail.active_owner_claim",
+            "reservation.owner_present"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "do_not_touch",
+        "recommended_safe_action": "notify_owner_wait_for_publish_or_pick_disjoint_work",
+        "confidence": "high",
+        "explanation_must_include": [
+          "local tracker closed state is not durable until committed and pushed",
+          "do not stage or commit another agent's closeout",
+          "origin/main and the legacy mirror ref must contain the closeout before dependent work is claimable"
+        ]
+      },
+      "forbidden_actions": [
+        "commit_another_agents_closeout",
+        "stage_unowned_tracker_changes",
+        "touch_reserved_paths",
+        "claim_dependent_work_before_publish",
+        "force_release_active_owner"
+      ],
+      "volatility": {
+        "level": 4,
+        "strategy": "scrub timestamps, message ids, reservation ids, target refs, and commit shas unless the closeout commit is the scenario subject"
+      }
+    },
+    {
       "scenario_id": "docs-only-ready-while-proof-blocked",
       "title": "Docs-only or fixture-only ready slice while code proof is blocked",
       "summary": "The router must allow a static docs/fixture task when RCH blocks code proof lanes and the edit surface is disjoint from active dirty work.",
@@ -344,7 +411,8 @@
       "Agent Mail degraded state recommends repair or restart",
       "RCH degraded state recommends service mutation or build cancellation",
       "dirty overlap recommends stashing, reverting, or staging another agent's work",
-      "stale-claim detection force-releases without status-check evidence"
+      "stale-claim detection force-releases without status-check evidence",
+      "local closed tracker state is treated as durable before commit and remote publication"
     ],
     "proof_policy": "RCH-only for Rust/e2e harness execution after code exists; static jq and diff checks are sufficient for this inventory."
   }
