@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
   "bead_id": "ft-tf6g3.2",
-  "generated_at": "2026-05-18T06:16:12Z",
+  "generated_at": "2026-05-18T06:44:44Z",
   "generator": "scripts/stamp-readme-counts.sh --json --source=head",
   "source": {
     "script": "scripts/stamp-readme-counts.sh",
@@ -377,15 +377,15 @@
     {
       "name": "e2e_scripts",
       "command": "git ls-tree -r --name-only HEAD tests/e2e | awk '/\\.sh$/ { count++ } END { print count + 0 }'",
-      "live_value": 252,
+      "live_value": 253,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 252,
-          "live_value": 252,
+          "documented_value": 253,
+          "live_value": 253,
           "drift_pct": 0,
           "status": "matches"
         },

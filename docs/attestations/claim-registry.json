@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.claim_drift.registry.v1",
+  "producing_bead": "ft-e87u6.16",
+  "purpose": "Map operator-facing README, AGENTS, robot-contract, attestation-manifest, and release-checklist claims to the retained evidence that proves, constrains, or blocks the wording.",
+  "allowed_wording_states": [
+    "supported",
+    "planned",
+    "skipped",
+    "stale",
+    "unavailable",
+    "deprecated"
+  ],
+  "source_policy": {
+    "release_claims_require_head_source": true,
+    "dirty_worktree_measurements_allowed_for_release_claims": false,
+    "missing_artifact_behavior": "fail_closed",
+    "planned_only_behavior": "must_not_advertise_supported",
+    "diagnostic_formats": [
+      "json",
+      "toon"
+    ]
+  },
+  "claims": [
+    {
+      "claim_id": "readme.e2e_scripts_count",
+      "surface_path": "README.md",
+      "claim_type": "count_placeholder",
+      "selector": "e2e_scripts",
+      "claim_text": "README documents the committed number of tracked shell E2E scripts.",
+      "wording_state": "supported",
+      "source_of_truth_command": "git ls-tree -r --name-only HEAD tests/e2e | awk '/\\.sh$/ { count++ } END { print count + 0 }'",
+      "expected_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
+      "producing_bead": "ft-tf6g3.2",
+      "proof_category": "doctrine/agents-md-counts",
+      "freshness_rule": "Release wording must use source.count_source=head and match the checked-in README marker value.",
+      "release_source_required": true,
+      "dirty_worktree_measurement_allowed": false,
+      "tracked_count": "e2e_scripts"
+    },
+    {
+      "claim_id": "readme.robot_contracts_attestation",
+      "surface_path": "README.md",
+      "claim_type": "manifest_slot",
+      "selector": "proofs/robot-contracts",
+      "claim_text": "README points robot JSON/TOON envelope claims at the populated proofs/robot-contracts attestation slot.",
+      "wording_state": "supported",
+      "source_of_truth_command": "git show HEAD:docs/attestations/manifest.json | jq -e '.slots[] | select(.category == \"proofs/robot-contracts\" and .path == \"crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json\")'",
+      "expected_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+      "producing_bead": "ft-0elb9",
+      "proof_category": "proofs/robot-contracts",
+      "freshness_rule": "Manifest slot path must be non-null and the referenced golden matrix must exist.",
+      "release_source_required": true,
+      "dirty_worktree_measurement_allowed": false,
+      "manifest_category": "proofs/robot-contracts"
+    },
+    {
+      "claim_id": "agents.resource_cockpit_target_class_skipped",
+      "surface_path": "AGENTS.md",
+      "claim_type": "artifact_status",
+      "selector": "resource-cockpit-target-class",
+      "claim_text": "AGENTS keeps high-scale resource-cockpit wording blocked while the retained target-class artifact is skipped_not_proven.",
+      "wording_state": "skipped",
+      "source_of_truth_command": "git show HEAD:docs/attestations/proofs/resource-cockpit-target-class.json | jq -r '.status'",
+      "expected_artifact_path": "docs/attestations/proofs/resource-cockpit-target-class.json",
+      "producing_bead": "ft-tf6g3.14",
+      "proof_category": "perf/resource-cockpit-target-class",
+      "freshness_rule": "High-scale wording cannot graduate until status is no longer skipped_not_proven and the target-class summary is retained.",
+      "release_source_required": true,
+      "dirty_worktree_measurement_allowed": false,
+      "status_json_path": [
+        "status"
+      ],
+      "expected_artifact_status": "skipped_not_proven",
+      "required_terms": [
+        "skipped_not_proven",
+        "high-scale memory-envelope wording must wait"
+      ]
+    },
+    {
+      "claim_id": "robot_contracts.attention_router_planned",
+      "surface_path": "docs/robot-contracts/attention-router.md",
+      "claim_type": "planned_contract",
+      "selector": "Status: planned contract",
+      "claim_text": "The attention-router contract is explicitly planned, not advertised as a live supported router.",
+      "wording_state": "planned",
+      "source_of_truth_command": "jq empty fixtures/attention-router/scenarios.v1.json docs/json-schema/ft-attention-router-scenarios.json",
+      "expected_artifact_path": "fixtures/attention-router/scenarios.v1.json",
+      "producing_bead": "ft-x3nsb.6.1",
+      "proof_category": "proofs/robot-contracts",
+      "freshness_rule": "Planned wording may cite static fixtures, but cannot be upgraded to supported until a future implementation bead publishes live router evidence.",
+      "release_source_required": false,
+      "dirty_worktree_measurement_allowed": false,
+      "required_terms": [
+        "Status: planned contract",
+        "planned-contract slice"
+      ]
+    },
+    {
+      "claim_id": "attestation.manifest_agents_md_counts_slot",
+      "surface_path": "docs/attestations/manifest.json",
+      "claim_type": "manifest_slot",
+      "selector": "doctrine/agents-md-counts",
+      "claim_text": "The release attestation manifest has a populated doctrine/agents-md-counts slot.",
+      "wording_state": "supported",
+      "source_of_truth_command": "git show HEAD:docs/attestations/manifest.json | jq -e '.slots[] | select(.category == \"doctrine/agents-md-counts\" and .path == \"docs/attestations/doctrine/agents-md-counts.json\")'",
+      "expected_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
+      "producing_bead": "ft-tf6g3.2",
+      "proof_category": "doctrine/agents-md-counts",
+      "freshness_rule": "Manifest path must stay non-null and point at the checked-in head-sourced count snapshot.",
+      "release_source_required": true,
+      "dirty_worktree_measurement_allowed": false,
+      "manifest_category": "doctrine/agents-md-counts"
+    },
+    {
+      "claim_id": "release.checklist_head_sourced_counts",
+      "surface_path": "docs/release/checklist.md",
+      "claim_type": "text_terms",
+      "selector": "Stamp README/AGENTS counts",
+      "claim_text": "The release checklist requires head-sourced README/AGENTS count stamping and snapshot regeneration.",
+      "wording_state": "supported",
+      "source_of_truth_command": "bash scripts/stamp-readme-counts.sh --source=head --json",
+      "expected_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
+      "producing_bead": "ft-tf6g3.2",
+      "proof_category": "doctrine/agents-md-counts",
+      "freshness_rule": "Release checklist wording must mention --source=head and the checked-in snapshot path.",
+      "release_source_required": true,
+      "dirty_worktree_measurement_allowed": false,
+      "required_terms": [
+        "bash scripts/stamp-readme-counts.sh --source=head",
+        "docs/attestations/doctrine/agents-md-counts.json"
+      ]
+    },
+    {
+      "claim_id": "readme.high_scale_target_class_held_back",
+      "surface_path": "README.md",
+      "claim_type": "artifact_status",
+      "selector": "skipped_not_proven",
+      "claim_text": "README holds back high-scale memory-envelope claims until a non-skipped target-class artifact exists.",
+      "wording_state": "skipped",
+      "source_of_truth_command": "git show HEAD:docs/attestations/proofs/resource-cockpit-target-class.json | jq -r '.status'",
+      "expected_artifact_path": "docs/attestations/proofs/resource-cockpit-target-class.json",
+      "producing_bead": "ft-tf6g3.14",
+      "proof_category": "perf/resource-cockpit-target-class",
+      "freshness_rule": "High-scale wording remains blocked while the retained target-class artifact status is skipped_not_proven.",
+      "release_source_required": true,
+      "dirty_worktree_measurement_allowed": false,
+      "status_json_path": [
+        "status"
+      ],
+      "expected_artifact_status": "skipped_not_proven",
+      "required_terms": [
+        "skipped_not_proven",
+        "Target-class memory envelope claims"
+      ]
+    }
+  ]
+}

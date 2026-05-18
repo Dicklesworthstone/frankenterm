@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-claim-drift-registry.json",
+  "title": "FrankenTerm Claim Drift Registry",
+  "description": "Machine-readable registry that maps operator-facing claims to the source command, retained artifact, producing bead, proof category, and wording state that prove or constrain the claim.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "producing_bead",
+    "purpose",
+    "allowed_wording_states",
+    "source_policy",
+    "claims"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.claim_drift.registry.v1"
+    },
+    "producing_bead": {
+      "type": "string",
+      "const": "ft-e87u6.16"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "allowed_wording_states": {
+      "$ref": "#/$defs/allowed_wording_states"
+    },
+    "source_policy": {
+      "type": "object",
+      "required": [
+        "release_claims_require_head_source",
+        "dirty_worktree_measurements_allowed_for_release_claims",
+        "missing_artifact_behavior",
+        "planned_only_behavior",
+        "diagnostic_formats"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "release_claims_require_head_source": {
+          "type": "boolean",
+          "const": true
+        },
+        "dirty_worktree_measurements_allowed_for_release_claims": {
+          "type": "boolean",
+          "const": false
+        },
+        "missing_artifact_behavior": {
+          "type": "string",
+          "const": "fail_closed"
+        },
+        "planned_only_behavior": {
+          "type": "string",
+          "const": "must_not_advertise_supported"
+        },
+        "diagnostic_formats": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "json",
+              "toon"
+            ]
+          },
+          "allOf": [
+            {
+              "contains": {
+                "const": "json"
+              }
+            },
+            {
+              "contains": {
+                "const": "toon"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "claims": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "$ref": "#/$defs/claim"
+      }
+    }
+  },
+  "$defs": {
+    "allowed_wording_states": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/wording_state"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "const": "supported"
+          }
+        },
+        {
+          "contains": {
+            "const": "planned"
+          }
+        },
+        {
+          "contains": {
+            "const": "skipped"
+          }
+        },
+        {
+          "contains": {
+            "const": "stale"
+          }
+        },
+        {
+          "contains": {
+            "const": "unavailable"
+          }
+        },
+        {
+          "contains": {
+            "const": "deprecated"
+          }
+        }
+      ]
+    },
+    "wording_state": {
+      "type": "string",
+      "enum": [
+        "supported",
+        "planned",
+        "skipped",
+        "stale",
+        "unavailable",
+        "deprecated"
+      ]
+    },
+    "repo_relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "^/"
+      }
+    },
+    "claim": {
+      "type": "object",
+      "required": [
+        "claim_id",
+        "surface_path",
+        "claim_type",
+        "selector",
+        "claim_text",
+        "wording_state",
+        "source_of_truth_command",
+        "expected_artifact_path",
+        "producing_bead",
+        "proof_category",
+        "freshness_rule",
+        "release_source_required",
+        "dirty_worktree_measurement_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+        },
+        "surface_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "claim_type": {
+          "type": "string",
+          "enum": [
+            "count_placeholder",
+            "manifest_slot",
+            "artifact_status",
+            "text_terms",
+            "planned_contract"
+          ]
+        },
+        "selector": {
+          "type": "string",
+          "minLength": 1
+        },
+        "claim_text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wording_state": {
+          "$ref": "#/$defs/wording_state"
+        },
+        "source_of_truth_command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_artifact_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "producing_bead": {
+          "type": "string",
+          "pattern": "^ft-[a-z0-9.]+$"
+        },
+        "proof_category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "freshness_rule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "release_source_required": {
+          "type": "boolean"
+        },
+        "dirty_worktree_measurement_allowed": {
+          "type": "boolean"
+        },
+        "tracked_count": {
+          "type": "string",
+          "minLength": 1
+        },
+        "manifest_category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required_terms": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "status_json_path": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "expected_artifact_status": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

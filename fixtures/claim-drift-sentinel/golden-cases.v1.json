@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.claim_drift.golden_cases.v1",
+  "producing_bead": "ft-e87u6.16",
+  "purpose": "Synthetic reduced cases for the claim-drift sentinel. Cases avoid raw pane content, credentials, live service calls, and local Cargo proof.",
+  "cases": [
+    {
+      "case_id": "fresh-head-count",
+      "title": "Fresh head-sourced count claim",
+      "observed": {
+        "wording_state": "supported",
+        "release_source_required": true,
+        "source_mode": "head",
+        "dirty_worktree_measurement": false,
+        "artifact_present": true,
+        "artifact_path_null": false,
+        "documented_value": 253,
+        "artifact_value": 253,
+        "advertised_as_supported": true
+      },
+      "expected": {
+        "verdict": "pass",
+        "reason_codes": [
+          "fixture.claim_fresh",
+          "fixture.head_source",
+          "fixture.artifact_present"
+        ]
+      }
+    },
+    {
+      "case_id": "stale-count",
+      "title": "Documented count drifts from retained artifact value",
+      "observed": {
+        "wording_state": "supported",
+        "release_source_required": true,
+        "source_mode": "head",
+        "dirty_worktree_measurement": false,
+        "artifact_present": true,
+        "artifact_path_null": false,
+        "documented_value": 252,
+        "artifact_value": 253,
+        "advertised_as_supported": true
+      },
+      "expected": {
+        "verdict": "fail",
+        "reason_codes": [
+          "fixture.count_drift"
+        ]
+      }
+    },
+    {
+      "case_id": "dirty-worktree-release-count",
+      "title": "Release claim measured from a dirty worktree source",
+      "observed": {
+        "wording_state": "supported",
+        "release_source_required": true,
+        "source_mode": "worktree",
+        "dirty_worktree_measurement": true,
+        "artifact_present": true,
+        "artifact_path_null": false,
+        "documented_value": 253,
+        "artifact_value": 253,
+        "advertised_as_supported": true
+      },
+      "expected": {
+        "verdict": "fail",
+        "reason_codes": [
+          "fixture.release_source_not_head",
+          "fixture.dirty_worktree_contaminated"
+        ]
+      }
+    },
+    {
+      "case_id": "missing-attestation-path",
+      "title": "Attestation slot has a null or missing artifact path",
+      "observed": {
+        "wording_state": "supported",
+        "release_source_required": true,
+        "source_mode": "head",
+        "dirty_worktree_measurement": false,
+        "artifact_present": false,
+        "artifact_path_null": true,
+        "advertised_as_supported": true
+      },
+      "expected": {
+        "verdict": "fail",
+        "reason_codes": [
+          "fixture.artifact_path_null",
+          "fixture.artifact_missing"
+        ]
+      }
+    },
+    {
+      "case_id": "planned-only-advertised-supported",
+      "title": "Planned-only contract wording is advertised as supported",
+      "observed": {
+        "wording_state": "planned",
+        "release_source_required": false,
+        "source_mode": "worktree",
+        "dirty_worktree_measurement": false,
+        "artifact_present": true,
+        "artifact_path_null": false,
+        "advertised_as_supported": true
+      },
+      "expected": {
+        "verdict": "fail",
+        "reason_codes": [
+          "fixture.planned_only_advertised_supported"
+        ]
+      }
+    },
+    {
+      "case_id": "unsupported-command-advertised-supported",
+      "title": "Unavailable command surface is advertised as supported",
+      "observed": {
+        "wording_state": "unavailable",
+        "release_source_required": false,
+        "source_mode": "worktree",
+        "dirty_worktree_measurement": false,
+        "artifact_present": true,
+        "artifact_path_null": false,
+        "advertised_as_supported": true
+      },
+      "expected": {
+        "verdict": "fail",
+        "reason_codes": [
+          "fixture.unsupported_advertised_supported"
+        ]
+      }
+    }
+  ]
+}
