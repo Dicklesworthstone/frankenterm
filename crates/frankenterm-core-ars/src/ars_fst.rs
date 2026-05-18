@@ -28,9 +28,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 // =============================================================================
 // Types
@@ -490,7 +491,7 @@ pub fn key_to_minhash(key: &[u8]) -> Vec<u64> {
 #[derive(Debug)]
 pub struct FstHandle {
     /// Current index (behind a read-write lock for simplicity).
-    inner: std::sync::RwLock<FstIndex>,
+    inner: RwLock<FstIndex>,
     /// Generation counter (incremented on each swap).
     generation: AtomicU64,
 }
@@ -499,7 +500,7 @@ impl FstHandle {
     /// Create a handle with an initial index.
     pub fn new(index: FstIndex) -> Self {
         Self {
-            inner: std::sync::RwLock::new(index),
+            inner: RwLock::new(index),
             generation: AtomicU64::new(0),
         }
     }
@@ -509,21 +510,49 @@ impl FstHandle {
         self.generation.load(Ordering::Acquire)
     }
 
+    fn read_index(&self) -> RwLockReadGuard<'_, FstIndex> {
+        match self.inner.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!(
+                    generation = self.generation(),
+                    "recovering poisoned ARS FST read lock"
+                );
+                self.inner.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn write_index(&self) -> RwLockWriteGuard<'_, FstIndex> {
+        match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!(
+                    generation = self.generation(),
+                    "recovering poisoned ARS FST write lock"
+                );
+                self.inner.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Look up a key in the current index.
     pub fn lookup(&self, key: &[u8]) -> Option<FstMatch> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_index();
         guard.lookup(key)
     }
 
     /// Prefix search in the current index.
     pub fn prefix_search(&self, input: &[u8]) -> Vec<FstMatch> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_index();
         guard.prefix_search(input)
     }
 
     /// Hot-swap the index with a newly compiled one.
     pub fn swap(&self, new_index: FstIndex) {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_index();
         let old_gen = self.generation.fetch_add(1, Ordering::Release);
         debug!(
             old_gen,
@@ -535,13 +564,13 @@ impl FstHandle {
 
     /// Get stats from the current index.
     pub fn stats(&self) -> FstStats {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_index();
         guard.stats().clone()
     }
 
     /// Get the entry count.
     pub fn len(&self) -> usize {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_index();
         guard.len()
     }
 
@@ -923,6 +952,30 @@ mod tests {
         assert_eq!(handle.generation(), 1);
         assert!(handle.lookup(b"old").is_none());
         assert!(handle.lookup(b"new").is_some());
+    }
+
+    #[test]
+    fn handle_recovers_after_poisoned_write_lock() {
+        let compiler = FstCompiler::with_defaults();
+        let idx1 = compiler.compile(&[entry("old", 1, 0)]).unwrap();
+        let idx2 = compiler.compile(&[entry("new", 2, 0)]).unwrap();
+        let handle = FstHandle::new(idx1);
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.write().unwrap();
+            panic!("poison ARS FST handle");
+        }));
+        assert!(poison.is_err());
+
+        let old_match = handle.lookup(b"old").unwrap();
+        assert_eq!(old_match.reflex_id, 1);
+        assert_eq!(handle.stats().entry_count, 1);
+
+        handle.swap(idx2);
+        assert_eq!(handle.generation(), 1);
+        assert!(handle.lookup(b"old").is_none());
+        let new_match = handle.lookup(b"new").unwrap();
+        assert_eq!(new_match.reflex_id, 2);
     }
 
     #[test]
