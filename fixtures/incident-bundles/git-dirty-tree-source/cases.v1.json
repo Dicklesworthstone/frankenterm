@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.incident_bundle.git_dirty_tree_source.fixtures.v1",
+  "producing_bead": "ft-9srtq",
+  "related_bead": "ft-ip124",
+  "purpose": "Static golden fixture corpus for the incident-bundle git_dirty_tree source before the blocked Rust collector can close with RCH proof.",
+  "golden_confidence": {
+    "artifact_kind": "structural_json_golden",
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 2,
+    "strategy": "Exact structural validation with redacted paths and reason-code checks."
+  },
+  "source_policy": {
+    "mutates_git_state_allowed": false,
+    "staging_allowed": false,
+    "reset_allowed": false,
+    "checkout_allowed": false,
+    "clean_allowed": false,
+    "delete_files_allowed": false,
+    "full_diff_payload_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "rch_service_mutation_allowed": false
+  },
+  "required_cases": [
+    "clean-tree",
+    "dirty-tracked-overlap",
+    "untracked-review-required",
+    "git-metadata-unavailable"
+  ],
+  "cases": [
+    {
+      "case_id": "clean-tree",
+      "title": "Clean worktree source collection",
+      "source_name": "git_dirty_tree",
+      "source_surface": "git status --short --branch",
+      "allowed_source_commands": [
+        "git status --short --branch",
+        "git diff --stat --"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "not_applicable",
+        "privacy_tier": "metadata_only",
+        "size_bytes": 0,
+        "warning_ids": []
+      },
+      "branch": {
+        "name": "[BRANCH]",
+        "ahead": 0,
+        "behind": 0,
+        "tracking_state": "up_to_date"
+      },
+      "summary": {
+        "tracked_dirty_count": 0,
+        "untracked_count": 0,
+        "staged_count": 0,
+        "unstaged_count": 0,
+        "deleted_count": 0,
+        "high_risk_count": 0,
+        "risk_level": "clean",
+        "truncated": false,
+        "full_diff_stored": false
+      },
+      "path_summaries": [],
+      "warnings": [],
+      "safe_next_action": "record_clean_git_dirty_tree_source",
+      "forbidden_actions": [
+        "git reset --hard",
+        "git clean -fd",
+        "git checkout -- <path>",
+        "git add <path>",
+        "delete_files"
+      ]
+    },
+    {
+      "case_id": "dirty-tracked-overlap",
+      "title": "Tracked dirty files require ownership caution",
+      "source_name": "git_dirty_tree",
+      "source_surface": "git status --short --branch",
+      "allowed_source_commands": [
+        "git status --short --branch",
+        "git diff --stat --"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "size_bytes": 640,
+        "warning_ids": [
+          "git-dirty-tree.tracked-overlap"
+        ]
+      },
+      "branch": {
+        "name": "[BRANCH]",
+        "ahead": 0,
+        "behind": 0,
+        "tracking_state": "unknown"
+      },
+      "summary": {
+        "tracked_dirty_count": 3,
+        "untracked_count": 0,
+        "staged_count": 0,
+        "unstaged_count": 3,
+        "deleted_count": 0,
+        "high_risk_count": 3,
+        "risk_level": "high",
+        "truncated": false,
+        "full_diff_stored": false
+      },
+      "path_summaries": [
+        {
+          "status": " M",
+          "path": "crates/frankenterm-core/src/crash.rs",
+          "category": "tracked_overlap_risk",
+          "severity": "high"
+        },
+        {
+          "status": " M",
+          "path": "crates/frankenterm-core/src/events.rs",
+          "category": "tracked_overlap_risk",
+          "severity": "high"
+        },
+        {
+          "status": " M",
+          "path": "crates/frankenterm-core/tests/proptest_crash.rs",
+          "category": "tracked_overlap_risk",
+          "severity": "high"
+        }
+      ],
+      "warnings": [
+        {
+          "id": "git-dirty-tree.tracked-overlap",
+          "severity": "high",
+          "reason_code": "git.tracked_overlap_risk",
+          "message": "Tracked files are dirty; treat ownership as unclear before editing or staging related paths."
+        }
+      ],
+      "safe_next_action": "record_dirty_tree_risk_without_mutation",
+      "forbidden_actions": [
+        "git reset --hard",
+        "git clean -fd",
+        "git checkout -- <path>",
+        "git add <path>",
+        "delete_files"
+      ]
+    },
+    {
+      "case_id": "untracked-review-required",
+      "title": "Untracked files are evidence but not proof of harmlessness",
+      "source_name": "git_dirty_tree",
+      "source_surface": "git status --short --branch",
+      "allowed_source_commands": [
+        "git status --short --branch",
+        "git diff --stat --"
+      ],
+      "bundle_entry": {
+        "status": "collected",
+        "evidence_state": "measured",
+        "mutates_state": false,
+        "redaction": "partial",
+        "privacy_tier": "metadata_only",
+        "size_bytes": 384,
+        "warning_ids": [
+          "git-dirty-tree.untracked-review"
+        ]
+      },
+      "branch": {
+        "name": "[BRANCH]",
+        "ahead": 0,
+        "behind": 0,
+        "tracking_state": "up_to_date"
+      },
+      "summary": {
+        "tracked_dirty_count": 0,
+        "untracked_count": 2,
+        "staged_count": 0,
+        "unstaged_count": 0,
+        "deleted_count": 0,
+        "high_risk_count": 0,
+        "risk_level": "medium",
+        "truncated": false,
+        "full_diff_stored": false
+      },
+      "path_summaries": [
+        {
+          "status": "??",
+          "path": "fixtures/incident-bundles/git-dirty-tree-source/cases.v1.json",
+          "category": "untracked_review_required",
+          "severity": "medium"
+        },
+        {
+          "status": "??",
+          "path": "tests/e2e/test_incident_git_dirty_tree_source_fixtures.sh",
+          "category": "untracked_review_required",
+          "severity": "medium"
+        }
+      ],
+      "warnings": [
+        {
+          "id": "git-dirty-tree.untracked-review",
+          "severity": "medium",
+          "reason_code": "git.untracked_review_required",
+          "message": "Untracked files require ownership review before they can be treated as unrelated or harmless."
+        }
+      ],
+      "safe_next_action": "record_untracked_review_required",
+      "forbidden_actions": [
+        "git reset --hard",
+        "git clean -fd",
+        "git checkout -- <path>",
+        "git add <path>",
+        "delete_files"
+      ]
+    },
+    {
+      "case_id": "git-metadata-unavailable",
+      "title": "Git metadata unavailable fails closed",
+      "source_name": "git_dirty_tree",
+      "source_surface": "git status --short --branch",
+      "allowed_source_commands": [
+        "git status --short --branch"
+      ],
+      "bundle_entry": {
+        "status": "unavailable",
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "redaction": "not_applicable",
+        "privacy_tier": "metadata_only",
+        "size_bytes": 0,
+        "warning_ids": [
+          "git-dirty-tree.unavailable"
+        ]
+      },
+      "branch": {
+        "name": null,
+        "ahead": null,
+        "behind": null,
+        "tracking_state": "unavailable"
+      },
+      "summary": {
+        "tracked_dirty_count": null,
+        "untracked_count": null,
+        "staged_count": null,
+        "unstaged_count": null,
+        "deleted_count": null,
+        "high_risk_count": null,
+        "risk_level": "unavailable",
+        "truncated": false,
+        "full_diff_stored": false
+      },
+      "path_summaries": [],
+      "warnings": [
+        {
+          "id": "git-dirty-tree.unavailable",
+          "severity": "high",
+          "reason_code": "git.metadata_unavailable",
+          "message": "Git dirty-tree metadata could not be collected; incident bundle must record unavailable evidence instead of assuming clean state."
+        }
+      ],
+      "safe_next_action": "record_unavailable_git_dirty_tree_source",
+      "forbidden_actions": [
+        "git reset --hard",
+        "git clean -fd",
+        "git checkout -- <path>",
+        "git add <path>",
+        "delete_files"
+      ]
+    }
+  ]
+}
