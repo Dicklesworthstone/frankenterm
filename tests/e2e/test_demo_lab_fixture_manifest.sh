@@ -123,11 +123,11 @@ for scenario_id in "${REQUIRED_SCENARIOS[@]}"; do
   scenario_hash="$(sha256_file "${scenario_path}")"
   mapfile -t artifact_rows < <(jq -r --arg id "${scenario_id}" '
     .scenarios[] | select(.id == $id) | .expected_artifacts[] |
-    [.kind, .path, (.max_bytes | tostring)] | @tsv
+    [.kind, .path, (.max_bytes | tostring), (.sha256 // "")] | @tsv
   ' "${MANIFEST}")
 
   for row in "${artifact_rows[@]}"; do
-    IFS=$'\t' read -r kind path max_bytes <<<"${row}"
+    IFS=$'\t' read -r kind path max_bytes expected_sha <<<"${row}"
     require_repo_relative_path "${path}"
     if [[ ! -f "${path}" ]]; then
       case "${kind}" in
@@ -138,6 +138,13 @@ for scenario_id in "${REQUIRED_SCENARIOS[@]}"; do
 
     bytes="$(wc -c < "${path}" | tr -d ' ')"
     ((bytes <= max_bytes)) || fail "${path} exceeds max_bytes ${max_bytes}"
+
+    if [[ "${kind}" != "manifest" ]]; then
+      [[ "${expected_sha}" =~ ^[0-9a-f]{64}$ ]] || fail "${path} missing manifest-pinned sha256"
+      actual_sha="$(sha256_file "${path}")"
+      [[ "${actual_sha}" == "${expected_sha}" ]] ||
+        fail "${path} sha256 drifted: expected ${expected_sha}, got ${actual_sha}"
+    fi
 
     case "${kind}" in
       golden_json)
