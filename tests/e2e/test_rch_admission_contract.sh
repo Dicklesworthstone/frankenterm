@@ -10,6 +10,7 @@ DOC="docs/rch-admission-contract.md"
 FIXTURES="fixtures/rch-admission/reason-code-fixtures.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 README="README.md"
+SOURCE="crates/frankenterm-core/src/rch_admission.rs"
 
 fail() {
   printf 'rch admission contract: %s\n' "$*" >&2
@@ -31,6 +32,7 @@ require_file "${DOC}"
 require_file "${FIXTURES}"
 require_file "${PROVENANCE}"
 require_file "${README}"
+require_file "${SOURCE}"
 
 jq empty "${SCHEMA}" "${FIXTURES}"
 
@@ -43,6 +45,7 @@ DOC = "docs/rch-admission-contract.md"
 FIXTURES = "fixtures/rch-admission/reason-code-fixtures.json"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 README = "README.md"
+SOURCE = "crates/frankenterm-core/src/rch_admission.rs"
 EXPECTED_CODES = %w[
   local_eno_space
   no_admissible_workers
@@ -93,6 +96,7 @@ fixtures = read_json(FIXTURES)
 doc = File.read(DOC)
 provenance = File.read(PROVENANCE)
 readme = File.read(README)
+source = File.read(SOURCE)
 
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-rch-admission.json")
 fail!("contract id const missing") unless schema.dig("properties", "contract_id", "const") == "ft.rch_admission.v1"
@@ -144,6 +148,27 @@ EXPECTED_FORBIDDEN.each do |action|
 end
 fail!("doc must explicitly say advisory") unless doc.downcase.include?("advisory")
 fail!("doc must reject dry-run as proof") unless doc.include?("dry-run") && doc.include?("compile/test proof")
+%w[
+  analyze_rch_admission_cargo_command
+  command.normalized
+  command.classification
+  command.target_dir
+  cargo_jobs
+  estimated_slots
+  slot_estimate_mismatch
+].each do |term|
+  fail!("doc missing cargo analyzer term #{term}") unless doc.include?(term)
+end
+%w[
+  RchAdmissionCargoCommandAnalysis
+  RchAdmissionCargoJobSource
+  analyze_rch_admission_cargo_command
+  CARGO_BUILD_JOBS
+  --target-dir
+  slot_estimate_mismatch
+].each do |term|
+  fail!("source missing cargo analyzer term #{term}") unless source.include?(term)
+end
 
 fail!("provenance missing ft-rch-admission row") unless provenance.include?("`ft-rch-admission.json`")
 fail!("provenance row must cite static verifier") unless provenance.include?("bash tests/e2e/test_rch_admission_contract.sh")

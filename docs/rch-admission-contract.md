@@ -83,3 +83,31 @@ The core module intentionally does not shell out, write Beads state, probe Agent
 Mail databases, restart services, mutate RCH workers, cancel builds, run Cargo,
 or delete files. CLI and doctor collectors must perform their read-only probes
 outside this module and pass redacted facts into the normalizer.
+
+## Cargo Command Analyzer
+
+`analyze_rch_admission_cargo_command` is the pure parser used by follow-on
+doctor wiring to explain Cargo-shaped proof commands before an agent attempts a
+material RCH run. It tokenizes an already-known command string and caller
+provided environment facts; it does not execute the command, query RCH, inspect
+workers, or mutate local state.
+
+The analyzer feeds the existing v1 fields rather than adding a second schema
+surface:
+
+| Output field | Analyzer source |
+|---|---|
+| `command.normalized` | The `cargo ...` suffix after wrappers such as `rch exec --` or `env`. |
+| `command.classification` | Cargo subcommand family such as `cargo_test`, `cargo_check`, `cargo_clippy`, or `cargo_build`. |
+| `command.target_dir` | `CARGO_TARGET_DIR`, `--target-dir VALUE`, or `--target-dir=VALUE`. |
+| `cargo_jobs` | Explicit `cargo -j`, `cargo --jobs`, or `CARGO_BUILD_JOBS` value when present. |
+| `estimated_slots` | The explicit job count when present; otherwise the installed selector estimate when supplied, falling back to one advisory slot. |
+| `citations` | A summary explaining explicit versus inferred job count, package scope, test scope, target dir, installed selector estimate, and whether the selector estimate mismatched the explicit command. |
+
+Job-source precedence is intentional: Cargo `-j` / `--jobs` wins over
+`CARGO_BUILD_JOBS`; `CARGO_BUILD_JOBS` wins over an installed RCH selector
+estimate; and the final fallback is a one-slot advisory estimate. When an
+explicit job count differs from the installed selector estimate, the analyzer
+sets `slot_estimate_mismatch=true` in the citation summary. That mismatch is
+evidence for humans and follow-up beads; it is not by itself compiled proof and
+must not be cited as a Cargo result.

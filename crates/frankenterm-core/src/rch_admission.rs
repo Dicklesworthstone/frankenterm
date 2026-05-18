@@ -189,6 +189,263 @@ impl RchAdmissionCommandDiagnostic {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RchAdmissionCargoJobSource {
+    CargoJobsFlag,
+    CargoBuildJobsEnv,
+    InstalledSelectorEstimate,
+    Default,
+}
+
+impl RchAdmissionCargoJobSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CargoJobsFlag => "cargo_jobs_flag",
+            Self::CargoBuildJobsEnv => "cargo_build_jobs_env",
+            Self::InstalledSelectorEstimate => "installed_selector_estimate",
+            Self::Default => "default",
+        }
+    }
+
+    #[must_use]
+    pub fn explicit(self) -> bool {
+        matches!(self, Self::CargoJobsFlag | Self::CargoBuildJobsEnv)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RchAdmissionCargoCommandAnalysis {
+    pub raw: String,
+    pub normalized: String,
+    pub classification: String,
+    pub would_intercept: bool,
+    pub target_dir: Option<String>,
+    pub cargo_subcommand: Option<String>,
+    pub package_scope: Vec<String>,
+    pub test_scope: Vec<String>,
+    pub explicit_jobs: Option<u32>,
+    pub effective_jobs: u32,
+    pub job_source: RchAdmissionCargoJobSource,
+    pub estimated_slots: u32,
+    pub installed_selector_estimated_slots: Option<u32>,
+    pub slot_estimate_mismatch: bool,
+    pub explanation: String,
+}
+
+impl RchAdmissionCargoCommandAnalysis {
+    #[must_use]
+    pub fn command_diagnostic(&self) -> RchAdmissionCommandDiagnostic {
+        RchAdmissionCommandDiagnostic::new(self.raw.clone())
+            .normalized(self.normalized.clone())
+            .classification(self.classification.clone())
+            .would_intercept(self.would_intercept)
+            .maybe_target_dir(self.target_dir.clone())
+    }
+
+    #[must_use]
+    pub fn collector_observation(&self) -> RchAdmissionCollectorObservation {
+        RchAdmissionCollectorObservation::new(
+            "rch_admission.cargo_command_analysis",
+            "pure cargo command analyzer",
+            self.explanation.clone(),
+        )
+    }
+}
+
+impl RchAdmissionCommandDiagnostic {
+    #[must_use]
+    fn maybe_target_dir(mut self, target_dir: Option<String>) -> Self {
+        self.target_dir = target_dir;
+        self
+    }
+}
+
+#[must_use]
+pub fn analyze_rch_admission_cargo_command<I, K, V>(
+    raw: impl AsRef<str>,
+    env: I,
+    installed_selector_estimated_slots: Option<u32>,
+) -> RchAdmissionCargoCommandAnalysis
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let raw = raw.as_ref().trim().to_string();
+    let tokens = shell_words_lossy(&raw);
+    let cargo_index = tokens.iter().position(|token| token == "cargo");
+    let mut command_env = env
+        .into_iter()
+        .map(|(key, value)| (key.as_ref().to_string(), value.as_ref().to_string()))
+        .collect::<Vec<_>>();
+    collect_inline_env_assignments(&tokens, cargo_index, &mut command_env);
+
+    let installed_selector_estimated_slots =
+        installed_selector_estimated_slots.map(|value| value.max(1));
+    let Some(cargo_index) = cargo_index else {
+        return RchAdmissionCargoCommandAnalysis {
+            raw: nonempty_string(raw, "unknown"),
+            normalized: "non-cargo command".to_string(),
+            classification: "non_cargo".to_string(),
+            would_intercept: false,
+            target_dir: env_value(&command_env, "CARGO_TARGET_DIR"),
+            cargo_subcommand: None,
+            package_scope: Vec::new(),
+            test_scope: Vec::new(),
+            explicit_jobs: None,
+            effective_jobs: 1,
+            job_source: RchAdmissionCargoJobSource::Default,
+            estimated_slots: 1,
+            installed_selector_estimated_slots,
+            slot_estimate_mismatch: installed_selector_estimated_slots
+                .is_some_and(|slots| slots != 1),
+            explanation: "command analyzer did not find a cargo invocation".to_string(),
+        };
+    };
+
+    let cargo_tokens = tokens[cargo_index..].to_vec();
+    let normalized = cargo_tokens.join(" ");
+    let mut cargo_subcommand = None;
+    let mut package_scope = Vec::new();
+    let mut test_scope = Vec::new();
+    let mut jobs_flag = None;
+    let mut target_dir = env_value(&command_env, "CARGO_TARGET_DIR");
+    let mut i = 1;
+    let mut after_double_dash = false;
+
+    while i < cargo_tokens.len() {
+        let token = &cargo_tokens[i];
+        if token == "--" {
+            after_double_dash = true;
+            i += 1;
+            continue;
+        }
+        if after_double_dash {
+            i += 1;
+            continue;
+        }
+
+        if let Some(value) = token.strip_prefix("--jobs=") {
+            jobs_flag = parse_positive_u32(value);
+            i += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("-j") {
+            if !value.is_empty() {
+                jobs_flag = parse_positive_u32(value);
+                i += 1;
+                continue;
+            }
+        }
+        if matches!(token.as_str(), "-j" | "--jobs") {
+            if let Some(value) = cargo_tokens
+                .get(i + 1)
+                .and_then(|value| parse_positive_u32(value))
+            {
+                jobs_flag = Some(value);
+            }
+            i += 2;
+            continue;
+        }
+
+        if let Some(value) = token.strip_prefix("--target-dir=") {
+            target_dir = Some(nonempty_string(value, "unknown"));
+            i += 1;
+            continue;
+        }
+        if token == "--target-dir" {
+            if let Some(value) = cargo_tokens.get(i + 1) {
+                target_dir = Some(nonempty_string(value, "unknown"));
+            }
+            i += 2;
+            continue;
+        }
+
+        if let Some(value) = token.strip_prefix("--package=") {
+            push_nonempty_unique(&mut package_scope, value);
+            i += 1;
+            continue;
+        }
+        if matches!(token.as_str(), "-p" | "--package") {
+            if let Some(value) = cargo_tokens.get(i + 1) {
+                push_nonempty_unique(&mut package_scope, value);
+            }
+            i += 2;
+            continue;
+        }
+
+        if cargo_subcommand.is_none() && !token.starts_with('-') && !token.starts_with('+') {
+            cargo_subcommand = Some(token.clone());
+            i += 1;
+            continue;
+        }
+
+        if cargo_subcommand.as_deref() == Some("test") && !token.starts_with('-') {
+            push_nonempty_unique(&mut test_scope, token);
+        }
+
+        if cargo_option_takes_value(token) {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let env_jobs =
+        env_value(&command_env, "CARGO_BUILD_JOBS").and_then(|value| parse_positive_u32(&value));
+    let (explicit_jobs, effective_jobs, job_source) = if let Some(jobs) = jobs_flag {
+        (Some(jobs), jobs, RchAdmissionCargoJobSource::CargoJobsFlag)
+    } else if let Some(jobs) = env_jobs {
+        (
+            Some(jobs),
+            jobs,
+            RchAdmissionCargoJobSource::CargoBuildJobsEnv,
+        )
+    } else if let Some(slots) = installed_selector_estimated_slots {
+        (
+            None,
+            slots,
+            RchAdmissionCargoJobSource::InstalledSelectorEstimate,
+        )
+    } else {
+        (None, 1, RchAdmissionCargoJobSource::Default)
+    };
+    let estimated_slots = effective_jobs.max(1);
+    let slot_estimate_mismatch = installed_selector_estimated_slots
+        .is_some_and(|installed_slots| installed_slots != estimated_slots);
+    let classification = classify_cargo_command(cargo_subcommand.as_deref());
+    let explanation = cargo_analysis_explanation(
+        explicit_jobs,
+        effective_jobs,
+        job_source,
+        estimated_slots,
+        installed_selector_estimated_slots,
+        slot_estimate_mismatch,
+        &package_scope,
+        &test_scope,
+        target_dir.as_deref(),
+    );
+
+    RchAdmissionCargoCommandAnalysis {
+        raw: nonempty_string(raw, "unknown"),
+        normalized,
+        classification,
+        would_intercept: true,
+        target_dir,
+        cargo_subcommand,
+        package_scope,
+        test_scope,
+        explicit_jobs,
+        effective_jobs,
+        job_source,
+        estimated_slots,
+        installed_selector_estimated_slots,
+        slot_estimate_mismatch,
+        explanation,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RchAdmissionProbeDiagnostic {
     pub status: RchAdmissionProbeStatus,
@@ -517,6 +774,19 @@ impl RchAdmissionCollectorInput {
     }
 
     #[must_use]
+    pub fn with_cargo_command_analysis(
+        mut self,
+        analysis: &RchAdmissionCargoCommandAnalysis,
+    ) -> Self {
+        self.command = analysis.command_diagnostic();
+        self.cargo_jobs = analysis.explicit_jobs;
+        self.estimated_slots = Some(analysis.estimated_slots);
+        self.collector_observations
+            .push(analysis.collector_observation());
+        self
+    }
+
+    #[must_use]
     pub fn with_ready_bead(mut self, bead_id: impl Into<String>) -> Self {
         push_nonempty_unique(&mut self.ready_beads, bead_id);
         self
@@ -837,6 +1107,174 @@ fn push_nonempty_unique(values: &mut Vec<String>, value: impl Into<String>) {
     }
 }
 
+fn shell_words_lossy(input: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(quote_ch) = quote {
+            if ch == quote_ch {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn collect_inline_env_assignments(
+    tokens: &[String],
+    cargo_index: Option<usize>,
+    command_env: &mut Vec<(String, String)>,
+) {
+    let limit = cargo_index.unwrap_or(tokens.len());
+    for token in tokens.iter().take(limit) {
+        if token == "env"
+            || token == "--"
+            || token == "rch"
+            || token == "exec"
+            || token == "diagnose"
+        {
+            continue;
+        }
+        if let Some((key, value)) = token.split_once('=') {
+            if is_supported_cargo_env_key(key) {
+                command_env.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+}
+
+fn is_supported_cargo_env_key(key: &str) -> bool {
+    matches!(key, "CARGO_BUILD_JOBS" | "CARGO_TARGET_DIR")
+}
+
+fn env_value(command_env: &[(String, String)], key: &str) -> Option<String> {
+    command_env.iter().rev().find_map(|(env_key, env_value)| {
+        (env_key == key).then(|| nonempty_string(env_value.clone(), "unknown"))
+    })
+}
+
+fn parse_positive_u32(value: &str) -> Option<u32> {
+    value.parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn cargo_option_takes_value(token: &str) -> bool {
+    matches!(
+        token,
+        "--bin"
+            | "--bench"
+            | "--example"
+            | "--features"
+            | "--manifest-path"
+            | "--target"
+            | "--target-dir"
+            | "--profile"
+            | "--message-format"
+            | "--config"
+            | "-p"
+            | "--package"
+            | "-j"
+            | "--jobs"
+    )
+}
+
+fn classify_cargo_command(cargo_subcommand: Option<&str>) -> String {
+    match cargo_subcommand {
+        Some("test") => "cargo_test",
+        Some("check") => "cargo_check",
+        Some("clippy") => "cargo_clippy",
+        Some("build") => "cargo_build",
+        Some("bench") => "cargo_bench",
+        Some("fuzz") => "cargo_fuzz",
+        Some(other) if !other.trim().is_empty() => "cargo_other",
+        _ => "cargo_unknown",
+    }
+    .to_string()
+}
+
+fn cargo_analysis_explanation(
+    explicit_jobs: Option<u32>,
+    effective_jobs: u32,
+    job_source: RchAdmissionCargoJobSource,
+    estimated_slots: u32,
+    installed_selector_estimated_slots: Option<u32>,
+    slot_estimate_mismatch: bool,
+    package_scope: &[String],
+    test_scope: &[String],
+    target_dir: Option<&str>,
+) -> String {
+    let job_phrase = if let Some(explicit_jobs) = explicit_jobs {
+        format!(
+            "explicit cargo job count {explicit_jobs} from {}",
+            job_source.as_str()
+        )
+    } else {
+        format!(
+            "inferred cargo job count {effective_jobs} from {}",
+            job_source.as_str()
+        )
+    };
+    let selector_phrase = installed_selector_estimated_slots.map_or_else(
+        || "installed_selector_estimated_slots=unavailable".to_string(),
+        |slots| format!("installed_selector_estimated_slots={slots}"),
+    );
+    let mismatch_phrase = if slot_estimate_mismatch {
+        "slot_estimate_mismatch=true"
+    } else {
+        "slot_estimate_mismatch=false"
+    };
+    let package_phrase = if package_scope.is_empty() {
+        "package_scope=workspace".to_string()
+    } else {
+        format!("package_scope={}", package_scope.join(","))
+    };
+    let test_phrase = if test_scope.is_empty() {
+        "test_scope=unspecified".to_string()
+    } else {
+        format!("test_scope={}", test_scope.join(","))
+    };
+    let target_phrase = target_dir.map_or_else(
+        || "target_dir=unspecified".to_string(),
+        |target_dir| format!("target_dir={target_dir}"),
+    );
+
+    format!(
+        "{job_phrase}; estimated_slots={estimated_slots}; {selector_phrase}; {mismatch_phrase}; {package_phrase}; {test_phrase}; {target_phrase}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +1285,106 @@ mod tests {
             .classification("cargo_test")
             .would_intercept(true)
             .target_dir("/tmp/ft-proof")
+    }
+
+    #[test]
+    fn cargo_command_analysis_honors_jobs_flag_scope_and_selector_mismatch() {
+        let analysis = analyze_rch_admission_cargo_command(
+            "rch diagnose --dry-run -- env CARGO_TARGET_DIR=/tmp/ft-rch cargo test -j 1 -p frankenterm-core rch_admission --lib -- --nocapture",
+            std::iter::empty::<(&str, &str)>(),
+            Some(4),
+        );
+
+        assert_eq!(analysis.classification, "cargo_test");
+        assert_eq!(analysis.target_dir.as_deref(), Some("/tmp/ft-rch"));
+        assert_eq!(
+            analysis.package_scope,
+            vec![String::from("frankenterm-core")]
+        );
+        assert_eq!(analysis.test_scope, vec![String::from("rch_admission")]);
+        assert_eq!(analysis.explicit_jobs, Some(1));
+        assert_eq!(analysis.effective_jobs, 1);
+        assert_eq!(analysis.estimated_slots, 1);
+        assert_eq!(
+            analysis.job_source,
+            RchAdmissionCargoJobSource::CargoJobsFlag
+        );
+        assert!(analysis.slot_estimate_mismatch);
+        assert!(analysis.explanation.contains("explicit cargo job count 1"));
+        assert!(
+            analysis
+                .explanation
+                .contains("installed_selector_estimated_slots=4")
+        );
+        assert!(analysis.explanation.contains("slot_estimate_mismatch=true"));
+    }
+
+    #[test]
+    fn cargo_command_analysis_honors_env_jobs_and_target_dir_flag() {
+        let analysis = analyze_rch_admission_cargo_command(
+            "cargo check -p mux --target-dir /tmp/target-rch --all-targets",
+            [("CARGO_BUILD_JOBS", "2")],
+            Some(2),
+        );
+
+        assert_eq!(analysis.classification, "cargo_check");
+        assert_eq!(analysis.target_dir.as_deref(), Some("/tmp/target-rch"));
+        assert_eq!(analysis.package_scope, vec![String::from("mux")]);
+        assert!(analysis.test_scope.is_empty());
+        assert_eq!(analysis.explicit_jobs, Some(2));
+        assert_eq!(
+            analysis.job_source,
+            RchAdmissionCargoJobSource::CargoBuildJobsEnv
+        );
+        assert_eq!(analysis.estimated_slots, 2);
+        assert!(!analysis.slot_estimate_mismatch);
+        assert!(analysis.explanation.contains("explicit cargo job count 2"));
+    }
+
+    #[test]
+    fn cargo_command_analysis_uses_installed_selector_when_jobs_are_inferred() {
+        let analysis = analyze_rch_admission_cargo_command(
+            "cargo clippy --workspace --all-targets -- -D warnings",
+            std::iter::empty::<(&str, &str)>(),
+            Some(4),
+        );
+
+        assert_eq!(analysis.classification, "cargo_clippy");
+        assert_eq!(analysis.explicit_jobs, None);
+        assert_eq!(analysis.effective_jobs, 4);
+        assert_eq!(analysis.estimated_slots, 4);
+        assert_eq!(
+            analysis.job_source,
+            RchAdmissionCargoJobSource::InstalledSelectorEstimate
+        );
+        assert!(!analysis.slot_estimate_mismatch);
+        assert!(analysis.explanation.contains("inferred cargo job count 4"));
+    }
+
+    #[test]
+    fn cargo_command_analysis_populates_report_fields_and_citation() {
+        let analysis = analyze_rch_admission_cargo_command(
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo test -p frankenterm-core rch_admission --lib",
+            [("CARGO_BUILD_JOBS", "1")],
+            Some(4),
+        );
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.cargo_command_analysis",
+            RchAdmissionCommandDiagnostic::new("placeholder"),
+        )
+        .with_cargo_command_analysis(&analysis);
+
+        let report = build_rch_admission_report(&input);
+
+        assert_eq!(report.command.classification.as_deref(), Some("cargo_test"));
+        assert_eq!(report.command.target_dir.as_deref(), Some("/tmp/ft-proof"));
+        assert_eq!(report.cargo_jobs, Some(1));
+        assert_eq!(report.estimated_slots, Some(1));
+        assert!(report.citations.iter().any(|citation| {
+            citation.summary.contains("explicit cargo job count 1")
+                && citation.summary.contains("slot_estimate_mismatch=true")
+        }));
     }
 
     #[test]
