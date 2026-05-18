@@ -95,7 +95,12 @@ mutation, build-cancel, or destructive filesystem command fragments, and that
 every collector side-effect flag is false. The verifier also emits ignored
 artifacts under `tests/e2e/artifacts/`: a JSONL `structured.log` plus a
 `summary.json`. Every emitted event must keep `service_actions_invoked`,
-`local_cargo_proof`, and `side_effects_executed` set to false.
+`local_cargo_proof`, and `side_effects_executed` set to false. The emitted
+structured log must byte-match
+`fixtures/rch-admission/expected-structured-log.golden.jsonl`, and the
+deterministic summary fields must match
+`fixtures/rch-admission/summary.golden.json`; intentional fixture changes
+update those committed goldens in the same review.
 
 ## Read-only Collector Substrate
 

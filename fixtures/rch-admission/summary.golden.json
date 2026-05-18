@@ -1,0 +1,9 @@
+{
+  "contract_id": "ft.rch_admission.v1",
+  "schema_version": "ft.rch_admission.no_service_actions.v1",
+  "status": "passed",
+  "reason_fixture_count": 9,
+  "no_service_fixture_count": 10,
+  "reason_code_count": 9,
+  "forbidden_action_count": 8
+}

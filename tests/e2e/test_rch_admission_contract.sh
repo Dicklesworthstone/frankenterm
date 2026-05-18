@@ -9,6 +9,8 @@ SCHEMA="docs/json-schema/ft-rch-admission.json"
 DOC="docs/rch-admission-contract.md"
 FIXTURES="fixtures/rch-admission/reason-code-fixtures.json"
 NO_SERVICE_FIXTURES="fixtures/rch-admission/no-service-action-fixtures.json"
+STRUCTURED_LOG_GOLDEN="fixtures/rch-admission/expected-structured-log.golden.jsonl"
+SUMMARY_GOLDEN="fixtures/rch-admission/summary.golden.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 README="README.md"
 SOURCE="crates/frankenterm-core/src/rch_admission.rs"
@@ -36,6 +38,8 @@ require_file "${SCHEMA}"
 require_file "${DOC}"
 require_file "${FIXTURES}"
 require_file "${NO_SERVICE_FIXTURES}"
+require_file "${STRUCTURED_LOG_GOLDEN}"
+require_file "${SUMMARY_GOLDEN}"
 require_file "${PROVENANCE}"
 require_file "${README}"
 require_file "${SOURCE}"
@@ -55,6 +59,8 @@ SCHEMA = "docs/json-schema/ft-rch-admission.json"
 DOC = "docs/rch-admission-contract.md"
 FIXTURES = "fixtures/rch-admission/reason-code-fixtures.json"
 NO_SERVICE_FIXTURES = "fixtures/rch-admission/no-service-action-fixtures.json"
+STRUCTURED_LOG_GOLDEN = "fixtures/rch-admission/expected-structured-log.golden.jsonl"
+SUMMARY_GOLDEN = "fixtures/rch-admission/summary.golden.json"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 README = "README.md"
 SOURCE = "crates/frankenterm-core/src/rch_admission.rs"
@@ -304,6 +310,8 @@ structured_events = no_service_cases.map do |entry|
   )
 end
 File.write(STRUCTURED_LOG, structured_events.map { |event| JSON.generate(event) }.join("\n") + "\n")
+fail!("structured log golden drifted") unless File.read(STRUCTURED_LOG) == File.read(STRUCTURED_LOG_GOLDEN)
+
 parsed_events = File.readlines(STRUCTURED_LOG, chomp: true).map { |line| JSON.parse(line) }
 fail!("structured log event count drifted") unless parsed_events.length == no_service_cases.length
 parsed_events.each do |event|
@@ -325,6 +333,8 @@ summary = {
 }
 File.write(SUMMARY_FILE, JSON.pretty_generate(summary) + "\n")
 fail!("summary file is not JSON") unless read_json(SUMMARY_FILE).fetch("status") == "passed"
+summary_golden = summary.reject { |key, _| %w[structured_log summary_file].include?(key) }
+fail!("summary golden drifted") unless summary_golden == read_json(SUMMARY_GOLDEN)
 
 puts "rch admission contract: static verifier passed (#{cases.length} reason fixtures, #{no_service_cases.length} no-service fixtures, #{EXPECTED_CODES.length} reason codes, #{live_e2e} E2E scripts; log #{STRUCTURED_LOG})"
 RUBY
