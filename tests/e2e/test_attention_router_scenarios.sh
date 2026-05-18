@@ -85,9 +85,14 @@ jq -e '
     "dirty-overlap-active-owner",
     "closed-local-not-pushed",
     "bv-stale-bd-command-hints",
-    "docs-only-ready-while-proof-blocked"
+    "docs-only-ready-while-proof-blocked",
+    "active-exclusive-reservation-overlap",
+    "reservation-release-message-not-released",
+    "ownership-source-disagreement",
+    "local-closeout-publication-pending",
+    "stale-owner-status-before-force-release"
   ]))
-  and (.scenarios | length >= 8)
+  and (.scenarios | length >= 13)
 ' "${INVENTORY}" >/dev/null || fail "top-level inventory contract is incomplete"
 
 jq -e '
@@ -218,6 +223,113 @@ jq -e '
     and (.forbidden_actions | index("run_bv_claim_hint_without_br_reconciliation") != null)
     and (.forbidden_actions | index("auto_claim_bv_pick") != null)
 ' "${INVENTORY}" >/dev/null || fail "BV stale bd command-hints scenario drifted"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "active-exclusive-reservation-overlap")
+  | ([.source_fixture_requirements[].source_id] | sort) == [
+      "agent-mail-reservation-snapshot",
+      "beads-candidate-state",
+      "git-candidate-paths"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "agent-mail-reservation-snapshot")
+      | (.required_reason_codes | index("reservation.exclusive_active") != null)
+      and (.required_reason_codes | index("reservation.path_overlap") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "git-candidate-paths")
+      | (.required_reason_codes | index("dirty_overlap.reservation_overlap") != null))
+    and .expected.classification == "dirty_overlap"
+    and .expected.recommended_safe_action == "choose_disjoint_work_or_request_handoff_before_editing"
+    and (.expected.explanation_must_include | index("active exclusive reservation covers the candidate path") != null)
+    and (.forbidden_actions | index("edit_reserved_path") != null)
+    and (.forbidden_actions | index("force_release_fresh_reservation") != null)
+' "${INVENTORY}" >/dev/null || fail "active exclusive reservation firewall scenario drifted"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "reservation-release-message-not-released")
+  | ([.source_fixture_requirements[].source_id] | sort) == [
+      "agent-mail-publication-message",
+      "git-publication-state",
+      "reservation-lease-state"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "reservation-lease-state")
+      | .required_counters.active_reservation_count == 1
+      and .required_counters.released_reservation_count == 0
+      and (.required_reason_codes | index("reservation.lease_active") != null)
+      and (.required_reason_codes | index("reservation.released_false") != null)
+      and (.required_reason_codes | index("reservation.not_expired") != null))
+    and .expected.classification == "do_not_touch"
+    and .expected.recommended_safe_action == "wait_for_reservation_release_or_expiry_then_recheck"
+    and (.expected.explanation_must_include | index("publication message does not release the file lease") != null)
+    and (.forbidden_actions | index("treat_message_as_reservation_release") != null)
+    and (.forbidden_actions | index("claim_dependent_work_before_lease_release") != null)
+' "${INVENTORY}" >/dev/null || fail "reservation release-message firewall scenario drifted"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "ownership-source-disagreement")
+  | ([.source_fixture_requirements[].source_id] | sort) == [
+      "beads-owner",
+      "dirty-path-attribution",
+      "reservation-holder"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "beads-owner")
+      | (.required_reason_codes | index("beads.owner_conflicts_with_reservation") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "reservation-holder")
+      | (.required_reason_codes | index("reservation.owner_conflicts_with_beads") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "dirty-path-attribution")
+      | (.required_reason_codes | index("git.dirty_owner_conflicts_with_tracker") != null))
+    and .expected.classification == "do_not_touch"
+    and .expected.recommended_safe_action == "fail_closed_request_targeted_handoff_or_pick_disjoint_work"
+    and (.expected.explanation_must_include | index("ownership sources disagree") != null)
+    and (.forbidden_actions | index("claim_based_on_one_source_only") != null)
+    and (.forbidden_actions | index("force_release_conflicting_owner") != null)
+' "${INVENTORY}" >/dev/null || fail "ownership source disagreement scenario drifted"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "local-closeout-publication-pending")
+  | ([.source_fixture_requirements[].source_id] | sort) == [
+      "beads-local-state",
+      "git-publication-gap",
+      "reservation-after-closeout"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "git-publication-gap")
+      | .required_counters.origin_main_contains_closeout == 0
+      and .required_counters.legacy_mirror_contains_closeout == 0
+      and (.required_reason_codes | index("git.origin_main_missing_closeout") != null)
+      and (.required_reason_codes | index("git.legacy_mirror_missing_closeout") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "reservation-after-closeout")
+      | (.required_reason_codes | index("reservation.release_state_unknown_or_active") != null))
+    and .expected.classification == "do_not_touch"
+    and .expected.recommended_safe_action == "wait_for_commit_push_mirror_and_reservation_release"
+    and (.expected.explanation_must_include | index("reservation release remains a separate gate") != null)
+    and (.forbidden_actions | index("claim_dependent_work_before_publication") != null)
+    and (.forbidden_actions | index("stage_another_agents_tracker_closeout") != null)
+' "${INVENTORY}" >/dev/null || fail "local closeout publication-pending scenario drifted"
+
+jq -e '
+  .scenarios[]
+  | select(.scenario_id == "stale-owner-status-before-force-release")
+  | ([.source_fixture_requirements[].source_id] | sort) == [
+      "agent-mail-freshness",
+      "beads-stale-owner",
+      "git-owner-freshness",
+      "pane-state-optional"
+    ]
+    and (.source_fixture_requirements[] | select(.source_id == "beads-stale-owner")
+      | (.required_reason_codes | index("beads.in_progress_present") != null)
+      and (.required_reason_codes | index("beads.no_recent_update") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "agent-mail-freshness")
+      | (.required_reason_codes | index("agent_mail.status_check_not_yet_sent") != null))
+    and (.source_fixture_requirements[] | select(.source_id == "pane-state-optional")
+      | (.required_reason_codes | index("pane.idle_placeholder_not_stuck_evidence") != null))
+    and .expected.classification == "stale_claim"
+    and .expected.recommended_safe_action == "send_status_check_then_prepare_operator_review_if_no_response"
+    and (.expected.explanation_must_include | index("elapsed time alone is not enough for force-release") != null)
+    and (.forbidden_actions | index("force_release_without_status_check") != null)
+    and (.forbidden_actions | index("auto_reassign_active_work") != null)
+' "${INVENTORY}" >/dev/null || fail "stale-owner force-release guard scenario drifted"
 
 grep -Fq "The claimability check must treat \`bv --robot-triage\` and \`bv --robot-next\` as" \
   "${BLOCKER_RADAR_CONTRACT}" || fail "blocker-radar contract no longer treats BV as advisory"

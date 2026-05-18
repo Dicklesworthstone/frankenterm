@@ -186,6 +186,28 @@ warnings[2]:
 - If no useful work is ready, recommend a docs/spec/testing-planning slice or a
   new Beads issue with explicit scope and proof expectations.
 
+## Reservation Firewall
+
+The router treats Agent Mail reservations, Beads ownership, dirty paths, and
+publication state as a single ownership firewall. It must never decide that a
+path is safe from only one source when another source still reports an active
+owner or unreleased lease.
+
+The retained fixture matrix in
+`fixtures/attention-router/scenarios.v1.json` covers these firewall cases:
+
+| Scenario | Required outcome |
+|---|---|
+| `active-exclusive-reservation-overlap` | Active exclusive reservations block editing, staging, claiming, and committing overlapping paths. |
+| `reservation-release-message-not-released` | A publication or closeout message is not a reservation release; wait for release or expiry and recheck. |
+| `ownership-source-disagreement` | Beads assignee, reservation holder, and dirty-path attribution conflicts classify as `do_not_touch`. |
+| `local-closeout-publication-pending` | Local Beads closed state is not durable until commit, `origin/main`, legacy mirror, and reservation release all agree. |
+| `stale-owner-status-before-force-release` | Stale-looking ownership may produce a status-check or operator-review recommendation, never an automatic force-release. |
+
+Every firewall recommendation is side-effect-free. The router may explain the
+next evidence to collect, but it does not release reservations, reopen Beads,
+send handoff mail, stage files, or publish another agent's closeout.
+
 ## Safety Rules
 
 The attention router must never perform these actions:
@@ -210,6 +232,8 @@ The first implementation pass should add golden fixtures for:
 4. Dirty path overlap with another owner.
 5. RCH `no_admissible_workers` refusing remote-required proof.
 6. A docs-only ready slice that can move while implementation proof is blocked.
+7. Reservation firewall cases where leases, dirty paths, Beads ownership, and
+   publication state disagree or have not all cleared.
 
 Any Rust code, generated JSON/TOON golden tests, or docs tests that compile
 code must run through RCH only. Static markdown and JSON checks are sufficient

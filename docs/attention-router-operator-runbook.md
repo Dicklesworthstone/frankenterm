@@ -233,6 +233,46 @@ Safe action:
 Do not use `git reset --hard`, `git clean`, broad `git checkout --`, stash,
 package-wide formatting, or broad `git add .` to escape overlap.
 
+### Reservation Firewall
+
+Evidence shape:
+
+```text
+Agent Mail reservation metadata, Beads assignee state, git dirty paths, or
+publication refs disagree about who owns the candidate path.
+```
+
+Classification: `dirty_overlap` for a clear active reservation/path overlap,
+or `do_not_touch` when ownership sources disagree or publication is pending.
+
+Safe action:
+
+1. Treat active exclusive reservations as blocking until they are released or
+   expired by policy.
+2. Treat a closeout or publication message as evidence, not as a reservation
+   release.
+3. If Beads owner, reservation holder, and dirty-path attribution disagree,
+   ask for a targeted handoff or pick disjoint work.
+4. If a Bead is locally closed but not committed, pushed to `origin/main`,
+   mirrored to the legacy ref, and released from reservations, wait.
+5. If ownership merely looks stale, send a status-check before any operator
+   force-release review.
+
+Forbidden shortcuts:
+
+```text
+edit_reserved_path
+stage_unowned_tracker_changes
+commit_another_agents_closeout
+claim_dependent_work_before_publication
+force_release_without_status_check
+```
+
+Fixture anchors: `active-exclusive-reservation-overlap`,
+`reservation-release-message-not-released`,
+`ownership-source-disagreement`, `local-closeout-publication-pending`, and
+`stale-owner-status-before-force-release`.
+
 ## Trust Boundary
 
 The router is a read-only decision surface. Routine operators and agents must

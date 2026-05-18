@@ -461,6 +461,310 @@
         "level": 2,
         "strategy": "exact structural golden after scrubbing timestamps and generated Bead ids"
       }
+    },
+    {
+      "scenario_id": "active-exclusive-reservation-overlap",
+      "title": "Active exclusive reservation overlaps candidate paths",
+      "summary": "The router must fail closed when a candidate edit path overlaps another agent's active exclusive reservation, even when the Bead looks otherwise attractive.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "agent-mail-reservation-snapshot",
+          "command_or_api": "file reservation snapshot or reduced Agent Mail reservation metadata",
+          "required_reason_codes": [
+            "reservation.exclusive_active",
+            "reservation.path_overlap"
+          ],
+          "required_subjects": [
+            "fixtures/attention-router/*",
+            "[OWNER_AGENT]"
+          ]
+        },
+        {
+          "source_id": "beads-candidate-state",
+          "command_or_api": "br show <candidate> --json",
+          "required_reason_codes": [
+            "beads.status_open_or_ready",
+            "beads.candidate_path_known"
+          ],
+          "required_subjects": [
+            "<candidate>"
+          ]
+        },
+        {
+          "source_id": "git-candidate-paths",
+          "command_or_api": "git status --short --branch -- <candidate paths>",
+          "required_reason_codes": [
+            "git.path_scope_checked",
+            "dirty_overlap.reservation_overlap"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "dirty_overlap",
+        "recommended_safe_action": "choose_disjoint_work_or_request_handoff_before_editing",
+        "confidence": "high",
+        "explanation_must_include": [
+          "active exclusive reservation covers the candidate path",
+          "path reservation is stronger than graph availability language",
+          "safe work must be disjoint or explicitly handed off"
+        ]
+      },
+      "forbidden_actions": [
+        "edit_reserved_path",
+        "stage_reserved_path",
+        "claim_over_active_reservation",
+        "force_release_fresh_reservation",
+        "commit_reserved_path"
+      ],
+      "volatility": {
+        "level": 3,
+        "strategy": "canonicalize paths and reservation ids while preserving holder, exclusivity, and overlap reason codes"
+      }
+    },
+    {
+      "scenario_id": "reservation-release-message-not-released",
+      "title": "Release message exists but reservation is still active",
+      "summary": "The router must wait for an actual reservation release or expiry when an owner announces publication but the reservation lease is still active.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "agent-mail-publication-message",
+          "command_or_api": "search_messages(project_key, query=<bead-id>, ranking=recency)",
+          "required_reason_codes": [
+            "agent_mail.publication_message_present",
+            "agent_mail.closeout_claim_present"
+          ],
+          "required_subjects": [
+            "<bead>",
+            "[OWNER_AGENT]"
+          ]
+        },
+        {
+          "source_id": "reservation-lease-state",
+          "command_or_api": "file reservation snapshot or list_contacts-compatible reduced reservation metadata",
+          "required_reason_codes": [
+            "reservation.lease_active",
+            "reservation.released_false",
+            "reservation.not_expired"
+          ],
+          "required_counters": {
+            "active_reservation_count": 1,
+            "released_reservation_count": 0
+          }
+        },
+        {
+          "source_id": "git-publication-state",
+          "command_or_api": "git rev-parse HEAD origin/main refs/remotes/origin/<legacy-mirror>",
+          "required_reason_codes": [
+            "git.publication_refs_checked"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "do_not_touch",
+        "recommended_safe_action": "wait_for_reservation_release_or_expiry_then_recheck",
+        "confidence": "high",
+        "explanation_must_include": [
+          "publication message does not release the file lease",
+          "reservation must be released or expired before editing",
+          "recheck both tracker and git refs after the lease clears"
+        ]
+      },
+      "forbidden_actions": [
+        "treat_message_as_reservation_release",
+        "edit_before_lease_release",
+        "stage_unowned_closeout",
+        "claim_dependent_work_before_lease_release",
+        "force_release_fresh_reservation"
+      ],
+      "volatility": {
+        "level": 4,
+        "strategy": "scrub message ids, lease ids, timestamps, and shas while preserving release state booleans"
+      }
+    },
+    {
+      "scenario_id": "ownership-source-disagreement",
+      "title": "Beads owner, reservation holder, and dirty-path owner disagree",
+      "summary": "The router must classify conflicting ownership signals as do-not-touch until a human or explicit handoff resolves the mismatch.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "beads-owner",
+          "command_or_api": "br show <bead> --json",
+          "required_reason_codes": [
+            "beads.assignee_present",
+            "beads.owner_conflicts_with_reservation"
+          ],
+          "required_subjects": [
+            "[BEADS_OWNER]"
+          ]
+        },
+        {
+          "source_id": "reservation-holder",
+          "command_or_api": "file reservation snapshot",
+          "required_reason_codes": [
+            "reservation.owner_present",
+            "reservation.owner_conflicts_with_beads"
+          ],
+          "required_subjects": [
+            "[RESERVATION_HOLDER]"
+          ]
+        },
+        {
+          "source_id": "dirty-path-attribution",
+          "command_or_api": "git status --short --branch plus recent git/mail attribution",
+          "required_reason_codes": [
+            "git.dirty_paths_present",
+            "git.dirty_owner_inferred",
+            "git.dirty_owner_conflicts_with_tracker"
+          ],
+          "required_subjects": [
+            "[DIRTY_OWNER]"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "do_not_touch",
+        "recommended_safe_action": "fail_closed_request_targeted_handoff_or_pick_disjoint_work",
+        "confidence": "medium",
+        "explanation_must_include": [
+          "ownership sources disagree",
+          "do not choose a winner from conflicting metadata",
+          "targeted handoff or disjoint work is the only safe action"
+        ]
+      },
+      "forbidden_actions": [
+        "stage_conflicting_owner_paths",
+        "commit_conflicting_owner_closeout",
+        "claim_based_on_one_source_only",
+        "force_release_conflicting_owner",
+        "overwrite_dirty_path"
+      ],
+      "volatility": {
+        "level": 5,
+        "strategy": "structural golden over owner roles and conflict reason codes; scrub agent names unless role identity is the assertion"
+      }
+    },
+    {
+      "scenario_id": "local-closeout-publication-pending",
+      "title": "Local closeout exists while publication and mirror are pending",
+      "summary": "The router must wait when a Bead appears closed locally but the commit, origin/main push, or legacy mirror update has not made the closeout durable.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "beads-local-state",
+          "command_or_api": "br show <bead> --json",
+          "required_reason_codes": [
+            "beads.status_closed",
+            "beads.close_reason_present"
+          ],
+          "required_subjects": [
+            "<bead>"
+          ]
+        },
+        {
+          "source_id": "git-publication-gap",
+          "command_or_api": "git status --short -- .beads/issues.jsonl <owned paths> && git rev-parse HEAD origin/main refs/remotes/origin/<legacy-mirror>",
+          "required_reason_codes": [
+            "git.tracker_dirty",
+            "git.origin_main_missing_closeout",
+            "git.legacy_mirror_missing_closeout"
+          ],
+          "required_counters": {
+            "origin_main_contains_closeout": 0,
+            "legacy_mirror_contains_closeout": 0
+          }
+        },
+        {
+          "source_id": "reservation-after-closeout",
+          "command_or_api": "file reservation snapshot",
+          "required_reason_codes": [
+            "reservation.owner_present",
+            "reservation.release_state_unknown_or_active"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "do_not_touch",
+        "recommended_safe_action": "wait_for_commit_push_mirror_and_reservation_release",
+        "confidence": "high",
+        "explanation_must_include": [
+          "local closed state is not durable until committed and pushed",
+          "origin/main and legacy mirror must both contain the closeout",
+          "reservation release remains a separate gate"
+        ]
+      },
+      "forbidden_actions": [
+        "claim_dependent_work_before_publication",
+        "stage_another_agents_tracker_closeout",
+        "commit_another_agents_owned_paths",
+        "mirror_push_without_owner_context",
+        "ignore_active_reservation"
+      ],
+      "volatility": {
+        "level": 4,
+        "strategy": "scrub commit shas, refs, lease ids, and timestamps while preserving publication counters"
+      }
+    },
+    {
+      "scenario_id": "stale-owner-status-before-force-release",
+      "title": "Stale owner candidate requires status check before force-release review",
+      "summary": "The router may recommend a status check or operator review for stale ownership, but it must not force-release or reopen work based only on age.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "beads-stale-owner",
+          "command_or_api": "br list --status in_progress --json && br show <bead> --json",
+          "required_reason_codes": [
+            "beads.in_progress_present",
+            "beads.no_recent_update"
+          ],
+          "required_subjects": [
+            "<bead>",
+            "[OWNER_AGENT]"
+          ]
+        },
+        {
+          "source_id": "agent-mail-freshness",
+          "command_or_api": "search_messages(project_key, query=<bead-id>, ranking=recency)",
+          "required_reason_codes": [
+            "agent_mail.no_recent_owner_message_or_unavailable",
+            "agent_mail.status_check_not_yet_sent"
+          ]
+        },
+        {
+          "source_id": "git-owner-freshness",
+          "command_or_api": "git log --since=<window> --format=<agent-aware-format> -- <owned paths>",
+          "required_reason_codes": [
+            "git.no_recent_owner_commit"
+          ]
+        },
+        {
+          "source_id": "pane-state-optional",
+          "command_or_api": "ft robot state or swarm fallback snapshot",
+          "required_reason_codes": [
+            "pane.optional_liveness_signal",
+            "pane.idle_placeholder_not_stuck_evidence"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "stale_claim",
+        "recommended_safe_action": "send_status_check_then_prepare_operator_review_if_no_response",
+        "confidence": "medium",
+        "explanation_must_include": [
+          "elapsed time alone is not enough for force-release",
+          "status check must precede takeover review",
+          "optional pane state is context, not ownership proof"
+        ]
+      },
+      "forbidden_actions": [
+        "force_release_without_status_check",
+        "reopen_without_owner_evidence",
+        "edit_stale_owner_paths_before_handoff",
+        "treat_idle_placeholder_as_stuck",
+        "auto_reassign_active_work"
+      ],
+      "volatility": {
+        "level": 5,
+        "strategy": "structural golden over freshness classes and source counts; scrub times, pane ids, commit shas, and message ids"
+      }
     }
   ],
   "future_harness_requirements": {
@@ -477,7 +781,11 @@
       "dirty overlap recommends stashing, reverting, or staging another agent's work",
       "stale-claim detection force-releases without status-check evidence",
       "local closed tracker state is treated as durable before commit and remote publication",
-      "stale bv command hints are executed or trusted without br reconciliation"
+      "stale bv command hints are executed or trusted without br reconciliation",
+      "active exclusive reservations are treated as advisory rather than blocking overlap",
+      "publication messages are treated as reservation releases",
+      "conflicting Beads, reservation, and dirty-path owners are resolved by guessing a winner",
+      "force-release or reopen happens before a status check and operator review"
     ],
     "proof_policy": "RCH-only for Rust/e2e harness execution after code exists; static jq and diff checks are sufficient for this inventory."
   }
