@@ -1127,16 +1127,18 @@ $ ft robot --format json profile apply codex_ws --count 3
 
 ### Error handling
 
-Robot mode returns structured errors:
+Robot mode returns structured errors using the flat envelope shape (`error`, `error_code`, and `hint` are sibling top-level fields, not nested):
 
 ```json
 {
   "ok": false,
-  "error": {
-    "code": "robot.pane_not_found",
-    "message": "Pane 99 not found",
-    "hint": "Use 'ft robot state' to list available panes"
-  }
+  "error": "Pane 99 not found",
+  "error_code": "robot.pane_not_found",
+  "hint": "Use 'ft robot state' to list available panes",
+  "elapsed_ms": 1,
+  "version": "0.2.0",
+  "now": 1747371700000,
+  "schema_version": 1
 }
 ```
 
@@ -2106,27 +2108,33 @@ A release attestation bundle is a content-addressed, Sigstore-signed JSON file u
 
 ### Bundle structure
 
+Top-level shape per the live bundles under `docs/attestations/`:
+
 ```json
 {
-  "bundle_version": "1.0",
-  "release": "0.2.0",
-  "release_tag": "v0.2.0",
-  "release_commit": "<sha>",
-  "build_metadata": { "rustc": "...", "target": "...", "...": "..." },
+  "schema_version": "1.0.0",
+  "generated_at": "2026-05-17T03:47:27Z",
+  "generator": { "name": "...", "version": "..." },
+  "release":   { "channel": "...", "tag": "...", "version": "..." },
+  "git":       { "branch": "...", "commit": "<sha>", "tree": "..." },
   "required_categories": ["perf/headline-claims", "security/redactor-coverage", "..."],
-  "slots": [
+  "artifacts": [
     {
       "category": "perf/headline-claims",
-      "artifact_path": "docs/perf/headline-claims.json",
-      "artifact_sha256": "<64 hex>",
-      "artifact_size": 12345,
-      "producing_bead": "ft-syqcz.3",
-      "...": "..."
+      "description": "...",
+      "media_type": "application/json",
+      "path": "docs/perf/headline-claims.json",
+      "produced_by_bead": "ft-syqcz.3",
+      "proof_categories": ["..."],
+      "sha256": "<64 hex>",
+      "size_bytes": 12345
     }
   ],
-  "canonical_payload_sha256": "<64 hex>",
-  "sigstore_path": "<bundle>.sigstore",
-  "sigstore_sha256": "<64 hex>"
+  "confidence_summary":  { "best_confidence_by_category": {}, "records": [], "schema_path": "...", "schema_version": "..." },
+  "taxonomy_coverage":   { "below_threshold_count": 0, "category_counts": {}, "delta_from_prior_release": {}, "schema_version": "...", "taxonomy_path": "...", "uncategorized_artifact_count": 0 },
+  "deferred_slots":      [],
+  "retractions":         [],
+  "signature":           { "canonical_sha256": "<64 hex>", "method": "...", "reason": "..." }
 }
 ```
 
