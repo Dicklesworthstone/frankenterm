@@ -841,7 +841,9 @@ fn with_global_degradation_lock<T>(f: impl FnOnce() -> T) -> T {
     {
         static TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
         let lock = TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()));
-        let _guard = lock.lock().unwrap();
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f()
     }
     #[cfg(not(test))]
@@ -1302,6 +1304,22 @@ mod tests {
                 "{subsystem} should have affected capabilities"
             );
         }
+    }
+
+    #[test]
+    fn global_degradation_test_lock_recovers_after_poison() {
+        let result = std::panic::catch_unwind(|| {
+            with_global_degradation_lock(|| {
+                panic!("deliberately poisoning global degradation test lock");
+            });
+        });
+
+        assert!(result.is_err(), "panic should poison the test lock");
+        assert_eq!(
+            with_global_degradation_lock(|| 42),
+            42,
+            "subsequent global degradation calls must recover from poison"
+        );
     }
 
     #[test]
