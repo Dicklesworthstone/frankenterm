@@ -21,8 +21,8 @@ pub mod gui_debug_log {
     use chrono::{DateTime, Local};
     use log::Level;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     const CAPACITY: usize = 256;
 
@@ -42,6 +42,14 @@ pub mod gui_debug_log {
             Mutex::new(VecDeque::with_capacity(CAPACITY));
     }
 
+    fn lock_entries(_context: &str) -> MutexGuard<'static, VecDeque<GuiDebugLogEntry>> {
+        ENTRIES.lock().unwrap_or_else(|poisoned| {
+            // Avoid log::warn! here: this is the log sink and may re-enter ENTRIES.
+            ENTRIES.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
     pub fn record(level: Level, target: impl Into<String>, message: impl Into<String>) -> u64 {
         let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let entry = GuiDebugLogEntry {
@@ -52,7 +60,7 @@ pub mod gui_debug_log {
             message: message.into(),
         };
 
-        let mut entries = ENTRIES.lock().unwrap();
+        let mut entries = lock_entries("recording log entry");
         if entries.len() == CAPACITY {
             entries.pop_front();
         }
@@ -62,9 +70,7 @@ pub mod gui_debug_log {
 
     pub fn entries_after(sequence: Option<u64>) -> Vec<GuiDebugLogEntry> {
         let min_sequence = sequence.unwrap_or(0);
-        ENTRIES
-            .lock()
-            .unwrap()
+        lock_entries("reading log entries")
             .iter()
             .filter(|entry| entry.sequence > min_sequence)
             .cloned()
@@ -74,15 +80,26 @@ pub mod gui_debug_log {
     #[cfg(test)]
     fn reset_for_tests() {
         NEXT_SEQUENCE.store(1, Ordering::Relaxed);
-        ENTRIES.lock().unwrap().clear();
+        lock_entries("resetting test state").clear();
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        lazy_static::lazy_static! {
+            static ref TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        }
+
+        fn lock_test() -> std::sync::MutexGuard<'static, ()> {
+            TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
         #[test]
         fn entries_after_filters_by_sequence() {
+            let _guard = lock_test();
             reset_for_tests();
 
             let first = record(Level::Info, "test", "first");
@@ -96,6 +113,7 @@ pub mod gui_debug_log {
 
         #[test]
         fn entries_are_bounded_to_recent_capacity() {
+            let _guard = lock_test();
             reset_for_tests();
 
             for index in 0..(CAPACITY + 4) {
@@ -109,6 +127,25 @@ pub mod gui_debug_log {
                 entries[CAPACITY - 1].message,
                 format!("entry-{}", CAPACITY + 3)
             );
+        }
+
+        #[test]
+        fn entries_recover_after_poisoned_lock() {
+            let _guard = lock_test();
+            reset_for_tests();
+
+            let handle = std::thread::spawn(|| {
+                let _guard = ENTRIES.lock().unwrap();
+                panic!("simulate GUI debug log poison");
+            });
+
+            assert!(handle.join().is_err());
+
+            let sequence = record(Level::Error, "test", "after poison");
+            let entries = entries_after(None);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].sequence, sequence);
+            assert_eq!(entries[0].message, "after poison");
         }
     }
 }
