@@ -1314,11 +1314,21 @@ impl WaylandWindowInner {
                 self.emit_focus(mapper, false);
             }
             WlKeyboardEvent::Key { key, state, .. } => {
-                if let Some(event) = mapper.process_wayland_key(
-                    key,
-                    state.into_result().unwrap() == KeyState::Pressed,
-                    &mut self.events,
-                ) {
+                let pressed = match state.into_result() {
+                    Ok(KeyState::Pressed) => true,
+                    Ok(KeyState::Released) => false,
+                    Ok(key_state) => {
+                        log::warn!("Ignoring Wayland keyboard event with unsupported key state {key_state:?}");
+                        return;
+                    }
+                    Err(raw_state) => {
+                        log::warn!(
+                            "Ignoring Wayland keyboard event with unknown key state {raw_state:?}"
+                        );
+                        return;
+                    }
+                };
+                if let Some(event) = mapper.process_wayland_key(key, pressed, &mut self.events) {
                     let rep = Arc::new(Mutex::new(KeyRepeatState {
                         when: Instant::now(),
                         event,
