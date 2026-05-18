@@ -40,9 +40,10 @@ wezterm-term.workspace = true
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}
 
-# Uses workspace lints but allows unsafe_code for set_var/remove_var at startup.
+# Deny unsafe by default. Narrow exceptions live on audited helper functions in
+# src/main.rs and src/daemonize.rs so future unsafe expansion is visible.
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
 [lints.rust]
-unsafe_code = "allow"
+unsafe_code = "deny"
