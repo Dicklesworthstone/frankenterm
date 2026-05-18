@@ -67,3 +67,19 @@ They cover every reason-code family above using minimal retained command-output
 shapes. The static verifier
 `tests/e2e/test_rch_admission_contract.sh` checks that the schema enum, docs,
 fixtures, provenance row, and README E2E count remain synchronized.
+
+## Read-only Collector Substrate
+
+`crates/frankenterm-core/src/rch_admission.rs` provides the pure normalization
+layer for follow-on live wiring. It accepts already-collected observations for
+local disk, `/private/tmp`, Beads, Agent Mail, RCH queue state, worker
+rejections, Cargo job estimates, and dirty git paths, then emits the existing
+`ft.rch_admission.v1` report shape. Collector observations retain source
+command/API, freshness, and error-category metadata in citations so later
+doctor wiring can explain where evidence came from without expanding the stable
+schema.
+
+The core module intentionally does not shell out, write Beads state, probe Agent
+Mail databases, restart services, mutate RCH workers, cancel builds, run Cargo,
+or delete files. CLI and doctor collectors must perform their read-only probes
+outside this module and pass redacted facts into the normalizer.

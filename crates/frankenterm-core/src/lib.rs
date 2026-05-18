@@ -441,6 +441,7 @@ pub mod quota_gate;
 pub mod r_tree;
 pub mod rate_distortion;
 pub mod rate_limit_tracker;
+pub mod rch_admission;
 pub mod recorder_audit;
 pub mod recorder_export;
 pub mod recorder_invariants;
