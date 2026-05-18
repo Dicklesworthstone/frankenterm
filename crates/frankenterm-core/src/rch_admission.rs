@@ -362,6 +362,15 @@ where
             continue;
         }
 
+        if token.starts_with("--exclude=") {
+            i += 1;
+            continue;
+        }
+        if token == "--exclude" {
+            i += 2;
+            continue;
+        }
+
         if let Some(value) = token.strip_prefix("--package=") {
             push_nonempty_unique(&mut package_scope, value);
             i += 1;
@@ -1316,6 +1325,20 @@ mod tests {
                 .contains("installed_selector_estimated_slots=4")
         );
         assert!(analysis.explanation.contains("slot_estimate_mismatch=true"));
+    }
+
+    #[test]
+    fn cargo_command_analysis_does_not_treat_excluded_packages_as_test_filters() {
+        let analysis = analyze_rch_admission_cargo_command(
+            "cargo test --workspace --exclude frankenterm-core --exclude=frankenterm-gui rch_admission --all-targets",
+            std::iter::empty::<(&str, &str)>(),
+            Some(2),
+        );
+
+        assert_eq!(analysis.classification, "cargo_test");
+        assert!(analysis.package_scope.is_empty());
+        assert_eq!(analysis.test_scope, vec![String::from("rch_admission")]);
+        assert_eq!(analysis.effective_jobs, 2);
     }
 
     #[test]
