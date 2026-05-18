@@ -26,20 +26,18 @@ impl<'a> std::ops::Deref for BitmapRef<'a> {
 impl<'a> BitmapRef<'a> {
     pub fn with_image(image: &'a dyn BitmapImage) -> Self {
         let (width, height) = image.image_dimensions();
-        let byte_size = width * height * 4;
 
         // This is safe because BitmapRef<'a> borrows the
         // data from BitmapImage and the compiler will ensure
         // that the lifetime is maintained
-        let slice = unsafe {
-            let data = image.pixel_data();
-            std::slice::from_raw_parts(data, byte_size)
-        };
+        let slice = image.pixel_data_slice();
         // This is also safe for the same reason as above
         let provider = unsafe { CGDataProvider::from_slice(slice) };
 
         let should_interpolate = true;
-        let bytes_per_row = width * 4;
+        let bytes_per_row = width
+            .checked_mul(4)
+            .expect("image dimensions overflow bgra32 row byte length");
         let image = CGImage::new(
             width,
             height,

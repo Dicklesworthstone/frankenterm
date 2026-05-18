@@ -1020,13 +1020,14 @@ impl TerminalState {
                     _ => data,
                 };
 
+                let expected_rgba_len = u128::from(width) * u128::from(height) * 4;
                 anyhow::ensure!(
-                    width * height * 4 == data.len() as u32,
+                    expected_rgba_len == data.len() as u128,
                     "transmit data len is {} but it doesn't match width*height*4 {}x{}x4 = {}",
                     data.len(),
                     width,
                     height,
-                    width * height * 4
+                    expected_rgba_len
                 );
 
                 ImageDataType::new_single_frame(width, height, data)
