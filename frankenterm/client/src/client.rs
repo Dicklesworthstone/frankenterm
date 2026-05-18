@@ -513,6 +513,9 @@ pub fn unix_connect_with_retry(
     }
 
     let max_attempts = max_attempts.unwrap_or(10);
+    if max_attempts == 0 {
+        bail!("unix connection retry count must be greater than zero");
+    }
 
     for iter in 0..max_attempts {
         if iter > 0 {
@@ -527,8 +530,11 @@ pub fn unix_connect_with_retry(
                 }
             },
             UnixTarget::Proxy(argv) => {
-                let mut cmd = std::process::Command::new(&argv[0]);
-                cmd.args(&argv[1..]);
+                let (program, args) = argv
+                    .split_first()
+                    .ok_or_else(|| anyhow!("unix proxy command is empty"))?;
+                let mut cmd = std::process::Command::new(program);
+                cmd.args(args);
 
                 let (a, b) = filedescriptor::socketpair()?;
 
@@ -580,7 +586,7 @@ pub fn unix_connect_with_retry(
         }
     }
 
-    error.expect("only get here after at least one unix fail")
+    error.unwrap_or_else(|| Err(anyhow!("unix connection failed without recording a cause")))
 }
 
 #[async_trait(?Send)]
@@ -1023,9 +1029,12 @@ impl Reconnectable {
                 ui.output_str(&format!("Error: {}.  Will try spawning server.\n", e));
 
                 let argv = unix_dom.serve_command()?;
+                let (program, args) = argv
+                    .split_first()
+                    .ok_or_else(|| anyhow!("unix domain serve command is empty"))?;
 
-                let mut cmd = std::process::Command::new(&argv[0]);
-                cmd.args(&argv[1..]);
+                let mut cmd = std::process::Command::new(program);
+                cmd.args(args);
 
                 #[cfg(unix)]
                 if let Some(mask) = umask::UmaskSaver::saved_umask() {
@@ -2052,6 +2061,60 @@ mod tests {
         assert!(Reconnectable::should_retry_tls_bootstrap_after_reuse_error(
             &err
         ));
+    }
+
+    #[test]
+    fn unix_connect_with_retry_rejects_zero_attempts() {
+        let err = match unix_connect_with_retry(
+            &UnixTarget::Socket(PathBuf::from("/tmp/frankenterm-zero-attempts.sock")),
+            false,
+            Some(0),
+        ) {
+            Ok(_) => panic!("zero retry attempts should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("greater than zero"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unix_connect_with_retry_rejects_empty_proxy_command() {
+        let err = match unix_connect_with_retry(&UnixTarget::Proxy(Vec::new()), false, Some(1)) {
+            Ok(_) => panic!("empty proxy command should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("proxy command is empty"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unix_connect_rejects_empty_serve_command() {
+        let socket_path = PathBuf::from("/tmp/frankenterm-empty-serve-command.sock");
+        let unix_domain = UnixDomain {
+            name: "empty-serve-command".to_string(),
+            socket_path: Some(socket_path),
+            serve_command: Some(Vec::new()),
+            no_serve_automatically: false,
+            ..Default::default()
+        };
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(unix_domain.clone()), None);
+        let mut ui = ConnectionUI::new_headless();
+
+        let err = reconnectable
+            .unix_connect(unix_domain, true, &mut ui, false)
+            .expect_err("empty serve command should fail before spawning");
+
+        assert!(
+            err.to_string().contains("serve command is empty"),
+            "unexpected error: {err:#}"
+        );
     }
 
     fn unilateral(pdu: Pdu) -> DecodedPdu {
