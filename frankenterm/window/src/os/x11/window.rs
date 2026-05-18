@@ -163,8 +163,7 @@ impl Drop for XWindowInner {
     fn drop(&mut self) {
         if self.window_id != xcb::x::Window::none() {
             if let Some(conn) = self.conn.upgrade() {
-                self.conn()
-                    .conn()
+                conn.conn()
                     .flush()
                     .context("flush pending requests prior to issuing DestroyWindow")
                     .ok();
@@ -207,7 +206,7 @@ impl HasWindowHandle for XWindowInner {
 
 impl XWindowInner {
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
-        let conn = self.conn();
+        let conn = self.conn()?;
 
         let gl_state = match conn.gl_connection.borrow().as_ref() {
             None => crate::egl::GlState::create(
@@ -287,8 +286,8 @@ impl XWindowInner {
         self.cursors.set_cursor(self.window_id, cursor)
     }
 
-    fn check_dpi_and_synthesize_resize(&mut self) {
-        let conn = self.conn();
+    fn check_dpi_and_synthesize_resize(&mut self) -> anyhow::Result<()> {
+        let conn = self.conn()?;
         let dpi = conn.default_dpi();
 
         if dpi != self.dpi {
@@ -309,22 +308,24 @@ impl XWindowInner {
                 live_resizing: false,
             });
         }
+        Ok(())
     }
 
     fn queue_pending(&mut self, event: WindowEvent) {
         self.pending.push(event);
     }
 
-    fn resize_child(&self, width: u32, height: u32) {
-        self.conn()
-            .send_request_no_reply_log(&xcb::x::ConfigureWindow {
-                window: self.child_id,
-                value_list: &[
-                    xcb::x::ConfigWindow::Width(width),
-                    xcb::x::ConfigWindow::Height(height),
-                ],
-            });
+    fn resize_child(&self, width: u32, height: u32) -> anyhow::Result<()> {
+        let conn = self.conn()?;
+        conn.send_request_no_reply_log(&xcb::x::ConfigureWindow {
+            window: self.child_id,
+            value_list: &[
+                xcb::x::ConfigWindow::Width(width),
+                xcb::x::ConfigWindow::Height(height),
+            ],
+        });
         // send_request_no_reply_log() is synchronous, so no further synchronization required
+        Ok(())
     }
 
     pub fn dispatch_pending_events(&mut self) -> anyhow::Result<()> {
@@ -377,7 +378,7 @@ impl XWindowInner {
                     log::trace!("About to paint, but we're unsure about focus; querying!");
 
                     let focus = self
-                        .conn()
+                        .conn()?
                         .send_and_wait_request(&xcb::x::GetInputFocus {})?;
                     let focused = focus.focus() == self.window_id;
                     log::trace!(
@@ -402,7 +403,7 @@ impl XWindowInner {
                         self.window_id
                     );
                     let geom = self
-                        .conn()
+                        .conn()?
                         .send_and_wait_request(&xcb::x::GetGeometry {
                             drawable: xcb::x::Drawable::Window(self.window_id),
                         })
@@ -421,7 +422,7 @@ impl XWindowInner {
                         || self.height != geom.height()
                         || self.last_wm_state != window_state
                     {
-                        self.resize_child(geom.width() as u32, geom.height() as u32);
+                        self.resize_child(geom.width() as u32, geom.height() as u32)?;
 
                         self.width = geom.width();
                         self.height = geom.height();
@@ -501,7 +502,7 @@ impl XWindowInner {
     }
 
     fn configure_notify(&mut self, source: &str, width: u16, height: u16) -> anyhow::Result<()> {
-        let conn = self.conn();
+        let conn = self.conn()?;
 
         self.update_ime_position();
 
@@ -553,7 +554,7 @@ impl XWindowInner {
             return Ok(());
         }
 
-        self.resize_child(width as u32, height as u32);
+        self.resize_child(width as u32, height as u32)?;
 
         log::trace!(
             "{source}: width {} -> {}, height {} -> {}, dpi {} -> {}",
@@ -588,7 +589,7 @@ impl XWindowInner {
 
     fn xdnd_event(&mut self, msgtype: Atom, data: &[u32]) -> anyhow::Result<()> {
         use xcb::XidNew;
-        let conn = self.conn();
+        let conn = self.conn()?;
         let msgtype_name = conn.atom_name(msgtype);
         let srcwin = xcb::x::Window::new(data[0]);
         if msgtype == conn.atom_xdndenter {
@@ -713,7 +714,7 @@ impl XWindowInner {
     }
 
     pub fn dispatch_event(&mut self, event: &Event) -> anyhow::Result<()> {
-        let conn = self.conn();
+        let conn = self.conn()?;
         match event {
             Event::X(xcb::x::Event::Expose(expose)) => {
                 self.expose(
@@ -843,7 +844,7 @@ impl XWindowInner {
                     // the dpi.  We use this as a way to detect dpi changes
                     // when running under gnome.
                     conn.update_xrm();
-                    self.check_dpi_and_synthesize_resize();
+                    self.check_dpi_and_synthesize_resize()?;
                     let appearance = conn.get_appearance();
                     self.appearance_changed(appearance);
                 }
@@ -925,7 +926,7 @@ impl XWindowInner {
     /// that and vice versa.
     fn update_selection_owner(&mut self, clipboard: Clipboard) -> anyhow::Result<()> {
         let window_id = self.window_id;
-        let conn = self.conn();
+        let conn = self.conn()?;
         let selection = match clipboard {
             Clipboard::PrimarySelection => xcb::x::ATOM_PRIMARY,
             Clipboard::Clipboard => conn.atom_clipboard,
@@ -972,10 +973,13 @@ impl XWindowInner {
     fn selection_atom_to_clipboard(&self, atom: Atom) -> Option<Clipboard> {
         if atom == xcb::x::ATOM_PRIMARY {
             Some(Clipboard::PrimarySelection)
-        } else if atom == self.conn().atom_clipboard {
-            Some(Clipboard::Clipboard)
         } else {
-            None
+            let conn = self.conn_or_log("mapping selection atom")?;
+            if atom == conn.atom_clipboard {
+                Some(Clipboard::Clipboard)
+            } else {
+                None
+            }
         }
     }
 
@@ -994,7 +998,7 @@ impl XWindowInner {
     /// A selection request is made to us after we've announced that we own the selection
     /// and when another client wants to copy it.
     fn selection_request(&mut self, request: &xcb::x::SelectionRequestEvent) -> anyhow::Result<()> {
-        let conn = self.conn();
+        let conn = self.conn()?;
         let window_id = self.window_id;
         log::trace!("SEL: window_id={window_id:?} {:?}", request);
         log::trace!(
@@ -1072,7 +1076,7 @@ impl XWindowInner {
     }
 
     fn selection_notify(&mut self, selection: &xcb::x::SelectionNotifyEvent) -> anyhow::Result<()> {
-        let conn = self.conn();
+        let conn = self.conn()?;
         let window_id = self.window_id;
         let selection_name = conn.atom_name(selection.selection());
         let target_name = conn.atom_name(selection.target());
@@ -1208,7 +1212,7 @@ impl XWindowInner {
     }
 
     fn get_window_state(&self) -> anyhow::Result<WindowState> {
-        let conn = self.conn();
+        let conn = self.conn()?;
 
         let reply = conn.send_and_wait_request(&xcb::x::GetProperty {
             delete: false,
@@ -1243,7 +1247,7 @@ impl XWindowInner {
         atom: Atom,
         atom2: Option<Atom>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn();
+        let conn = self.conn()?;
         let data: [u32; 5] = [
             action as u32,
             atom.resource_id(),
@@ -1271,17 +1275,19 @@ impl XWindowInner {
     }
 
     fn set_maximized_hint(&mut self, enable: bool) -> anyhow::Result<()> {
+        let conn = self.conn()?;
         self.set_wm_state(
             NetWmStateAction::with_bool(enable),
-            self.conn().atom_state_maximized_vert,
-            Some(self.conn().atom_state_maximized_horz),
+            conn.atom_state_maximized_vert,
+            Some(conn.atom_state_maximized_horz),
         )
     }
 
     fn set_fullscreen_hint(&mut self, enable: bool) -> anyhow::Result<()> {
+        let conn = self.conn()?;
         self.set_wm_state(
             NetWmStateAction::with_bool(enable),
-            self.conn().atom_state_fullscreen,
+            conn.atom_state_fullscreen,
             None,
         )
     }
@@ -1331,7 +1337,7 @@ impl XWindowInner {
             status: 0,
         };
 
-        let conn = self.conn();
+        let conn = self.conn()?;
 
         let hints_slice =
             unsafe { std::slice::from_raw_parts(&hints as *const _ as *const u32, 5) };
@@ -1346,8 +1352,23 @@ impl XWindowInner {
         Ok(())
     }
 
-    fn conn(&self) -> Rc<XConnection> {
-        self.conn.upgrade().expect("XConnection to be alive")
+    fn conn(&self) -> anyhow::Result<Rc<XConnection>> {
+        self.conn.upgrade().ok_or_else(|| {
+            anyhow!(
+                "X11 connection is unavailable for window {:?}",
+                self.window_id
+            )
+        })
+    }
+
+    fn conn_or_log(&self, action: &str) -> Option<Rc<XConnection>> {
+        match self.conn() {
+            Ok(conn) => Some(conn),
+            Err(err) => {
+                log::debug!("skip {action} for {:?}: {err:#}", self.window_id);
+                None
+            }
+        }
     }
 }
 
@@ -1607,7 +1628,9 @@ impl XWindow {
 
 impl XWindowInner {
     fn close(&mut self) {
-        let conn = self.conn();
+        let Some(conn) = self.conn_or_log("closing X11 window") else {
+            return;
+        };
         conn.flush()
             .context("flush pending requests prior to issuing DestroyWindow")
             .ok();
@@ -1615,11 +1638,8 @@ impl XWindowInner {
         // requires that it is able to make_current() in its
         // Drop impl, and that cannot succeed after we've
         // destroyed the window at the X11 level.
-        self.conn().windows.borrow_mut().remove(&self.window_id);
-        self.conn()
-            .child_to_parent_id
-            .borrow_mut()
-            .remove(&self.child_id);
+        conn.windows.borrow_mut().remove(&self.window_id);
+        conn.child_to_parent_id.borrow_mut().remove(&self.child_id);
 
         // Unmap the window first: calling DestroyWindow here may race
         // with some requests made either by EGL or the IME, but I haven't
@@ -1658,13 +1678,18 @@ impl XWindowInner {
     }
     fn hide(&mut self) {}
     fn show(&mut self) {
-        self.conn().send_request_no_reply_log(&xcb::x::MapWindow {
+        let Some(conn) = self.conn_or_log("showing X11 window") else {
+            return;
+        };
+        conn.send_request_no_reply_log(&xcb::x::MapWindow {
             window: self.window_id,
         });
     }
 
     fn focus(&mut self) {
-        let conn = self.conn();
+        let Some(conn) = self.conn_or_log("focusing X11 window") else {
+            return;
+        };
         conn.send_request_no_reply_log(&xcb::x::SendEvent {
             propagate: true,
             destination: xcb::x::SendEventDest::Window(conn.root),
@@ -1732,7 +1757,9 @@ impl XWindowInner {
 
     fn net_wm_moveresize(&mut self, x_root: u32, y_root: u32, direction: u32, button: u32) {
         let source_indication = 1;
-        let conn = self.conn();
+        let Some(conn) = self.conn_or_log("sending X11 _NET_WM_MOVERESIZE") else {
+            return;
+        };
 
         if !conn
             .supported
@@ -1801,7 +1828,9 @@ impl XWindowInner {
         // Note that neither this technique or the configure_window
         // approach below will successfully move a window running
         // under the crostini environment on a chromebook :-(
-        let conn = self.conn();
+        let Some(conn) = self.conn_or_log("setting X11 window position") else {
+            return;
+        };
 
         conn.send_request_no_reply_log(&xcb::x::SendEvent {
             propagate: true,
@@ -1833,7 +1862,9 @@ impl XWindowInner {
         }
         self.title = title.to_string();
 
-        let conn = self.conn();
+        let Some(conn) = self.conn_or_log("setting X11 window title") else {
+            return;
+        };
 
         conn.send_request_no_reply_log(&xcb::x::ChangeProperty {
             mode: PropMode::Replace,
@@ -1866,7 +1897,10 @@ impl XWindowInner {
         if !self.has_focus.unwrap_or(false) {
             return;
         }
-        self.conn().ime.borrow_mut().update_pos(
+        let Some(conn) = self.conn_or_log("updating X11 IME position") else {
+            return;
+        };
+        conn.ime.borrow_mut().update_pos(
             self.window_id,
             self.last_cursor_position.min_x() as i16,
             self.last_cursor_position.max_y() as i16,
@@ -1874,6 +1908,9 @@ impl XWindowInner {
     }
 
     fn set_icon(&mut self, image: &dyn BitmapImage) {
+        let Some(conn) = self.conn_or_log("setting X11 window icon") else {
+            return;
+        };
         let (width, height) = image.image_dimensions();
 
         // https://specifications.freedesktop.org/wm-spec/wm-spec-1.3.html#idm44927025355360
@@ -1890,14 +1927,13 @@ impl XWindowInner {
             icon_data.push(u32::from_be_bytes([a, r, g, b]));
         }
 
-        self.conn()
-            .send_request_no_reply_log(&xcb::x::ChangeProperty {
-                mode: PropMode::Replace,
-                window: self.window_id,
-                property: self.conn().atom_net_wm_icon,
-                r#type: xcb::x::ATOM_CARDINAL,
-                data: &icon_data,
-            });
+        conn.send_request_no_reply_log(&xcb::x::ChangeProperty {
+            mode: PropMode::Replace,
+            window: self.window_id,
+            property: conn.atom_net_wm_icon,
+            r#type: xcb::x::ATOM_CARDINAL,
+            data: &icon_data,
+        });
     }
 
     fn set_resize_increments(&mut self, incr: ResizeIncrement) -> anyhow::Result<()> {
@@ -1932,13 +1968,14 @@ impl XWindowInner {
             )
         };
 
-        self.conn().send_request_no_reply(&xcb::x::ChangeProperty {
-            mode: PropMode::Replace,
-            window: self.window_id,
-            property: xcb::x::ATOM_WM_NORMAL_HINTS,
-            r#type: xcb::x::ATOM_WM_SIZE_HINTS,
-            data,
-        })?;
+        self.conn()?
+            .send_request_no_reply(&xcb::x::ChangeProperty {
+                mode: PropMode::Replace,
+                window: self.window_id,
+                property: xcb::x::ATOM_WM_NORMAL_HINTS,
+                r#type: xcb::x::ATOM_WM_SIZE_HINTS,
+                data,
+            })?;
 
         Ok(())
     }
@@ -2086,7 +2123,7 @@ impl WindowOps for XWindow {
     fn set_inner_size(&self, width: usize, height: usize) {
         XConnection::with_window_inner(self.0, move |inner| {
             inner
-                .conn()
+                .conn()?
                 .send_request_no_reply_log(&xcb::x::ConfigureWindow {
                     window: inner.window_id,
                     value_list: &[
@@ -2094,7 +2131,7 @@ impl WindowOps for XWindow {
                         xcb::x::ConfigWindow::Height(height as u32),
                     ],
                 });
-            inner.resize_child(width as u32, height as u32);
+            inner.resize_child(width as u32, height as u32)?;
             inner.outstanding_configure_requests += 1;
             Ok(())
         });
@@ -2174,7 +2211,7 @@ impl WindowOps for XWindow {
                 inner.copy_and_paste.time
             );
             inner.copy_and_paste.request_mut(clipboard).replace(promise);
-            let conn = inner.conn();
+            let conn = inner.conn()?;
             // Find the owner and ask them to send us the buffer
             conn.send_request_no_reply_log(&xcb::x::ConvertSelection {
                 requestor: inner.window_id,
