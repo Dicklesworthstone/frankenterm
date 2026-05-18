@@ -1125,15 +1125,15 @@ impl InputSerial {
 
 impl From<std::time::SystemTime> for InputSerial {
     fn from(val: std::time::SystemTime) -> Self {
-        let duration = val
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .expect("SystemTime before unix epoch?");
-        let millis: u64 = duration
-            .as_millis()
-            .try_into()
-            .expect("millisecond count to fit in u64");
-        InputSerial(millis)
+        match val.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+            Ok(duration) => input_serial_from_epoch_duration(duration),
+            Err(_) => InputSerial::empty(),
+        }
     }
+}
+
+fn input_serial_from_epoch_duration(duration: std::time::Duration) -> InputSerial {
+    InputSerial(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -1993,6 +1993,24 @@ mod test {
         let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(12345);
         let serial: InputSerial = time.into();
         assert_eq!(format!("{:?}", serial), "InputSerial(12345)");
+    }
+
+    #[test]
+    fn input_serial_from_pre_epoch_system_time_saturates_to_empty() {
+        let time = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_millis(1);
+        let serial: InputSerial = time.into();
+        assert_eq!(serial, InputSerial::empty());
+    }
+
+    #[test]
+    fn input_serial_from_epoch_duration_saturates_on_u64_overflow() {
+        let overflowing = std::time::Duration::from_millis(u64::MAX)
+            .checked_add(std::time::Duration::from_millis(1))
+            .expect("duration addition should fit");
+        assert_eq!(
+            input_serial_from_epoch_duration(overflowing),
+            InputSerial(u64::MAX)
+        );
     }
 
     #[test]
