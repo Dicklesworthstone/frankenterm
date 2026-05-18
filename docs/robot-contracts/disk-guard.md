@@ -1,6 +1,6 @@
 # Robot Family Contract: `disk-guard`
 
-**Beads:** `ft-fyk4x.1`, `ft-fyk4x.2`
+**Beads:** `ft-fyk4x.1`, `ft-fyk4x.2`, `ft-fyk4x.3`
 **Status:** core collector normalizer shipped under
 `crates/frankenterm-core/src/disk_guard.rs`; no runtime CLI command is shipped by
 this document.
@@ -54,6 +54,32 @@ normal tracker updates by the agent performing the work.
 
 Cleanup candidates are advisory evidence only. They must be separated from
 automatic behavior and require explicit operator approval outside this contract.
+
+## Preflight Surfaces
+
+`preflight_results` is an optional surface-specific decision array. It lets an
+agent ask the normalizer whether a concrete write path should proceed before
+the agent starts work that can otherwise fail half-applied.
+
+Supported surfaces:
+
+- `patch_application`: checks shared-checkout patch application before `git
+  apply` or equivalent patch writes;
+- `static_verifier_creation`: checks whether bounded static verifier artifacts
+  can be created locally or must be retained on external scratch;
+- `beads_comment_export`: checks Beads DB plus JSONL export writeability before
+  comment/export work; and
+- `rch_proof_lane`: checks whether local disk and RCH cache state permit a
+  material remote-required proof attempt, independent of final worker
+  selection.
+
+Every result records `surface`, `action`, `write_allowed`,
+`external_scratch_required`, `blocking_probe_ids`, reason codes, and the next
+safe action. The result fails closed: missing, unknown, unavailable, failed, or
+blocked precondition probes become explicit blockers. The static verifier
+surface is the only surface that may return `external_scratch_only`; patch
+application, Beads writes, and RCH proof lanes must not treat external scratch as
+a substitute for the shared checkout or required local cache/write probes.
 
 ## Cleanup Inventory Candidates
 
@@ -121,6 +147,7 @@ Fixtures live under `fixtures/disk-guard/`:
 - `manifest.json`
 - `valid/current-eno-space.json`
 - `valid/cleanup-inventory.json`
+- `valid/preflight-surfaces.json`
 - `valid/healthy.json`
 - `valid/warning-low-space.json`
 - `valid/fatal-write-probe-failed.json`

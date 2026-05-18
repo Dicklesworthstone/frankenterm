@@ -7,6 +7,7 @@
   "valid": [
     "fixtures/disk-guard/valid/current-eno-space.json",
     "fixtures/disk-guard/valid/cleanup-inventory.json",
+    "fixtures/disk-guard/valid/preflight-surfaces.json",
     "fixtures/disk-guard/valid/healthy.json",
     "fixtures/disk-guard/valid/warning-low-space.json",
     "fixtures/disk-guard/valid/fatal-write-probe-failed.json"

@@ -235,6 +235,52 @@ pub enum DiskGuardLiveUseState {
     NotChecked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskGuardPreflightSurface {
+    PatchApplication,
+    StaticVerifierCreation,
+    BeadsCommentExport,
+    RchProofLane,
+}
+
+impl DiskGuardPreflightSurface {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PatchApplication => "patch_application",
+            Self::StaticVerifierCreation => "static_verifier_creation",
+            Self::BeadsCommentExport => "beads_comment_export",
+            Self::RchProofLane => "rch_proof_lane",
+        }
+    }
+
+    #[must_use]
+    pub fn reason_prefix(self) -> String {
+        format!("preflight.{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskGuardPreflightAction {
+    Allow,
+    StaticOnly,
+    ExternalScratchOnly,
+    Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskGuardPreflightResult {
+    pub surface: DiskGuardPreflightSurface,
+    pub action: DiskGuardPreflightAction,
+    pub write_allowed: bool,
+    pub external_scratch_required: bool,
+    pub blocking_probe_ids: Vec<DiskGuardProbeId>,
+    pub reason_codes: Vec<String>,
+    pub next_safe_action: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskGuardCleanupCandidateInput {
     pub path: String,
@@ -518,6 +564,7 @@ pub struct DiskGuardCollectorInput {
     pub guard_id: String,
     pub workspace_root: String,
     pub probes: Vec<DiskGuardProbe>,
+    pub preflight_surfaces: Vec<DiskGuardPreflightSurface>,
     pub cleanup_candidates: Vec<DiskGuardCleanupCandidateInput>,
     pub artifact_paths: Vec<String>,
 }
@@ -534,6 +581,7 @@ impl DiskGuardCollectorInput {
             guard_id: nonempty_string(guard_id, "disk_guard.unknown"),
             workspace_root: nonempty_string(workspace_root, "unknown"),
             probes: Vec::new(),
+            preflight_surfaces: Vec::new(),
             cleanup_candidates: Vec::new(),
             artifact_paths: Vec::new(),
         }
@@ -542,6 +590,14 @@ impl DiskGuardCollectorInput {
     #[must_use]
     pub fn with_probe(mut self, probe: DiskGuardProbe) -> Self {
         self.probes.push(probe);
+        self
+    }
+
+    #[must_use]
+    pub fn with_preflight_surface(mut self, surface: DiskGuardPreflightSurface) -> Self {
+        if !self.preflight_surfaces.contains(&surface) {
+            self.preflight_surfaces.push(surface);
+        }
         self
     }
 
@@ -570,6 +626,8 @@ pub struct DiskGuardReport {
     pub probes: Vec<DiskGuardProbe>,
     pub reason_codes: Vec<String>,
     pub artifact_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preflight_results: Vec<DiskGuardPreflightResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_candidates: Vec<DiskGuardCleanupCandidate>,
 }
@@ -660,6 +718,14 @@ pub fn build_disk_guard_report(input: &DiskGuardCollectorInput) -> DiskGuardRepo
     reason_codes.insert("policy.cleanup_requires_operator_approval".to_string());
 
     let decision = classify_decision(&probes, missing_required || duplicate_probe);
+    let preflight_results =
+        evaluate_preflight_results(&probes, decision, &input.preflight_surfaces);
+    for result in &preflight_results {
+        for reason_code in &result.reason_codes {
+            reason_codes.insert(reason_code.clone());
+        }
+    }
+
     match decision {
         DiskGuardDecision::Proceed => {
             reason_codes.insert("disk.guard.healthy".to_string());
@@ -689,8 +755,383 @@ pub fn build_disk_guard_report(input: &DiskGuardCollectorInput) -> DiskGuardRepo
         probes,
         reason_codes: reason_codes.into_iter().collect(),
         artifact_paths,
+        preflight_results,
         cleanup_candidates,
     }
+}
+
+fn evaluate_preflight_results(
+    probes: &[DiskGuardProbe],
+    decision: DiskGuardDecision,
+    requested_surfaces: &[DiskGuardPreflightSurface],
+) -> Vec<DiskGuardPreflightResult> {
+    let mut seen = BTreeSet::new();
+    let mut results = Vec::new();
+
+    for surface in requested_surfaces {
+        if seen.insert(*surface) {
+            results.push(evaluate_preflight_surface(probes, decision, *surface));
+        }
+    }
+
+    results
+}
+
+fn evaluate_preflight_surface(
+    probes: &[DiskGuardProbe],
+    decision: DiskGuardDecision,
+    surface: DiskGuardPreflightSurface,
+) -> DiskGuardPreflightResult {
+    match surface {
+        DiskGuardPreflightSurface::PatchApplication => {
+            evaluate_patch_application_preflight(probes, decision)
+        }
+        DiskGuardPreflightSurface::StaticVerifierCreation => {
+            evaluate_static_verifier_preflight(probes, decision)
+        }
+        DiskGuardPreflightSurface::BeadsCommentExport => {
+            evaluate_beads_comment_export_preflight(probes)
+        }
+        DiskGuardPreflightSurface::RchProofLane => {
+            evaluate_rch_proof_lane_preflight(probes, decision)
+        }
+    }
+}
+
+fn preflight_state(
+    surface: DiskGuardPreflightSurface,
+) -> (String, BTreeSet<DiskGuardProbeId>, BTreeSet<String>) {
+    let prefix = surface.reason_prefix();
+    let reason_codes = BTreeSet::from([format!("{prefix}.evaluated")]);
+    (prefix, BTreeSet::new(), reason_codes)
+}
+
+fn evaluate_patch_application_preflight(
+    probes: &[DiskGuardProbe],
+    decision: DiskGuardDecision,
+) -> DiskGuardPreflightResult {
+    let surface = DiskGuardPreflightSurface::PatchApplication;
+    let (prefix, mut blocking_probe_ids, mut reason_codes) = preflight_state(surface);
+    add_blocking_probes(
+        probes,
+        &mut blocking_probe_ids,
+        [
+            DiskGuardProbeId::SystemDataVolume,
+            DiskGuardProbeId::PrivateTmp,
+            DiskGuardProbeId::RepoWriteProbe,
+        ],
+        preflight_probe_blocks,
+    );
+    if decision != DiskGuardDecision::Proceed {
+        add_blocking_probes(
+            probes,
+            &mut blocking_probe_ids,
+            DiskGuardProbeId::required(),
+            preflight_probe_degrades_or_blocks,
+        );
+        reason_codes.insert(format!("{prefix}.decision_not_proceed"));
+    }
+
+    if blocking_probe_ids.is_empty() {
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::Allow,
+            true,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "Patch application may proceed in the shared checkout within owned paths.",
+        )
+    } else {
+        add_blocking_reason_codes(&mut reason_codes, &blocking_probe_ids, &prefix);
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::Block,
+            false,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "Do not apply git patches in the shared checkout until the blocking write preconditions recover.",
+        )
+    }
+}
+
+fn evaluate_static_verifier_preflight(
+    probes: &[DiskGuardProbe],
+    decision: DiskGuardDecision,
+) -> DiskGuardPreflightResult {
+    let surface = DiskGuardPreflightSurface::StaticVerifierCreation;
+    let (prefix, mut blocking_probe_ids, mut reason_codes) = preflight_state(surface);
+    let external_scratch_available = probe_passes(probes, DiskGuardProbeId::ExternalScratch, true);
+    add_blocking_probes(
+        probes,
+        &mut blocking_probe_ids,
+        [
+            DiskGuardProbeId::SystemDataVolume,
+            DiskGuardProbeId::PrivateTmp,
+            DiskGuardProbeId::RepoWriteProbe,
+        ],
+        preflight_probe_blocks,
+    );
+
+    if blocking_probe_ids.is_empty() {
+        match decision {
+            DiskGuardDecision::Proceed => preflight_result(
+                surface,
+                DiskGuardPreflightAction::Allow,
+                true,
+                false,
+                blocking_probe_ids,
+                reason_codes,
+                "Static verifier creation may use the normal workspace proof surface.",
+            ),
+            DiskGuardDecision::StaticOnly => {
+                reason_codes.insert(format!("{prefix}.static_only"));
+                preflight_result(
+                    surface,
+                    DiskGuardPreflightAction::StaticOnly,
+                    true,
+                    false,
+                    blocking_probe_ids,
+                    reason_codes,
+                    "Create only bounded static verifier artifacts and defer material proof lanes.",
+                )
+            }
+            DiskGuardDecision::ExternalScratchOnly if external_scratch_available => {
+                reason_codes.insert(format!("{prefix}.external_scratch_required"));
+                preflight_result(
+                    surface,
+                    DiskGuardPreflightAction::ExternalScratchOnly,
+                    false,
+                    true,
+                    blocking_probe_ids,
+                    reason_codes,
+                    "Create static verifier artifacts only on retained external scratch; do not write them in the shared checkout.",
+                )
+            }
+            _ => {
+                reason_codes.insert(format!("{prefix}.decision_not_safe"));
+                preflight_result(
+                    surface,
+                    DiskGuardPreflightAction::Block,
+                    false,
+                    false,
+                    blocking_probe_ids,
+                    reason_codes,
+                    "Do not create verifier artifacts until disk guard evidence reaches a static-only or healthier envelope.",
+                )
+            }
+        }
+    } else if external_scratch_available {
+        add_blocking_reason_codes(&mut reason_codes, &blocking_probe_ids, &prefix);
+        reason_codes.insert(format!("{prefix}.external_scratch_required"));
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::ExternalScratchOnly,
+            false,
+            true,
+            blocking_probe_ids,
+            reason_codes,
+            "Create static verifier artifacts only on retained external scratch; do not write them in the shared checkout.",
+        )
+    } else {
+        add_blocking_reason_codes(&mut reason_codes, &blocking_probe_ids, &prefix);
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::Block,
+            false,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "Do not create verifier artifacts until local write preconditions or external scratch recover.",
+        )
+    }
+}
+
+fn evaluate_beads_comment_export_preflight(probes: &[DiskGuardProbe]) -> DiskGuardPreflightResult {
+    let surface = DiskGuardPreflightSurface::BeadsCommentExport;
+    let (prefix, mut blocking_probe_ids, mut reason_codes) = preflight_state(surface);
+    add_blocking_probes(
+        probes,
+        &mut blocking_probe_ids,
+        [
+            DiskGuardProbeId::SystemDataVolume,
+            DiskGuardProbeId::PrivateTmp,
+            DiskGuardProbeId::BeadsDbWriteability,
+            DiskGuardProbeId::BeadsJsonlExportability,
+        ],
+        preflight_probe_blocks,
+    );
+
+    let beads_degraded = !blocking_probe_ids.contains(&DiskGuardProbeId::BeadsDbWriteability)
+        && !blocking_probe_ids.contains(&DiskGuardProbeId::BeadsJsonlExportability)
+        && [
+            DiskGuardProbeId::BeadsDbWriteability,
+            DiskGuardProbeId::BeadsJsonlExportability,
+        ]
+        .iter()
+        .any(|probe_id| probe_is_degraded(probes, *probe_id));
+
+    if blocking_probe_ids.is_empty() && !beads_degraded {
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::Allow,
+            true,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "Beads comment and JSONL export work may proceed under normal coordination.",
+        )
+    } else if blocking_probe_ids.is_empty() {
+        reason_codes.insert(format!("{prefix}.beads_degraded"));
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::StaticOnly,
+            false,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "Use a read-only Beads snapshot or external handoff until DB and JSONL export probes are green.",
+        )
+    } else {
+        add_blocking_reason_codes(&mut reason_codes, &blocking_probe_ids, &prefix);
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::Block,
+            false,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "Do not write Beads comments or export JSONL until the listed Beads and local-space probes recover.",
+        )
+    }
+}
+
+fn evaluate_rch_proof_lane_preflight(
+    probes: &[DiskGuardProbe],
+    decision: DiskGuardDecision,
+) -> DiskGuardPreflightResult {
+    let surface = DiskGuardPreflightSurface::RchProofLane;
+    let (prefix, mut blocking_probe_ids, mut reason_codes) = preflight_state(surface);
+    add_blocking_probes(
+        probes,
+        &mut blocking_probe_ids,
+        [
+            DiskGuardProbeId::SystemDataVolume,
+            DiskGuardProbeId::PrivateTmp,
+            DiskGuardProbeId::RchCacheWriteability,
+        ],
+        preflight_probe_degrades_or_blocks,
+    );
+    if decision != DiskGuardDecision::Proceed {
+        add_blocking_probes(
+            probes,
+            &mut blocking_probe_ids,
+            DiskGuardProbeId::required(),
+            preflight_probe_degrades_or_blocks,
+        );
+        reason_codes.insert(format!("{prefix}.decision_not_proceed"));
+    }
+
+    if blocking_probe_ids.is_empty() {
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::Allow,
+            true,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "RCH proof lanes may be admitted when worker selection also passes.",
+        )
+    } else {
+        add_blocking_reason_codes(&mut reason_codes, &blocking_probe_ids, &prefix);
+        preflight_result(
+            surface,
+            DiskGuardPreflightAction::Block,
+            false,
+            false,
+            blocking_probe_ids,
+            reason_codes,
+            "Do not launch material RCH proof lanes until the listed probes return to green.",
+        )
+    }
+}
+
+fn preflight_result(
+    surface: DiskGuardPreflightSurface,
+    action: DiskGuardPreflightAction,
+    write_allowed: bool,
+    external_scratch_required: bool,
+    blocking_probe_ids: BTreeSet<DiskGuardProbeId>,
+    reason_codes: BTreeSet<String>,
+    next_safe_action: impl Into<String>,
+) -> DiskGuardPreflightResult {
+    DiskGuardPreflightResult {
+        surface,
+        action,
+        write_allowed,
+        external_scratch_required,
+        blocking_probe_ids: blocking_probe_ids.into_iter().collect(),
+        reason_codes: reason_codes.into_iter().collect(),
+        next_safe_action: nonempty_string(next_safe_action, "Re-run disk guard preflight."),
+    }
+}
+
+fn add_blocking_probes<const N: usize>(
+    probes: &[DiskGuardProbe],
+    blocking_probe_ids: &mut BTreeSet<DiskGuardProbeId>,
+    probe_ids: [DiskGuardProbeId; N],
+    predicate: fn(&DiskGuardProbe) -> bool,
+) {
+    for probe_id in probe_ids {
+        if let Some(probe) = probes.iter().find(|probe| probe.probe_id == probe_id) {
+            if predicate(probe) {
+                blocking_probe_ids.insert(probe_id);
+            }
+        } else {
+            blocking_probe_ids.insert(probe_id);
+        }
+    }
+}
+
+fn add_blocking_reason_codes(
+    reason_codes: &mut BTreeSet<String>,
+    blocking_probe_ids: &BTreeSet<DiskGuardProbeId>,
+    prefix: &str,
+) {
+    for probe_id in blocking_probe_ids {
+        reason_codes.insert(format!("{prefix}.blocked_by.{}", probe_id.as_str()));
+    }
+}
+
+fn preflight_probe_blocks(probe: &DiskGuardProbe) -> bool {
+    probe.state.is_hard_failure()
+        || probe.state.is_evidence_gap()
+        || probe.severity.is_hard_failure()
+        || probe.severity == DiskGuardSeverity::Unknown
+}
+
+fn preflight_probe_degrades_or_blocks(probe: &DiskGuardProbe) -> bool {
+    preflight_probe_blocks(probe) || probe.state.is_degraded() || probe.severity.is_degraded()
+}
+
+fn probe_passes(probes: &[DiskGuardProbe], probe_id: DiskGuardProbeId, allow_yellow: bool) -> bool {
+    probes.iter().any(|probe| {
+        probe.probe_id == probe_id
+            && probe.state == DiskGuardProbeState::Pass
+            && matches!(
+                (allow_yellow, probe.severity),
+                (_, DiskGuardSeverity::Green) | (true, DiskGuardSeverity::Yellow)
+            )
+    })
+}
+
+fn probe_is_degraded(probes: &[DiskGuardProbe], probe_id: DiskGuardProbeId) -> bool {
+    probes.iter().any(|probe| {
+        probe.probe_id == probe_id
+            && !preflight_probe_blocks(probe)
+            && (probe.state.is_degraded() || probe.severity.is_degraded())
+    })
 }
 
 fn classify_decision(probes: &[DiskGuardProbe], required_evidence_gap: bool) -> DiskGuardDecision {
@@ -1485,6 +1926,174 @@ mod tests {
             candidate
                 .reason_codes
                 .contains(&"cleanup_candidate.live_reference".to_string())
+        );
+    }
+
+    #[test]
+    fn patch_application_preflight_blocks_repo_write_failure() {
+        let mut input =
+            healthy_input().with_preflight_surface(DiskGuardPreflightSurface::PatchApplication);
+        input
+            .probes
+            .retain(|probe| probe.probe_id != DiskGuardProbeId::RepoWriteProbe);
+        input = input.with_probe(
+            DiskGuardProbe::status_probe(
+                DiskGuardProbeId::RepoWriteProbe,
+                "fixture",
+                NOW_MS,
+                DiskGuardProbeState::Fail,
+                DiskGuardSeverity::Black,
+                "bounded write probe failed",
+                "write_probe.repo.failed",
+                "Do not apply patches in the shared checkout.",
+            )
+            .with_error_category("eno_space"),
+        );
+
+        let report = build_disk_guard_report(&input);
+        let result = report
+            .preflight_results
+            .first()
+            .expect("preflight result is emitted");
+
+        assert_eq!(result.surface, DiskGuardPreflightSurface::PatchApplication);
+        assert_eq!(result.action, DiskGuardPreflightAction::Block);
+        assert!(!result.write_allowed);
+        assert!(
+            result
+                .blocking_probe_ids
+                .contains(&DiskGuardProbeId::RepoWriteProbe)
+        );
+        assert!(
+            result
+                .reason_codes
+                .contains(&"preflight.patch_application.blocked_by.repo_write_probe".to_string())
+        );
+    }
+
+    #[test]
+    fn static_verifier_preflight_uses_external_scratch_for_local_enospc() {
+        let mut input = healthy_input()
+            .with_preflight_surface(DiskGuardPreflightSurface::StaticVerifierCreation);
+        input.probes.retain(|probe| {
+            !matches!(
+                probe.probe_id,
+                DiskGuardProbeId::SystemDataVolume | DiskGuardProbeId::PrivateTmp
+            )
+        });
+        input = input
+            .with_probe(DiskGuardProbe::filesystem_sample(
+                DiskGuardProbeId::SystemDataVolume,
+                "fixture",
+                NOW_MS,
+                "/System/Volumes/Data",
+                279_506_944,
+                1_995_218_165_760,
+                1_073_741_824,
+            ))
+            .with_probe(DiskGuardProbe::filesystem_sample(
+                DiskGuardProbeId::PrivateTmp,
+                "fixture",
+                NOW_MS,
+                "/private/tmp",
+                279_506_944,
+                1_995_218_165_760,
+                1_073_741_824,
+            ));
+
+        let report = build_disk_guard_report(&input);
+        let result = report
+            .preflight_results
+            .first()
+            .expect("preflight result is emitted");
+
+        assert_eq!(report.decision, DiskGuardDecision::ExternalScratchOnly);
+        assert_eq!(result.action, DiskGuardPreflightAction::ExternalScratchOnly);
+        assert!(!result.write_allowed);
+        assert!(result.external_scratch_required);
+        assert!(
+            result
+                .blocking_probe_ids
+                .contains(&DiskGuardProbeId::SystemDataVolume)
+        );
+        assert!(
+            result.reason_codes.contains(
+                &"preflight.static_verifier_creation.external_scratch_required".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn beads_comment_export_preflight_blocks_jsonl_failure() {
+        let mut input =
+            healthy_input().with_preflight_surface(DiskGuardPreflightSurface::BeadsCommentExport);
+        input
+            .probes
+            .retain(|probe| probe.probe_id != DiskGuardProbeId::BeadsJsonlExportability);
+        input = input.with_probe(DiskGuardProbe::status_probe(
+            DiskGuardProbeId::BeadsJsonlExportability,
+            "fixture",
+            NOW_MS,
+            DiskGuardProbeState::Blocked,
+            DiskGuardSeverity::Black,
+            "JSONL export failed with ENOSPC",
+            "beads.jsonl.export_blocked",
+            "Record handoff externally until JSONL export recovers.",
+        ));
+
+        let report = build_disk_guard_report(&input);
+        let result = report
+            .preflight_results
+            .first()
+            .expect("preflight result is emitted");
+
+        assert_eq!(result.action, DiskGuardPreflightAction::Block);
+        assert!(!result.write_allowed);
+        assert!(
+            result
+                .blocking_probe_ids
+                .contains(&DiskGuardProbeId::BeadsJsonlExportability)
+        );
+        assert!(result.reason_codes.contains(
+            &"preflight.beads_comment_export.blocked_by.beads_jsonl_exportability".to_string()
+        ));
+    }
+
+    #[test]
+    fn rch_proof_preflight_blocks_degraded_cache() {
+        let mut input =
+            healthy_input().with_preflight_surface(DiskGuardPreflightSurface::RchProofLane);
+        input
+            .probes
+            .retain(|probe| probe.probe_id != DiskGuardProbeId::RchCacheWriteability);
+        input = input.with_probe(DiskGuardProbe::status_probe(
+            DiskGuardProbeId::RchCacheWriteability,
+            "fixture",
+            NOW_MS,
+            DiskGuardProbeState::Degraded,
+            DiskGuardSeverity::Red,
+            "RCH cache is reachable but degraded",
+            "rch.cache.degraded",
+            "Do not launch material RCH proof lanes until the cache probe recovers.",
+        ));
+
+        let report = build_disk_guard_report(&input);
+        let result = report
+            .preflight_results
+            .first()
+            .expect("preflight result is emitted");
+
+        assert_eq!(result.action, DiskGuardPreflightAction::Block);
+        assert!(!result.write_allowed);
+        assert!(
+            result
+                .blocking_probe_ids
+                .contains(&DiskGuardProbeId::RchCacheWriteability)
+        );
+        assert!(
+            result.reason_codes.contains(
+                &"preflight.rch_proof_lane.blocked_by.rch_cache_writeability".to_string()
+            )
         );
     }
 
