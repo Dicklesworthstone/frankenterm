@@ -42,19 +42,33 @@ impl EnvEntry {
 }
 
 #[cfg(unix)]
-fn get_shell() -> String {
-    use nix::unistd::{access, AccessFlags};
+fn passwd_field_to_string(field: *const libc::c_char, field_name: &str) -> anyhow::Result<String> {
     use std::ffi::CStr;
     use std::str;
 
+    anyhow::ensure!(
+        !field.is_null(),
+        "passwd database {field_name} field was null"
+    );
+
+    let field = unsafe { CStr::from_ptr(field) };
+    field
+        .to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("passwd database {field_name} field was not valid utf-8"))
+}
+
+#[cfg(unix)]
+fn get_shell() -> String {
+    use nix::unistd::{access, AccessFlags};
+
     let ent = unsafe { libc::getpwuid(libc::getuid()) };
     if !ent.is_null() {
-        let shell = unsafe { CStr::from_ptr((*ent).pw_shell) };
-        match shell.to_str().map(str::to_owned) {
+        let shell = unsafe { (*ent).pw_shell };
+        match passwd_field_to_string(shell, "shell") {
             Err(err) => {
                 log::warn!(
-                    "passwd database shell could not be \
-                     represented as utf-8: {err:#}, \
+                    "passwd database shell could not be resolved: {err:#}, \
                      falling back to /bin/sh"
                 );
             }
@@ -969,12 +983,8 @@ impl CommandBuilder {
         if ent.is_null() {
             Ok("/".into())
         } else {
-            use std::ffi::CStr;
-            use std::str;
-            let home = unsafe { CStr::from_ptr((*ent).pw_dir) };
-            home.to_str()
-                .map(str::to_owned)
-                .context("failed to resolve home dir")
+            let home = unsafe { (*ent).pw_dir };
+            passwd_field_to_string(home, "home directory").context("failed to resolve home dir")
         }
     }
 }
@@ -1434,6 +1444,23 @@ mod tests {
         assert!(!shell.is_empty());
         // Should be an absolute path on unix
         assert!(shell.starts_with('/'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passwd_field_to_string_rejects_null_pointer() {
+        let err = passwd_field_to_string(std::ptr::null(), "shell").unwrap_err();
+        assert!(err.to_string().contains("shell field was null"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passwd_field_to_string_decodes_valid_pointer() {
+        let field = std::ffi::CString::new("/bin/sh").unwrap();
+        assert_eq!(
+            passwd_field_to_string(field.as_ptr(), "shell").unwrap(),
+            "/bin/sh"
+        );
     }
 
     // ── Second-pass expansion ────────────────────────────────────
