@@ -492,11 +492,10 @@ impl WindowOps for WaylandWindow {
         let future = promise.get_future().unwrap();
         let promise = Arc::new(Mutex::new(promise));
         let window_future = WaylandConnection::with_window_inner(self.0, move |inner| {
-            let read = inner
-                .copy_and_paste
-                .lock()
-                .unwrap()
-                .get_clipboard_data(clipboard)?;
+            let read = match inner.copy_and_paste.lock() {
+                Ok(mut copy_and_paste) => copy_and_paste.get_clipboard_data(clipboard)?,
+                Err(_) => bail!("Wayland copy-and-paste lock was poisoned while reading clipboard"),
+            };
             let promise_for_thread = Arc::clone(&promise);
             let spawn_result = std::thread::Builder::new()
                 .name("wayland-clipboard-read".to_string())
@@ -536,11 +535,12 @@ impl WindowOps for WaylandWindow {
 
     fn set_clipboard(&self, clipboard: Clipboard, text: String) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
-            inner
-                .copy_and_paste
-                .lock()
-                .unwrap()
-                .set_clipboard_data(clipboard, text);
+            match inner.copy_and_paste.lock() {
+                Ok(mut copy_and_paste) => copy_and_paste.set_clipboard_data(clipboard, text),
+                Err(_) => {
+                    log::error!("Wayland copy-and-paste lock was poisoned while setting clipboard");
+                }
+            }
             Ok(())
         });
     }

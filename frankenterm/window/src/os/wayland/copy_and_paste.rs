@@ -34,7 +34,10 @@ impl CopyAndPaste {
     }
 
     pub(super) fn get_clipboard_data(&mut self, clipboard: Clipboard) -> anyhow::Result<ReadPipe> {
-        let conn = crate::Connection::get().unwrap().wayland();
+        let Some(conn) = crate::Connection::get() else {
+            bail!("Wayland connection is unavailable while reading clipboard");
+        };
+        let conn = conn.wayland();
         let wayland_state = conn.wayland_state.borrow();
         let primary_selection = if let Clipboard::PrimarySelection = clipboard {
             wayland_state.primary_selection_device.as_ref()
@@ -63,7 +66,11 @@ impl CopyAndPaste {
     }
 
     pub(super) fn set_clipboard_data(&mut self, clipboard: Clipboard, data: String) {
-        let conn = crate::Connection::get().unwrap().wayland();
+        let Some(conn) = crate::Connection::get() else {
+            log::warn!("Wayland connection is unavailable while setting clipboard");
+            return;
+        };
+        let conn = conn.wayland();
         let qh = conn.event_queue.borrow().handle();
         let mut wayland_state = conn.wayland_state.borrow_mut();
         let last_serial = *wayland_state.last_serial.borrow();
@@ -76,7 +83,12 @@ impl CopyAndPaste {
 
         match primary_selection {
             Some(primary_selection) => {
-                let manager = wayland_state.primary_selection_manager.as_ref().unwrap();
+                let Some(manager) = wayland_state.primary_selection_manager.as_ref() else {
+                    log::warn!(
+                        "Wayland primary selection device is present without a selection manager"
+                    );
+                    return;
+                };
                 let source = manager.create_selection_source(&qh, [TEXT_MIME_TYPE]);
                 source.set_selection(&primary_selection, last_serial);
                 wayland_state
@@ -84,11 +96,14 @@ impl CopyAndPaste {
                     .replace((source, data));
             }
             None => {
-                let data_device = &wayland_state.data_device;
+                let Some(data_device) = wayland_state.data_device.as_ref() else {
+                    log::warn!("Wayland data device is unavailable while setting clipboard");
+                    return;
+                };
                 let source = wayland_state
                     .data_device_manager_state
                     .create_copy_paste_source(&qh, vec![TEXT_MIME_TYPE]);
-                source.set_selection(data_device.as_ref().unwrap(), last_serial);
+                source.set_selection(data_device, last_serial);
                 wayland_state.copy_paste_source.replace((source, data));
             }
         }
