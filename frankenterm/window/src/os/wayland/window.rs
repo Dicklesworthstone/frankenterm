@@ -96,7 +96,13 @@ impl KeyRepeatState {
             let delay;
             let gap;
             {
-                let conn = WaylandConnection::get().unwrap().wayland();
+                let Some(conn) = WaylandConnection::get() else {
+                    log::debug!(
+                        "Stopping Wayland key repeat: connection unavailable while reading repeat settings"
+                    );
+                    return;
+                };
+                let conn = conn.wayland();
                 let (rate, ddelay) = {
                     let wstate = conn.wayland_state.borrow();
                     (
@@ -116,7 +122,13 @@ impl KeyRepeatState {
             loop {
                 {
                     let handle = {
-                        let conn = WaylandConnection::get().unwrap().wayland();
+                        let Some(conn) = WaylandConnection::get() else {
+                            log::debug!(
+                                "Stopping Wayland key repeat for window {window_id}: connection unavailable"
+                            );
+                            return;
+                        };
+                        let conn = conn.wayland();
                         match conn.window_by_id(window_id) {
                             Some(handle) => handle,
                             None => return,
@@ -133,7 +145,16 @@ impl KeyRepeatState {
                         return;
                     }
 
-                    let mut st = state.lock().unwrap();
+                    let mut st = match state.lock() {
+                        Ok(st) => st,
+                        Err(_) => {
+                            log::warn!(
+                                "Stopping Wayland key repeat for window {window_id}: repeat state lock was poisoned"
+                            );
+                            inner.key_repeat.take();
+                            return;
+                        }
+                    };
 
                     let mut repeat_count = 1;
 
