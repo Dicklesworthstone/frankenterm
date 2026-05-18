@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 // ============================================================================
 // Override action
@@ -1291,6 +1291,21 @@ struct ApplicatorInner {
     substitutions: Vec<SubstitutionRecord>,
 }
 
+fn lock_or_recover<'a, T>(
+    mutex: &'a Mutex<T>,
+    lock_name: &'static str,
+    context: &'static str,
+) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            lock_name = lock_name,
+            context = context,
+            "recovering poisoned replay counterfactual mutex"
+        );
+        poisoned.into_inner()
+    })
+}
+
 /// The result of looking up an override for a rule ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupResult {
@@ -1390,13 +1405,13 @@ impl OverrideApplicator {
     /// Get all substitution records.
     #[must_use]
     pub fn substitutions(&self) -> Vec<SubstitutionRecord> {
-        self.inner.lock().unwrap().substitutions.clone()
+        self.lock_inner("substitutions").substitutions.clone()
     }
 
     /// Number of substitutions applied.
     #[must_use]
     pub fn substitution_count(&self) -> usize {
-        self.inner.lock().unwrap().substitutions.len()
+        self.lock_inner("substitution_count").substitutions.len()
     }
 
     fn record_substitution(
@@ -1407,7 +1422,7 @@ impl OverrideApplicator {
         original_hash: Option<&str>,
         override_hash: Option<&str>,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner("record_substitution");
         inner.substitutions.push(SubstitutionRecord {
             item_id: item_id.to_string(),
             category: category.to_string(),
@@ -1415,6 +1430,10 @@ impl OverrideApplicator {
             original_hash: original_hash.map(String::from),
             override_hash: override_hash.map(String::from),
         });
+    }
+
+    fn lock_inner(&self, context: &'static str) -> MutexGuard<'_, ApplicatorInner> {
+        lock_or_recover(&self.inner, "override_applicator", context)
     }
 
     fn apply_pattern_override(
@@ -1926,6 +1945,28 @@ new_definition = "def"
         assert_eq!(subs[0].category, "pattern");
         assert_eq!(subs[0].action, OverrideAction::Replace);
         assert_eq!(subs[0].original_hash.as_deref(), Some("orig_h"));
+    }
+
+    #[test]
+    fn applicator_recovers_after_poisoned_inner_lock() {
+        let pkg = OverridePackageLoader::load(sample_toml()).unwrap();
+        let app = OverrideApplicator::new(&pkg);
+
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = app.inner.lock().unwrap();
+                panic!("poison override applicator");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        assert!(app.inner.is_poisoned());
+        let result = app.lookup_pattern("rate_limit_api", Some("orig_h"));
+        assert_eq!(result, LookupResult::Replace("threshold = 100".to_string()));
+        assert_eq!(app.substitution_count(), 1);
+        let substitutions = app.substitutions();
+        assert_eq!(substitutions[0].item_id, "rate_limit_api");
+        assert_eq!(substitutions[0].original_hash.as_deref(), Some("orig_h"));
     }
 
     // ── Serde roundtrips ────────────────────────────────────────────────
