@@ -17,7 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use frankenterm_core::policy::ActionKind;
 
@@ -121,6 +121,21 @@ struct SideEffectLogInner {
     entries: Vec<SideEffectEntry>,
 }
 
+fn lock_or_recover<'a, T>(
+    mutex: &'a Mutex<T>,
+    lock_name: &'static str,
+    context: &'static str,
+) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            lock_name = lock_name,
+            context = context,
+            "recovering poisoned replay side-effect barrier mutex"
+        );
+        poisoned.into_inner()
+    })
+}
+
 impl Default for SideEffectLog {
     fn default() -> Self {
         Self::new()
@@ -136,9 +151,13 @@ impl SideEffectLog {
         }
     }
 
+    fn lock_inner(&self, context: &'static str) -> MutexGuard<'_, SideEffectLogInner> {
+        lock_or_recover(&self.inner, "side_effect_log", context)
+    }
+
     /// Record a side-effect entry.
     pub fn record(&self, mut entry: SideEffectEntry) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner("record");
         entry.index = inner.entries.len();
         inner.entries.push(entry);
     }
@@ -146,27 +165,25 @@ impl SideEffectLog {
     /// Number of recorded entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().entries.len()
+        self.lock_inner("len").entries.len()
     }
 
     /// True if no entries have been recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().entries.is_empty()
+        self.lock_inner("is_empty").entries.is_empty()
     }
 
     /// Return all entries (snapshot).
     #[must_use]
     pub fn entries(&self) -> Vec<SideEffectEntry> {
-        self.inner.lock().unwrap().entries.clone()
+        self.lock_inner("entries").entries.clone()
     }
 
     /// Return entries of a specific effect type.
     #[must_use]
     pub fn effects_of_type(&self, effect_type: EffectType) -> Vec<SideEffectEntry> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_inner("effects_of_type")
             .entries
             .iter()
             .filter(|e| e.effect_type == effect_type)
@@ -177,9 +194,7 @@ impl SideEffectLog {
     /// Return entries targeting a specific pane.
     #[must_use]
     pub fn effects_for_pane(&self, pane_id: u64) -> Vec<SideEffectEntry> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_inner("effects_for_pane")
             .entries
             .iter()
             .filter(|e| e.pane_id == Some(pane_id))
@@ -190,7 +205,7 @@ impl SideEffectLog {
     /// Serialize the log to JSON.
     #[must_use]
     pub fn to_json(&self) -> String {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner("to_json");
         serde_json::to_string(&inner.entries).unwrap_or_else(|_| "[]".to_string())
     }
 
@@ -204,7 +219,7 @@ impl SideEffectLog {
 
     /// Clear all entries.
     pub fn clear(&self) {
-        self.inner.lock().unwrap().entries.clear();
+        self.lock_inner("clear").entries.clear();
     }
 }
 
@@ -468,7 +483,15 @@ impl CounterfactualBarrier {
     /// Number of overrides that have been applied.
     #[must_use]
     pub fn overrides_applied(&self) -> usize {
-        *self.override_count.lock().unwrap()
+        *self.lock_override_count("overrides_applied")
+    }
+
+    fn lock_override_count(&self, context: &'static str) -> MutexGuard<'_, usize> {
+        lock_or_recover(
+            &self.override_count,
+            "counterfactual_override_count",
+            context,
+        )
     }
 }
 
@@ -501,7 +524,7 @@ impl SideEffectBarrier for CounterfactualBarrier {
                 metadata,
             });
 
-            *self.override_count.lock().unwrap() += 1;
+            *self.lock_override_count("process") += 1;
 
             EffectOutcome {
                 executed: false,
@@ -574,6 +597,19 @@ mod tests {
             pane_id,
             payload: payload.to_string(),
             caller: "test::caller".to_string(),
+            action_kind: ActionKind::SendText,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_entry(payload_summary: &str) -> SideEffectEntry {
+        SideEffectEntry {
+            index: 0,
+            timestamp_ms: 100,
+            effect_type: EffectType::SendKeys,
+            pane_id: Some(7),
+            payload_summary: payload_summary.to_string(),
+            caller_hint: "test".to_string(),
             action_kind: ActionKind::SendText,
             metadata: HashMap::new(),
         }
@@ -732,6 +768,32 @@ mod tests {
             metadata: HashMap::new(),
         });
         assert_eq!(log.len(), 1);
+        log.clear();
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn side_effect_log_recovers_after_poisoned_inner_lock() {
+        let log = SideEffectLog::new();
+        let poisoner = log.clone();
+
+        let poison_result = std::thread::spawn(move || {
+            let _guard = poisoner.inner.lock().unwrap();
+            panic!("poison side-effect log");
+        })
+        .join();
+
+        assert!(poison_result.is_err());
+        assert!(log.inner.is_poisoned());
+
+        log.record(make_entry("after-poison"));
+        assert_eq!(log.len(), 1);
+        assert!(!log.is_empty());
+        assert_eq!(log.entries()[0].payload_summary, "after-poison");
+        assert_eq!(log.effects_of_type(EffectType::SendKeys).len(), 1);
+        assert_eq!(log.effects_for_pane(7).len(), 1);
+        assert!(log.to_json().contains("after-poison"));
+
         log.clear();
         assert!(log.is_empty());
     }
@@ -1045,6 +1107,34 @@ mod tests {
             entry.metadata.get("override_applied").unwrap(),
             "test provenance"
         );
+    }
+
+    #[test]
+    fn counterfactual_override_count_recovers_after_poisoned_lock() {
+        let rule = OverrideRule {
+            effect_type: EffectType::SendKeys,
+            pane_id: Some(1),
+            payload_contains: None,
+            replacement_payload: "recovered".to_string(),
+            description: "poison recovery".to_string(),
+        };
+        let barrier = CounterfactualBarrier::new(vec![rule]);
+
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = barrier.override_count.lock().unwrap();
+                panic!("poison override count");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        assert!(barrier.override_count.is_poisoned());
+
+        let req = make_request(EffectType::SendKeys, Some(1), "original");
+        let outcome = barrier.process(&req);
+
+        assert!(outcome.overridden);
+        assert_eq!(barrier.overrides_applied(), 1);
     }
 
     #[test]
