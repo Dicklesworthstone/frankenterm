@@ -257,7 +257,16 @@ if (( ready == 0 )); then
     exit 2
 fi
 
-PANE_ID="$(jq -r '.data.panes[0].pane_id // empty' "$ARTIFACT_DIR/robot_state_probe.json")"
+PANE_ID=""
+for _ in $(seq 1 30); do
+    "$FT_BIN" robot --format json state >"$ARTIFACT_DIR/robot_state_pane_probe.json" 2>/dev/null || true
+    PANE_ID="$(jq -r 'if (.data | type) == "array" then (.data[0].pane_id // empty) else (.data.panes[0].pane_id // empty) end' "$ARTIFACT_DIR/robot_state_pane_probe.json" 2>/dev/null || true)"
+    if [[ -n "$PANE_ID" ]]; then
+        break
+    fi
+    sleep 0.5
+done
+
 if [[ -z "$PANE_ID" ]]; then
     mark_infra_fail "No active pane available for load-test seed data"
     exit 2

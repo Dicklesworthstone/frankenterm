@@ -258,7 +258,7 @@ if ! jq -e '.ok == true' "${STATE_JSON}" >/dev/null; then
     "ft robot state returned ok=false"
 fi
 
-PANE_ID="${FT_DOGFOOD_PANE_ID:-$(jq -r '.data.panes[0].pane_id // empty' "${STATE_JSON}")}"
+PANE_ID="${FT_DOGFOOD_PANE_ID:-$(jq -r 'if (.data | type) == "array" then (.data[0].pane_id // empty) else (.data.panes[0].pane_id // empty) end' "${STATE_JSON}")}"
 if [[ -z "${PANE_ID}" ]]; then
   fail_now \
     "live_capture" \

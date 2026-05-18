@@ -251,7 +251,7 @@ log_phase "setup" "pass" "Watcher readiness probe passed" 0
 PANE_ID=""
 for _ in $(seq 1 30); do
     "$FT_BIN" robot --format json state >"$ARTIFACT_DIR/robot_state_pane_probe.json" 2>/dev/null || true
-    PANE_ID="$(jq -r '.data.panes[0].pane_id // empty' "$ARTIFACT_DIR/robot_state_pane_probe.json" 2>/dev/null || true)"
+    PANE_ID="$(jq -r 'if (.data | type) == "array" then (.data[0].pane_id // empty) else (.data.panes[0].pane_id // empty) end' "$ARTIFACT_DIR/robot_state_pane_probe.json" 2>/dev/null || true)"
     if [[ -n "$PANE_ID" ]]; then
         break
     fi
