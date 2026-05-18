@@ -1133,7 +1133,7 @@ impl From<std::time::SystemTime> for InputSerial {
 }
 
 fn input_serial_from_epoch_duration(duration: std::time::Duration) -> InputSerial {
-    InputSerial(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+    InputSerial(duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
