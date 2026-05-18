@@ -63,6 +63,12 @@
     },
     "artifact_paths": {
       "$ref": "#/$defs/paths"
+    },
+    "cleanup_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/cleanup_candidate"
+      }
     }
   },
   "$defs": {
@@ -108,6 +114,7 @@
               "bounded_write_probe",
               "read_status",
               "read_retained_artifact",
+              "read_cleanup_inventory",
               "not_collected"
             ]
           }
@@ -213,6 +220,103 @@
         "error_category": {
           "type": "string",
           "minLength": 1
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/paths"
+        },
+        "next_safe_action": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "cleanup_candidate": {
+      "type": "object",
+      "required": [
+        "path",
+        "project",
+        "kind",
+        "risk_tier",
+        "operator_approval_required",
+        "automatic_cleanup_allowed",
+        "size_bytes",
+        "live_use",
+        "reason_codes",
+        "next_safe_action"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "cargo_target",
+            "cargo_home_registry",
+            "rch_cargo_home",
+            "rch_target",
+            "project_cache",
+            "temp_proof_artifact",
+            "unknown"
+          ]
+        },
+        "risk_tier": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "protected",
+            "unknown"
+          ]
+        },
+        "operator_approval_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "automatic_cleanup_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "modified_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "age_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "has_cachedir_tag": {
+          "type": "boolean"
+        },
+        "lsof_reference_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "process_reference_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "live_use": {
+          "type": "string",
+          "enum": [
+            "not_referenced",
+            "referenced",
+            "not_checked"
+          ]
         },
         "reason_codes": {
           "$ref": "#/$defs/reason_codes"

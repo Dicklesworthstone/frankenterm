@@ -160,6 +160,7 @@ pub enum DiskGuardPerformedAction {
     BoundedWriteProbe,
     ReadStatus,
     ReadRetainedArtifact,
+    ReadCleanupInventory,
     NotCollected,
 }
 
@@ -202,6 +203,127 @@ pub struct DiskGuardSideEffectPolicy {
     pub cleanup_requires_operator_approval: bool,
     pub performed_actions: Vec<DiskGuardPerformedAction>,
     pub forbidden_actions: Vec<DiskGuardForbiddenAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskGuardCleanupKind {
+    CargoTarget,
+    CargoHomeRegistry,
+    RchCargoHome,
+    RchTarget,
+    ProjectCache,
+    TempProofArtifact,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskGuardCleanupRiskTier {
+    Low,
+    Medium,
+    High,
+    Protected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskGuardLiveUseState {
+    NotReferenced,
+    Referenced,
+    NotChecked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskGuardCleanupCandidateInput {
+    pub path: String,
+    pub project: String,
+    pub kind: DiskGuardCleanupKind,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<u64>,
+    pub has_cachedir_tag: Option<bool>,
+    pub lsof_reference_count: Option<u32>,
+    pub process_reference_count: Option<u32>,
+    pub artifact_paths: Vec<String>,
+}
+
+impl DiskGuardCleanupCandidateInput {
+    #[must_use]
+    pub fn new(
+        path: impl Into<String>,
+        project: impl Into<String>,
+        kind: DiskGuardCleanupKind,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            path: nonempty_string(path, "unknown"),
+            project: nonempty_string(project, "unknown"),
+            kind,
+            size_bytes,
+            modified_at_ms: None,
+            has_cachedir_tag: None,
+            lsof_reference_count: None,
+            process_reference_count: None,
+            artifact_paths: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_modified_at_ms(mut self, modified_at_ms: u64) -> Self {
+        self.modified_at_ms = Some(modified_at_ms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cachedir_tag(mut self, has_cachedir_tag: bool) -> Self {
+        self.has_cachedir_tag = Some(has_cachedir_tag);
+        self
+    }
+
+    #[must_use]
+    pub fn with_lsof_reference_count(mut self, reference_count: u32) -> Self {
+        self.lsof_reference_count = Some(reference_count);
+        self
+    }
+
+    #[must_use]
+    pub fn with_process_reference_count(mut self, reference_count: u32) -> Self {
+        self.process_reference_count = Some(reference_count);
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact_path(mut self, artifact_path: impl Into<String>) -> Self {
+        push_nonempty_unique(&mut self.artifact_paths, artifact_path);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskGuardCleanupCandidate {
+    pub path: String,
+    pub project: String,
+    pub kind: DiskGuardCleanupKind,
+    pub risk_tier: DiskGuardCleanupRiskTier,
+    pub operator_approval_required: bool,
+    pub automatic_cleanup_allowed: bool,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_cachedir_tag: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lsof_reference_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_reference_count: Option<u32>,
+    pub live_use: DiskGuardLiveUseState,
+    pub reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_paths: Vec<String>,
+    pub next_safe_action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +518,7 @@ pub struct DiskGuardCollectorInput {
     pub guard_id: String,
     pub workspace_root: String,
     pub probes: Vec<DiskGuardProbe>,
+    pub cleanup_candidates: Vec<DiskGuardCleanupCandidateInput>,
     pub artifact_paths: Vec<String>,
 }
 
@@ -411,6 +534,7 @@ impl DiskGuardCollectorInput {
             guard_id: nonempty_string(guard_id, "disk_guard.unknown"),
             workspace_root: nonempty_string(workspace_root, "unknown"),
             probes: Vec::new(),
+            cleanup_candidates: Vec::new(),
             artifact_paths: Vec::new(),
         }
     }
@@ -418,6 +542,12 @@ impl DiskGuardCollectorInput {
     #[must_use]
     pub fn with_probe(mut self, probe: DiskGuardProbe) -> Self {
         self.probes.push(probe);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cleanup_candidate(mut self, candidate: DiskGuardCleanupCandidateInput) -> Self {
+        self.cleanup_candidates.push(candidate);
         self
     }
 
@@ -440,6 +570,8 @@ pub struct DiskGuardReport {
     pub probes: Vec<DiskGuardProbe>,
     pub reason_codes: Vec<String>,
     pub artifact_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_candidates: Vec<DiskGuardCleanupCandidate>,
 }
 
 #[must_use]
@@ -478,6 +610,20 @@ pub fn build_disk_guard_report(input: &DiskGuardCollectorInput) -> DiskGuardRepo
     let mut reason_codes = BTreeSet::new();
     let mut artifact_paths = input.artifact_paths.clone();
     let mut duplicate_probe = false;
+    let cleanup_candidates = input
+        .cleanup_candidates
+        .iter()
+        .map(|candidate| classify_cleanup_candidate(candidate, input.generated_at_ms))
+        .collect::<Vec<_>>();
+
+    for candidate in &cleanup_candidates {
+        for reason_code in &candidate.reason_codes {
+            reason_codes.insert(reason_code.clone());
+        }
+        for artifact_path in &candidate.artifact_paths {
+            push_nonempty_unique(&mut artifact_paths, artifact_path.clone());
+        }
+    }
 
     for probe in &input.probes {
         if probe_by_id.insert(probe.probe_id, probe.clone()).is_some() {
@@ -539,10 +685,11 @@ pub fn build_disk_guard_report(input: &DiskGuardCollectorInput) -> DiskGuardRepo
         guard_id: input.guard_id.clone(),
         workspace_root: input.workspace_root.clone(),
         decision,
-        side_effect_policy: side_effect_policy_for(&probes),
+        side_effect_policy: side_effect_policy_for(&probes, !cleanup_candidates.is_empty()),
         probes,
         reason_codes: reason_codes.into_iter().collect(),
         artifact_paths,
+        cleanup_candidates,
     }
 }
 
@@ -596,7 +743,10 @@ fn classify_decision(probes: &[DiskGuardProbe], required_evidence_gap: bool) -> 
     DiskGuardDecision::Proceed
 }
 
-fn side_effect_policy_for(probes: &[DiskGuardProbe]) -> DiskGuardSideEffectPolicy {
+fn side_effect_policy_for(
+    probes: &[DiskGuardProbe],
+    cleanup_inventory_collected: bool,
+) -> DiskGuardSideEffectPolicy {
     let mut performed_actions = BTreeSet::new();
     for probe in probes {
         if probe.source == "not_collected" {
@@ -623,6 +773,10 @@ fn side_effect_policy_for(probes: &[DiskGuardProbe]) -> DiskGuardSideEffectPolic
         if !probe.artifact_paths.is_empty() {
             performed_actions.insert(DiskGuardPerformedAction::ReadRetainedArtifact);
         }
+    }
+
+    if cleanup_inventory_collected {
+        performed_actions.insert(DiskGuardPerformedAction::ReadCleanupInventory);
     }
 
     if performed_actions.is_empty() {
@@ -709,6 +863,178 @@ fn read_filesystem_space(path: &Path) -> Result<(u64, u64), String> {
 fn read_filesystem_space(path: &Path) -> Result<(u64, u64), String> {
     let _ = path;
     Err("unsupported_platform".to_string())
+}
+
+const CLEANUP_RECENT_MTIME_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const CLEANUP_LARGE_CANDIDATE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn classify_cleanup_candidate(
+    input: &DiskGuardCleanupCandidateInput,
+    generated_at_ms: u64,
+) -> DiskGuardCleanupCandidate {
+    let live_use = cleanup_live_use(input);
+    let age_ms = input
+        .modified_at_ms
+        .map(|modified_at_ms| generated_at_ms.saturating_sub(modified_at_ms));
+    let future_mtime = input
+        .modified_at_ms
+        .is_some_and(|modified_at_ms| modified_at_ms > generated_at_ms);
+    let mut reason_codes = BTreeSet::from([
+        "cleanup_candidate.operator_approval_required".to_string(),
+        "cleanup_candidate.no_automatic_deletion".to_string(),
+    ]);
+
+    match input.has_cachedir_tag {
+        Some(true) => {
+            reason_codes.insert("cleanup_candidate.cachedir_tag_present".to_string());
+        }
+        Some(false) => {
+            reason_codes.insert("cleanup_candidate.cachedir_tag_absent".to_string());
+        }
+        None => {
+            reason_codes.insert("cleanup_candidate.cachedir_tag_not_checked".to_string());
+        }
+    }
+
+    match input.modified_at_ms {
+        Some(_) if future_mtime => {
+            reason_codes.insert("cleanup_candidate.future_mtime".to_string());
+        }
+        Some(_) => {
+            if age_ms.unwrap_or(0) < CLEANUP_RECENT_MTIME_WINDOW_MS {
+                reason_codes.insert("cleanup_candidate.recent_mtime".to_string());
+            } else {
+                reason_codes.insert("cleanup_candidate.stale_mtime".to_string());
+            }
+        }
+        None => {
+            reason_codes.insert("cleanup_candidate.mtime_not_checked".to_string());
+        }
+    }
+
+    if input.size_bytes >= CLEANUP_LARGE_CANDIDATE_FLOOR_BYTES {
+        reason_codes.insert("cleanup_candidate.large_candidate".to_string());
+    } else {
+        reason_codes.insert("cleanup_candidate.small_candidate".to_string());
+    }
+
+    if input.kind == DiskGuardCleanupKind::Unknown {
+        reason_codes.insert("cleanup_candidate.kind_unknown".to_string());
+    }
+
+    match live_use {
+        DiskGuardLiveUseState::Referenced => {
+            reason_codes.insert("cleanup_candidate.live_reference".to_string());
+        }
+        DiskGuardLiveUseState::NotReferenced => {
+            reason_codes.insert("cleanup_candidate.no_live_reference".to_string());
+        }
+        DiskGuardLiveUseState::NotChecked => {
+            reason_codes.insert("cleanup_candidate.live_reference_not_checked".to_string());
+        }
+    }
+
+    let path_is_protected = cleanup_path_is_protected(&input.path);
+    if path_is_protected {
+        reason_codes.insert("cleanup_candidate.protected_path".to_string());
+    }
+
+    let risk_tier = cleanup_risk_tier(input, age_ms, live_use, path_is_protected, future_mtime);
+
+    DiskGuardCleanupCandidate {
+        path: input.path.clone(),
+        project: input.project.clone(),
+        kind: input.kind,
+        risk_tier,
+        operator_approval_required: true,
+        automatic_cleanup_allowed: false,
+        size_bytes: input.size_bytes,
+        modified_at_ms: input.modified_at_ms,
+        age_ms,
+        has_cachedir_tag: input.has_cachedir_tag,
+        lsof_reference_count: input.lsof_reference_count,
+        process_reference_count: input.process_reference_count,
+        live_use,
+        reason_codes: reason_codes.into_iter().collect(),
+        artifact_paths: input.artifact_paths.clone(),
+        next_safe_action: cleanup_next_safe_action(risk_tier).to_string(),
+    }
+}
+
+fn cleanup_live_use(input: &DiskGuardCleanupCandidateInput) -> DiskGuardLiveUseState {
+    let lsof_count = input.lsof_reference_count.unwrap_or(0);
+    let process_count = input.process_reference_count.unwrap_or(0);
+    if lsof_count > 0 || process_count > 0 {
+        DiskGuardLiveUseState::Referenced
+    } else if input.lsof_reference_count.is_some() || input.process_reference_count.is_some() {
+        DiskGuardLiveUseState::NotReferenced
+    } else {
+        DiskGuardLiveUseState::NotChecked
+    }
+}
+
+fn cleanup_path_is_protected(path: &str) -> bool {
+    let mut previous_component = None;
+    for component in Path::new(path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+    {
+        if component == ".git" {
+            return true;
+        }
+        if previous_component == Some("crates") && component == "frankenterm-core" {
+            return true;
+        }
+        previous_component = Some(component);
+    }
+    false
+}
+
+fn cleanup_risk_tier(
+    input: &DiskGuardCleanupCandidateInput,
+    age_ms: Option<u64>,
+    live_use: DiskGuardLiveUseState,
+    path_is_protected: bool,
+    future_mtime: bool,
+) -> DiskGuardCleanupRiskTier {
+    if path_is_protected {
+        return DiskGuardCleanupRiskTier::Protected;
+    }
+    if live_use == DiskGuardLiveUseState::Referenced || future_mtime {
+        return DiskGuardCleanupRiskTier::High;
+    }
+    if !matches!(age_ms, Some(age_ms) if age_ms >= CLEANUP_RECENT_MTIME_WINDOW_MS) {
+        return DiskGuardCleanupRiskTier::High;
+    }
+    if input.size_bytes < CLEANUP_LARGE_CANDIDATE_FLOOR_BYTES
+        || input.has_cachedir_tag != Some(true)
+        || input.kind == DiskGuardCleanupKind::Unknown
+        || live_use == DiskGuardLiveUseState::NotChecked
+    {
+        return DiskGuardCleanupRiskTier::Medium;
+    }
+
+    DiskGuardCleanupRiskTier::Low
+}
+
+fn cleanup_next_safe_action(risk_tier: DiskGuardCleanupRiskTier) -> &'static str {
+    match risk_tier {
+        DiskGuardCleanupRiskTier::Low => {
+            "Eligible for operator review; no automatic cleanup command is emitted."
+        }
+        DiskGuardCleanupRiskTier::Medium => {
+            "Collect more evidence before asking an operator to approve cleanup."
+        }
+        DiskGuardCleanupRiskTier::High => {
+            "Do not delete; re-sample after live references, recent writes, or evidence gaps clear."
+        }
+        DiskGuardCleanupRiskTier::Protected => {
+            "Do not delete; this path is protected by FrankenTerm repository policy."
+        }
+        DiskGuardCleanupRiskTier::Unknown => {
+            "Treat as unsafe until the candidate can be reclassified."
+        }
+    }
 }
 
 fn default_next_safe_action(
@@ -1060,6 +1386,105 @@ mod tests {
             report
                 .reason_codes
                 .contains(&"disk.guard.static_only".to_string())
+        );
+    }
+
+    #[test]
+    fn cleanup_inventory_is_advisory_for_old_cached_targets() {
+        let input = healthy_input().with_cleanup_candidate(
+            DiskGuardCleanupCandidateInput::new(
+                "/repo/frankenterm/target/old-proof",
+                "frankenterm",
+                DiskGuardCleanupKind::CargoTarget,
+                16 * 1024 * 1024 * 1024,
+            )
+            .with_modified_at_ms(NOW_MS - CLEANUP_RECENT_MTIME_WINDOW_MS - 1)
+            .with_cachedir_tag(true)
+            .with_lsof_reference_count(0)
+            .with_process_reference_count(0)
+            .with_artifact_path("fixtures/disk-guard/valid/cleanup-inventory.json"),
+        );
+
+        let report = build_disk_guard_report(&input);
+        let candidate = report
+            .cleanup_candidates
+            .first()
+            .expect("cleanup candidate is retained");
+
+        assert_eq!(candidate.risk_tier, DiskGuardCleanupRiskTier::Low);
+        assert!(candidate.operator_approval_required);
+        assert!(!candidate.automatic_cleanup_allowed);
+        assert_eq!(candidate.live_use, DiskGuardLiveUseState::NotReferenced);
+        assert!(
+            candidate
+                .reason_codes
+                .contains(&"cleanup_candidate.no_automatic_deletion".to_string())
+        );
+        assert!(
+            report
+                .side_effect_policy
+                .performed_actions
+                .contains(&DiskGuardPerformedAction::ReadCleanupInventory)
+        );
+    }
+
+    #[test]
+    fn cleanup_inventory_protects_core_paths() {
+        let input = healthy_input().with_cleanup_candidate(
+            DiskGuardCleanupCandidateInput::new(
+                "/repo/frankenterm/crates/frankenterm-core/target",
+                "frankenterm",
+                DiskGuardCleanupKind::CargoTarget,
+                20 * 1024 * 1024 * 1024,
+            )
+            .with_modified_at_ms(NOW_MS - CLEANUP_RECENT_MTIME_WINDOW_MS - 1)
+            .with_cachedir_tag(true)
+            .with_lsof_reference_count(0)
+            .with_process_reference_count(0),
+        );
+
+        let report = build_disk_guard_report(&input);
+        let candidate = report
+            .cleanup_candidates
+            .first()
+            .expect("cleanup candidate is retained");
+
+        assert_eq!(candidate.risk_tier, DiskGuardCleanupRiskTier::Protected);
+        assert!(!candidate.automatic_cleanup_allowed);
+        assert!(
+            candidate
+                .reason_codes
+                .contains(&"cleanup_candidate.protected_path".to_string())
+        );
+    }
+
+    #[test]
+    fn cleanup_inventory_live_references_are_high_risk() {
+        let input = healthy_input().with_cleanup_candidate(
+            DiskGuardCleanupCandidateInput::new(
+                "/repo/frankenterm/target/active-proof",
+                "frankenterm",
+                DiskGuardCleanupKind::CargoTarget,
+                10 * 1024 * 1024 * 1024,
+            )
+            .with_modified_at_ms(NOW_MS - CLEANUP_RECENT_MTIME_WINDOW_MS - 1)
+            .with_cachedir_tag(true)
+            .with_lsof_reference_count(2)
+            .with_process_reference_count(1),
+        );
+
+        let report = build_disk_guard_report(&input);
+        let candidate = report
+            .cleanup_candidates
+            .first()
+            .expect("cleanup candidate is retained");
+
+        assert_eq!(candidate.risk_tier, DiskGuardCleanupRiskTier::High);
+        assert_eq!(candidate.live_use, DiskGuardLiveUseState::Referenced);
+        assert!(
+            candidate
+                .reason_codes
+                .contains(&"cleanup_candidate.live_reference".to_string())
         );
     }
 

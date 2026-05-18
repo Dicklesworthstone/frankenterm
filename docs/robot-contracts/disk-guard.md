@@ -1,6 +1,6 @@
 # Robot Family Contract: `disk-guard`
 
-**Bead:** `ft-fyk4x.1`
+**Beads:** `ft-fyk4x.1`, `ft-fyk4x.2`
 **Status:** core collector normalizer shipped under
 `crates/frankenterm-core/src/disk_guard.rs`; no runtime CLI command is shipped by
 this document.
@@ -55,6 +55,34 @@ normal tracker updates by the agent performing the work.
 Cleanup candidates are advisory evidence only. They must be separated from
 automatic behavior and require explicit operator approval outside this contract.
 
+## Cleanup Inventory Candidates
+
+`cleanup_candidates` is an optional read-only inventory attached to the
+`ft.disk_guard.v1` report. It normalizes facts collected by external commands
+such as `du`, `stat`, `lsof`, and process scans, but it does not run those
+commands itself and never emits a deletion command.
+
+Every candidate records:
+
+- path and owning project;
+- candidate kind, such as `cargo_target`, `cargo_home_registry`,
+  `rch_cargo_home`, `rch_target`, `project_cache`, or
+  `temp_proof_artifact`;
+- size in bytes, mtime, derived age, and `CACHEDIR.TAG` evidence when known;
+- live-use evidence from `lsof` or process-reference counts when collected;
+- `risk_tier`, where `low` still means "operator review only", not safe
+  automatic deletion;
+- `operator_approval_required: true` and
+  `automatic_cleanup_allowed: false`; and
+- retained artifact paths for the inventory evidence that produced the row.
+
+The classifier is deliberately conservative. Paths under
+`crates/frankenterm-core/` and `.git/` are `protected`. Live process references,
+future mtimes, recent mtimes, missing live-use evidence, missing
+`CACHEDIR.TAG`, unknown candidate kind, or sub-floor size all keep the candidate
+out of the low-risk advisory bucket. A low-risk candidate is still only a prompt
+for explicit operator review.
+
 ## Result Semantics
 
 `decision` is one of:
@@ -92,6 +120,7 @@ Fixtures live under `fixtures/disk-guard/`:
 
 - `manifest.json`
 - `valid/current-eno-space.json`
+- `valid/cleanup-inventory.json`
 - `valid/healthy.json`
 - `valid/warning-low-space.json`
 - `valid/fatal-write-probe-failed.json`
