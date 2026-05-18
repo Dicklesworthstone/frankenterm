@@ -3,13 +3,20 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use super::protocol::{EmbedRequest, EmbedResponse};
 use crate::search::{Embedder, HashEmbedder};
 
 type SharedEmbedder = Arc<dyn Embedder>;
+
+static EMBEDDER_CACHE_LOCK_POISONED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of times an embedder cache lock was poisoned and recovered.
+pub fn embedder_cache_lock_poisoned_count() -> u64 {
+    EMBEDDER_CACHE_LOCK_POISONED.load(Ordering::Relaxed)
+}
 
 /// Worker that processes embedding requests.
 pub struct EmbedWorker {
@@ -20,7 +27,7 @@ pub struct EmbedWorker {
 
 impl fmt::Debug for EmbedWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let cached_embedders = self.embedders.lock().map_or(0, |cache| cache.len());
+        let cached_embedders = self.cached_embedders();
         f.debug_struct("EmbedWorker")
             .field("id", &self.id)
             .field("processed", &self.processed())
@@ -51,7 +58,7 @@ impl EmbedWorker {
 
     /// Get the number of cached embedders.
     pub fn cached_embedders(&self) -> usize {
-        self.embedders.lock().map_or(0, |cache| cache.len())
+        self.embedders_guard().len()
     }
 
     /// Process an embedding request.
@@ -80,25 +87,30 @@ impl EmbedWorker {
     fn embedder_for(&self, model: Option<&str>) -> Result<SharedEmbedder, String> {
         let selector = normalize_model_selector(model)?;
         {
-            let cache = self
-                .embedders
-                .lock()
-                .map_err(|_| "embedder cache lock poisoned".to_string())?;
+            let cache = self.embedders_guard();
             if let Some(embedder) = cache.get(&selector) {
                 return Ok(Arc::clone(embedder));
             }
         }
 
         let embedder = build_embedder_from_normalized_selector(&selector)?;
-        let mut cache = self
-            .embedders
-            .lock()
-            .map_err(|_| "embedder cache lock poisoned".to_string())?;
+        let mut cache = self.embedders_guard();
         Ok(Arc::clone(
             cache
                 .entry(selector)
                 .or_insert_with(|| Arc::clone(&embedder)),
         ))
+    }
+
+    fn embedders_guard(&self) -> MutexGuard<'_, HashMap<String, SharedEmbedder>> {
+        match self.embedders.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                EMBEDDER_CACHE_LOCK_POISONED.fetch_add(1, Ordering::Relaxed);
+                self.embedders.clear_poison();
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -182,6 +194,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn req(id: u64, text: &str, model: Option<&str>) -> EmbedRequest {
         EmbedRequest {
@@ -210,6 +223,51 @@ mod tests {
         assert_eq!(resp.id, 2);
         assert_eq!(resp.model, "fnv1a-hash-64");
         assert_eq!(resp.vector.len(), 64);
+    }
+
+    #[test]
+    fn worker_recovers_poisoned_embedder_cache_lock() {
+        let poison_count_before = embedder_cache_lock_poisoned_count();
+        let worker = EmbedWorker::new(11);
+        worker
+            .process(&req(1, "seed", Some("fnv1a-hash-64")))
+            .unwrap();
+
+        let poison_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = worker.embedders.lock().unwrap();
+            panic!("poison embedder cache lock");
+        }));
+        assert!(poison_result.is_err());
+
+        assert_eq!(worker.cached_embedders(), 1);
+        let poison_count_after_recovery = embedder_cache_lock_poisoned_count();
+        assert!(poison_count_after_recovery > poison_count_before);
+
+        let resp = worker
+            .process(&req(2, "after poison", Some("fnv1a-hash-32")))
+            .unwrap();
+        assert_eq!(resp.vector.len(), 32);
+        assert_eq!(worker.cached_embedders(), 2);
+        assert_eq!(worker.processed(), 2);
+        assert!(embedder_cache_lock_poisoned_count() >= poison_count_after_recovery);
+    }
+
+    #[test]
+    fn worker_debug_recovers_poisoned_embedder_cache_lock() {
+        let poison_count_before = embedder_cache_lock_poisoned_count();
+        let worker = EmbedWorker::new(12);
+        worker.process(&req(1, "seed", None)).unwrap();
+
+        let poison_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = worker.embedders.lock().unwrap();
+            panic!("poison embedder cache lock before debug");
+        }));
+        assert!(poison_result.is_err());
+
+        let dbg = format!("{worker:?}");
+        assert!(dbg.contains("EmbedWorker"));
+        assert!(dbg.contains("cached_embedders: 1"));
+        assert!(embedder_cache_lock_poisoned_count() > poison_count_before);
     }
 
     #[test]
