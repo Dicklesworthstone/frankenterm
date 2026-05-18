@@ -37,7 +37,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 // =============================================================================
 // br-ft-wd0fc: WorkStealingDeque Mutex poison-recovery observability counter
@@ -246,11 +246,22 @@ impl<T> Clone for Stealer<T> {
 }
 
 impl<T> Stealer<T> {
+    fn try_state(&self) -> Result<MutexGuard<'_, SharedState<T>>, ()> {
+        match self.state.try_lock() {
+            Ok(state) => Ok(state),
+            Err(TryLockError::WouldBlock) => Err(()),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                self.state.clear_poison();
+                Ok(record_poison_and_recover(poisoned))
+            }
+        }
+    }
+
     /// Attempt to steal an item from the top of the deque (FIFO).
     pub fn steal(&self) -> StealResult<T> {
-        let mut state = match self.state.try_lock() {
+        let mut state = match self.try_state() {
             Ok(s) => s,
-            Err(_) => {
+            Err(()) => {
                 // Another thread holds the lock — Retry
                 return StealResult::Retry;
             }
@@ -271,9 +282,9 @@ impl<T> Stealer<T> {
 
     /// Attempt to steal up to `max` items at once (batch steal).
     pub fn steal_batch(&self, max: usize) -> Vec<T> {
-        let mut state = match self.state.try_lock() {
+        let mut state = match self.try_state() {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(()) => return Vec::new(),
         };
 
         let n = max.min(state.buffer.len());
@@ -289,9 +300,9 @@ impl<T> Stealer<T> {
 
     /// Check if the deque is empty (may be stale immediately).
     pub fn is_empty(&self) -> bool {
-        match self.state.try_lock() {
+        match self.try_state() {
             Ok(s) => s.buffer.is_empty(),
-            Err(_) => false, // Assume not empty when contended
+            Err(()) => false, // Assume not empty when contended
         }
     }
 }
@@ -429,6 +440,24 @@ impl<T> WorkStealingPool<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+
+    static POISON_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn poison_test_lock() -> StdMutexGuard<'static, ()> {
+        POISON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn poison_shared_state<T>(worker: &Worker<T>) {
+        let state = Arc::clone(&worker.state);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = state.lock().expect("deque lock starts unpoisoned");
+            panic!("poison work-stealing deque state");
+        }));
+        assert!(result.is_err(), "poison helper must panic while locked");
+    }
 
     #[test]
     fn empty_deque() {
@@ -743,6 +772,52 @@ mod tests {
         assert!(!stealer.is_empty());
         stealer.steal();
         assert!(stealer.is_empty());
+    }
+
+    #[test]
+    fn stealer_steal_recovers_poisoned_lock() {
+        let _guard = poison_test_lock();
+        reset_ws_deque_lock_poisoned_count_for_test();
+        let (worker, stealer) = new_deque(16);
+        worker.push(10);
+        poison_shared_state(&worker);
+        assert!(worker.state.is_poisoned());
+
+        assert_eq!(stealer.steal().unwrap(), 10);
+
+        assert!(!worker.state.is_poisoned());
+        assert_eq!(ws_deque_lock_poisoned_count(), 1);
+        assert!(worker.is_empty());
+    }
+
+    #[test]
+    fn stealer_batch_recovers_poisoned_lock() {
+        let _guard = poison_test_lock();
+        reset_ws_deque_lock_poisoned_count_for_test();
+        let (worker, stealer) = new_deque(16);
+        worker.push(1);
+        worker.push(2);
+        worker.push(3);
+        poison_shared_state(&worker);
+
+        assert_eq!(stealer.steal_batch(2), vec![1, 2]);
+
+        assert!(!worker.state.is_poisoned());
+        assert_eq!(ws_deque_lock_poisoned_count(), 1);
+        assert_eq!(worker.pop(), Some(3));
+    }
+
+    #[test]
+    fn stealer_is_empty_recovers_poisoned_lock() {
+        let _guard = poison_test_lock();
+        reset_ws_deque_lock_poisoned_count_for_test();
+        let (worker, stealer) = new_deque::<i32>(16);
+        poison_shared_state(&worker);
+
+        assert!(stealer.is_empty());
+
+        assert!(!worker.state.is_poisoned());
+        assert_eq!(ws_deque_lock_poisoned_count(), 1);
     }
 
     // ── Pop edge cases ──────────────────────────────────────────────
