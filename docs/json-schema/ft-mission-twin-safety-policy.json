@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-mission-twin-safety-policy.json",
+  "title": "FrankenTerm Mission Twin Safety Policy",
+  "description": "Static privacy, retention, and side-effect policy for the simulation-only mission twin.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "source_bead",
+    "simulation_only",
+    "live_mutation_authority",
+    "raw_pane_content_stored",
+    "artifact_paths",
+    "retention_policy",
+    "forbidden_actions",
+    "failure_behaviors",
+    "output_requirements"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.mission_twin_safety_policy.v1"
+    },
+    "source_bead": {
+      "type": "string",
+      "const": "ft-u7r37.7"
+    },
+    "simulation_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "live_mutation_authority": {
+      "type": "boolean",
+      "const": false
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "artifact_paths": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/repo_relative_path"
+      }
+    },
+    "retention_policy": {
+      "type": "object",
+      "required": [
+        "snapshots",
+        "replay_logs",
+        "plan_outputs",
+        "artifacts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "snapshots": {
+          "$ref": "#/$defs/retention_rule"
+        },
+        "replay_logs": {
+          "$ref": "#/$defs/retention_rule"
+        },
+        "plan_outputs": {
+          "$ref": "#/$defs/retention_rule"
+        },
+        "artifacts": {
+          "$ref": "#/$defs/retention_rule"
+        }
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "failure_behaviors": {
+      "type": "object",
+      "required": [
+        "missing",
+        "stale",
+        "contradictory",
+        "unredacted"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "missing": {
+          "$ref": "#/$defs/failure_behavior"
+        },
+        "stale": {
+          "$ref": "#/$defs/failure_behavior"
+        },
+        "contradictory": {
+          "$ref": "#/$defs/failure_behavior"
+        },
+        "unredacted": {
+          "$ref": "#/$defs/failure_behavior"
+        }
+      }
+    },
+    "output_requirements": {
+      "type": "object",
+      "required": [
+        "every_output_marks_simulated",
+        "every_output_carries_forbidden_actions",
+        "approval_does_not_grant_live_mutation",
+        "raw_inputs_rejected_before_replay"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "every_output_marks_simulated": {
+          "type": "boolean",
+          "const": true
+        },
+        "every_output_carries_forbidden_actions": {
+          "type": "boolean",
+          "const": true
+        },
+        "approval_does_not_grant_live_mutation": {
+          "type": "boolean",
+          "const": true
+        },
+        "raw_inputs_rejected_before_replay": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    }
+  },
+  "$defs": {
+    "repo_relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*(^|/)\\.\\.(/|$))(?!.*(^|/)\\.git(/|$))(?!.*\\\\)(?!.*//).+[^/]$"
+    },
+    "retention_rule": {
+      "type": "object",
+      "required": [
+        "retention_class",
+        "max_contains_raw_content",
+        "allowed_fields",
+        "forbidden_fields"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "retention_class": {
+          "type": "string",
+          "enum": [
+            "metadata_only",
+            "redacted_artifact",
+            "schema_fixture"
+          ]
+        },
+        "max_contains_raw_content": {
+          "type": "boolean",
+          "const": false
+        },
+        "allowed_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "forbidden_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "agent_mail_service_repair_restart",
+        "rch_service_repair_restart",
+        "worker_mutation",
+        "build_cancellation",
+        "file_deletion",
+        "destructive_git",
+        "local_cargo_proof",
+        "pane_mutation",
+        "raw_pane_content_storage",
+        "beads_mutation"
+      ]
+    },
+    "failure_behavior": {
+      "type": "object",
+      "required": [
+        "fail_closed",
+        "outcome",
+        "reason_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fail_closed": {
+          "type": "boolean",
+          "const": true
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "reject",
+            "mark_unavailable",
+            "lower_confidence",
+            "operator_review_required"
+          ]
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^mission_twin\\.[a-z0-9_]+$"
+        }
+      }
+    }
+  }
+}

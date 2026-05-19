@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_safety_policy.invalid_fragments.v1",
+  "source_bead": "ft-u7r37.7",
+  "valid_fixture": "fixtures/mission-twin/safety-policy/valid/policy.v1.json",
+  "cases": [
+    {
+      "case_id": "raw-pane-content-stored",
+      "expected_failure": "raw_pane_content_must_not_be_retained",
+      "reason_codes": [
+        "mission_twin.input_unredacted",
+        "mission_twin.raw_pane_content_forbidden"
+      ],
+      "invalid_fragment": {
+        "raw_pane_content_stored": true
+      }
+    },
+    {
+      "case_id": "destructive-suggestion",
+      "expected_failure": "simulator_must_not_suggest_destructive_actions",
+      "reason_codes": [
+        "mission_twin.forbidden_action_suggested"
+      ],
+      "invalid_fragment": {
+        "simulated_action": "delete files under an RCH worker target directory",
+        "forbidden_actions": [
+          "file_deletion"
+        ]
+      }
+    },
+    {
+      "case_id": "missing-forbidden-action",
+      "expected_failure": "every_output_must_carry_full_forbidden_action_set",
+      "reason_codes": [
+        "mission_twin.forbidden_action_set_incomplete"
+      ],
+      "invalid_fragment": {
+        "omitted_forbidden_action": "local_cargo_proof"
+      }
+    },
+    {
+      "case_id": "live-permission-confused",
+      "expected_failure": "simulation_must_not_grant_live_authority",
+      "reason_codes": [
+        "mission_twin.live_authority_forbidden"
+      ],
+      "invalid_fragment": {
+        "simulation_only": false,
+        "live_mutation_authority": true
+      }
+    },
+    {
+      "case_id": "unsafe-artifact-path",
+      "expected_failure": "artifact_paths_must_be_safe_repo_relative",
+      "reason_codes": [
+        "mission_twin.artifact_path_unsafe"
+      ],
+      "invalid_fragment": {
+        "artifact_paths": [
+          "../outside.json",
+          ".git/config",
+          "/tmp/mission-twin.json"
+        ]
+      }
+    }
+  ]
+}

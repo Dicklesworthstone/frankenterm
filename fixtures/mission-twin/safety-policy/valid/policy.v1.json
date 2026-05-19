@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_safety_policy.v1",
+  "source_bead": "ft-u7r37.7",
+  "simulation_only": true,
+  "live_mutation_authority": false,
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/mission-twin-privacy-safety.md",
+    "docs/json-schema/ft-mission-twin-safety-policy.json",
+    "fixtures/mission-twin/safety-policy/valid/policy.v1.json",
+    "fixtures/mission-twin/safety-policy/invalid/fragments.v1.json",
+    "tests/e2e/test_mission_twin_safety_policy.sh"
+  ],
+  "retention_policy": {
+    "snapshots": {
+      "retention_class": "metadata_only",
+      "max_contains_raw_content": false,
+      "allowed_fields": [
+        "bead_ids",
+        "rch_reason_codes",
+        "agent_mail_status",
+        "git_path_summaries",
+        "operating_envelope_refs"
+      ],
+      "forbidden_fields": [
+        "raw_pane_text",
+        "mail_body",
+        "secret_material",
+        "unredacted_command_output"
+      ]
+    },
+    "replay_logs": {
+      "retention_class": "redacted_artifact",
+      "max_contains_raw_content": false,
+      "allowed_fields": [
+        "scenario_id",
+        "reason_codes",
+        "simulated_actions",
+        "artifact_paths"
+      ],
+      "forbidden_fields": [
+        "raw_pane_text",
+        "service_restart_command",
+        "cleanup_command"
+      ]
+    },
+    "plan_outputs": {
+      "retention_class": "metadata_only",
+      "max_contains_raw_content": false,
+      "allowed_fields": [
+        "simulated",
+        "ranked_options",
+        "forbidden_actions",
+        "required_approvals"
+      ],
+      "forbidden_fields": [
+        "live_permission_granted",
+        "pane_input",
+        "raw_mail_body"
+      ]
+    },
+    "artifacts": {
+      "retention_class": "schema_fixture",
+      "max_contains_raw_content": false,
+      "allowed_fields": [
+        "repo_relative_path",
+        "sha256",
+        "schema_id",
+        "verification_command"
+      ],
+      "forbidden_fields": [
+        "absolute_path",
+        "parent_relative_path",
+        "git_internal_path"
+      ]
+    }
+  },
+  "forbidden_actions": [
+    "agent_mail_service_repair_restart",
+    "rch_service_repair_restart",
+    "worker_mutation",
+    "build_cancellation",
+    "file_deletion",
+    "destructive_git",
+    "local_cargo_proof",
+    "pane_mutation",
+    "raw_pane_content_storage",
+    "beads_mutation"
+  ],
+  "failure_behaviors": {
+    "missing": {
+      "fail_closed": true,
+      "outcome": "mark_unavailable",
+      "reason_code": "mission_twin.input_missing"
+    },
+    "stale": {
+      "fail_closed": true,
+      "outcome": "lower_confidence",
+      "reason_code": "mission_twin.input_stale"
+    },
+    "contradictory": {
+      "fail_closed": true,
+      "outcome": "operator_review_required",
+      "reason_code": "mission_twin.input_contradictory"
+    },
+    "unredacted": {
+      "fail_closed": true,
+      "outcome": "reject",
+      "reason_code": "mission_twin.input_unredacted"
+    }
+  },
+  "output_requirements": {
+    "every_output_marks_simulated": true,
+    "every_output_carries_forbidden_actions": true,
+    "approval_does_not_grant_live_mutation": true,
+    "raw_inputs_rejected_before_replay": true
+  }
+}
