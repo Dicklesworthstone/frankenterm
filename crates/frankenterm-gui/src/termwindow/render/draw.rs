@@ -260,10 +260,42 @@ impl crate::TermWindow {
                     uniforms.add_struct("blink", &blink);
                     uniforms.add_struct("rapid_blink", &rapid_blink);
 
+                    // These slice() / as_ref() calls used to be unwrap() —
+                    // which crashed the GUI on every window resize because
+                    // the geometry pass occasionally reports a vertex_count
+                    // larger than the current vertex buffer length (the
+                    // buffer hasn't been resized for the new window
+                    // dimensions yet on the very first post-resize draw).
+                    // Treat the out-of-range case as a recoverable per-
+                    // frame error: skip this draw, log context, let the
+                    // next paint cycle render with correctly-sized buffers.
+                    let vertex_buf_len = vertices.glium().len();
+                    let index_buf_len = vb.indices.glium().len();
+                    let Some(vert_slice) = vertices.glium().slice(0..vertex_count)
+                    else {
+                        log::warn!(
+                            "skipping draw: vertex slice 0..{vertex_count} out of range (buf len {vertex_buf_len})"
+                        );
+                        vb.next_index();
+                        continue;
+                    };
+                    let Some(idx_slice) = vb.indices.glium().slice(0..index_count)
+                    else {
+                        log::warn!(
+                            "skipping draw: index slice 0..{index_count} out of range (buf len {index_buf_len})"
+                        );
+                        vb.next_index();
+                        continue;
+                    };
+                    let Some(prog) = gl_state.glyph_prog.as_ref() else {
+                        log::warn!("skipping draw: glyph_prog not initialized");
+                        vb.next_index();
+                        continue;
+                    };
                     frame.draw(
-                        vertices.glium().slice(0..vertex_count).unwrap(),
-                        vb.indices.glium().slice(0..index_count).unwrap(),
-                        gl_state.glyph_prog.as_ref().unwrap(),
+                        vert_slice,
+                        idx_slice,
+                        prog,
                         &uniforms,
                         if subpixel_aa {
                             &dual_source_blending

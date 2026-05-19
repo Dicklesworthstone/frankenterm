@@ -51,22 +51,19 @@ impl crate::TermWindow {
             match self.paint_pass(frame_reduce_motion) {
                 Ok(_) => match self.render_state.as_mut() {
                     Some(render_state) => {
-                        if self.quad_buffer_policy.is_gesture_active()
-                            && render_state.needs_more_quads()
-                        {
-                            let snapshot = render_state.quad_allocation_snapshot();
-                            self.quad_buffer_policy.record_live_allocation(
-                                snapshot.used,
-                                snapshot.capacity,
-                                0,
-                            );
-                            log::trace!(
-                                "quad buffer growth deferred during resize gesture: used={} capacity={}",
-                                snapshot.used,
-                                snapshot.capacity,
-                            );
-                            break 'pass;
-                        }
+                        // NOTE: the previous revision deferred quad-buffer
+                        // *growth* while a resize gesture was active. That was
+                        // a perf optimization to avoid per-resize-event GPU
+                        // buffer reallocations, but it was incorrect: the
+                        // geometry pass had already written `next_quad`
+                        // quads to a buffer whose capacity is now too small,
+                        // so the subsequent draw call sliced out-of-range
+                        // (panic before the unwrap→let-else fix at
+                        // draw.rs:264, transparent window after it). Always
+                        // grow on demand. Elastic-buffer *shrinking* during a
+                        // gesture is still deferred via
+                        // ElasticBuffer::try_shrink_if_idle — that's a
+                        // separate concern handled in elastic_buffer.rs.
 
                         match render_state.allocate_more_quads() {
                             Ok(change) => {
