@@ -413,7 +413,19 @@ impl UndoExecutor {
             .await
         {
             Ok(result) if result.aborted => {
-                let undone_at = self.mark_undone(action.id, &request.actor).await?;
+                let undone_at = match self.mark_undone(action.id, &request.actor).await {
+                    Ok(at) => at,
+                    Err(err) => {
+                        return Ok(UndoExecutionResult::failed(
+                            action.id,
+                            undo.undo_strategy.clone(),
+                            format!("Workflow {execution_id} aborted but audit update failed: {err}"),
+                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                            Some(execution_id),
+                            action.pane_id,
+                        ));
+                    }
+                };
                 Ok(UndoExecutionResult::success(
                     action.id,
                     undo.undo_strategy.clone(),
@@ -484,9 +496,22 @@ impl UndoExecutor {
             .await
         {
             Ok(result) if result.aborted => {
-                let undone_at = self
+                let undone_at = match self
                     .mark_undone_with_cx(cx, action.id, &request.actor)
-                    .await?;
+                    .await
+                {
+                    Ok(at) => at,
+                    Err(err) => {
+                        return Ok(UndoExecutionResult::failed(
+                            action.id,
+                            undo.undo_strategy.clone(),
+                            format!("Workflow {execution_id} aborted but audit update failed: {err}"),
+                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                            Some(execution_id),
+                            action.pane_id,
+                        ));
+                    }
+                };
                 Ok(UndoExecutionResult::success(
                     action.id,
                     undo.undo_strategy.clone(),
@@ -568,7 +593,19 @@ impl UndoExecutor {
 
         match self.wezterm.kill_pane(pane_id).await {
             Ok(()) => {
-                let undone_at = self.mark_undone(action.id, &request.actor).await?;
+                let undone_at = match self.mark_undone(action.id, &request.actor).await {
+                    Ok(at) => at,
+                    Err(err) => {
+                        return Ok(UndoExecutionResult::failed(
+                            action.id,
+                            undo.undo_strategy.clone(),
+                            format!("Pane {pane_id} closed but audit update failed: {err}"),
+                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                            action.actor_id.clone(),
+                            Some(pane_id),
+                        ));
+                    }
+                };
                 Ok(UndoExecutionResult::success(
                     action.id,
                     undo.undo_strategy.clone(),
@@ -674,9 +711,22 @@ impl UndoExecutor {
 
         match self.wezterm.kill_pane_with_cx(cx, pane_id).await {
             Ok(()) => {
-                let undone_at = self
+                let undone_at = match self
                     .mark_undone_with_cx(cx, action.id, &request.actor)
-                    .await?;
+                    .await
+                {
+                    Ok(at) => at,
+                    Err(err) => {
+                        return Ok(UndoExecutionResult::failed(
+                            action.id,
+                            undo.undo_strategy.clone(),
+                            format!("Pane {pane_id} closed but audit update failed: {err}"),
+                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                            action.actor_id.clone(),
+                            Some(pane_id),
+                        ));
+                    }
+                };
                 Ok(UndoExecutionResult::success(
                     action.id,
                     undo.undo_strategy.clone(),
