@@ -250,13 +250,165 @@
       }
     },
     {
+      "case_id": "fake-rch-command-shape",
+      "expected_rejection": "stale_command_shape",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad6:fake-rch-shape",
+        "bead_id": "ft-bad6",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "bash",
+            "-lc",
+            "rch --no-self-healing exec -- cargo test"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "RCH_REQUIRE_REMOTE",
+            "RCH_NO_SELF_HEALING"
+          ],
+          "target_dir": "/tmp/ft-bad6",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/rch_admission.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "env-not-allowlisted",
+      "expected_rejection": "env_not_allowlisted",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad7:env-not-allowlisted",
+        "bead_id": "ft-bad7",
+        "command": {
+          "command_shape_version": "static-verifier-v1",
+          "argv": [
+            "bash",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "env": [
+            {
+              "name": "UNDECLARED_ENV",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [],
+          "target_dir": null,
+          "material_remote_required": false
+        },
+        "proof": {
+          "material_cargo_required": false
+        },
+        "paths": {
+          "owned_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "duplicate-env",
+      "expected_rejection": "duplicate_env",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad8:duplicate-env",
+        "bead_id": "ft-bad8",
+        "command": {
+          "command_shape_version": "static-verifier-v1",
+          "argv": [
+            "bash",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "env": [
+            {
+              "name": "FT_STATIC_MODE",
+              "value": "1"
+            },
+            {
+              "name": "FT_STATIC_MODE",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "FT_STATIC_MODE"
+          ],
+          "target_dir": null,
+          "material_remote_required": false
+        },
+        "proof": {
+          "material_cargo_required": false
+        },
+        "paths": {
+          "owned_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
       "case_id": "unsafe-artifact-path",
       "expected_rejection": "unsafe_artifact_path",
       "receipt": {
         "schema_version": 1,
         "contract_id": "ft.deferred_proof_receipt.v1",
-        "receipt_id": "ft-bad6:unsafe-artifact",
-        "bead_id": "ft-bad6",
+        "receipt_id": "ft-bad9:unsafe-artifact",
+        "bead_id": "ft-bad9",
         "command": {
           "command_shape_version": "static-verifier-v1",
           "argv": [

@@ -158,12 +158,14 @@
         },
         "env": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/env_var"
           }
         },
         "env_allowlist": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
             "type": "string",
             "pattern": "^[A-Z][A-Z0-9_]*$"

@@ -60,6 +60,9 @@ REQUIRED_INVALID = %w[
   local-fallback-evidence
   missing-owned-paths
   ambiguous-dirty-overlap
+  fake-rch-command-shape
+  env-not-allowlisted
+  duplicate-env
   unsafe-artifact-path
 ].freeze
 REQUIRED_FORBIDDEN = %w[
@@ -105,8 +108,26 @@ def env_map(receipt)
   receipt.fetch("command").fetch("env", []).to_h { |item| [item.fetch("name"), item.fetch("value")] }
 end
 
-def command_text(receipt)
-  receipt.fetch("command").fetch("argv", []).join(" ")
+def command_argv(receipt)
+  receipt.fetch("command").fetch("argv", [])
+end
+
+def remote_command_shape_valid?(argv)
+  return false unless argv.is_a?(Array)
+  return false unless argv.first == "rch"
+
+  exec_index = argv.index("exec")
+  return false unless exec_index && argv[exec_index + 1] == "--"
+
+  rch_options = argv[1...exec_index] || []
+  rch_options.include?("--no-self-healing")
+end
+
+def remote_command_payload(argv)
+  exec_index = argv.index("exec")
+  return [] unless exec_index && argv[exec_index + 1] == "--"
+
+  argv[(exec_index + 2)..] || []
 end
 
 def path_safe?(path)
@@ -136,17 +157,22 @@ def rejection_reasons(receipt)
   eligibility = receipt.fetch("eligibility", {})
   shape = command["command_shape_version"]
   argv = command.fetch("argv", [])
-  text = argv.join(" ")
+  env_entries = command.fetch("env", [])
+  env_names = env_entries.map { |item| item.fetch("name") }
+  env_allowlist = command.fetch("env_allowlist", [])
   env = env_map(receipt)
   owned = paths.fetch("owned_paths", [])
   dirty = paths.fetch("dirty_paths_at_capture", [])
   overlap = owned & dirty
 
   reasons << "stale_command_shape" unless [REMOTE_SHAPE, STATIC_SHAPE].include?(shape)
+  reasons << "duplicate_env" unless env_names.uniq.length == env_names.length
+  reasons << "duplicate_env_allowlist" unless env_allowlist.uniq.length == env_allowlist.length
+  reasons << "env_not_allowlisted" unless (env_names - env_allowlist).empty?
   if proof["material_cargo_required"] || command["material_remote_required"]
-    reasons << "missing_no_self_healing" unless env["RCH_NO_SELF_HEALING"] == "1" && text.include?("--no-self-healing")
+    reasons << "missing_no_self_healing" unless env["RCH_NO_SELF_HEALING"] == "1" && argv.include?("--no-self-healing")
     reasons << "missing_require_remote" unless env["RCH_REQUIRE_REMOTE"] == "1"
-    reasons << "stale_command_shape" unless shape == REMOTE_SHAPE && text.include?("exec --")
+    reasons << "stale_command_shape" unless shape == REMOTE_SHAPE && remote_command_shape_valid?(argv)
   end
   reasons << "local_fallback_evidence" if local_fallback_text?(receipt)
   reasons << "missing_owned_paths" if owned.empty?
@@ -195,7 +221,7 @@ valid_cases.each do |entry|
   fail!("#{receipt_id} eligibility state is outside valid corpus") unless VALID_STATES.include?(receipt.dig("eligibility", "state"))
   if receipt.dig("proof", "material_cargo_required")
     fail!("#{receipt_id} material proof missing RCH target dir") unless receipt.dig("command", "target_dir")&.start_with?("/tmp/")
-    fail!("#{receipt_id} material proof missing cargo argv") unless command_text(receipt).include?("cargo")
+    fail!("#{receipt_id} material proof missing cargo argv") unless remote_command_payload(command_argv(receipt)).include?("cargo")
   else
     fail!("#{receipt_id} static proof should not require RCH target dir") unless receipt.dig("command", "target_dir").nil?
   end

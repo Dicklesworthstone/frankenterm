@@ -53,6 +53,9 @@ The static verifier freezes valid and invalid examples:
 - `local-fallback-evidence`
 - `missing-owned-paths`
 - `ambiguous-dirty-overlap`
+- `fake-rch-command-shape`
+- `env-not-allowlisted`
+- `duplicate-env`
 - `unsafe-artifact-path`
 
 Run:
