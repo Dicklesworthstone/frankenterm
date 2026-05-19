@@ -54,6 +54,21 @@ jq -e '
   def severity_ok: IN("medium", "high");
   def safe_command:
     . == "git status --short --branch" or . == "git diff --stat --";
+  def retained_repo_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not);
   def forbidden_set_ok:
     sort == [
       "delete_files",
@@ -81,7 +96,7 @@ jq -e '
     and (.path_summaries | type == "array")
     and all(.path_summaries[];
       (.status | IN(" M", "??"))
-      and (.path | type == "string" and length > 0)
+      and (.path | retained_repo_path_ok)
       and (.category | IN("tracked_overlap_risk", "untracked_review_required"))
       and (.severity | severity_ok)
     )
