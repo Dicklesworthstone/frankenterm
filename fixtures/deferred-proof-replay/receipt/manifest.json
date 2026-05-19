@@ -1,0 +1,24 @@
+{
+  "schema_version": "ft.deferred_proof_receipt.fixtures.v1",
+  "contract_id": "ft.deferred_proof_receipt.v1",
+  "schema_path": "docs/json-schema/ft-deferred-proof-receipt.json",
+  "contract_doc": "docs/robot-contracts/deferred-proof-receipt.md",
+  "static_verifier": "tests/e2e/test_deferred_proof_receipt_contract.sh",
+  "valid_cases": "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json",
+  "invalid_fragments": "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json",
+  "golden_summary": {
+    "valid_case_count": 5,
+    "invalid_case_count": 6,
+    "command_shape_versions": [
+      "rch-no-self-healing-v1",
+      "static-verifier-v1"
+    ],
+    "eligibility_states": [
+      "dirty_overlap",
+      "eligible",
+      "operator_cancelled",
+      "prerequisite_blocked",
+      "wait_rch"
+    ]
+  }
+}

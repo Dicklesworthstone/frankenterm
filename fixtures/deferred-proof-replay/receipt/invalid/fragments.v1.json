@@ -1,0 +1,295 @@
+{
+  "schema_path": "docs/json-schema/ft-deferred-proof-receipt.json",
+  "cases": [
+    {
+      "case_id": "stale-command-shape",
+      "expected_rejection": "stale_command_shape",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad1:stale-command",
+        "bead_id": "ft-bad1",
+        "command": {
+          "command_shape_version": "rch-legacy-v0",
+          "argv": [
+            "rch",
+            "exec",
+            "--",
+            "cargo",
+            "test"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "RCH_REQUIRE_REMOTE"
+          ],
+          "target_dir": "/tmp/ft-bad1",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/rch_admission.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "missing-no-self-healing",
+      "expected_rejection": "missing_no_self_healing",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad2:missing-no-self",
+        "bead_id": "ft-bad2",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "exec",
+            "--",
+            "env",
+            "CARGO_TARGET_DIR=/tmp/ft-bad2",
+            "cargo",
+            "check"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "RCH_REQUIRE_REMOTE"
+          ],
+          "target_dir": "/tmp/ft-bad2",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/rch_admission.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "local-fallback-evidence",
+      "expected_rejection": "local_fallback_evidence",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad3:local-fallback",
+        "bead_id": "ft-bad3",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "cargo",
+            "test"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "RCH_REQUIRE_REMOTE",
+            "RCH_NO_SELF_HEALING"
+          ],
+          "target_dir": "/tmp/ft-bad3",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true,
+          "evidence_classification": "local_fallback"
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/rch_admission.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "reason_codes": [
+            "proof.local_fallback"
+          ],
+          "replay_allowed": true
+        },
+        "evidence_excerpt": "[RCH] local fallback running locally"
+      }
+    },
+    {
+      "case_id": "missing-owned-paths",
+      "expected_rejection": "missing_owned_paths",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad4:no-owned-paths",
+        "bead_id": "ft-bad4",
+        "command": {
+          "command_shape_version": "static-verifier-v1",
+          "argv": [
+            "bash",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "env": [],
+          "env_allowlist": [],
+          "target_dir": null,
+          "material_remote_required": false
+        },
+        "proof": {
+          "material_cargo_required": false
+        },
+        "paths": {
+          "owned_paths": [],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "ambiguous-dirty-overlap",
+      "expected_rejection": "ambiguous_dirty_overlap",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad5:dirty-overlap",
+        "bead_id": "ft-bad5",
+        "command": {
+          "command_shape_version": "static-verifier-v1",
+          "argv": [
+            "bash",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "env": [],
+          "env_allowlist": [],
+          "target_dir": null,
+          "material_remote_required": false
+        },
+        "proof": {
+          "material_cargo_required": false
+        },
+        "paths": {
+          "owned_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json"
+          ],
+          "dirty_paths_at_capture": [
+            "docs/json-schema/ft-deferred-proof-receipt.json"
+          ],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "unsafe-artifact-path",
+      "expected_rejection": "unsafe_artifact_path",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad6:unsafe-artifact",
+        "bead_id": "ft-bad6",
+        "command": {
+          "command_shape_version": "static-verifier-v1",
+          "argv": [
+            "bash",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "env": [],
+          "env_allowlist": [],
+          "target_dir": null,
+          "material_remote_required": false
+        },
+        "proof": {
+          "material_cargo_required": false
+        },
+        "paths": {
+          "owned_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "../secret.json",
+            "fixtures/deferred-proof-replay/receipt/.git/config.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    }
+  ]
+}

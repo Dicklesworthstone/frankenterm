@@ -1,0 +1,367 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-deferred-proof-receipt.json",
+  "title": "FrankenTerm Deferred Proof Receipt",
+  "description": "Static contract for a queued proof lane that is source-landed or static-clean but cannot yet be replayed because remote-required proof is blocked or unsafe.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "receipt_id",
+    "bead_id",
+    "captured_at",
+    "source",
+    "command",
+    "proof",
+    "paths",
+    "coordination",
+    "eligibility",
+    "forbidden_actions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.deferred_proof_receipt.v1"
+    },
+    "receipt_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*:[a-z0-9][a-z0-9._-]*$"
+    },
+    "bead_id": {
+      "$ref": "#/$defs/bead_id"
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "$ref": "#/$defs/source_snapshot"
+    },
+    "command": {
+      "$ref": "#/$defs/command_receipt"
+    },
+    "proof": {
+      "$ref": "#/$defs/proof_expectation"
+    },
+    "paths": {
+      "$ref": "#/$defs/path_snapshot"
+    },
+    "coordination": {
+      "$ref": "#/$defs/coordination_snapshot"
+    },
+    "eligibility": {
+      "$ref": "#/$defs/replay_eligibility"
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    }
+  },
+  "$defs": {
+    "artifact_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$))(?:docs/json-schema|docs/robot-contracts|fixtures/deferred-proof-replay/receipt|tests/e2e)/.+(?:\\.json|\\.md|\\.sh)$"
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$)).+$"
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": [
+        "commit",
+        "tree",
+        "source_state",
+        "commit_pushed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
+        "tree": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
+        "source_state": {
+          "type": "string",
+          "enum": [
+            "source_landed",
+            "static_clean",
+            "planning_only"
+          ]
+        },
+        "commit_pushed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "env_var": {
+      "type": "object",
+      "required": [
+        "name",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "command_receipt": {
+      "type": "object",
+      "required": [
+        "command_shape_version",
+        "argv",
+        "env",
+        "env_allowlist",
+        "target_dir",
+        "material_remote_required"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "command_shape_version": {
+          "type": "string",
+          "enum": [
+            "rch-no-self-healing-v1",
+            "static-verifier-v1"
+          ]
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/env_var"
+          }
+        },
+        "env_allowlist": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          }
+        },
+        "target_dir": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^/tmp/[A-Za-z0-9._-]+$"
+        },
+        "material_remote_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "proof_expectation": {
+      "type": "object",
+      "required": [
+        "expected_kind",
+        "package",
+        "test_filter",
+        "feature_set",
+        "material_cargo_required",
+        "evidence_classification"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "expected_kind": {
+          "type": "string",
+          "enum": [
+            "cargo_check",
+            "cargo_test",
+            "cargo_clippy",
+            "static_verifier"
+          ]
+        },
+        "package": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "test_filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "feature_set": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "material_cargo_required": {
+          "type": "boolean"
+        },
+        "evidence_classification": {
+          "type": "string",
+          "enum": [
+            "remote_required_pending",
+            "static_only_clean",
+            "blocked_infra",
+            "ineligible"
+          ]
+        }
+      }
+    },
+    "path_snapshot": {
+      "type": "object",
+      "required": [
+        "owned_paths",
+        "dirty_paths_at_capture",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "owned_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "dirty_paths_at_capture": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "artifact_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/artifact_path"
+          }
+        }
+      }
+    },
+    "coordination_snapshot": {
+      "type": "object",
+      "required": [
+        "prerequisite_beads",
+        "agent_mail_state",
+        "rch_admission_state",
+        "operator_cancelled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "prerequisite_beads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bead_id"
+          }
+        },
+        "agent_mail_state": {
+          "type": "string",
+          "enum": [
+            "green",
+            "degraded_read_only",
+            "unavailable",
+            "unknown"
+          ]
+        },
+        "rch_admission_state": {
+          "type": "string",
+          "enum": [
+            "admissible",
+            "critical_pressure",
+            "no_admissible_workers",
+            "telemetry_gap",
+            "not_required",
+            "unknown"
+          ]
+        },
+        "operator_cancelled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "replay_eligibility": {
+      "type": "object",
+      "required": [
+        "state",
+        "reason_codes",
+        "freshness_deadline",
+        "replay_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "eligible",
+            "wait_rch",
+            "dirty_overlap",
+            "stale_command_shape",
+            "prerequisite_blocked",
+            "operator_cancelled",
+            "local_fallback_invalid"
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9_.-]+$"
+          }
+        },
+        "freshness_deadline": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "replay_allowed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "local_cargo_proof",
+        "local_heavy_cargo_fallback",
+        "rch_service_repair",
+        "rch_worker_mutation",
+        "agent_mail_repair",
+        "delete_files",
+        "destructive_git",
+        "build_cancellation",
+        "raw_pane_text_storage",
+        "secret_storage"
+      ]
+    }
+  }
+}
