@@ -1,0 +1,545 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-agent-mail-failover-snapshot.json",
+  "title": "FrankenTerm Agent Mail Failover Snapshot",
+  "description": "Machine-readable Beads/git coordination snapshot for sessions where Agent Mail is unavailable or recovering. The snapshot is read-only and must never recommend service repair, process kills, deletion, worker mutation, or local Cargo proof.",
+  "type": "object",
+  "required": [
+    "ts",
+    "session",
+    "mode",
+    "agent_mail",
+    "beads",
+    "git",
+    "next_actions",
+    "proof_doctor"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "ts": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "agent_mail_healthy",
+        "agent_mail_unavailable_beads_only",
+        "agent_mail_transient_database_recovery"
+      ]
+    },
+    "agent_mail": {
+      "$ref": "#/$defs/agent_mail"
+    },
+    "beads": {
+      "$ref": "#/$defs/beads_snapshot"
+    },
+    "git": {
+      "$ref": "#/$defs/git_snapshot"
+    },
+    "next_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "proof_doctor": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "agent_mail_status": {
+      "type": "string",
+      "enum": [
+        "healthy",
+        "unavailable",
+        "transient_database_recovery"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "am service restart",
+        "am service stop",
+        "am doctor fix",
+        "am doctor repair",
+        "am doctor reconstruct",
+        "kill am/serve-http/mcp-agent-mail",
+        "delete files",
+        "git reset --hard",
+        "git clean -fd",
+        "run local Cargo as proof",
+        "mutate RCH worker",
+        "cancel RCH build"
+      ]
+    },
+    "agent_mail": {
+      "type": "object",
+      "required": [
+        "status",
+        "marker",
+        "retry_count",
+        "forbidden_actions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/agent_mail_status"
+        },
+        "marker": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "forbidden_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/forbidden_action"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "issue_ref": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "status",
+        "priority",
+        "assignee"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "assignee": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "age_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stale_over_2h": {
+          "type": "boolean"
+        }
+      }
+    },
+    "active_agent": {
+      "type": "object",
+      "required": [
+        "assignee",
+        "active_count",
+        "beads"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "assignee": {
+          "type": "string"
+        },
+        "active_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "beads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/issue_ref"
+          }
+        }
+      }
+    },
+    "stale_reopen": {
+      "type": "object",
+      "required": [
+        "default_action",
+        "threshold_seconds",
+        "dirty_risk_level",
+        "high_risk_dirty_count",
+        "dirty_tree_guard",
+        "manual_checks",
+        "active_not_stale",
+        "candidates",
+        "dirty_overlap_unknown"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "default_action": {
+          "type": "string",
+          "const": "do_not_reopen"
+        },
+        "threshold_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dirty_risk_level": {
+          "$ref": "#/$defs/dirty_risk_level"
+        },
+        "high_risk_dirty_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dirty_tree_guard": {
+          "type": "string",
+          "minLength": 1
+        },
+        "manual_checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "active_not_stale": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reopen_recommendation"
+          }
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reopen_recommendation"
+          }
+        },
+        "dirty_overlap_unknown": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dirty_overlap"
+          }
+        }
+      }
+    },
+    "reopen_recommendation": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "assignee",
+        "updated_at",
+        "age_seconds",
+        "recommendation",
+        "reason"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "assignee": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "age_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "recommendation": {
+          "type": "string",
+          "enum": [
+            "do_not_reopen",
+            "status_check_before_reopen"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "beads_snapshot": {
+      "type": "object",
+      "required": [
+        "in_progress_count",
+        "ready_count",
+        "active_agents",
+        "in_progress",
+        "stale_reopen",
+        "ready"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "in_progress_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ready_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "active_agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/active_agent"
+          }
+        },
+        "in_progress": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/issue_ref"
+          }
+        },
+        "stale_reopen": {
+          "$ref": "#/$defs/stale_reopen"
+        },
+        "ready": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/issue_ref"
+          }
+        }
+      }
+    },
+    "dirty_risk_level": {
+      "type": "string",
+      "enum": [
+        "clean",
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "dirty_category": {
+      "type": "string",
+      "enum": [
+        "shared_tracker",
+        "janitor_untracked",
+        "untracked_review_required",
+        "tracked_overlap_risk"
+      ]
+    },
+    "dirty_path": {
+      "type": "object",
+      "required": [
+        "raw",
+        "status",
+        "path",
+        "category",
+        "severity"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "category": {
+          "$ref": "#/$defs/dirty_category"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      }
+    },
+    "dirty_overlap": {
+      "type": "object",
+      "required": [
+        "path",
+        "status",
+        "category",
+        "severity",
+        "recommendation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "category": {
+          "$ref": "#/$defs/dirty_category"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "medium",
+            "high"
+          ]
+        },
+        "recommendation": {
+          "type": "string",
+          "const": "do_not_reopen_related_beads_until_owner_clear"
+        }
+      }
+    },
+    "dirty_domain": {
+      "type": "object",
+      "required": [
+        "category",
+        "severity",
+        "count",
+        "paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/dirty_category"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "conflict_hint": {
+      "type": "object",
+      "required": [
+        "path",
+        "status",
+        "category",
+        "severity",
+        "guidance"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "category": {
+          "$ref": "#/$defs/dirty_category"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "guidance": {
+          "type": "string"
+        }
+      }
+    },
+    "git_snapshot": {
+      "type": "object",
+      "required": [
+        "dirty_count",
+        "tracked_dirty_count",
+        "untracked_dirty_count",
+        "high_risk_count",
+        "risk_level",
+        "risk_reason",
+        "dirty_domains",
+        "dirty_paths",
+        "conflict_hints"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "dirty_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tracked_dirty_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "untracked_dirty_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "high_risk_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "risk_level": {
+          "$ref": "#/$defs/dirty_risk_level"
+        },
+        "risk_reason": {
+          "type": "string"
+        },
+        "dirty_domains": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dirty_domain"
+          }
+        },
+        "dirty_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dirty_path"
+          }
+        },
+        "conflict_hints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/conflict_hint"
+          }
+        }
+      }
+    }
+  }
+}

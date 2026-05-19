@@ -1,0 +1,704 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_failover.snapshot.fixture_corpus.v1",
+  "source_bead": "ft-5lsqo.1",
+  "schema": "docs/json-schema/ft-agent-mail-failover-snapshot.json",
+  "contract": "docs/robot-contracts/agent-mail-failover.md",
+  "fixtures": [
+    {
+      "id": "healthy-agent-mail",
+      "covers": [
+        "healthy_agent_mail"
+      ],
+      "snapshot": {
+        "ts": "2026-05-18T04:30:00Z",
+        "session": "frankenterm",
+        "mode": "agent_mail_healthy",
+        "agent_mail": {
+          "status": "healthy",
+          "marker": "Agent Mail reachable; normal mailbox coordination is available.",
+          "retry_count": 0,
+          "last_error": null,
+          "forbidden_actions": [
+            "am service restart",
+            "am service stop",
+            "am doctor fix",
+            "am doctor repair",
+            "am doctor reconstruct",
+            "kill am/serve-http/mcp-agent-mail",
+            "delete files",
+            "git reset --hard",
+            "git clean -fd",
+            "run local Cargo as proof",
+            "mutate RCH worker",
+            "cancel RCH build"
+          ]
+        },
+        "beads": {
+          "in_progress_count": 1,
+          "ready_count": 1,
+          "active_agents": [
+            {
+              "assignee": "EmeraldBear",
+              "active_count": 1,
+              "beads": [
+                {
+                  "id": "ft-5lsqo.1",
+                  "title": "Fallback snapshot schema and retained fixture corpus",
+                  "status": "in_progress",
+                  "priority": 2,
+                  "assignee": "EmeraldBear",
+                  "updated_at": "2026-05-18T04:28:00Z",
+                  "age_seconds": 120,
+                  "stale_over_2h": false
+                }
+              ]
+            }
+          ],
+          "in_progress": [
+            {
+              "id": "ft-5lsqo.1",
+              "title": "Fallback snapshot schema and retained fixture corpus",
+              "status": "in_progress",
+              "priority": 2,
+              "assignee": "EmeraldBear",
+              "updated_at": "2026-05-18T04:28:00Z",
+              "age_seconds": 120,
+              "stale_over_2h": false
+            }
+          ],
+          "stale_reopen": {
+            "default_action": "do_not_reopen",
+            "threshold_seconds": 7200,
+            "dirty_risk_level": "clean",
+            "high_risk_dirty_count": 0,
+            "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+            "manual_checks": [
+              "br show <id> --json",
+              "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+              "git status --short --untracked-files=all"
+            ],
+            "active_not_stale": [
+              {
+                "id": "ft-5lsqo.1",
+                "title": "Fallback snapshot schema and retained fixture corpus",
+                "assignee": "EmeraldBear",
+                "updated_at": "2026-05-18T04:28:00Z",
+                "age_seconds": 120,
+                "recommendation": "do_not_reopen",
+                "reason": "Updated inside the stale threshold; treat as active while Agent Mail is unavailable."
+              }
+            ],
+            "candidates": [],
+            "dirty_overlap_unknown": []
+          },
+          "ready": [
+            {
+              "id": "ft-5lsqo.2",
+              "title": "Retry classifier and no-repair reason codes",
+              "status": "open",
+              "priority": 2,
+              "assignee": "unassigned"
+            }
+          ]
+        },
+        "git": {
+          "dirty_count": 0,
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 0,
+          "high_risk_count": 0,
+          "risk_level": "clean",
+          "risk_reason": "worktree is clean",
+          "dirty_domains": [],
+          "dirty_paths": [],
+          "conflict_hints": []
+        },
+        "next_actions": [
+          "Use Agent Mail for direct coordination while it is healthy.",
+          "Keep Beads state current and cite proof commands in closeout."
+        ],
+        "proof_doctor": "coordination snapshot only; no Cargo/RCH proof lane claimed."
+      }
+    },
+    {
+      "id": "unavailable-after-retry",
+      "covers": [
+        "unavailable_after_retry"
+      ],
+      "snapshot": {
+        "ts": "2026-05-18T04:31:00Z",
+        "session": "frankenterm",
+        "mode": "agent_mail_unavailable_beads_only",
+        "agent_mail": {
+          "status": "unavailable",
+          "marker": "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+          "retry_count": 1,
+          "last_error": "connection refused after retry",
+          "forbidden_actions": [
+            "am service restart",
+            "am service stop",
+            "am doctor fix",
+            "am doctor repair",
+            "am doctor reconstruct",
+            "kill am/serve-http/mcp-agent-mail",
+            "delete files",
+            "git reset --hard",
+            "git clean -fd",
+            "run local Cargo as proof",
+            "mutate RCH worker",
+            "cancel RCH build"
+          ]
+        },
+        "beads": {
+          "in_progress_count": 0,
+          "ready_count": 0,
+          "active_agents": [],
+          "in_progress": [],
+          "stale_reopen": {
+            "default_action": "do_not_reopen",
+            "threshold_seconds": 7200,
+            "dirty_risk_level": "clean",
+            "high_risk_dirty_count": 0,
+            "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+            "manual_checks": [
+              "br show <id> --json",
+              "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+              "git status --short --untracked-files=all"
+            ],
+            "active_not_stale": [],
+            "candidates": [],
+            "dirty_overlap_unknown": []
+          },
+          "ready": []
+        },
+        "git": {
+          "dirty_count": 0,
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 0,
+          "high_risk_count": 0,
+          "risk_level": "clean",
+          "risk_reason": "worktree is clean",
+          "dirty_domains": [],
+          "dirty_paths": [],
+          "conflict_hints": []
+        },
+        "next_actions": [
+          "Use Beads status as the coordination source of truth until Agent Mail recovers.",
+          "Record this snapshot in the Beads comment when closing or handing off work."
+        ],
+        "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."
+      }
+    },
+    {
+      "id": "transient-database-recovery",
+      "covers": [
+        "transient_database_recovery_message"
+      ],
+      "snapshot": {
+        "ts": "2026-05-18T04:32:00Z",
+        "session": "frankenterm",
+        "mode": "agent_mail_transient_database_recovery",
+        "agent_mail": {
+          "status": "transient_database_recovery",
+          "marker": "Agent Mail reported transient database recovery; retry once, then use Beads-only fallback without repair.",
+          "retry_count": 1,
+          "last_error": "database is in recovery mode; retry later",
+          "forbidden_actions": [
+            "am service restart",
+            "am service stop",
+            "am doctor fix",
+            "am doctor repair",
+            "am doctor reconstruct",
+            "kill am/serve-http/mcp-agent-mail",
+            "delete files",
+            "git reset --hard",
+            "git clean -fd",
+            "run local Cargo as proof",
+            "mutate RCH worker",
+            "cancel RCH build"
+          ]
+        },
+        "beads": {
+          "in_progress_count": 0,
+          "ready_count": 1,
+          "active_agents": [],
+          "in_progress": [],
+          "stale_reopen": {
+            "default_action": "do_not_reopen",
+            "threshold_seconds": 7200,
+            "dirty_risk_level": "clean",
+            "high_risk_dirty_count": 0,
+            "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+            "manual_checks": [
+              "br show <id> --json",
+              "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+              "git status --short --untracked-files=all"
+            ],
+            "active_not_stale": [],
+            "candidates": [],
+            "dirty_overlap_unknown": []
+          },
+          "ready": [
+            {
+              "id": "ft-5lsqo.2",
+              "title": "Retry classifier and no-repair reason codes",
+              "status": "open",
+              "priority": 2,
+              "assignee": "unassigned"
+            }
+          ]
+        },
+        "git": {
+          "dirty_count": 0,
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 0,
+          "high_risk_count": 0,
+          "risk_level": "clean",
+          "risk_reason": "worktree is clean",
+          "dirty_domains": [],
+          "dirty_paths": [],
+          "conflict_hints": []
+        },
+        "next_actions": [
+          "Do not repair or reconstruct Agent Mail.",
+          "Use Beads status as the coordination source of truth until Agent Mail recovers."
+        ],
+        "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."
+      }
+    },
+    {
+      "id": "no-in-progress-beads",
+      "covers": [
+        "no_in_progress_beads"
+      ],
+      "snapshot": {
+        "ts": "2026-05-18T04:33:00Z",
+        "session": "frankenterm",
+        "mode": "agent_mail_unavailable_beads_only",
+        "agent_mail": {
+          "status": "unavailable",
+          "marker": "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+          "retry_count": 1,
+          "last_error": "timeout",
+          "forbidden_actions": [
+            "am service restart",
+            "am service stop",
+            "am doctor fix",
+            "am doctor repair",
+            "am doctor reconstruct",
+            "kill am/serve-http/mcp-agent-mail",
+            "delete files",
+            "git reset --hard",
+            "git clean -fd",
+            "run local Cargo as proof",
+            "mutate RCH worker",
+            "cancel RCH build"
+          ]
+        },
+        "beads": {
+          "in_progress_count": 0,
+          "ready_count": 2,
+          "active_agents": [],
+          "in_progress": [],
+          "stale_reopen": {
+            "default_action": "do_not_reopen",
+            "threshold_seconds": 7200,
+            "dirty_risk_level": "clean",
+            "high_risk_dirty_count": 0,
+            "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+            "manual_checks": [
+              "br show <id> --json",
+              "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+              "git status --short --untracked-files=all"
+            ],
+            "active_not_stale": [],
+            "candidates": [],
+            "dirty_overlap_unknown": []
+          },
+          "ready": [
+            {
+              "id": "ft-5lsqo.2",
+              "title": "Retry classifier and no-repair reason codes",
+              "status": "open",
+              "priority": 2,
+              "assignee": "unassigned"
+            },
+            {
+              "id": "ft-5lsqo.3",
+              "title": "Stale-reopen guard and dirty-tree overlap policy",
+              "status": "open",
+              "priority": 2,
+              "assignee": "unassigned"
+            }
+          ]
+        },
+        "git": {
+          "dirty_count": 0,
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 0,
+          "high_risk_count": 0,
+          "risk_level": "clean",
+          "risk_reason": "worktree is clean",
+          "dirty_domains": [],
+          "dirty_paths": [],
+          "conflict_hints": []
+        },
+        "next_actions": [
+          "Use br ready and bv robot output to select a safe next bead.",
+          "Do not fabricate active agents when in_progress is empty."
+        ],
+        "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."
+      }
+    },
+    {
+      "id": "stale-candidates-present",
+      "covers": [
+        "stale_candidates_present"
+      ],
+      "snapshot": {
+        "ts": "2026-05-18T04:34:00Z",
+        "session": "frankenterm",
+        "mode": "agent_mail_unavailable_beads_only",
+        "agent_mail": {
+          "status": "unavailable",
+          "marker": "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+          "retry_count": 1,
+          "last_error": "socket unavailable",
+          "forbidden_actions": [
+            "am service restart",
+            "am service stop",
+            "am doctor fix",
+            "am doctor repair",
+            "am doctor reconstruct",
+            "kill am/serve-http/mcp-agent-mail",
+            "delete files",
+            "git reset --hard",
+            "git clean -fd",
+            "run local Cargo as proof",
+            "mutate RCH worker",
+            "cancel RCH build"
+          ]
+        },
+        "beads": {
+          "in_progress_count": 1,
+          "ready_count": 0,
+          "active_agents": [
+            {
+              "assignee": "OldAgent",
+              "active_count": 1,
+              "beads": [
+                {
+                  "id": "ft-abc12.1",
+                  "title": "Long-stale example",
+                  "status": "in_progress",
+                  "priority": 2,
+                  "assignee": "OldAgent",
+                  "updated_at": "2026-05-18T00:00:00Z",
+                  "age_seconds": 16440,
+                  "stale_over_2h": true
+                }
+              ]
+            }
+          ],
+          "in_progress": [
+            {
+              "id": "ft-abc12.1",
+              "title": "Long-stale example",
+              "status": "in_progress",
+              "priority": 2,
+              "assignee": "OldAgent",
+              "updated_at": "2026-05-18T00:00:00Z",
+              "age_seconds": 16440,
+              "stale_over_2h": true
+            }
+          ],
+          "stale_reopen": {
+            "default_action": "do_not_reopen",
+            "threshold_seconds": 7200,
+            "dirty_risk_level": "clean",
+            "high_risk_dirty_count": 0,
+            "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+            "manual_checks": [
+              "br show <id> --json",
+              "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+              "git status --short --untracked-files=all"
+            ],
+            "active_not_stale": [],
+            "candidates": [
+              {
+                "id": "ft-abc12.1",
+                "title": "Long-stale example",
+                "assignee": "OldAgent",
+                "updated_at": "2026-05-18T00:00:00Z",
+                "age_seconds": 16440,
+                "recommendation": "status_check_before_reopen",
+                "reason": "Stale threshold exceeded, but red-mail mode cannot prove abandonment from age alone.",
+                "required_evidence": [
+                  "No recent br comments or handoff",
+                  "Latest fallback snapshot still marks the bead stale",
+                  "Dirty paths do not overlap expected files for the bead",
+                  "Assignee is unreachable or explicitly inactive"
+                ]
+              }
+            ],
+            "dirty_overlap_unknown": []
+          },
+          "ready": []
+        },
+        "git": {
+          "dirty_count": 0,
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 0,
+          "high_risk_count": 0,
+          "risk_level": "clean",
+          "risk_reason": "worktree is clean",
+          "dirty_domains": [],
+          "dirty_paths": [],
+          "conflict_hints": []
+        },
+        "next_actions": [
+          "Comment for status before reopening the stale bead.",
+          "If Agent Mail recovers, ask or acknowledge the assignee before reopening."
+        ],
+        "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."
+      }
+    },
+    {
+      "id": "dirty-tracked-overlap",
+      "covers": [
+        "dirty_tracked_overlap"
+      ],
+      "snapshot": {
+        "ts": "2026-05-18T04:35:00Z",
+        "session": "frankenterm",
+        "mode": "agent_mail_unavailable_beads_only",
+        "agent_mail": {
+          "status": "unavailable",
+          "marker": "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+          "retry_count": 1,
+          "last_error": "timeout",
+          "forbidden_actions": [
+            "am service restart",
+            "am service stop",
+            "am doctor fix",
+            "am doctor repair",
+            "am doctor reconstruct",
+            "kill am/serve-http/mcp-agent-mail",
+            "delete files",
+            "git reset --hard",
+            "git clean -fd",
+            "run local Cargo as proof",
+            "mutate RCH worker",
+            "cancel RCH build"
+          ]
+        },
+        "beads": {
+          "in_progress_count": 1,
+          "ready_count": 0,
+          "active_agents": [],
+          "in_progress": [
+            {
+              "id": "ft-def34.1",
+              "title": "Dirty overlap example",
+              "status": "in_progress",
+              "priority": 2,
+              "assignee": "Unknown",
+              "updated_at": "2026-05-18T00:00:00Z",
+              "age_seconds": 16500,
+              "stale_over_2h": true
+            }
+          ],
+          "stale_reopen": {
+            "default_action": "do_not_reopen",
+            "threshold_seconds": 7200,
+            "dirty_risk_level": "high",
+            "high_risk_dirty_count": 1,
+            "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+            "manual_checks": [
+              "br show <id> --json",
+              "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+              "git status --short --untracked-files=all"
+            ],
+            "active_not_stale": [],
+            "candidates": [
+              {
+                "id": "ft-def34.1",
+                "title": "Dirty overlap example",
+                "assignee": "Unknown",
+                "updated_at": "2026-05-18T00:00:00Z",
+                "age_seconds": 16500,
+                "recommendation": "status_check_before_reopen",
+                "reason": "Stale threshold exceeded, but dirty tracked paths may belong to the assignee."
+              }
+            ],
+            "dirty_overlap_unknown": [
+              {
+                "path": "crates/frankenterm-core/src/runtime.rs",
+                "status": " M",
+                "category": "tracked_overlap_risk",
+                "severity": "high",
+                "recommendation": "do_not_reopen_related_beads_until_owner_clear"
+              }
+            ]
+          },
+          "ready": []
+        },
+        "git": {
+          "dirty_count": 1,
+          "tracked_dirty_count": 1,
+          "untracked_dirty_count": 0,
+          "high_risk_count": 1,
+          "risk_level": "high",
+          "risk_reason": "tracked or shared coordination files are already dirty",
+          "dirty_domains": [
+            {
+              "category": "tracked_overlap_risk",
+              "severity": "high",
+              "count": 1,
+              "paths": [
+                "crates/frankenterm-core/src/runtime.rs"
+              ]
+            }
+          ],
+          "dirty_paths": [
+            {
+              "raw": " M crates/frankenterm-core/src/runtime.rs",
+              "status": " M",
+              "path": "crates/frankenterm-core/src/runtime.rs",
+              "category": "tracked_overlap_risk",
+              "severity": "high"
+            }
+          ],
+          "conflict_hints": [
+            {
+              "path": "crates/frankenterm-core/src/runtime.rs",
+              "status": " M",
+              "category": "tracked_overlap_risk",
+              "severity": "high",
+              "guidance": "Tracked file already has local changes; treat as another active pane work item until ownership is known."
+            }
+          ]
+        },
+        "next_actions": [
+          "Do not reopen related beads until the dirty tracked owner is clear.",
+          "Record the dirty path in any handoff comment."
+        ],
+        "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."
+      }
+    },
+    {
+      "id": "untracked-review-required",
+      "covers": [
+        "untracked_review_required"
+      ],
+      "snapshot": {
+        "ts": "2026-05-18T04:36:00Z",
+        "session": "frankenterm",
+        "mode": "agent_mail_unavailable_beads_only",
+        "agent_mail": {
+          "status": "unavailable",
+          "marker": "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+          "retry_count": 1,
+          "last_error": "timeout",
+          "forbidden_actions": [
+            "am service restart",
+            "am service stop",
+            "am doctor fix",
+            "am doctor repair",
+            "am doctor reconstruct",
+            "kill am/serve-http/mcp-agent-mail",
+            "delete files",
+            "git reset --hard",
+            "git clean -fd",
+            "run local Cargo as proof",
+            "mutate RCH worker",
+            "cancel RCH build"
+          ]
+        },
+        "beads": {
+          "in_progress_count": 0,
+          "ready_count": 1,
+          "active_agents": [],
+          "in_progress": [],
+          "stale_reopen": {
+            "default_action": "do_not_reopen",
+            "threshold_seconds": 7200,
+            "dirty_risk_level": "medium",
+            "high_risk_dirty_count": 0,
+            "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+            "manual_checks": [
+              "br show <id> --json",
+              "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+              "git status --short --untracked-files=all"
+            ],
+            "active_not_stale": [],
+            "candidates": [],
+            "dirty_overlap_unknown": [
+              {
+                "path": "docs/draft-handoff.md",
+                "status": "??",
+                "category": "untracked_review_required",
+                "severity": "medium",
+                "recommendation": "do_not_reopen_related_beads_until_owner_clear"
+              }
+            ]
+          },
+          "ready": [
+            {
+              "id": "ft-5lsqo.2",
+              "title": "Retry classifier and no-repair reason codes",
+              "status": "open",
+              "priority": 2,
+              "assignee": "unassigned"
+            }
+          ]
+        },
+        "git": {
+          "dirty_count": 1,
+          "tracked_dirty_count": 0,
+          "untracked_dirty_count": 1,
+          "high_risk_count": 0,
+          "risk_level": "medium",
+          "risk_reason": "only untracked review-required paths are dirty",
+          "dirty_domains": [
+            {
+              "category": "untracked_review_required",
+              "severity": "medium",
+              "count": 1,
+              "paths": [
+                "docs/draft-handoff.md"
+              ]
+            }
+          ],
+          "dirty_paths": [
+            {
+              "raw": "?? docs/draft-handoff.md",
+              "status": "??",
+              "path": "docs/draft-handoff.md",
+              "category": "untracked_review_required",
+              "severity": "medium"
+            }
+          ],
+          "conflict_hints": [
+            {
+              "path": "docs/draft-handoff.md",
+              "status": "??",
+              "category": "untracked_review_required",
+              "severity": "medium",
+              "guidance": "Untracked path needs ownership review before editing or staging."
+            }
+          ]
+        },
+        "next_actions": [
+          "Review untracked paths before editing or staging.",
+          "Do not treat untracked paths as cleanup authorization."
+        ],
+        "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."
+      }
+    }
+  ],
+  "verification": [
+    "jq empty docs/json-schema/ft-agent-mail-failover-snapshot.json fixtures/agent-mail-failover/snapshots.v1.json",
+    "bash fixtures/agent-mail-failover/verify-fallback-snapshots.sh"
+  ]
+}

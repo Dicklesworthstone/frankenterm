@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.local_superseded_agent_mail_failover_runbook_draft.v1",
+  "source_bead": "ft-5lsqo.5",
+  "status": "superseded_local_draft",
+  "superseded_by_commit": "42446024e",
+  "note": "This untracked local draft was created during a duplicate ft-5lsqo.5 attempt after the committed runbook had already landed. It is intentionally inert and must not be included as proof."
+}
