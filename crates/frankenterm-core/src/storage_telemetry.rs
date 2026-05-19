@@ -1090,9 +1090,17 @@ mod tests {
         }
     }
 
+    fn poison_test_lock(message: &'static str) -> ! {
+        std::panic::panic_any(message);
+    }
+
     fn make_lag(latest_offset: u64, offsets_behind: u64) -> RecorderStorageLag {
         RecorderStorageLag {
-            latest_offset: Some(RecorderOffset(latest_offset)),
+            latest_offset: Some(RecorderOffset {
+                segment_id: 0,
+                byte_offset: latest_offset,
+                ordinal: latest_offset,
+            }),
             consumers: vec![RecorderConsumerLag {
                 consumer: CheckpointConsumerId("test-consumer".to_string()),
                 offsets_behind,
@@ -1239,7 +1247,7 @@ mod tests {
                 .last_health
                 .write()
                 .expect("health lock should start clean");
-            panic!("intentional storage health poison");
+            poison_test_lock("intentional storage health poison");
         }));
         assert!(poison.is_err());
 
@@ -1259,7 +1267,7 @@ mod tests {
         let telem = StorageTelemetry::with_defaults();
         let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = telem.last_lag.write().expect("lag lock should start clean");
-            panic!("intentional storage lag poison");
+            poison_test_lock("intentional storage lag poison");
         }));
         assert!(poison.is_err());
 
@@ -1267,7 +1275,14 @@ mod tests {
 
         let snapshot = telem.snapshot();
         let lag = snapshot.lag.expect("lag snapshot should survive poison");
-        assert_eq!(lag.latest_offset, Some(RecorderOffset(12)));
+        assert_eq!(
+            lag.latest_offset,
+            Some(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 12,
+                ordinal: 12,
+            })
+        );
         assert_eq!(lag.consumers[0].offsets_behind, 34);
         assert!(
             telem.last_lag.read().is_ok(),
@@ -1283,7 +1298,7 @@ mod tests {
                 .rate_ewma
                 .lock()
                 .expect("rate lock should start clean");
-            panic!("intentional storage rate poison");
+            poison_test_lock("intentional storage rate poison");
         }));
         assert!(poison.is_err());
 
