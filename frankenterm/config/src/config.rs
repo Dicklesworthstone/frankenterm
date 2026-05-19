@@ -1301,9 +1301,42 @@ impl Config {
         // multiple.  In addition, it spawns a lot of subprocesses,
         // so we do this bit "by-hand"
 
-        let mut paths = vec![PathPossibility::optional(HOME_DIR.join(".wezterm.lua"))];
+        // Priority order (first match wins):
+        //   1. ~/.frankenterm.lua              — explicit FrankenTerm-only top-level config
+        //   2. dir/frankenterm.lua  ∀ dir       — per-config-dir FrankenTerm-named config
+        //   3. ~/.wezterm.lua                  — back-compat with users sharing config
+        //   4. dir/wezterm.lua      ∀ dir       — back-compat
+        // `CONFIG_DIRS` itself lists FrankenTerm-namespaced dirs first
+        // (~/.config/frankenterm/) and the wezterm-namespaced dirs after, so
+        // a FrankenTerm-namespaced `wezterm.lua` still beats a wezterm-namespaced
+        // one if a user prefers the wezterm filename inside the FrankenTerm dir.
+        let mut paths = vec![PathPossibility::optional(HOME_DIR.join(".frankenterm.lua"))];
         for dir in CONFIG_DIRS.iter() {
-            paths.push(PathPossibility::optional(dir.join("wezterm.lua")))
+            paths.push(PathPossibility::optional(dir.join("frankenterm.lua")));
+        }
+        paths.push(PathPossibility::optional(HOME_DIR.join(".wezterm.lua")));
+        for dir in CONFIG_DIRS.iter() {
+            paths.push(PathPossibility::optional(dir.join("wezterm.lua")));
+        }
+
+        // Last-resort fallback: bundled default config that ships inside the
+        // FrankenTerm.app on macOS (Contents/Resources/{frankenterm,wezterm}.lua).
+        // Lets a freshly-installed app launch with sensible defaults — fonts,
+        // ssh-domain remotes, keybindings, host-aware colors — without the user
+        // having to author a config first. User configs above still win.
+        #[cfg(target_os = "macos")]
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
+                    if let Some(contents_dir) = exe_dir.parent() {
+                        let resources = contents_dir.join("Resources");
+                        paths.push(PathPossibility::optional(
+                            resources.join("frankenterm.lua"),
+                        ));
+                        paths.push(PathPossibility::optional(resources.join("wezterm.lua")));
+                    }
+                }
+            }
         }
 
         if cfg!(windows) {
@@ -1320,6 +1353,10 @@ impl Config {
                     paths.insert(0, PathPossibility::optional(exe_dir.join("wezterm.lua")));
                 }
             }
+        }
+        if let Some(path) = std::env::var_os("FRANKENTERM_CONFIG_FILE") {
+            log::trace!("Note: FRANKENTERM_CONFIG_FILE is set in the environment");
+            paths.insert(0, PathPossibility::required(path.into()));
         }
         if let Some(path) = std::env::var_os("WEZTERM_CONFIG_FILE") {
             log::trace!("Note: WEZTERM_CONFIG_FILE is set in the environment");

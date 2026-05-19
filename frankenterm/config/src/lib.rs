@@ -507,6 +507,12 @@ pub(crate) fn frankenterm_config_dirs() -> Vec<PathBuf> {
 
 fn config_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    // FrankenTerm-namespaced config locations take precedence so a side-by-side
+    // wezterm install on the same machine doesn't have its config silently
+    // co-opted by FrankenTerm. A user who wants the two clients to share config
+    // can still place files under ~/.config/wezterm/ — that path is searched
+    // below as a fallback.
+    dirs.extend(frankenterm_config_dirs());
     dirs.push(xdg_config_home());
 
     #[cfg(unix)]
