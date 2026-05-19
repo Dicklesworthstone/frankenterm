@@ -20351,6 +20351,7 @@ async fn bootstrap_recorder_backend_with_probe(
     let make_config = |backend| RecorderStorageConfig {
         backend,
         append_log: append_log.clone(),
+        frankensqlite: Default::default(),
     };
     let attempt_bootstrap = |backend| bootstrap_recorder_storage(make_config(backend));
 
@@ -39323,25 +39324,34 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             match setup::locate_wezterm_config() {
                                 Ok(config_path) => match fs::read_to_string(&config_path) {
                                     Ok(content) => {
-                                        if setup::has_ft_block(&content) {
-                                            let existing = setup::extract_ft_block(&content)
-                                                .unwrap_or_default();
-                                            if existing.trim_end() == ft_block.trim_end() {
+                                        match setup::extract_ft_block_checked(&content) {
+                                            Ok(Some(existing)) => {
+                                                if existing.trim_end() == ft_block.trim_end() {
+                                                    println!(
+                                                        "✓ ft-managed block already up to date in {}",
+                                                        config_path.display()
+                                                    );
+                                                } else {
+                                                    println!(
+                                                        "• ft-managed block would be updated in {}",
+                                                        config_path.display()
+                                                    );
+                                                }
+                                            }
+                                            Ok(None) => {
                                                 println!(
-                                                    "✓ ft-managed block already up to date in {}",
-                                                    config_path.display()
-                                                );
-                                            } else {
-                                                println!(
-                                                    "• ft-managed block would be updated in {}",
+                                                    "• ft-managed block would be added to {}",
                                                     config_path.display()
                                                 );
                                             }
-                                        } else {
-                                            println!(
-                                                "• ft-managed block would be added to {}",
-                                                config_path.display()
-                                            );
+                                            Err(err) => {
+                                                eprintln!(
+                                                    "Error: Invalid ft-managed block in {}: {}",
+                                                    config_path.display(),
+                                                    err
+                                                );
+                                                std::process::exit(1);
+                                            }
                                         }
                                     }
                                     Err(err) => {

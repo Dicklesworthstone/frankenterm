@@ -814,16 +814,7 @@ impl AppendLogRecorderStorage {
     }
 
     fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
-        let current = self.in_flight.load(Ordering::Acquire);
-        if current >= self.config.queue_capacity {
-            return Err(RecorderStorageError::QueueFull {
-                capacity: self.config.queue_capacity,
-            });
-        }
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        Ok(InFlightGuard {
-            counter: &self.in_flight,
-        })
+        try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
     }
 
     fn persist_state(
@@ -909,6 +900,28 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
+fn try_acquire_bounded_slot(
+    counter: &AtomicUsize,
+    capacity: usize,
+) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= capacity {
+            return Err(RecorderStorageError::QueueFull { capacity });
+        }
+
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(InFlightGuard { counter }),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl RecorderStorage for AppendLogRecorderStorage {
     fn backend_kind(&self) -> RecorderBackendKind {
         RecorderBackendKind::AppendLog
@@ -944,7 +957,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
             });
         }
 
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
         let AppendRequest {
             batch_id,
             events,
@@ -1229,16 +1242,7 @@ impl FrankenSqliteRecorderStorage {
     }
 
     fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
-        let current = self.in_flight.load(Ordering::Acquire);
-        if current >= self.config.queue_capacity {
-            return Err(RecorderStorageError::QueueFull {
-                capacity: self.config.queue_capacity,
-            });
-        }
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        Ok(InFlightGuard {
-            counter: &self.in_flight,
-        })
+        try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
     }
 
     fn clear_last_error(inner: &mut FrankenSqliteInner) {
@@ -2164,6 +2168,8 @@ mod tests {
         RecorderEventPayload, RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel,
         RecorderTextEncoding,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
 
     fn run_async_test<F>(future: F)
@@ -2338,6 +2344,85 @@ mod tests {
     }
 
     #[test]
+    fn append_log_slot_admission_is_atomic_at_capacity_one() {
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.queue_capacity = 1;
+        let storage = Arc::new(AppendLogRecorderStorage::open(cfg).unwrap());
+        let attempts = 32usize;
+        let start = Arc::new(Barrier::new(attempts));
+        let release = Arc::new(Barrier::new(attempts));
+        let successes = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..attempts)
+            .map(|_| {
+                let storage = Arc::clone(&storage);
+                let start = Arc::clone(&start);
+                let release = Arc::clone(&release);
+                let successes = Arc::clone(&successes);
+                std::thread::spawn(move || {
+                    start.wait();
+                    let guard = storage.try_acquire_slot().ok();
+                    if guard.is_some() {
+                        successes.fetch_add(1, Ordering::AcqRel);
+                    }
+                    release.wait();
+                    drop(guard);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(successes.load(Ordering::Acquire), 1);
+        assert_eq!(storage.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn frankensqlite_slot_admission_is_atomic_at_capacity_one() {
+        let dir = tempdir().unwrap();
+        let cfg = FrankenSqliteStorageConfig {
+            db_path: dir.path().join("recorder.sqlite3"),
+            queue_capacity: 1,
+            max_batch_events: 16,
+            max_batch_bytes: 128 * 1024,
+            max_idempotency_entries: 8,
+        };
+        let storage = Arc::new(FrankenSqliteRecorderStorage::open(cfg).unwrap());
+        let attempts = 32usize;
+        let start = Arc::new(Barrier::new(attempts));
+        let release = Arc::new(Barrier::new(attempts));
+        let successes = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..attempts)
+            .map(|_| {
+                let storage = Arc::clone(&storage);
+                let start = Arc::clone(&start);
+                let release = Arc::clone(&release);
+                let successes = Arc::clone(&successes);
+                std::thread::spawn(move || {
+                    start.wait();
+                    let guard = storage.try_acquire_slot().ok();
+                    if guard.is_some() {
+                        successes.fetch_add(1, Ordering::AcqRel);
+                    }
+                    release.wait();
+                    drop(guard);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(successes.load(Ordering::Acquire), 1);
+        assert_eq!(storage.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn recorder_storage_config_serde_roundtrip() {
         let dir = tempdir().unwrap();
         let config = recorder_test_config(dir.path());
@@ -2363,6 +2448,92 @@ mod tests {
         });
         let config = serde_json::from_value::<RecorderStorageConfig>(value).unwrap();
         assert_eq!(config.backend, RecorderBackendKind::FrankenSqlite);
+    }
+
+    #[test]
+    fn bounded_slot_admission_rejects_second_live_guard() {
+        let counter = AtomicUsize::new(0);
+        let first = try_acquire_bounded_slot(&counter, 1).unwrap();
+
+        let second = try_acquire_bounded_slot(&counter, 1);
+        assert!(matches!(
+            second,
+            Err(RecorderStorageError::QueueFull { capacity: 1 })
+        ));
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+
+        drop(first);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        let reacquired = try_acquire_bounded_slot(&counter, 1).unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        drop(reacquired);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounded_slot_admission_stays_at_capacity_one_under_contention() {
+        let attempts = 32;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(attempts));
+        let attempted = Arc::new(Barrier::new(attempts));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let queue_full = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..attempts {
+                let counter = Arc::clone(&counter);
+                let start = Arc::clone(&start);
+                let attempted = Arc::clone(&attempted);
+                let successes = Arc::clone(&successes);
+                let queue_full = Arc::clone(&queue_full);
+
+                scope.spawn(move || {
+                    start.wait();
+                    let acquired = match try_acquire_bounded_slot(&counter, 1) {
+                        Ok(guard) => {
+                            successes.fetch_add(1, Ordering::AcqRel);
+                            Some(guard)
+                        }
+                        Err(RecorderStorageError::QueueFull { capacity: 1 }) => {
+                            queue_full.fetch_add(1, Ordering::AcqRel);
+                            None
+                        }
+                        Err(err) => panic!("unexpected bounded-slot admission error: {err}"),
+                    };
+                    attempted.wait();
+                    drop(acquired);
+                });
+            }
+        });
+
+        assert_eq!(successes.load(Ordering::Acquire), 1);
+        assert_eq!(queue_full.load(Ordering::Acquire), attempts - 1);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concrete_storage_slot_admission_guards_share_bounded_helper() {
+        let append_dir = tempdir().unwrap();
+        let mut append_config = test_config(append_dir.path());
+        append_config.queue_capacity = 1;
+        let append_storage = AppendLogRecorderStorage::open(append_config).unwrap();
+        let append_first = append_storage.try_acquire_slot().unwrap();
+        assert!(matches!(
+            append_storage.try_acquire_slot(),
+            Err(RecorderStorageError::QueueFull { capacity: 1 })
+        ));
+        drop(append_first);
+
+        let sqlite_dir = tempdir().unwrap();
+        let mut sqlite_config = recorder_test_config(sqlite_dir.path()).frankensqlite;
+        sqlite_config.queue_capacity = 1;
+        let sqlite_storage = FrankenSqliteRecorderStorage::open(sqlite_config).unwrap();
+        let sqlite_first = sqlite_storage.try_acquire_slot().unwrap();
+        assert!(matches!(
+            sqlite_storage.try_acquire_slot(),
+            Err(RecorderStorageError::QueueFull { capacity: 1 })
+        ));
+        drop(sqlite_first);
     }
 
     #[test]
