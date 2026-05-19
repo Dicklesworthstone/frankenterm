@@ -72,11 +72,16 @@ Fixtures live under `fixtures/rch-worker-storage-recovery-proof/`:
 - `valid/blocked-no-admissible-worker.json`
 - `valid/blocked-new-reason.json`
 - `valid/failed-remote-smoke.json`
+- `valid/invalid-missing-approval.json`
 
 All fixtures are schema-valid. Only `passed-remote-smoke.json` allows
 `ft4tp7g` closeout. The blocked fixtures require remote-smoke skip evidence and
 a stable reason code. The failed-smoke fixture proves that selecting a worker is
-not enough; the material remote smoke must complete successfully.
+not enough; the material remote smoke must complete successfully. The
+`invalid-missing-approval` fixture covers `invalid_missing_approval`: without an
+approval artifact and operator recovery reference, the proof gate is invalid,
+remote-required proof commands remain not-attempted, and `ft-4tp7g` closeout is
+forbidden.
 
 ## Proof Posture
 

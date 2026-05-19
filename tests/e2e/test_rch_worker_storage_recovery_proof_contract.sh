@@ -42,12 +42,14 @@ EXPECTED_FIXTURE_IDS = %w[
   blocked-no-admissible-worker
   blocked-new-reason
   failed-remote-smoke
+  invalid-missing-approval
 ].freeze
 EXPECTED_RESULTS = {
   "passed-remote-smoke" => "passed_remote_smoke",
   "blocked-no-admissible-worker" => "blocked_no_admissible_worker",
   "blocked-new-reason" => "blocked_new_reason",
-  "failed-remote-smoke" => "failed_remote_smoke"
+  "failed-remote-smoke" => "failed_remote_smoke",
+  "invalid-missing-approval" => "invalid_missing_approval"
 }.freeze
 EXPECTED_FORBIDDEN = %w[
   run_local_cargo_as_proof
@@ -99,7 +101,7 @@ fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-rch-worker-stora
 fail!("contract id const missing") unless schema.dig("properties", "contract_id", "const") == "ft.rch_worker_storage_recovery_proof.v1"
 fail!("source bead const missing") unless schema.dig("properties", "source_bead", "const") == "ft-5xwsu.3"
 fail!("approval contract const missing") unless schema.dig("properties", "approval_contract_id", "const") == "ft.rch_worker_storage_approval.v1"
-fail!("gate result enum drifted") unless schema.dig("$defs", "gate_result", "enum").sort == EXPECTED_RESULTS.values.push("invalid_missing_approval").sort
+fail!("gate result enum drifted") unless schema.dig("$defs", "gate_result", "enum").sort == EXPECTED_RESULTS.values.sort
 fail!("forbidden-action enum drifted") unless schema.dig("$defs", "forbidden_action", "enum").sort == EXPECTED_FORBIDDEN.sort
 fail!("RCH status command const drifted") unless schema.dig("$defs", "rch_status", "properties", "command", "const") == "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs"
 fail!("br dep cycles count const missing") unless schema.dig("$defs", "br_dep_cycles", "properties", "count", "const") == 0
@@ -126,7 +128,13 @@ payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} gate result drifted") unless payload["gate_result"] == EXPECTED_RESULTS.fetch(fixture_id)
   fail!("#{fixture_id} forbidden actions drifted") unless payload.fetch("forbidden_actions").sort == EXPECTED_FORBIDDEN.sort
   fail!("#{fixture_id} missing notes") if payload.fetch("notes").empty?
-  assert_sha!(payload.fetch("approval_artifact_sha256"), "#{fixture_id} approval hash invalid")
+  if fixture_id == "invalid-missing-approval"
+    fail!("invalid fixture must not cite an approval path") unless payload["approval_artifact_path"].nil?
+    fail!("invalid fixture must not cite an approval hash") unless payload["approval_artifact_sha256"].nil?
+  else
+    fail!("#{fixture_id} missing approval artifact path") if payload.fetch("approval_artifact_path").empty?
+    assert_sha!(payload.fetch("approval_artifact_sha256"), "#{fixture_id} approval hash invalid")
+  end
 
   side_effects = payload.fetch("agent_side_effect_policy")
   fail!("#{fixture_id} side-effect keys drifted") unless side_effects.keys.sort == EXPECTED_SIDE_EFFECT_FLAGS.sort
@@ -149,7 +157,6 @@ payloads.each do |fixture_id, payload|
   end
 
   dry_run = payload.fetch("remote_required_dry_run")
-  fail!("#{fixture_id} dry-run must be required") unless dry_run["required"] == true
   fail!("#{fixture_id} dry-run lacks RCH_REQUIRE_REMOTE") unless dry_run.fetch("command").include?("RCH_REQUIRE_REMOTE=1")
   fail!("#{fixture_id} dry-run lacks --dry-run") unless dry_run.fetch("command").include?("--dry-run")
   fail!("#{fixture_id} dry-run should not have an exit status") unless dry_run["exit_status"].nil?
@@ -161,6 +168,17 @@ payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} smoke target dir not included in command") unless smoke.fetch("command").include?(smoke.fetch("target_dir"))
   fail!("#{fixture_id} smoke command must not be a dry-run") if smoke.fetch("command").include?("--dry-run")
   fail!("#{fixture_id} smoke would_intercept drifted") unless smoke["would_intercept"] == true
+
+  if fixture_id == "invalid-missing-approval"
+    fail!("invalid fixture dry-run must be skipped") unless dry_run["required"] == false
+    fail!("invalid fixture dry-run transfer drifted") unless dry_run["transfer_state"] == "not_attempted"
+    fail!("invalid fixture dry-run remote execution drifted") unless dry_run["remote_execution_state"] == "not_attempted"
+    fail!("invalid fixture smoke must be skipped") unless smoke["required"] == false
+    fail!("invalid fixture smoke transfer drifted") unless smoke["transfer_state"] == "not_attempted"
+    fail!("invalid fixture smoke remote execution drifted") unless smoke["remote_execution_state"] == "not_attempted"
+  else
+    fail!("#{fixture_id} dry-run must be required") unless dry_run["required"] == true
+  end
 
   cycles = payload.fetch("br_dep_cycles")
   fail!("#{fixture_id} br dep command drifted") unless cycles["command"] == "br dep cycles --json"
@@ -207,11 +225,22 @@ fail!("failed smoke must be required") unless failed.dig("remote_required_smoke"
 fail!("failed smoke must have nonzero exit") unless failed.dig("remote_required_smoke", "exit_status").to_i > 0
 fail!("failed smoke remote execution should fail") unless failed.dig("remote_required_smoke", "remote_execution_state") == "failed"
 
+invalid = payloads.fetch("invalid-missing-approval")
+fail!("invalid fixture should not recover admission") unless invalid["admission_recovered"] == false
+fail!("invalid fixture should not close ft-4tp7g") unless invalid["ft4tp7g_closeout_allowed"] == false
+fail!("invalid fixture should not have an operator recovery reference") unless invalid["operator_recovery_reference"].nil?
+fail!("invalid fixture missing stable reason") unless invalid["stable_reason_code"] == "missing_operator_recovery_reference"
+fail!("invalid fixture dry-run selected worker") unless invalid.dig("remote_required_dry_run", "selected_worker").nil?
+fail!("invalid fixture smoke selected worker") unless invalid.dig("remote_required_smoke", "selected_worker").nil?
+fail!("invalid fixture smoke has exit status") unless invalid.dig("remote_required_smoke", "exit_status").nil?
+
 fail!("doc missing schema path") unless doc.include?(SCHEMA)
 fail!("doc missing remote-required dry-run rule") unless doc.include?("remote-required dry-run")
 fail!("doc missing material remote smoke rule") unless doc.include?("material remote-required smoke")
 fail!("doc missing ft-4tp7g closeout rule") unless doc.include?("ft-4tp7g")
 fail!("doc missing local Cargo prohibition") unless doc.include?("Local Cargo")
+fail!("doc missing missing-approval fixture") unless doc.include?("invalid-missing-approval")
+fail!("doc missing missing-approval gate result") unless doc.include?("invalid_missing_approval")
 
 puts "rch worker storage recovery proof contract: static verifier passed (#{fixture_paths.length} fixtures, #{EXPECTED_FORBIDDEN.length} forbidden actions)"
 RUBY

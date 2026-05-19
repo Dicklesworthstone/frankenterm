@@ -8,7 +8,8 @@
     "fixtures/rch-worker-storage-recovery-proof/valid/passed-remote-smoke.json",
     "fixtures/rch-worker-storage-recovery-proof/valid/blocked-no-admissible-worker.json",
     "fixtures/rch-worker-storage-recovery-proof/valid/blocked-new-reason.json",
-    "fixtures/rch-worker-storage-recovery-proof/valid/failed-remote-smoke.json"
+    "fixtures/rch-worker-storage-recovery-proof/valid/failed-remote-smoke.json",
+    "fixtures/rch-worker-storage-recovery-proof/valid/invalid-missing-approval.json"
   ],
   "invalid": [],
   "verification": [

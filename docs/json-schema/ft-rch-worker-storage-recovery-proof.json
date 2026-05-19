@@ -54,11 +54,21 @@
       "const": "ft.rch_worker_storage_approval.v1"
     },
     "approval_artifact_path": {
-      "type": "string",
+      "type": [
+        "string",
+        "null"
+      ],
       "minLength": 1
     },
     "approval_artifact_sha256": {
-      "$ref": "#/$defs/sha256"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "operator_recovery_reference": {
       "type": [
