@@ -36,13 +36,11 @@ hardware-baseline runners, and runs in well under a second.
 - **Actual bench runs.** Producing Distribution JSON artifacts
   is `cargo bench` infrastructure that requires
   hardware-baseline runners. Filed as **`ft-f5zyr.cont.runs`**.
-- **Corpus compression measurements.** The MANIFEST schema, three
-  documented fixture names, concrete fixture files, and real sha256
-  values are now pinned by **`ft-ym2y1`**
-  (`BR-RC-FOUNDATION.G3.5.cont.corpus`). This substrate audit checks
-  that the manifest exists and names the expected fixtures; it does
-  not recompute zstd ratios or replace the hardware-baseline bench
-  artifacts.
+- **Corpus content.** The MANIFEST schema + the three
+  documented fixture names ship under this bead. Pinning
+  concrete agent-output samples (with real sha256 values
+  replacing the `TBD-cont-corpus` placeholders) is filed as
+  **`ft-f5zyr.cont.corpus`**.
 - **Per-PR regression gating.** The manifest's
   `publishing.regression_gate` block names the EBCI upper bound
   + 10% threshold; wiring that into a per-PR CI lane is
@@ -69,12 +67,12 @@ Same pattern as ft-t9a6q.1 / .2 / .3 + ft-53zsr + ft-hac7w.2:
 
 **Substrate-pass (this bead):**
 - Audit harness regression-guarding the manifest ↔ bench-source contract (9 tests).
-- Corpus MANIFEST scaffold with documented fixture names + pinned sha256 column.
+- Corpus MANIFEST scaffold with documented fixture names + placeholder sha256 column.
 - This conventions doc.
 
 **Wired-pass (named follow-ups):**
 - **`ft-f5zyr.cont.runs`**: First-run distribution artifacts on hardware-baseline runners. Each bench produces `target/criterion/<bench>/wa-bench-meta.jsonl` lines validating against `bench-stats-schema.json`.
-- **`ft-ym2y1`**: Pinned agent-output samples with real sha256 values for `repetitive`, `heterogeneous_agent_log`, and `compressed_already`.
+- **`ft-f5zyr.cont.corpus`**: Pinned agent-output samples. Replaces `TBD-cont-corpus` sha256 placeholders with real content hashes. Three fixtures: `repetitive` / `heterogeneous_agent_log` / `compressed_already`.
 - **`ft-f5zyr.cont.runners`**: GitHub Actions workflow wiring `cargo bench` on the documented 3 hardware baselines (macos-14 M1, Apple M1 Pro local, ubuntu-24.04). Output goes to `docs/perf/releases/<version>.headline-claims.json` per the manifest's `publishing.release_artifact_path`.
 
 ## Cross-references
