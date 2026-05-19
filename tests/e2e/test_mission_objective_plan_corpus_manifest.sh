@@ -54,7 +54,17 @@ require_repo_relative_path() {
 
   [[ -n "${path}" ]] || fail "empty path"
   [[ "${path}" != /* ]] || fail "absolute path is forbidden: ${path}"
-  [[ "${path}" != *'..'* ]] || fail "parent-relative path is forbidden: ${path}"
+  [[ "${path}" != "." ]] || fail "bare dot path is forbidden: ${path}"
+  [[ "${path}" != ".." ]] || fail "parent-relative path is forbidden: ${path}"
+  [[ "${path}" != ./* ]] || fail "dot-prefixed path is forbidden: ${path}"
+  [[ "${path}" != ../* ]] || fail "parent-relative path is forbidden: ${path}"
+  [[ "${path}" != */../* ]] || fail "parent-relative path is forbidden: ${path}"
+  [[ "${path}" != */./* ]] || fail "embedded dot segment is forbidden: ${path}"
+  [[ "${path}" != */.. ]] || fail "trailing parent-relative segment is forbidden: ${path}"
+  [[ "${path}" != */. ]] || fail "trailing dot segment is forbidden: ${path}"
+  [[ "${path}" != ".git" ]] || fail ".git path is forbidden: ${path}"
+  [[ "${path}" != .git/* ]] || fail ".git path is forbidden: ${path}"
+  [[ "${path}" != */.git/* ]] || fail ".git path is forbidden: ${path}"
 }
 
 sha256_file() {
@@ -97,6 +107,30 @@ diff -u <(printf '%s\n' "${manifest_input_paths[@]}") <(printf '%s\n' "${actual_
 
 jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq -s .)" \
   --arg plan_schema "${PLAN_SCHEMA}" '
+  def repo_relative_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not);
+  def planner_input_path_ok:
+    repo_relative_path_ok
+    and startswith("fixtures/mission-planner/objective-plan-corpus/inputs/")
+    and endswith(".json");
+  def objective_plan_artifact_path_ok:
+    repo_relative_path_ok
+    and startswith("fixtures/mission-planner/objective-plan/")
+    and endswith(".json");
+
   .schema_version == 1
   and .contract_id == "ft.mission_objective_plan.golden_corpus.v1"
   and ([.cases[].case_id] | sort) == ($required | sort)
@@ -108,7 +142,7 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
   )
   and (.retained_negative_artifacts | type == "array" and length >= 1)
   and all(.retained_negative_artifacts[];
-    (.artifact_path | type == "string" and length > 0)
+    (.artifact_path | objective_plan_artifact_path_ok)
     and (.artifact_kind == "objective_plan_json_expected_invalid")
     and (.schema_path == $plan_schema)
     and (.validation_expectation == "schema_rejects_raw_pane_content")
@@ -121,11 +155,17 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
   ))
   and all(.cases[];
     (.case_id | type == "string" and length > 0)
-    and (.input_path | type == "string" and length > 0)
+    and (.input_path | planner_input_path_ok)
     and (.retained_artifacts | type == "array" and length >= 1)
     and all(.retained_artifacts[];
-      (.artifact_path | type == "string" and length > 0)
-      and (.artifact_kind | IN("objective_plan_json", "planner_input_json"))
+      (.artifact_kind | IN("objective_plan_json", "planner_input_json"))
+      and (
+        if .artifact_kind == "planner_input_json" then
+          (.artifact_path | planner_input_path_ok)
+        else
+          (.artifact_path | objective_plan_artifact_path_ok)
+        end
+      )
       and (.source_command | type == "string" and length > 0)
       and (.exit_code | type == "number" and . >= 0 and . <= 255)
       and (.fixture_sha256 | test("^[0-9a-f]{64}$"))
@@ -287,6 +327,28 @@ for case_id in "${REQUIRED_CASES[@]}"; do
       objective_plan_json)
         ((exit_code == 0)) || fail "${case_id} objective_plan_json retained artifact must have exit_code 0"
         jq -e '
+          def repo_relative_artifact_path_ok:
+            type == "string"
+            and length > 0
+            and . != "."
+            and . != ".."
+            and (startswith("/") | not)
+            and (startswith("./") | not)
+            and (startswith("../") | not)
+            and (contains("/../") | not)
+            and (contains("/./") | not)
+            and (endswith("/..") | not)
+            and (endswith("/.") | not)
+            and . != ".git"
+            and (startswith(".git/") | not)
+            and (contains("/.git/") | not);
+          def retained_artifact_path_ok:
+            repo_relative_artifact_path_ok
+            and (
+              . == "docs/json-schema/ft-mission-objective-plan.json"
+              or (startswith("fixtures/mission-planner/objective-plan/") and endswith(".json"))
+            );
+
           .schema_version == 1
           and .contract_id == "ft.mission_objective_plan.v1"
           and (.generated_at_ms | type == "number" and . >= 0)
@@ -313,6 +375,7 @@ for case_id in "${REQUIRED_CASES[@]}"; do
           )
           and (.forbidden_actions | type == "array" and length >= 1)
           and (.artifact_paths | type == "array" and length >= 1)
+          and all(.artifact_paths[]; retained_artifact_path_ok)
         ' "${artifact_path}" >/dev/null || fail "${artifact_path} retained objective-plan JSON is unsafe or incomplete"
 
         for action_class in "${REQUIRED_FORBIDDEN_ACTIONS[@]}"; do
