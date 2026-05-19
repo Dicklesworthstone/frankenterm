@@ -49,7 +49,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::events_dedup_cuckoo::{CuckooDedupVerdict, EventCuckooDedup, EventCuckooDedupSnapshot};
-use crate::mission_events::MissionEvent;
 use crate::patterns::Detection;
 use crate::policy::Redactor;
 use crate::runtime_async::broadcast;
@@ -204,9 +203,6 @@ pub enum Event {
         reason: Option<String>,
     },
 
-    /// Mission-loop audit event emitted by mission planning/dispatch surfaces.
-    MissionAudit { event: Box<MissionEvent> },
-
     /// User-var event received via IPC from shell hook
     UserVarReceived {
         pane_id: u64,
@@ -232,7 +228,6 @@ impl Event {
             Self::WorkflowStarted { .. } => "workflow_started",
             Self::WorkflowStep { .. } => "workflow_step",
             Self::WorkflowCompleted { .. } => "workflow_completed",
-            Self::MissionAudit { .. } => "mission_audit",
             Self::UserVarReceived { .. } => "user_var_received",
         }
     }
@@ -248,9 +243,7 @@ impl Event {
             | Self::PaneDisappeared { pane_id }
             | Self::WorkflowStarted { pane_id, .. }
             | Self::UserVarReceived { pane_id, .. } => Some(*pane_id),
-            Self::WorkflowStep { .. }
-            | Self::WorkflowCompleted { .. }
-            | Self::MissionAudit { .. } => None,
+            Self::WorkflowStep { .. } | Self::WorkflowCompleted { .. } => None,
         }
     }
 }
@@ -1215,7 +1208,6 @@ impl EventBus {
             | Event::WorkflowStarted { .. }
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
-            | Event::MissionAudit { .. }
             | Event::UserVarReceived { .. } => self.send_routed(
                 event,
                 &self.signal_sender,
@@ -1391,12 +1383,13 @@ impl EventBus {
                 // past the 2000-key default capacity — operators had
                 // no way to detect that the dedup gate had stopped
                 // catching duplicates of newly-seen keys.
-                if dedup.load_factor() >= Self::DELTA_DEDUP_SATURATION_THRESHOLD {
+                let verdict = dedup.check(&key);
+                if dedup.load_factor() >= Self::DELTA_DEDUP_SATURATION_THRESHOLD || verdict == CuckooDedupVerdict::NewButFull {
                     self.metrics
                         .delta_dedup_full_count
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                dedup.check(&key) == CuckooDedupVerdict::PossibleDuplicate
+                verdict == CuckooDedupVerdict::PossibleDuplicate
             }
             Err(_) => {
                 // br-ft-skec1 site #1: dedup mutex poisoned →
@@ -2950,7 +2943,7 @@ mod tests {
         let stats = bus.stats();
         assert_eq!(stats.capacity, 2);
         assert_eq!(stats.delta_subscribers, 1);
-        assert_eq!(stats.delta_queued, 2);
+        assert_eq!(stats.delta_queued, 3);
         assert!(stats.delta_oldest_lag_ms.is_some());
     }
 
