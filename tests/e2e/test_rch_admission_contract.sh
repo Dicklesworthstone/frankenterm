@@ -154,6 +154,12 @@ EXPECTED_FUZZ_CORPUS = {
   "target_dir" => ["--target-dir="],
   "test_filter" => ["rch_admission"]
 }.freeze
+CANONICAL_BEADS_READY_COMMAND = "br ready --json --no-auto-import --no-auto-flush".freeze
+CANONICAL_RCH_STATUS_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs".freeze
+CANONICAL_RCH_CHECK_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check".freeze
+CANONICAL_RCH_DRY_RUN_PREFIX = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- ".freeze
+CANONICAL_RCH_SPEEDSCORE_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing speedscore --all --json".freeze
+CANONICAL_REMOTE_REQUIRED_EXEC_COMMAND = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-remote-required cargo check -p frankenterm-core --lib".freeze
 
 def fail!(message)
   warn "rch admission contract: #{message}"
@@ -239,6 +245,21 @@ no_service_cases.each do |entry|
   fail!("no-service case #{fixture_id} has no retained read-only commands") if commands.empty?
   commands.each do |command|
     fail!("no-service case #{fixture_id} records direct local Cargo proof command: #{command}") if command.start_with?("cargo ")
+    if command.include?("diagnose --dry-run --json --")
+      fail!("no-service case #{fixture_id} dry-run command is not canonical remote-required/no-self-healing: #{command}") unless command.start_with?(CANONICAL_RCH_DRY_RUN_PREFIX)
+    end
+    if command.include?("status --workers --jobs")
+      fail!("no-service case #{fixture_id} status command is not canonical no-self-healing: #{command}") unless command == CANONICAL_RCH_STATUS_COMMAND
+    end
+    if command.include?("--json check")
+      fail!("no-service case #{fixture_id} check command is not canonical no-self-healing: #{command}") unless command == CANONICAL_RCH_CHECK_COMMAND
+    end
+    if command.include?("speedscore --all --json")
+      fail!("no-service case #{fixture_id} speedscore command is not canonical no-self-healing: #{command}") unless command == CANONICAL_RCH_SPEEDSCORE_COMMAND
+    end
+    if command.start_with?("br ready --json")
+      fail!("no-service case #{fixture_id} Beads ready command can auto-mutate tracker state: #{command}") unless command == CANONICAL_BEADS_READY_COMMAND
+    end
     forbidden_fragments.each do |fragment|
       if command.downcase.include?(fragment.downcase)
         fail!("no-service case #{fixture_id} command contains forbidden fragment #{fragment}: #{command}")
@@ -283,6 +304,10 @@ current_fleet_text = current_fleet.fetch("retained_evidence").map { |record| rec
 end
 
 remote_required = no_service_cases.find { |entry| entry.fetch("fixture_id") == "remote-required-local-fallback-refusal" }
+fail!("remote-required fixture target command is not canonical") unless remote_required.fetch("target_command") == CANONICAL_REMOTE_REQUIRED_EXEC_COMMAND
+remote_required_commands = remote_required.fetch("executed_read_only_commands")
+fail!("remote-required fixture missing canonical Beads ready command") unless remote_required_commands.include?(CANONICAL_BEADS_READY_COMMAND)
+fail!("remote-required fixture missing canonical dry-run command") unless remote_required_commands.any? { |command| command.start_with?(CANONICAL_RCH_DRY_RUN_PREFIX) }
 remote_required_text = remote_required.fetch("retained_evidence").map { |record| record.fetch("summary") }.join("\n")
 [
   "RCH_REQUIRE_REMOTE=1",

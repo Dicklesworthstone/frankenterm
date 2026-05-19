@@ -38,8 +38,8 @@
       "diagnosis_family": "RCH-E100 worker unreachable",
       "target_command": "cargo test -p frankenterm-core rch_admission --lib -- --nocapture",
       "executed_read_only_commands": [
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-rch-e100 CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib -- --nocapture",
-        "rch status --workers --jobs --json",
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-rch-e100 CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib -- --nocapture",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
         "git status --short"
       ],
       "retained_evidence": [
@@ -87,9 +87,9 @@
       "diagnosis_family": "all workers offline",
       "target_command": "cargo check -p frankenterm-core --all-targets",
       "executed_read_only_commands": [
-        "rch status --workers --jobs --json",
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-all-offline CARGO_BUILD_JOBS=1 cargo check -p frankenterm-core --all-targets",
-        "br ready --json"
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-all-offline CARGO_BUILD_JOBS=1 cargo check -p frankenterm-core --all-targets",
+        "br ready --json --no-auto-import --no-auto-flush"
       ],
       "retained_evidence": [
         {
@@ -136,8 +136,8 @@
       "diagnosis_family": "worker telemetry gap",
       "target_command": "cargo clippy -p frankenterm-core --all-targets -- -D warnings",
       "executed_read_only_commands": [
-        "rch status --workers --jobs --json",
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-telemetry-gap CARGO_BUILD_JOBS=1 cargo clippy -p frankenterm-core --all-targets -- -D warnings",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-telemetry-gap CARGO_BUILD_JOBS=1 cargo clippy -p frankenterm-core --all-targets -- -D warnings",
         "git status --short"
       ],
       "retained_evidence": [
@@ -185,8 +185,8 @@
       "diagnosis_family": "worker critical pressure",
       "target_command": "cargo test -p frankenterm-core rch_admission --lib",
       "executed_read_only_commands": [
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-critical-pressure CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib",
-        "rch status --workers --jobs --json",
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-critical-pressure CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
         "df -h /System/Volumes/Data"
       ],
       "retained_evidence": [
@@ -236,8 +236,8 @@
       "executed_read_only_commands": [
         "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
         "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check",
-        "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- cargo check -p frankenterm-core --lib",
-        "br ready --json"
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-current-fleet cargo check -p frankenterm-core --lib",
+        "br ready --json --no-auto-import --no-auto-flush"
       ],
       "retained_evidence": [
         {
@@ -250,7 +250,7 @@
         },
         {
           "kind": "beads_snapshot",
-          "summary": "br ready --json was empty; the blocked proof lane must remain blocked instead of falling back to host-side Cargo."
+          "summary": "br ready --json --no-auto-import --no-auto-flush was empty; the blocked proof lane must remain blocked instead of falling back to host-side Cargo."
         }
       ],
       "forbidden_actions": [
@@ -286,12 +286,12 @@
       "fixture_id": "remote-required-local-fallback-refusal",
       "reason_code": "no_admissible_workers",
       "diagnosis_family": "remote-required local fallback refusal",
-      "target_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-remote-required cargo check -p frankenterm-core --lib",
+      "target_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-remote-required cargo check -p frankenterm-core --lib",
       "executed_read_only_commands": [
         "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
         "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check",
-        "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-remote-required cargo check -p frankenterm-core --lib",
-        "br ready --json"
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-remote-required cargo check -p frankenterm-core --lib",
+        "br ready --json --no-auto-import --no-auto-flush"
       ],
       "retained_evidence": [
         {
@@ -342,9 +342,9 @@
       "diagnosis_family": "insufficient worker slots",
       "target_command": "cargo test -j 12 -p frankenterm-core rch_admission --lib",
       "executed_read_only_commands": [
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-insufficient-slots cargo test -j 12 -p frankenterm-core rch_admission --lib",
-        "rch status --workers --jobs --json",
-        "br ready --json"
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-insufficient-slots cargo test -j 12 -p frankenterm-core rch_admission --lib",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+        "br ready --json --no-auto-import --no-auto-flush"
       ],
       "retained_evidence": [
         {
@@ -391,9 +391,9 @@
       "diagnosis_family": "same-project active build exclusion",
       "target_command": "cargo test -p frankenterm-core storage --lib",
       "executed_read_only_commands": [
-        "rch status --workers --jobs --json",
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-active-project CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core storage --lib",
-        "br ready --json"
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-active-project CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core storage --lib",
+        "br ready --json --no-auto-import --no-auto-flush"
       ],
       "retained_evidence": [
         {
@@ -441,7 +441,7 @@
       "target_command": "cargo test -p frankenterm-core rch_admission --lib",
       "executed_read_only_commands": [
         "df -h /System/Volumes/Data",
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-local-eno-space CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib",
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-local-eno-space CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib",
         "git status --short"
       ],
       "retained_evidence": [
@@ -489,8 +489,8 @@
       "diagnosis_family": "SpeedScore parse failure",
       "target_command": "rch speedscore --all --json",
       "executed_read_only_commands": [
-        "rch speedscore --all --json",
-        "rch status --workers --jobs --json",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing speedscore --all --json",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
         "git status --short"
       ],
       "retained_evidence": [
@@ -538,9 +538,9 @@
       "diagnosis_family": "dry-run worker inconsistency",
       "target_command": "cargo test -p frankenterm-core rch_admission --lib",
       "executed_read_only_commands": [
-        "rch diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-dry-run-inconsistent CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib",
-        "rch status --workers --jobs --json",
-        "br ready --json"
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_TARGET_DIR=/tmp/ft-dry-run-inconsistent CARGO_BUILD_JOBS=1 cargo test -p frankenterm-core rch_admission --lib",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+        "br ready --json --no-auto-import --no-auto-flush"
       ],
       "retained_evidence": [
         {
