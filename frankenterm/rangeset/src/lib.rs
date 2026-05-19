@@ -298,7 +298,19 @@ impl<T: Integer + Copy + Debug + ToPrimitive> RangeSet<T> {
 
     pub fn sort_if_needed(&mut self) {
         if self.needs_sort {
+            self.ranges.retain(|r| !range_is_empty(r));
             self.ranges.sort_by_key(|r| r.start);
+            let mut normalized = Vec::with_capacity(self.ranges.len());
+            for range in self.ranges.drain(..) {
+                if let Some(last) = normalized.last_mut() {
+                    if touches_or_intersects_range(last, &range) {
+                        last.end = last.end.max(range.end);
+                        continue;
+                    }
+                }
+                normalized.push(range);
+            }
+            self.ranges = normalized;
             self.needs_sort = false;
         }
     }
@@ -622,6 +634,46 @@ mod tests {
         set.sort_if_needed();
         let ranges = collect(&set);
         assert_eq!(ranges, vec![1..5, 10..15]);
+    }
+
+    #[test]
+    fn sort_if_needed_after_unchecked_merges_overlapping_and_adjacent_ranges() {
+        let mut set = RangeSet::new();
+        set.add_range_unchecked(12..20);
+        set.add_range_unchecked(3..8);
+        set.add_range_unchecked(10..15);
+        set.add_range_unchecked(8..10);
+
+        set.sort_if_needed();
+
+        assert_eq!(collect(&set), vec![3..20]);
+        assert_eq!(set.len(), 17);
+    }
+
+    #[test]
+    fn add_range_after_unchecked_normalizes_existing_ranges_first() {
+        let mut set = RangeSet::new();
+        set.add_range_unchecked(10..12);
+        set.add_range_unchecked(1..5);
+        set.add_range_unchecked(4..10);
+
+        set.add_range(20..22);
+
+        assert_eq!(collect(&set), vec![1..12, 20..22]);
+        assert_eq!(set.len(), 13);
+    }
+
+    #[test]
+    fn sort_if_needed_drops_empty_unchecked_ranges() {
+        let mut set = RangeSet::new();
+        set.add_range_unchecked(5..5);
+        set.add_range_unchecked(8..4);
+        set.add_range_unchecked(1..3);
+
+        set.sort_if_needed();
+
+        assert_eq!(collect(&set), vec![1..3]);
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

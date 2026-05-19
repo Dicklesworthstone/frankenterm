@@ -855,6 +855,14 @@ impl<'term> LineEditor<'term> {
     }
 }
 
+/// Create a `Terminal` with the recommended settings for use with
+/// a `LineEditor`.
+pub fn line_editor_terminal() -> Result<impl Terminal> {
+    let hints = ProbeHints::new_from_env().mouse_reporting(Some(false));
+    let caps = Capabilities::new_with_hints(hints)?;
+    new_terminal(caps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,12 +958,4 @@ mod tests {
         assert_eq!(editor.get_line_and_cursor(), (line, line.len()));
         assert_eq!(editor.state, EditorState::Editing);
     }
-}
-
-/// Create a `Terminal` with the recommended settings for use with
-/// a `LineEditor`.
-pub fn line_editor_terminal() -> Result<impl Terminal> {
-    let hints = ProbeHints::new_from_env().mouse_reporting(Some(false));
-    let caps = Capabilities::new_with_hints(hints)?;
-    new_terminal(caps)
 }

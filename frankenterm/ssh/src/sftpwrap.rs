@@ -249,6 +249,6 @@ mod tests {
     fn libssh_mode_rejects_negative_permissions() {
         let err = libssh_mode(-1, "test").expect_err("negative mode should fail");
         let text = err.to_string();
-        assert!(text.contains("test mode -1"), "{text}");
+        assert!(text.contains("test mode -1"), "{}", text);
     }
 }

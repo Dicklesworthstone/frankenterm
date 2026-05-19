@@ -795,6 +795,12 @@ mod test {
             .collect::<Vec<_>>()
     }
 
+    fn line(text: &str, wrapped: bool) -> Line {
+        let mut l = Line::from_text(text, &Default::default(), SEQ_ZERO, None);
+        l.set_last_cell_was_wrapped(wrapped, SEQ_ZERO);
+        l
+    }
+
     #[test]
     fn fake_pane_default_methods_do_not_panic() {
         let pane = FakePane::new(Vec::new());
@@ -1204,7 +1210,7 @@ mod test {
 
         assert_eq!(
             summarize_logical_lines(&lines),
-            vec![(1, "visible".to_string())]
+            vec![(1, Cow::Borrowed("visible"))]
         );
     }
 
@@ -1223,7 +1229,7 @@ mod test {
 
         assert_eq!(
             summarize_logical_lines(&lines),
-            vec![(0, "wrapped".to_string())]
+            vec![(0, Cow::Borrowed("wrapped"))]
         );
     }
 

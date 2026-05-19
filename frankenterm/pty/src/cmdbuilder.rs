@@ -227,10 +227,31 @@ pub struct CommandBuilder {
 #[cfg(feature = "serde_support")]
 mod os_string_serde {
     use super::OsString;
-    use serde::de::{self, IgnoredAny, MapAccess, Visitor};
-    use serde::ser::SerializeStruct;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::fmt;
+
+    #[cfg(unix)]
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "OsString")]
+    struct OsStringProxy {
+        #[serde(rename = "Unix")]
+        data: Vec<u8>,
+    }
+
+    #[cfg(windows)]
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "OsString")]
+    struct OsStringProxy {
+        #[serde(rename = "Windows")]
+        data: Vec<u16>,
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "OsString")]
+    struct OsStringProxy {
+        #[serde(rename = "String")]
+        data: String,
+    }
 
     pub(super) struct OsStringRef<'a>(pub(super) &'a OsString);
 
@@ -274,10 +295,10 @@ mod os_string_serde {
         S: Serializer,
     {
         use std::os::unix::ffi::OsStrExt;
-
-        let mut state = serializer.serialize_struct("OsString", 1)?;
-        state.serialize_field("Unix", value.as_os_str().as_bytes())?;
-        state.end()
+        OsStringProxy {
+            data: value.as_os_str().as_bytes().to_vec(),
+        }
+        .serialize(serializer)
     }
 
     #[cfg(windows)]
@@ -286,11 +307,10 @@ mod os_string_serde {
         S: Serializer,
     {
         use std::os::windows::ffi::OsStrExt;
-
-        let code_units: Vec<u16> = value.encode_wide().collect();
-        let mut state = serializer.serialize_struct("OsString", 1)?;
-        state.serialize_field("Windows", &code_units)?;
-        state.end()
+        OsStringProxy {
+            data: value.encode_wide().collect(),
+        }
+        .serialize(serializer)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -298,9 +318,10 @@ mod os_string_serde {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("OsString", 1)?;
-        state.serialize_field("String", &value.to_string_lossy())?;
-        state.end()
+        OsStringProxy {
+            data: value.to_string_lossy().into_owned(),
+        }
+        .serialize(serializer)
     }
 
     #[cfg(unix)]
@@ -309,44 +330,7 @@ mod os_string_serde {
         D: Deserializer<'de>,
     {
         use std::os::unix::ffi::OsStringExt;
-
-        struct OsStringVisitor;
-
-        impl<'de> Visitor<'de> for OsStringVisitor {
-            type Value = OsString;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an object containing a Unix byte-array field")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut bytes = None;
-
-                while let Some(field) = map.next_key::<String>()? {
-                    match field.as_str() {
-                        "Unix" => {
-                            if bytes.is_some() {
-                                return Err(de::Error::duplicate_field("Unix"));
-                            }
-                            bytes = Some(map.next_value::<Vec<u8>>()?);
-                        }
-                        other => {
-                            let _ = map.next_value::<IgnoredAny>()?;
-                            return Err(de::Error::unknown_field(other, &["Unix"]));
-                        }
-                    }
-                }
-
-                bytes
-                    .map(OsString::from_vec)
-                    .ok_or_else(|| de::Error::missing_field("Unix"))
-            }
-        }
-
-        deserializer.deserialize_map(OsStringVisitor)
+        OsStringProxy::deserialize(deserializer).map(|proxy| OsString::from_vec(proxy.data))
     }
 
     #[cfg(windows)]
@@ -355,44 +339,7 @@ mod os_string_serde {
         D: Deserializer<'de>,
     {
         use std::os::windows::ffi::OsStringExt;
-
-        struct OsStringVisitor;
-
-        impl<'de> Visitor<'de> for OsStringVisitor {
-            type Value = OsString;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an object containing a Windows UTF-16 code-unit field")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut code_units = None;
-
-                while let Some(field) = map.next_key::<String>()? {
-                    match field.as_str() {
-                        "Windows" => {
-                            if code_units.is_some() {
-                                return Err(de::Error::duplicate_field("Windows"));
-                            }
-                            code_units = Some(map.next_value::<Vec<u16>>()?);
-                        }
-                        other => {
-                            let _ = map.next_value::<IgnoredAny>()?;
-                            return Err(de::Error::unknown_field(other, &["Windows"]));
-                        }
-                    }
-                }
-
-                code_units
-                    .map(|units| OsString::from_wide(&units))
-                    .ok_or_else(|| de::Error::missing_field("Windows"))
-            }
-        }
-
-        deserializer.deserialize_map(OsStringVisitor)
+        OsStringProxy::deserialize(deserializer).map(|proxy| OsString::from_wide(&proxy.data))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -400,43 +347,7 @@ mod os_string_serde {
     where
         D: Deserializer<'de>,
     {
-        struct OsStringVisitor;
-
-        impl<'de> Visitor<'de> for OsStringVisitor {
-            type Value = OsString;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an object containing a String field")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut string = None;
-
-                while let Some(field) = map.next_key::<String>()? {
-                    match field.as_str() {
-                        "String" => {
-                            if string.is_some() {
-                                return Err(de::Error::duplicate_field("String"));
-                            }
-                            string = Some(map.next_value::<String>()?);
-                        }
-                        other => {
-                            let _ = map.next_value::<IgnoredAny>()?;
-                            return Err(de::Error::unknown_field(other, &["String"]));
-                        }
-                    }
-                }
-
-                string
-                    .map(OsString::from)
-                    .ok_or_else(|| de::Error::missing_field("String"))
-            }
-        }
-
-        deserializer.deserialize_map(OsStringVisitor)
+        OsStringProxy::deserialize(deserializer).map(|proxy| OsString::from(proxy.data))
     }
 }
 

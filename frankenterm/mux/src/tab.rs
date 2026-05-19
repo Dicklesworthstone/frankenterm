@@ -4269,6 +4269,7 @@ mod test {
     /// Ensure the global Mux singleton is initialized for tests that trigger
     /// focus-change notifications (e.g. floating pane and top-level split tests).
     fn ensure_mux_initialized() {
+        let _guard = crate::MUX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if Mux::try_get().is_none() {
             let mux = Arc::new(Mux::new(None));
             Mux::set_mux(&mux);

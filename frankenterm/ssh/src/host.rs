@@ -65,7 +65,7 @@ fn known_hosts_file_needs_leading_newline(file: &Path) -> std::io::Result<bool> 
     existing.seek(SeekFrom::End(-1))?;
     let mut last = [0u8; 1];
     existing.read_exact(&mut last)?;
-    Ok(last != [b'\n'])
+    Ok(last != *b"\n")
 }
 
 #[cfg(feature = "ssh2")]

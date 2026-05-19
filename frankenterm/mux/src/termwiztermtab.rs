@@ -636,9 +636,6 @@ mod tests {
     use super::*;
     use crate::domain::LocalDomain;
     use crate::Mux;
-    use std::sync::Mutex as StdMutex;
-
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,
@@ -677,7 +674,7 @@ mod tests {
 
     #[test]
     fn allocate_registers_overlay_pane_with_termwiz_domain() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = crate::MUX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let default_domain: Arc<dyn Domain> =
             Arc::new(LocalDomain::new("termwiz-overlay-default").unwrap());
         let mux = Arc::new(Mux::new(Some(default_domain)));

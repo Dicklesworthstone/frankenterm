@@ -2168,7 +2168,7 @@ mod tests {
         let mut hold = SynchronizedOutputHold::default();
         let mut flushes = 0;
 
-        parser.parse(b"\x1b[?2026h\x1bc", |action| {
+        parser.parse(b"\x1b[?2026h\x1b[!p", |action| {
             let effect = handle_synchronized_output_action(&action, &mut hold, |_| {});
             if effect.flush {
                 flushes += 1;

@@ -317,8 +317,14 @@ mod tests {
 
     #[test]
     fn field_info_rejects_unsupported_single_arg_container() {
-        let field: Field = parse_quote! {
-            unsupported: Result<String>
+        let item: syn::DeriveInput = parse_quote! {
+            struct Dummy {
+                unsupported: Result<String>
+            }
+        };
+        let field = match item.data {
+            syn::Data::Struct(s) => s.fields.into_iter().next().unwrap(),
+            _ => panic!("Expected struct"),
         };
 
         let err = field_info_error(field);
@@ -329,8 +335,14 @@ mod tests {
 
     #[test]
     fn field_info_rejects_unsupported_tuple_type() {
-        let field: Field = parse_quote! {
-            unsupported: (String, String)
+        let item: syn::DeriveInput = parse_quote! {
+            struct Dummy {
+                unsupported: (String, String)
+            }
+        };
+        let field = match item.data {
+            syn::Data::Struct(s) => s.fields.into_iter().next().unwrap(),
+            _ => panic!("Expected struct"),
         };
 
         let err = field_info_error(field);

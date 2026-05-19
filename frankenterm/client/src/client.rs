@@ -1,23 +1,23 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
+use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
-use asupersync::Cx;
-use async_channel::{bounded, unbounded, Receiver, Sender};
+use async_channel::{Receiver, Sender, bounded, unbounded};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
+use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
 use filedescriptor::FileDescriptor;
-use futures::future::{select, Either};
+use futures::future::{Either, select};
 use futures::pin_mut;
+use mux::Mux;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
-use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
@@ -30,7 +30,7 @@ use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
@@ -639,6 +639,18 @@ impl std::fmt::Debug for SshStream {
     }
 }
 
+fn lock_registration_mutex(
+    registration: &Mutex<Option<IoRegistration>>,
+) -> MutexGuard<'_, Option<IoRegistration>> {
+    match registration.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            registration.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
 impl SshStream {
     fn new(mut stdin: FileDescriptor, mut stdout: FileDescriptor) -> std::io::Result<Self> {
         stdin
@@ -693,9 +705,7 @@ impl SshStream {
         interest: Interest,
         task_cx: &TaskContext<'_>,
     ) -> std::io::Result<()> {
-        let mut registration = registration
-            .lock()
-            .map_err(|_| std::io::Error::other("SSH registration lock poisoned"))?;
+        let mut registration = lock_registration_mutex(registration);
         if let Some(existing) = registration.as_mut() {
             match existing.rearm(interest, task_cx.waker()) {
                 Ok(true) => return Ok(()),
@@ -2064,19 +2074,37 @@ mod tests {
     }
 
     #[test]
+    fn ssh_registration_lock_recovers_after_poison() {
+        let registration = Mutex::new(None::<IoRegistration>);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registration.lock().unwrap();
+            panic!("simulate SSH registration lock poison");
+        }));
+
+        assert!(poisoned.is_err());
+        assert!(registration.is_poisoned());
+
+        {
+            let guard = lock_registration_mutex(&registration);
+            assert!(guard.is_none());
+        }
+
+        assert!(!registration.is_poisoned());
+    }
+
+    #[test]
     fn unix_connect_with_retry_rejects_zero_attempts() {
-        let err = match unix_connect_with_retry(
-            &UnixTarget::Socket(PathBuf::from("/tmp/frankenterm-zero-attempts.sock")),
-            false,
-            Some(0),
-        ) {
+        let socket_path = PathBuf::from("/tmp/frankenterm-zero-attempts.sock");
+        let err = match unix_connect_with_retry(&UnixTarget::Socket(socket_path), false, Some(0)) {
             Ok(_) => panic!("zero retry attempts should fail"),
             Err(err) => err,
         };
 
         assert!(
             err.to_string().contains("greater than zero"),
-            "unexpected error: {err:#}"
+            "unexpected error: {:?}",
+            err
         );
     }
 
@@ -2089,7 +2117,8 @@ mod tests {
 
         assert!(
             err.to_string().contains("proxy command is empty"),
-            "unexpected error: {err:#}"
+            "unexpected error: {:?}",
+            err
         );
     }
 
@@ -2113,7 +2142,8 @@ mod tests {
 
         assert!(
             err.to_string().contains("serve command is empty"),
-            "unexpected error: {err:#}"
+            "unexpected error: {:?}",
+            err
         );
     }
 

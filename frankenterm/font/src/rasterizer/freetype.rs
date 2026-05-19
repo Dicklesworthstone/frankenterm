@@ -575,8 +575,8 @@ impl<'a> Walker<'a> {
                     let grad = paint.u.sweep_gradient.as_ref();
                     log::trace!("{level:>3} {grad:?}");
                     let (x0, y0) = vector_x_y(&grad.center);
-                    let start_angle = colr_sweep_angle_to_radians(grad.start_angle.to_num());
-                    let end_angle = colr_sweep_angle_to_radians(grad.end_angle.to_num());
+                    let start_angle = colr_sweep_angle_to_radians(grad.start_angle.to_num()) as f32;
+                    let end_angle = colr_sweep_angle_to_radians(grad.end_angle.to_num()) as f32;
 
                     let paint = PaintOp::PaintSweepGradient {
                         x0,

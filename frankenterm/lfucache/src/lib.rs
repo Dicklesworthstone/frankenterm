@@ -350,6 +350,10 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             }
         }
 
+        if self.cap == 0 {
+            return evicted;
+        }
+
         while self.len >= self.cap {
             if let Some(entry) = self.evict_one() {
                 evicted.push(entry);
@@ -893,6 +897,37 @@ mod test {
         assert!(cache.get(&1).is_some());
         assert!(cache.get(&2).is_none());
         assert!(cache.get(&3).is_some());
+    }
+
+    #[test]
+    fn zero_capacity_put_does_not_insert() {
+        let mut cache = LfuCacheU64::<&'static str>::with_capacity(0);
+
+        assert!(cache.put_capturing_evictions(1, "one").is_empty());
+
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert!(cache.get(&1).is_none());
+    }
+
+    #[test]
+    fn update_config_to_zero_evicts_all_and_keeps_cache_disabled() {
+        fn zero_cap(_: &ConfigHandle) -> usize {
+            0
+        }
+
+        let mut cache = LfuCacheU64::<&'static str>::with_capacity(2);
+        cache.put(1, "one");
+        cache.put(2, "two");
+        cache.cap_func = zero_cap;
+
+        let mut evicted = cache.update_config_capturing_evictions(&ConfigHandle::default_config());
+        evicted.sort_by_key(|(key, _)| *key);
+
+        assert_eq!(evicted, vec![(1, "one"), (2, "two")]);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.put_capturing_evictions(3, "three").is_empty());
+        assert!(cache.get(&3).is_none());
     }
 
     #[test]

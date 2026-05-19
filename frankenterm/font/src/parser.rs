@@ -891,6 +891,62 @@ pub(crate) fn load_built_in_fonts(font_info: &mut Vec<ParsedFont>) -> anyhow::Re
     Ok(())
 }
 
+pub fn best_matching_font(
+    source: &FontDataSource,
+    font_attr: &FontAttributes,
+    origin: FontOrigin,
+    pixel_size: u16,
+) -> anyhow::Result<Option<ParsedFont>> {
+    let mut font_info = vec![];
+    parse_and_collect_font_info(source, &mut font_info, origin)?;
+    font_info.retain(|font| font.matches_name(font_attr));
+    Ok(ParsedFont::best_match(font_attr, pixel_size, font_info))
+}
+
+pub(crate) fn parse_and_collect_font_info(
+    source: &FontDataSource,
+    font_info: &mut Vec<ParsedFont>,
+    origin: FontOrigin,
+) -> anyhow::Result<()> {
+    let lib = crate::ftwrap::Library::new()?;
+    let num_faces = lib.query_num_faces(source)?;
+
+    fn load_one(
+        lib: &crate::ftwrap::Library,
+        source: &FontDataSource,
+        index: u32,
+        font_info: &mut Vec<ParsedFont>,
+        origin: &FontOrigin,
+    ) -> anyhow::Result<()> {
+        let locator = FontDataHandle {
+            source: source.clone(),
+            index,
+            variation: 0,
+            origin: origin.clone(),
+            coverage: None,
+        };
+
+        let face = lib.face_from_locator(&locator)?;
+        if let Ok(variations) = face.variations() {
+            for parsed in variations {
+                font_info.push(parsed);
+            }
+        } else {
+            let parsed = ParsedFont::from_locator(&locator)?;
+            font_info.push(parsed);
+        }
+        Ok(())
+    }
+
+    for index in 0..num_faces {
+        if let Err(err) = load_one(&lib, source, index, font_info, &origin) {
+            log::trace!("error while parsing {:?} index {}: {}", source, index, err);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,60 +1019,4 @@ mod tests {
         assert!(intersection.contains(99));
         assert!(!intersection.contains(100));
     }
-}
-
-pub fn best_matching_font(
-    source: &FontDataSource,
-    font_attr: &FontAttributes,
-    origin: FontOrigin,
-    pixel_size: u16,
-) -> anyhow::Result<Option<ParsedFont>> {
-    let mut font_info = vec![];
-    parse_and_collect_font_info(source, &mut font_info, origin)?;
-    font_info.retain(|font| font.matches_name(font_attr));
-    Ok(ParsedFont::best_match(font_attr, pixel_size, font_info))
-}
-
-pub(crate) fn parse_and_collect_font_info(
-    source: &FontDataSource,
-    font_info: &mut Vec<ParsedFont>,
-    origin: FontOrigin,
-) -> anyhow::Result<()> {
-    let lib = crate::ftwrap::Library::new()?;
-    let num_faces = lib.query_num_faces(source)?;
-
-    fn load_one(
-        lib: &crate::ftwrap::Library,
-        source: &FontDataSource,
-        index: u32,
-        font_info: &mut Vec<ParsedFont>,
-        origin: &FontOrigin,
-    ) -> anyhow::Result<()> {
-        let locator = FontDataHandle {
-            source: source.clone(),
-            index,
-            variation: 0,
-            origin: origin.clone(),
-            coverage: None,
-        };
-
-        let face = lib.face_from_locator(&locator)?;
-        if let Ok(variations) = face.variations() {
-            for parsed in variations {
-                font_info.push(parsed);
-            }
-        } else {
-            let parsed = ParsedFont::from_locator(&locator)?;
-            font_info.push(parsed);
-        }
-        Ok(())
-    }
-
-    for index in 0..num_faces {
-        if let Err(err) = load_one(&lib, source, index, font_info, &origin) {
-            log::trace!("error while parsing {:?} index {}: {}", source, index, err);
-        }
-    }
-
-    Ok(())
 }

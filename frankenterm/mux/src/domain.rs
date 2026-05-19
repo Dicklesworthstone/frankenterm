@@ -965,7 +965,14 @@ mod tests {
         }
 
         fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, Error> {
-            Ok(Box::new(std::io::Cursor::new(Vec::<u8>::new())))
+            struct BlockingReader;
+            impl Read for BlockingReader {
+                fn read(&mut self, _buf: &mut [u8]) -> IoResult<usize> {
+                    std::thread::sleep(Duration::from_secs(86400));
+                    Ok(0)
+                }
+            }
+            Ok(Box::new(BlockingReader))
         }
 
         fn take_writer(&self) -> Result<Box<dyn Write + Send>, Error> {

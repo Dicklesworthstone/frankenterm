@@ -600,7 +600,6 @@ fn primary_device_attributes_do_not_advertise_selective_erase_without_support() 
     );
 
     term.advance_bytes("\x1b[c");
-    term.writer.flush().unwrap();
 
     let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert_eq!(output, "\x1b[?65;4;18;22;52c");
