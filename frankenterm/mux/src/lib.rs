@@ -1287,7 +1287,32 @@ impl Mux {
     }
 
     pub fn shutdown() {
-        MUX.lock().take();
+        // Important: bind the taken Arc<Mux> to a `let` so the MutexGuard
+        // returned by MUX.lock() is dropped at the end of the *statement*
+        // (i.e., right here), BEFORE `taken` itself is dropped at end of
+        // function. Without the let-binding, a temporary-drop-order
+        // deadlock fires:
+        //
+        //   MUX.lock().take();           // as one statement, temporaries
+        //                                // dropped reverse-of-construction
+        //   ── drops Option<Arc<Mux>> first  ⇨ Mux::drop ⇨ ClientDomain::drop
+        //         which calls Mux::try_get  ⇨ tries to acquire MUX.lock
+        //   ── while MutexGuard STILL HELD                ⇨ deadlock
+        //                                                   (main thread
+        //                                                   parked in
+        //                                                   parking_lot::
+        //                                                   RawMutex::
+        //                                                   lock_slow,
+        //                                                   beachball)
+        //
+        // Reproduces reliably by closing the last GUI tab on macOS when
+        // a remote ClientDomain is registered: gui-startup spawns the
+        // domain which adds a mux notification subscriber holding a weak
+        // ref to ClientDomain; on app exit the FnOnce subscriber drops,
+        // which drops ClientDomain, whose Drop calls Mux::try_get(). With
+        // the implicit-temp form we deadlock on the same lock the outer
+        // shutdown() is holding.
+        let _taken = MUX.lock().take();
     }
 
     pub fn get() -> Arc<Mux> {
