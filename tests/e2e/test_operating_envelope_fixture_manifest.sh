@@ -93,6 +93,14 @@ require_file() {
   [[ -f "${path}" ]] || fail "missing file: ${path}"
 }
 
+require_tracked_file() {
+  local path="$1"
+  require_repo_relative_path "${path}"
+  require_file "${path}"
+  git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1 \
+    || fail "referenced artifact is not tracked by git: ${path}"
+}
+
 require_repo_relative_path() {
   local path="$1"
 
@@ -212,6 +220,10 @@ jq -e '
     all(.artifact_paths[]?; repo_relative_artifact_path_ok)
   )
 ' "${current_fixture_paths[@]}" >/dev/null || fail "valid/root fixture artifact_paths must stay repo-relative"
+
+while IFS= read -r artifact_path; do
+  require_tracked_file "${artifact_path}"
+done < <(jq -r '.artifact_paths[]?' "${current_fixture_paths[@]}" | sort -u)
 
 jq -e '
   all(.invalid_fixtures[];
@@ -409,6 +421,15 @@ jq -e '
       | all(.artifact.toon_projection.rows[]; length == $toon_width and .[0] == $case_id))
   )
 ' "${PROOF_CALENDAR_FIXTURES}" >/dev/null || fail "proof-calendar fixture artifacts are not fail-closed"
+
+while IFS= read -r artifact_path; do
+  require_tracked_file "${artifact_path}"
+done < <(
+  jq -r '
+    .cases[].artifact.artifact_paths[]?,
+    .cases[].artifact.source_snapshots[].artifact_paths[]?
+  ' "${PROOF_CALENDAR_FIXTURES}" | sort -u
+)
 
 for doc_text in \
   "ft.operating_envelope.proof_calendar.v1" \
