@@ -66,6 +66,8 @@ EXPECTED_SIDE_EFFECT_FLAGS = %w[
   read_only
   worker_mutated
 ].freeze
+EXPECTED_FIXTURE_PREFIX = "fixtures/rch-worker-pressure/valid/".freeze
+EXPECTED_RETAINED_ARTIFACT_PREFIX = "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/".freeze
 FORBIDDEN_COMMAND_FRAGMENTS = [
   "am service restart",
   "am service stop",
@@ -95,6 +97,32 @@ def read_json(path)
   JSON.parse(File.read(path))
 rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
+end
+
+def safe_repo_relative_path?(path)
+  return false unless path.is_a?(String) && !path.empty?
+  return false if path == "." || path == ".."
+  return false if path.start_with?("/", "./", "../")
+  return false if path.end_with?("/")
+  return false if path.include?("\\")
+
+  segments = path.split("/", -1)
+  return false if segments.any?(&:empty?)
+  return false if segments.any? { |segment| segment == "." || segment == ".." || segment == ".git" }
+
+  true
+end
+
+def safe_fixture_path?(path)
+  safe_repo_relative_path?(path) &&
+    path.start_with?(EXPECTED_FIXTURE_PREFIX) &&
+    path.end_with?(".json")
+end
+
+def safe_retained_artifact_path?(path)
+  safe_repo_relative_path?(path) &&
+    path.start_with?(EXPECTED_RETAINED_ARTIFACT_PREFIX) &&
+    path.end_with?(".json")
 end
 
 def scan_records(payload)
@@ -140,7 +168,10 @@ fail!("manifest verifier missing") unless manifest.fetch("verification").include
 
 fixture_paths = manifest.fetch("valid")
 fail!("fixture path count drifted") unless fixture_paths.length == EXPECTED_FIXTURE_IDS.length
-fixture_paths.each { |path| fail!("manifest references missing fixture #{path}") unless File.file?(path) }
+fixture_paths.each do |path|
+  fail!("manifest fixture path is unsafe: #{path}") unless safe_fixture_path?(path)
+  fail!("manifest references missing fixture #{path}") unless File.file?(path)
+end
 
 payloads = fixture_paths.map { |path| [path, read_json(path)] }
 fixture_ids = payloads.map { |path, _| File.basename(path, ".json") }
@@ -164,11 +195,15 @@ payloads.each do |path, payload|
 
   artifact_paths = payload.fetch("artifact_paths")
   fail!("#{fixture_id} has no top-level artifact paths") if artifact_paths.empty?
+  artifact_paths.each do |artifact|
+    fail!("#{fixture_id} top-level artifact path is unsafe: #{artifact}") unless safe_retained_artifact_path?(artifact)
+  end
   artifact_set = artifact_paths.to_set
   payload.fetch("worker_inventories").each do |worker|
     worker_id = worker.fetch("worker_id")
     fail!("#{fixture_id} worker #{worker_id} has no retained artifacts") if worker.fetch("artifact_paths").empty?
     worker.fetch("artifact_paths").each do |artifact|
+      fail!("#{fixture_id} worker #{worker_id} artifact path is unsafe: #{artifact}") unless safe_retained_artifact_path?(artifact)
       fail!("#{fixture_id} worker #{worker_id} artifact not in top-level set: #{artifact}") unless artifact_set.include?(artifact)
     end
     %w[df_samples shallow_scans project_du_samples].each do |field|
@@ -190,7 +225,9 @@ payloads.each do |path, payload|
     %w[source_command sampled_at_ms artifact_path pressure_reason notes].each do |field|
       fail!("#{fixture_id} retained scan record missing #{field}") unless record.key?(field)
     end
-    fail!("#{fixture_id} retained scan record artifact not in top-level set: #{record.fetch("artifact_path")}") unless artifact_set.include?(record.fetch("artifact_path"))
+    artifact_path = record.fetch("artifact_path")
+    fail!("#{fixture_id} retained scan record artifact path is unsafe: #{artifact_path}") unless safe_retained_artifact_path?(artifact_path)
+    fail!("#{fixture_id} retained scan record artifact not in top-level set: #{artifact_path}") unless artifact_set.include?(artifact_path)
   end
 end
 
