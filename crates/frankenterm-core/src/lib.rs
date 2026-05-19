@@ -379,6 +379,7 @@ pub mod mission_load_shed_planner;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_loop;
 pub mod mission_objective_plan;
+pub mod mission_twin_snapshot;
 pub mod mux_client;
 pub mod namespace_isolation;
 pub mod network_calculus_bound;
