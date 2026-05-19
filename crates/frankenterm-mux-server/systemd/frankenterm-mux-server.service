@@ -1,0 +1,21 @@
+[Unit]
+Description=FrankenTerm Mux Server (headless mux for AI agent fleets)
+Documentation=https://github.com/Dicklesworthstone/frankenterm
+After=network.target
+
+[Service]
+Type=simple
+# Explicit --config-file so the daemon binds to its FrankenTerm-namespaced
+# config and never accidentally picks up a sibling ~/.wezterm.lua or
+# ~/.config/wezterm/wezterm.lua. Path lives under XDG_CONFIG_HOME.
+ExecStart=%h/.local/bin/frankenterm-mux-server --daemonize=false --config-file=%h/.config/frankenterm/frankenterm.lua
+Restart=on-failure
+RestartSec=5
+# Log only warnings + errors; full output goes to journalctl --user.
+Environment=WEZTERM_LOG=warn
+# The mux socket is created at $XDG_RUNTIME_DIR/frankenterm/sock at startup.
+# That path is owned by systemd-logind and persists for the lifetime of the
+# user session, which is preserved across SSH disconnect by enable-linger.
+
+[Install]
+WantedBy=default.target

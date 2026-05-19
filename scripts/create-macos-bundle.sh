@@ -268,6 +268,19 @@ if [ -f "$DEFAULT_CONFIG" ]; then
     cp "$DEFAULT_CONFIG" "$APP_BUNDLE/Contents/Resources/frankenterm.toml"
 fi
 
+# --- Copy default GUI Lua config (loaded by frankenterm-gui when no user
+#     ~/.frankenterm.lua / ~/.config/frankenterm/*.lua / ~/.wezterm.lua exists).
+#     Resolved via the macOS-bundle fallback in
+#     frankenterm/config/src/config.rs::Configuration::load (search for
+#     "Last-resort fallback: bundled default config").
+#     File is named frankenterm.lua (not wezterm.lua) to keep the bundled
+#     defaults under the FrankenTerm namespace; the config loader checks
+#     both names in that order.
+DEFAULT_LUA="$PROJECT_ROOT/crates/frankenterm-gui/frankenterm.lua"
+if [ -f "$DEFAULT_LUA" ]; then
+    cp "$DEFAULT_LUA" "$APP_BUNDLE/Contents/Resources/frankenterm.lua"
+fi
+
 # --- Bundle the default Pragmasevka Nerd Font ---
 FONT_PAYLOAD="$PROJECT_ROOT/crates/frankenterm/assets/Pragmasevka_NF.zip.zst"
 FONT_DIR="$APP_BUNDLE/Contents/Resources/fonts"

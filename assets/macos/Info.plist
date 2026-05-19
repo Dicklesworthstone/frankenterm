@@ -28,6 +28,23 @@
 	</array>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
+	<key>LSEnvironment</key>
+	<dict>
+		<!-- Enable Lua config loading by default for the bundled .app.
+		     Without this, frankenterm-config falls back to TOML-only and
+		     never reads ~/.config/frankenterm/frankenterm.lua,
+		     ~/.frankenterm.lua, ~/.wezterm.lua, or the bundled
+		     Contents/Resources/frankenterm.lua. The gate lives in
+		     frankenterm/config/src/config.rs::Config::load_with_overrides
+		     (search for FRANKENTERM_LUA_CONFIG). Setting it here makes the
+		     out-of-the-box experience match what users coming from
+		     wezterm expect — they drop a wezterm.lua-style config and it
+		     just works. The env var can still be unset by the operator
+		     (LSEnvironment is only consulted at launch via `open`/Finder;
+		     direct CLI launches of the bin honor the calling shell's env). -->
+		<key>FRANKENTERM_LUA_CONFIG</key>
+		<string>1</string>
+	</dict>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>NSHighResolutionCapable</key>
