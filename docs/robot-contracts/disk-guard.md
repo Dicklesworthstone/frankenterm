@@ -142,7 +142,8 @@ local work.
 
 ## Fixtures
 
-Fixtures live under `fixtures/disk-guard/`:
+Fixtures live under `fixtures/disk-guard/`; the manifest is
+`fixtures/disk-guard/manifest.json`:
 
 - `manifest.json`
 - `valid/current-eno-space.json`
@@ -151,6 +152,13 @@ Fixtures live under `fixtures/disk-guard/`:
 - `valid/healthy.json`
 - `valid/warning-low-space.json`
 - `valid/fatal-write-probe-failed.json`
+
+The retained static verifier lives at
+`tests/e2e/test_disk_guard_contract.sh`. It checks the schema pointers,
+manifest fixture coverage, required probe IDs, read-only side-effect policy,
+cleanup-inventory operator-approval semantics, preflight surface coverage, and
+README E2E count stamp. It is a static contract verifier only; it is not Cargo,
+RCH, or runtime proof.
 
 The current fixture models an ENOSPC recovery state from 2026-05-17 where
 `/System/Volumes/Data` and `/private/tmp` are below the recovery floor, Beads

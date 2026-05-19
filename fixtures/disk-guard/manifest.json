@@ -14,6 +14,7 @@
   ],
   "invalid": [],
   "verification": [
-    "jq empty docs/json-schema/ft-disk-guard.json fixtures/disk-guard/manifest.json fixtures/disk-guard/valid/*.json"
+    "jq empty docs/json-schema/ft-disk-guard.json fixtures/disk-guard/manifest.json fixtures/disk-guard/valid/*.json",
+    "bash tests/e2e/test_disk_guard_contract.sh"
   ]
 }
