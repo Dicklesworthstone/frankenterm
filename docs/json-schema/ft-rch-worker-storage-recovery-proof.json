@@ -268,7 +268,7 @@
       "properties": {
         "command": {
           "type": "string",
-          "const": "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs"
+          "const": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs"
         },
         "rch_version": {
           "type": "string",

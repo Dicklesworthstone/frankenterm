@@ -30,7 +30,7 @@ Every proof artifact records:
 
 - the approval artifact path and SHA-256;
 - the operator recovery reference;
-- read-only `rch --json status --workers --jobs` evidence;
+- read-only `RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs` evidence;
 - a remote-required dry-run for a narrow FrankenTerm Cargo command;
 - a material remote-required smoke when the dry-run selects a worker;
 - transfer, skip, remote execution, and exit-state evidence;

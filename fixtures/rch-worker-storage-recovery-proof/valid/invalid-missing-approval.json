@@ -25,7 +25,7 @@
     "local_cargo_counted_as_proof": false
   },
   "rch_status": {
-    "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs",
+    "command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
     "rch_version": "1.0.26",
     "daemon_posture": "degraded",
     "workers_total": 8,
@@ -40,7 +40,7 @@
   },
   "remote_required_dry_run": {
     "required": false,
-    "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch diagnose --json --dry-run -- env CARGO_TARGET_DIR=/tmp/ft-rch-recovery-proof-dryrun CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core-replay-types -- --nocapture",
+    "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --json --dry-run -- env CARGO_TARGET_DIR=/tmp/ft-rch-recovery-proof-dryrun CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core-replay-types -- --nocapture",
     "target_dir": "/tmp/ft-rch-recovery-proof-dryrun",
     "classification": "cargo_test",
     "would_intercept": true,
@@ -54,7 +54,7 @@
   },
   "remote_required_smoke": {
     "required": false,
-    "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec --no-self-healing -- env CARGO_TARGET_DIR=/tmp/ft-rch-recovery-proof-smoke CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core-replay-types -- --nocapture",
+    "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-rch-recovery-proof-smoke CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core-replay-types -- --nocapture",
     "target_dir": "/tmp/ft-rch-recovery-proof-smoke",
     "classification": "cargo_test",
     "would_intercept": true,

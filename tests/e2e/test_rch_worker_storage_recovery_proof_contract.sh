@@ -76,6 +76,8 @@ EXPECTED_SIDE_EFFECT_FLAGS = %w[
   remote_mirror_mutated
   worker_mutated_by_agent
 ].freeze
+STATUS_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs".freeze
+REMOTE_REQUIRED_PREFIX = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing".freeze
 SHA256 = /\A[0-9a-f]{64}\z/
 
 def fail!(message)
@@ -103,7 +105,7 @@ fail!("source bead const missing") unless schema.dig("properties", "source_bead"
 fail!("approval contract const missing") unless schema.dig("properties", "approval_contract_id", "const") == "ft.rch_worker_storage_approval.v1"
 fail!("gate result enum drifted") unless schema.dig("$defs", "gate_result", "enum").sort == EXPECTED_RESULTS.values.sort
 fail!("forbidden-action enum drifted") unless schema.dig("$defs", "forbidden_action", "enum").sort == EXPECTED_FORBIDDEN.sort
-fail!("RCH status command const drifted") unless schema.dig("$defs", "rch_status", "properties", "command", "const") == "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs"
+fail!("RCH status command const drifted") unless schema.dig("$defs", "rch_status", "properties", "command", "const") == STATUS_COMMAND
 fail!("br dep cycles count const missing") unless schema.dig("$defs", "br_dep_cycles", "properties", "count", "const") == 0
 
 manifest_expected_verifier = "bash tests/e2e/test_rch_worker_storage_recovery_proof_contract.sh"
@@ -144,7 +146,7 @@ payloads.each do |fixture_id, payload|
   end
 
   status = payload.fetch("rch_status")
-  fail!("#{fixture_id} status command drifted") unless status["command"] == "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs"
+  fail!("#{fixture_id} status command drifted") unless status["command"] == STATUS_COMMAND
   fail!("#{fixture_id} missing RCH version") if status.fetch("rch_version").empty?
   fail!("#{fixture_id} negative worker count") if status.fetch("workers_total").negative?
   assert_sha!(status.fetch("artifact_sha256"), "#{fixture_id} status artifact hash invalid")
@@ -157,16 +159,18 @@ payloads.each do |fixture_id, payload|
   end
 
   dry_run = payload.fetch("remote_required_dry_run")
-  fail!("#{fixture_id} dry-run lacks RCH_REQUIRE_REMOTE") unless dry_run.fetch("command").include?("RCH_REQUIRE_REMOTE=1")
-  fail!("#{fixture_id} dry-run lacks --dry-run") unless dry_run.fetch("command").include?("--dry-run")
+  dry_run_command = dry_run.fetch("command")
+  fail!("#{fixture_id} dry-run lacks canonical no-self-healing prefix") unless dry_run_command.start_with?("#{REMOTE_REQUIRED_PREFIX} diagnose ")
+  fail!("#{fixture_id} dry-run lacks --dry-run") unless dry_run_command.include?("--dry-run")
   fail!("#{fixture_id} dry-run should not have an exit status") unless dry_run["exit_status"].nil?
-  fail!("#{fixture_id} dry-run target dir not included in command") unless dry_run.fetch("command").include?(dry_run.fetch("target_dir"))
+  fail!("#{fixture_id} dry-run target dir not included in command") unless dry_run_command.include?(dry_run.fetch("target_dir"))
   fail!("#{fixture_id} dry-run would_intercept drifted") unless dry_run["would_intercept"] == true
 
   smoke = payload.fetch("remote_required_smoke")
-  fail!("#{fixture_id} smoke lacks RCH_REQUIRE_REMOTE") unless smoke.fetch("command").include?("RCH_REQUIRE_REMOTE=1")
-  fail!("#{fixture_id} smoke target dir not included in command") unless smoke.fetch("command").include?(smoke.fetch("target_dir"))
-  fail!("#{fixture_id} smoke command must not be a dry-run") if smoke.fetch("command").include?("--dry-run")
+  smoke_command = smoke.fetch("command")
+  fail!("#{fixture_id} smoke lacks canonical no-self-healing prefix") unless smoke_command.start_with?("#{REMOTE_REQUIRED_PREFIX} exec -- ")
+  fail!("#{fixture_id} smoke target dir not included in command") unless smoke_command.include?(smoke.fetch("target_dir"))
+  fail!("#{fixture_id} smoke command must not be a dry-run") if smoke_command.include?("--dry-run")
   fail!("#{fixture_id} smoke would_intercept drifted") unless smoke["would_intercept"] == true
 
   if fixture_id == "invalid-missing-approval"
