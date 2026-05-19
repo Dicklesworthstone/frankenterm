@@ -28,6 +28,16 @@
       "reason": "host identity must not be part of the golden"
     }
   ],
+  "retained_negative_artifacts": [
+    {
+      "artifact_path": "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json",
+      "artifact_kind": "objective_plan_json_expected_invalid",
+      "schema_path": "docs/json-schema/ft-mission-objective-plan.json",
+      "validation_expectation": "schema_rejects_raw_pane_content",
+      "expected_failure": "raw_pane_content_stored_const_false",
+      "fixture_sha256": "b02893fe57e299af89a13a996a36b8502e78bdfb41a424c9c1d5a37753ef0dfd"
+    }
+  ],
   "cases": [
     {
       "case_id": "clean-ready-queue",

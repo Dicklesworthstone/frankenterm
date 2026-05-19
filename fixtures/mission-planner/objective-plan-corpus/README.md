@@ -9,4 +9,6 @@ determinism, and verifies retained artifact hashes.
 
 The retained artifacts are redacted command-output fixtures or prior reviewed
 contract examples. They record source commands, exit codes, scrub rules, and
-hashes so drift is intentional rather than accidental.
+hashes so drift is intentional rather than accidental. Retained negative
+artifacts pin reviewed rejection examples, including raw pane content storage
+that must keep failing the objective-plan schema.

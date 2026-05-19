@@ -128,9 +128,12 @@ These fixtures are schema examples, not proof that a CLI surface exists.
 
 `fixtures/mission-planner/objective-plan-corpus/` adds the reviewed planner
 golden corpus for `ft-auy2g.5`. Its manifest records scrub rules, retained
-source commands, exit codes, fixture hashes, and expected contract fields for
-clean ready queues, no-ready fallback, Agent Mail unavailable, RCH degraded,
-dirty path overlap, stale in-progress work, and blocked proof lanes. The
+source commands, exit codes, fixture hashes, retained negative artifacts, and
+expected contract fields for clean ready queues, no-ready fallback, Agent Mail
+unavailable, RCH degraded, dirty path overlap, stale in-progress work, and
+blocked proof lanes. The retained negative artifacts prove rejection fixtures
+such as `invalid-raw-pane-content.json` still violate the schema invariants
+that forbid raw pane content storage. The
 `mission_objective_plan_golden_corpus` integration test feeds those fixtures
 through the real dry-run planner, validates generated plan JSON against the
 schema, and verifies deterministic TOON encoding.

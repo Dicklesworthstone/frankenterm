@@ -31,6 +31,9 @@ REQUIRED_FORBIDDEN_ACTIONS=(
   "pane_mutation"
   "service_mutation"
 )
+REQUIRED_INVALID_PLAN_ARTIFACTS=(
+  "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"
+)
 
 fail() {
   printf 'mission objective-plan corpus manifest: %s\n' "$*" >&2
@@ -69,6 +72,7 @@ require_file "${MANIFEST}"
 mapfile -t manifest_input_paths < <(jq -r '.cases[].input_path' "${MANIFEST}" | sort)
 mapfile -t actual_input_paths < <(find "${INPUT_DIR}" -type f -name '*.json' | sort)
 mapfile -t retained_artifact_paths < <(jq -r '.cases[].retained_artifacts[].artifact_path' "${MANIFEST}" | sort -u)
+mapfile -t retained_negative_artifact_paths < <(jq -r '.retained_negative_artifacts[]?.artifact_path' "${MANIFEST}" | sort -u)
 mapfile -t plan_artifact_paths < <(find "${PLAN_ARTIFACT_DIR}" -type f -name '*.json' | sort)
 
 all_json=(
@@ -77,6 +81,7 @@ all_json=(
   "${MANIFEST}"
   "${manifest_input_paths[@]}"
   "${retained_artifact_paths[@]}"
+  "${retained_negative_artifact_paths[@]}"
   "${plan_artifact_paths[@]}"
 )
 
@@ -90,7 +95,8 @@ jq empty "${all_json[@]}"
 diff -u <(printf '%s\n' "${manifest_input_paths[@]}") <(printf '%s\n' "${actual_input_paths[@]}") \
   >/dev/null || fail "manifest case input paths do not match ${INPUT_DIR}/*.json"
 
-jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq -s .)" '
+jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq -s .)" \
+  --arg plan_schema "${PLAN_SCHEMA}" '
   .schema_version == 1
   and .contract_id == "ft.mission_objective_plan.golden_corpus.v1"
   and ([.cases[].case_id] | sort) == ($required | sort)
@@ -100,6 +106,19 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
     and (.replacement | type == "string" and length > 0)
     and (.reason | type == "string" and length > 0)
   )
+  and (.retained_negative_artifacts | type == "array" and length >= 1)
+  and all(.retained_negative_artifacts[];
+    (.artifact_path | type == "string" and length > 0)
+    and (.artifact_kind == "objective_plan_json_expected_invalid")
+    and (.schema_path == $plan_schema)
+    and (.validation_expectation == "schema_rejects_raw_pane_content")
+    and (.expected_failure == "raw_pane_content_stored_const_false")
+    and (.fixture_sha256 | test("^[0-9a-f]{64}$"))
+  )
+  and (. as $manifest | all(.retained_negative_artifacts[];
+    .artifact_path as $negative_path |
+    all($manifest.cases[].retained_artifacts[]; .artifact_path != $negative_path)
+  ))
   and all(.cases[];
     (.case_id | type == "string" and length > 0)
     and (.input_path | type == "string" and length > 0)
@@ -138,6 +157,56 @@ for field in "${REQUIRED_SCRUB_FIELDS[@]}"; do
     )
   ' "${MANIFEST}" >/dev/null || fail "manifest missing scrub rule for ${field}"
 done
+
+for artifact_path in "${REQUIRED_INVALID_PLAN_ARTIFACTS[@]}"; do
+  jq -e --arg artifact_path "${artifact_path}" '
+    any(.retained_negative_artifacts[];
+      .artifact_path == $artifact_path
+      and .artifact_kind == "objective_plan_json_expected_invalid"
+      and .validation_expectation == "schema_rejects_raw_pane_content"
+    )
+  ' "${MANIFEST}" >/dev/null || fail "manifest missing retained negative artifact ${artifact_path}"
+done
+
+while IFS=$'\t' read -r artifact_path schema_path expected_failure fixture_sha256; do
+  require_repo_relative_path "${artifact_path}"
+  require_repo_relative_path "${schema_path}"
+  require_file "${artifact_path}"
+  require_file "${schema_path}"
+
+  actual_sha256="$(sha256_file "${artifact_path}")"
+  [[ "${actual_sha256}" == "${fixture_sha256}" ]] \
+    || fail "retained negative artifact hash drift for ${artifact_path}: expected ${fixture_sha256}, got ${actual_sha256}"
+
+  [[ "${expected_failure}" == "raw_pane_content_stored_const_false" ]] \
+    || fail "${artifact_path} uses unsupported retained negative expectation ${expected_failure}"
+
+  jq -e '
+    .properties.raw_pane_content_stored.const == false
+    and .["$defs"].source_snapshot.properties.redacted.const == true
+    and .["$defs"].source_snapshot.properties.raw_pane_content_stored.const == false
+    and .["$defs"].redaction_policy.properties.raw_pane_content_allowed.const == false
+  ' "${schema_path}" >/dev/null || fail "${schema_path} no longer fail-closes raw pane content redaction fields"
+
+  jq -e '
+    .contract_id == "ft.mission_objective_plan.v1"
+    and .raw_pane_content_stored == true
+    and .redaction_policy.raw_pane_content_allowed == false
+    and any(.source_snapshots[];
+      .redacted == false
+      and .raw_pane_content_stored == true
+      and .redaction_posture.pane_content == "raw_forbidden"
+    )
+    and any(.proof_requirements[];
+      .proof_kind == "static_schema"
+      and (.artifact_paths | index("docs/json-schema/ft-mission-objective-plan.json"))
+      and (.artifact_paths | index("fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"))
+    )
+  ' "${artifact_path}" >/dev/null || fail "${artifact_path} no longer exercises the raw pane content schema rejection"
+done < <(jq -r '
+  .retained_negative_artifacts[] |
+  [.artifact_path, .schema_path, .expected_failure, .fixture_sha256] | @tsv
+' "${MANIFEST}")
 
 for case_id in "${REQUIRED_CASES[@]}"; do
   input_path="$(jq -r --arg case_id "${case_id}" '.cases[] | select(.case_id == $case_id) | .input_path' "${MANIFEST}")"
@@ -283,5 +352,5 @@ if rg -n --hidden --glob '!*.md' \
   fail "secret-shaped strings found in mission-planner fixtures"
 fi
 
-printf 'mission objective-plan corpus manifest: static verifier passed (%d cases, %d retained artifacts)\n' \
-  "${#REQUIRED_CASES[@]}" "${#retained_artifact_paths[@]}"
+printf 'mission objective-plan corpus manifest: static verifier passed (%d cases, %d retained artifacts, %d retained negative artifacts)\n' \
+  "${#REQUIRED_CASES[@]}" "${#retained_artifact_paths[@]}" "${#retained_negative_artifact_paths[@]}"
