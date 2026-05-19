@@ -194,6 +194,10 @@ SAFETY_REASONS = %w[
   safety.no_human_scoreboard
   planner.mission_objective_ref
 ].freeze
+EXPECTED_ARTIFACT_PATH_PREFIXES = [
+  "docs/json-schema/",
+  "fixtures/mission-planner/agent-task-fit-passport/"
+].freeze
 
 def fail!(message)
   warn "agent task-fit passport contract: #{message}"
@@ -204,6 +208,25 @@ def read_json(path)
   JSON.parse(File.read(path))
 rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
+end
+
+def safe_repo_relative_json_path?(path)
+  return false unless path.is_a?(String) && !path.empty?
+  return false if path == "." || path == ".."
+  return false if path.start_with?("/", "./", "../")
+  return false if path.end_with?("/")
+  return false if path.include?("\\")
+
+  segments = path.split("/", -1)
+  return false if segments.any?(&:empty?)
+  return false if segments.any? { |segment| segment == "." || segment == ".." || segment == ".git" }
+
+  path.end_with?(".json")
+end
+
+def safe_artifact_path?(path)
+  safe_repo_relative_json_path?(path) &&
+    EXPECTED_ARTIFACT_PATH_PREFIXES.any? { |prefix| path.start_with?(prefix) }
 end
 
 schema = read_json(SCHEMA)
@@ -229,6 +252,7 @@ fail!("schema forbidden enum drifted") unless schema_forbidden.sort == REQUIRED_
 
 fail!("fixture schema version drifted") unless fixtures["schema_version"] == "ft.agent_task_fit_passport.fixtures.v1"
 fail!("fixture contract id drifted") unless fixtures["contract_id"] == "ft.agent_task_fit_passport.fixture_manifest.v1"
+fail!("fixture schema pointer unsafe") unless safe_artifact_path?(fixtures.fetch("schema_path"))
 fail!("fixture schema pointer drifted") unless fixtures["schema_path"] == SCHEMA
 fail!("fixture doc pointer drifted") unless fixtures["contract_doc"] == DOC
 fail!("fixture source bead drifted") unless fixtures["source_bead"] == "ft-auy2g.9"
@@ -238,7 +262,9 @@ fail!("toon columns too sparse") unless fixtures.fetch("toon_columns").length >=
 
 fail!("invalid fixture schema version drifted") unless invalid_fixtures["schema_version"] == "ft.agent_task_fit_passport.invalid_fragments.v1"
 fail!("invalid fixture contract id drifted") unless invalid_fixtures["contract_id"] == "ft.agent_task_fit_passport.invalid_fragments.v1"
+fail!("invalid fixture schema pointer unsafe") unless safe_artifact_path?(invalid_fixtures.fetch("schema_path"))
 fail!("invalid fixture schema pointer drifted") unless invalid_fixtures["schema_path"] == SCHEMA
+fail!("invalid fixture valid fixture pointer unsafe") unless safe_artifact_path?(invalid_fixtures.fetch("valid_fixture"))
 fail!("invalid fixture valid fixture pointer drifted") unless invalid_fixtures["valid_fixture"] == FIXTURES
 fail!("invalid fixture doc pointer drifted") unless invalid_fixtures["contract_doc"] == DOC
 fail!("invalid fixture source bead drifted") unless invalid_fixtures["source_bead"] == "ft-auy2g.10"
@@ -330,6 +356,9 @@ cases.each do |entry|
     %w[domain ownership_state source_artifact freshness_state].each do |field|
       fail!("#{case_id} claimed domain missing #{field}") unless domain[field]
     end
+    source_artifact = domain.fetch("source_artifact")
+    fail!("#{case_id} claimed domain source artifact unsafe: #{source_artifact}") unless safe_artifact_path?(source_artifact)
+    fail!("#{case_id} claimed domain source artifact must point at fixtures") unless source_artifact == FIXTURES
   end
 
   evidence = artifact.fetch("evidence")
@@ -344,7 +373,9 @@ cases.each do |entry|
     ].each do |field|
       fail!("#{case_id} evidence #{row["evidence_id"] || "(missing)"} lacks #{field}") unless row.key?(field)
     end
-    fail!("#{case_id} source artifact must point at fixtures") unless row.fetch("source_artifact") == FIXTURES
+    source_artifact = row.fetch("source_artifact")
+    fail!("#{case_id} evidence source artifact unsafe: #{source_artifact}") unless safe_artifact_path?(source_artifact)
+    fail!("#{case_id} source artifact must point at fixtures") unless source_artifact == FIXTURES
     fail!("#{case_id} raw pane content stored") unless row.fetch("raw_pane_content_stored") == false
     fail!("#{case_id} mail body stored") unless row.fetch("mail_body_stored") == false
     fail!("#{case_id} secret material stored") unless row.fetch("secret_material_stored") == false
@@ -424,6 +455,10 @@ cases.each do |entry|
 
   artifact_paths = artifact.fetch("artifact_paths")
   fail!("#{case_id} missing self artifact path") unless artifact_paths.include?(FIXTURES)
+  artifact_paths.each do |artifact_path|
+    fail!("#{case_id} unsafe artifact path: #{artifact_path}") unless safe_artifact_path?(artifact_path)
+    fail!("#{case_id} artifact path missing retained file: #{artifact_path}") unless File.file?(artifact_path)
+  end
 
   toon = artifact.fetch("toon_projection")
   fail!("#{case_id} TOON columns drifted") unless toon.fetch("columns") == fixtures.fetch("toon_columns")
