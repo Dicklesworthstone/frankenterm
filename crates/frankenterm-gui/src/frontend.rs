@@ -252,11 +252,13 @@ impl GuiFrontEnd {
         // before any windows are created
         config::reload();
 
-        // And build the initial menu bar.
-        promise::spawn::spawn(async {
-            crate::commands::CommandDef::recreate_menubar(config::configuration()).await;
-        })
-        .detach();
+        // And build the initial menu bar — synchronously, BEFORE we hand
+        // control to AppKit's run loop. Deferring this via spawn_into_main_thread
+        // queues it for the next main-thread tick, but the implicit AE-open
+        // event AppKit dispatches at launch arrives first; AppKit then walks
+        // [NSApp mainMenu] in -[NSApplication _hasOpenMenuItem] / _doOpenUntitled
+        // and segfaults because the menu hasn't been built yet.
+        crate::commands::CommandDef::recreate_menubar(&config::configuration());
 
         Ok(front_end)
     }
@@ -783,8 +785,8 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
 
     let config_subscription = config::subscribe_to_config_reload({
         move || {
-            promise::spawn::spawn(async {
-                crate::commands::CommandDef::recreate_menubar(config::configuration()).await;
+            promise::spawn::spawn_into_main_thread(async {
+                crate::commands::CommandDef::recreate_menubar(&config::configuration());
             })
             .detach();
             true
