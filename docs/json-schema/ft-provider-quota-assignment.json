@@ -76,8 +76,7 @@
       "type": "array",
       "minItems": 1,
       "items": {
-        "type": "string",
-        "minLength": 1
+        "$ref": "#/$defs/artifact_path"
       }
     },
     "toon_projection": {
@@ -85,6 +84,11 @@
     }
   },
   "$defs": {
+    "artifact_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$))(?:docs/json-schema|fixtures/mission-planner/provider-quota-assignment)/.+\\.json$"
+    },
     "planner_context": {
       "type": "object",
       "required": [
@@ -237,8 +241,7 @@
           ]
         },
         "source_artifact": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/artifact_path"
         },
         "redaction_state": {
           "type": "string",

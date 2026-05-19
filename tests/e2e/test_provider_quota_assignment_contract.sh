@@ -143,6 +143,38 @@ FAIL_CLOSED_ACTIONS = %w[
   require_approval
   request_fresh_quota_evidence
 ].freeze
+ARTIFACT_PATH_PATTERN = "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$))(?:docs/json-schema|fixtures/mission-planner/provider-quota-assignment)/.+\\.json$".freeze
+ARTIFACT_PATH_ROOTS = %w[
+  docs/json-schema/
+  fixtures/mission-planner/provider-quota-assignment/
+].freeze
+SAFE_ARTIFACT_PATH_POSITIVES = [
+  SCHEMA,
+  FIXTURES,
+  INVALID_FIXTURES
+].freeze
+SAFE_ARTIFACT_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/provider-quota-assignment/cases.v1.json",
+  "./fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+  "../fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+  "fixtures/mission-planner/provider-quota-assignment//cases.v1.json",
+  "fixtures/mission-planner/provider-quota-assignment/../cases.v1.json",
+  "fixtures/mission-planner/provider-quota-assignment/./cases.v1.json",
+  "fixtures/mission-planner/provider-quota-assignment/.",
+  "fixtures/mission-planner/provider-quota-assignment/..",
+  "fixtures/mission-planner/provider-quota-assignment/.git/config.json",
+  "docs/json-schema/.git/ft-provider-quota-assignment.json",
+  "docs/robot-contracts/provider-quota-assignment.md",
+  "fixtures/mission-planner/other/cases.v1.json",
+  "fixtures\\mission-planner\\provider-quota-assignment\\cases.v1.json"
+].freeze
+MISSING_ARTIFACT_PATH_NEGATIVES = %w[
+  docs/json-schema/ft-provider-quota-assignment-missing.json
+  fixtures/mission-planner/provider-quota-assignment/missing.json
+].freeze
+ARTIFACT_PATH_REGEX = Regexp.new(ARTIFACT_PATH_PATTERN)
 
 def fail!(message)
   warn "provider quota assignment contract: #{message}"
@@ -153,6 +185,22 @@ def read_json(path)
   JSON.parse(File.read(path))
 rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
+end
+
+def safe_artifact_path?(path)
+  return false unless path.is_a?(String)
+  return false if path.empty? || path.start_with?("/") || path.include?("\\")
+  return false unless path.end_with?(".json")
+
+  parts = path.split("/")
+  return false if parts.empty? || parts.any?(&:empty?)
+  return false if parts.any? { |part| part == "." || part == ".." || part == ".git" }
+
+  ARTIFACT_PATH_ROOTS.any? { |root| path.start_with?(root) && path.length > root.length }
+end
+
+def retained_artifact_path?(path)
+  safe_artifact_path?(path) && File.file?(path)
 end
 
 schema = read_json(SCHEMA)
@@ -166,6 +214,9 @@ fail!("schema contract const drifted") unless schema.dig("properties", "contract
 fail!("schema source bead const drifted") unless schema.dig("properties", "source_bead", "const") == "ft-auy2g.8"
 fail!("dry_run must be const true") unless schema.dig("properties", "dry_run", "const") == true
 fail!("read_only must be const true") unless schema.dig("properties", "read_only", "const") == true
+fail!("artifact path schema pattern drifted") unless schema.dig("$defs", "artifact_path", "pattern") == ARTIFACT_PATH_PATTERN
+fail!("artifact_paths schema not shared") unless schema.dig("properties", "artifact_paths", "items", "$ref") == "#/$defs/artifact_path"
+fail!("source_artifact schema not shared") unless schema.dig("$defs", "provider_evidence", "properties", "source_artifact", "$ref") == "#/$defs/artifact_path"
 
 schema_actions = schema.dig("$defs", "recommendation", "properties", "action", "enum")
 fail!("recommendation enum drifted") unless schema_actions.sort == REQUIRED_RECOMMENDATIONS.sort
@@ -175,10 +226,23 @@ REQUIRED_REASON_CODES.each do |reason|
 end
 schema_forbidden = schema.dig("$defs", "forbidden_action", "enum")
 fail!("schema forbidden enum drifted") unless schema_forbidden.sort == REQUIRED_FORBIDDEN.sort
+SAFE_ARTIFACT_PATH_POSITIVES.each do |path|
+  fail!("safe artifact path rejected: #{path}") unless retained_artifact_path?(path)
+  fail!("schema artifact path pattern rejected safe path: #{path}") unless ARTIFACT_PATH_REGEX.match?(path)
+end
+SAFE_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("unsafe artifact path accepted: #{path.inspect}") if safe_artifact_path?(path)
+  fail!("schema artifact path pattern accepted unsafe path: #{path.inspect}") if path.is_a?(String) && ARTIFACT_PATH_REGEX.match?(path)
+end
+MISSING_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("missing artifact path rejected by shape check: #{path}") unless safe_artifact_path?(path)
+  fail!("missing artifact path unexpectedly exists: #{path}") if retained_artifact_path?(path)
+end
 
 fail!("fixture schema version drifted") unless fixtures["schema_version"] == "ft.provider_quota_assignment.fixtures.v1"
 fail!("fixture contract id drifted") unless fixtures["contract_id"] == "ft.provider_quota_assignment.fixture_manifest.v1"
 fail!("fixture schema pointer drifted") unless fixtures["schema_path"] == SCHEMA
+fail!("fixture schema pointer unsafe or missing") unless retained_artifact_path?(fixtures.fetch("schema_path"))
 fail!("fixture doc pointer drifted") unless fixtures["contract_doc"] == DOC
 fail!("fixture source bead drifted") unless fixtures["source_bead"] == "ft-auy2g.8"
 fail!("fixture verifier missing") unless fixtures.fetch("verification").include?("bash tests/e2e/test_provider_quota_assignment_contract.sh")
@@ -188,7 +252,9 @@ fail!("toon columns too sparse") unless fixtures.fetch("toon_columns").length >=
 fail!("invalid fixture schema version drifted") unless invalid_fixtures["schema_version"] == "ft.provider_quota_assignment.invalid_fragments.v1"
 fail!("invalid fixture contract id drifted") unless invalid_fixtures["contract_id"] == "ft.provider_quota_assignment.invalid_fragments.v1"
 fail!("invalid fixture schema pointer drifted") unless invalid_fixtures["schema_path"] == SCHEMA
+fail!("invalid fixture schema pointer unsafe or missing") unless retained_artifact_path?(invalid_fixtures.fetch("schema_path"))
 fail!("invalid fixture valid fixture pointer drifted") unless invalid_fixtures["valid_fixture"] == FIXTURES
+fail!("invalid fixture valid fixture pointer unsafe or missing") unless retained_artifact_path?(invalid_fixtures.fetch("valid_fixture"))
 fail!("invalid fixture doc pointer drifted") unless invalid_fixtures["contract_doc"] == DOC
 fail!("invalid fixture source bead drifted") unless invalid_fixtures["source_bead"] == "ft-auy2g.11"
 fail!("invalid fixture verifier missing") unless invalid_fixtures.fetch("verification").include?("bash tests/e2e/test_provider_quota_assignment_contract.sh")
@@ -281,6 +347,7 @@ cases.each do |entry|
       fail!("#{case_id} evidence #{row["evidence_id"] || "(missing)"} lacks #{field}") unless row.key?(field)
     end
     fail!("#{case_id} source artifact must point at fixtures") unless row.fetch("source_artifact") == FIXTURES
+    fail!("#{case_id} source artifact unsafe or missing: #{row.fetch("source_artifact")}") unless retained_artifact_path?(row.fetch("source_artifact"))
     fail!("#{case_id} raw provider evidence is forbidden") if row.fetch("redaction_state") == "raw_forbidden"
   end
 
@@ -348,6 +415,9 @@ cases.each do |entry|
 
   artifact_paths = artifact.fetch("artifact_paths")
   fail!("#{case_id} missing self artifact path") unless artifact_paths.include?(FIXTURES)
+  artifact_paths.each do |artifact_path|
+    fail!("#{case_id} unsafe or missing artifact path: #{artifact_path}") unless retained_artifact_path?(artifact_path)
+  end
 
   toon = artifact.fetch("toon_projection")
   fail!("#{case_id} TOON columns drifted") unless toon.fetch("columns") == fixtures.fetch("toon_columns")

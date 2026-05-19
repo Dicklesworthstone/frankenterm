@@ -33,6 +33,9 @@ Every assignment artifact records:
   `require_approval`, or `request_fresh_quota_evidence`;
 - stable reason codes for both happy and fail-closed paths;
 - forbidden action classes; and
+- retained artifact paths that are safe repo-relative JSON paths under
+  `docs/json-schema/` or
+  `fixtures/mission-planner/provider-quota-assignment/`; and
 - a compact `toon_projection` table with deterministic columns and rows for
   agent-to-agent consumption.
 
@@ -72,6 +75,10 @@ evidence, degrade the model class, or require explicit approval.
    approval-gated bead implements a stricter policy.
 5. `request_fresh_quota_evidence` is mandatory when quota evidence is unknown,
    stale, contradictory, privacy-redacted, or provider-unavailable.
+6. `artifact_paths` and evidence `source_artifact` values must be safe
+   repo-relative JSON paths under the provider-quota schema or fixture roots.
+   Absolute paths, backslashes, empty segments, dot segments, `.git` internals,
+   wrong roots, non-JSON paths, and missing retained files are invalid.
 
 The exact forbidden action IDs are `provider_api_call`,
 `credential_mutation`, `account_rotation`, `hidden_spend_decision`,
