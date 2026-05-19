@@ -557,6 +557,18 @@ impl DiskPressureMonitor {
         self.telemetry.updates += 1;
         let prev_tier = self.current_tier();
 
+        if sample.usage_fraction.is_nan() {
+            let tier = DiskPressureTier::Black;
+            self.telemetry.tier_black += 1;
+            if tier != prev_tier {
+                self.telemetry.tier_transitions += 1;
+            }
+            self.latest_tier
+                .store(tier.as_u8() as u64, Ordering::Relaxed);
+            self.update_count += 1;
+            return tier;
+        }
+
         let smoothed_usage = self.ewma.update(sample.usage_fraction);
 
         let dt_secs = self.last_sample.map_or_else(
