@@ -213,10 +213,69 @@ impl ShellType {
     }
 }
 
+fn find_unique_ft_marker(
+    content: &str,
+    marker: &str,
+    config_kind: &str,
+    marker_kind: &str,
+) -> Result<Option<usize>> {
+    let mut matches = content.match_indices(marker);
+    let first = matches.next().map(|(idx, _)| idx);
+    if matches.next().is_some() {
+        return Err(Error::SetupError(format!(
+            "{config_kind} contains multiple FT {marker_kind} markers"
+        )));
+    }
+    Ok(first)
+}
+
+fn validated_ft_block_bounds(
+    content: &str,
+    begin_marker: &str,
+    end_marker: &str,
+    config_kind: &str,
+) -> Result<Option<(usize, usize)>> {
+    let begin_idx = find_unique_ft_marker(content, begin_marker, config_kind, "begin")?;
+    let end_marker_start = find_unique_ft_marker(content, end_marker, config_kind, "end")?;
+
+    match (begin_idx, end_marker_start) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(Error::SetupError(format!(
+            "{config_kind} contains FT begin marker without FT end marker"
+        ))),
+        (None, Some(_)) => Err(Error::SetupError(format!(
+            "{config_kind} contains FT end marker without FT begin marker"
+        ))),
+        (Some(begin_idx), Some(end_marker_start)) => {
+            if end_marker_start <= begin_idx {
+                return Err(Error::SetupError(format!(
+                    "{config_kind} contains FT markers out of order"
+                )));
+            }
+
+            let end_idx = content[end_marker_start..]
+                .find('\n')
+                .map_or(content.len(), |i| end_marker_start + i + 1);
+            Ok(Some((begin_idx, end_idx)))
+        }
+    }
+}
+
 /// Check if the shell ft-managed block is already present
 #[must_use]
 pub fn has_shell_ft_block(content: &str) -> bool {
-    content.contains(FT_BEGIN_MARKER_SHELL) && content.contains(FT_END_MARKER_SHELL)
+    validated_shell_ft_block_bounds(content)
+        .map(|bounds| bounds.is_some())
+        .unwrap_or(false)
+}
+
+fn validated_shell_ft_block_bounds(content: &str) -> Result<Option<(usize, usize)>> {
+    validated_ft_block_bounds(
+        content,
+        FT_BEGIN_MARKER_SHELL,
+        FT_END_MARKER_SHELL,
+        "Shell config",
+    )
 }
 
 /// Create the full ft-managed block for shell rc files
@@ -269,8 +328,8 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
         String::new()
     };
 
-    // Check if already patched
-    if has_shell_ft_block(&content) {
+    // Check if already patched. Malformed marker pairs must fail before any write.
+    if validated_shell_ft_block_bounds(&content)?.is_some() {
         return Ok(PatchResult {
             config_path: rc_path.to_path_buf(),
             backup_path: None,
@@ -349,7 +408,7 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
     let content = fs::read_to_string(rc_path)
         .map_err(|e| Error::SetupError(format!("Failed to read {}: {}", rc_path.display(), e)))?;
 
-    if !has_shell_ft_block(&content) {
+    let Some((begin_idx, end_idx)) = validated_shell_ft_block_bounds(&content)? else {
         return Ok(PatchResult {
             config_path: rc_path.to_path_buf(),
             backup_path: None,
@@ -359,25 +418,10 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
                 rc_path.display()
             ),
         });
-    }
+    };
 
-    // Create backup before modifying
+    // Create backup only after marker structure is known to be valid.
     let backup_path = create_backup(rc_path)?;
-
-    // Remove the ft-managed block (markers guaranteed present by has_shell_ft_block check above).
-    let Some(begin_idx) = content.find(FT_BEGIN_MARKER_SHELL) else {
-        return Err(Error::SetupError(
-            "Begin marker not found in shell config".into(),
-        ));
-    };
-    let Some(end_marker_start) = content.find(FT_END_MARKER_SHELL) else {
-        return Err(Error::SetupError(
-            "End marker not found in shell config".into(),
-        ));
-    };
-    let end_idx = content[end_marker_start..]
-        .find('\n')
-        .map_or(content.len(), |i| end_marker_start + i + 1);
 
     // Also remove any leading newlines before the block
     let mut start = begin_idx;
@@ -795,51 +839,24 @@ fn get_config_candidates() -> Vec<PathBuf> {
 /// Check if the ft-managed block is already present in the content
 #[must_use]
 pub fn has_ft_block(content: &str) -> bool {
-    content.contains(FT_BEGIN_MARKER) && content.contains(FT_END_MARKER)
+    validated_wezterm_ft_block_bounds(content)
+        .map(|bounds| bounds.is_some())
+        .unwrap_or(false)
 }
 
 /// Extract the current ft-managed block from content (if present)
 #[must_use]
 pub fn extract_ft_block(content: &str) -> Option<String> {
-    let begin_idx = content.find(FT_BEGIN_MARKER)?;
-    let end_idx = content.find(FT_END_MARKER)?;
-
-    if end_idx > begin_idx {
-        // Include the FT-END marker line.
-        let end_line_end = content[end_idx..]
-            .find('\n')
-            .map_or(content.len(), |i| end_idx + i);
-        Some(content[begin_idx..end_line_end].to_string())
-    } else {
-        None
-    }
+    let (begin_idx, end_idx) = validated_wezterm_ft_block_bounds(content).ok().flatten()?;
+    Some(
+        content[begin_idx..end_idx]
+            .trim_end_matches(|c| c == '\r' || c == '\n')
+            .to_string(),
+    )
 }
 
 fn validated_wezterm_ft_block_bounds(content: &str) -> Result<Option<(usize, usize)>> {
-    let begin_idx = content.find(FT_BEGIN_MARKER);
-    let end_marker_start = content.find(FT_END_MARKER);
-
-    match (begin_idx, end_marker_start) {
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(Error::SetupError(
-            "WezTerm config contains FT begin marker without FT end marker".to_string(),
-        )),
-        (None, Some(_)) => Err(Error::SetupError(
-            "WezTerm config contains FT end marker without FT begin marker".to_string(),
-        )),
-        (Some(begin_idx), Some(end_marker_start)) => {
-            if end_marker_start <= begin_idx {
-                return Err(Error::SetupError(
-                    "WezTerm config contains FT markers out of order".to_string(),
-                ));
-            }
-
-            let end_idx = content[end_marker_start..]
-                .find('\n')
-                .map_or(content.len(), |i| end_marker_start + i + 1);
-            Ok(Some((begin_idx, end_idx)))
-        }
-    }
+    validated_ft_block_bounds(content, FT_BEGIN_MARKER, FT_END_MARKER, "WezTerm config")
 }
 
 fn find_return_line_start(content: &str) -> Option<usize> {
@@ -942,9 +959,9 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
 
     let ft_block = create_ft_block();
 
-    // Check if already patched
-    if has_ft_block(&content) {
-        let existing = extract_ft_block(&content).unwrap_or_default();
+    // Check if already patched. Malformed marker pairs must fail before any write.
+    if let Some((begin_idx, end_idx)) = validated_wezterm_ft_block_bounds(&content)? {
+        let existing = content[begin_idx..end_idx].to_string();
         let normalized_existing = existing.trim_end_matches('\n');
         let normalized_new = ft_block.trim_end_matches('\n');
 
@@ -1018,7 +1035,7 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
 ///
 /// This supports idempotent updates for generated blocks (e.g., ssh_domains).
 pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Result<PatchResult> {
-    if !ft_block.contains(FT_BEGIN_MARKER) || !ft_block.contains(FT_END_MARKER) {
+    if validated_wezterm_ft_block_bounds(ft_block)?.is_none() {
         return Err(Error::SetupError(
             "Generated ft block is missing FT markers.".to_string(),
         ));
@@ -1030,8 +1047,8 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
 
     let normalized_block = ft_block.trim_end_matches('\n');
 
-    if has_ft_block(&content) {
-        let existing = extract_ft_block(&content).unwrap_or_default();
+    if let Some((begin_idx, end_idx)) = validated_wezterm_ft_block_bounds(&content)? {
+        let existing = content[begin_idx..end_idx].to_string();
         let normalized_existing = existing.trim_end_matches('\n');
         if normalized_existing == normalized_block {
             return Ok(PatchResult {
@@ -1045,16 +1062,6 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
         }
 
         let backup_path = create_backup(config_path)?;
-
-        let Some(begin_idx) = content.find(FT_BEGIN_MARKER) else {
-            return Err(Error::SetupError("Begin marker not found in config".into()));
-        };
-        let Some(end_marker_start) = content.find(FT_END_MARKER) else {
-            return Err(Error::SetupError("End marker not found in config".into()));
-        };
-        let end_idx = content[end_marker_start..]
-            .find('\n')
-            .map_or(content.len(), |i| end_marker_start + i + 1);
 
         let return_idx = find_return_line_start(&content);
         let new_content = if return_idx.is_some_and(|idx| begin_idx > idx) {
@@ -1497,6 +1504,22 @@ mod tests {
         file
     }
 
+    fn assert_setup_error_preserves_file(
+        content: &str,
+        expected_message: &str,
+        action: impl FnOnce(&Path) -> Result<PatchResult>,
+    ) {
+        let file = create_temp_config(content);
+
+        let err = action(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string().contains(expected_message),
+            "expected error to contain {expected_message:?}, got {err}"
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
     #[test]
     fn test_has_ft_block_when_present() {
         let content = r"
@@ -1531,6 +1554,16 @@ return config
         // Only END marker
         let content2 = "some code\n-- FT-END";
         assert!(!has_ft_block(content2));
+
+        // END before BEGIN is malformed, not a valid block.
+        let content3 = "-- FT-END\nsome code\n-- FT-BEGIN (do not edit this block)";
+        assert!(!has_ft_block(content3));
+
+        // Duplicate markers are ambiguous and therefore not a valid block.
+        let content4 = "-- FT-BEGIN (do not edit this block)\n-- duplicate\n-- FT-BEGIN (do not edit this block)\n-- FT-END";
+        assert!(!has_ft_block(content4));
+        let content5 = "-- FT-BEGIN (do not edit this block)\n-- code\n-- FT-END\n-- FT-END";
+        assert!(!has_ft_block(content5));
     }
 
     #[test]
@@ -1586,6 +1619,104 @@ return config
         // Content should be unchanged
         let content_after = fs::read_to_string(file.path()).unwrap();
         assert_eq!(original, content_after);
+    }
+
+    #[test]
+    fn test_patch_errors_on_partial_begin_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-BEGIN (do not edit this block)
+-- some ft code
+
+return config
+";
+        let file = create_temp_config(content);
+
+        let err = patch_wezterm_config_at(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("begin marker without FT end marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_patch_errors_on_partial_end_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- some ft code
+-- FT-END
+
+return config
+";
+        let file = create_temp_config(content);
+
+        let err = patch_wezterm_config_at(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("end marker without FT begin marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_patch_errors_on_reversed_markers() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-END
+-- some ft code
+-- FT-BEGIN (do not edit this block)
+
+return config
+";
+        let file = create_temp_config(content);
+
+        let err = patch_wezterm_config_at(file.path()).unwrap_err();
+
+        assert!(err.to_string().contains("markers out of order"));
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_patch_errors_on_duplicate_begin_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-BEGIN (do not edit this block)
+-- first ft code
+-- FT-BEGIN (do not edit this block)
+-- second ft code
+-- FT-END
+
+return config
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT begin markers", |path| {
+            patch_wezterm_config_at(path)
+        });
+    }
+
+    #[test]
+    fn test_patch_errors_on_duplicate_end_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-BEGIN (do not edit this block)
+-- some ft code
+-- FT-END
+-- FT-END
+
+return config
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT end markers", |path| {
+            patch_wezterm_config_at(path)
+        });
     }
 
     #[test]
@@ -1892,6 +2023,43 @@ return config
     }
 
     #[test]
+    fn test_unpatch_errors_on_duplicate_begin_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-BEGIN (do not edit this block)
+-- first ft code
+-- FT-BEGIN (do not edit this block)
+-- second ft code
+-- FT-END
+
+return config
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT begin markers", |path| {
+            unpatch_wezterm_config_at(path)
+        });
+    }
+
+    #[test]
+    fn test_unpatch_errors_on_duplicate_end_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-BEGIN (do not edit this block)
+-- some ft code
+-- FT-END
+-- FT-END
+
+return config
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT end markers", |path| {
+            unpatch_wezterm_config_at(path)
+        });
+    }
+
+    #[test]
     fn test_extract_ft_block() {
         let content = r"before
 -- FT-BEGIN (do not edit this block)
@@ -1956,6 +2124,104 @@ alias ll='ls -la'
         // Only END marker
         let content2 = "some code\n# FT-END";
         assert!(!has_shell_ft_block(content2));
+
+        // END before BEGIN is malformed, not a valid block.
+        let content3 = "# FT-END\nsome code\n# FT-BEGIN (do not edit this block)";
+        assert!(!has_shell_ft_block(content3));
+
+        // Duplicate markers are ambiguous and therefore not a valid block.
+        let content4 = "# FT-BEGIN (do not edit this block)\n# duplicate\n# FT-BEGIN (do not edit this block)\n# FT-END";
+        assert!(!has_shell_ft_block(content4));
+        let content5 = "# FT-BEGIN (do not edit this block)\n# code\n# FT-END\n# FT-END";
+        assert!(!has_shell_ft_block(content5));
+    }
+
+    #[test]
+    fn test_shell_patch_errors_on_partial_begin_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-BEGIN (do not edit this block)
+# ft: OSC 133 markers
+";
+        let file = create_temp_config(content);
+
+        let err = patch_shell_rc_at(file.path(), ShellType::Bash).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("begin marker without FT end marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_shell_patch_errors_on_partial_end_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# ft: OSC 133 markers
+# FT-END
+";
+        let file = create_temp_config(content);
+
+        let err = patch_shell_rc_at(file.path(), ShellType::Bash).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("end marker without FT begin marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_shell_patch_errors_on_reversed_markers() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-END
+# ft: OSC 133 markers
+# FT-BEGIN (do not edit this block)
+";
+        let file = create_temp_config(content);
+
+        let err = patch_shell_rc_at(file.path(), ShellType::Bash).unwrap_err();
+
+        assert!(err.to_string().contains("markers out of order"));
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_shell_patch_errors_on_duplicate_begin_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-BEGIN (do not edit this block)
+# first ft block
+# FT-BEGIN (do not edit this block)
+# second ft block
+# FT-END
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT begin markers", |path| {
+            patch_shell_rc_at(path, ShellType::Bash)
+        });
+    }
+
+    #[test]
+    fn test_shell_patch_errors_on_duplicate_end_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-BEGIN (do not edit this block)
+# ft block
+# FT-END
+# FT-END
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT end markers", |path| {
+            patch_shell_rc_at(path, ShellType::Bash)
+        });
     }
 
     #[test]
@@ -2061,6 +2327,94 @@ alias ll='ls -la'
 
         assert!(!result.modified);
         assert!(result.backup_path.is_none());
+    }
+
+    #[test]
+    fn test_shell_unpatch_errors_on_partial_begin_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-BEGIN (do not edit this block)
+# ft: OSC 133 markers
+";
+        let file = create_temp_config(content);
+
+        let err = unpatch_shell_rc_at(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("begin marker without FT end marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_shell_unpatch_errors_on_partial_end_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# ft: OSC 133 markers
+# FT-END
+";
+        let file = create_temp_config(content);
+
+        let err = unpatch_shell_rc_at(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("end marker without FT begin marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_shell_unpatch_errors_on_reversed_markers() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-END
+# ft: OSC 133 markers
+# FT-BEGIN (do not edit this block)
+";
+        let file = create_temp_config(content);
+
+        let err = unpatch_shell_rc_at(file.path()).unwrap_err();
+
+        assert!(err.to_string().contains("markers out of order"));
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_shell_unpatch_errors_on_duplicate_begin_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-BEGIN (do not edit this block)
+# first ft block
+# FT-BEGIN (do not edit this block)
+# second ft block
+# FT-END
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT begin markers", |path| {
+            unpatch_shell_rc_at(path)
+        });
+    }
+
+    #[test]
+    fn test_shell_unpatch_errors_on_duplicate_end_marker() {
+        let content = r"# ~/.bashrc
+export PATH=$HOME/bin:$PATH
+
+# FT-BEGIN (do not edit this block)
+# ft block
+# FT-END
+# FT-END
+";
+
+        assert_setup_error_preserves_file(content, "multiple FT end markers", |path| {
+            unpatch_shell_rc_at(path)
+        });
     }
 
     #[test]
@@ -3046,6 +3400,15 @@ alias ll='ls -la'
     }
 
     #[test]
+    fn extract_ft_block_duplicate_markers() {
+        let duplicate_begin = "-- FT-BEGIN (do not edit this block)\n-- one\n-- FT-BEGIN (do not edit this block)\n-- FT-END\n";
+        assert!(extract_ft_block(duplicate_begin).is_none());
+
+        let duplicate_end = "-- FT-BEGIN (do not edit this block)\n-- one\n-- FT-END\n-- FT-END\n";
+        assert!(extract_ft_block(duplicate_end).is_none());
+    }
+
+    #[test]
     fn extract_ft_block_end_without_newline() {
         let content = "-- FT-BEGIN (do not edit this block)\n-- code\n-- FT-END";
         let block = extract_ft_block(content).unwrap();
@@ -3066,6 +3429,77 @@ alias ll='ls -la'
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("marker"));
+    }
+
+    #[test]
+    fn patch_wezterm_config_block_reversed_generated_markers_error() {
+        let original = "local x = 1\n";
+        let file = create_temp_config(original);
+        let bad_block = "-- FT-END\nbad block\n-- FT-BEGIN (do not edit this block)\n";
+
+        let result = patch_wezterm_config_block_at(file.path(), bad_block);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out of order"));
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[test]
+    fn patch_wezterm_config_block_duplicate_generated_markers_error() {
+        let original = "local x = 1\n";
+        let file = create_temp_config(original);
+        let bad_block = "-- FT-BEGIN (do not edit this block)\nfirst\n-- FT-BEGIN (do not edit this block)\nsecond\n-- FT-END\n";
+
+        let result = patch_wezterm_config_block_at(file.path(), bad_block);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("multiple FT begin markers")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[test]
+    fn patch_wezterm_config_block_reversed_existing_markers_error() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-END
+-- some ft code
+-- FT-BEGIN (do not edit this block)
+
+return config
+";
+        let file = create_temp_config(content);
+        let block = create_ft_block();
+
+        let err = patch_wezterm_config_block_at(file.path(), &block).unwrap_err();
+
+        assert!(err.to_string().contains("markers out of order"));
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn patch_wezterm_config_block_duplicate_existing_markers_error() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-BEGIN (do not edit this block)
+-- first ft code
+-- FT-BEGIN (do not edit this block)
+-- second ft code
+-- FT-END
+
+return config
+";
+        let block = create_ft_block();
+
+        assert_setup_error_preserves_file(content, "multiple FT begin markers", |path| {
+            patch_wezterm_config_block_at(path, &block)
+        });
     }
 
     // =========================================================================
