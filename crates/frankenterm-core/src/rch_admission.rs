@@ -1067,13 +1067,26 @@ fn reason_codes_from_error_category(error_category: &str) -> Vec<RchAdmissionRea
     if looks_like_enospc(&normalized) || normalized.contains("cache.write_failed") {
         reason_codes.push(RchAdmissionReasonCode::LocalEnoSpace);
     }
-    if normalized.contains("no_admissible") || normalized.contains("worker=null") {
+    if normalized.contains("no_admissible")
+        || normalized.contains("no_workers_passed_health")
+        || normalized.contains("worker=null")
+    {
         reason_codes.push(RchAdmissionReasonCode::NoAdmissibleWorkers);
     }
-    if normalized.contains("critical_pressure") || normalized.contains("pressure-critical") {
+    if normalized.contains("critical_pressure")
+        || normalized.contains("pressure-critical")
+        || normalized.contains("pressure_state=critical")
+        || normalized.contains("disk_free_below_critical_gb")
+        || normalized.contains("disk_ratio_below_critical")
+        || normalized.contains("disk_critical_without_fresh_telemetry")
+    {
         reason_codes.push(RchAdmissionReasonCode::CriticalPressure);
     }
-    if normalized.contains("telemetry_gap") || normalized.contains("stale_telemetry") {
+    if normalized.contains("telemetry_gap")
+        || normalized.contains("stale_telemetry")
+        || normalized.contains("disk_metrics_unavailable")
+        || normalized.contains("disk_critical_without_fresh_telemetry")
+    {
         reason_codes.push(RchAdmissionReasonCode::TelemetryGap);
     }
     if normalized.contains("insufficient_slots") {
@@ -1520,6 +1533,48 @@ mod tests {
             report
                 .reason_codes
                 .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
+    }
+
+    #[test]
+    fn installed_rch_pressure_reason_strings_normalize_to_stable_codes() {
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.installed_pressure_reason_strings",
+            intercepted_command(),
+        )
+        .with_collector_observation(
+            RchAdmissionCollectorObservation::new(
+                "rch.status.worker_pressure",
+                "RCH_NO_SELF_HEALING=1 rch --json status --workers --jobs",
+                "installed RCH reported current worker pressure codes",
+            )
+            .error_category(
+                "worker=null; no_workers_passed_health; \
+                 pressure_reason_code=disk_free_below_critical_gb; \
+                 pressure_reason_code=disk_ratio_below_critical; \
+                 pressure_reason_code=disk_critical_without_fresh_telemetry; \
+                 pressure_reason_code=disk_metrics_unavailable",
+            ),
+        );
+
+        let report = build_rch_admission_report(&input);
+
+        assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::TelemetryGap)
         );
     }
 

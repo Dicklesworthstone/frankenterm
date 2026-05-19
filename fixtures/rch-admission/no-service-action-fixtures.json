@@ -242,7 +242,7 @@
       "retained_evidence": [
         {
           "kind": "status_snapshot",
-          "summary": "RCH status reported degraded posture with 5/8 healthy workers and 54/54 available slots, but the healthy workers remained under critical pressure."
+          "summary": "RCH status reported degraded posture with 5/8 healthy workers and 54/54 available slots, but the healthy workers remained under critical pressure: disk_free_below_critical_gb and disk_ratio_below_critical. Degraded or unreachable workers reported disk_metrics_unavailable telemetry gaps."
         },
         {
           "kind": "command_output",

@@ -44,6 +44,15 @@ The schema lives at `docs/json-schema/ft-rch-admission.json` and uses
 | `dry_run_inconsistent_worker` | Dry-run envelope claims worker availability while selected worker is null or skipped. | Preserve both fields and classify the result as advisory/inconclusive. |
 | `unknown` | The blocker is real but does not fit a stable code yet. | File or update a bead with the retained artifact and propose a new code. |
 
+Installed RCH versions may surface lower-level pressure strings before the
+contract can receive structured selector diagnostics. The normalizer treats
+`no_workers_passed_health` as `no_admissible_workers`;
+`disk_free_below_critical_gb`, `disk_ratio_below_critical`, and
+`disk_critical_without_fresh_telemetry` as `critical_pressure`; and
+`disk_metrics_unavailable` or `disk_critical_without_fresh_telemetry` as
+`telemetry_gap`. These aliases are still advisory evidence, not proof that
+Cargo, rustc, or a test binary ran.
+
 ## Forbidden Actions
 
 The contract always carries `forbidden_actions`. Normal agents must not perform
@@ -145,3 +154,35 @@ explicit job count differs from the installed selector estimate, the analyzer
 sets `slot_estimate_mismatch=true` in the citation summary. That mismatch is
 evidence for humans and follow-up beads; it is not by itself compiled proof and
 must not be cited as a Cargo result.
+
+## Fuzz Target Coverage
+
+`fuzz/fuzz_targets/rch_admission_cargo.rs` is the coverage-guided harness for
+the pure Cargo command analyzer and v1 report normalization path. It exercises
+`analyze_rch_admission_cargo_command`, `build_rch_admission_report`, reason-code
+normalization, queue diagnostic inputs, explicit job parsing, target-dir
+parsing, package/exclude handling, test-filter handling, libtest argument
+handling, malformed quoting, and non-Cargo command classification. Like the core
+normalizer, the fuzz target must not shell out, run Cargo as proof, restart
+services, mutate RCH workers, write Beads state, or delete files.
+
+The harness is registered in `fuzz/Cargo.toml` as `rch_admission_cargo` and is
+kept behind `required-features = ["core-fuzz-targets"]`. Its seed corpus lives
+under `fuzz/corpus/rch_admission_cargo` and must cover the stable analyzer cases
+below:
+
+| Seed | Coverage |
+|---|---|
+| `non_cargo` | A command outside Cargo that still contains the word cargo in text. |
+| `inline_env` | `rch ... env` wrapping with `CARGO_BUILD_JOBS` and `CARGO_TARGET_DIR`. |
+| `jobs_forms` | `-j`, `--jobs=N`, and `--jobs N` forms. |
+| `target_dir` | `--target-dir=VALUE` parsing. |
+| `exclude_not_filter` | `--exclude` values are package exclusions, not test filters. |
+| `test_filter` | Positional `cargo test` filters remain test scope. |
+| `libtest_args` | Arguments after `--` stay out of Cargo package/test classification. |
+| `malformed_quote` | Unterminated quote input stays advisory and non-panicking. |
+
+The static verifier only proves that this harness, registration, corpus, and
+documentation are synchronized. Any compiled fuzz-target, Cargo, test, or clippy
+evidence for FrankenTerm still requires an RCH proof lane and must be reported
+separately from this static contract check.

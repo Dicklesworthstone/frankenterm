@@ -14,6 +14,9 @@ SUMMARY_GOLDEN="fixtures/rch-admission/summary.golden.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 README="README.md"
 SOURCE="crates/frankenterm-core/src/rch_admission.rs"
+FUZZ_CARGO="fuzz/Cargo.toml"
+FUZZ_TARGET="fuzz/fuzz_targets/rch_admission_cargo.rs"
+FUZZ_CORPUS_DIR="fuzz/corpus/rch_admission_cargo"
 RUN_ID="${FT_RCH_ADMISSION_CONTRACT_RUN_ID:-static}"
 ARTIFACT_DIR="${FT_RCH_ADMISSION_CONTRACT_ARTIFACT_DIR:-tests/e2e/artifacts/static-proof/ft-69gwh.4/rch-admission-contract/${RUN_ID}}"
 STRUCTURED_LOG="${ARTIFACT_DIR}/structured.log"
@@ -32,6 +35,10 @@ require_file() {
   [[ -f "$1" ]] || fail "missing file: $1"
 }
 
+require_dir() {
+  [[ -d "$1" ]] || fail "missing directory: $1"
+}
+
 require_command jq
 require_command ruby
 require_file "${SCHEMA}"
@@ -43,6 +50,9 @@ require_file "${SUMMARY_GOLDEN}"
 require_file "${PROVENANCE}"
 require_file "${README}"
 require_file "${SOURCE}"
+require_file "${FUZZ_CARGO}"
+require_file "${FUZZ_TARGET}"
+require_dir "${FUZZ_CORPUS_DIR}"
 
 mkdir -p "${ARTIFACT_DIR}"
 export FT_RCH_ADMISSION_STRUCTURED_LOG="${STRUCTURED_LOG}"
@@ -64,6 +74,9 @@ SUMMARY_GOLDEN = "fixtures/rch-admission/summary.golden.json"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 README = "README.md"
 SOURCE = "crates/frankenterm-core/src/rch_admission.rs"
+FUZZ_CARGO = "fuzz/Cargo.toml"
+FUZZ_TARGET = "fuzz/fuzz_targets/rch_admission_cargo.rs"
+FUZZ_CORPUS_DIR = "fuzz/corpus/rch_admission_cargo"
 STRUCTURED_LOG = ENV.fetch("FT_RCH_ADMISSION_STRUCTURED_LOG")
 SUMMARY_FILE = ENV.fetch("FT_RCH_ADMISSION_SUMMARY_FILE")
 EXPECTED_CODES = %w[
@@ -130,6 +143,16 @@ REQUIRED_FORBIDDEN_COMMAND_FRAGMENTS = [
   "git clean -fd",
   "rm -rf"
 ].freeze
+EXPECTED_FUZZ_CORPUS = {
+  "exclude_not_filter" => ["--exclude", "rch_admission"],
+  "inline_env" => ["CARGO_BUILD_JOBS", "CARGO_TARGET_DIR"],
+  "jobs_forms" => ["-j2", "--jobs=3", "--jobs 4"],
+  "libtest_args" => ["-- --nocapture"],
+  "malformed_quote" => ['"unterminated'],
+  "non_cargo" => ["echo not cargo"],
+  "target_dir" => ["--target-dir="],
+  "test_filter" => ["rch_admission"]
+}.freeze
 
 def fail!(message)
   warn "rch admission contract: #{message}"
@@ -149,6 +172,8 @@ doc = File.read(DOC)
 provenance = File.read(PROVENANCE)
 readme = File.read(README)
 source = File.read(SOURCE)
+fuzz_cargo = File.read(FUZZ_CARGO)
+fuzz_target = File.read(FUZZ_TARGET)
 
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-rch-admission.json")
 fail!("contract id const missing") unless schema.dig("properties", "contract_id", "const") == "ft.rch_admission.v1"
@@ -245,6 +270,17 @@ no_service_cases.each do |entry|
   fail!("no-service case #{fixture_id} executed side effects") unless structured["side_effects_executed"] == false
 end
 
+current_fleet = no_service_cases.find { |entry| entry.fetch("fixture_id") == "critical-pressure-current-fleet" }
+current_fleet_text = current_fleet.fetch("retained_evidence").map { |record| record.fetch("summary") }.join("\n")
+%w[
+  disk_free_below_critical_gb
+  disk_ratio_below_critical
+  disk_metrics_unavailable
+  no_admissible_workers=critical_pressure=5
+].each do |term|
+  fail!("current fleet fixture missing installed RCH reason term #{term}") unless current_fleet_text.include?(term)
+end
+
 EXPECTED_CODES.each do |code|
   fail!("doc missing reason code #{code}") unless doc.include?("`#{code}`")
 end
@@ -287,8 +323,71 @@ end
   CARGO_BUILD_JOBS
   --target-dir
   slot_estimate_mismatch
+  no_workers_passed_health
+  disk_free_below_critical_gb
+  disk_ratio_below_critical
+  disk_critical_without_fresh_telemetry
+  disk_metrics_unavailable
 ].each do |term|
   fail!("source missing cargo analyzer term #{term}") unless source.include?(term)
+end
+%w[
+  no_workers_passed_health
+  disk_free_below_critical_gb
+  disk_ratio_below_critical
+  disk_critical_without_fresh_telemetry
+  disk_metrics_unavailable
+].each do |term|
+  fail!("doc missing installed RCH alias term #{term}") unless doc.include?(term)
+end
+[
+  'name = "rch_admission_cargo"',
+  'path = "fuzz_targets/rch_admission_cargo.rs"',
+  'required-features = ["core-fuzz-targets"]'
+].each do |term|
+  fail!("fuzz Cargo missing rch_admission_cargo registration term #{term}") unless fuzz_cargo.include?(term)
+end
+%w[
+  FuzzInput
+  analyze_rch_admission_cargo_command
+  build_rch_admission_report
+  assert_seeded_regressions
+  assert_error_category_contract
+  RchAdmissionQueueDiagnostic
+  with_rch_queue
+  --exclude
+  --target-dir
+  CARGO_BUILD_JOBS
+  malformed_quote
+].each do |term|
+  fail!("fuzz target missing analyzer coverage term #{term}") unless fuzz_target.include?(term)
+end
+corpus_entries = Dir.children(FUZZ_CORPUS_DIR).reject { |name| name.start_with?(".") }.sort
+fail!("fuzz corpus coverage drifted: #{corpus_entries.inspect}") unless corpus_entries == EXPECTED_FUZZ_CORPUS.keys.sort
+EXPECTED_FUZZ_CORPUS.each do |name, fragments|
+  corpus_path = File.join(FUZZ_CORPUS_DIR, name)
+  content = File.read(corpus_path)
+  fail!("fuzz corpus seed #{name} is empty") if content.empty?
+  fragments.each do |fragment|
+    fail!("fuzz corpus seed #{name} missing #{fragment}") unless content.include?(fragment)
+  end
+end
+fail!("non_cargo corpus seed must start outside Cargo") unless File.read(File.join(FUZZ_CORPUS_DIR, "non_cargo")).start_with?("echo ")
+%w[
+  fuzz/fuzz_targets/rch_admission_cargo.rs
+  fuzz/corpus/rch_admission_cargo
+  rch_admission_cargo
+  core-fuzz-targets
+  non_cargo
+  inline_env
+  jobs_forms
+  target_dir
+  exclude_not_filter
+  test_filter
+  libtest_args
+  malformed_quote
+].each do |term|
+  fail!("doc missing fuzz contract term #{term}") unless doc.include?(term)
 end
 
 fail!("provenance missing ft-rch-admission row") unless provenance.include?("`ft-rch-admission.json`")

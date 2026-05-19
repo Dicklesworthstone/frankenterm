@@ -548,6 +548,14 @@ fn assert_error_category_contract(reason: ReasonInput) {
                 .classification("cargo_check")
                 .would_intercept(true),
         )
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("fuzz".to_string()),
+            active_project_exclusion: false,
+            active_builds: 0,
+            queued_builds: 0,
+            workers_healthy: Some(1),
+            workers_total: Some(1),
+        })
         .with_collector_observation(
             RchAdmissionCollectorObservation::new(
                 "fuzz.error_category",
