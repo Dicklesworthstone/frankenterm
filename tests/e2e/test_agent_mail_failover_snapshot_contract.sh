@@ -113,6 +113,19 @@ EXPECTED_FAILURE_CLASSES = %w[
   contact_permission_failed
   unknown
 ].freeze
+SAFE_ARTIFACT_PATH_NEGATIVES = [
+  "",
+  "/tmp/agent-mail-failover.json",
+  "./fixtures/agent-mail-failover/valid/healthy-agent-mail.json",
+  "../fixtures/agent-mail-failover/valid/healthy-agent-mail.json",
+  "fixtures/../agent-mail-failover/valid/healthy-agent-mail.json",
+  "fixtures/agent-mail-failover/./valid/healthy-agent-mail.json",
+  "fixtures/agent-mail-failover/valid/.",
+  "fixtures/agent-mail-failover/valid/..",
+  ".git/config",
+  "fixtures/.git/config",
+  "fixtures/agent-mail-failover//valid/healthy-agent-mail.json"
+].freeze
 
 def fail!(message)
   warn "agent mail failover snapshot contract: #{message}"
@@ -125,12 +138,32 @@ rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
 end
 
+def safe_repo_relative_artifact_path?(path)
+  return false unless path.is_a?(String)
+  return false if path.empty?
+  return false if path.start_with?("/")
+  return false if path.include?("\\")
+
+  segments = path.split("/", -1)
+  return false if segments.any?(&:empty?)
+  return false if segments.any? { |segment| segment == "." || segment == ".." || segment == ".git" }
+
+  true
+end
+
 schema = read_json(SCHEMA)
 manifest = read_json(MANIFEST)
 classifier_cases = read_json(CLASSIFIER_CASES)
 no_service_gate = read_json(NO_SERVICE_GATE)
 no_service_companion = read_json(NO_SERVICE_COMPANION)
 doc = File.read(DOC)
+
+SAFE_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("unsafe artifact path accepted: #{path.inspect}") if safe_repo_relative_artifact_path?(path)
+end
+unless safe_repo_relative_artifact_path?("fixtures/agent-mail-failover/valid/healthy-agent-mail.json")
+  fail!("valid retained fixture artifact path rejected")
+end
 
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-agent-mail-failover-snapshot.json")
 fail!("contract id const missing") unless schema.dig("properties", "contract_id", "const") == "ft.agent_mail_failover_snapshot.v1"
@@ -175,7 +208,12 @@ payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} retry limit drifted") unless payload.dig("agent_mail", "retry_limit") == 1
   fail!("#{fixture_id} forbidden actions drifted") unless payload.dig("agent_mail", "forbidden_actions").sort == EXPECTED_FORBIDDEN.sort
   fail!("#{fixture_id} next actions missing") if payload.fetch("next_actions").empty?
-  fail!("#{fixture_id} artifact path missing self") unless payload.fetch("artifact_paths").include?("fixtures/agent-mail-failover/valid/#{fixture_id}.json")
+  artifact_paths = payload.fetch("artifact_paths")
+  fail!("#{fixture_id} artifact path missing self") unless artifact_paths.include?("fixtures/agent-mail-failover/valid/#{fixture_id}.json")
+  artifact_paths.each do |artifact_path|
+    fail!("#{fixture_id} unsafe artifact path #{artifact_path.inspect}") unless safe_repo_relative_artifact_path?(artifact_path)
+    fail!("#{fixture_id} artifact path missing retained file #{artifact_path}") unless File.file?(artifact_path)
+  end
 
   expected_failure_class, expected_reason = CLASSIFIER_EXPECTATIONS.fetch(fixture_id)
   mail = payload.fetch("agent_mail")
