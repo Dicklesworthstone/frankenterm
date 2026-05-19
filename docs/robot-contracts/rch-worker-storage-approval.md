@@ -38,6 +38,14 @@ Inventory evidence alone is never enough. A missing evidence hash, expired
 approval, path mismatch, protected path, or live-use unknown must set
 `destructive_recovery_allowed: false`.
 
+Evidence artifact paths are also fail-closed data. Root
+`evidence_artifact_path` values and each requested path's
+`inventory_evidence_path` must be non-empty safe repo-relative JSON paths under
+`artifacts/rch-worker-pressure/` or
+`tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/`; absolute paths,
+backslashes, empty segments, dot segments, `.git` internals, and non-JSON paths
+are invalid.
+
 The only valid inventory source contract for this approval gate is
 `ft.rch_worker_storage_inventory.v1`. Retained pressure-named local drafts are
 not approval evidence unless their useful content has been normalized into that
@@ -54,11 +62,11 @@ The root object carries:
 | `approval_id` | Stable fixture, retained artifact, or run id. |
 | `source_bead` | Bead that produced the approval artifact. |
 | `evidence_contract_id` | Must be `ft.rch_worker_storage_inventory.v1`, the canonical retained inventory contract used as source evidence. |
-| `evidence_artifact_path` / `evidence_artifact_sha256` | Exact retained inventory artifact and hash. |
+| `evidence_artifact_path` / `evidence_artifact_sha256` | Safe repo-relative retained inventory artifact path and hash. |
 | `approval_decision` | One of `approved`, `expired`, `path_mismatch`, `protected_path`, `missing_evidence_hash`, `live_use_unknown`, or `denied`. |
 | `destructive_recovery_allowed` | `true` only for an unexpired exact-path approval with evidence hashes and inactive paths. |
 | `approval_record` | Human identity/reference, approval timestamp, expiration, scope, and approval text hash. |
-| `requested_paths` | Exact path rows, each with path hash, requested operation, classification, evidence hash, approval match, and live-use state. |
+| `requested_paths` | Exact path rows, each with path hash, requested operation, classification, safe repo-relative evidence path and hash, approval match, and live-use state. |
 | `protected_path_policy` | Fail-closed rules for protected paths, exact matching, hash requirements, live-use unknowns, and source evidence. |
 | `post_action_verification` | Remote-required RCH proof and Beads updates required after an approved recovery. |
 

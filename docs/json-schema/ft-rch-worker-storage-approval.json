@@ -55,8 +55,7 @@
       "const": "ft.rch_worker_storage_inventory.v1"
     },
     "evidence_artifact_path": {
-      "type": "string",
-      "minLength": 1
+      "$ref": "#/$defs/evidence_artifact_path"
     },
     "evidence_artifact_sha256": {
       "type": [
@@ -138,6 +137,11 @@
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "evidence_artifact_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$))(?:artifacts/rch-worker-pressure|tests/e2e/artifacts/retained/ft-5xwsu\\.1/rch-worker-pressure)/.+\\.json$"
     },
     "approval_decision": {
       "type": "string",
@@ -310,8 +314,7 @@
           "$ref": "#/$defs/live_use_state"
         },
         "inventory_evidence_path": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/evidence_artifact_path"
         },
         "inventory_evidence_sha256": {
           "type": [

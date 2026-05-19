@@ -86,6 +86,33 @@ EXPECTED_PROTECTED_GLOBS = %w[
   /private/tmp/agent-mail/**
   /tmp/am-*/**
 ].freeze
+EVIDENCE_ARTIFACT_PATH_PATTERN = "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$))(?:artifacts/rch-worker-pressure|tests/e2e/artifacts/retained/ft-5xwsu\\.1/rch-worker-pressure)/.+\\.json$".freeze
+EVIDENCE_ARTIFACT_ROOTS = %w[
+  artifacts/rch-worker-pressure/
+  tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/
+].freeze
+SAFE_EVIDENCE_ARTIFACT_PATH_POSITIVES = %w[
+  artifacts/rch-worker-pressure/20260518T030000Z/healthy-complete.json
+  tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json
+].freeze
+SAFE_EVIDENCE_ARTIFACT_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/rch-worker-pressure/healthy-complete.json",
+  "./artifacts/rch-worker-pressure/healthy-complete.json",
+  "../artifacts/rch-worker-pressure/healthy-complete.json",
+  "fixtures/rch-worker-pressure/valid/healthy-complete.json",
+  "artifacts//rch-worker-pressure/healthy-complete.json",
+  "artifacts/rch-worker-pressure/20260518T030000Z/../healthy-complete.json",
+  "artifacts/rch-worker-pressure/20260518T030000Z/./healthy-complete.json",
+  "artifacts/rch-worker-pressure/20260518T030000Z/.",
+  "artifacts/rch-worker-pressure/20260518T030000Z/..",
+  "artifacts/rch-worker-pressure/.git/config.json",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/.git/config.json",
+  "artifacts/rch-worker-pressure/20260518T030000Z/healthy-complete.txt",
+  "artifacts\\rch-worker-pressure\\healthy-complete.json"
+].freeze
+EVIDENCE_ARTIFACT_REGEX = Regexp.new(EVIDENCE_ARTIFACT_PATH_PATTERN)
 SHA256 = /\A[0-9a-f]{64}\z/
 
 def fail!(message)
@@ -99,6 +126,18 @@ rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
 end
 
+def safe_evidence_artifact_path?(path)
+  return false unless path.is_a?(String)
+  return false if path.empty? || path.start_with?("/") || path.include?("\\")
+  return false unless path.end_with?(".json")
+
+  parts = path.split("/")
+  return false if parts.empty? || parts.any?(&:empty?)
+  return false if parts.any? { |part| part == "." || part == ".." || part == ".git" }
+
+  EVIDENCE_ARTIFACT_ROOTS.any? { |root| path.start_with?(root) && path.length > root.length }
+end
+
 schema = read_json(SCHEMA)
 manifest = read_json(MANIFEST)
 doc = File.read(DOC)
@@ -108,10 +147,21 @@ readme = File.read(README)
 fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-rch-worker-storage-approval.json")
 fail!("contract id const missing") unless schema.dig("properties", "contract_id", "const") == "ft.rch_worker_storage_approval.v1"
 fail!("evidence contract id const missing") unless schema.dig("properties", "evidence_contract_id", "const") == EXPECTED_EVIDENCE_CONTRACT_ID
+fail!("root evidence path schema not shared") unless schema.dig("properties", "evidence_artifact_path", "$ref") == "#/$defs/evidence_artifact_path"
+fail!("per-path evidence path schema not shared") unless schema.dig("$defs", "path_request", "properties", "inventory_evidence_path", "$ref") == "#/$defs/evidence_artifact_path"
+fail!("evidence path schema pattern drifted") unless schema.dig("$defs", "evidence_artifact_path", "pattern") == EVIDENCE_ARTIFACT_PATH_PATTERN
 fail!("explicit human approval const missing") unless schema.dig("properties", "explicit_human_approval_required", "const") == true
 fail!("schema missing destructive recovery field") unless schema.fetch("required").include?("destructive_recovery_allowed")
 fail!("approval decision enum drifted") unless schema.dig("$defs", "approval_decision", "enum").sort.include?("approved")
 fail!("forbidden-operation enum drifted") unless schema.dig("$defs", "forbidden_operation", "enum").sort == EXPECTED_FORBIDDEN.sort
+SAFE_EVIDENCE_ARTIFACT_PATH_POSITIVES.each do |path|
+  fail!("safe evidence artifact path rejected: #{path}") unless safe_evidence_artifact_path?(path)
+  fail!("schema evidence artifact pattern rejected safe path: #{path}") unless EVIDENCE_ARTIFACT_REGEX.match?(path)
+end
+SAFE_EVIDENCE_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("unsafe evidence artifact path accepted: #{path.inspect}") if safe_evidence_artifact_path?(path)
+  fail!("schema evidence artifact pattern accepted unsafe path: #{path.inspect}") if path.is_a?(String) && EVIDENCE_ARTIFACT_REGEX.match?(path)
+end
 
 fail!("manifest schema_version drifted") unless manifest["schema_version"] == 1
 fail!("manifest contract id drifted") unless manifest["contract_id"] == "ft.rch_worker_storage_approval.fixture_manifest.v1"
@@ -133,6 +183,7 @@ payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} source bead drifted") unless payload["source_bead"] == "ft-5xwsu.2"
   fail!("#{fixture_id} decision drifted") unless payload["approval_decision"] == EXPECTED_DECISIONS.fetch(fixture_id)
   fail!("#{fixture_id} explicit human approval flag drifted") unless payload["explicit_human_approval_required"] == true
+  fail!("#{fixture_id} evidence artifact path is unsafe: #{payload.fetch("evidence_artifact_path")}") unless safe_evidence_artifact_path?(payload.fetch("evidence_artifact_path"))
   fail!("#{fixture_id} forbidden operations drifted") unless payload.fetch("forbidden_operations").sort == EXPECTED_FORBIDDEN.sort
 
   policy = payload.fetch("protected_path_policy")
@@ -157,6 +208,7 @@ payloads.each do |fixture_id, payload|
   paths.each do |path|
     fail!("#{fixture_id} path contains wildcard: #{path.fetch("path")}") if path.fetch("path").include?("*")
     fail!("#{fixture_id} path hash invalid") unless SHA256.match?(path.fetch("path_sha256"))
+    fail!("#{fixture_id} path evidence artifact path is unsafe: #{path.fetch("inventory_evidence_path")}") unless safe_evidence_artifact_path?(path.fetch("inventory_evidence_path"))
     evidence_hash = path["inventory_evidence_sha256"]
     fail!("#{fixture_id} path evidence hash invalid") if evidence_hash && !SHA256.match?(evidence_hash)
   end
