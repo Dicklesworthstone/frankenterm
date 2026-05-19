@@ -50,7 +50,7 @@ Start with current RCH posture:
 ```text
 RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs
 RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check
-RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- cargo check -p frankenterm-core --lib
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> cargo check -p frankenterm-core --lib
 br ready --json
 br list --status in_progress --json
 br dep cycles --json
@@ -157,7 +157,7 @@ Minimum proof sequence:
 
 ```text
 RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- cargo check -p frankenterm-core --lib
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> cargo check -p frankenterm-core --lib
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> cargo check -p frankenterm-core --lib
 br dep cycles --json
 ```

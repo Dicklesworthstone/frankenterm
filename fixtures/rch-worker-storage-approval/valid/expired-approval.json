@@ -88,7 +88,7 @@
     "required": true,
     "remote_required_rch": true,
     "commands": [
-      "RCH_REQUIRE_REMOTE=1 rch exec --no-self-healing -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core output_gate --lib -- --nocapture"
+      "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> cargo test -p frankenterm-core output_gate --lib -- --nocapture"
     ],
     "evidence_required": [
       "new approval reference",

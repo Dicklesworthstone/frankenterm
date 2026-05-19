@@ -114,6 +114,19 @@ SAFE_EVIDENCE_ARTIFACT_PATH_NEGATIVES = [
 ].freeze
 EVIDENCE_ARTIFACT_REGEX = Regexp.new(EVIDENCE_ARTIFACT_PATH_PATTERN)
 SHA256 = /\A[0-9a-f]{64}\z/
+CANONICAL_RCH_EXEC_PREFIX = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env ".freeze
+REQUIRED_RCH_ENV = %w[
+  CARGO_BUILD_JOBS=1
+  CARGO_INCREMENTAL=0
+  CARGO_TARGET_DIR=<target-dir>
+].freeze
+FORBIDDEN_RCH_COMMAND_FRAGMENTS = [
+  "RCH_REQUIRE_REMOTE=1 rch exec",
+  "rch exec --no-self-healing",
+  "RCH_NO_SELF_HEALING=1 rch --json",
+  "RCH_NO_SELF_HEALING=1 rch status",
+  "RCH_NO_SELF_HEALING=1 rch check"
+].freeze
 
 def fail!(message)
   warn "rch worker storage approval contract: #{message}"
@@ -199,6 +212,18 @@ payloads.each do |fixture_id, payload|
   verification = payload.fetch("post_action_verification")
   fail!("#{fixture_id} post-action verification not required") unless verification["required"] == true
   fail!("#{fixture_id} post-action verification must require remote RCH") unless verification["remote_required_rch"] == true
+  commands = verification.fetch("commands")
+  fail!("#{fixture_id} post-action verification commands missing") if commands.empty?
+  commands.each do |command|
+    FORBIDDEN_RCH_COMMAND_FRAGMENTS.each do |fragment|
+      fail!("#{fixture_id} command uses stale RCH shape #{fragment}: #{command}") if command.include?(fragment)
+    end
+    next unless command.include?("cargo ")
+    fail!("#{fixture_id} command is not canonical remote-required RCH exec: #{command}") unless command.start_with?(CANONICAL_RCH_EXEC_PREFIX)
+    REQUIRED_RCH_ENV.each do |env_var|
+      fail!("#{fixture_id} command missing #{env_var}: #{command}") unless command.include?(env_var)
+    end
+  end
   fail!("#{fixture_id} verification lacks ft-5xwsu.3") unless verification.fetch("beads_to_update").include?("ft-5xwsu.3")
   fail!("#{fixture_id} verification lacks ft-4tp7g") unless verification.fetch("beads_to_update").include?("ft-4tp7g")
   fail!("#{fixture_id} missing rollback/restore notes") if payload.fetch("rollback_or_restore_notes").empty?

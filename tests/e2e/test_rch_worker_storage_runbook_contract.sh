@@ -67,6 +67,23 @@ REQUIRED_TERMS = [
   "RCH worker storage pressure handoff",
   "Agent Mail handoff"
 ].freeze
+CANONICAL_STATUS_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs".freeze
+CANONICAL_CHECK_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check".freeze
+CANONICAL_DRY_RUN_COMMAND = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> cargo check -p frankenterm-core --lib".freeze
+CANONICAL_EXEC_COMMAND = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> cargo check -p frankenterm-core --lib".freeze
+REQUIRED_CARGO_ENV = %w[
+  CARGO_BUILD_JOBS=1
+  CARGO_INCREMENTAL=0
+  CARGO_TARGET_DIR=<target-dir>
+].freeze
+FORBIDDEN_COMMAND_FRAGMENTS = [
+  "RCH_REQUIRE_REMOTE=1 rch exec",
+  "rch exec --no-self-healing",
+  "RCH_NO_SELF_HEALING=1 rch --json",
+  "RCH_NO_SELF_HEALING=1 rch status",
+  "RCH_NO_SELF_HEALING=1 rch check",
+  "diagnose --dry-run --json -- cargo"
+].freeze
 
 def fail!(message)
   warn "rch worker storage runbook contract: #{message}"
@@ -142,12 +159,28 @@ fail!("Agent Mail handoff template missing") unless mail
 end
 
 read_only = contract.fetch("read_only_commands")
+all_rch_commands = read_only + contract.fetch("post_recovery_commands")
+FORBIDDEN_COMMAND_FRAGMENTS.each do |fragment|
+  fail!("runbook contains forbidden stale RCH command fragment #{fragment}") if runbook.include?(fragment)
+  fail!("contract contains forbidden stale RCH command fragment #{fragment}") if all_rch_commands.any? { |command| command.include?(fragment) }
+end
+fail!("read-only status command not canonical") unless read_only.include?(CANONICAL_STATUS_COMMAND)
+fail!("read-only check command not canonical") unless read_only.include?(CANONICAL_CHECK_COMMAND)
+fail!("read-only dry-run command not canonical") unless read_only.include?(CANONICAL_DRY_RUN_COMMAND)
+all_rch_commands.each do |command|
+  next unless command.include?("cargo ")
+  REQUIRED_CARGO_ENV.each do |env_var|
+    fail!("RCH cargo command missing #{env_var}: #{command}") unless command.include?(env_var)
+  end
+  fail!("RCH cargo command must be remote-required: #{command}") unless command.include?("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1")
+  fail!("RCH cargo command must use --no-self-healing before subcommand: #{command}") unless command.include?("rch --no-self-healing")
+end
 fail!("read-only command list must include br dep cycles") unless read_only.include?("br dep cycles --json")
 fail!("read-only command list must include git status") unless read_only.include?("git status --short")
 
 post = contract.fetch("post_recovery_commands")
-fail!("post-recovery dry-run missing") unless post.any? { |command| command.include?("diagnose --dry-run") && command.include?("RCH_REQUIRE_REMOTE=1") }
-fail!("post-recovery smoke missing") unless post.any? { |command| command.include?("rch --no-self-healing exec") && command.include?("RCH_REQUIRE_REMOTE=1") }
+fail!("post-recovery dry-run missing") unless post.include?(CANONICAL_DRY_RUN_COMMAND)
+fail!("post-recovery smoke missing") unless post.include?(CANONICAL_EXEC_COMMAND)
 
 puts "rch worker storage runbook contract: static verifier passed (#{contract.fetch("required_sections").length} sections, #{contract.fetch("forbidden_actions").length} forbidden actions)"
 RUBY
