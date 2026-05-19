@@ -10,6 +10,7 @@ README="README.md"
 DOCS=(
   "docs/asupersync-rch-execution-policy.md"
   "docs/operator-runbook.md"
+  "docs/terminal-conformance-contract.md"
   "docs/robot-contracts/api-surface-coverage.md"
   "docs/robot-contracts/checkpoint.md"
   "docs/robot-contracts/current-ntm-gap-dispatch.md"
@@ -43,6 +44,7 @@ README = "README.md"
 CONTRACT_DOCS = [
   "docs/asupersync-rch-execution-policy.md",
   "docs/operator-runbook.md",
+  "docs/terminal-conformance-contract.md",
   "docs/robot-contracts/api-surface-coverage.md",
   "docs/robot-contracts/checkpoint.md",
   "docs/robot-contracts/current-ntm-gap-dispatch.md",

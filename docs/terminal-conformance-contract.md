@@ -177,7 +177,7 @@ If a child runs Cargo, clippy, tests, benches, or an executable E2E harness that
 invokes Cargo, the proof must run through RCH:
 
 ```bash
-RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-terminal-conformance cargo test -p <crate> <test> -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/<bead>-terminal-conformance cargo test -p <crate> <test> -- --nocapture
 ```
 
 RCH setup, worker selection, sync, transfer, or cache output is not terminal
