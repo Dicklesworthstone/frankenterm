@@ -239,7 +239,7 @@ impl Default for MutationGuardConfig {
 /// for concurrent access from multiple robot request handlers.
 pub struct MutationGuard {
     config: MutationGuardConfig,
-    /// Key → record mapping.
+    /// Action-scoped key → record mapping.
     records: HashMap<String, MutationRecord>,
     /// Insertion order for FIFO eviction.
     insertion_order: VecDeque<String>,
@@ -285,21 +285,21 @@ impl MutationGuard {
     /// Returns `Some(record)` if the key exists and hasn't expired,
     /// `None` if the key is new or expired.
     pub fn check(&mut self, key: &MutationKey, now_ms: u64) -> Option<&MutationRecord> {
-        let key_str = key.as_str();
+        let record_id = mutation_record_id(key);
 
         // Check expiry first, remove if needed
         let expired = self
             .records
-            .get(key_str)
+            .get(&record_id)
             .is_some_and(|r| r.is_expired(now_ms, self.config.ttl_ms));
 
         if expired {
-            self.remove_key(key_str);
+            self.remove_record_id(&record_id);
             self.telemetry.evictions += 1;
             return None;
         }
 
-        self.records.get(key_str)
+        self.records.get(&record_id)
     }
 
     /// Record a mutation outcome and return the disposition.
@@ -317,9 +317,10 @@ impl MutationGuard {
         now_ms: u64,
     ) -> MutationOutcome {
         let key_str = key.as_str().to_string();
+        let record_id = mutation_record_id(&key);
 
         // Check for existing non-expired record
-        if let Some(existing) = self.records.get_mut(&key_str) {
+        if let Some(existing) = self.records.get_mut(&record_id) {
             if !existing.is_expired(now_ms, self.config.ttl_ms) {
                 existing.submission_count += 1;
                 self.telemetry.deduplications += 1;
@@ -330,7 +331,7 @@ impl MutationGuard {
                 };
             }
             // Expired — remove and re-record
-            self.remove_key(&key_str);
+            self.remove_record_id(&record_id);
             self.telemetry.evictions += 1;
         }
 
@@ -344,6 +345,10 @@ impl MutationGuard {
             self.telemetry.failures_seen += 1;
         }
 
+        if self.config.capacity == 0 {
+            return MutationOutcome::Executed { key: key_str };
+        }
+
         // Evict oldest if at capacity
         self.evict_if_full();
 
@@ -354,8 +359,8 @@ impl MutationGuard {
             MutationRecord::failure(key, error_message.unwrap_or_default(), elapsed_ms, now_ms)
         };
 
-        self.records.insert(key_str.clone(), record);
-        self.insertion_order.push_back(key_str.clone());
+        self.records.insert(record_id.clone(), record);
+        self.insertion_order.push_back(record_id);
         self.telemetry.mutations_recorded += 1;
         self.telemetry.active_records = self.records.len() as u64;
 
@@ -401,21 +406,60 @@ impl MutationGuard {
         &self.config
     }
 
-    /// Look up a record by key string (for diagnostics).
+    /// Look up a unique record by external key string (for diagnostics).
+    ///
+    /// Client-supplied keys are scoped by action internally, so the same
+    /// external key can legitimately have multiple records. In that case this
+    /// method returns `None`; use [`Self::get_records_for_key_str`] or
+    /// [`Self::get_record_for_key`] when the action is known.
     #[must_use]
     pub fn get_record(&self, key_str: &str) -> Option<&MutationRecord> {
-        self.records.get(key_str)
+        let mut matches = self
+            .records
+            .values()
+            .filter(|record| record.key.as_str() == key_str);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
     }
 
-    /// Remove a specific key.
-    fn remove_key(&mut self, key_str: &str) {
-        self.records.remove(key_str);
-        self.insertion_order.retain(|k| k != key_str);
+    /// Look up all records that share an external key string.
+    #[must_use]
+    pub fn get_records_for_key_str(&self, key_str: &str) -> Vec<&MutationRecord> {
+        self.records
+            .values()
+            .filter(|record| record.key.as_str() == key_str)
+            .collect()
+    }
+
+    /// Look up a record by action-scoped key.
+    #[must_use]
+    pub fn get_record_for_key(&self, key: &MutationKey) -> Option<&MutationRecord> {
+        self.records.get(&mutation_record_id(key))
+    }
+
+    /// Remove a specific action-scoped record id.
+    fn remove_record_id(&mut self, record_id: &str) {
+        self.records.remove(record_id);
+        self.insertion_order.retain(|k| k != record_id);
         self.telemetry.active_records = self.records.len() as u64;
     }
 
     /// Evict the oldest record if we're at capacity.
     fn evict_if_full(&mut self) {
+        if self.config.capacity == 0 {
+            if !self.records.is_empty() {
+                self.telemetry.evictions += self.records.len() as u64;
+            }
+            self.records.clear();
+            self.insertion_order.clear();
+            self.telemetry.active_records = 0;
+            return;
+        }
+
         while self.records.len() >= self.config.capacity {
             if let Some(oldest_key) = self.insertion_order.pop_front() {
                 self.records.remove(&oldest_key);
@@ -452,13 +496,14 @@ impl MutationGuard {
 
         for key in keys {
             let key_str = key.as_str().to_string();
-            match self.records.get(key.as_str()) {
+            let record_id = mutation_record_id(key);
+            match self.records.get(&record_id) {
                 Some(record) if !record.is_expired(now_ms, self.config.ttl_ms) => {
                     result.dedup_keys.push(key_str);
                 }
                 Some(_) => {
                     // Expired
-                    self.remove_key(&key_str);
+                    self.remove_record_id(&record_id);
                     self.telemetry.evictions += 1;
                     result.expired_keys.push(key_str);
                 }
@@ -546,6 +591,16 @@ fn fnv1a_update_len_prefixed(hash: u64, bytes: &[u8]) -> u64 {
     fnv1a_update(hash, bytes)
 }
 
+fn mutation_record_id(key: &MutationKey) -> String {
+    format!(
+        "{}:{}{}:{}",
+        key.action().len(),
+        key.action(),
+        key.as_str().len(),
+        key.as_str()
+    )
+}
+
 fn fnv1a_update(mut hash: u64, data: &[u8]) -> u64 {
     for byte in data {
         hash ^= u64::from(*byte);
@@ -611,17 +666,72 @@ mod tests {
     }
 
     #[test]
+    fn client_keys_are_action_scoped_in_guard() {
+        let mut guard = MutationGuard::with_defaults();
+        let send = MutationKey::from_client("send_text", "operator-step-42");
+        let split = MutationKey::from_client("split_pane", "operator-step-42");
+
+        let first = guard.record(send.clone(), true, Some("sent".into()), None, 1, 1000);
+        let second = guard.record(split.clone(), true, Some("split".into()), None, 1, 1001);
+        let replay = guard.record(send.clone(), true, Some("ignored".into()), None, 1, 1002);
+
+        assert!(first.is_first_execution());
+        assert!(second.is_first_execution());
+        assert!(replay.is_deduplicated());
+        assert_eq!(guard.len(), 2);
+        assert_eq!(
+            guard
+                .get_record_for_key(&send)
+                .and_then(|record| record.response_payload.as_deref()),
+            Some("sent")
+        );
+        assert_eq!(
+            guard
+                .get_record_for_key(&split)
+                .and_then(|record| record.response_payload.as_deref()),
+            Some("split")
+        );
+    }
+
+    #[test]
+    fn raw_key_lookup_reports_ambiguity_for_shared_client_keys() {
+        let mut guard = MutationGuard::with_defaults();
+        let send = MutationKey::from_client("send_text", "operator-step-42");
+        let split = MutationKey::from_client("split_pane", "operator-step-42");
+
+        let _ = guard.record(send.clone(), true, Some("sent".into()), None, 1, 1000);
+        let _ = guard.record(split.clone(), true, Some("split".into()), None, 1, 1001);
+
+        assert!(guard.get_record("operator-step-42").is_none());
+        let records = guard.get_records_for_key_str("operator-step-42");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            guard
+                .get_record_for_key(&send)
+                .and_then(|record| record.response_payload.as_deref()),
+            Some("sent")
+        );
+        assert_eq!(
+            guard
+                .get_record_for_key(&split)
+                .and_then(|record| record.response_payload.as_deref()),
+            Some("split")
+        );
+    }
+
+    #[test]
     fn key_display_matches_as_str() {
         let k = MutationKey::derive("test", "data");
         assert_eq!(format!("{k}"), k.as_str());
     }
 
     #[test]
-    fn key_serde_roundtrip() {
+    fn key_serde_roundtrip() -> serde_json::Result<()> {
         let k = MutationKey::derive("send_text", "42|abc");
-        let json = serde_json::to_string(&k).unwrap();
-        let k2: MutationKey = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&k)?;
+        let k2: MutationKey = serde_json::from_str(&json)?;
         assert_eq!(k, k2);
+        Ok(())
     }
 
     // -- MutationRecord tests --
@@ -657,14 +767,15 @@ mod tests {
     }
 
     #[test]
-    fn record_serde_roundtrip() {
+    fn record_serde_roundtrip() -> serde_json::Result<()> {
         let key = MutationKey::derive("send_text", "1|hello");
         let record = MutationRecord::success(key, Some("payload".into()), 10, 5000);
-        let json = serde_json::to_string(&record).unwrap();
-        let record2: MutationRecord = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&record)?;
+        let record2: MutationRecord = serde_json::from_str(&json)?;
         assert_eq!(record.key, record2.key);
         assert_eq!(record.success, record2.success);
         assert_eq!(record.response_payload, record2.response_payload);
+        Ok(())
     }
 
     // -- MutationOutcome tests --
@@ -691,16 +802,17 @@ mod tests {
     }
 
     #[test]
-    fn outcome_serde_roundtrip() {
+    fn outcome_serde_roundtrip() -> serde_json::Result<()> {
         let outcome = MutationOutcome::Deduplicated {
             key: "rk:abc".into(),
             submission_count: 2,
             original_success: false,
         };
-        let json = serde_json::to_string(&outcome).unwrap();
+        let json = serde_json::to_string(&outcome)?;
         assert!(json.contains("\"disposition\":\"deduplicated\""));
-        let outcome2: MutationOutcome = serde_json::from_str(&json).unwrap();
+        let outcome2: MutationOutcome = serde_json::from_str(&json)?;
         assert!(outcome2.is_deduplicated());
+        Ok(())
     }
 
     // -- MutationGuard tests --
@@ -737,14 +849,13 @@ mod tests {
         let _ = guard.record(key.clone(), true, None, None, 1, 1000);
         let _ = guard.record(key.clone(), true, None, None, 1, 1001);
         let outcome = guard.record(key, true, None, None, 1, 1002);
-        if let MutationOutcome::Deduplicated {
-            submission_count, ..
-        } = outcome
-        {
-            assert_eq!(submission_count, 3);
-        } else {
-            panic!("expected Deduplicated");
-        }
+        assert!(matches!(
+            outcome,
+            MutationOutcome::Deduplicated {
+                submission_count: 3,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -759,9 +870,11 @@ mod tests {
         let mut guard = MutationGuard::with_defaults();
         let key = MutationKey::derive("send_text", "1|hello");
         let _ = guard.record(key.clone(), true, Some("ok".into()), None, 5, 1000);
-        let record = guard.check(&key, 1001).unwrap();
-        assert!(record.success);
-        assert_eq!(record.response_payload.as_deref(), Some("ok"));
+        let record = guard.check(&key, 1001);
+        assert_eq!(
+            record.map(|record| (record.success, record.response_payload.as_deref())),
+            Some((true, Some("ok")))
+        );
     }
 
     #[test]
@@ -830,6 +943,27 @@ mod tests {
                 .get_record(MutationKey::derive("test", "4").as_str())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn guard_zero_capacity_disables_caching() {
+        let config = MutationGuardConfig {
+            capacity: 0,
+            ttl_ms: 60_000,
+            cache_failures: true,
+        };
+        let mut guard = MutationGuard::new(config);
+        let key = MutationKey::derive("send_text", "1|hello");
+
+        let first = guard.record(key.clone(), true, Some("ok".into()), None, 1, 1000);
+        let second = guard.record(key.clone(), true, Some("ok".into()), None, 1, 1001);
+        let failed = guard.record(key, false, None, Some("err".into()), 1, 1002);
+
+        assert!(first.is_first_execution());
+        assert!(second.is_first_execution());
+        assert!(failed.is_first_execution());
+        assert_eq!(guard.len(), 0);
+        assert_eq!(guard.telemetry().active_records, 0);
     }
 
     #[test]
@@ -930,6 +1064,19 @@ mod tests {
         assert_eq!(result.new_keys.len(), 1);
     }
 
+    #[test]
+    fn batch_check_scopes_client_keys_by_action() {
+        let mut guard = MutationGuard::with_defaults();
+        let send = MutationKey::from_client("send_text", "shared-client-key");
+        let split = MutationKey::from_client("split_pane", "shared-client-key");
+        let _ = guard.record(send.clone(), true, None, None, 1, 1000);
+
+        let result = guard.check_batch(&[send, split], 1001);
+        assert_eq!(result.dedup_keys, vec!["shared-client-key".to_string()]);
+        assert_eq!(result.new_keys, vec!["shared-client-key".to_string()]);
+        assert!(result.expired_keys.is_empty());
+    }
+
     // -- Key helper tests --
 
     #[test]
@@ -1023,9 +1170,17 @@ mod tests {
         let _ = guard.record(k2.clone(), true, Some("b".into()), None, 1, 1001);
         assert_eq!(guard.len(), 2);
 
-        let r1 = guard.get_record(k1.as_str()).unwrap();
-        assert_eq!(r1.response_payload.as_deref(), Some("a"));
-        let r2 = guard.get_record(k2.as_str()).unwrap();
-        assert_eq!(r2.response_payload.as_deref(), Some("b"));
+        assert_eq!(
+            guard
+                .get_record(k1.as_str())
+                .and_then(|record| record.response_payload.as_deref()),
+            Some("a")
+        );
+        assert_eq!(
+            guard
+                .get_record(k2.as_str())
+                .and_then(|record| record.response_payload.as_deref()),
+            Some("b")
+        );
     }
 }
