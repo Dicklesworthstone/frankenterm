@@ -14,6 +14,11 @@ mkdir -p "${ARTIFACT_DIR}"
 
 cd "${ROOT_DIR}"
 
+if ! command -v rch >/dev/null 2>&1; then
+  echo "ERROR: rch is required for the cross-family Cargo proof lane" >&2
+  exit 1
+fi
+
 doc_hash="$(shasum -a 256 "${DOC_PATH}" | awk '{print $1}')"
 jq -e --arg doc_hash "${doc_hash}" '
   .bead_id == "ft-tf6g3.46"
@@ -22,18 +27,12 @@ jq -e --arg doc_hash "${doc_hash}" '
   and .invariants_sha256 == $doc_hash
 ' "${ATTESTATION_PATH}" >/dev/null
 
-if command -v rch >/dev/null 2>&1; then
-  rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
-    cargo test -p frankenterm-core \
-      --test contract_families_invariant_parser \
-      --test contract_families_integration_matrix \
-      -- --nocapture
-else
-  CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR="${TARGET_DIR}" \
+  cargo test -p frankenterm-core \
     --test contract_families_invariant_parser \
     --test contract_families_integration_matrix \
     -- --nocapture
-fi
 
 jq -cn \
   --arg run_id "${RUN_ID}" \
