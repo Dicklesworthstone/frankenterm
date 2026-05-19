@@ -6,6 +6,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 AGENTS="AGENTS.md"
+DOCS=(
+  "docs/robot-contracts/api-surface-coverage.md"
+  "docs/robot-contracts/checkpoint.md"
+  "docs/robot-contracts/current-ntm-gap-dispatch.md"
+  "docs/robot-contracts/fleet.md"
+  "docs/robot-contracts/work.md"
+)
 
 fail() {
   printf 'agents rch remote-required contract: %s\n' "$*" >&2
@@ -22,9 +29,19 @@ require_file() {
 
 require_command ruby
 require_file "${AGENTS}"
+for doc in "${DOCS[@]}"; do
+  require_file "${doc}"
+done
 
 ruby <<'RUBY'
 AGENTS = "AGENTS.md"
+CONTRACT_DOCS = [
+  "docs/robot-contracts/api-surface-coverage.md",
+  "docs/robot-contracts/checkpoint.md",
+  "docs/robot-contracts/current-ntm-gap-dispatch.md",
+  "docs/robot-contracts/fleet.md",
+  "docs/robot-contracts/work.md"
+]
 
 def fail!(message)
   warn "agents rch remote-required contract: #{message}"
@@ -50,6 +67,20 @@ required_snippets = [
     fail!("#{name} section missing #{snippet}") unless section.include?(snippet)
   end
   fail!("#{name} section still has bare rch exec") if section.match?(/(^|\s)rch exec --\s+env\s+CARGO_TARGET_DIR=/)
+  fail!("#{name} section still omits --no-self-healing") if section.match?(/(^|\s)RCH_REQUIRE_REMOTE=1\s+rch exec --/)
+end
+
+CONTRACT_DOCS.each do |path|
+  doc = File.read(path)
+  required_snippets.each do |snippet|
+    fail!("#{path} missing #{snippet}") unless doc.include?(snippet)
+  end
+  if doc.match?(/(^|\s)rch exec --\s+env\s+CARGO_TARGET_DIR=/)
+    fail!("#{path} still has bare rch exec")
+  end
+  if doc.match?(/(^|\s)RCH_REQUIRE_REMOTE=1\s+rch exec --/)
+    fail!("#{path} still omits --no-self-healing")
+  end
 end
 
 %w[

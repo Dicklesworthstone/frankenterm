@@ -229,23 +229,23 @@ conformance harness has 19 tests, 19 passing.
 
 ```bash
 # Live dispatch smoke harness (checkpoint + context + work + fleet):
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
   cargo test -p frankenterm --test robot_ntm_gap_contract_tests \
   robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture
 
 # Library tests (state machine + family contract):
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-core \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-core \
   cargo test -p frankenterm-core --lib robot_checkpoint_state_machine:: \
   --features asupersync-runtime --no-default-features
 # → 16 passed
 
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-contract \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-contract \
   cargo test -p frankenterm-core --lib robot_family_contract:: \
   --features asupersync-runtime --no-default-features
 # → 13 passed
 
 # Conformance harness (profile + checkpoint families):
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-conformance \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-conformance \
   cargo test -p frankenterm-core --test robot_family_conformance \
   --features asupersync-runtime --no-default-features
 # → 19 passed (7 profile + 9 checkpoint contract + 3 state machine)

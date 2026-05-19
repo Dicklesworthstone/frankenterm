@@ -223,27 +223,27 @@ Total conformance harness: **31 always-on tests** (7 profile +
 
 ```bash
 # Live dispatch smoke harness (checkpoint + context + work + fleet):
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
   cargo test -p frankenterm --test robot_ntm_gap_contract_tests \
   robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture
 
 # Focused native work backend tests:
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-backend \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-backend \
   cargo test -p frankenterm --bin ft robot_work_backend_tests -- --nocapture
 
 # State-machine model:
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-core \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-core \
   cargo test -p frankenterm-core --lib robot_work_state_machine:: \
   --features asupersync-runtime --no-default-features
 # → 18 passed (incl. exhaustive BFS + 1024-trial random sweep)
 
 # Contract DSL (profile + checkpoint + work):
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-contract \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-contract \
   cargo test -p frankenterm-core --lib robot_family_contract:: \
   --features asupersync-runtime --no-default-features
 
 # Conformance harness (all three families):
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-conformance \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-conformance \
   cargo test -p frankenterm-core --test robot_family_conformance \
   --features asupersync-runtime --no-default-features
 # → 31 passed
