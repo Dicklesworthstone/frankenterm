@@ -1,0 +1,64 @@
+{
+  "schema_version": "ft.deferred_proof_comment_extractor.invalid.v1",
+  "contract_id": "ft.deferred_proof_comment_extraction.v1",
+  "cases": [
+    {
+      "case_id": "missing-source-text",
+      "expected_rejection": "missing_source_text",
+      "case": {
+        "bead_id": "ft-bad3",
+        "source_comment": {
+          "kind": "beads_comment",
+          "comment_id": 6301,
+          "author": "SilverTrout",
+          "created_at": "2026-05-19T01:50:00Z",
+          "raw_pane_content_stored": false
+        },
+        "expected_state": "ineligible",
+        "expected_reason_codes": [
+          "ambiguous_comment"
+        ]
+      }
+    },
+    {
+      "case_id": "raw-pane-text-stored",
+      "expected_rejection": "raw_pane_text_stored",
+      "case": {
+        "case_id": "raw-pane-text-stored",
+        "bead_id": "ft-bad4",
+        "source_comment": {
+          "kind": "beads_comment",
+          "comment_id": 6302,
+          "author": "SilverTrout",
+          "created_at": "2026-05-19T01:52:00Z",
+          "raw_pane_content_stored": true,
+          "source_text": "raw pane transcript should never be stored here"
+        },
+        "expected_state": "ineligible",
+        "expected_reason_codes": [
+          "ambiguous_comment"
+        ]
+      }
+    },
+    {
+      "case_id": "unknown-expected-state",
+      "expected_rejection": "unknown_expected_state",
+      "case": {
+        "case_id": "unknown-expected-state",
+        "bead_id": "ft-bad5",
+        "source_comment": {
+          "kind": "beads_comment",
+          "comment_id": 6303,
+          "author": "SilverTrout",
+          "created_at": "2026-05-19T01:54:00Z",
+          "raw_pane_content_stored": false,
+          "source_text": "Proof-State: static_clean\nCommand: bash tests/e2e/test_deferred_proof_receipt_contract.sh"
+        },
+        "expected_state": "maybe",
+        "expected_reason_codes": [
+          "ambiguous_comment"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,395 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-deferred-proof-comment-extraction.json",
+  "title": "FrankenTerm Deferred Proof Comment Extraction Record",
+  "description": "Static contract for deterministic records emitted by the Beads/comment extractor that feeds deferred proof receipts.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "record_id",
+    "bead_id",
+    "source",
+    "extraction",
+    "receipt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.deferred_proof_comment_extraction.v1"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "bead_id": {
+      "$ref": "#/$defs/bead_id"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "extraction": {
+      "$ref": "#/$defs/extraction"
+    },
+    "receipt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/receipt_projection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$)).+$"
+    },
+    "env_var": {
+      "type": "object",
+      "required": [
+        "name",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "kind",
+        "comment_id",
+        "author",
+        "created_at",
+        "source_text_sha256",
+        "raw_pane_content_stored"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "beads_comment",
+            "closeout_footer",
+            "static_proof_note"
+          ]
+        },
+        "comment_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "author": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_text_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "raw_pane_content_stored": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "extraction": {
+      "type": "object",
+      "required": [
+        "state",
+        "reason_codes",
+        "provenance_preserved"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "receipt_emitted",
+            "ineligible",
+            "duplicate"
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "ambiguous_comment",
+              "duplicate_comment",
+              "env_not_allowlisted",
+              "local_fallback_evidence",
+              "malformed_footer",
+              "missing_command",
+              "missing_owned_paths",
+              "receipt_emitted",
+              "stale_command_shape",
+              "static_clean_remote_pending"
+            ]
+          }
+        },
+        "provenance_preserved": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "receipt_projection": {
+      "type": "object",
+      "required": [
+        "contract_id",
+        "receipt_id",
+        "bead_id",
+        "source_state",
+        "command",
+        "proof",
+        "paths",
+        "coordination",
+        "eligibility"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract_id": {
+          "type": "string",
+          "const": "ft.deferred_proof_receipt.v1"
+        },
+        "receipt_id": {
+          "type": "string",
+          "pattern": "^ft-[a-z0-9][a-z0-9.-]*:[a-z0-9][a-z0-9._-]*$"
+        },
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "source_state": {
+          "type": "string",
+          "enum": [
+            "source_landed",
+            "static_clean",
+            "planning_only"
+          ]
+        },
+        "command": {
+          "type": "object",
+          "required": [
+            "command_shape_version",
+            "argv",
+            "env",
+            "env_allowlist",
+            "target_dir",
+            "material_remote_required"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "command_shape_version": {
+              "type": "string",
+              "enum": [
+                "rch-no-self-healing-v1",
+                "static-verifier-v1"
+              ]
+            },
+            "argv": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "env": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/env_var"
+              }
+            },
+            "env_allowlist": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9_]*$"
+              }
+            },
+            "target_dir": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^/tmp/[A-Za-z0-9._-]+$"
+            },
+            "material_remote_required": {
+              "type": "boolean"
+            }
+          }
+        },
+        "proof": {
+          "type": "object",
+          "required": [
+            "expected_kind",
+            "package",
+            "test_filter",
+            "feature_set",
+            "material_cargo_required",
+            "evidence_classification"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "expected_kind": {
+              "type": "string",
+              "enum": [
+                "cargo_check",
+                "cargo_test",
+                "cargo_clippy",
+                "static_verifier"
+              ]
+            },
+            "package": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "test_filter": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "feature_set": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "material_cargo_required": {
+              "type": "boolean"
+            },
+            "evidence_classification": {
+              "type": "string",
+              "enum": [
+                "remote_required_pending",
+                "static_only_clean",
+                "blocked_infra",
+                "ineligible"
+              ]
+            }
+          }
+        },
+        "paths": {
+          "type": "object",
+          "required": [
+            "owned_paths",
+            "dirty_paths_at_capture"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "owned_paths": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/path"
+              }
+            },
+            "dirty_paths_at_capture": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/path"
+              }
+            }
+          }
+        },
+        "coordination": {
+          "type": "object",
+          "required": [
+            "prerequisite_beads",
+            "agent_mail_state",
+            "rch_admission_state"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "prerequisite_beads": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/bead_id"
+              }
+            },
+            "agent_mail_state": {
+              "type": "string",
+              "enum": [
+                "available",
+                "unavailable_after_retry",
+                "unknown"
+              ]
+            },
+            "rch_admission_state": {
+              "type": "string",
+              "enum": [
+                "admitted",
+                "blocked_worker_pressure",
+                "not_required",
+                "unknown"
+              ]
+            }
+          }
+        },
+        "eligibility": {
+          "type": "object",
+          "required": [
+            "state",
+            "reason_codes",
+            "replay_allowed"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": [
+                "eligible",
+                "wait_rch",
+                "stale_command_shape",
+                "local_fallback_invalid"
+              ]
+            },
+            "reason_codes": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string"
+              }
+            },
+            "replay_allowed": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}

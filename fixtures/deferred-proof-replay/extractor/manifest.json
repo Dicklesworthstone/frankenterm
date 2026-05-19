@@ -1,0 +1,24 @@
+{
+  "schema_version": "ft.deferred_proof_comment_extractor.fixtures.v1",
+  "contract_id": "ft.deferred_proof_comment_extraction.v1",
+  "schema_path": "docs/json-schema/ft-deferred-proof-comment-extraction.json",
+  "contract_doc": "docs/robot-contracts/deferred-proof-comment-extractor.md",
+  "static_verifier": "tests/e2e/test_deferred_proof_comment_extractor_contract.sh",
+  "source_cases": "fixtures/deferred-proof-replay/extractor/valid/cases.v1.json",
+  "expected_jsonl": "fixtures/deferred-proof-replay/extractor/expected/records.v1.jsonl",
+  "invalid_fragments": "fixtures/deferred-proof-replay/extractor/invalid/fragments.v1.json",
+  "golden_summary": {
+    "source_case_count": 6,
+    "output_record_count": 6,
+    "receipt_emitted_count": 3,
+    "ineligible_count": 2,
+    "duplicate_count": 1,
+    "reason_codes": [
+      "ambiguous_comment",
+      "duplicate_comment",
+      "receipt_emitted",
+      "stale_command_shape",
+      "static_clean_remote_pending"
+    ]
+  }
+}

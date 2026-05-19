@@ -1,0 +1,103 @@
+{
+  "schema_version": "ft.deferred_proof_comment_extractor.cases.v1",
+  "contract_id": "ft.deferred_proof_comment_extraction.v1",
+  "cases": [
+    {
+      "case_id": "remote-rch-blocked-closeout",
+      "bead_id": "ft-ssy4x",
+      "source_comment": {
+        "kind": "beads_comment",
+        "comment_id": 6201,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:12:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T01:12Z SilverTrout closeout footer:\nProof-State: source_landed\nCommit: fe28cae64\nTree: 1234567890abcdef1234567890abcdef12345678\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-ssy4x-recorder-storage cargo test -p frankenterm-core recorder_storage_cas -- --nocapture\nProof-Kind: cargo_test\nPackage: frankenterm-core\nTest-Filter: recorder_storage_cas\nFeature-Set: default\nTarget-Dir: /tmp/ft-ssy4x-recorder-storage\nOwned-Paths: crates/frankenterm-core/src/recorder_storage.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: no_admissible_workers=critical_pressure=5\nBlocker: rch_admission"
+      },
+      "expected_state": "receipt_emitted",
+      "expected_reason_codes": [
+        "receipt_emitted"
+      ]
+    },
+    {
+      "case_id": "static-only-closeout",
+      "bead_id": "ft-zbnz4.1",
+      "source_comment": {
+        "kind": "static_proof_note",
+        "comment_id": 6202,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:18:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T01:18Z SilverTrout static closeout footer:\nProof-State: static_clean\nCommit: 2bb124d5f\nTree: abcdef1234567890abcdef1234567890abcdef12\nCommand: bash tests/e2e/test_deferred_proof_receipt_contract.sh\nProof-Kind: static_verifier\nPackage:\nTest-Filter:\nFeature-Set:\nTarget-Dir:\nOwned-Paths: docs/json-schema/ft-deferred-proof-receipt.json, tests/e2e/test_deferred_proof_receipt_contract.sh\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: unavailable_after_retry\nRCH-Admission: not_required\nBlocker: none"
+      },
+      "expected_state": "receipt_emitted",
+      "expected_reason_codes": [
+        "receipt_emitted"
+      ]
+    },
+    {
+      "case_id": "mixed-static-rch-closeout",
+      "bead_id": "ft-dk7ad",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6203,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:24:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T01:24Z SilverTrout mixed proof footer:\nProof-State: static_clean\nCommit: 7654321abc\nTree: fedcba9876543210fedcba9876543210fedcba98\nStatic-Checks: bash -n tests/e2e/test_latency_stage_contract.sh; git diff --check\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-dk7ad-latency cargo check -p frankenterm-core --lib\nProof-Kind: cargo_check\nPackage: frankenterm-core\nTest-Filter:\nFeature-Set: default\nTarget-Dir: /tmp/ft-dk7ad-latency\nOwned-Paths: crates/frankenterm-core/src/latency_stages/pipeline_run.rs, crates/frankenterm-core/src/latency_stages/tests.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: no_admissible_workers=critical_pressure=5\nBlocker: rch_admission"
+      },
+      "expected_state": "receipt_emitted",
+      "expected_reason_codes": [
+        "receipt_emitted",
+        "static_clean_remote_pending"
+      ]
+    },
+    {
+      "case_id": "ambiguous-prose-ineligible",
+      "bead_id": "ft-bad1",
+      "source_comment": {
+        "kind": "beads_comment",
+        "comment_id": 6204,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:30:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "I think this one is probably good. Cargo looked fine locally earlier, and RCH was weird, so we can replay later."
+      },
+      "expected_state": "ineligible",
+      "expected_reason_codes": [
+        "ambiguous_comment"
+      ]
+    },
+    {
+      "case_id": "stale-command-ineligible",
+      "bead_id": "ft-bad2",
+      "source_comment": {
+        "kind": "beads_comment",
+        "comment_id": 6205,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:36:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T01:36Z stale footer:\nProof-State: source_landed\nCommit: 1111111\nTree: 2222222222222222222222222222222222222222\nCommand: RCH_REQUIRE_REMOTE=1 rch exec -- cargo check -p frankenterm-core --lib\nProof-Kind: cargo_check\nPackage: frankenterm-core\nTest-Filter:\nFeature-Set: default\nTarget-Dir: /tmp/ft-bad2-stale\nOwned-Paths: crates/frankenterm-core/src/setup.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: no_admissible_workers=critical_pressure=5\nBlocker: rch_admission"
+      },
+      "expected_state": "ineligible",
+      "expected_reason_codes": [
+        "stale_command_shape"
+      ]
+    },
+    {
+      "case_id": "duplicate-comment-ineligible",
+      "bead_id": "ft-ssy4x",
+      "source_comment": {
+        "kind": "beads_comment",
+        "comment_id": 6206,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:42:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T01:12Z SilverTrout closeout footer:\nProof-State: source_landed\nCommit: fe28cae64\nTree: 1234567890abcdef1234567890abcdef12345678\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-ssy4x-recorder-storage cargo test -p frankenterm-core recorder_storage_cas -- --nocapture\nProof-Kind: cargo_test\nPackage: frankenterm-core\nTest-Filter: recorder_storage_cas\nFeature-Set: default\nTarget-Dir: /tmp/ft-ssy4x-recorder-storage\nOwned-Paths: crates/frankenterm-core/src/recorder_storage.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: no_admissible_workers=critical_pressure=5\nBlocker: rch_admission"
+      },
+      "expected_state": "duplicate",
+      "expected_reason_codes": [
+        "duplicate_comment"
+      ]
+    }
+  ]
+}
