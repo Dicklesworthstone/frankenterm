@@ -80,6 +80,31 @@ jq -e '
     . == "read HealthSnapshot pressure fields"
     or . == "read SwarmResourceCockpitSnapshot"
     or . == "read retained resource cockpit artifact";
+  def retained_artifact_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not)
+    and (
+      startswith("tests/e2e/artifacts/resource-cockpit/[RUN]/")
+      or startswith("docs/attestations/proofs/")
+    );
+  def artifact_paths_ok:
+    if .cockpit.artifact_posture == "absent" then
+      (.cockpit.artifact_paths | type == "array" and length == 0)
+    else
+      (.cockpit.artifact_paths | type == "array" and length >= 1 and all(.[]; retained_artifact_path_ok))
+    end;
   def forbidden_set_ok:
     sort == [
       "delete files",
@@ -134,7 +159,7 @@ jq -e '
       and all(.reason_codes[]; test("^resource\\."))
     )
     and (.cockpit.artifact_posture | type == "string" and length > 0)
-    and (.cockpit.artifact_paths | type == "array")
+    and artifact_paths_ok
     and ((has("warnings") | not) or all(.warnings[];
       (.id | test("^resource-pressure\\."))
       and (.severity | severity_ok)
