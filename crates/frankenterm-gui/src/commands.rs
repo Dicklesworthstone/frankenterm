@@ -270,32 +270,6 @@ impl CommandDef {
         Self::actions_for_palette_and_menubar_with_domains(config, &domains)
     }
 
-    pub fn actions_for_palette_and_menubar(config: &ConfigHandle) -> Vec<ExpandedCommand> {
-        let domains = match Mux::try_get() {
-            Some(mux) => {
-                let mut domains = mux
-                    .iter_domains()
-                    .into_iter()
-                    .map(|dom| {
-                        let name = dom.domain_name().to_string();
-                        DomainCommandSnapshot {
-                            id: dom.domain_id(),
-                            label: name.clone(),
-                            name,
-                            state: dom.state(),
-                            spawnable: dom.spawnable(),
-                            detachable: dom.detachable(),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                sort_domain_snapshots(&mut domains);
-                domains
-            }
-            None => vec![],
-        };
-
-        Self::actions_for_palette_and_menubar_with_domains(config, &domains)
-    }
 
     fn actions_for_palette_and_menubar_with_domains(
         config: &ConfigHandle,
@@ -485,6 +459,9 @@ impl CommandDef {
             }
         }
 
+        let mut commands = Self::actions_for_palette_and_menubar_async(&config).await;
+        commands.retain(|cmd| !cmd.menubar.is_empty());
+
         let main_menu = match Menu::get_main_menu() {
             Some(existing) => {
                 mark_candidates(
@@ -501,9 +478,6 @@ impl CommandDef {
                 menu
             }
         };
-
-        let mut commands = Self::actions_for_palette_and_menubar_async(&config).await;
-        commands.retain(|cmd| !cmd.menubar.is_empty());
 
         // Prefer to put the menus in this order
         let mut order: Vec<&'static str> = vec!["FrankenTerm", "Shell", "Edit", "View", "Window"];

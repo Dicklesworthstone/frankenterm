@@ -1428,6 +1428,7 @@ where
                         0,
                     )?;
                 }
+                Ok(Item::Notif(MuxNotification::SynchronizedOutput { .. })) => {}
                 Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
                 Ok(Item::Notif(MuxNotification::Empty)) => {}
                 Err(err) => {

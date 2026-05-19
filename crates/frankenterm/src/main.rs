@@ -3831,7 +3831,7 @@ enum RobotMissionCommands {
     /// Compile an operator objective into a read-only dry-run plan
     ObjectivePlan {
         #[command(flatten)]
-        args: RobotMissionObjectivePlanArgs,
+        args: Box<RobotMissionObjectivePlanArgs>,
     },
 
     /// Get mission state with assignment-level filtering
@@ -4264,7 +4264,7 @@ enum MissionCommands {
     /// Compile an operator objective into a read-only dry-run plan
     ObjectivePlan {
         #[command(flatten)]
-        args: MissionObjectivePlanArgs,
+        args: Box<MissionObjectivePlanArgs>,
     },
 
     /// Validate mission contract and compute deterministic planning summary
@@ -47021,7 +47021,7 @@ fn mission_objective_source_slug(source: MissionObjectiveSourceArg) -> &'static 
 }
 
 fn mission_objective_non_empty(
-    value: &Option<String>,
+    value: Option<&str>,
     field_name: &'static str,
     error_code: &'static str,
 ) -> Result<Option<String>, MissionCommandError> {
@@ -47129,22 +47129,22 @@ fn build_mission_objective_planner_input(
 
     validate_mission_objective_plan_args(args)?;
     let target_bead = mission_objective_non_empty(
-        &args.target_bead,
+        args.target_bead.as_deref(),
         "target_bead",
         "mission.objective_plan.target_bead_empty",
     )?;
     let candidate_id = mission_objective_non_empty(
-        &args.candidate_id,
+        args.candidate_id.as_deref(),
         "candidate_id",
         "mission.objective_plan.candidate_id_empty",
     )?;
     let candidate_title = mission_objective_non_empty(
-        &args.candidate_title,
+        args.candidate_title.as_deref(),
         "candidate_title",
         "mission.objective_plan.candidate_title_empty",
     )?;
     let active_assignee = mission_objective_non_empty(
-        &args.active_assignee,
+        args.active_assignee.as_deref(),
         "active_assignee",
         "mission.objective_plan.active_assignee_empty",
     )?;
