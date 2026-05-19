@@ -1,0 +1,482 @@
+{
+  "schema_path": "docs/json-schema/ft-deferred-proof-ownership-gate.json",
+  "contract_doc": "docs/robot-contracts/deferred-proof-ownership-gate.md",
+  "cases": [
+    {
+      "case_id": "allow-clean-static",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:allow-clean-static",
+        "receipt_id": "ft-69gwh.4.3:rch-admission-static",
+        "bead_id": "ft-69gwh.4.3",
+        "evaluated_at": "2026-05-19T02:42:00Z",
+        "receipt": {
+          "owned_paths": [
+            "fixtures/rch-admission/no-service-action-fixtures.json",
+            "tests/e2e/test_rch_admission_contract.sh"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "git_status_short",
+          "dirty_paths": [
+            {
+              "path": "CHANGELOG.md",
+              "status": " M",
+              "category": "tracked_non_overlap"
+            }
+          ],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "green",
+          "agent_mail_fallback_snapshot": false,
+          "in_progress_owners": [],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "not_required",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "allow",
+          "replay_allowed": true,
+          "reason_codes": [
+            "gate.clean_ownership"
+          ],
+          "explanation": "Static verifier receipt owns no currently dirty paths and has no active owner or prerequisite conflicts."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "wait-rch-critical-pressure",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:wait-rch-critical-pressure",
+        "receipt_id": "ft-ssy4x:recorder-storage-slot-test",
+        "bead_id": "ft-ssy4x",
+        "evaluated_at": "2026-05-19T02:42:01Z",
+        "receipt": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/recorder_storage.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": false
+        },
+        "current_checkout": {
+          "git_status_source": "swarm_tick_fallback",
+          "dirty_paths": [],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "unavailable",
+          "agent_mail_fallback_snapshot": true,
+          "in_progress_owners": [],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "critical_pressure",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "wait",
+          "replay_allowed": false,
+          "reason_codes": [
+            "rch.critical_pressure",
+            "agent_mail.fallback_active"
+          ],
+          "explanation": "Ownership is clean, but material remote proof must wait because RCH admission has no safe worker."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "dirty-overlap-current",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:dirty-overlap-current",
+        "receipt_id": "ft-dk7ad:latency-rejects",
+        "bead_id": "ft-dk7ad",
+        "evaluated_at": "2026-05-19T02:42:02Z",
+        "receipt": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/latency_stages/pipeline_run.rs",
+            "crates/frankenterm-core/src/latency_stages/tests.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "git_status_short",
+          "dirty_paths": [
+            {
+              "path": "crates/frankenterm-core/src/latency_stages/pipeline_run.rs",
+              "status": " M",
+              "category": "owned_overlap"
+            }
+          ],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "green",
+          "agent_mail_fallback_snapshot": false,
+          "in_progress_owners": [],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "admissible",
+          "selected_worker": "vmi1293453"
+        },
+        "decision": {
+          "state": "dirty_overlap",
+          "replay_allowed": false,
+          "reason_codes": [
+            "git.dirty_overlap"
+          ],
+          "explanation": "A currently dirty path overlaps the receipt ownership slice, so replay would prove unowned work."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "owner-handoff-active",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:owner-handoff-active",
+        "receipt_id": "ft-j4fnv:disk-pressure-sample",
+        "bead_id": "ft-j4fnv",
+        "evaluated_at": "2026-05-19T02:42:03Z",
+        "receipt": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/disk_pressure.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "swarm_tick_fallback",
+          "dirty_paths": [
+            {
+              "path": "crates/frankenterm-core/src/disk_pressure.rs",
+              "status": " M",
+              "category": "owned_overlap"
+            }
+          ],
+          "shared_tracker_dirty": true
+        },
+        "coordination": {
+          "agent_mail_state": "unavailable",
+          "agent_mail_fallback_snapshot": true,
+          "in_progress_owners": [
+            {
+              "bead_id": "ft-j4fnv",
+              "assignee": "jemanuel",
+              "updated_at": "2026-05-19T02:36:19Z",
+              "stale_over_2h": false,
+              "owned_paths": [
+                "crates/frankenterm-core/src/disk_pressure.rs"
+              ]
+            }
+          ],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "not_required",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "owner_handoff_required",
+          "replay_allowed": false,
+          "reason_codes": [
+            "owner.active_overlap",
+            "agent_mail.fallback_active"
+          ],
+          "explanation": "A non-stale in-progress owner overlaps the receipt paths; wait for explicit handoff instead of replaying."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "prerequisite-blocked",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:prerequisite-blocked",
+        "receipt_id": "ft-zbnz4.4:remote-runner",
+        "bead_id": "ft-zbnz4.4",
+        "evaluated_at": "2026-05-19T02:42:04Z",
+        "receipt": {
+          "owned_paths": [
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "git_status_short",
+          "dirty_paths": [],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "green",
+          "agent_mail_fallback_snapshot": false,
+          "in_progress_owners": [],
+          "prerequisite_beads": [
+            {
+              "bead_id": "ft-5xwsu.3",
+              "status": "blocked"
+            }
+          ]
+        },
+        "rch_admission": {
+          "state": "critical_pressure",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "prerequisite_blocked",
+          "replay_allowed": false,
+          "reason_codes": [
+            "beads.prerequisite_blocked"
+          ],
+          "explanation": "A prerequisite bead remains blocked, so this receipt cannot be replayed yet."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "mail-state-unknown",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:mail-state-unknown",
+        "receipt_id": "ft-abc12:unknown-mail",
+        "bead_id": "ft-abc12",
+        "evaluated_at": "2026-05-19T02:42:05Z",
+        "receipt": {
+          "owned_paths": [
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "git_status_short",
+          "dirty_paths": [],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "unknown",
+          "agent_mail_fallback_snapshot": false,
+          "in_progress_owners": [],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "not_required",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "mail_state_unknown",
+          "replay_allowed": false,
+          "reason_codes": [
+            "agent_mail.state_unknown"
+          ],
+          "explanation": "The gate has neither Agent Mail state nor the documented fallback snapshot, so ownership cannot be proven."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "stale-receipt",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:stale-receipt",
+        "receipt_id": "ft-old99:stale-proof",
+        "bead_id": "ft-old99",
+        "evaluated_at": "2026-05-19T02:42:06Z",
+        "receipt": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/recorder_storage.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "stale",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "git_status_short",
+          "dirty_paths": [],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "green",
+          "agent_mail_fallback_snapshot": false,
+          "in_progress_owners": [],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "admissible",
+          "selected_worker": "vmi1293453"
+        },
+        "decision": {
+          "state": "stale",
+          "replay_allowed": false,
+          "reason_codes": [
+            "receipt.stale"
+          ],
+          "explanation": "The receipt freshness window has expired; regenerate ownership evidence before replay."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "wait-shared-tracker-dirty",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:wait-shared-tracker-dirty",
+        "receipt_id": "ft-trk77:tracker-dirty",
+        "bead_id": "ft-trk77",
+        "evaluated_at": "2026-05-19T02:42:07Z",
+        "receipt": {
+          "owned_paths": [
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "swarm_tick_fallback",
+          "dirty_paths": [
+            {
+              "path": ".beads/issues.jsonl",
+              "status": " M",
+              "category": "shared_tracker"
+            }
+          ],
+          "shared_tracker_dirty": true
+        },
+        "coordination": {
+          "agent_mail_state": "unavailable",
+          "agent_mail_fallback_snapshot": true,
+          "in_progress_owners": [],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "not_required",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "wait",
+          "replay_allowed": false,
+          "reason_codes": [
+            "git.shared_tracker_dirty",
+            "agent_mail.fallback_active"
+          ],
+          "explanation": "The shared Beads JSONL is dirty while Agent Mail is unavailable; wait for a clean tracker window before replay."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    }
+  ]
+}

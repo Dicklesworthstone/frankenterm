@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-deferred-proof-ownership-gate.json",
+  "title": "FrankenTerm Deferred Proof Ownership Gate",
+  "description": "Static contract for deciding whether a queued deferred proof receipt can be replayed in the current checkout without proving or staging another agent's work.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "gate_id",
+    "receipt_id",
+    "bead_id",
+    "evaluated_at",
+    "receipt",
+    "current_checkout",
+    "coordination",
+    "rch_admission",
+    "decision",
+    "forbidden_actions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.deferred_proof_ownership_gate.v1"
+    },
+    "gate_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*:[a-z0-9][a-z0-9._-]*$"
+    },
+    "receipt_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*:[a-z0-9][a-z0-9._-]*$"
+    },
+    "bead_id": {
+      "$ref": "#/$defs/bead_id"
+    },
+    "evaluated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "receipt": {
+      "$ref": "#/$defs/receipt_summary"
+    },
+    "current_checkout": {
+      "$ref": "#/$defs/current_checkout"
+    },
+    "coordination": {
+      "$ref": "#/$defs/coordination_snapshot"
+    },
+    "rch_admission": {
+      "$ref": "#/$defs/rch_admission_snapshot"
+    },
+    "decision": {
+      "$ref": "#/$defs/gate_decision"
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    }
+  },
+  "$defs": {
+    "agent_mail_state": {
+      "type": "string",
+      "enum": [
+        "green",
+        "degraded_read_only",
+        "unavailable",
+        "unknown"
+      ]
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*$"
+    },
+    "dirty_path": {
+      "type": "object",
+      "required": [
+        "path",
+        "status",
+        "category"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "owned_overlap",
+            "tracked_non_overlap",
+            "shared_tracker",
+            "untracked_non_overlap"
+          ]
+        }
+      }
+    },
+    "current_checkout": {
+      "type": "object",
+      "required": [
+        "git_status_source",
+        "dirty_paths",
+        "shared_tracker_dirty"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "git_status_source": {
+          "type": "string",
+          "enum": [
+            "git_status_short",
+            "swarm_tick_fallback",
+            "robot_coordination_risk"
+          ]
+        },
+        "dirty_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/dirty_path"
+          }
+        },
+        "shared_tracker_dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "coordination_snapshot": {
+      "type": "object",
+      "required": [
+        "agent_mail_state",
+        "agent_mail_fallback_snapshot",
+        "in_progress_owners",
+        "prerequisite_beads"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "agent_mail_state": {
+          "$ref": "#/$defs/agent_mail_state"
+        },
+        "agent_mail_fallback_snapshot": {
+          "type": "boolean"
+        },
+        "in_progress_owners": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/in_progress_owner"
+          }
+        },
+        "prerequisite_beads": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/prerequisite_bead"
+          }
+        }
+      }
+    },
+    "decision_state": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "wait",
+        "stale",
+        "dirty_overlap",
+        "owner_handoff_required",
+        "prerequisite_blocked",
+        "mail_state_unknown"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "delete_files",
+        "destructive_git",
+        "stash_or_reset_worktree",
+        "broad_formatting",
+        "local_cargo_proof",
+        "rch_service_repair",
+        "rch_worker_mutation",
+        "agent_mail_repair",
+        "build_cancellation",
+        "prove_unowned_dirty_work"
+      ]
+    },
+    "gate_decision": {
+      "type": "object",
+      "required": [
+        "state",
+        "replay_allowed",
+        "reason_codes",
+        "explanation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/decision_state"
+        },
+        "replay_allowed": {
+          "type": "boolean"
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9_.-]+$"
+          }
+        },
+        "explanation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "in_progress_owner": {
+      "type": "object",
+      "required": [
+        "bead_id",
+        "assignee",
+        "updated_at",
+        "stale_over_2h",
+        "owned_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "assignee": {
+          "type": "string",
+          "minLength": 1
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "stale_over_2h": {
+          "type": "boolean"
+        },
+        "owned_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        }
+      }
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*(?:^|/)\\.\\.?$)(?!.*//)(?!.*\\\\)(?!.*(?:^|/)\\.git(?:/|$)).+$"
+    },
+    "prerequisite_bead": {
+      "type": "object",
+      "required": [
+        "bead_id",
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "closed",
+            "open",
+            "blocked",
+            "in_progress"
+          ]
+        }
+      }
+    },
+    "receipt_summary": {
+      "type": "object",
+      "required": [
+        "owned_paths",
+        "dirty_paths_at_capture",
+        "freshness_state",
+        "replay_allowed_before_gate"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "owned_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "dirty_paths_at_capture": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "freshness_state": {
+          "type": "string",
+          "enum": [
+            "fresh",
+            "stale"
+          ]
+        },
+        "replay_allowed_before_gate": {
+          "type": "boolean"
+        }
+      }
+    },
+    "rch_admission_snapshot": {
+      "type": "object",
+      "required": [
+        "state",
+        "selected_worker"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "admissible",
+            "critical_pressure",
+            "no_admissible_workers",
+            "telemetry_gap",
+            "not_required",
+            "unknown"
+          ]
+        },
+        "selected_worker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

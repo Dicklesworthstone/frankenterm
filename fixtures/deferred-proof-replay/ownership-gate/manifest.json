@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.deferred_proof_ownership_gate.fixture_manifest.v1",
+  "bead": "ft-zbnz4.3",
+  "schema": "docs/json-schema/ft-deferred-proof-ownership-gate.json",
+  "contract": "docs/robot-contracts/deferred-proof-ownership-gate.md",
+  "cases": "fixtures/deferred-proof-replay/ownership-gate/cases.v1.json",
+  "golden_summary": {
+    "case_count": 8,
+    "decision_states": [
+      "allow",
+      "dirty_overlap",
+      "mail_state_unknown",
+      "owner_handoff_required",
+      "prerequisite_blocked",
+      "stale",
+      "wait"
+    ]
+  },
+  "verification": [
+    "jq empty docs/json-schema/ft-deferred-proof-ownership-gate.json fixtures/deferred-proof-replay/ownership-gate/manifest.json fixtures/deferred-proof-replay/ownership-gate/cases.v1.json",
+    "bash tests/e2e/test_deferred_proof_ownership_gate.sh"
+  ]
+}
