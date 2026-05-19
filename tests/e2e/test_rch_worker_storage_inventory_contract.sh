@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 SCHEMA="docs/json-schema/ft-rch-worker-storage-inventory.json"
+DOC="docs/robot-contracts/rch-worker-pressure.md"
 MANIFEST="fixtures/rch-worker-pressure/manifest.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 README="README.md"
@@ -26,6 +27,7 @@ require_file() {
 require_command jq
 require_command ruby
 require_file "${SCHEMA}"
+require_file "${DOC}"
 require_file "${MANIFEST}"
 require_file "${PROVENANCE}"
 require_file "${README}"
@@ -37,6 +39,7 @@ require "json"
 require "set"
 
 SCHEMA = "docs/json-schema/ft-rch-worker-storage-inventory.json"
+DOC = "docs/robot-contracts/rch-worker-pressure.md"
 MANIFEST = "fixtures/rch-worker-pressure/manifest.json"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 README = "README.md"
@@ -87,6 +90,15 @@ FORBIDDEN_COMMAND_FRAGMENTS = [
   "git clean -fd",
   "rm -rf"
 ].freeze
+CANONICAL_RCH_STATUS_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs".freeze
+CANONICAL_RCH_CAPABILITIES_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing workers capabilities --refresh --json".freeze
+LEGACY_RCH_COMMAND_FRAGMENTS = [
+  "rch status --workers --json",
+  "RCH_NO_SELF_HEALING=1 rch --json",
+  "RCH_NO_SELF_HEALING=1 rch workers",
+  "rch exec --no-self-healing",
+  "rch diagnose --json --dry-run"
+].freeze
 
 def fail!(message)
   warn "rch worker storage inventory contract: #{message}"
@@ -97,6 +109,38 @@ def read_json(path)
   JSON.parse(File.read(path))
 rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
+end
+
+def each_string(value, &block)
+  case value
+  when String
+    yield value
+  when Array
+    value.each { |item| each_string(item, &block) }
+  when Hash
+    value.each_value { |item| each_string(item, &block) }
+  end
+end
+
+def rch_invocation?(text)
+  text.start_with?("rch ") ||
+    text.include?(" rch ") ||
+    text.include?("RCH_NO_SELF_HEALING=1 rch") ||
+    text.include?("RCH_REQUIRE_REMOTE=1")
+end
+
+def assert_canonical_rch_command!(label, text)
+  LEGACY_RCH_COMMAND_FRAGMENTS.each do |fragment|
+    fail!("#{label} contains legacy RCH command fragment #{fragment.inspect}: #{text}") if text.include?(fragment)
+  end
+
+  return unless rch_invocation?(text)
+
+  if text.include?("status") && text.include?("--workers")
+    fail!("#{label} has noncanonical RCH status command: #{text}") unless text == CANONICAL_RCH_STATUS_COMMAND
+  elsif text.include?("capabilities")
+    fail!("#{label} has noncanonical RCH capabilities command: #{text}") unless text == CANONICAL_RCH_CAPABILITIES_COMMAND
+  end
 end
 
 def safe_repo_relative_path?(path)
@@ -133,6 +177,7 @@ end
 
 schema = read_json(SCHEMA)
 manifest = read_json(MANIFEST)
+doc = File.read(DOC)
 provenance = File.read(PROVENANCE)
 readme = File.read(README)
 
@@ -165,12 +210,19 @@ fail!("manifest contract id drifted") unless manifest["contract_id"] == "ft.rch_
 fail!("manifest bead drifted") unless manifest["bead"] == "ft-5xwsu.1"
 fail!("manifest schema pointer drifted") unless manifest["schema"] == SCHEMA
 fail!("manifest verifier missing") unless manifest.fetch("verification").include?("bash tests/e2e/test_rch_worker_storage_inventory_contract.sh")
+fail!("doc missing canonical storage inventory contract id") unless doc.include?("`ft.rch_worker_storage_inventory.v1`")
+fail!("doc still points at superseded pressure inventory schema") if doc.include?("ft-rch-worker-pressure-inventory.json")
+fail!("doc missing canonical RCH status command") unless doc.include?(CANONICAL_RCH_STATUS_COMMAND)
 
 fixture_paths = manifest.fetch("valid")
 fail!("fixture path count drifted") unless fixture_paths.length == EXPECTED_FIXTURE_IDS.length
 fixture_paths.each do |path|
   fail!("manifest fixture path is unsafe: #{path}") unless safe_fixture_path?(path)
   fail!("manifest references missing fixture #{path}") unless File.file?(path)
+end
+
+Dir.glob("fixtures/rch-worker-pressure/valid/*.json").sort.each do |path|
+  each_string(read_json(path)) { |text| assert_canonical_rch_command!(path, text) }
 end
 
 payloads = fixture_paths.map { |path| [path, read_json(path)] }
@@ -214,6 +266,7 @@ payloads.each do |path, payload|
   commands = payload.dig("collection_scope", "commands") + scan_records(payload).map { |record| record.fetch("source_command") }
   commands.each do |command|
     fail!("#{fixture_id} records direct local Cargo proof command: #{command}") if command.start_with?("cargo ")
+    assert_canonical_rch_command!(fixture_id, command)
     FORBIDDEN_COMMAND_FRAGMENTS.each do |fragment|
       if command.downcase.include?(fragment.downcase)
         fail!("#{fixture_id} command contains forbidden fragment #{fragment}: #{command}")

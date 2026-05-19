@@ -70,6 +70,13 @@ The root object carries:
 | `protected_path_policy` | Fail-closed rules for protected paths, exact matching, hash requirements, live-use unknowns, and source evidence. |
 | `post_action_verification` | Remote-required RCH proof and Beads updates required after an approved recovery. |
 
+Post-action verification command examples must use the repo-required
+remote-only shape:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<target-dir> ...
+```
+
 ## Fixture Coverage
 
 Fixtures live under `fixtures/rch-worker-storage-approval/`:

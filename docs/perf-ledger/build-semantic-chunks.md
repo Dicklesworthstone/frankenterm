@@ -63,7 +63,7 @@ env -u CARGO_TARGET_DIR \
   RCH_VISIBILITY=verbose \
   RCH_NO_SELF_HEALING=1 \
   RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=7200 \
-  rch exec -- env \
+  rch --no-self-healing exec -- env \
     CARGO_BUILD_JOBS=1 \
     CARGO_INCREMENTAL=0 \
     CARGO_TARGET_DIR=/tmp/ft-o2mtn-semantic-chunks-target \
@@ -73,12 +73,12 @@ env -u CARGO_TARGET_DIR \
 Compare against the criterion baseline saved by previous retained RCH runs:
 
 ```
-env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
   CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
   CARGO_TARGET_DIR=/tmp/ft-o2mtn-semantic-chunks-baseline-target \
   cargo bench -p frankenterm-core --bench semantic_chunks -- --save-baseline ft-o2mtn
 # … later:
-env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
   CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
   CARGO_TARGET_DIR=/tmp/ft-o2mtn-semantic-chunks-compare-target \
   cargo bench -p frankenterm-core --bench semantic_chunks -- --baseline ft-o2mtn

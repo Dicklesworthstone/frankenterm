@@ -65,7 +65,7 @@
       "freshness_state": "fresh",
       "collected_at_ms": 1778912280000,
       "freshness_ms": 0,
-      "command_or_api": "rch diagnose --json --dry-run",
+      "command_or_api": "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json",
       "evidence_level": "fixture",
       "redacted": true,
       "redaction_posture": {

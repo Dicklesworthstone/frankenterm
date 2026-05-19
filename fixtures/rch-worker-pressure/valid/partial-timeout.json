@@ -9,7 +9,7 @@
   "collection_scope": {
     "source_status": "retained_partial",
     "commands": [
-      "rch status --workers --json",
+      "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
       "timeout 15s df -B1 / /tmp /data/projects/frankenterm",
       "timeout 15s find /data/projects/frankenterm/target -maxdepth 2 -type d -prune -print",
       "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target"

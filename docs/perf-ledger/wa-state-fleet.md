@@ -44,7 +44,7 @@ env -u CARGO_TARGET_DIR \
   RCH_VISIBILITY=verbose \
   RCH_NO_SELF_HEALING=1 \
   RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=7200 \
-  rch exec -- env \
+  rch --no-self-healing exec -- env \
     CARGO_BUILD_JOBS=1 \
     CARGO_INCREMENTAL=0 \
     CARGO_TARGET_DIR=/tmp/ft-3r0n4-wa-state-fleet-target \
@@ -54,12 +54,12 @@ env -u CARGO_TARGET_DIR \
 Compare against the criterion baseline saved by previous retained RCH runs:
 
 ```
-env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
   CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
   CARGO_TARGET_DIR=/tmp/ft-3r0n4-wa-state-fleet-baseline-target \
   cargo bench -p frankenterm-core --bench wa_state_fleet -- --save-baseline ft-3r0n4
 # … later:
-env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- env \
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
   CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
   CARGO_TARGET_DIR=/tmp/ft-3r0n4-wa-state-fleet-compare-target \
   cargo bench -p frankenterm-core --bench wa_state_fleet -- --baseline ft-3r0n4

@@ -18,7 +18,7 @@
       "freshness_state": "fresh",
       "collected_at_ms": 1778911560000,
       "freshness_ms": 0,
-      "command_or_api": "rch diagnose --json --dry-run -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
+      "command_or_api": "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,

@@ -283,6 +283,7 @@ fail!("live-use fixture lacks unknown state") unless unknown.fetch("requested_pa
 fail!("doc missing schema path") unless doc.include?(SCHEMA)
 fail!("doc missing canonical evidence contract id") unless doc.include?("`ft.rch_worker_storage_inventory.v1`")
 fail!("doc still endorses pressure-named inventory id") if doc.include?("ft.rch_worker_pressure.inventory.v1")
+fail!("doc missing canonical post-action RCH command") unless doc.include?(CANONICAL_RCH_EXEC_PREFIX)
 fail!("doc missing exact path rule") unless doc.include?("exact requested and approved path-set hashes")
 fail!("doc missing live-use fail-closed rule") unless doc.include?("live-use unknown must set")
 fail!("provenance missing approval schema row") unless provenance.include?("`ft-rch-worker-storage-approval.json`")

@@ -61,14 +61,14 @@
       "scan_status": "telemetry_gap",
       "source_commands": [
         {
-          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
           "scan_kind": "rch_status",
           "timeout_state": "completed",
           "partial_output": false,
           "artifact_path": "ft-4tp7g#6014"
         },
         {
-          "command": "RCH_NO_SELF_HEALING=1 rch workers capabilities --refresh --json",
+          "command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing workers capabilities --refresh --json",
           "scan_kind": "worker_capabilities",
           "timeout_state": "partial",
           "partial_output": true,
@@ -79,7 +79,7 @@
         {
           "path": "worker:vmi1156319",
           "size_text": "unavailable",
-          "source_command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "source_command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
           "scan_kind": "rch_status",
           "freshness": "unknown",
           "timeout_state": "not_run",
@@ -108,7 +108,7 @@
       "scan_status": "telemetry_gap",
       "source_commands": [
         {
-          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
           "scan_kind": "rch_status",
           "timeout_state": "completed",
           "partial_output": false,
@@ -119,7 +119,7 @@
         {
           "path": "worker:vmi1153651",
           "size_text": "unavailable",
-          "source_command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "source_command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
           "scan_kind": "rch_status",
           "freshness": "unknown",
           "timeout_state": "not_run",
@@ -148,7 +148,7 @@
       "scan_status": "telemetry_gap",
       "source_commands": [
         {
-          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
           "scan_kind": "rch_status",
           "timeout_state": "completed",
           "partial_output": false,
@@ -159,7 +159,7 @@
         {
           "path": "worker:vmi1152480",
           "size_text": "unavailable",
-          "source_command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "source_command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
           "scan_kind": "rch_status",
           "freshness": "unknown",
           "timeout_state": "not_run",

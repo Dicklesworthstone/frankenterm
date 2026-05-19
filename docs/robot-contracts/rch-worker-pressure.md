@@ -12,8 +12,10 @@ remote scans. It exists because remote-required FrankenTerm proof lanes can be
 blocked before Cargo, rustc, or test binaries are reached when every healthy RCH
 worker is under critical storage pressure.
 
-The output contract is `ft.rch_worker_pressure.inventory.v1`, defined in
-`docs/json-schema/ft-rch-worker-pressure-inventory.json`.
+The canonical output contract is `ft.rch_worker_storage_inventory.v1`, defined
+in `docs/json-schema/ft-rch-worker-storage-inventory.json`. The older
+pressure-named draft is superseded and must not be used by approval or
+post-recovery proof artifacts.
 
 ## Non-Authority
 
@@ -24,9 +26,10 @@ actions.
 
 Every valid artifact records:
 
-- `side_effect_policy.read_only: true`;
-- `side_effect_policy.operator_approval_required: true`;
-- `side_effect_policy.automatic_cleanup_allowed: false`;
+- `collection_scope.side_effect_policy.read_only: true`;
+- `collection_scope.side_effect_policy.files_deleted: false`;
+- `collection_scope.side_effect_policy.worker_mutated: false`;
+- `collection_scope.side_effect_policy.local_cargo_counted_as_proof: false`;
 - the performed read-only evidence collection actions; and
 - forbidden actions including deletion, target cleaning, RCH repair/restart,
   worker mutation, build cancellation, mirror mutation, and local Cargo proof.
@@ -42,30 +45,29 @@ The root object carries:
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | Integer schema version, currently `1`. |
-| `contract_id` | Stable string, currently `ft.rch_worker_pressure.inventory.v1`. |
+| `contract_id` | Stable string, currently `ft.rch_worker_storage_inventory.v1`. |
 | `generated_at_ms` | Unix epoch milliseconds for the retained artifact. |
 | `inventory_id` | Stable run or fixture id. |
 | `source_bead` | Bead that produced the inventory artifact. |
 | `source_context` | Optional parent bead and seed evidence pointers. |
-| `side_effect_policy` | Read-only and forbidden-action posture. |
+| `collection_scope.side_effect_policy` | Read-only and forbidden-action posture. |
 | `summary` | Worker counts, pressure counts, and next required action. |
-| `workers` | Per-worker storage and scan evidence. |
+| `worker_inventories` | Per-worker storage and scan evidence. |
 | `artifact_paths` | Retained artifacts or Beads/Mail evidence references. |
 
-Each worker row must include `worker_id`, `host_label`, `sampled_at_ms`,
-`pressure_state`, `admission_state`, `scan_status`, `source_commands`,
-`entries`, `reason_codes`, and `notes`.
+Each worker inventory row must include `worker_id`, `host_label`,
+`telemetry_status`, `pressure_reason`, `df_samples`, `shallow_scans`,
+`project_du_samples`, `artifact_paths`, and `notes`.
 
-Each inventory entry must include `path`, `source_command`, `scan_kind`,
-`freshness`, `timeout_state`, `partial_output`, `pressure_reason`,
-`artifact_path`, and `notes`. It must also include either `size_bytes` or
-`size_text`.
+Each retained scan entry must include `path`, `source_command`, freshness or
+status, timeout or partial-output state where applicable, `pressure_reason`,
+`artifact_path`, and `notes`.
 
 ## Scan Kinds
 
 | `scan_kind` | Meaning |
 | --- | --- |
-| `rch_status` | Read-only `rch --json status --workers` or equivalent status snapshot. |
+| `rch_status` | Read-only `RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs` or equivalent status snapshot. |
 | `worker_capabilities` | Read-only worker capability or probe snapshot. |
 | `df_root` | Worker root filesystem free-space sample. |
 | `shallow_target_temp` | Bounded target/temp scan such as `/tmp/rch-*` and `target*`. |
@@ -81,9 +83,9 @@ pressure but not as a complete inventory for cleanup review.
 Fixtures live under `fixtures/rch-worker-pressure/`:
 
 - `manifest.json`
-- `valid/complete-inventory.json`
-- `valid/partial-timeout-inventory.json`
-- `valid/telemetry-gap-inventory.json`
+- `valid/healthy-complete.json`
+- `valid/partial-timeout.json`
+- `valid/telemetry-gap.json`
 
 The complete fixture models a worker with a completed root `df`, shallow
 target/temp scan, and bounded project inventory. The partial-timeout fixture
@@ -97,8 +99,9 @@ Schema and fixture work is static documentation work. Local static checks are
 sufficient for this bead:
 
 ```text
-jq empty docs/json-schema/ft-rch-worker-pressure-inventory.json fixtures/rch-worker-pressure/manifest.json fixtures/rch-worker-pressure/valid/complete-inventory.json fixtures/rch-worker-pressure/valid/partial-timeout-inventory.json fixtures/rch-worker-pressure/valid/telemetry-gap-inventory.json
-git diff --check -- docs/json-schema/ft-rch-worker-pressure-inventory.json docs/robot-contracts/rch-worker-pressure.md fixtures/rch-worker-pressure
+jq empty docs/json-schema/ft-rch-worker-storage-inventory.json fixtures/rch-worker-pressure/manifest.json fixtures/rch-worker-pressure/valid/*.json
+bash tests/e2e/test_rch_worker_storage_inventory_contract.sh
+git diff --check -- docs/json-schema/ft-rch-worker-storage-inventory.json docs/robot-contracts/rch-worker-pressure.md fixtures/rch-worker-pressure tests/e2e/test_rch_worker_storage_inventory_contract.sh
 jq -c empty .beads/issues.jsonl
 br dep cycles --json
 ```

@@ -62,7 +62,7 @@
       "scan_status": "partial_timeout",
       "source_commands": [
         {
-          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "command": "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
           "scan_kind": "rch_status",
           "timeout_state": "completed",
           "partial_output": false,

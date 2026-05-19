@@ -105,7 +105,7 @@
       "source_fixture_requirements": [
         {
           "source_id": "rch-diagnose",
-          "command_or_api": "rch diagnose --json --dry-run -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-<bead>-proof cargo test ...",
+          "command_or_api": "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-<bead>-proof cargo test ...",
           "required_reason_codes": [
             "rch.no_admissible_workers",
             "rch.remote_cargo_reached_false"
