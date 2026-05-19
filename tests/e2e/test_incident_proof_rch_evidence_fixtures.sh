@@ -64,6 +64,19 @@ jq -e '
   def reason_category_ok: IN("result", "no_worker", "local_fallback", "transport", "missing_artifact");
   def verdict_ok: IN("passed", "blocked");
   def severity_ok: IN("medium", "high");
+  def retained_artifact_path_ok:
+    (type == "string")
+    and (length > 0)
+    and (startswith("/") | not)
+    and (startswith(".git/") | not)
+    and (contains("..") | not)
+    and startswith("tests/e2e/artifacts/[RUN]/");
+  def artifact_paths_ok:
+    if .proof.artifact_posture == "missing_required_artifact" then
+      (.proof.artifact_paths | type == "array" and length == 0)
+    else
+      (.proof.artifact_paths | type == "array" and length >= 1 and all(.[]; retained_artifact_path_ok))
+    end;
   def safe_command:
     . == "read retained RCH summary artifact"
     or . == "read retained proof ledger entry"
@@ -102,7 +115,7 @@ jq -e '
     and (.proof.setup_chatter_only | type == "boolean")
     and .proof.launches_new_proof == false
     and (.proof.artifact_posture | type == "string" and length > 0)
-    and (.proof.artifact_paths | type == "array")
+    and artifact_paths_ok
     and (.proof.reason_codes | type == "array" and length >= 1)
     and all(.proof.reason_codes[]; test("^rch\\.[a-z0-9_]+$"))
     and ((has("warnings") | not) or all(.warnings[];
