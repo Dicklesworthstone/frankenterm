@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 AGENTS="AGENTS.md"
+README="README.md"
 DOCS=(
   "docs/asupersync-rch-execution-policy.md"
   "docs/operator-runbook.md"
@@ -31,12 +32,14 @@ require_file() {
 
 require_command ruby
 require_file "${AGENTS}"
+require_file "${README}"
 for doc in "${DOCS[@]}"; do
   require_file "${doc}"
 done
 
 ruby <<'RUBY'
 AGENTS = "AGENTS.md"
+README = "README.md"
 CONTRACT_DOCS = [
   "docs/asupersync-rch-execution-policy.md",
   "docs/operator-runbook.md",
@@ -53,6 +56,7 @@ def fail!(message)
 end
 
 text = File.read(AGENTS)
+readme = File.read(README)
 
 compiler = text[/## Compiler Checks \(CRITICAL\).*?---/m]
 fail!("missing Compiler Checks section") unless compiler
@@ -60,13 +64,32 @@ fail!("missing Compiler Checks section") unless compiler
 manual = text[/## RCH — Remote Compilation Helper.*?### When rch is down/m]
 fail!("missing RCH helper section") unless manual
 
+weekly = text[/## Weekly WezTerm Upstream Backport Workflow.*?## Toolchain: Rust & Cargo/m]
+fail!("missing Weekly WezTerm section") unless weekly
+
+testing = text[/## Testing.*?## ast-grep vs ripgrep/m]
+fail!("missing AGENTS Testing section") unless testing
+
+readme_benchmarks = readme[/## Performance Benchmarks.*?## Testing/m]
+fail!("missing README Performance Benchmarks section") unless readme_benchmarks
+
+readme_testing = readme[/## Testing.*?## Troubleshooting/m]
+fail!("missing README Testing section") unless readme_testing
+
 required_snippets = [
   "RCH_REQUIRE_REMOTE=1",
   "RCH_NO_SELF_HEALING=1",
   "rch --no-self-healing exec --"
 ]
 
-[["compiler", compiler], ["manual", manual]].each do |name, section|
+[
+  ["compiler", compiler],
+  ["manual", manual],
+  ["weekly", weekly],
+  ["testing", testing],
+  ["README Performance Benchmarks", readme_benchmarks],
+  ["README Testing", readme_testing]
+].each do |name, section|
   required_snippets.each do |snippet|
     fail!("#{name} section missing #{snippet}") unless section.include?(snippet)
   end

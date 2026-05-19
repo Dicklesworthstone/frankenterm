@@ -210,9 +210,9 @@ deliberately.
    it in. Record it as skipped/deferred with the reason.
 9. Validate with the narrowest relevant proof first, usually package-scoped for
    vendored crates (for example
-   `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-mux-check cargo check -p mux --lib`
+   `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-mux-check cargo check -p mux --lib`
    and
-   `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-mux-test cargo test -p mux --lib`
+   `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-mux-test cargo test -p mux --lib`
    for mux-only changes). Then run broader workspace checks when feasible.
    Report unrelated workspace or system-package blockers separately from the
    backport result.
@@ -1084,25 +1084,25 @@ gate vacuous-pass, redactor pattern drift), see
 
 ```bash
 # Run all tests across the workspace
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
   cargo test --workspace
 
 # Run with output
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test-output \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test-output \
   cargo test --workspace -- --nocapture
 
 # Run tests for a specific crate
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-ft-test \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-ft-test \
   cargo test -p frankenterm
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-core-test \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-core-test \
   cargo test -p frankenterm-core
 
 # Run specific test by name pattern
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-pattern-test \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-pattern-test \
   cargo test pattern_matching
 
 # Run tests with all features enabled
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-all-features-test \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-all-features-test \
   cargo test --workspace --all-features
 ```
 
