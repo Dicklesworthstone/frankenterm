@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_pressure.inventory.v1",
+  "generated_at_ms": 1779060600000,
+  "inventory_id": "ft-5xwsu-1-telemetry-gap-fixture",
+  "source_bead": "ft-5xwsu.1",
+  "source_context": {
+    "parent_bead": "ft-5xwsu",
+    "seed_evidence": [
+      "ft-4tp7g#6014",
+      "agent-mail://frankenterm/2244"
+    ]
+  },
+  "side_effect_policy": {
+    "read_only": true,
+    "operator_approval_required": true,
+    "automatic_cleanup_allowed": false,
+    "performed_actions": [
+      "read_rch_status",
+      "read_worker_capabilities",
+      "read_retained_artifact"
+    ],
+    "forbidden_actions": [
+      "delete_file",
+      "delete_directory",
+      "clean_target",
+      "restart_rch",
+      "repair_rch",
+      "mutate_worker",
+      "cancel_build",
+      "mutate_remote_mirror",
+      "run_local_cargo_proof",
+      "destructive_git"
+    ]
+  },
+  "summary": {
+    "workers_total": 3,
+    "workers_complete": 0,
+    "workers_partial": 0,
+    "workers_telemetry_gap": 3,
+    "critical_pressure_workers": 0,
+    "operator_approval_required": true,
+    "automatic_cleanup_allowed": false,
+    "next_required_action": "Do not infer available cleanup candidates from telemetry gaps; collect fresh read-only worker telemetry first.",
+    "reason_codes": [
+      "rch.worker_pressure.telemetry_gap",
+      "rch.inventory.telemetry_gap",
+      "policy.operator_approval_required"
+    ]
+  },
+  "workers": [
+    {
+      "worker_id": "vmi1156319",
+      "host_label": "ubuntu@178.18.254.243",
+      "sampled_at_ms": 1779060600000,
+      "pressure_state": "telemetry_gap",
+      "admission_state": "unreachable",
+      "root_usage_percent": null,
+      "free_bytes": null,
+      "free_size_text": null,
+      "scan_status": "telemetry_gap",
+      "source_commands": [
+        {
+          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "scan_kind": "rch_status",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "artifact_path": "ft-4tp7g#6014"
+        },
+        {
+          "command": "RCH_NO_SELF_HEALING=1 rch workers capabilities --refresh --json",
+          "scan_kind": "worker_capabilities",
+          "timeout_state": "partial",
+          "partial_output": true,
+          "artifact_path": "ft-4tp7g#6014"
+        }
+      ],
+      "entries": [
+        {
+          "path": "worker:vmi1156319",
+          "size_text": "unavailable",
+          "source_command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "scan_kind": "rch_status",
+          "freshness": "unknown",
+          "timeout_state": "not_run",
+          "partial_output": true,
+          "pressure_reason": "storage telemetry stale or missing",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "The worker is unreachable; no filesystem inventory may be inferred."
+        }
+      ],
+      "reason_codes": [
+        "rch.worker_pressure.telemetry_gap",
+        "rch.worker.unreachable",
+        "rch.inventory.telemetry_gap"
+      ],
+      "notes": "Telemetry-gap rows block cleanup review until a fresh read-only probe succeeds."
+    },
+    {
+      "worker_id": "vmi1153651",
+      "host_label": "ubuntu@38.242.134.66",
+      "sampled_at_ms": 1779060600000,
+      "pressure_state": "telemetry_gap",
+      "admission_state": "unreachable",
+      "root_usage_percent": null,
+      "free_bytes": null,
+      "free_size_text": null,
+      "scan_status": "telemetry_gap",
+      "source_commands": [
+        {
+          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "scan_kind": "rch_status",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "artifact_path": "ft-4tp7g#6014"
+        }
+      ],
+      "entries": [
+        {
+          "path": "worker:vmi1153651",
+          "size_text": "unavailable",
+          "source_command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "scan_kind": "rch_status",
+          "freshness": "unknown",
+          "timeout_state": "not_run",
+          "partial_output": true,
+          "pressure_reason": "storage telemetry stale or missing",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "No worker filesystem inventory was collected."
+        }
+      ],
+      "reason_codes": [
+        "rch.worker_pressure.telemetry_gap",
+        "rch.worker.unreachable",
+        "rch.inventory.telemetry_gap"
+      ],
+      "notes": "Telemetry gap must fail closed for approval and proof decisions."
+    },
+    {
+      "worker_id": "vmi1152480",
+      "host_label": "worker:vmi1152480",
+      "sampled_at_ms": 1779060600000,
+      "pressure_state": "telemetry_gap",
+      "admission_state": "unknown",
+      "root_usage_percent": null,
+      "free_bytes": null,
+      "free_size_text": null,
+      "scan_status": "telemetry_gap",
+      "source_commands": [
+        {
+          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "scan_kind": "rch_status",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "artifact_path": "ft-4tp7g#6014"
+        }
+      ],
+      "entries": [
+        {
+          "path": "worker:vmi1152480",
+          "size_text": "unavailable",
+          "source_command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "scan_kind": "rch_status",
+          "freshness": "unknown",
+          "timeout_state": "not_run",
+          "partial_output": true,
+          "pressure_reason": "storage telemetry stale or missing",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "Missing disk metrics are preserved as a blocker, not treated as green."
+        }
+      ],
+      "reason_codes": [
+        "rch.worker_pressure.telemetry_gap",
+        "rch.inventory.telemetry_gap"
+      ],
+      "notes": "The inventory preserves a telemetry gap without fabricating filesystem sizes."
+    }
+  ],
+  "artifact_paths": [
+    "fixtures/rch-worker-pressure/valid/telemetry-gap-inventory.json",
+    "ft-4tp7g#6014",
+    "agent-mail://frankenterm/2244"
+  ]
+}

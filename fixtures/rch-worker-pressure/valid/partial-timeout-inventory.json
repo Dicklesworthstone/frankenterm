@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.rch_worker_pressure.inventory.v1",
+  "generated_at_ms": 1779060300000,
+  "inventory_id": "ft-5xwsu-1-partial-timeout-fixture",
+  "source_bead": "ft-5xwsu.1",
+  "source_context": {
+    "parent_bead": "ft-5xwsu",
+    "seed_evidence": [
+      "ft-4tp7g#6014",
+      "agent-mail://frankenterm/2243"
+    ]
+  },
+  "side_effect_policy": {
+    "read_only": true,
+    "operator_approval_required": true,
+    "automatic_cleanup_allowed": false,
+    "performed_actions": [
+      "read_rch_status",
+      "read_worker_df",
+      "read_worker_du",
+      "read_retained_artifact"
+    ],
+    "forbidden_actions": [
+      "delete_file",
+      "delete_directory",
+      "clean_target",
+      "restart_rch",
+      "repair_rch",
+      "mutate_worker",
+      "cancel_build",
+      "mutate_remote_mirror",
+      "run_local_cargo_proof",
+      "destructive_git"
+    ]
+  },
+  "summary": {
+    "workers_total": 2,
+    "workers_complete": 0,
+    "workers_partial": 2,
+    "workers_telemetry_gap": 0,
+    "critical_pressure_workers": 2,
+    "operator_approval_required": true,
+    "automatic_cleanup_allowed": false,
+    "next_required_action": "Treat partial rows as pressure evidence only; rerun bounded inventory or request approval before any destructive recovery.",
+    "reason_codes": [
+      "rch.worker_pressure.critical",
+      "rch.inventory.partial_timeout",
+      "policy.operator_approval_required"
+    ]
+  },
+  "workers": [
+    {
+      "worker_id": "vmi1167313",
+      "host_label": "ubuntu@154.12.232.219",
+      "sampled_at_ms": 1779060300000,
+      "pressure_state": "critical",
+      "admission_state": "blocked",
+      "root_usage_percent": 97,
+      "free_bytes": 6979321856,
+      "free_size_text": "6.5G",
+      "scan_status": "partial_timeout",
+      "source_commands": [
+        {
+          "command": "RCH_NO_SELF_HEALING=1 rch --json status --workers",
+          "scan_kind": "rch_status",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "artifact_path": "ft-4tp7g#6014"
+        },
+        {
+          "command": "ssh ubuntu@154.12.232.219 'df -h / /tmp'",
+          "scan_kind": "df_root",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "artifact_path": "ft-4tp7g#6014"
+        },
+        {
+          "command": "ssh ubuntu@154.12.232.219 'du -sh /data/projects/* 2>/dev/null'",
+          "scan_kind": "bounded_project_du",
+          "timeout_state": "timed_out",
+          "partial_output": true,
+          "artifact_path": "ft-4tp7g#6014"
+        }
+      ],
+      "entries": [
+        {
+          "path": "/",
+          "size_text": "97% used, 6.5G free",
+          "source_command": "ssh ubuntu@154.12.232.219 'df -h / /tmp'",
+          "scan_kind": "df_root",
+          "freshness": "fresh",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "pressure_reason": "root filesystem below RCH admission floor",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "Worker is status-healthy but still rejected by critical pressure admission."
+        },
+        {
+          "path": "/data/projects/franken_engine",
+          "size_text": "13G",
+          "source_command": "ssh ubuntu@154.12.232.219 'du -sh /data/projects/* 2>/dev/null'",
+          "scan_kind": "bounded_project_du",
+          "freshness": "fresh",
+          "timeout_state": "partial",
+          "partial_output": true,
+          "pressure_reason": "partial broad project inventory before timeout",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "The row is retained pressure evidence, not a complete cleanup candidate list."
+        },
+        {
+          "path": "/data/projects/frankensqlite",
+          "size_text": "timed out",
+          "source_command": "ssh ubuntu@154.12.232.219 'du -sh /data/projects/* 2>/dev/null'",
+          "scan_kind": "bounded_project_du",
+          "freshness": "unknown",
+          "timeout_state": "timed_out",
+          "partial_output": true,
+          "pressure_reason": "project scan timed out before size was collected",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "Timed-out paths must be reviewed as unknown until a fresh bounded scan completes."
+        }
+      ],
+      "reason_codes": [
+        "rch.worker_pressure.critical",
+        "rch.inventory.partial_timeout",
+        "rch.scan.project_du_timed_out"
+      ],
+      "notes": "Partial output included useful rows before timeout; missing rows fail closed for approval."
+    },
+    {
+      "worker_id": "vmi1149989",
+      "host_label": "ubuntu@212.90.121.76",
+      "sampled_at_ms": 1779060300000,
+      "pressure_state": "critical",
+      "admission_state": "blocked",
+      "root_usage_percent": 96,
+      "free_bytes": 41875931136,
+      "free_size_text": "39G",
+      "scan_status": "partial_timeout",
+      "source_commands": [
+        {
+          "command": "ssh ubuntu@212.90.121.76 'df -h / /tmp'",
+          "scan_kind": "df_root",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "artifact_path": "ft-4tp7g#6014"
+        },
+        {
+          "command": "ssh ubuntu@212.90.121.76 'du -sh /data/projects/* 2>/dev/null'",
+          "scan_kind": "bounded_project_du",
+          "timeout_state": "timed_out",
+          "partial_output": true,
+          "artifact_path": "ft-4tp7g#6014"
+        }
+      ],
+      "entries": [
+        {
+          "path": "/",
+          "size_text": "96% used, 39G free",
+          "source_command": "ssh ubuntu@212.90.121.76 'df -h / /tmp'",
+          "scan_kind": "df_root",
+          "freshness": "fresh",
+          "timeout_state": "completed",
+          "partial_output": false,
+          "pressure_reason": "root filesystem below RCH admission floor",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "Free space remains insufficient for RCH admission despite tens of gigabytes free."
+        },
+        {
+          "path": "/data/projects/flywheel_connectors-angoc37-clean-20260516",
+          "size_text": "47G",
+          "source_command": "ssh ubuntu@212.90.121.76 'du -sh /data/projects/* 2>/dev/null'",
+          "scan_kind": "bounded_project_du",
+          "freshness": "fresh",
+          "timeout_state": "partial",
+          "partial_output": true,
+          "pressure_reason": "partial broad project inventory before timeout",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "Large project tree retained for operator review only."
+        },
+        {
+          "path": "/data/projects/frankensqlite",
+          "size_text": "timed out",
+          "source_command": "ssh ubuntu@212.90.121.76 'du -sh /data/projects/* 2>/dev/null'",
+          "scan_kind": "bounded_project_du",
+          "freshness": "unknown",
+          "timeout_state": "timed_out",
+          "partial_output": true,
+          "pressure_reason": "project scan timed out before size was collected",
+          "artifact_path": "ft-4tp7g#6014",
+          "notes": "Unknown live-use and ownership state must fail closed."
+        }
+      ],
+      "reason_codes": [
+        "rch.worker_pressure.critical",
+        "rch.inventory.partial_timeout",
+        "rch.scan.project_du_timed_out"
+      ],
+      "notes": "The retained artifact distinguishes observed rows from timeout gaps."
+    }
+  ],
+  "artifact_paths": [
+    "fixtures/rch-worker-pressure/valid/partial-timeout-inventory.json",
+    "ft-4tp7g#6014"
+  ]
+}
