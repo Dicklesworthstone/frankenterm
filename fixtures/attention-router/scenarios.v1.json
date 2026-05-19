@@ -765,6 +765,64 @@
         "level": 5,
         "strategy": "structural golden over freshness classes and source counts; scrub times, pane ids, commit shas, and message ids"
       }
+    },
+    {
+      "scenario_id": "local-disk-pressure-cleanup-approval",
+      "title": "Local disk pressure blocks writes but cleanup still requires explicit approval",
+      "summary": "The router must pause write-dependent work or choose read-only/disjoint work when ENOSPC blocks edits and cleanup candidates exist without exact deletion approval.",
+      "source_fixture_requirements": [
+        {
+          "source_id": "filesystem-capacity",
+          "command_or_api": "df -h /System/Volumes/Data /tmp .",
+          "required_reason_codes": [
+            "local_disk.capacity_critical",
+            "local_disk.write_blocked"
+          ],
+          "required_counters": {
+            "available_gib_max": 1
+          }
+        },
+        {
+          "source_id": "cleanup-inventory",
+          "command_or_api": "du -sh /private/tmp/* 2>/dev/null | sort -h | tail",
+          "required_reason_codes": [
+            "cleanup.candidates_identified",
+            "cleanup.read_only_inventory"
+          ],
+          "required_counters": {
+            "candidate_count_min": 1
+          }
+        },
+        {
+          "source_id": "deletion-approval-state",
+          "command_or_api": "session instruction review",
+          "required_reason_codes": [
+            "approval.exact_delete_command_absent",
+            "approval.irreversible_consent_absent"
+          ]
+        }
+      ],
+      "expected": {
+        "classification": "blocked_infra",
+        "recommended_safe_action": "pause_write_work_request_exact_cleanup_approval_or_pick_read_only_work",
+        "confidence": "high",
+        "explanation_must_include": [
+          "ENOSPC blocks file writes and commits",
+          "cleanup inventory is not deletion approval",
+          "destructive cleanup requires exact command and explicit irreversible consent"
+        ]
+      },
+      "forbidden_actions": [
+        "delete_without_explicit_approval",
+        "run_rm_rf_from_inventory",
+        "treat_proceed_as_deletion_consent",
+        "continue_write_dependent_patch_after_enospc",
+        "run_local_cargo_as_proof"
+      ],
+      "volatility": {
+        "level": 4,
+        "strategy": "scrub absolute temp-path ownership details and byte-exact free-space values while preserving approval state and write failure class"
+      }
     }
   ],
   "future_harness_requirements": {
@@ -785,7 +843,8 @@
       "active exclusive reservations are treated as advisory rather than blocking overlap",
       "publication messages are treated as reservation releases",
       "conflicting Beads, reservation, and dirty-path owners are resolved by guessing a winner",
-      "force-release or reopen happens before a status check and operator review"
+      "force-release or reopen happens before a status check and operator review",
+      "cleanup candidates are deleted without exact approval and explicit irreversible consent"
     ],
     "proof_policy": "RCH-only for Rust/e2e harness execution after code exists; static jq and diff checks are sufficient for this inventory."
   }

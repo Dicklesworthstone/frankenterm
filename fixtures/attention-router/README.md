@@ -24,6 +24,11 @@ the shared scenario inventory so the future JSON and TOON golden harness
 classifies ownership hazards with the same vocabulary as the rest of the
 attention router.
 
+`ft-x3nsb.6.4` adds the local disk-pressure approval scenario. It preserves the
+case where ENOSPC blocks writes, read-only cleanup inventory identifies
+candidate temporary/build directories, and no destructive cleanup may run until
+the user supplies the exact command and explicit irreversible consent.
+
 The inventory is static-proof only. Validating this directory requires:
 
 ```bash
