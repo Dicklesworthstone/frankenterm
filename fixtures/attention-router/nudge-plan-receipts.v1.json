@@ -234,6 +234,61 @@
         "release-reservations-without-owner-evidence",
         "use-elapsed-time-alone"
       ]
+    },
+    {
+      "receipt_id": "proof-starved-no-action",
+      "scenario_id": "rch-no-admissible-worker",
+      "trigger_classification": "proof_starved",
+      "target": {
+        "kind": "none"
+      },
+      "evidence": {
+        "sources_checked": [
+          "br.ready",
+          "bv.triage",
+          "rch.diagnose",
+          "beads.blocker_state"
+        ],
+        "reason_codes": [
+          "beads.ready_empty",
+          "bv.recommends_blocked_issue",
+          "rch.no_admissible_workers",
+          "rch.remote_cargo_reached_false"
+        ],
+        "subjects": [
+          "ft-4tp7g",
+          "ft-5xwsu.3"
+        ],
+        "minimum_source_count": 4,
+        "summary": "RCH selected no admissible worker and remote Cargo was not reached; there is no communication nudge or mutation to send, only blocker recording or disjoint static work."
+      },
+      "nudge": {
+        "kind": "no_action",
+        "command_hint": "record the RCH blocker or choose disjoint static work; do not send a broadcast or run local Cargo as proof",
+        "urgency": "normal",
+        "mutates": false,
+        "review_required": false
+      },
+      "escalation": {
+        "status_check_before_force_release": true,
+        "elapsed_time_alone_sufficient": false,
+        "human_review_required_for_mutation": true,
+        "minimum_evidence_sources": 4,
+        "minimum_wait_minutes_after_status_check": 0
+      },
+      "redaction": {
+        "body_handling": "metadata_only",
+        "raw_pane_text_allowed": false,
+        "full_message_body_allowed": false,
+        "secret_material_allowed": false
+      },
+      "forbidden_actions": [
+        "claim-blocked-bv-pick",
+        "run-local-cargo-as-proof",
+        "restart-rch-daemon",
+        "mutate-rch-worker",
+        "send-unrequested-broadcast"
+      ]
     }
   ]
 }

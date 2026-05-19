@@ -71,15 +71,16 @@ jq -e '
     "ack-required-direct-request",
     "stale-claim-status-check",
     "dirty-overlap-handoff",
-    "force-release-review-only"
+    "force-release-review-only",
+    "proof-starved-no-action"
   ]))
-  and (.receipts | length >= 4)
+  and (.receipts | length >= 5)
 ' "${FIXTURE}" >/dev/null || fail "top-level receipt inventory is incomplete"
 
 jq -e '
   def known_classification:
     . as $value
-    | ["waiting_comm", "stale_claim", "dirty_overlap", "do_not_touch"]
+    | ["blocked_infra", "proof_starved", "waiting_comm", "stale_claim", "dirty_overlap", "do_not_touch"]
     | index($value) != null;
 
   def known_kind:
@@ -124,6 +125,14 @@ jq -e '
     and .nudge.review_required == true
     and .escalation.minimum_evidence_sources >= 3
     and .escalation.minimum_wait_minutes_after_status_check >= 1)
+  and any(.receipts[]; .nudge.kind == "no_action"
+    and .trigger_classification == "proof_starved"
+    and .target.kind == "none"
+    and .nudge.review_required == false
+    and (.evidence.reason_codes | index("rch.no_admissible_workers") != null)
+    and (.evidence.reason_codes | index("rch.remote_cargo_reached_false") != null)
+    and (.forbidden_actions | index("run-local-cargo-as-proof") != null)
+    and (.forbidden_actions | index("send-unrequested-broadcast") != null))
   and all(.receipts[]; .nudge.mutates == false)
 ' "${FIXTURE}" >/dev/null || fail "force-release review guardrails are missing"
 
