@@ -283,6 +283,60 @@
       }
     },
     {
+      "fixture_id": "remote-required-local-fallback-refusal",
+      "reason_code": "no_admissible_workers",
+      "diagnosis_family": "remote-required local fallback refusal",
+      "target_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-remote-required cargo check -p frankenterm-core --lib",
+      "executed_read_only_commands": [
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json check",
+        "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-rch-admission-remote-required cargo check -p frankenterm-core --lib",
+        "br ready --json"
+      ],
+      "retained_evidence": [
+        {
+          "kind": "command_output",
+          "summary": "A retained RCH_REQUIRE_REMOTE=1 attempt stopped before transfer with no worker assigned and refused host-side local fallback; the command output must not be counted as Cargo proof."
+        },
+        {
+          "kind": "admission_snapshot",
+          "summary": "The matching dry-run selected no worker with no_admissible_workers=critical_pressure=5, so the proof lane remains blocked instead of running local Cargo."
+        },
+        {
+          "kind": "coordination_snapshot",
+          "summary": "The safe next action is to retain the refusal evidence and wait for an admissible worker or operator-approved recovery, not to restart services or mutate workers."
+        }
+      ],
+      "forbidden_actions": [
+        "run_local_cargo_as_proof",
+        "restart_agent_mail",
+        "repair_agent_mail_db",
+        "restart_rch_daemon",
+        "mutate_rch_worker",
+        "cancel_other_agent_build",
+        "delete_files_without_approval",
+        "treat_dry_run_as_compile_proof"
+      ],
+      "collector_side_effects": {
+        "agent_mail_repaired": false,
+        "agent_mail_restarted": false,
+        "rch_daemon_restarted": false,
+        "worker_mutated": false,
+        "build_cancelled": false,
+        "files_deleted": false,
+        "local_cargo_counted_as_proof": false
+      },
+      "expected_structured_log": {
+        "component": "rch_admission_contract_static",
+        "fixture_id": "remote-required-local-fallback-refusal",
+        "reason_code": "no_admissible_workers",
+        "outcome": "blocked",
+        "service_actions_invoked": false,
+        "local_cargo_proof": false,
+        "side_effects_executed": false
+      }
+    },
+    {
       "fixture_id": "insufficient-slots",
       "reason_code": "insufficient_slots",
       "diagnosis_family": "insufficient worker slots",

@@ -118,6 +118,7 @@ EXPECTED_NO_SERVICE_CASE_IDS = %w[
   telemetry-gap
   critical-pressure
   critical-pressure-current-fleet
+  remote-required-local-fallback-refusal
   insufficient-slots
   active-project-exclusion
   local-eno-space
@@ -279,6 +280,17 @@ current_fleet_text = current_fleet.fetch("retained_evidence").map { |record| rec
   no_admissible_workers=critical_pressure=5
 ].each do |term|
   fail!("current fleet fixture missing installed RCH reason term #{term}") unless current_fleet_text.include?(term)
+end
+
+remote_required = no_service_cases.find { |entry| entry.fetch("fixture_id") == "remote-required-local-fallback-refusal" }
+remote_required_text = remote_required.fetch("retained_evidence").map { |record| record.fetch("summary") }.join("\n")
+[
+  "RCH_REQUIRE_REMOTE=1",
+  "refused host-side local fallback",
+  "no worker assigned",
+  "no_admissible_workers=critical_pressure=5"
+].each do |term|
+  fail!("remote-required fixture missing refusal term #{term}") unless remote_required_text.include?(term)
 end
 
 EXPECTED_CODES.each do |code|

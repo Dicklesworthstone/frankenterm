@@ -91,6 +91,7 @@ before an RCH proof lane can run:
 | `telemetry-gap` | Worker health or capability data is stale or missing. | `telemetry_gap` |
 | `critical-pressure` | Worker root, project, or cache pressure is critical. | `critical_pressure` |
 | `critical-pressure-current-fleet` | Current retained FrankenTerm dry-run selected no worker because five admissible Rust workers were under critical pressure. | `critical_pressure` |
+| `remote-required-local-fallback-refusal` | Remote-required RCH execution selected no worker and refused host-side local fallback before Cargo could run. | `no_admissible_workers` |
 | `insufficient-slots` | The parsed Cargo job request needs more slots than workers can admit. | `insufficient_slots` |
 | `active-project-exclusion` | Another same-project build is already active. | `active_project_exclusion` |
 | `local-eno-space` | Local disk or cache write probes failed with ENOSPC. | `local_eno_space` |
