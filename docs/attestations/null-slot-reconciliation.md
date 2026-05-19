@@ -1,7 +1,7 @@
 # Null-Slot Reconciliation
 
-**Bead:** `ft-e87u6.1`  
-**Generated:** 2026-05-09T21:37:04Z  
+**Bead:** `ft-e87u6.1`
+**Generated:** 2026-05-09T21:37:04Z
 **Manifest:** `docs/attestations/manifest.json` (`sha256:608ee741282e79dcf041e0efe49639f91200b17b3c594b7fc0cbbc96f9eb48a6`)
 
 This worksheet covers every `path: null` slot currently declared in
