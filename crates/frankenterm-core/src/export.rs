@@ -3076,13 +3076,32 @@ mod tests {
             let (storage, tmp) = test_db_with_pane("no_redact").await;
 
             let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+            // We use an Event rather than a Segment to test export-time redaction
+            // because segments are unconditionally redacted at write-time by the
+            // storage writer thread.
             storage
-                .append_segment(1, &format!("has secret: {}", secret), None)
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: "test".to_string(),
+                    agent_type: "test".to_string(),
+                    event_type: "test".to_string(),
+                    severity: "info".to_string(),
+                    confidence: 1.0,
+                    extracted: None,
+                    matched_text: Some(format!("has secret: {}", secret)),
+                    segment_id: None,
+                    detected_at: 0,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
                 .await
                 .unwrap();
 
             let opts = ExportOptions {
-                kind: ExportKind::Segments,
+                kind: ExportKind::Events,
                 query: ExportQuery::default(),
                 audit_actor: None,
                 audit_action: None,
@@ -3095,7 +3114,7 @@ mod tests {
 
             let output = String::from_utf8(buf).unwrap();
             let (_header, records) = parse_jsonl(&output);
-            let content = records[0]["content"].as_str().unwrap();
+            let content = records[0]["matched_text"].as_str().unwrap();
             // Secret should NOT be redacted when redact=false
             assert!(
                 content.contains(secret),

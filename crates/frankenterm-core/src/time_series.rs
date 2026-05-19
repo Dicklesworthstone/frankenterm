@@ -854,11 +854,9 @@ mod tests {
             let ds = ts.downsample(target);
             // Reconstruct chunk sizes from the integer partition.
             let mut reconstructed = 0.0;
-            for (i, p) in ds.to_vec().iter().enumerate() {
-                let start = (i * n as usize) / target;
-                let end = ((i + 1) * n as usize) / target;
-                let size = (end - start) as f64;
-                reconstructed += p.value * size;
+            for p in &ds.to_vec() {
+                let size = p.timestamp_ms as f64;
+                reconstructed = p.value.mul_add(size, reconstructed);
             }
             assert!(
                 (reconstructed - original_sum).abs() < 1e-6,

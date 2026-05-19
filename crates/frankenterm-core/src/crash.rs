@@ -3606,6 +3606,7 @@ fn agent_mail_warning_id(reason_code: &str) -> &'static str {
     }
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn agent_mail_reason_category(reason_code: &str) -> &'static str {
     let reason = reason_code.to_ascii_lowercase();
     if reason == "agent_mail.ok" || reason.ends_with(".ok") {
@@ -10139,8 +10140,8 @@ not-json
 
         assert!(!manifest_text.contains(secret));
         assert!(!warnings_text.contains(secret));
-        assert!(manifest_text.contains("[REDACTED:aws_access_key]"));
-        assert!(warnings_text.contains("[REDACTED:aws_access_key]"));
+        assert!(manifest_text.contains("[REDACTED:aws_access_key_id]"));
+        assert!(warnings_text.contains("[REDACTED:aws_access_key_id]"));
         assert!(result.path.to_string_lossy().contains(secret));
         let manifest: IncidentBundleResult = serde_json::from_str(&manifest_text).unwrap();
         assert!(!manifest.path.to_string_lossy().contains(secret));

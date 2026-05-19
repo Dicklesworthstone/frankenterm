@@ -163,6 +163,7 @@ fn arb_crash_manifest() -> impl Strategy<Value = CrashManifest> {
                     files,
                     has_health_snapshot,
                     has_resize_forensics: false,
+                    has_environment_markers: false,
                     bundle_size_bytes,
                 }
             },

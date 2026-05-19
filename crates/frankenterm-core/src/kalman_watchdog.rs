@@ -125,12 +125,13 @@ pub struct KalmanFilter {
 }
 
 impl KalmanFilter {
-    /// Create a new Kalman filter with specified noise parameters.
+    /// Create a new 1D Kalman filter with specific process and measurement noise.
     ///
     /// - `q`: Process noise variance (higher = more adaptive, tracks changes faster)
     /// - `r`: Measurement noise variance (higher = smoother, less reactive to outliers)
     #[must_use]
     pub fn new(q: f64, r: f64) -> Self {
+        assert!(q.is_finite() && r.is_finite(), "q and r must be finite");
         Self {
             x: 0.0,
             p: 1.0,
@@ -145,6 +146,9 @@ impl KalmanFilter {
     /// On the first call, initializes the state to the observation value.
     /// Subsequent calls run the predict-update cycle.
     pub fn update(&mut self, z: f64) {
+        if !z.is_finite() {
+            return;
+        }
         if !self.initialized {
             self.x = z;
             self.p = self.r; // Initial uncertainty = measurement noise
@@ -327,6 +331,9 @@ impl ComponentTracker {
     /// Get the adaptive threshold at k standard deviations above the mean.
     #[must_use]
     pub fn adaptive_threshold(&self, k: f64) -> Option<f64> {
+        if !k.is_finite() {
+            return None;
+        }
         if !self.filter.is_initialized() {
             return None;
         }

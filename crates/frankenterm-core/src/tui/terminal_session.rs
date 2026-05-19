@@ -169,7 +169,7 @@ fn publish_crash_session_markers(phase: SessionPhase, mode: Option<ScreenMode>) 
 fn set_active_output_gate_for_mode(mode: ScreenMode) {
     match mode {
         ScreenMode::AltScreen => {
-            super::output_gate::set_phase(super::output_gate::GatePhase::Active)
+            super::output_gate::set_phase(super::output_gate::GatePhase::Active);
         }
         ScreenMode::Inline { ui_height } => {
             super::output_gate::set_inline_active_region(super::output_gate::InlineRegion::bottom(

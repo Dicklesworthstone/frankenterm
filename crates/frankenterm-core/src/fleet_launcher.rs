@@ -983,13 +983,13 @@ fn allocate_weighted(total: u32, mix: &[AgentMixEntry]) -> Vec<u32> {
         return vec![0; mix.len()];
     }
 
-    let total_weight: u32 = mix.iter().fold(0u32, |acc, e| acc.saturating_add(e.weight));
+    let total_weight: u64 = mix.iter().fold(0u64, |acc, e| acc + u64::from(e.weight));
     if total_weight == 0 {
         return vec![0; mix.len()];
     }
 
     let total_f = f64::from(total);
-    let weight_f = f64::from(total_weight);
+    let weight_f = total_weight as f64;
 
     // Compute exact quotas
     let quotas: Vec<f64> = mix

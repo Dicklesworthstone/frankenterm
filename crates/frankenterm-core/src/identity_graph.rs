@@ -2126,6 +2126,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn delegation_non_cycle_chain_still_accepted() {
         // Regression: the strengthened cycle check must NOT block
         // legitimate transitive chains. A->B, then B->C, then C->D

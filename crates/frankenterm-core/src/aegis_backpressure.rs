@@ -163,8 +163,9 @@ pub struct GaussianPosterior {
 }
 
 impl GaussianPosterior {
-    /// Create from prior mean and variance.
+    /// Create a new Gaussian posterior with initial mean and variance.
     pub fn new(mean: f64, variance: f64) -> Self {
+        assert!(mean.is_finite() && variance.is_finite(), "mean and variance must be finite");
         Self {
             mean,
             variance: variance.max(1e-12),

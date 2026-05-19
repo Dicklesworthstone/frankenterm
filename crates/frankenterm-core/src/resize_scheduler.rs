@@ -2027,7 +2027,7 @@ mod tests {
     use super::{
         ResizeDomain, ResizeExecutionPhase, ResizeIntent, ResizeLifecycleDetail,
         ResizeLifecycleStage, ResizeScheduler, ResizeSchedulerConfig, ResizeSchedulerDebugSnapshot,
-        ResizeWorkClass, SubmitOutcome,
+        ResizeWorkClass, SubmitOutcome, resize_debug_snapshot_lock,
     };
 
     fn intent(
@@ -2084,6 +2084,10 @@ mod tests {
             domain,
             tab_id: None,
         }
+    }
+
+    fn poison_test_lock(message: &'static str) -> ! {
+        std::panic::panic_any(message);
     }
 
     #[test]
@@ -2381,7 +2385,7 @@ mod tests {
         let poisoner = std::thread::spawn(move || {
             let mut guard = lock.write().expect("lock should be clean before poison");
             *guard = Some(poisoned);
-            panic!("intentional resize debug snapshot poison");
+            poison_test_lock("intentional resize debug snapshot poison");
         });
         assert!(poisoner.join().is_err());
 

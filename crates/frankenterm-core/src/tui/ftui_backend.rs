@@ -8857,7 +8857,7 @@ mod tests {
         // remain active but are not part of the ratatui-oracle tab chrome.
         for (i, view) in View::all().iter().enumerate() {
             let expected = view.name();
-            if tab_line.contains(&expected) {
+            if tab_line.contains(expected) {
                 // Tab is visible — good
             } else {
                 // Tab was truncated due to width — only acceptable for later tabs

@@ -66,6 +66,8 @@ use serde::{Deserialize, Serialize};
 pub enum CuckooDedupVerdict {
     /// Filter says key is NOT in set — definitely new (no false negatives).
     New,
+    /// Filter says key is NOT in set, but the filter is full so it could not be recorded.
+    NewButFull,
     /// Filter says key IS in set — probably duplicate (true positive
     /// with bounded false-positive risk from 32-bit fingerprints).
     PossibleDuplicate,
@@ -146,8 +148,10 @@ impl EventCuckooDedup {
             // Definitely new — record it for future dedup.
             // InsertResult::Full is treated as best-effort; the key
             // doesn't get recorded but the verdict is still New.
-            let _ = self.filter.insert(key);
-            CuckooDedupVerdict::New
+            match self.filter.insert(key) {
+                crate::cuckoo_filter::InsertResult::Ok => CuckooDedupVerdict::New,
+                crate::cuckoo_filter::InsertResult::Full => CuckooDedupVerdict::NewButFull,
+            }
         }
     }
 

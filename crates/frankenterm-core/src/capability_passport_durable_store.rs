@@ -581,7 +581,7 @@ mod tests {
         );
 
         let p = passport("agent-poison", Some(7), 1);
-        let key = PassportKey::from_passport(&p);
+        let key = PassportKey::from(&p);
 
         assert_eq!(s.upsert(&p).unwrap(), UpsertOutcome::Inserted);
         assert_eq!(s.fetch_by_key(&key).unwrap(), Some(p));

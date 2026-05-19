@@ -211,6 +211,7 @@ impl BreakerManager {
                 state.opened_at_us = timestamp_us;
                 state.half_open_probes = 0;
                 state.half_open_successes = 0;
+                state.total_trips += 1;
             }
             BreakerState::Open => {}
         }

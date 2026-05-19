@@ -796,6 +796,7 @@ impl DataflowGraph {
     pub fn flush_debounced(&mut self) -> usize {
         let now = Instant::now();
         let mut flushed = 0;
+        let mut changed_nodes: HashSet<NodeId> = HashSet::new();
         let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
         for nid in node_ids {
             let should_flush = {
@@ -822,6 +823,7 @@ impl DataflowGraph {
                         if val != node.value {
                             node.value = val;
                             flushed += 1;
+                            changed_nodes.insert(nid);
                             // Mark dependents dirty.
                             for &out in &node.outputs.clone() {
                                 self.dirty.insert(out);
@@ -831,9 +833,39 @@ impl DataflowGraph {
                 }
             }
         }
+
+        // Fire sink callbacks for nodes that flushed
+        let sink_ids: Vec<NodeId> = self.sinks.keys().copied().collect();
+        let mut sink_callback_panics = 0;
+        for sid in sink_ids {
+            if changed_nodes.contains(&sid) {
+                if let (Some(node), Some(callback)) = (self.nodes.get(&sid), self.sinks.get(&sid)) {
+                    match catch_unwind(AssertUnwindSafe(|| callback(&node.value))) {
+                        Ok(()) => {
+                            trace!(
+                                node_id = sid.0,
+                                label = node.label.as_str(),
+                                value = ?node.value,
+                                "dataflow sink callback fired during flush"
+                            );
+                        }
+                        Err(_) => {
+                            sink_callback_panics += 1;
+                            warn!(
+                                node_id = sid.0,
+                                label = node.label.as_str(),
+                                "dataflow sink callback panicked during flush"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if flushed > 0 {
             debug!(
                 flushed_nodes = flushed,
+                sink_callback_panics,
                 dirty_count = self.dirty.len(),
                 "dataflow flushed debounced nodes"
             );

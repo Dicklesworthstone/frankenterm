@@ -118,7 +118,7 @@ impl Distribution {
         confidence: f64,
         seed: u64,
     ) -> Option<Self> {
-        if samples.is_empty() {
+        if samples.is_empty() || !samples.iter().all(|x| x.is_finite()) {
             return None;
         }
 
@@ -223,7 +223,10 @@ pub fn bootstrap_percentile_ci(
     confidence: f64,
     seed: u64,
 ) -> (f64, f64) {
-    if sorted_samples.is_empty() || resamples == 0 {
+    if sorted_samples.is_empty() || resamples == 0 || !sorted_samples.iter().all(|x| x.is_finite()) {
+        return (f64::NAN, f64::NAN);
+    }
+    if !q.is_finite() || !(0.0..=1.0).contains(&q) || !confidence.is_finite() || !(0.0..1.0).contains(&confidence) {
         return (f64::NAN, f64::NAN);
     }
     let n = sorted_samples.len();
@@ -266,6 +269,9 @@ pub fn mann_whitney_u(samples_a: &[f64], samples_b: &[f64]) -> Option<MannWhitne
     let n_a = samples_a.len();
     let n_b = samples_b.len();
     if n_a == 0 || n_b == 0 {
+        return None;
+    }
+    if !samples_a.iter().all(|x| x.is_finite()) || !samples_b.iter().all(|x| x.is_finite()) {
         return None;
     }
 
@@ -471,7 +477,10 @@ pub fn criterion_group_and_bench_id(
 /// ±infinity are rejected.
 #[must_use]
 pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option<f64> {
-    if samples.is_empty() || !range.is_finite() || range <= 0.0 || !(0.0..1.0).contains(&alpha) {
+    if samples.is_empty() || !range.is_finite() || range <= 0.0 || !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+        return None;
+    }
+    if !samples.iter().all(|x| x.is_finite()) {
         return None;
     }
     let n = samples.len() as f64;

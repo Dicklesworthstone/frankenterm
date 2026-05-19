@@ -1276,7 +1276,7 @@ fn any_reason(sources: &[&OperatingEnvelopeSourceSnapshot], needles: &[&str]) ->
                     .iter()
                     .flat_map(|evidence| evidence.reason_codes.iter()),
             )
-            .any(|reason| needles.iter().any(|needle| reason.as_str() == *needle))
+            .any(|reason| needles.contains(&reason.as_str()))
     })
 }
 

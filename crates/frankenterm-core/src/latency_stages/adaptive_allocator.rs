@@ -533,6 +533,30 @@ impl AdaptiveAllocator {
             }
         }
 
+        // Return any floating-point rounding slack to the first available donor
+        if remaining > 1e-9 {
+            for &idx in &donors {
+                let lane = &mut self.lanes[idx];
+                let ceiling = lane.default_p95_us * self.config.max_budget_pct;
+                let room = ceiling - lane.current_p95_us;
+                let give = remaining.min(room);
+                if give > 0.0 {
+                    let before = lane.current_p95_us;
+                    lane.current_p95_us += give;
+                    let actual_give = lane.current_p95_us - before;
+                    lane.cumulative_transfer_us += actual_give;
+                    remaining -= actual_give;
+                    if let Some(adj) = adjustments.iter_mut().find(|a| a.stage == lane.stage) {
+                        adj.after_p95_us = lane.current_p95_us;
+                        adj.delta_us += actual_give;
+                    }
+                }
+                if remaining <= 1e-9 {
+                    break;
+                }
+            }
+        }
+
         let decision = AllocationDecision {
             epoch: self.epoch,
             correlation_id: correlation_id.to_string(),

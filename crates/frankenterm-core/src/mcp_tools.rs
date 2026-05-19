@@ -55,8 +55,8 @@ use super::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
     HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
     MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
-    MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE,
-    MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, Osc133State,
+    MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
+    MCP_ERR_WORKFLOW, McpToolError, Osc133State,
     PaneCapabilities, PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter, PatternEngine,
     PolicyDecision, PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults,
     SearchQueryInput, SharedRateLimiter, StorageHandle, UnifiedSearchMode, WaitOptions, WaitResult,
@@ -8298,7 +8298,7 @@ mod tests {
 
     #[test]
     fn mission_state_tool_rejects_mission_state_filter_miss() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let mission_path = write_mission_file(&dir, MissionLifecycleState::Completed);
         let tool = WaMissionStateTool::new(config());
 
@@ -8669,7 +8669,6 @@ mod tests {
             env.args(),
             vec![
                 "search",
-                "agent context",
                 "--robot",
                 "--limit",
                 "5",
@@ -8685,6 +8684,8 @@ mod tests {
                 "minimal",
                 "--max-tokens",
                 "128",
+                "--",
+                "agent context",
             ]
         );
         assert_eq!(envelope["ok"], true);
@@ -8719,7 +8720,7 @@ mod tests {
 
         assert_eq!(
             env.args(),
-            vec!["view", "/tmp/session.md", "-n", "42", "--json", "-C", "3"]
+            vec!["view", "-n", "42", "--json", "-C", "3", "--", "/tmp/session.md"]
         );
         assert_eq!(envelope["ok"], true);
         assert_eq!(envelope["data"]["source_path"], "/tmp/session.md");

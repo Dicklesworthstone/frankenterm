@@ -453,7 +453,7 @@ to send control bytes becomes visible in policy review and audit trails.",
         "Review whether the target pane should accept control-byte input",
         "Use approval-gated workflows for interrupt or escape-sequence actions",
     ],
-    see_also: &["ft policy", "wa.send"],
+    see_also: &["ft policy", "ft send"],
 };
 
 // ============================================================================
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn list_templates_by_category_risk() {
         let risks = list_templates_by_category("risk");
-        assert_eq!(risks.len(), 5, "Should have 5 risk templates");
+        assert_eq!(risks.len(), 6, "Should have 6 risk templates");
         for tmpl in risks {
             assert!(tmpl.id.starts_with("risk."));
         }

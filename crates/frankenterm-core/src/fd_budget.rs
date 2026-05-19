@@ -1081,7 +1081,7 @@ mod tests {
             // but the test still validates audit() completes.
             h.push((now, 200));
             h.push((now, 100));
-            h.push((now, 150));
+            h.push((now, u64::MAX)); // Use MAX to guarantee current > MAX is false
         }
 
         // No panic, no overflow, returns a result.

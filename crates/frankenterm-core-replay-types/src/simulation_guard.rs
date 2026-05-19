@@ -21,6 +21,9 @@ static PROCESS_SIMULATION_DEPTH: AtomicU64 = AtomicU64::new(0);
 /// reaches storage, event fanout, or pane mutation.
 pub struct SimulationGuard {
     _private: (),
+    // Ensure the guard cannot be sent across threads, as its Drop impl
+    // modifies thread-local storage.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl SimulationGuard {
@@ -36,7 +39,10 @@ impl SimulationGuard {
             depth.set(1);
         });
         PROCESS_SIMULATION_DEPTH.fetch_add(1, Ordering::SeqCst);
-        Self { _private: () }
+        Self {
+            _private: (),
+            _not_send: std::marker::PhantomData,
+        }
     }
 
     /// Check whether any replay simulation is active in this process.

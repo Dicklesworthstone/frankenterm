@@ -794,8 +794,8 @@ fn extract_line_numbers(text: &str) -> Vec<(String, usize)> {
         }
         // Pattern 2: `line NUM` or `Line NUM`
         if i + 5 < len {
-            let window = &text[i..i + 5];
-            if window.eq_ignore_ascii_case("line ") {
+            let window = &bytes[i..i + 5];
+            if window.eq_ignore_ascii_case(b"line ") {
                 let start = i + 5;
                 let mut end = start;
                 while end < len && bytes[end].is_ascii_digit() {

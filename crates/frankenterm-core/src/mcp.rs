@@ -42,10 +42,10 @@ use crate::config::{Config, PaneFilterConfig};
 use crate::error::WeztermError;
 use crate::ingest::Osc133State;
 use crate::mcp_error::{
-    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
-    MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE,
-    MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
-    map_caut_error, map_mcp_error,
+    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY,
+    MCP_ERR_INVALID_ARGS, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
+    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError,
+    map_cass_error, map_caut_error, map_mcp_error,
 };
 #[cfg(test)]
 use crate::mcp_error::{MCP_ERR_INTERNAL, MCP_ERR_RESERVATION_CONFLICT};
@@ -1553,7 +1553,6 @@ mod tests {
             MCP_ERR_PANE_NOT_FOUND,
             MCP_ERR_WORKFLOW,
             MCP_ERR_TIMEOUT,
-            MCP_ERR_NOT_IMPLEMENTED,
             MCP_ERR_FTS_QUERY,
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
@@ -1582,7 +1581,6 @@ mod tests {
             MCP_ERR_PANE_NOT_FOUND,
             MCP_ERR_WORKFLOW,
             MCP_ERR_TIMEOUT,
-            MCP_ERR_NOT_IMPLEMENTED,
             MCP_ERR_FTS_QUERY,
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,

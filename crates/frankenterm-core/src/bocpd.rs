@@ -195,6 +195,10 @@ impl BocpdModel {
     /// Create a new BOCPD model.
     #[must_use]
     pub fn new(config: BocpdConfig) -> Self {
+        assert!(
+            config.hazard_rate.is_finite() && config.detection_threshold.is_finite(),
+            "BOCPD config hazard_rate and detection_threshold must be finite"
+        );
         let mut run_length_log_probs = Vec::with_capacity(config.max_run_length + 1);
         run_length_log_probs.push(0.0); // log(1.0) — start with run length 0
 
@@ -212,6 +216,9 @@ impl BocpdModel {
 
     /// Process a new observation. Returns a change-point event if detected.
     pub fn update(&mut self, x: f64) -> Option<ChangePoint> {
+        if !x.is_finite() {
+            return None;
+        }
         self.observation_count += 1;
         let n = self.run_length_log_probs.len();
 

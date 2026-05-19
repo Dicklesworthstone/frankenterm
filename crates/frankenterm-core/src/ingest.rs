@@ -1071,8 +1071,11 @@ impl PaneRegistry {
                     let is_observed = new_observation.is_observed();
 
                     entry.update_info(pane);
-                    entry.observation = new_observation;
-                    entry.decision_at = epoch_ms();
+                    
+                    if entry.observation != new_observation {
+                        entry.observation = new_observation;
+                        entry.decision_at = epoch_ms();
+                    }
 
                     if is_observed && !was_observed {
                         self.cursors.insert(
@@ -1321,8 +1324,10 @@ impl PaneRegistry {
             let was_observed = entry.should_observe();
             let is_observed = new_decision.is_observed();
 
-            entry.observation = new_decision;
-            entry.decision_at = epoch_ms();
+            if entry.observation != new_decision {
+                entry.observation = new_decision;
+                entry.decision_at = epoch_ms();
+            }
 
             // Update cursor state
             if is_observed && !was_observed {

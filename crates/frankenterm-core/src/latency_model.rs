@@ -53,6 +53,7 @@ impl PiecewiseLinear {
     /// Points are sorted by t; duplicates are removed (last wins).
     pub fn new(mut points: Vec<CurvePoint>) -> Self {
         assert!(!points.is_empty(), "curve must have at least one point");
+        assert!(points.iter().all(|p| p.t.is_finite() && p.y.is_finite()), "PiecewiseLinear points must be finite");
         points.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
         // Deduplicate: keep last point at each t.
         let mut deduped: Vec<CurvePoint> = Vec::with_capacity(points.len());
@@ -198,11 +199,13 @@ pub enum ArrivalCurve {
 impl ArrivalCurve {
     /// Create a leaky bucket arrival curve.
     pub fn leaky_bucket(sigma: f64, rho: f64) -> Self {
+        assert!(sigma.is_finite() && rho.is_finite(), "sigma and rho must be finite");
         ArrivalCurve::LeakyBucket { sigma, rho }
     }
 
     /// Create a token bucket arrival curve.
     pub fn token_bucket(sigma: f64, rho: f64, peak_rate: f64) -> Self {
+        assert!(sigma.is_finite() && rho.is_finite() && peak_rate.is_finite(), "sigma, rho, and peak_rate must be finite");
         ArrivalCurve::TokenBucket {
             sigma,
             rho,
@@ -212,6 +215,7 @@ impl ArrivalCurve {
 
     /// Create a staircase arrival curve.
     pub fn staircase(period: f64, burst: f64) -> Self {
+        assert!(period.is_finite() && burst.is_finite(), "period and burst must be finite");
         ArrivalCurve::Staircase { period, burst }
     }
 
@@ -288,11 +292,13 @@ pub enum ServiceCurve {
 impl ServiceCurve {
     /// Create a rate-latency service curve.
     pub fn rate_latency(rate: f64, latency: f64) -> Self {
+        assert!(rate.is_finite() && latency.is_finite(), "rate and latency must be finite");
         ServiceCurve::RateLatency { rate, latency }
     }
 
     /// Create a strict constant-rate service curve.
     pub fn strict_rate(rate: f64) -> Self {
+        assert!(rate.is_finite(), "rate must be finite");
         ServiceCurve::StrictRate { rate }
     }
 

@@ -71,7 +71,7 @@ impl BeadsBridge {
     /// Returns an empty vec on any failure (fail-open).
     pub fn list_all(&self) -> Vec<BeadSummary> {
         match self.bridge.invoke(&["list", "--json"]) {
-            Ok(value) => self.parse_summary_rows(value, "beads list"),
+            Ok(value) => Self::parse_summary_rows(value, "beads list"),
             Err(err) => {
                 warn!(bridge = "br", error = %err, "beads list failed, degrading gracefully");
                 Vec::new()
@@ -82,7 +82,7 @@ impl BeadsBridge {
     /// List open beads only.
     pub fn list_open(&self) -> Vec<BeadSummary> {
         match self.bridge.invoke(&["list", "--status=open", "--json"]) {
-            Ok(value) => self.parse_summary_rows(value, "open beads list"),
+            Ok(value) => Self::parse_summary_rows(value, "open beads list"),
             Err(err) => {
                 warn!(bridge = "br", error = %err, unavailable = true, "open beads list failed");
                 Vec::new()
@@ -125,7 +125,7 @@ impl BeadsBridge {
             .bridge
             .invoke(&["list", "--all", "--limit", "0", "--json"])
         {
-            Ok(value) => self.parse_summary_rows(value, "beads list --all"),
+            Ok(value) => Self::parse_summary_rows(value, "beads list --all"),
             Err(err) => {
                 warn!(
                     bridge = "br",
@@ -233,7 +233,7 @@ impl BeadsBridge {
         self.backpressure(&BeadsBackpressureConfig::default())
     }
 
-    fn parse_summary_rows(&self, value: Value, operation: &'static str) -> Vec<BeadSummary> {
+    fn parse_summary_rows(value: Value, operation: &'static str) -> Vec<BeadSummary> {
         match parse_br_rows::<BeadSummary>(value) {
             Ok(beads) => {
                 debug!(
