@@ -192,8 +192,24 @@ for action_class in "${REQUIRED_FORBIDDEN_ACTION_CLASSES[@]}"; do
 done
 
 jq -e '
+  def repo_relative_artifact_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not);
+
   all(.;
-    all(.artifact_paths[]?; (startswith("/") | not) and ((contains("../") or startswith("../")) | not))
+    all(.artifact_paths[]?; repo_relative_artifact_path_ok)
   )
 ' "${current_fixture_paths[@]}" >/dev/null || fail "valid/root fixture artifact_paths must stay repo-relative"
 
@@ -325,6 +341,22 @@ for source_kind in "${PROOF_CALENDAR_REQUIRED_SOURCE_KINDS[@]}"; do
 done
 
 jq -e '
+  def repo_relative_artifact_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not);
+
   .toon_columns as $toon_columns
   | all(.cases[];
     .case_id as $case_id
@@ -355,9 +387,14 @@ jq -e '
     and (.artifact.redaction_policy.mail_body_storage_allowed == false)
     and (.artifact.redaction_policy.secret_material_allowed == false)
     and (.artifact.reason_codes | index($required_reason) != null)
+    and all(.artifact.artifact_paths[]; repo_relative_artifact_path_ok)
     and (.artifact.artifact_paths | index("docs/json-schema/ft-operating-envelope-proof-calendar.json") != null)
     and (.artifact.artifact_paths | index("fixtures/operating-envelope/proof-calendar/cases.v1.json") != null)
-    and all(.artifact.source_snapshots[]; .raw_pane_content_stored == false and (.artifact_paths | length > 0))
+    and all(.artifact.source_snapshots[];
+      .raw_pane_content_stored == false
+      and (.artifact_paths | length > 0)
+      and all(.artifact_paths[]; repo_relative_artifact_path_ok)
+    )
     and (if .artifact.input_summary.rch_state != "available"
       then all(.artifact.calendar_entries[]; (.requires_rch == false) or (.recommendation != "run_now"))
       else true end)
