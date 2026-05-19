@@ -450,36 +450,51 @@ wezterm.on('gui-startup', function(cmd)
   local gui = window:gui_window()
   if gui then gui:maximize() end
 
-  -- 2) Remote domains: staggered attach, seed tabs only if mux is empty
-  for idx, dcfg in ipairs(startup_domains) do
-    wezterm.time.call_after(idx * 1.0, function()
-      local info = ssh_info[dcfg.name]
-      if not info then return end
-
+  -- 2) Remote domains: attach to each in order, seeding tabs only if the
+  --    remote mux is empty.
+  --
+  --    The reference wezterm config uses `wezterm.time.call_after(t, fn)` to
+  --    stagger remote attaches across N seconds so they don't fight for SSH
+  --    and network resources at startup. The FrankenTerm fork does NOT
+  --    expose the `wezterm.time` Lua module (no `time.call_after`), nor the
+  --    `wezterm.log_*` helpers, so we run all attaches in-line and use
+  --    plain Lua `print` for diagnostics — it surfaces in the stderr capture
+  --    when the GUI is launched from a shell.
+  for _, dcfg in ipairs(startup_domains) do
+    local info = ssh_info[dcfg.name]
+    if info then
       local ok, err = pcall(function()
         local domain = wezterm.mux.get_domain(dcfg.name)
-        if not domain then return end
+        if not domain then
+          print('gui-startup: domain not registered: ' .. dcfg.name)
+          return
+        end
+        print('gui-startup: attaching to domain ' .. dcfg.name)
         domain:attach()
-        wezterm.time.call_after(3.0, function()
-          if not domain_has_panes(dcfg.name) then
-            pcall(function()
-              local _, _, rwindow = wezterm.mux.spawn_window({
-                domain = { DomainName = dcfg.name },
-                cwd = dcfg.cwd,
-              })
-              for _ = 2, (dcfg.tabs or 3) do
-                rwindow:spawn_tab({ cwd = dcfg.cwd })
-              end
-              local rgui = rwindow:gui_window()
-              if rgui then rgui:maximize() end
-            end)
+        if not domain_has_panes(dcfg.name) then
+          print('gui-startup: ' .. dcfg.name .. ' is empty; seeding ' .. (dcfg.tabs or 3) .. ' tabs')
+          local seed_ok, seed_err = pcall(function()
+            local _, _, rwindow = wezterm.mux.spawn_window({
+              domain = { DomainName = dcfg.name },
+              cwd = dcfg.cwd,
+            })
+            for _ = 2, (dcfg.tabs or 3) do
+              rwindow:spawn_tab({ cwd = dcfg.cwd })
+            end
+            local rgui = rwindow:gui_window()
+            if rgui then rgui:maximize() end
+          end)
+          if not seed_ok then
+            print('gui-startup: failed to seed tabs in ' .. dcfg.name .. ': ' .. tostring(seed_err))
           end
-        end)
+        else
+          print('gui-startup: ' .. dcfg.name .. ' already has panes from previous session; inheriting')
+        end
       end)
       if not ok then
-        wezterm.log_error('Failed to attach ' .. dcfg.name .. ': ' .. tostring(err))
+        print('gui-startup: failed to attach ' .. dcfg.name .. ': ' .. tostring(err))
       end
-    end)
+    end
   end
 end)
 
