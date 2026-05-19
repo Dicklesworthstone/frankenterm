@@ -328,17 +328,25 @@ We do not care about backwards compatibility—we're in early development with n
 
 ```bash
 # Check for compiler errors and warnings (workspace-wide)
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-check \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-check \
   cargo check --workspace --all-targets
 
 # Check for clippy lints (pedantic + nursery are enabled)
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-clippy \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-clippy \
   cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-fmt \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-fmt \
   cargo fmt --check
 ```
+
+Remote proof must fail closed. If `rch` reports `[RCH] local`, `running
+locally`, `no admissible workers`, `worker=null`, `local fallback`, or any other
+path that did not reach a remote worker, stop the proof lane and mark the bead
+blocked with the exact RCH reason. Do not count local Cargo output as proof.
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
@@ -1224,10 +1232,18 @@ RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation 
 
 To manually offload a build:
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-build cargo build --release
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-test cargo test
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-clippy cargo clippy
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-<bead>-build cargo build --release
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-<bead>-test cargo test
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+  env CARGO_TARGET_DIR=/tmp/ft-<bead>-clippy cargo clippy
 ```
+
+For proof lanes, a remote worker must actually be selected and reached. Output
+that says `[RCH] local`, `running locally`, `worker=null`, `no admissible
+workers`, or `local fallback` is blocker evidence only; it is never a successful
+Rust proof.
 
 Quick commands:
 ```bash
