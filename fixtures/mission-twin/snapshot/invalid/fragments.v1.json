@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_snapshot.invalid_fragments.v1",
+  "source_bead": "ft-u7r37.1",
+  "valid_fixtures": [
+    "fixtures/mission-twin/snapshot/valid/healthy.json",
+    "fixtures/mission-twin/snapshot/valid/agent-mail-red.json",
+    "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json",
+    "fixtures/mission-twin/snapshot/valid/active-owner.json",
+    "fixtures/mission-twin/snapshot/valid/dirty-overlap.json",
+    "fixtures/mission-twin/snapshot/valid/no-ready-work.json"
+  ],
+  "cases": [
+    {
+      "case_id": "raw-pane-content-stored",
+      "expected_failure": "raw_pane_content_must_not_be_retained",
+      "reason_codes": [
+        "mission_twin.raw_pane_content_forbidden"
+      ],
+      "invalid_fragment": {
+        "raw_pane_content_stored": true,
+        "sources": {
+          "beads": {
+            "raw_pane_content_stored": true
+          }
+        }
+      }
+    },
+    {
+      "case_id": "unsafe-artifact-path",
+      "expected_failure": "artifact_paths_must_be_safe_repo_relative",
+      "reason_codes": [
+        "mission_twin.artifact_path_unsafe"
+      ],
+      "invalid_fragment": {
+        "artifact_paths": [
+          "../outside.json",
+          ".git/config",
+          "/tmp/mission-twin.json",
+          "https://example.invalid/snapshot.json",
+          "fixtures/mission-twin/snapshot/"
+        ]
+      }
+    },
+    {
+      "case_id": "destructive-action-hint",
+      "expected_failure": "simulator_must_not_suggest_destructive_actions",
+      "reason_codes": [
+        "mission_twin.forbidden_action_suggested"
+      ],
+      "invalid_fragment": {
+        "validation": {
+          "destructive_action_hints": [
+            "file_deletion"
+          ]
+        }
+      }
+    },
+    {
+      "case_id": "ambiguous-timestamp",
+      "expected_failure": "timestamps_must_be_epoch_ms",
+      "reason_codes": [
+        "mission_twin.ambiguous_timestamp"
+      ],
+      "invalid_fragment": {
+        "generated_at": "2026-05-19T01:00:00Z",
+        "validation": {
+          "ambiguous_timestamps_rejected": false
+        },
+        "sources": {
+          "git": {
+            "collected_at": "today"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "missing-forbidden-action",
+      "expected_failure": "every_output_must_carry_full_forbidden_action_set",
+      "reason_codes": [
+        "mission_twin.forbidden_action_set_incomplete"
+      ],
+      "invalid_fragment": {
+        "omitted_forbidden_action": "local_cargo_proof",
+        "forbidden_actions": [
+          "agent_mail_service_repair_restart",
+          "rch_service_repair_restart",
+          "worker_mutation",
+          "build_cancellation",
+          "file_deletion",
+          "destructive_git",
+          "pane_mutation",
+          "raw_pane_content_storage",
+          "beads_mutation"
+        ]
+      }
+    },
+    {
+      "case_id": "unredacted-source",
+      "expected_failure": "source_facts_must_be_redacted",
+      "reason_codes": [
+        "mission_twin.source_unredacted"
+      ],
+      "invalid_fragment": {
+        "sources": {
+          "git": {
+            "redacted": false
+          }
+        }
+      }
+    }
+  ]
+}

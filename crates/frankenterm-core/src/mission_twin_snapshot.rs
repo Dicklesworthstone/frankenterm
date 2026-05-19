@@ -126,6 +126,12 @@ impl SourceEvidence {
         if self.source_id.trim().is_empty() {
             return Err(MissionTwinSnapshotError::MissingSourceId { source });
         }
+        if self.source_id != source {
+            return Err(MissionTwinSnapshotError::SourceIdMismatch {
+                source,
+                found: self.source_id.clone(),
+            });
+        }
         if self.status != SourceStatus::Unavailable && self.collected_at_ms.unwrap_or(0) == 0 {
             return Err(MissionTwinSnapshotError::MissingCollectedAt { source });
         }
@@ -430,6 +436,7 @@ pub enum MissionTwinSnapshotError {
     MissingSnapshotId,
     MissingGeneratedAt,
     MissingSourceId { source: &'static str },
+    SourceIdMismatch { source: &'static str, found: String },
     MissingCollectedAt { source: &'static str },
     MissingForbiddenAction { action: MissionTwinForbiddenAction },
     RawPaneContentStored { source: &'static str },
@@ -460,6 +467,12 @@ impl std::fmt::Display for MissionTwinSnapshotError {
             }
             Self::MissingSourceId { source } => {
                 write!(f, "{source} source_id is required")
+            }
+            Self::SourceIdMismatch { source, found } => {
+                write!(
+                    f,
+                    "{source} source_id does not match expected source: {found}"
+                )
             }
             Self::MissingCollectedAt { source } => {
                 write!(f, "{source} collected_at_ms is required unless unavailable")
