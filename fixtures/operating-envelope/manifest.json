@@ -70,6 +70,7 @@
   "static_checks": [
     "jq empty docs/json-schema/ft-operating-envelope.json fixtures/operating-envelope/manifest.json fixtures/operating-envelope/valid/*.json fixtures/operating-envelope/invalid/*.json",
     "jq -s 'all(.[]; .schema_version == 1 and .contract_id == \"ft.operating_envelope.v1\" and .raw_pane_content_stored == false)' fixtures/operating-envelope/valid/*.json",
-    "jq -s 'all(.[]; .side_effect_policy.dry_run_only == true and .side_effect_policy.local_cargo_proof_allowed == false and .side_effect_policy.service_mutation_allowed == false)' fixtures/operating-envelope/valid/*.json"
+    "jq -s 'all(.[]; .side_effect_policy.dry_run_only == true and .side_effect_policy.local_cargo_proof_allowed == false and .side_effect_policy.service_mutation_allowed == false)' fixtures/operating-envelope/valid/*.json",
+    "bash tests/e2e/test_operating_envelope_fixture_manifest.sh"
   ]
 }

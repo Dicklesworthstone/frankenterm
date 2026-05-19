@@ -161,6 +161,7 @@ jq -e '
   and (.invalid_fixtures | length >= 4)
   and (.static_checks | type == "array")
   and (.static_checks | length >= 3)
+  and (.static_checks | index("bash tests/e2e/test_operating_envelope_fixture_manifest.sh") != null)
   and all(.static_checks[]; type == "string" and length > 0)
   and all(.valid_fixtures[]; (.coverage | type == "array") and (.coverage | length > 0) and all(.coverage[]; type == "string" and length > 0))
   and all(.invalid_fixtures[]; (.expected_failure | type == "string") and (.expected_failure | length > 0))
