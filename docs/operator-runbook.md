@@ -172,7 +172,9 @@ Before launching or claiming a proof lane:
    `CARGO_TARGET_DIR`. RCH-required lanes use direct remote Cargo argv, for
    example:
    ```bash
-   rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target cargo test -p <crate> <filter> -- --nocapture
+   RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
+     CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target \
+     cargo test -p <crate> <filter> -- --nocapture
    ```
 3. Inspect `git status --short` and active ownership. If a dirty path overlaps
    the proof scope and belongs to another Bead, agent, or reservation, classify
@@ -188,8 +190,8 @@ Cargo started:
 ```bash
 cargo test ...
 scripts/cargo-local.sh test ...
-rch exec -- bash -lc 'cargo test ...'
-rch exec -- env CARGO_TARGET_DIR=/tmp/foo bash -lc 'cargo test ...'
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- bash -lc 'cargo test ...'
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/foo bash -lc 'cargo test ...'
 ```
 
 Local Cargo can be cited only as local smoke or docs-static validation, never
@@ -274,7 +276,9 @@ or script-syntax check. The operator flow is:
      --evidence-artifact <retained-rch-or-harness-summary.json> \
      --proof-record-output docs/attestations/proof-ledger/<id>.jsonl \
      --proof-record-redaction-status <none-needed|redacted> \
-     -- rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target cargo test -p <crate> <filter> -- --nocapture \
+     -- RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
+     CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target \
+     cargo test -p <crate> <filter> -- --nocapture \
      > /tmp/<id>-proof-doctor.json
    ```
 2. Review `/tmp/<id>-proof-doctor.json` before posting it. The fields that
@@ -413,7 +417,8 @@ Capture the full JSONL stream and original exit status:
 
 ```bash
 set +e
-rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-clippy-target \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/<bead>-clippy-target \
   cargo clippy --no-deps -p <crate> --lib --message-format=json -- -D warnings \
   > /tmp/<bead>-clippy.jsonl
 cargo_status=$?

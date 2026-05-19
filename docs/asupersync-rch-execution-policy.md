@@ -67,8 +67,8 @@ For heavy commands, execution must use one of the validator-recognized
 RCH-backed execution shapes:
 
 ```bash
-rch exec -- <command>
-VAR=value rch exec -- <command>
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- <command>
+VAR=value RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- <command>
 ```
 
 or the shared fail-closed harness helpers:
@@ -78,15 +78,17 @@ run_rch_cargo_logged <log-file> env CARGO_TARGET_DIR=<repo-relative-target> carg
 run_rch_cargo_logged_with_timeout <seconds> <log-file> env CARGO_TARGET_DIR=<repo-relative-target> cargo <args...>
 ```
 
-The helper forms are evidence-equivalent to direct `rch exec -- ...` because
-they route through `tests/e2e/lib_rch_guards.sh`, reject local fallback markers,
+The helper forms are evidence-equivalent to direct
+`RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...`
+because they route through `tests/e2e/lib_rch_guards.sh`, reject local fallback markers,
 emit RCH metadata sidecars, and, when `RCH_MIRROR_REQUIRED_PATHS` or explicit
 workspace-root mirror coverage is configured, sync-check, attest, and pin the
 scheduler-selected worker before the material Cargo command starts.
 
-RCH status checks, worker probes, sync logs, or shell wrappers that merely echo
-`rch exec -- ...` are not proof. If the material Cargo command is local, the
-ledger must classify it as a fallback and include approval metadata.
+RCH status checks, worker probes, sync logs, or shell wrappers that merely echo a
+remote-required `rch --no-self-healing exec -- ...` command are not proof. If the
+material Cargo command is local, the ledger must classify it as a fallback and
+include approval metadata.
 
 ## Worker-Targeted Proof Contract
 
@@ -146,7 +148,9 @@ Allowed during worker-specific RCH incidents:
 
 - Read-only `rch status`, `rch check`, worker probe, Beads, git, and log
   inspection.
-- A material proof command through `rch exec -- ...` or a fail-closed harness.
+- A material proof command through
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...`
+  or a fail-closed harness.
 - A read-only mirror attestation that checks required tracked-file hashes and,
   when available, HEAD metadata on the selected worker. RCH rsync mirrors may
   have stale or non-verifiable Git metadata because object data is intentionally

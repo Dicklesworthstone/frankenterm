@@ -7,6 +7,8 @@ cd "${ROOT}"
 
 AGENTS="AGENTS.md"
 DOCS=(
+  "docs/asupersync-rch-execution-policy.md"
+  "docs/operator-runbook.md"
   "docs/robot-contracts/api-surface-coverage.md"
   "docs/robot-contracts/checkpoint.md"
   "docs/robot-contracts/current-ntm-gap-dispatch.md"
@@ -36,6 +38,8 @@ done
 ruby <<'RUBY'
 AGENTS = "AGENTS.md"
 CONTRACT_DOCS = [
+  "docs/asupersync-rch-execution-policy.md",
+  "docs/operator-runbook.md",
   "docs/robot-contracts/api-surface-coverage.md",
   "docs/robot-contracts/checkpoint.md",
   "docs/robot-contracts/current-ntm-gap-dispatch.md",
