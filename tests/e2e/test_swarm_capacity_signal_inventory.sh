@@ -130,15 +130,66 @@ e2e_outcome_for_evidence_state() {
 emit_event "suite" "e2e_jsonl" "start" "running" "mixed" "capacity.signal_inventory.started" "none" "${LOG_FILE}"
 
 require_command jq
+require_command git
 require_file "${SCHEMA_FILE}" "schema"
 require_file "${FIXTURE_FILE}" "fixture"
 require_file "${DOC_FILE}" "doc"
+
+require_repo_relative_file() {
+  local path="$1"
+  local label="$2"
+
+  if [[ -z "${path}" || "${path}" == "." || "${path}" == ".." ]]; then
+    emit_event "${label}" "static" "artifact_path_shape" "failed" "unavailable" "capacity.signal_inventory.artifact_path_unsafe" "empty_or_dot_path" "${LOG_FILE}"
+    exit 1
+  fi
+  if [[ "${path}" == /* || "${path}" == ./* || "${path}" == ../* || "${path}" == */ ]]; then
+    emit_event "${label}" "static" "artifact_path_shape" "failed" "unavailable" "capacity.signal_inventory.artifact_path_unsafe" "absolute_or_dot_segment_path" "${LOG_FILE}"
+    exit 1
+  fi
+  if [[ "${path}" == *\\* ]]; then
+    emit_event "${label}" "static" "artifact_path_shape" "failed" "unavailable" "capacity.signal_inventory.artifact_path_unsafe" "backslash_path" "${LOG_FILE}"
+    exit 1
+  fi
+
+  local segment
+  local -a path_segments
+  IFS='/' read -r -a path_segments <<<"${path}"
+  for segment in "${path_segments[@]}"; do
+    if [[ -z "${segment}" || "${segment}" == "." || "${segment}" == ".." || "${segment}" == ".git" ]]; then
+      emit_event "${label}" "static" "artifact_path_shape" "failed" "unavailable" "capacity.signal_inventory.artifact_path_unsafe" "unsafe_path_segment" "${LOG_FILE}"
+      exit 1
+    fi
+  done
+
+  if [[ ! -f "${ROOT_DIR}/${path}" ]]; then
+    emit_event "${label}" "static" "artifact_path_exists" "failed" "unavailable" "capacity.signal_inventory.artifact_missing" "missing_artifact" "${path}"
+    exit 1
+  fi
+  if ! git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
+    emit_event "${label}" "static" "artifact_path_tracked" "failed" "unavailable" "capacity.signal_inventory.artifact_untracked" "untracked_artifact" "${path}"
+    exit 1
+  fi
+}
 
 jq empty "${SCHEMA_FILE}"
 emit_event "schema" "static" "jq_empty" "passed" "measured" "capacity.signal_inventory.schema_json" "none" "${SCHEMA_FILE}"
 
 jq empty "${FIXTURE_FILE}"
 emit_event "fixture" "static" "jq_empty" "passed" "measured" "capacity.signal_inventory.fixture_json" "none" "${FIXTURE_FILE}"
+
+while IFS= read -r artifact_path; do
+  require_repo_relative_file "${artifact_path}" "fixture_artifact_path"
+done < <(jq -r '.artifact_paths[]' "${FIXTURE_FILE}")
+
+while IFS= read -r source_path; do
+  require_repo_relative_file "${source_path}" "signal_source_ref"
+done < <(jq -r '.signals[].source_refs[].path' "${FIXTURE_FILE}")
+
+while IFS= read -r redacted_artifact_path; do
+  require_repo_relative_file "${redacted_artifact_path}" "redacted_artifact_path"
+done < <(jq -r '.signals[] | select(.redacted_artifact_path != null) | .redacted_artifact_path' "${FIXTURE_FILE}")
+emit_event "fixture" "static" "artifact_paths" "passed" "measured" "capacity.signal_inventory.artifact_paths_safe" "none" "${FIXTURE_FILE}"
 
 signal_count="$(jq '.signals | length' "${FIXTURE_FILE}")"
 if [[ "${signal_count}" -lt 12 ]]; then
