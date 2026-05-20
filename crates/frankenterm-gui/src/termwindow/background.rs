@@ -442,7 +442,18 @@ impl crate::TermWindow {
         let vbs = render_layer.vb.borrow();
         let mut layer0 = vbs[0].map();
 
-        let color = bg_color.mul_alpha(layer.def.opacity);
+        // Compose per-layer opacity with the global window opacity. Without
+        // this multiplication, a config that sets both `window_background_opacity
+        // = 0.85` AND `config.background = { { opacity = 0.92, ... } }` would
+        // get a window that's effectively 92% opaque (the only translucency
+        // applied), instead of 92% × 85% ≈ 78% (the wezterm behavior).
+        // The fallback no-layer path at paint.rs::paint_impl already applies
+        // `window_background_opacity` to the terminal background; this brings
+        // the layered path into parity so the wezterm-style config-
+        // composition rules hold.
+        let color = bg_color
+            .mul_alpha(layer.def.opacity)
+            .mul_alpha(self.config.window_background_opacity);
 
         let (sprite, next_due, load_state) = gl_state.glyph_cache.borrow_mut().cached_image(
             &layer.source,
