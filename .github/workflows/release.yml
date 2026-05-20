@@ -102,7 +102,20 @@ jobs:
       - name: Build release binary
         env:
           SOURCE_DATE_EPOCH: "0"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          # Windows builds drop the `jemalloc` default feature because
+          # tikv-jemalloc-sys does not compile on x86_64-pc-windows-msvc
+          # (its autoconf build script can't produce executables under MSVC).
+          # System allocator is used on Windows; jemalloc still ships for
+          # Unix targets where it provides measurable RSS savings.
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cargo build --release --target ${{ matrix.target }} \
+              --no-default-features \
+              --features browser,distributed,vendored,mcp,metrics,native-wezterm,semantic-search,subprocess-bridge,sync,ftui,tui-dashboard,tui-widgets,web,redis-session,asupersync-runtime
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+        shell: bash
 
       - name: Smoke test binary (Unix)
         if: runner.os != 'Windows'
@@ -114,8 +127,22 @@ jobs:
           "$BINARY" version --full
           echo "=== ft --help ==="
           "$BINARY" --help
-          echo "=== ft doctor --json ==="
-          "$BINARY" doctor --json
+          # `ft doctor --json` exits non-zero whenever it finds any environmental
+          # problem (missing WezTerm install, no agent-mail, etc.) — all of
+          # which are expected on a vanilla CI runner. Capture and inspect the
+          # output but don't gate the smoke test on its exit code: we only
+          # care that the binary launches, parses args, and emits valid JSON.
+          echo "=== ft doctor --json (informational) ==="
+          set +e
+          DOCTOR_OUTPUT="$("$BINARY" doctor --json 2>&1)"
+          DOCTOR_EXIT=$?
+          set -e
+          echo "$DOCTOR_OUTPUT" | head -30
+          echo "ft doctor exit code: $DOCTOR_EXIT (non-zero is acceptable in CI environments without backends installed)"
+          # Validate the output is at least parseable JSON — that catches
+          # crashes / panic-at-startup / malformed output regressions even when
+          # the doctor checks themselves correctly report environmental gaps.
+          echo "$DOCTOR_OUTPUT" | python3 -c "import json,sys; json.loads(sys.stdin.read())"
           echo "=== All smoke tests passed ==="
 
       - name: Smoke test binary (Windows)
@@ -124,13 +151,8 @@ jobs:
         run: |
           # Default pwsh invocation by GitHub Actions does NOT set $ErrorActionPreference
           # nor $PSNativeCommandUseErrorActionPreference, so a non-zero exit from ft.exe
-          # sets $LASTEXITCODE but does NOT terminate the script — the final Write-Host
-          # would then exit 0 and a Windows-only regression (panic at startup, crash on
-          # --help, non-zero `ft doctor --json`) would ship to release without the
-          # workflow catching it. The Unix step at the top gets `set -eo pipefail`
-          # implicitly from Actions' default bash args; we have to opt in explicitly
-          # for pwsh. `$PSNativeCommandUseErrorActionPreference` is PowerShell 7.3+;
-          # Windows GHA runners ship pwsh 7.4+.
+          # sets $LASTEXITCODE but does NOT terminate the script. We opt in explicitly
+          # so a panic-at-startup or crash-on-help regression aborts the workflow.
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
 
@@ -141,8 +163,19 @@ jobs:
           & $binary version --full
           Write-Host "=== ft --help ==="
           & $binary --help
-          Write-Host "=== ft doctor --json ==="
-          & $binary doctor --json
+          # `ft doctor --json` is informational on Windows CI: non-zero exit
+          # is expected when the runner has no FrankenTerm/WezTerm install or
+          # agent-mail. We only assert that the binary emits parseable JSON,
+          # which catches launch panics / arg-parse regressions but doesn't
+          # gate on environmental gaps the doctor correctly reports.
+          Write-Host "=== ft doctor --json (informational) ==="
+          $PSNativeCommandUseErrorActionPreference = $false
+          $doctorOutput = & $binary doctor --json 2>&1 | Out-String
+          $doctorExit = $LASTEXITCODE
+          $PSNativeCommandUseErrorActionPreference = $true
+          Write-Host ($doctorOutput.Substring(0, [Math]::Min(2000, $doctorOutput.Length)))
+          Write-Host "ft doctor exit code: $doctorExit (non-zero acceptable in CI)"
+          $doctorOutput | python -c "import json,sys; json.loads(sys.stdin.read())"
           Write-Host "=== All smoke tests passed ==="
 
       - name: Create tarball (Unix)
