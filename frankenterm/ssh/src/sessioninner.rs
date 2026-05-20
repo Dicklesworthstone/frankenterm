@@ -404,9 +404,14 @@ impl SessionInner {
                 }
                 #[cfg(windows)]
                 unsafe {
-                    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+                    use filedescriptor::IntoRawSocketDescriptor;
+                    use std::os::windows::io::FromRawSocket;
+                    // `FileDescriptor` doesn't impl std's `IntoRawSocket`
+                    // directly — only the project's `IntoRawSocketDescriptor`.
+                    // `SocketDescriptor` (= SOCKET) and `RawSocket` are both
+                    // SOCKET-shaped on Windows; cast bridges the two.
                     return Ok((
-                        Socket::from_raw_socket(a.into_raw_socket()),
+                        Socket::from_raw_socket(a.into_socket_descriptor() as _),
                         Some(KillOnDropChild(child)),
                     ));
                 }

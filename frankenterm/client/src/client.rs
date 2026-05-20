@@ -578,8 +578,17 @@ pub fn unix_connect_with_retry(
                     }
                     #[cfg(windows)]
                     unsafe {
-                        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                        return Ok(UnixStream::from_raw_socket(a.into_raw_socket()));
+                        // `a` is a `filedescriptor::FileDescriptor`, which
+                        // does not impl `std::os::windows::io::IntoRawSocket`
+                        // directly — only the project's
+                        // `IntoRawSocketDescriptor` (returning `SocketDescriptor
+                        // = SOCKET`). `RawSocket` is also SOCKET-shaped on
+                        // Windows, so the `as _` cast bridges them.
+                        use filedescriptor::IntoRawSocketDescriptor;
+                        use std::os::windows::io::FromRawSocket;
+                        return Ok(UnixStream::from_raw_socket(
+                            a.into_socket_descriptor() as _,
+                        ));
                     }
                 }
             }
