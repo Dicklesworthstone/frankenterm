@@ -3404,7 +3404,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-alloc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion 0.5.1",
  "thiserror 2.0.18",
@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "asupersync 0.3.1",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-ars"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -3673,11 +3673,11 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-atlas-pack-types"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "frankenterm-core-audit-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "frankenterm-core-replay-types",
  "serde",
@@ -3688,7 +3688,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-cass-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3698,7 +3698,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-caut-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3707,7 +3707,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-config-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -3715,14 +3715,14 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-connector-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "frankenterm-core-connectors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "frankenterm-core-connector-types",
  "proptest",
@@ -3731,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-error-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3739,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-fleet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "frankenterm-core",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fastmcp-rust",
  "proptest",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-policy-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "proptest",
@@ -3778,7 +3778,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-replay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -3797,7 +3797,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-replay-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3807,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-resource-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3818,7 +3818,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-tantivy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fancy-regex 0.14.0",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-telemetry-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3856,7 +3856,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-x11-resize-types"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "frankenterm-dynamic"
@@ -3980,7 +3980,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-mux-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async_ossl",
@@ -4111,7 +4111,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-mux-server-impl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "asupersync 0.3.1",
@@ -4300,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-topo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
@@ -4392,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "ft-perf-gate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4401,7 +4401,7 @@ dependencies = [
 
 [[package]]
 name = "ft-test-log"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
