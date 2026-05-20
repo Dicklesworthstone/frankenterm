@@ -103,13 +103,19 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: "0"
         run: |
-          # Windows builds drop the `jemalloc` default feature because
-          # tikv-jemalloc-sys does not compile on x86_64-pc-windows-msvc
-          # (its autoconf build script can't produce executables under MSVC).
-          # System allocator is used on Windows; jemalloc still ships for
-          # Unix targets where it provides measurable RSS savings.
+          # Windows-specific build flags:
+          #   1. `-p frankenterm --bin ft` — Windows release ships only the
+          #      `ft` CLI for now. The GUI (frankenterm-gui) pulls in
+          #      cairo-rs/cairo-sys-rs via frankenterm-font, which needs
+          #      pkg-config Cairo on the build host — impractical on the
+          #      MSVC GitHub runner. Building the full workspace would also
+          #      drag in jemalloc and other Unix-only build scripts.
+          #   2. `--no-default-features --features ...` minus `jemalloc` —
+          #      tikv-jemalloc-sys's autoconf build script can't produce
+          #      executables under MSVC. System allocator instead.
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cargo build --release --target ${{ matrix.target }} \
+              -p frankenterm --bin ft \
               --no-default-features \
               --features browser,distributed,vendored,mcp,metrics,native-wezterm,semantic-search,subprocess-bridge,sync,ftui,tui-dashboard,tui-widgets,web,redis-session,asupersync-runtime
           else
@@ -133,15 +139,19 @@ jobs:
           # output but don't gate the smoke test on its exit code: we only
           # care that the binary launches, parses args, and emits valid JSON.
           echo "=== ft doctor --json (informational) ==="
+          # stderr goes to console for diagnostics, stdout is the JSON we
+          # validate. Redirecting 2>&1 would interleave tracing logs
+          # ("INFO ft: Workspace resolved …") with the JSON body, breaking
+          # the strict json.loads parse below.
           set +e
-          DOCTOR_OUTPUT="$("$BINARY" doctor --json 2>&1)"
+          DOCTOR_OUTPUT="$("$BINARY" doctor --json 2>/dev/null)"
           DOCTOR_EXIT=$?
           set -e
           echo "$DOCTOR_OUTPUT" | head -30
           echo "ft doctor exit code: $DOCTOR_EXIT (non-zero is acceptable in CI environments without backends installed)"
-          # Validate the output is at least parseable JSON — that catches
-          # crashes / panic-at-startup / malformed output regressions even when
-          # the doctor checks themselves correctly report environmental gaps.
+          # Validate the JSON body parses — catches panic-at-startup or
+          # malformed-output regressions while letting the doctor's
+          # environmental checks correctly flag missing backends.
           echo "$DOCTOR_OUTPUT" | python3 -c "import json,sys; json.loads(sys.stdin.read())"
           echo "=== All smoke tests passed ==="
 
@@ -169,8 +179,10 @@ jobs:
           # which catches launch panics / arg-parse regressions but doesn't
           # gate on environmental gaps the doctor correctly reports.
           Write-Host "=== ft doctor --json (informational) ==="
+          # Capture stdout only — stderr (tracing logs) would mix into the
+          # captured stream and break the json.loads validation below.
           $PSNativeCommandUseErrorActionPreference = $false
-          $doctorOutput = & $binary doctor --json 2>&1 | Out-String
+          $doctorOutput = & $binary doctor --json 2>$null | Out-String
           $doctorExit = $LASTEXITCODE
           $PSNativeCommandUseErrorActionPreference = $true
           Write-Host ($doctorOutput.Substring(0, [Math]::Min(2000, $doctorOutput.Length)))
