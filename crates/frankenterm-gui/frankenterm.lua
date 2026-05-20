@@ -325,8 +325,12 @@ config.font = frankenterm.font {
 config.font_size = 16.0
 config.warn_about_missing_glyphs = false
 
-config.window_background_opacity = 0.85
-config.macos_window_background_blur = 20
+-- Window translucency: 0.95 (was 0.85) so the effective alpha with the
+-- gradient layer (0.92) is ~0.87. A bit of desktop bleed-through for
+-- the glassy look, but enough opacity that text on a busy wallpaper
+-- stays legible. The blur smooths whatever does show through.
+config.window_background_opacity = 0.95
+config.macos_window_background_blur = 30
 config.background = {
   {
     source = { Gradient = { colors = { '#060a10', '#0a1018', '#0e1420' }, orientation = { Linear = { angle = -45.0 } } } },
