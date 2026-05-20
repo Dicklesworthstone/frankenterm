@@ -727,23 +727,38 @@ impl SshStream {
             fallback_rewake(task_cx);
             return Ok(());
         };
-        match current.register_io(desc, interest) {
-            Ok(new_registration) => {
-                let _ = new_registration.update_waker(task_cx.waker().clone());
-                *registration = Some(new_registration);
-                Ok(())
+
+        // asupersync's `Cx::register_io` is gated `#[cfg(unix)]`. On Windows
+        // (where this code only runs through the `uds_windows`-backed
+        // ssh-pipe path) we fall through to `fallback_rewake` polling —
+        // same shape as frankenterm-uds and async_ossl.
+        #[cfg(unix)]
+        {
+            match current.register_io(desc, interest) {
+                Ok(new_registration) => {
+                    let _ = new_registration.update_waker(task_cx.waker().clone());
+                    *registration = Some(new_registration);
+                    Ok(())
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    drop(registration);
+                    fallback_rewake(task_cx);
+                    Ok(())
+                }
+                Err(err) => Err(err),
             }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotConnected
-                ) =>
-            {
-                drop(registration);
-                fallback_rewake(task_cx);
-                Ok(())
-            }
-            Err(err) => Err(err),
+        }
+        #[cfg(windows)]
+        {
+            let _ = (current, desc, interest);
+            drop(registration);
+            fallback_rewake(task_cx);
+            Ok(())
         }
     }
 }

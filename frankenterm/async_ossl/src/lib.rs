@@ -206,23 +206,39 @@ impl AsyncSslStream {
             fallback_rewake(cx);
             return Ok(());
         };
-        match current.register_io(self, interest) {
-            Ok(new_registration) => {
-                let _ = new_registration.update_waker(cx.waker().clone());
-                *registration = Some(new_registration);
-                Ok(())
+
+        // asupersync's `Cx::register_io` is gated `#[cfg(unix)]` — the
+        // mio-style I/O driver only exists on Unix. On Windows we fall
+        // through to the same `fallback_rewake` polling path the function
+        // already takes when no driver is available; matches the
+        // frankenterm-uds shape (see frankenterm/uds/src/lib.rs).
+        #[cfg(unix)]
+        {
+            match current.register_io(self, interest) {
+                Ok(new_registration) => {
+                    let _ = new_registration.update_waker(cx.waker().clone());
+                    *registration = Some(new_registration);
+                    Ok(())
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    drop(registration);
+                    fallback_rewake(cx);
+                    Ok(())
+                }
+                Err(err) => Err(err),
             }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotConnected
-                ) =>
-            {
-                drop(registration);
-                fallback_rewake(cx);
-                Ok(())
-            }
-            Err(err) => Err(err),
+        }
+        #[cfg(windows)]
+        {
+            let _ = (current, interest);
+            drop(registration);
+            fallback_rewake(cx);
+            Ok(())
         }
     }
 }
