@@ -43,7 +43,15 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: high-scale-evidence-gate
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # macOS arm64 release builds of the full default-members set
+    # (frankenterm-gui + frankenterm-mux-server + ft + supporting
+    # crates, with default features including semantic-search /
+    # subprocess-bridge / web / mcp / etc.) routinely run ~50 minutes
+    # on the macos-14 hosted runner. The previous 45-minute limit hit
+    # exactly at 43:15 in v0.2.0 round 7, missing release publication
+    # by a fraction. 90 minutes is conservative and matches the upper
+    # end of what hosted runners observed cold-cache.
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
