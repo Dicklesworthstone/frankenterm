@@ -1,8 +1,8 @@
 -- FrankenTerm default GUI config.
 --
 -- Ships inside FrankenTerm.app at Contents/Resources/frankenterm.lua and is loaded
--- automatically when no user config (~/.frankenterm.lua,
--- ~/.config/frankenterm/{frankenterm,wezterm}.lua, ~/.frankenterm.lua) is present.
+-- automatically when no user config (~/.frankenterm.lua or
+-- ~/.config/frankenterm/{frankenterm,wezterm}.lua) is present.
 --
 -- This file is intentionally a near-copy of the reference WezTerm config the
 -- author uses day-to-day, ported to FrankenTerm so:

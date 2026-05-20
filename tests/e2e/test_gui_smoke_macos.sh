@@ -72,9 +72,11 @@ fail() {
     printf 'gui-smoke FAIL: %s\n' "$*" >&2
     # Capture a sample of the wedged process if we can find one — this
     # is the next agent's best lead when triaging.
-    local stuck_pid
-    stuck_pid="$(pgrep -n frankenterm-gui || true)"
-    if [[ -n "${stuck_pid}" ]]; then
+    # Use the pid WE spawned for the sample / kill — not `pgrep -n` which
+    # would return any frankenterm-gui (potentially the user's pre-existing
+    # instance). GUI_PID may be empty if we failed before launch detection.
+    local stuck_pid="${GUI_PID:-}"
+    if [[ -n "${stuck_pid}" ]] && ps -p "${stuck_pid}" >/dev/null 2>&1; then
         local sample_path="/tmp/gui-smoke-fail-sample-${stuck_pid}-$(date +%s).txt"
         /usr/bin/sample "${stuck_pid}" 3 -mayDie -file "${sample_path}" >/dev/null 2>&1 || true
         printf 'gui-smoke: captured sample of pid %s at %s\n' "${stuck_pid}" "${sample_path}" >&2
@@ -82,6 +84,10 @@ fail() {
     fi
     exit 1
 }
+
+# GUI_PID is populated after launch detection. fail() references it via the
+# `${GUI_PID:-}` guard above so a pre-launch fail() call works too.
+GUI_PID=""
 
 require_environment() {
     if [[ ! -d "${FT_GUI_APP_PATH}" ]]; then
@@ -121,29 +127,50 @@ require_environment
 SENTINEL="$(mktemp /tmp/gui-smoke-sentinel.XXXXXX)"
 trap 'rm -f "${SENTINEL}"' EXIT
 
-# Kill any running frankenterm-gui from a prior run so we get a clean
-# pid-was-launched-by-this-test signal.
-pkill -x frankenterm-gui 2>/dev/null || true
-sleep 1
+# Record the set of frankenterm-gui pids that are ALREADY running before
+# we launch our own — so we can target only the one WE spawned for
+# resize / keystroke / Quit. Killing pre-existing instances would
+# destroy whatever real work the developer had open. The previous
+# `pkill -x frankenterm-gui` here was exactly that bug. If a
+# pre-existing instance is detected, we either abort (with exit code 2
+# to signal "env unusable, not a regression") or, if FT_GUI_SMOKE_
+# OVERRIDE_RUNNING=1, defer to whatever pgrep -n picks last (best
+# effort — still preferred over killing).
+EXISTING_PIDS="$(pgrep -x frankenterm-gui | sort -u | tr '\n' ' ')"
+if [[ -n "${EXISTING_PIDS// /}" ]]; then
+    if [[ "${FT_GUI_SMOKE_OVERRIDE_RUNNING:-0}" != "1" ]]; then
+        printf 'gui-smoke: skipping (frankenterm-gui already running, pids: %s).\n' "${EXISTING_PIDS}" >&2
+        printf 'gui-smoke: set FT_GUI_SMOKE_OVERRIDE_RUNNING=1 to run anyway (will NOT target existing pids).\n' >&2
+        exit 2
+    fi
+    log "pre-existing frankenterm-gui pids: ${EXISTING_PIDS} (override=on, will skip them)"
+fi
 
 log "launching ${FT_GUI_APP_PATH}"
 open -W -F "${FT_GUI_APP_PATH}" &
 OPEN_PID=$!
 
-# `open -W` blocks until the launched app exits. Run it in background
-# so this script can drive UI events. Detect the gui process pid.
-GUI_PID=""
+# Identify the pid OUR `open` spawned by diffing against the
+# pre-launch set. Poll up to 10s for a new pid to appear. GUI_PID was
+# initialized empty just below the fail() definition above so a fail()
+# call before this point has something to test.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
-    GUI_PID="$(pgrep -n frankenterm-gui || true)"
+    NEW_PIDS="$(pgrep -x frankenterm-gui | sort -u)"
+    for candidate in ${NEW_PIDS}; do
+        case " ${EXISTING_PIDS} " in
+            *" ${candidate} "*) ;;  # was running before, skip
+            *) GUI_PID="${candidate}"; break ;;
+        esac
+    done
     if [[ -n "${GUI_PID}" ]]; then
         break
     fi
 done
 if [[ -z "${GUI_PID}" ]]; then
-    fail "frankenterm-gui did not start within 10s of open"
+    fail "frankenterm-gui did not start within 10s of open (no new pid)"
 fi
-log "gui pid=${GUI_PID}"
+log "gui pid=${GUI_PID} (our test-spawned instance)"
 
 # Soak for 5 more seconds: catches crash-on-first-event-loop-tick
 # panics (the original menu-bar timing race manifested this way).

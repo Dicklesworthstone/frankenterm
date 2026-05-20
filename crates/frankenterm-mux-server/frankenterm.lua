@@ -10,8 +10,12 @@
 -- wezterm-mux-server. Everything GUI-shaped is omitted — fonts, colors,
 -- keybindings, ssh_domains have no effect on the headless mux.
 
-local wezterm = require 'wezterm'
-local config = wezterm.config_builder()
+-- The `frankenterm` module aliases the same backing table as `wezterm`, so
+-- either require name works. We prefer the project-native name for clarity;
+-- the alias still resolves on older mux binaries that only register the
+-- legacy `wezterm` module name.
+local frankenterm = require 'frankenterm'
+local config = frankenterm.config_builder()
 
 -- Login shells so .bashrc / .zshrc fire and prompts/PATH look right.
 config.default_prog = { '/bin/bash', '-l' }

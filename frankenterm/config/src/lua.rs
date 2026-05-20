@@ -380,7 +380,7 @@ end
         wezterm_mod.set("shell_split", lua.create_function(shell_split)?)?;
 
         // FrankenTerm-branded log helpers. Route to the Rust `log` crate so
-        // diagnostics from Lua land in the same WEZTERM_LOG/FRANKENTERM_LOG
+        // diagnostics from Lua land in the same RUST_LOG
         // stream as the rest of the binary. Five levels mirror the upstream
         // wezterm surface; the wezterm.* names below are kept as aliases so
         // reference WezTerm configs paste in unmodified.
@@ -461,30 +461,59 @@ end
 // message argument (coerced via `tostring()` semantics for consistency with
 // the upstream `wezterm.log_*` shape) and emits at the corresponding level.
 // The `target` is set to `lua_config` so log lines coming out of user config
-// scripts are easy to filter via `RUST_LOG=lua_config=info` / `WEZTERM_LOG=
+// scripts are easy to filter via `RUST_LOG=lua_config=info` (or the per-line wezterm style
 // lua_config=trace`.
 
-fn lua_log_error(_: &Lua, msg: String) -> mlua::Result<()> {
+/// Format a variadic list of Lua values into a single space-separated string
+/// using `tostring()` semantics. Mirrors upstream `wezterm.log_*` which
+/// accepts any number of args and stringifies each; without this, configs
+/// that do `wezterm.log_info("connected", host, "→", port)` would fail
+/// to type-check at the FFI boundary.
+fn format_lua_log_args<'lua>(
+    lua: &'lua Lua,
+    args: Variadic<mlua::Value<'lua>>,
+) -> mlua::Result<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(args.len());
+    for arg in args {
+        // Honor the value's `__tostring` metamethod when present (matches
+        // Lua's `tostring()` builtin). Falls back to `nil` literal for
+        // values that coerce to None.
+        let coerced = lua.coerce_string(arg)?;
+        let part = match coerced {
+            Some(s) => s.to_str()?.to_string(),
+            None => "nil".to_string(),
+        };
+        parts.push(part);
+    }
+    Ok(parts.join(" "))
+}
+
+fn lua_log_error<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+    let msg = format_lua_log_args(lua, args)?;
     log::error!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_warn(_: &Lua, msg: String) -> mlua::Result<()> {
+fn lua_log_warn<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+    let msg = format_lua_log_args(lua, args)?;
     log::warn!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_info(_: &Lua, msg: String) -> mlua::Result<()> {
+fn lua_log_info<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+    let msg = format_lua_log_args(lua, args)?;
     log::info!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_debug(_: &Lua, msg: String) -> mlua::Result<()> {
+fn lua_log_debug<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+    let msg = format_lua_log_args(lua, args)?;
     log::debug!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_trace(_: &Lua, msg: String) -> mlua::Result<()> {
+fn lua_log_trace<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+    let msg = format_lua_log_args(lua, args)?;
     log::trace!(target: "lua_config", "{msg}");
     Ok(())
 }

@@ -12,7 +12,12 @@ ExecStart=%h/.local/bin/frankenterm-mux-server --daemonize=false --config-file=%
 Restart=on-failure
 RestartSec=5
 # Log only warnings + errors; full output goes to journalctl --user.
-Environment=WEZTERM_LOG=warn
+# Honored by tracing-subscriber's EnvFilter (the binary uses RUST_LOG;
+# WEZTERM_LOG is documented in the upstream guide but isn't actually read
+# by this fork's logging::init path — see
+# crates/frankenterm-core/src/logging.rs::init which calls
+# EnvFilter::try_from_default_env, which is `RUST_LOG`).
+Environment=RUST_LOG=warn
 # The mux socket is created at $XDG_RUNTIME_DIR/frankenterm/sock at startup.
 # That path is owned by systemd-logind and persists for the lifetime of the
 # user session, which is preserved across SSH disconnect by enable-linger.

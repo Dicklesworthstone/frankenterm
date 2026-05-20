@@ -1347,19 +1347,30 @@ impl Config {
             // either the target system won't have any config, or will have
             // the config of another user.
             // So we prioritize that here: if there is a config in the same
-            // dir as the executable that will take precedence.
+            // dir as the executable that will take precedence. The
+            // FrankenTerm-namespaced filename `frankenterm.lua` is inserted
+            // LAST so it ends up at index 0 (winning over wezterm.lua if
+            // both happen to exist alongside the binary).
             if let Ok(exe_name) = std::env::current_exe() {
                 if let Some(exe_dir) = exe_name.parent() {
                     paths.insert(0, PathPossibility::optional(exe_dir.join("wezterm.lua")));
+                    paths.insert(
+                        0,
+                        PathPossibility::optional(exe_dir.join("frankenterm.lua")),
+                    );
                 }
             }
         }
-        if let Some(path) = std::env::var_os("FRANKENTERM_CONFIG_FILE") {
-            log::trace!("Note: FRANKENTERM_CONFIG_FILE is set in the environment");
-            paths.insert(0, PathPossibility::required(path.into()));
-        }
+        // Env-var override. Both insertions go to index 0, so the LAST one
+        // inserted ends up at the front — we want
+        // `FRANKENTERM_CONFIG_FILE` to win when both are set, so it's
+        // inserted second.
         if let Some(path) = std::env::var_os("WEZTERM_CONFIG_FILE") {
             log::trace!("Note: WEZTERM_CONFIG_FILE is set in the environment");
+            paths.insert(0, PathPossibility::required(path.into()));
+        }
+        if let Some(path) = std::env::var_os("FRANKENTERM_CONFIG_FILE") {
+            log::trace!("Note: FRANKENTERM_CONFIG_FILE is set in the environment");
             paths.insert(0, PathPossibility::required(path.into()));
         }
 

@@ -511,7 +511,9 @@ fn config_dirs() -> Vec<PathBuf> {
     // wezterm install on the same machine doesn't have its config silently
     // co-opted by FrankenTerm. A user who wants the two clients to share config
     // can still place files under ~/.config/wezterm/ — that path is searched
-    // below as a fallback.
+    // below as a fallback. `frankenterm_config_dirs()` already honors
+    // `XDG_CONFIG_DIRS` for FrankenTerm-namespaced system dirs, so we only need
+    // to add the wezterm-namespaced `XDG_CONFIG_DIRS` entries explicitly here.
     dirs.extend(frankenterm_config_dirs());
     dirs.push(xdg_config_home());
 
