@@ -321,23 +321,40 @@ impl UnixStream {
             fallback_rewake(cx);
             return Ok(());
         };
-        match current.register_io(self, interest) {
-            Ok(new_registration) => {
-                let _ = new_registration.update_waker(cx.waker().clone());
-                *registration = Some(new_registration);
-                Ok(())
+
+        // asupersync's `Cx::register_io` is gated `#[cfg(unix)]` because the
+        // mio-style I/O driver only exists on Unix. On Windows the uds_windows
+        // crate provides the socket primitive but there is no kernel-event
+        // driver in asupersync to register against, so we fall through to the
+        // `fallback_rewake` polling path — the same path we take whenever
+        // `Cx::current()` is absent or the driver reports `Unsupported`.
+        #[cfg(unix)]
+        {
+            match current.register_io(self, interest) {
+                Ok(new_registration) => {
+                    let _ = new_registration.update_waker(cx.waker().clone());
+                    *registration = Some(new_registration);
+                    Ok(())
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    drop(registration);
+                    fallback_rewake(cx);
+                    Ok(())
+                }
+                Err(err) => Err(err),
             }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotConnected
-                ) =>
-            {
-                drop(registration);
-                fallback_rewake(cx);
-                Ok(())
-            }
-            Err(err) => Err(err),
+        }
+        #[cfg(windows)]
+        {
+            let _ = (current, interest);
+            drop(registration);
+            fallback_rewake(cx);
+            Ok(())
         }
     }
 }

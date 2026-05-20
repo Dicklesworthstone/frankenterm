@@ -58,10 +58,13 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: ft
             asset: ft-linux-arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: ft
-            asset: ft-darwin-amd64
+          # x86_64-apple-darwin (Intel Mac) is intentionally excluded: ort-sys
+          # (pulled in via fastembed → semantic-search default feature) does not
+          # publish prebuilt ONNX Runtime binaries for that target, and building
+          # ORT from source on each release would balloon CI time. macOS users
+          # on Apple Silicon are covered by aarch64-apple-darwin; Intel Mac
+          # users can build from source with `--no-default-features` or
+          # `--features ...` minus `semantic-search`.
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: ft

@@ -847,12 +847,23 @@ pub fn has_ft_block(content: &str) -> bool {
 /// Extract the current ft-managed block from content (if present)
 #[must_use]
 pub fn extract_ft_block(content: &str) -> Option<String> {
-    let (begin_idx, end_idx) = validated_wezterm_ft_block_bounds(content).ok().flatten()?;
-    Some(
+    extract_ft_block_checked(content).ok().flatten()
+}
+
+/// Extract the current ft-managed block while preserving malformed-marker errors.
+///
+/// Use this for operator-facing flows that must fail closed instead of treating a
+/// corrupt managed block as if no block exists.
+pub fn extract_ft_block_checked(content: &str) -> Result<Option<String>> {
+    let Some((begin_idx, end_idx)) = validated_wezterm_ft_block_bounds(content)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
         content[begin_idx..end_idx]
             .trim_end_matches(|c| c == '\r' || c == '\n')
             .to_string(),
-    )
+    ))
 }
 
 fn validated_wezterm_ft_block_bounds(content: &str) -> Result<Option<(usize, usize)>> {
@@ -3397,6 +3408,21 @@ export PATH=$HOME/bin:$PATH
         // END before BEGIN should return None
         let content = "-- FT-END\nsome code\n-- FT-BEGIN (do not edit this block)\n";
         assert!(extract_ft_block(content).is_none());
+    }
+
+    #[test]
+    fn extract_ft_block_checked_preserves_marker_errors() {
+        let content = "-- FT-END\nsome code\n-- FT-BEGIN (do not edit this block)\n";
+        let err = extract_ft_block_checked(content).unwrap_err();
+        assert!(err.to_string().contains("markers out of order"));
+
+        let duplicate_begin = "-- FT-BEGIN (do not edit this block)\n-- one\n-- FT-BEGIN (do not edit this block)\n-- FT-END\n";
+        let err = extract_ft_block_checked(duplicate_begin).unwrap_err();
+        assert!(err.to_string().contains("multiple FT begin markers"));
+
+        let duplicate_end = "-- FT-BEGIN (do not edit this block)\n-- one\n-- FT-END\n-- FT-END\n";
+        let err = extract_ft_block_checked(duplicate_end).unwrap_err();
+        assert!(err.to_string().contains("multiple FT end markers"));
     }
 
     #[test]
