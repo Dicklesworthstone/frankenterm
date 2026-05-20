@@ -637,7 +637,7 @@ fn read_from_pane_pty(
             localpane::emit_output_for_pane(
                 pane_id,
                 &format!(
-                    "⚠️  wezterm: read_from_pane_pty: \
+                    "⚠️  FrankenTerm: read_from_pane_pty: \
                     Unable to allocate a socketpair: {err:#}"
                 ),
             );
@@ -655,7 +655,7 @@ fn read_from_pane_pty(
         log::error!("read_from_pane_pty: Unable to spawn parser thread: {err:#}");
         localpane::emit_output_for_pane(
             pane_id,
-            &format!("wezterm: read_from_pane_pty: Unable to spawn parser thread: {err:#}"),
+            &format!("FrankenTerm: read_from_pane_pty: Unable to spawn parser thread: {err:#}"),
         );
         return;
     }

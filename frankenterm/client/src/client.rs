@@ -1364,7 +1364,7 @@ impl Client {
                         }
 
                         let mut ui = ConnectionUI::new();
-                        ui.title("wezterm: Reconnecting...");
+                        ui.title("FrankenTerm: Reconnecting...");
 
                         loop {
                             ui.sleep_with_reason(
@@ -1533,7 +1533,7 @@ impl Client {
                         .to_string()
                 } else {
                     format!(
-                        "Please install the same version of wezterm on both \
+                        "Please install the same version of FrankenTerm on both \
                      the client and server! \
                      The server reported error '{err}' while being asked for its \
                      version.  This likely means that the server is older \

@@ -910,7 +910,7 @@ impl RenderableState {
                 && inner.is_tardy()
             {
                 let status = format!(
-                    "wezterm: {:.0?}⏳since last response",
+                    "FrankenTerm: {:.0?}⏳since last response",
                     inner.last_recv_time.elapsed()
                 );
                 // Right align it in the tab

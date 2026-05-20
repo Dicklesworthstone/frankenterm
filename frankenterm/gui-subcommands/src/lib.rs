@@ -4,7 +4,7 @@ use config::{GuiPosition, SshParameters};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const DEFAULT_WINDOW_CLASS: &str = "org.wezfurlong.wezterm";
+pub const DEFAULT_WINDOW_CLASS: &str = "com.dicklesworthstone.frankenterm";
 
 /// Helper for parsing config overrides
 pub fn name_equals_value(arg: &str) -> Result<(String, String), String> {
@@ -28,14 +28,14 @@ pub fn name_equals_value(arg: &str) -> Result<(String, String), String> {
 #[command(trailing_var_arg = true)]
 pub struct StartCommand {
     /// If true, do not connect to domains marked as connect_automatically
-    /// in your wezterm configuration file.
+    /// in your FrankenTerm configuration file.
     #[arg(long = "no-auto-connect")]
     pub no_auto_connect: bool,
 
-    /// If enabled, don't try to ask an existing wezterm GUI instance
+    /// If enabled, don't try to ask an existing FrankenTerm GUI instance
     /// to start the command.  Instead, always start the GUI in this
-    /// invocation of wezterm so that you can wait for the command
-    /// to complete by waiting for this wezterm process to finish.
+    /// invocation of FrankenTerm so that you can wait for the command
+    /// to complete by waiting for this FrankenTerm process to finish.
     #[arg(long = "always-new-process")]
     pub always_new_process: bool,
 
@@ -62,11 +62,11 @@ pub struct StartCommand {
     pub _cmd: bool,
 
     /// Override the default windowing system class.
-    /// The default is "org.wezfurlong.wezterm".
+    /// The default is "com.dicklesworthstone.frankenterm".
     /// Under X11 and Windows this changes the window class.
     /// Under Wayland this changes the app_id.
     /// This changes the class for all windows spawned by this
-    /// instance of wezterm, including error, update and ssh
+    /// instance of FrankenTerm, including error, update and ssh
     /// authentication dialogs.
     #[arg(long = "class")]
     pub class: Option<String>,
@@ -96,14 +96,14 @@ pub struct StartCommand {
     pub domain: Option<String>,
 
     /// When used with --domain, if the domain already has running panes,
-    /// wezterm will simply attach and will NOT spawn the specified PROG.
-    /// If you omit --attach when using --domain, wezterm will attach
+    /// frankenterm-gui will simply attach and will NOT spawn the specified PROG.
+    /// If you omit --attach when using --domain, frankenterm-gui will attach
     /// AND then spawn PROG.
     #[arg(long, requires = "domain")]
     pub attach: bool,
 
     /// Instead of executing your shell, run PROG.
-    /// For example: `wezterm start -- bash -l` will spawn bash
+    /// For example: `frankenterm-gui start -- bash -l` will spawn bash
     /// as if it were a login shell. [aliases: -e]
     #[arg(value_parser, value_hint=ValueHint::CommandWithArguments, num_args=1..)]
     pub prog: Vec<OsString>,
@@ -121,14 +121,14 @@ pub struct SshCommand {
     pub user_at_host_and_port: SshParameters,
 
     /// Override specific SSH configuration options.
-    /// `wezterm ssh` is able to parse some (but not all!) options
+    /// `frankenterm-gui ssh` is able to parse some (but not all!) options
     /// from your `~/.ssh/config` and `/etc/ssh/ssh_config` files.
     /// This command line switch allows you to override or otherwise
     /// specify ssh_config style options.
     ///
     /// For example:
     ///
-    /// `wezterm ssh -oIdentityFile=/secret/id_ed25519 some-host`
+    /// `frankenterm-gui ssh -oIdentityFile=/secret/id_ed25519 some-host`
     #[arg(
         long = "ssh-option",
         short = 'o',
@@ -144,11 +144,11 @@ pub struct SshCommand {
     pub verbose: bool,
 
     /// Override the default windowing system class.
-    /// The default is "org.wezfurlong.wezterm".
+    /// The default is "com.dicklesworthstone.frankenterm".
     /// Under X11 and Windows this changes the window class.
     /// Under Wayland this changes the app_id.
     /// This changes the class for all windows spawned by this
-    /// instance of wezterm, including error, update and ssh
+    /// instance of FrankenTerm, including error, update and ssh
     /// authentication dialogs.
     #[arg(long = "class")]
     pub class: Option<String>,
@@ -163,7 +163,7 @@ pub struct SshCommand {
     pub position: Option<GuiPosition>,
 
     /// Instead of executing your shell, run PROG.
-    /// For example: `wezterm ssh user@host -- bash -l` will spawn bash
+    /// For example: `frankenterm-gui ssh user@host -- bash -l` will spawn bash
     /// as if it were a login shell.
     #[arg(value_parser, value_hint=ValueHint::CommandWithArguments, num_args=1..)]
     pub prog: Vec<OsString>,
@@ -176,11 +176,11 @@ pub struct SerialCommand {
     pub baud: Option<usize>,
 
     /// Override the default windowing system class.
-    /// The default is "org.wezfurlong.wezterm".
+    /// The default is "com.dicklesworthstone.frankenterm".
     /// Under X11 and Windows this changes the window class.
     /// Under Wayland this changes the app_id.
     /// This changes the class for all windows spawned by this
-    /// instance of wezterm, including error, update and ssh
+    /// instance of FrankenTerm, including error, update and ssh
     /// authentication dialogs.
     #[arg(long = "class")]
     pub class: Option<String>,
@@ -214,11 +214,11 @@ pub struct ConnectCommand {
     pub new_tab: bool,
 
     /// Override the default windowing system class.
-    /// The default is "org.wezfurlong.wezterm".
+    /// The default is "com.dicklesworthstone.frankenterm".
     /// Under X11 and Windows this changes the window class.
     /// Under Wayland this changes the app_id.
     /// This changes the class for all windows spawned by this
-    /// instance of wezterm, including error, update and ssh
+    /// instance of FrankenTerm, including error, update and ssh
     /// authentication dialogs.
     #[arg(long = "class")]
     pub class: Option<String>,
@@ -239,7 +239,7 @@ pub struct ConnectCommand {
     pub position: Option<GuiPosition>,
 
     /// Instead of executing your shell, run PROG.
-    /// For example: `wezterm start -- bash -l` will spawn bash
+    /// For example: `frankenterm-gui start -- bash -l` will spawn bash
     /// as if it were a login shell.
     #[arg(value_parser, value_hint=ValueHint::CommandWithArguments, num_args=1..)]
     pub prog: Vec<OsString>,
