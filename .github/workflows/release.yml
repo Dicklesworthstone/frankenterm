@@ -69,10 +69,22 @@ jobs:
             target: aarch64-apple-darwin
             artifact: ft
             asset: ft-darwin-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: ft.exe
-            asset: ft-windows-amd64.exe
+          # x86_64-pc-windows-msvc is intentionally excluded from v0.2.0:
+          # frankenterm-core depends on Unix-only primitives across many
+          # modules (`crate::ipc` / `fd_budget` / `mux_pool` / `PaneDelta`
+          # vendored exports, `send_unix_signal_to_pid`,
+          # `asupersync::net::UnixListener` / `UnixStream`) plus several
+          # additional `Cx::register_io` + `FileDescriptor::into_raw_socket`
+          # callsites that all assume a POSIX fd model. Properly porting
+          # those — instead of patching them one-by-one as each Windows
+          # build round exposes the next — is a substantial engineering
+          # effort that belongs in its own release. Once those modules are
+          # actually cfg-portable on Windows, re-enable this matrix entry.
+          # Tracking: file Windows-port follow-up bead before next release.
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   artifact: ft.exe
+          #   asset: ft-windows-amd64.exe
     steps:
       - uses: actions/checkout@v6.0.2
         with:
