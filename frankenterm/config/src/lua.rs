@@ -14,7 +14,9 @@ use ordered_float::NotNan;
 use portable_pty::CommandBuilder;
 use std::convert::TryFrom;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 pub use mlua;
 
@@ -377,6 +379,36 @@ end
         wezterm_mod.set("shell_quote_arg", lua.create_function(shell_quote_arg)?)?;
         wezterm_mod.set("shell_split", lua.create_function(shell_split)?)?;
 
+        // FrankenTerm-branded log helpers. Route to the Rust `log` crate so
+        // diagnostics from Lua land in the same WEZTERM_LOG/FRANKENTERM_LOG
+        // stream as the rest of the binary. Five levels mirror the upstream
+        // wezterm surface; the wezterm.* names below are kept as aliases so
+        // reference WezTerm configs paste in unmodified.
+        wezterm_mod.set("log_error", lua.create_function(lua_log_error)?)?;
+        wezterm_mod.set("log_warn", lua.create_function(lua_log_warn)?)?;
+        wezterm_mod.set("log_info", lua.create_function(lua_log_info)?)?;
+        wezterm_mod.set("log_debug", lua.create_function(lua_log_debug)?)?;
+        wezterm_mod.set("log_trace", lua.create_function(lua_log_trace)?)?;
+
+        // FrankenTerm-branded time helpers. `time.call_after(secs, fn)`
+        // schedules a one-shot Lua callback via the asupersync timer
+        // primitive (NOT tokio — the project bans direct tokio use; see
+        // AGENTS.md "Async Runtime: asupersync"). Implemented in
+        // `lua_time_call_after` below, which stores the callback in the
+        // Lua named-registry then spawns a future that awaits
+        // `promise::spawn::sleep` (asupersync-backed when the
+        // async-asupersync feature is on, per
+        // frankenterm/promise/src/spawn.rs::sleep) and re-enters the
+        // main-thread Lua state via `with_lua_config_on_main_thread`
+        // to invoke the callback. The wezterm.time alias below is the
+        // back-compat surface for upstream configs.
+        let time_mod = get_or_create_sub_module(&lua, "time")?;
+        time_mod.set(
+            "call_after",
+            lua.create_function(lua_time_call_after)?,
+        )?;
+        time_mod.set("now", lua.create_function(lua_time_now)?)?;
+
         wezterm_mod.set(
             "default_hyperlink_rules",
             lua.create_function(move |lua, ()| {
@@ -394,6 +426,26 @@ end
         package
             .set("path", path_array.join(";"))
             .context("assign package.path")?;
+
+        // Register `frankenterm` as a sibling module that shares the same
+        // backing table as `wezterm`. This is the official rebrand: new code
+        // should write `local frankenterm = require 'frankenterm'`. The
+        // `wezterm` alias remains so reference WezTerm configs paste in
+        // without edits. Both `package.loaded.wezterm` and
+        // `package.loaded.frankenterm` resolve to the same Lua table, so a
+        // setting reached via either name reaches the same place.
+        let loaded_table: Table = package
+            .get("loaded")
+            .context("get package.loaded")?;
+        loaded_table
+            .set("frankenterm", wezterm_mod.clone())
+            .context("set package.loaded.frankenterm = wezterm_mod")?;
+        // Also expose as a top-level global so `frankenterm.action.…`
+        // works in config files that don't explicitly require() it,
+        // mirroring the `wezterm` global that the package loader installs.
+        globals
+            .set("frankenterm", wezterm_mod)
+            .context("set _G.frankenterm = wezterm_mod")?;
     }
 
     for func in setup_funcs_snapshot() {
@@ -401,6 +453,145 @@ end
     }
 
     Ok(lua)
+}
+
+// ─── FrankenTerm Lua API: log_* helpers ───────────────────────────────────────
+//
+// Lua-facing wrappers around the Rust `log` crate. Each one accepts a single
+// message argument (coerced via `tostring()` semantics for consistency with
+// the upstream `wezterm.log_*` shape) and emits at the corresponding level.
+// The `target` is set to `lua_config` so log lines coming out of user config
+// scripts are easy to filter via `RUST_LOG=lua_config=info` / `WEZTERM_LOG=
+// lua_config=trace`.
+
+fn lua_log_error(_: &Lua, msg: String) -> mlua::Result<()> {
+    log::error!(target: "lua_config", "{msg}");
+    Ok(())
+}
+
+fn lua_log_warn(_: &Lua, msg: String) -> mlua::Result<()> {
+    log::warn!(target: "lua_config", "{msg}");
+    Ok(())
+}
+
+fn lua_log_info(_: &Lua, msg: String) -> mlua::Result<()> {
+    log::info!(target: "lua_config", "{msg}");
+    Ok(())
+}
+
+fn lua_log_debug(_: &Lua, msg: String) -> mlua::Result<()> {
+    log::debug!(target: "lua_config", "{msg}");
+    Ok(())
+}
+
+fn lua_log_trace(_: &Lua, msg: String) -> mlua::Result<()> {
+    log::trace!(target: "lua_config", "{msg}");
+    Ok(())
+}
+
+// ─── FrankenTerm Lua API: time helpers ────────────────────────────────────────
+
+/// Monotonically-incrementing counter used to mint unique Lua named-registry
+/// keys for each pending `time.call_after` callback. Combined with a
+/// nanosecond timestamp to avoid collisions across config reloads.
+static TIME_CALL_AFTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `wezterm.time.now()` — returns seconds since UNIX epoch as a float.
+fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Ok(secs)
+}
+
+/// `wezterm.time.call_after(seconds, function)` — schedules `function` to be
+/// called once after `seconds` have elapsed. Returns immediately (fire-and-
+/// forget); the callback runs on the main thread with access to the live
+/// Lua state.
+///
+/// Implementation uses the project's `promise` crate, which delegates to
+/// `asupersync::time::sleep` when the `async-asupersync` feature is enabled
+/// (see `frankenterm/promise/src/spawn.rs::sleep`). This is the
+/// FrankenTerm-policy-compliant timer path — direct `tokio` usage is banned
+/// by AGENTS.md.
+///
+/// Internals:
+///   1. Stash the Lua callback in the named registry under a unique key
+///      (sync, while we still hold the `Lua` reference).
+///   2. `promise::spawn::spawn` a future that awaits
+///      `promise::spawn::sleep(duration)` (asupersync-backed).
+///   3. On wake, re-enter the main-thread Lua state via
+///      `crate::with_lua_config_on_main_thread`, fetch the callback
+///      from the registry, invoke it via `call_async`, then unset the
+///      registry slot. If the lua context has gone away (reload, shutdown)
+///      we silently drop the callback.
+fn lua_time_call_after<'lua>(
+    lua: &'lua Lua,
+    (seconds, func): (f64, mlua::Function<'lua>),
+) -> mlua::Result<()> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(mlua::Error::external(format!(
+            "time.call_after: seconds must be a finite, non-negative number; got {seconds}"
+        )));
+    }
+
+    let ts_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = TIME_CALL_AFTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let key = format!("frankenterm-time-call-after-{ts_ns}-{counter}");
+
+    lua.set_named_registry_value(&key, func)?;
+
+    let duration = Duration::from_secs_f64(seconds);
+    let key_for_async = key.clone();
+    promise::spawn::spawn(async move {
+        promise::spawn::sleep(duration).await;
+        let _ = crate::with_lua_config_on_main_thread(move |lua_opt| {
+            let key = key_for_async.clone();
+            async move {
+                let Some(lua) = lua_opt else {
+                    // No live Lua state (config reload mid-flight or
+                    // shutdown). The registry holding the callback is
+                    // gone with it, so there's nothing to clean up.
+                    return Ok(());
+                };
+                let result: mlua::Result<Value> = lua.named_registry_value(&key);
+                // Unset before the call so re-entrant config reloads or
+                // panics inside the callback don't leave the slot
+                // permanently allocated.
+                let _ = lua.unset_named_registry_value(&key);
+                match result {
+                    Ok(Value::Function(func)) => {
+                        if let Err(err) = func.call_async::<(), ()>(()).await {
+                            log::warn!(
+                                target: "lua_config",
+                                "time.call_after callback raised: {err}"
+                            );
+                        }
+                    }
+                    Ok(other) => {
+                        log::warn!(
+                            target: "lua_config",
+                            "time.call_after: registry slot {key} held non-function value {}",
+                            other.type_name()
+                        );
+                    }
+                    Err(_) => {
+                        // Registry slot vanished (config reload between
+                        // schedule and fire). Silently drop.
+                    }
+                }
+                Ok(())
+            }
+        })
+        .await;
+    })
+    .detach();
+
+    Ok(())
 }
 
 /// Resolve an environment variable.
