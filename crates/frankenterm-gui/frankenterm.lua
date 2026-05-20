@@ -1,8 +1,8 @@
 -- FrankenTerm default GUI config.
 --
--- Ships inside FrankenTerm.app at Contents/Resources/wezterm.lua and is loaded
+-- Ships inside FrankenTerm.app at Contents/Resources/frankenterm.lua and is loaded
 -- automatically when no user config (~/.frankenterm.lua,
--- ~/.config/frankenterm/{frankenterm,wezterm}.lua, ~/.wezterm.lua) is present.
+-- ~/.config/frankenterm/{frankenterm,wezterm}.lua, ~/.frankenterm.lua) is present.
 --
 -- This file is intentionally a near-copy of the reference WezTerm config the
 -- author uses day-to-day, ported to FrankenTerm so:
@@ -14,9 +14,9 @@
 --     per-host gradient backgrounds match the user's WezTerm setup so muscle
 --     memory carries over.
 
-local wezterm = require 'wezterm'
-local config = wezterm.config_builder()
-local act = wezterm.action
+local frankenterm = require 'frankenterm'
+local config = frankenterm.config_builder()
+local act = frankenterm.action
 
 -- ============================================================================
 -- Helper: is the pane running an interactive shell?
@@ -35,28 +35,28 @@ end
 -- ============================================================================
 -- Hyperlink click handler: open dirs in shell, text files in nvim
 -- ============================================================================
-wezterm.on('open-uri', function(window, pane, uri)
+frankenterm.on('open-uri', function(window, pane, uri)
   local editor = 'nvim'
   if uri:find '^https?:' then
     return true
   end
   if uri:find '^file:' == 1 and not pane:is_alt_screen_active() then
-    local url = wezterm.url.parse(uri)
+    local url = frankenterm.url.parse(uri)
     if is_shell(pane:get_foreground_process_name()) then
-      local success, stdout, _ = wezterm.run_child_process {
+      local success, stdout, _ = frankenterm.run_child_process {
         'file', '--brief', '--mime-type', url.file_path,
       }
       if success then
         if stdout:find 'directory' then
-          pane:send_text(wezterm.shell_join_args { 'cd', url.file_path } .. '\r')
+          pane:send_text(frankenterm.shell_join_args { 'cd', url.file_path } .. '\r')
           pane:send_text('ls\r')
           return false
         end
         if stdout:find 'text' then
           if url.fragment then
-            pane:send_text(wezterm.shell_join_args { editor, '+' .. url.fragment, url.file_path } .. '\r')
+            pane:send_text(frankenterm.shell_join_args { editor, '+' .. url.fragment, url.file_path } .. '\r')
           else
-            pane:send_text(wezterm.shell_join_args { editor, url.file_path } .. '\r')
+            pane:send_text(frankenterm.shell_join_args { editor, url.file_path } .. '\r')
           end
           return false
         end
@@ -87,35 +87,35 @@ local ssh_remotes = {
     name           = 'csd',
     remote_address = '144.126.137.164',
     username       = 'ubuntu',
-    ssh_key        = wezterm.home_dir .. '/.ssh/contabo_new_baremetal_sense_demo_box.pem',
+    ssh_key        = frankenterm.home_dir .. '/.ssh/contabo_new_baremetal_sense_demo_box.pem',
     cwd            = '/data/projects',
   },
   {
     name           = 'css',
     remote_address = '209.145.54.164',
     username       = 'ubuntu',
-    ssh_key        = wezterm.home_dir .. '/.ssh/contabo_new_baremetal_superserver_box.pem',
+    ssh_key        = frankenterm.home_dir .. '/.ssh/contabo_new_baremetal_superserver_box.pem',
     cwd            = '/data/projects',
   },
   {
     name           = 'trj',
     remote_address = '10.10.10.1',
     username       = 'ubuntu',
-    ssh_key        = wezterm.home_dir .. '/.ssh/trj_ed25519',
+    ssh_key        = frankenterm.home_dir .. '/.ssh/trj_ed25519',
     cwd            = '/data/projects',
   },
   {
     name           = 'ts1',
     remote_address = '100.74.254.33',
     username       = 'ubuntu',
-    ssh_key        = wezterm.home_dir .. '/.ssh/thinkstation1_ed25519',
+    ssh_key        = frankenterm.home_dir .. '/.ssh/thinkstation1_ed25519',
     cwd            = '/data/projects',
   },
   {
     name           = 'ts2',
     remote_address = '100.96.111.98',
     username       = 'ubuntu',
-    ssh_key        = wezterm.home_dir .. '/.ssh/thinkstation2_ed25519',
+    ssh_key        = frankenterm.home_dir .. '/.ssh/thinkstation2_ed25519',
     cwd            = '/data/projects',
   },
 }
@@ -163,35 +163,35 @@ end
 -- ============================================================================
 -- Each remote gets a distinct gradient + cursor + tab-bar palette so a
 -- glance at the window/tab bar tells you which host the pane is on.
--- Applied via wezterm.on('update-status') below.
+-- Applied via frankenterm.on('update-status') below.
 
 local domain_colors = {
   csd = { -- Sense Demo: Solar Flare / amber
-    background = {{ source = { Gradient = { colors = { '#0a0a06', '#14120a', '#1a1610' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
+    background = {{ source = { Gradient = { colors = { '#0a0a06', '#14120a', '#1a1610' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
     solid_bg = '#0a0a06', tab_bg = '#ff9933', foreground = '#ffe0b3', cursor = '#ffaa00',
     ansi    = { '#1a1a10', '#ff6644', '#99ff66', '#ffdd44', '#44aaff', '#ff9944', '#44ffdd', '#d5c4a1' },
     brights = { '#3d3d2f', '#ff9977', '#bbff99', '#ffee77', '#77ccff', '#ffbb77', '#77ffee', '#fffaf0' },
   },
   css = { -- Super Server: Ultraviolet / purple
-    background = {{ source = { Gradient = { colors = { '#08060e', '#100a18', '#180e22' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
+    background = {{ source = { Gradient = { colors = { '#08060e', '#100a18', '#180e22' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
     solid_bg = '#08060e', tab_bg = '#aa66ff', foreground = '#e0d0ff', cursor = '#cc44ff',
     ansi    = { '#1a1429', '#ff44aa', '#44ff99', '#ffcc44', '#6699ff', '#cc66ff', '#44ddff', '#c7c0e0' },
     brights = { '#3d3450', '#ff77cc', '#77ffbb', '#ffdd77', '#99bbff', '#dd99ff', '#77eeff', '#f0e8ff' },
   },
   trj = { -- Threadripper: Cyberpunk Aurora / magenta+cyan
-    background = {{ source = { Gradient = { colors = { '#0a0e14', '#0e1420', '#12182a' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
+    background = {{ source = { Gradient = { colors = { '#0a0e14', '#0e1420', '#12182a' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
     solid_bg = '#0a0e14', tab_bg = '#ff00ff', foreground = '#b3f4ff', cursor = '#ff00ff',
     ansi    = { '#1a1f29', '#ff3366', '#39ffb4', '#ffe566', '#00aaff', '#ff00ff', '#00ffff', '#c7d5e0' },
     brights = { '#3d4f5f', '#ff6b9d', '#6bffcd', '#ffef99', '#66ccff', '#ff66ff', '#66ffff', '#ffffff' },
   },
   ts1 = { -- ThinkStation1: Teal Forge
-    background = {{ source = { Gradient = { colors = { '#040e0e', '#081818', '#0c2222' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
+    background = {{ source = { Gradient = { colors = { '#040e0e', '#081818', '#0c2222' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
     solid_bg = '#040e0e', tab_bg = '#00ccaa', foreground = '#b0ffe0', cursor = '#00ffcc',
     ansi    = { '#0a1a1a', '#ff5566', '#00ffaa', '#ddff44', '#44aaff', '#bb66ff', '#00ffdd', '#a0d5c0' },
     brights = { '#2a3a3a', '#ff8899', '#66ffcc', '#eeff77', '#77ccff', '#dd99ff', '#66ffee', '#d0fff0' },
   },
   ts2 = { -- ThinkStation2: Coral Reef
-    background = {{ source = { Gradient = { colors = { '#0e0404', '#180808', '#220c0c' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
+    background = {{ source = { Gradient = { colors = { '#0e0404', '#180808', '#220c0c' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
     solid_bg = '#0e0404', tab_bg = '#ff6655', foreground = '#ffb0a0', cursor = '#ff7766',
     ansi    = { '#1a0a0a', '#ff5566', '#66ffaa', '#ffdd44', '#44aaff', '#ff6699', '#44ffdd', '#c0a0a0' },
     brights = { '#3a2a2a', '#ff8899', '#99ffcc', '#ffee77', '#77ccff', '#ff99bb', '#77ffee', '#ffe0d0' },
@@ -208,13 +208,13 @@ local domain_info = {
 
 -- Pre-build status strings + overrides ONCE at config load so
 -- update-status (which fires several times/sec per window) is allocation-
--- free. Building wezterm.format tables in the handler caused 14G+ Lua GC
+-- free. Building frankenterm.format tables in the handler caused 14G+ Lua GC
 -- churn under the previous live config — keep the lookup cheap.
 local right_status_by_domain = {}
 local overrides_by_domain = {}
 for domain, info in pairs(domain_info) do
   local dc = domain_colors[domain]
-  right_status_by_domain[domain] = wezterm.format {
+  right_status_by_domain[domain] = frankenterm.format {
     { Foreground = { Color = '#0d0d1a' } },
     { Background = { Color = dc and dc.tab_bg or '#7aa2f7' } },
     { Attribute = { Intensity = 'Bold' } },
@@ -242,7 +242,7 @@ for domain, info in pairs(domain_info) do
   end
 end
 
-local leader_left_status = wezterm.format {
+local leader_left_status = frankenterm.format {
   { Foreground = { Color = '#0d0d1a' } },
   { Background = { Color = '#9ece6a' } },
   { Attribute = { Intensity = 'Bold' } },
@@ -250,7 +250,7 @@ local leader_left_status = wezterm.format {
 }
 
 local window_state = {}
-wezterm.on('update-status', function(window, pane)
+frankenterm.on('update-status', function(window, pane)
   local ok, domain = pcall(function() return pane:get_domain_name() end)
   if not ok then return end
   local window_id = window:window_id()
@@ -300,7 +300,7 @@ config.keys = {
   { key = '3', mods = 'LEADER', action = act.SpawnCommandInNewTab { domain = { DomainName = 'trj' } } },
   { key = '4', mods = 'LEADER', action = act.SpawnCommandInNewTab { domain = { DomainName = 'ts1' } } },
   { key = '5', mods = 'LEADER', action = act.SpawnCommandInNewTab { domain = { DomainName = 'ts2' } } },
-  { key = 'NumLock',        mods = 'CTRL', action = act.SpawnCommandInNewTab { domain = { DomainName = 'local' }, cwd = wezterm.home_dir .. '/projects' } },
+  { key = 'NumLock',        mods = 'CTRL', action = act.SpawnCommandInNewTab { domain = { DomainName = 'local' }, cwd = frankenterm.home_dir .. '/projects' } },
   { key = 'KeypadDivide',   mods = 'CTRL', action = act.SpawnCommandInNewTab { domain = { DomainName = 'css' }, cwd = '/data/projects' } },
   { key = 'KeypadMultiply', mods = 'CTRL', action = act.SpawnCommandInNewTab { domain = { DomainName = 'csd' }, cwd = '/data/projects' } },
   { key = 'KeypadSubtract', mods = 'CTRL', action = act.SpawnCommandInNewTab { domain = { DomainName = 'trj' }, cwd = '/data/projects' } },
@@ -318,7 +318,7 @@ config.keys = {
 -- frankenterm/config/src/config.rs. The four faces (Regular/Bold/Italic/
 -- BoldItalic) come from the v1.7.0 zstd-packed payload at
 -- crates/frankenterm/assets/Pragmasevka_NF.zip.zst.
-config.font = wezterm.font {
+config.font = frankenterm.font {
   family = 'Pragmasevka Nerd Font',
   harfbuzz_features = { 'calt', 'clig', 'liga' },
 }
@@ -330,7 +330,7 @@ config.macos_window_background_blur = 20
 config.background = {
   {
     source = { Gradient = { colors = { '#060a10', '#0a1018', '#0e1420' }, orientation = { Linear = { angle = -45.0 } } } },
-    width = '100%', height = '100%', opacity = 0.55,
+    width = '100%', height = '100%', opacity = 0.92,
   },
 }
 
@@ -358,7 +358,7 @@ config.colors = {
 }
 
 config.window_frame = {
-  font = wezterm.font { family = 'Pragmasevka Nerd Font', weight = 'Bold' },
+  font = frankenterm.font { family = 'Pragmasevka Nerd Font', weight = 'Bold' },
   font_size = 12.0,
   active_titlebar_bg = '#060a10',
   inactive_titlebar_bg = '#060a10',
@@ -383,7 +383,7 @@ config.skip_close_confirmation_for_processes_named = {
   'claude', 'node', 'python', 'python3',
 }
 
-config.hyperlink_rules = wezterm.default_hyperlink_rules()
+config.hyperlink_rules = frankenterm.default_hyperlink_rules()
 
 config.mouse_bindings = {
   { event = { Up   = { streak = 1, button = 'Left'   } }, mods = 'CMD',  action = act.OpenLinkAtMouseCursor },
@@ -422,7 +422,7 @@ local startup_domains = {
 -- mux-control verb (see beads ft-mux-cli-parity).
 
 local function domain_has_panes(domain_name)
-  for _, w in ipairs(wezterm.mux.all_windows()) do
+  for _, w in ipairs(frankenterm.mux.all_windows()) do
     for _, t in ipairs(w:tabs()) do
       for _, p in ipairs(t:panes()) do
         local ok, dname = pcall(function() return p:get_domain_name() end)
@@ -435,46 +435,47 @@ local function domain_has_panes(domain_name)
   return false
 end
 
-wezterm.on('gui-startup', function(cmd)
+frankenterm.on('gui-startup', function(cmd)
   if cmd and cmd.args and #cmd.args > 0 then
-    local tab, pane, window = wezterm.mux.spawn_window(cmd)
+    local tab, pane, window = frankenterm.mux.spawn_window(cmd)
     if window:gui_window() then window:gui_window():maximize() end
     return
   end
 
   -- 1) Local window: 3 tabs in ~/projects
-  local _, _, window = wezterm.mux.spawn_window({ cwd = wezterm.home_dir .. '/projects' })
+  local _, _, window = frankenterm.mux.spawn_window({ cwd = frankenterm.home_dir .. '/projects' })
   for _ = 2, 3 do
-    window:spawn_tab({ cwd = wezterm.home_dir .. '/projects' })
+    window:spawn_tab({ cwd = frankenterm.home_dir .. '/projects' })
   end
   local gui = window:gui_window()
   if gui then gui:maximize() end
 
-  -- 2) Remote domains: attach to each in order, seeding tabs only if the
-  --    remote mux is empty.
+  -- 2) Remote domains: staggered attach with frankenterm.time.call_after so
+  --    we don't open five SSH connections in the same event-loop tick. Each
+  --    remote gets its own 1-second offset before its attach fires; if the
+  --    remote mux is empty we seed N tabs, otherwise we inherit whatever the
+  --    persistent mux already had.
   --
-  --    The reference wezterm config uses `wezterm.time.call_after(t, fn)` to
-  --    stagger remote attaches across N seconds so they don't fight for SSH
-  --    and network resources at startup. The FrankenTerm fork does NOT
-  --    expose the `wezterm.time` Lua module (no `time.call_after`), nor the
-  --    `wezterm.log_*` helpers, so we run all attaches in-line and use
-  --    plain Lua `print` for diagnostics — it surfaces in the stderr capture
-  --    when the GUI is launched from a shell.
-  for _, dcfg in ipairs(startup_domains) do
-    local info = ssh_info[dcfg.name]
-    if info then
+  --    `frankenterm.time.call_after(secs, fn)` is the FrankenTerm-policy-
+  --    compliant timer (asupersync-backed under the hood; project bans
+  --    direct tokio use — see AGENTS.md). The callback runs on the main
+  --    thread with full access to the Lua state.
+  for idx, dcfg in ipairs(startup_domains) do
+    frankenterm.time.call_after(idx * 1.0, function()
+      local info = ssh_info[dcfg.name]
+      if not info then return end
       local ok, err = pcall(function()
-        local domain = wezterm.mux.get_domain(dcfg.name)
+        local domain = frankenterm.mux.get_domain(dcfg.name)
         if not domain then
-          print('gui-startup: domain not registered: ' .. dcfg.name)
+          frankenterm.log_error('gui-startup: domain not registered: ' .. dcfg.name)
           return
         end
-        print('gui-startup: attaching to domain ' .. dcfg.name)
+        frankenterm.log_info('gui-startup: attaching to domain ' .. dcfg.name)
         domain:attach()
         if not domain_has_panes(dcfg.name) then
-          print('gui-startup: ' .. dcfg.name .. ' is empty; seeding ' .. (dcfg.tabs or 3) .. ' tabs')
+          frankenterm.log_info('gui-startup: ' .. dcfg.name .. ' is empty; seeding ' .. (dcfg.tabs or 3) .. ' tabs')
           local seed_ok, seed_err = pcall(function()
-            local _, _, rwindow = wezterm.mux.spawn_window({
+            local _, _, rwindow = frankenterm.mux.spawn_window({
               domain = { DomainName = dcfg.name },
               cwd = dcfg.cwd,
             })
@@ -485,16 +486,16 @@ wezterm.on('gui-startup', function(cmd)
             if rgui then rgui:maximize() end
           end)
           if not seed_ok then
-            print('gui-startup: failed to seed tabs in ' .. dcfg.name .. ': ' .. tostring(seed_err))
+            frankenterm.log_error('gui-startup: failed to seed tabs in ' .. dcfg.name .. ': ' .. tostring(seed_err))
           end
         else
-          print('gui-startup: ' .. dcfg.name .. ' already has panes from previous session; inheriting')
+          frankenterm.log_info('gui-startup: ' .. dcfg.name .. ' already has panes from previous session; inheriting')
         end
       end)
       if not ok then
-        print('gui-startup: failed to attach ' .. dcfg.name .. ': ' .. tostring(err))
+        frankenterm.log_error('gui-startup: failed to attach ' .. dcfg.name .. ': ' .. tostring(err))
       end
-    end
+    end)
   end
 end)
 
