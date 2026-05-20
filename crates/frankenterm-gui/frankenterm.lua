@@ -167,31 +167,31 @@ end
 
 local domain_colors = {
   csd = { -- Sense Demo: Solar Flare / amber
-    background = {{ source = { Gradient = { colors = { '#0a0a06', '#14120a', '#1a1610' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
+    background = {{ source = { Gradient = { colors = { '#0a0a06', '#14120a', '#1a1610' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
     solid_bg = '#0a0a06', tab_bg = '#ff9933', foreground = '#ffe0b3', cursor = '#ffaa00',
     ansi    = { '#1a1a10', '#ff6644', '#99ff66', '#ffdd44', '#44aaff', '#ff9944', '#44ffdd', '#d5c4a1' },
     brights = { '#3d3d2f', '#ff9977', '#bbff99', '#ffee77', '#77ccff', '#ffbb77', '#77ffee', '#fffaf0' },
   },
   css = { -- Super Server: Ultraviolet / purple
-    background = {{ source = { Gradient = { colors = { '#08060e', '#100a18', '#180e22' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
+    background = {{ source = { Gradient = { colors = { '#08060e', '#100a18', '#180e22' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
     solid_bg = '#08060e', tab_bg = '#aa66ff', foreground = '#e0d0ff', cursor = '#cc44ff',
     ansi    = { '#1a1429', '#ff44aa', '#44ff99', '#ffcc44', '#6699ff', '#cc66ff', '#44ddff', '#c7c0e0' },
     brights = { '#3d3450', '#ff77cc', '#77ffbb', '#ffdd77', '#99bbff', '#dd99ff', '#77eeff', '#f0e8ff' },
   },
   trj = { -- Threadripper: Cyberpunk Aurora / magenta+cyan
-    background = {{ source = { Gradient = { colors = { '#0a0e14', '#0e1420', '#12182a' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
+    background = {{ source = { Gradient = { colors = { '#0a0e14', '#0e1420', '#12182a' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
     solid_bg = '#0a0e14', tab_bg = '#ff00ff', foreground = '#b3f4ff', cursor = '#ff00ff',
     ansi    = { '#1a1f29', '#ff3366', '#39ffb4', '#ffe566', '#00aaff', '#ff00ff', '#00ffff', '#c7d5e0' },
     brights = { '#3d4f5f', '#ff6b9d', '#6bffcd', '#ffef99', '#66ccff', '#ff66ff', '#66ffff', '#ffffff' },
   },
   ts1 = { -- ThinkStation1: Teal Forge
-    background = {{ source = { Gradient = { colors = { '#040e0e', '#081818', '#0c2222' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
+    background = {{ source = { Gradient = { colors = { '#040e0e', '#081818', '#0c2222' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
     solid_bg = '#040e0e', tab_bg = '#00ccaa', foreground = '#b0ffe0', cursor = '#00ffcc',
     ansi    = { '#0a1a1a', '#ff5566', '#00ffaa', '#ddff44', '#44aaff', '#bb66ff', '#00ffdd', '#a0d5c0' },
     brights = { '#2a3a3a', '#ff8899', '#66ffcc', '#eeff77', '#77ccff', '#dd99ff', '#66ffee', '#d0fff0' },
   },
   ts2 = { -- ThinkStation2: Coral Reef
-    background = {{ source = { Gradient = { colors = { '#0e0404', '#180808', '#220c0c' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.92 }},
+    background = {{ source = { Gradient = { colors = { '#0e0404', '#180808', '#220c0c' }, orientation = { Linear = { angle = -45.0 } } } }, width = '100%', height = '100%', opacity = 0.55 }},
     solid_bg = '#0e0404', tab_bg = '#ff6655', foreground = '#ffb0a0', cursor = '#ff7766',
     ansi    = { '#1a0a0a', '#ff5566', '#66ffaa', '#ffdd44', '#44aaff', '#ff6699', '#44ffdd', '#c0a0a0' },
     brights = { '#3a2a2a', '#ff8899', '#99ffcc', '#ffee77', '#77ccff', '#ff99bb', '#77ffee', '#ffe0d0' },
@@ -330,7 +330,7 @@ config.macos_window_background_blur = 20
 config.background = {
   {
     source = { Gradient = { colors = { '#060a10', '#0a1018', '#0e1420' }, orientation = { Linear = { angle = -45.0 } } } },
-    width = '100%', height = '100%', opacity = 0.92,
+    width = '100%', height = '100%', opacity = 0.55,
   },
 }
 
