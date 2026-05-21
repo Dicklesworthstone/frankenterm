@@ -366,27 +366,40 @@ maybe_add_path() {
     *:"$DEST":*) return 0 ;;
     *)
       if [ "$EASY" -eq 1 ]; then
-        local updated=0
+        # The exact line we'd write — used both for the duplicate-check
+        # grep AND the printf below, so the two can't drift out of sync.
+        # shellcheck disable=SC2016
+        # ^ The literal `$PATH` is intentional — it must stay as a
+        #   shell-variable reference to be expanded at the user's
+        #   shell startup, not interpolated here at install time.
+        local export_line
+        export_line="export PATH=\"$DEST:\$PATH\""
+        local appended_to=0
+        local probed_count=0
         for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
           if [ -e "$rc" ] && [ -w "$rc" ]; then
-            if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
-              # Leading newline ensures we don't accidentally append to a
-              # line that didn't end with one (rc files don't always have
-              # a trailing newline). printf gives precise control.
-              # shellcheck disable=SC2016
-              # ^ The literal `$PATH` is intentional — it must stay as a
-              #   shell-variable reference to be expanded at the user's
-              #   shell startup, not interpolated here at install time.
-              printf '\n# Added by FrankenTerm installer\nexport PATH="%s:$PATH"\n' \
-                "$DEST" >> "$rc"
+            probed_count=$((probed_count + 1))
+            # `grep -Fx` matches the whole line as a fixed string —
+            # so a bare mention of $DEST in a comment doesn't fool us
+            # into skipping a real export, and we don't get tripped by
+            # PATHs that have $DEST as a substring of a longer path.
+            if ! grep -Fxq "$export_line" "$rc" 2>/dev/null; then
+              # Leading newline guards against rc files without a
+              # trailing newline (rare but valid POSIX text files).
+              printf '\n# Added by FrankenTerm installer\n%s\n' \
+                "$export_line" >> "$rc"
+              appended_to=$((appended_to + 1))
             fi
-            updated=1
           fi
         done
-        if [ "$updated" -eq 1 ]; then
-          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use ft"
+        if [ "$appended_to" -gt 0 ]; then
+          warn "PATH export appended to $appended_to shell rc file(s); restart shell to use ft"
+        elif [ "$probed_count" -gt 0 ]; then
+          # Files exist and are writable, but the export was already
+          # present — nothing to do.
+          info "PATH export already present in shell rc; no changes made"
         else
-          warn "Add $DEST to PATH to use ft"
+          warn "No writable ~/.zshrc or ~/.bashrc found; add $DEST to PATH manually"
         fi
       else
         warn "Add $DEST to PATH to use ft (or rerun with --easy-mode)"
