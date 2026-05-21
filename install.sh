@@ -67,8 +67,6 @@ fi
 # ───────────────────────────────────────────────────────────────────────────
 # Logging helpers (gum + ANSI fallback)
 # ───────────────────────────────────────────────────────────────────────────
-log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
-
 info() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
@@ -248,7 +246,10 @@ resolve_version() {
 # Preflight
 # ───────────────────────────────────────────────────────────────────────────
 check_disk_space() {
-  local min_kb=51200  # 50MB — ft + mux-server release binaries combined
+  # 50MB headroom. The ft release binary is ~19MB on macOS arm64 / ~15MB on
+  # Linux; tarball download + uncompressed extract + final installed copy
+  # all coexist briefly under $TMP and $DEST.
+  local min_kb=51200
   local path="$DEST"
   [ ! -d "$path" ] && path=$(dirname "$path")
   if command -v df >/dev/null 2>&1; then
@@ -622,8 +623,8 @@ trap cleanup EXIT
 # Download / source build / offline-tarball selection
 # ───────────────────────────────────────────────────────────────────────────
 if [ -n "$OFFLINE_TARBALL" ]; then
-  cp "$OFFLINE_TARBALL" "$TMP/$TAR"
   info "Using offline tarball: $OFFLINE_TARBALL"
+  cp "$OFFLINE_TARBALL" "$TMP/$TAR"
 elif [ "$FROM_SOURCE" -eq 0 ]; then
   if [ -z "$URL" ]; then
     warn "No artifact URL resolved; falling back to source build"
@@ -666,7 +667,12 @@ else
 
   # Extract
   info "Extracting $TAR"
-  tar -xf "$TMP/$TAR" -C "$TMP"
+  if ! tar -xf "$TMP/$TAR" -C "$TMP"; then
+    err "Failed to extract $TAR — archive may be corrupt or truncated"
+    err "If the download was interrupted, retry; otherwise file an issue at:"
+    err "  https://github.com/${OWNER}/${REPO}/issues"
+    exit 1
+  fi
   BIN="$TMP/ft"
   if [ ! -x "$BIN" ]; then
     BIN=$(find "$TMP" -maxdepth 3 -type f -name "ft" -perm -111 2>/dev/null | head -n 1)
@@ -688,7 +694,13 @@ fi
 if [ "$VERIFY" -eq 1 ]; then
   info "Running \`ft doctor --json\` (informational; non-zero exit is OK on first install)"
   set +e
-  "$DEST/ft" doctor --json 2>/dev/null | head -40
+  if [ "$QUIET" -eq 1 ]; then
+    # In quiet mode we just want a yes/no on "did the binary launch and emit
+    # parseable JSON?" — don't dump the doctor body to stdout.
+    "$DEST/ft" doctor --json >/dev/null 2>&1
+  else
+    "$DEST/ft" doctor --json 2>/dev/null | head -40
+  fi
   set -e
   ok "Self-test invoked"
 fi
@@ -709,7 +721,11 @@ if [ "$QUIET" -eq 0 ]; then
   summary_lines+=("")
   summary_lines+=("Binary:   $DEST/ft")
   summary_lines+=("Version:  $RESOLVED_VERSION")
-  summary_lines+=("Platform: ${OS}/${ARCH} ($TARGET)")
+  if [ -n "${TARGET:-}" ]; then
+    summary_lines+=("Platform: ${OS}/${ARCH} ($TARGET)")
+  else
+    summary_lines+=("Platform: ${OS}/${ARCH}")
+  fi
   if [ "$WITH_FONT" -eq 1 ]; then
     summary_lines+=("Font:     Pragmasevka NF installed")
   fi
