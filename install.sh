@@ -407,11 +407,18 @@ verify_sigstore_bundle() {
 # Optional: Pragmasevka Nerd Font install
 # ───────────────────────────────────────────────────────────────────────────
 install_pragmasevka() {
+  # --offline promises no network; honour that for the font too.
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    warn "Skipping --with-font in --offline mode (no network)."
+    warn "Install the font manually from your distro / Homebrew if needed."
+    return 0
+  fi
   # FrankenTerm bundles Pragmasevka NF v1.7.0 in its repo at
-  # crates/frankenterm/assets/Pragmasevka_NF.zip.zst (the macOS .app
-  # ships this inside Contents/Resources/fonts/). For curl|bash, fetch
-  # the same payload at the release tag and unpack into the user's
-  # font directory.
+  # crates/frankenterm/assets/Pragmasevka_NF.zip.zst. Despite the
+  # `.zip.zst` filename, the inner payload is a TAR archive (built
+  # that way by scripts/create-macos-bundle.sh — see
+  # `zstd -dc … | /usr/bin/tar -xf -` there). We use `tar -xf` after
+  # zstd-decompression for parity.
   local font_url="https://raw.githubusercontent.com/${OWNER}/${REPO}/${VERSION}/crates/frankenterm/assets/Pragmasevka_NF.zip.zst"
   local font_dir=""
   case "$OS" in
@@ -453,18 +460,30 @@ build_from_source() {
   info "Building ft from source — this takes 10-30+ minutes cold-cache"
   ensure_rust
   command -v git >/dev/null 2>&1 || { err "git is required for --from-source"; exit 1; }
-  git clone --depth 1 --branch "$VERSION" \
-    "https://github.com/${OWNER}/${REPO}.git" "$TMP/src" \
-    || git clone --depth 1 \
-       "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
-  (
-    cd "$TMP/src"
-    # Build only the ft CLI (not the GUI/mux-server) for the broadest
-    # platform coverage. Users who want the macOS .app should install
-    # from the .app bundle (separate flow) or build the workspace
-    # directly: `cargo build --release` after cloning.
-    cargo build --release -p frankenterm --bin ft
-  )
+  if ! git clone --depth 1 --branch "$VERSION" \
+       "https://github.com/${OWNER}/${REPO}.git" "$TMP/src" 2>/dev/null \
+     && ! git clone --depth 1 \
+       "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"; then
+    err "Failed to clone ${OWNER}/${REPO} (tried --branch $VERSION then default)"
+    err "Check network and that https://github.com/${OWNER}/${REPO} exists"
+    exit 1
+  fi
+  # Build only the ft CLI (not the GUI/mux-server) for the broadest
+  # platform coverage. Users who want the macOS .app should install
+  # from the .app bundle (separate flow) or build the workspace
+  # directly: `cargo build --release` after cloning.
+  # Friendly error wrapping: a bare `set -e` exit on cargo failure would
+  # not give the user any actionable diagnosis.
+  if ! ( cd "$TMP/src" && cargo build --release -p frankenterm --bin ft ); then
+    err "Source build failed."
+    err "Common causes:"
+    err "  - Missing system deps on Linux: pkg-config, libcairo2-dev,"
+    err "    libx11-dev, libx11-xcb-dev, libxcb-util-dev, libxcb-image0-dev,"
+    err "    libxkbcommon-dev, libxkbcommon-x11-dev."
+    err "  - Out-of-disk during compile (cargo's target/ uses 10+ GB)."
+    err "  - Old Rust toolchain (FrankenTerm needs Rust 1.85+)."
+    exit 1
+  fi
   local bin="$TMP/src/target/release/ft"
   [ -x "$bin" ] || { err "Build did not produce $bin"; exit 1; }
   install -m 0755 "$bin" "$DEST/ft"
@@ -490,7 +509,7 @@ Options:
   --verify           Run \`ft doctor\` after install
   --with-font        Also install the bundled Pragmasevka Nerd Font
   --from-source      Build from source (slow; requires Rust + git)
-  --quiet            Suppress non-error output
+  --quiet, -q        Suppress non-error output
   --no-gum           Disable gum formatting even if available
   --no-verify        Skip checksum + signature verification (for testing only)
   --offline TARBALL  Install from local tarball; skip all network calls
@@ -562,8 +581,17 @@ fi
 setup_proxy
 if [ -n "$OFFLINE_TARBALL" ]; then
   [ -f "$OFFLINE_TARBALL" ] || { err "Offline tarball not found: $OFFLINE_TARBALL"; exit 1; }
+  # --offline takes precedence over --from-source: the user explicitly
+  # supplied a binary tarball, so use that even if they also passed
+  # --from-source (which detect_platform may also auto-set on Intel Mac
+  # or unknown platforms). Without this override the offline tarball
+  # would be cp'd then ignored when the FROM_SOURCE branch runs cargo.
+  FROM_SOURCE=0
   # In offline mode we still need to know the platform/asset name for extraction
   detect_platform
+  # detect_platform may have set FROM_SOURCE=1 for Intel Mac / unknown
+  # platforms; offline tarball still wins. Clear it again post-detect.
+  FROM_SOURCE=0
   TAR=$(basename "$OFFLINE_TARBALL")
   URL=""
 else
