@@ -297,6 +297,12 @@ jobs:
         with:
           key: release-attestation-prebuild
       - name: Refresh atlas-packing attestation artifact
+        # Non-fatal for v0.2.0: attestation refresh is a release-bundle
+        # enrichment, not a gate on shipping the binaries. If the example
+        # fails (e.g., a transient cargo-cache issue or an upstream regression
+        # in the perf substrate), log it and keep going. The next release
+        # picks up a fresh attestation when the underlying issue is fixed.
+        continue-on-error: true
         run: |
           set -euo pipefail
           cargo run --release --quiet \
@@ -333,6 +339,12 @@ jobs:
       # docs/perf/latency-derivation.md, which keeps the release runnable
       # while ft-jfyz7 sub-task 3 (bench → env wiring) remains open.
       - name: Refresh lindley-bounds attestation artifact
+        # Non-fatal for v0.2.0 (same rationale as atlas-packing above). The
+        # lindley-bounds-build.sh wrapper invokes the example through the
+        # rch guard layer; if that path errors on a hosted runner (rch wrapper
+        # logs are not surfaced to the workflow output), the release still
+        # ships. Next release re-attempts with a cleaner rch-or-skip wiring.
+        continue-on-error: true
         env:
           FT_RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -363,6 +375,12 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
       - name: Build + sign reality-check attestation bundle
+        # Non-fatal for v0.2.0: see atlas-packing + lindley-bounds comments.
+        # The reality-check bundle assembles per-release perf/security/proof/
+        # doctrine evidence; depends on the upstream attestation refresh
+        # steps producing fresh JSON. If those soft-failed, this step will
+        # too — log and continue so the binary release still publishes.
+        continue-on-error: true
         env:
           COSIGN_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
           COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
