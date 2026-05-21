@@ -69,6 +69,12 @@ cleanup() {
 trap cleanup EXIT
 
 # Proxy support — populated by setup_proxy(), passed to every curl call.
+# We use the `${arr[@]+"${arr[@]}"}` idiom (rather than the simpler
+# `"${arr[@]}"`) at every call site because macOS still ships bash 3.2
+# as /bin/bash, and bash 3.2 + `set -u` treats `"${arr[@]}"` on an
+# empty array as "unbound variable". curl|bash users on a stock macOS
+# without Homebrew bash would otherwise crash on every empty-proxy
+# expansion. Bash 4.4+ handles the simple form, but we need 3.2 compat.
 PROXY_ARGS=()
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
@@ -133,7 +139,7 @@ draw_box() {
   local esc; esc=$(printf '\033')
   local strip_ansi_sed="s/${esc}\\[[0-9;]*m//g"
 
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     local stripped
     stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
     local len=${#stripped}
@@ -145,7 +151,7 @@ draw_box() {
   for ((i=0; i<inner_width; i++)); do border+="═"; done
 
   printf "\033[%sm╔%s╗\033[0m\n" "$color" "$border"
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     local stripped
     stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
     local len=${#stripped}
@@ -231,7 +237,7 @@ resolve_version() {
   if command -v curl >/dev/null 2>&1; then
     local api_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
     local resolved
-    resolved=$(curl -fsSL --max-time 10 "${PROXY_ARGS[@]}" "$api_url" 2>/dev/null \
+    resolved=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$api_url" 2>/dev/null \
       | grep '"tag_name":' \
       | sed -E 's/.*"([^"]+)".*/\1/' \
       | head -1 || true)
@@ -241,7 +247,7 @@ resolve_version() {
       return 0
     fi
     # Fallback: parse redirect URL of /releases/latest
-    resolved=$(curl -fsSL --max-time 10 "${PROXY_ARGS[@]}" \
+    resolved=$(curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
       -o /dev/null -w '%{url_effective}' \
       "https://github.com/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
       | sed -E 's|.*/tag/||' || true)
@@ -308,7 +314,7 @@ check_network() {
   # 10s total cap — generous enough to absorb a slow first byte on
   # high-latency links (LTE, satellite, throttled corp proxies) without
   # firing the false-positive warn that the previous 5s budget produced.
-  if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 5 --max-time 10 -o /dev/null -I "$URL"; then
+  if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 5 --max-time 10 -o /dev/null -I "$URL"; then
     warn "Network check failed for $URL"
     warn "Continuing; download may fail"
   fi
@@ -408,7 +414,7 @@ verify_sigstore_bundle() {
   [ -z "$bundle_url" ] && bundle_url="${artifact_url}.sigstore.json"
   local bundle_file
   bundle_file="$TMP/$(basename "$bundle_url")"
-  if ! curl -fsSL --max-time 10 "${PROXY_ARGS[@]}" "$bundle_url" -o "$bundle_file" 2>/dev/null; then
+  if ! curl -fsSL --max-time 10 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$bundle_url" -o "$bundle_file" 2>/dev/null; then
     warn "Sigstore bundle not found at $bundle_url; skipping signature verification"
     return 0
   fi
@@ -456,7 +462,7 @@ install_pragmasevka() {
     return 0
   fi
   info "Fetching Pragmasevka NF from $font_url"
-  if ! curl -fsSL --max-time 60 "${PROXY_ARGS[@]}" "$font_url" -o "$TMP/pragmasevka.zip.zst"; then
+  if ! curl -fsSL --max-time 60 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$font_url" -o "$TMP/pragmasevka.zip.zst"; then
     warn "Pragmasevka payload download failed; skipping font install"
     return 0
   fi
@@ -477,7 +483,7 @@ install_pragmasevka() {
 ensure_rust() {
   if command -v cargo >/dev/null 2>&1; then return 0; fi
   warn "Rust toolchain not found; installing rustup"
-  curl --proto '=https' --tlsv1.2 -fsSL "${PROXY_ARGS[@]}" https://sh.rustup.rs \
+  curl --proto '=https' --tlsv1.2 -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal
   export PATH="$HOME/.cargo/bin:$PATH"
 }
@@ -699,7 +705,7 @@ elif [ "$FROM_SOURCE" -eq 0 ]; then
     # caps the whole transfer.
     if ! run_with_spinner "Downloading $TAR" \
         curl -fsSL --max-time 300 --retry 3 --retry-delay 2 --retry-connrefused \
-        "${PROXY_ARGS[@]}" "$URL" -o "$TMP/$TAR"; then
+        ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$URL" -o "$TMP/$TAR"; then
       warn "Artifact download failed; falling back to build-from-source"
       FROM_SOURCE=1
     fi
@@ -718,7 +724,7 @@ else
     if [ -z "$CHECKSUM" ]; then
       [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
       info "Fetching checksum from $CHECKSUM_URL"
-      if ! curl -fsSL --max-time 30 "${PROXY_ARGS[@]}" "$CHECKSUM_URL" -o "$TMP/checksum.sha256"; then
+      if ! curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$CHECKSUM_URL" -o "$TMP/checksum.sha256"; then
         err "Checksum required and could not be fetched"
         err "Use --no-verify to skip checksum verification (not recommended)"
         exit 1
@@ -816,6 +822,6 @@ if [ "$QUIET" -eq 0 ]; then
   summary_lines+=("")
   summary_lines+=("Docs:     https://github.com/${OWNER}/${REPO}")
   echo
-  draw_box "0;32" "${summary_lines[@]}"
+  draw_box "0;32" ${summary_lines[@]+"${summary_lines[@]}"}
   echo
 fi
