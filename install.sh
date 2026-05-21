@@ -448,7 +448,13 @@ install_pragmasevka() {
   esac
   command -v zstd >/dev/null 2>&1 || { warn "zstd not found; skipping font install (install with: brew install zstd | apt install zstd)"; return 0; }
   command -v tar  >/dev/null 2>&1 || { warn "tar not found; skipping font install"; return 0; }
-  mkdir -p "$font_dir"
+  # install_pragmasevka is best-effort — a mkdir failure (locked-down
+  # system, ENOSPC, etc.) must not abort the whole installer. Wrap with
+  # a graceful return so the user still gets a successful ft install.
+  if ! mkdir -p "$font_dir" 2>/dev/null; then
+    warn "Could not create font dir $font_dir; skipping font install"
+    return 0
+  fi
   info "Fetching Pragmasevka NF from $font_url"
   if ! curl -fsSL --max-time 60 "${PROXY_ARGS[@]}" "$font_url" -o "$TMP/pragmasevka.zip.zst"; then
     warn "Pragmasevka payload download failed; skipping font install"
@@ -664,6 +670,9 @@ else
   fi
   if [ "$LOCKED" -eq 0 ]; then
     err "Another installer is running (lock $LOCK_DIR)"
+    err "If you're certain no installer is running (e.g., previous run was"
+    err "SIGKILL'd between mkdir and PID write), remove the lock manually:"
+    err "  rm -rf $LOCK_DIR"
     # Clear LOCK_DIR so the trap doesn't try to clean another installer's lock
     LOCK_DIR=""
     exit 1
