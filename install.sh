@@ -32,6 +32,25 @@ set -euo pipefail
 umask 022
 shopt -s lastpipe 2>/dev/null || true
 
+# Reject non-bash interpreters AND bash-in-POSIX-mode. We use bashisms
+# throughout (arrays, [[ ]], +=, C-style for, ${arr[@]+…} idiom, echo -e,
+# etc.); dash / ash / busybox sh / zsh would crash with cryptic syntax
+# errors many lines deep. On macOS `/bin/sh` is bash in POSIX mode
+# (BASH_VERSION still set, but `echo -e` and other bashisms disabled),
+# so checking BASH_VERSION alone isn't enough — POSIXLY_CORRECT
+# detects the POSIX-mode case.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "Error: this installer requires bash (not sh/dash/zsh)." >&2
+  echo "Re-run with: bash install.sh   (or pipe to: ... | bash)" >&2
+  exit 1
+fi
+if [ -n "${POSIXLY_CORRECT:-}" ]; then
+  echo "Error: this installer requires bash in non-POSIX mode." >&2
+  echo "You appear to be running bash via /bin/sh or with --posix set." >&2
+  echo "Re-run with: bash install.sh   (or pipe to: ... | bash)" >&2
+  exit 1
+fi
+
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-frankenterm}"
@@ -614,6 +633,25 @@ if [ "$QUIET" -eq 0 ]; then
     echo
   fi
 fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# Required tooling: curl + tar. We use both at multiple call sites and the
+# failure mode of "command not found" mid-flow is opaque (set -e exit with
+# no friendly message), so check upfront. Offline mode still needs tar to
+# extract the local tarball, and curl is used by ensure_rust /
+# install_pragmasevka even when the main download path is bypassed.
+# ───────────────────────────────────────────────────────────────────────────
+for required in curl tar; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    err "Required tool not found: $required"
+    err "Install $required via your package manager:"
+    err "  macOS:        $required is shipped by default; check your PATH"
+    err "  Debian/Ubuntu: sudo apt-get install -y $required"
+    err "  RHEL/Fedora:   sudo dnf install -y $required"
+    err "  Alpine:        sudo apk add $required"
+    exit 1
+  fi
+done
 
 # ───────────────────────────────────────────────────────────────────────────
 # Resolve, detect, preflight
