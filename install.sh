@@ -55,6 +55,19 @@ ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/ft-install.lock"
 HARDCODED_FALLBACK_VERSION="v0.2.0"
 
+# Cleanup state. Initialised to safe defaults so the EXIT trap (registered
+# *before* lock acquisition) can run even if we abort partway through init —
+# e.g., between `mkdir $LOCK_DIR` and `mktemp -d`. Without this, an mktemp
+# failure on a held lock would leak the lock dir permanently.
+TMP=""
+LOCK_DIR=""
+LOCKED=0
+cleanup() {
+  [ -n "$TMP" ] && rm -rf "$TMP"
+  [ "$LOCKED" -eq 1 ] && [ -n "$LOCK_DIR" ] && rm -rf "$LOCK_DIR"
+}
+trap cleanup EXIT
+
 # Proxy support — populated by setup_proxy(), passed to every curl call.
 PROXY_ARGS=()
 
@@ -292,7 +305,10 @@ check_network() {
   [ "$FROM_SOURCE" -eq 1 ] && return 0
   [ -z "$URL" ] && return 0
   command -v curl >/dev/null 2>&1 || { warn "curl not found; skipping network check"; return 0; }
-  if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null -I "$URL"; then
+  # 10s total cap — generous enough to absorb a slow first byte on
+  # high-latency links (LTE, satellite, throttled corp proxies) without
+  # firing the false-positive warn that the previous 5s budget produced.
+  if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 5 --max-time 10 -o /dev/null -I "$URL"; then
     warn "Network check failed for $URL"
     warn "Continuing; download may fail"
   fi
@@ -329,7 +345,11 @@ maybe_add_path() {
         for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
           if [ -e "$rc" ] && [ -w "$rc" ]; then
             if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
-              echo "export PATH=\"$DEST:\$PATH\"" >> "$rc"
+              # Leading newline ensures we don't accidentally append to a
+              # line that didn't end with one (rc files don't always have
+              # a trailing newline). printf gives precise control.
+              printf '\n# Added by FrankenTerm installer\nexport PATH="%s:$PATH"\n' \
+                "$DEST" >> "$rc"
             fi
             updated=1
           fi
@@ -460,13 +480,21 @@ build_from_source() {
   info "Building ft from source — this takes 10-30+ minutes cold-cache"
   ensure_rust
   command -v git >/dev/null 2>&1 || { err "git is required for --from-source"; exit 1; }
+  # Try the user-specified version first. If that fails (typo, tag doesn't
+  # exist, branch was renamed), wipe any partial clone state and try the
+  # default branch as a last-resort fallback. Without the explicit rm -rf
+  # between attempts, the second clone fails too because $TMP/src may not
+  # be empty.
   if ! git clone --depth 1 --branch "$VERSION" \
-       "https://github.com/${OWNER}/${REPO}.git" "$TMP/src" 2>/dev/null \
-     && ! git clone --depth 1 \
-       "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"; then
-    err "Failed to clone ${OWNER}/${REPO} (tried --branch $VERSION then default)"
-    err "Check network and that https://github.com/${OWNER}/${REPO} exists"
-    exit 1
+       "https://github.com/${OWNER}/${REPO}.git" "$TMP/src" 2>/dev/null; then
+    rm -rf "$TMP/src"
+    if ! git clone --depth 1 \
+         "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"; then
+      err "Failed to clone ${OWNER}/${REPO} (tried --branch $VERSION then default)"
+      err "Check network and that https://github.com/${OWNER}/${REPO} exists"
+      exit 1
+    fi
+    warn "Tag/branch '$VERSION' not found; built from default branch instead"
   fi
   # Build only the ft CLI (not the GUI/mux-server) for the broadest
   # platform coverage. Users who want the macOS .app should install
@@ -603,14 +631,15 @@ fi
 mkdir -p "$DEST" 2>/dev/null || true
 preflight_checks
 
-# Already at target version short-circuit (unless --force or offline)
+# Already at target version short-circuit (unless --force or offline).
+# Note: the EXIT trap is already registered at script init, so any TMP
+# we create here is auto-cleaned regardless of how we exit.
 if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] \
     && check_installed_version "$VERSION"; then
   ok "ft $VERSION is already installed at $DEST/ft"
   info "Use --force to reinstall"
   if [ "$WITH_FONT" -eq 1 ]; then
     TMP=$(mktemp -d)
-    trap 'rm -rf "$TMP"' EXIT
     install_pragmasevka
   fi
   exit 0
@@ -620,7 +649,6 @@ fi
 # Atomic lock (mkdir-based — works on macOS without flock)
 # ───────────────────────────────────────────────────────────────────────────
 LOCK_DIR="${LOCK_FILE}.d"
-LOCKED=0
 if mkdir "$LOCK_DIR" 2>/dev/null; then
   LOCKED=1
   echo $$ > "$LOCK_DIR/pid"
@@ -636,16 +664,13 @@ else
   fi
   if [ "$LOCKED" -eq 0 ]; then
     err "Another installer is running (lock $LOCK_DIR)"
+    # Clear LOCK_DIR so the trap doesn't try to clean another installer's lock
+    LOCK_DIR=""
     exit 1
   fi
 fi
 
 TMP=$(mktemp -d)
-cleanup() {
-  rm -rf "$TMP"
-  [ "$LOCKED" -eq 1 ] && rm -rf "$LOCK_DIR"
-}
-trap cleanup EXIT
 
 # ───────────────────────────────────────────────────────────────────────────
 # Download / source build / offline-tarball selection
@@ -659,8 +684,13 @@ elif [ "$FROM_SOURCE" -eq 0 ]; then
     FROM_SOURCE=1
   else
     info "Downloading $URL"
+    # --retry 3 with exponential backoff (curl default) absorbs transient
+    # CDN blips and connection resets. --retry-connrefused covers the
+    # common "GitHub CDN just woke up" 5s window. The 300s max-time still
+    # caps the whole transfer.
     if ! run_with_spinner "Downloading $TAR" \
-        curl -fsSL --max-time 300 "${PROXY_ARGS[@]}" "$URL" -o "$TMP/$TAR"; then
+        curl -fsSL --max-time 300 --retry 3 --retry-delay 2 --retry-connrefused \
+        "${PROXY_ARGS[@]}" "$URL" -o "$TMP/$TAR"; then
       warn "Artifact download failed; falling back to build-from-source"
       FROM_SOURCE=1
     fi
