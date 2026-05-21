@@ -195,7 +195,7 @@ setup_proxy() {
 }
 
 detect_platform() {
-  OS=$(uname -s | tr 'A-Z' 'a-z')
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
   ARCH=$(uname -m)
   case "$ARCH" in
     x86_64|amd64) ARCH="x86_64" ;;
@@ -373,6 +373,10 @@ maybe_add_path() {
               # Leading newline ensures we don't accidentally append to a
               # line that didn't end with one (rc files don't always have
               # a trailing newline). printf gives precise control.
+              # shellcheck disable=SC2016
+              # ^ The literal `$PATH` is intentional — it must stay as a
+              #   shell-variable reference to be expanded at the user's
+              #   shell startup, not interpolated here at install time.
               printf '\n# Added by FrankenTerm installer\nexport PATH="%s:$PATH"\n' \
                 "$DEST" >> "$rc"
             fi
