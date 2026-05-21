@@ -305,7 +305,15 @@ jobs:
             --no-default-features \
             > docs/perf/atlas-packing.json
           # Sanity: artifact must be valid JSON with at least one result.
-          python3 -c 'import json,sys; d=json.load(open("docs/perf/atlas-packing.json")); assert isinstance(d.get("results"),list) and d["results"], "atlas-packing attestation: empty or malformed"; print(f"atlas-packing: {len(d[\"results\"])} (corpus,packer) entries")'
+          python3 - <<'PY'
+          import json
+          with open("docs/perf/atlas-packing.json") as f:
+              d = json.load(f)
+          results = d.get("results")
+          assert isinstance(results, list) and results, \
+              "atlas-packing attestation: empty or malformed"
+          print(f"atlas-packing: {len(results)} (corpus,packer) entries")
+          PY
 
       # ── Refresh per-release perf/lindley-bounds artifact (ft-jfyz7) ───────────
       # Re-runs the lindley_bounds_build example via the wrapper script so
@@ -332,7 +340,21 @@ jobs:
           bash scripts/lindley-bounds-build.sh
           # Sanity: artifact must be valid JSON with the canonical schema fields
           # the substrate's render_attestation_json emits.
-          python3 -c 'import json; d=json.load(open("docs/attestations/perf/lindley-bounds.json")); req={"release_version","arrival","stages","analytical_bound_ms","empirical_p99_ms"}; missing=req-set(d); assert not missing, f"lindley-bounds attestation: missing fields {missing}"; print(f"lindley-bounds: release_version={d[\"release_version\"]} analytical_bound_ms={d[\"analytical_bound_ms\"]} empirical_p99_ms={d[\"empirical_p99_ms\"]} stages={len(d[\"stages\"])}")'
+          python3 - <<'PY'
+          import json
+          with open("docs/attestations/perf/lindley-bounds.json") as f:
+              d = json.load(f)
+          req = {"release_version", "arrival", "stages",
+                 "analytical_bound_ms", "empirical_p99_ms"}
+          missing = req - set(d)
+          assert not missing, f"lindley-bounds attestation: missing fields {missing}"
+          print(
+              f"lindley-bounds: release_version={d['release_version']} "
+              f"analytical_bound_ms={d['analytical_bound_ms']} "
+              f"empirical_p99_ms={d['empirical_p99_ms']} "
+              f"stages={len(d['stages'])}"
+          )
+          PY
 
       # ── Reality-check attestation bundle (ft-syqcz.1) ──────────────────────────
       # Distinct from actions/attest above (which signs the binary archives). This
