@@ -63,6 +63,8 @@ REQUIRED_INVALID = %w[
   fake-rch-command-shape
   env-not-allowlisted
   duplicate-env
+  payload-env-not-allowlisted
+  target-dir-drift
   unsafe-artifact-path
 ].freeze
 REQUIRED_FORBIDDEN = %w[
@@ -86,6 +88,12 @@ VALID_STATES = %w[
 ].freeze
 REMOTE_SHAPE = "rch-no-self-healing-v1"
 STATIC_SHAPE = "static-verifier-v1"
+REMOTE_ARGV_PREFIX = %w[
+  rch
+  --no-self-healing
+  exec
+  --
+].freeze
 SAFE_ARTIFACT_ROOTS = %w[
   docs/json-schema/
   docs/robot-contracts/
@@ -114,20 +122,25 @@ end
 
 def remote_command_shape_valid?(argv)
   return false unless argv.is_a?(Array)
-  return false unless argv.first == "rch"
 
-  exec_index = argv.index("exec")
-  return false unless exec_index && argv[exec_index + 1] == "--"
-
-  rch_options = argv[1...exec_index] || []
-  rch_options.include?("--no-self-healing")
+  argv[0, REMOTE_ARGV_PREFIX.length] == REMOTE_ARGV_PREFIX &&
+    argv.length > REMOTE_ARGV_PREFIX.length
 end
 
 def remote_command_payload(argv)
-  exec_index = argv.index("exec")
-  return [] unless exec_index && argv[exec_index + 1] == "--"
+  return [] unless remote_command_shape_valid?(argv)
 
-  argv[(exec_index + 2)..] || []
+  argv[REMOTE_ARGV_PREFIX.length..] || []
+end
+
+def payload_env_assignments(payload)
+  return [] unless payload.first == "env"
+
+  payload[1..].to_a.take_while { |token| token.match?(/\A[A-Z][A-Z0-9_]*=/) }
+end
+
+def payload_env_assignment_names(payload)
+  payload_env_assignments(payload).map { |token| token.split("=", 2).first }
 end
 
 def path_safe?(path)
@@ -160,6 +173,8 @@ def rejection_reasons(receipt)
   env_entries = command.fetch("env", [])
   env_names = env_entries.map { |item| item.fetch("name") }
   env_allowlist = command.fetch("env_allowlist", [])
+  payload = remote_command_payload(argv)
+  payload_names = payload_env_assignment_names(payload)
   env = env_map(receipt)
   owned = paths.fetch("owned_paths", [])
   dirty = paths.fetch("dirty_paths_at_capture", [])
@@ -169,10 +184,17 @@ def rejection_reasons(receipt)
   reasons << "duplicate_env" unless env_names.uniq.length == env_names.length
   reasons << "duplicate_env_allowlist" unless env_allowlist.uniq.length == env_allowlist.length
   reasons << "env_not_allowlisted" unless (env_names - env_allowlist).empty?
+  reasons << "duplicate_env" unless payload_names.uniq.length == payload_names.length
+  reasons << "env_not_allowlisted" unless (payload_names - env_allowlist).empty?
   if proof["material_cargo_required"] || command["material_remote_required"]
-    reasons << "missing_no_self_healing" unless env["RCH_NO_SELF_HEALING"] == "1" && argv.include?("--no-self-healing")
+    reasons << "missing_no_self_healing" unless env["RCH_NO_SELF_HEALING"] == "1" && remote_command_shape_valid?(argv)
     reasons << "missing_require_remote" unless env["RCH_REQUIRE_REMOTE"] == "1"
     reasons << "stale_command_shape" unless shape == REMOTE_SHAPE && remote_command_shape_valid?(argv)
+    target_dir = command["target_dir"]
+    if target_dir
+      target_assignment = "CARGO_TARGET_DIR=#{target_dir}"
+      reasons << "target_dir_drift" unless payload_env_assignments(payload).include?(target_assignment)
+    end
   end
   reasons << "local_fallback_evidence" if local_fallback_text?(receipt)
   reasons << "missing_owned_paths" if owned.empty?

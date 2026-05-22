@@ -52,6 +52,8 @@ EXPECTED_CASES = {
   "prerequisite-blocked" => "prerequisite_blocked",
   "mail-state-unknown" => "mail_state_unknown",
   "stale-receipt" => "stale",
+  "stale-owner-overlap" => "stale",
+  "owner-handoff-multiple-receipts" => "owner_handoff_required",
   "wait-shared-tracker-dirty" => "wait"
 }.freeze
 EXPECTED_STATES = %w[
@@ -114,6 +116,20 @@ def active_owner_overlap(gate)
   end
 end
 
+def stale_owner_overlap(gate)
+  owned = gate.fetch("receipt").fetch("owned_paths")
+  gate.fetch("coordination").fetch("in_progress_owners").any? do |owner|
+    owner.fetch("stale_over_2h") == true && (owned & owner.fetch("owned_paths")).any?
+  end
+end
+
+def queued_receipt_overlap(gate)
+  owned = gate.fetch("receipt").fetch("owned_paths")
+  gate.fetch("coordination").fetch("queued_receipt_owners").any? do |receipt|
+    (owned & receipt.fetch("owned_paths")).any?
+  end
+end
+
 def blocked_prerequisite?(gate)
   gate.fetch("coordination").fetch("prerequisite_beads").any? do |bead|
     bead.fetch("status") != "closed"
@@ -137,6 +153,7 @@ fail!("contract const drifted") unless schema.dig("properties", "contract_id", "
 fail!("decision enum drifted") unless schema.dig("$defs", "decision_state", "enum").sort == EXPECTED_STATES.sort
 fail!("forbidden enum drifted") unless schema.dig("$defs", "forbidden_action", "enum").sort == EXPECTED_FORBIDDEN.sort
 fail!("dirty path categories missing owned overlap") unless schema.dig("$defs", "dirty_path", "properties", "category", "enum").include?("owned_overlap")
+fail!("coordination schema missing queued receipt owners") unless schema.dig("$defs", "coordination_snapshot", "required").include?("queued_receipt_owners")
 
 fail!("manifest contract drifted") unless manifest["contract_id"] == "ft.deferred_proof_ownership_gate.fixture_manifest.v1"
 fail!("manifest bead drifted") unless manifest["bead"] == "ft-zbnz4.3"
@@ -171,12 +188,24 @@ fixture_cases.each do |entry|
   gate.fetch("receipt").fetch("dirty_paths_at_capture").each do |path|
     fail!("#{case_id} unsafe captured dirty path #{path.inspect}") unless path_safe?(path)
   end
+  gate.fetch("coordination").fetch("in_progress_owners").each do |owner|
+    owner.fetch("owned_paths").each do |path|
+      fail!("#{case_id} unsafe owner path #{path.inspect}") unless path_safe?(path)
+    end
+  end
+  gate.fetch("coordination").fetch("queued_receipt_owners").each do |receipt|
+    receipt.fetch("owned_paths").each do |path|
+      fail!("#{case_id} unsafe queued receipt path #{path.inspect}") unless path_safe?(path)
+    end
+  end
 
   if decision.fetch("state") == "allow"
     fail!("#{case_id} allow must permit replay") unless decision.fetch("replay_allowed") == true
     fail!("#{case_id} allow has current overlap") unless current_overlap.empty?
     fail!("#{case_id} allow has captured overlap") unless captured_overlap.empty?
     fail!("#{case_id} allow has active owner overlap") if active_owner_overlap(gate)
+    fail!("#{case_id} allow has stale owner overlap") if stale_owner_overlap(gate)
+    fail!("#{case_id} allow has queued receipt overlap") if queued_receipt_overlap(gate)
     fail!("#{case_id} allow has blocked prerequisite") if blocked_prerequisite?(gate)
     fail!("#{case_id} allow has stale receipt") unless gate.dig("receipt", "freshness_state") == "fresh"
   else
@@ -188,8 +217,9 @@ fixture_cases.each do |entry|
     fail!("#{case_id} dirty_overlap without overlap") if current_overlap.empty? && captured_overlap.empty?
     fail!("#{case_id} dirty_overlap missing reason") unless decision.fetch("reason_codes").include?("git.dirty_overlap")
   when "owner_handoff_required"
-    fail!("#{case_id} owner handoff without active overlap") unless active_owner_overlap(gate)
-    fail!("#{case_id} owner handoff missing reason") unless decision.fetch("reason_codes").include?("owner.active_overlap")
+    fail!("#{case_id} owner handoff without active or queued overlap") unless active_owner_overlap(gate) || queued_receipt_overlap(gate)
+    reasons = decision.fetch("reason_codes")
+    fail!("#{case_id} owner handoff missing reason") unless reasons.include?("owner.active_overlap") || reasons.include?("receipt.multiple_owner_overlap")
   when "prerequisite_blocked"
     fail!("#{case_id} prerequisite decision without blocked prereq") unless blocked_prerequisite?(gate)
     fail!("#{case_id} prerequisite missing reason") unless decision.fetch("reason_codes").include?("beads.prerequisite_blocked")
@@ -197,8 +227,9 @@ fixture_cases.each do |entry|
     fail!("#{case_id} mail decision without unknown mail") unless unknown_mail_without_fallback?(gate)
     fail!("#{case_id} mail missing reason") unless decision.fetch("reason_codes").include?("agent_mail.state_unknown")
   when "stale"
-    fail!("#{case_id} stale decision without stale receipt") unless gate.dig("receipt", "freshness_state") == "stale"
-    fail!("#{case_id} stale missing reason") unless decision.fetch("reason_codes").include?("receipt.stale")
+    fail!("#{case_id} stale decision without stale receipt or owner") unless gate.dig("receipt", "freshness_state") == "stale" || stale_owner_overlap(gate)
+    stale_reasons = decision.fetch("reason_codes")
+    fail!("#{case_id} stale missing reason") unless stale_reasons.include?("receipt.stale") || stale_reasons.include?("owner.stale_overlap")
   when "wait"
     wait_reasons = decision.fetch("reason_codes")
     fail!("#{case_id} wait lacks waiting reason") unless wait_reasons.any? { |reason| reason.start_with?("rch.") || reason == "git.shared_tracker_dirty" }

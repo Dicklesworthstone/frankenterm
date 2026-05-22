@@ -56,6 +56,8 @@ The static verifier freezes valid and invalid examples:
 - `fake-rch-command-shape`
 - `env-not-allowlisted`
 - `duplicate-env`
+- `payload-env-not-allowlisted`
+- `target-dir-drift`
 - `unsafe-artifact-path`
 
 Run:

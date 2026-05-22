@@ -6,7 +6,7 @@
   "contract": "docs/robot-contracts/deferred-proof-ownership-gate.md",
   "cases": "fixtures/deferred-proof-replay/ownership-gate/cases.v1.json",
   "golden_summary": {
-    "case_count": 8,
+    "case_count": 10,
     "decision_states": [
       "allow",
       "dirty_overlap",

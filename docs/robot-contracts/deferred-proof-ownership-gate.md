@@ -15,6 +15,8 @@ was valid yesterday can be unsafe today when:
 
 - current dirty paths overlap the receipt ownership slice;
 - an active non-stale in-progress bead owns the same paths;
+- a stale in-progress owner still overlaps and needs explicit tracker cleanup;
+- another queued receipt also owns one or more of the same paths;
 - Agent Mail is unavailable and no fallback coordination snapshot exists;
 - prerequisite beads are still open, blocked, or in progress;
 - the receipt freshness window has expired; or
@@ -30,9 +32,9 @@ comments by hand.
 | --- | --- |
 | `allow` | Ownership is clean and the receipt may be replayed. |
 | `wait` | Ownership is clean, but RCH or shared tracker state says to wait. |
-| `stale` | The receipt is outside its freshness window and must be regenerated. |
+| `stale` | The receipt or overlapping owner evidence is stale and must be regenerated or cleaned up. |
 | `dirty_overlap` | Current or captured dirty paths overlap the receipt-owned paths. |
-| `owner_handoff_required` | A non-stale in-progress owner overlaps the receipt-owned paths. |
+| `owner_handoff_required` | A non-stale in-progress owner or another queued receipt overlaps the receipt-owned paths. |
 | `prerequisite_blocked` | At least one prerequisite bead is not closed. |
 | `mail_state_unknown` | Neither Agent Mail state nor the documented fallback snapshot is available. |
 
@@ -43,8 +45,11 @@ Only `allow` may set `replay_allowed: true`.
 - Non-overlap dirty files are reportable context, not a reason to mutate them.
 - `.beads/issues.jsonl` dirty while Agent Mail is unavailable produces `wait`
   because tracker state cannot be safely bundled with proof replay.
-- Active overlapping owners produce `owner_handoff_required`; stale detection
-  requires explicit Beads evidence and must not be guessed from the filesystem.
+- Active overlapping owners produce `owner_handoff_required`; stale overlapping
+  owners produce `stale`; stale detection requires explicit Beads evidence and
+  must not be guessed from the filesystem.
+- Multiple queued receipts claiming the same path produce
+  `owner_handoff_required` until one receipt explicitly owns the path.
 - Dirty overlap produces `dirty_overlap` even if RCH is otherwise admissible.
 - Missing Agent Mail and missing fallback snapshot produces `mail_state_unknown`.
 - Material Cargo proof blocked by RCH admission produces `wait`; local Cargo is
@@ -78,6 +83,8 @@ The static verifier freezes these scenarios:
 - `prerequisite-blocked`
 - `mail-state-unknown`
 - `stale-receipt`
+- `stale-owner-overlap`
+- `owner-handoff-multiple-receipts`
 - `wait-shared-tracker-dirty`
 
 Run:

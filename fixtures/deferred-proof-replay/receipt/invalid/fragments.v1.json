@@ -402,13 +402,134 @@
       }
     },
     {
+      "case_id": "payload-env-not-allowlisted",
+      "expected_rejection": "env_not_allowlisted",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad9:payload-env-not-allowlisted",
+        "bead_id": "ft-bad9",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_TARGET_DIR=/tmp/ft-bad9",
+            "UNDECLARED_PAYLOAD_ENV=1",
+            "cargo",
+            "test"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_TARGET_DIR",
+            "RCH_REQUIRE_REMOTE",
+            "RCH_NO_SELF_HEALING"
+          ],
+          "target_dir": "/tmp/ft-bad9",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/rch_admission.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
+      "case_id": "target-dir-drift",
+      "expected_rejection": "target_dir_drift",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad10:target-dir-drift",
+        "bead_id": "ft-bad10",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_TARGET_DIR=/tmp/ft-bad10-other",
+            "cargo",
+            "test"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_TARGET_DIR",
+            "RCH_REQUIRE_REMOTE",
+            "RCH_NO_SELF_HEALING"
+          ],
+          "target_dir": "/tmp/ft-bad10",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/rch_admission.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": true
+        }
+      }
+    },
+    {
       "case_id": "unsafe-artifact-path",
       "expected_rejection": "unsafe_artifact_path",
       "receipt": {
         "schema_version": 1,
         "contract_id": "ft.deferred_proof_receipt.v1",
-        "receipt_id": "ft-bad9:unsafe-artifact",
-        "bead_id": "ft-bad9",
+        "receipt_id": "ft-bad11:unsafe-artifact",
+        "bead_id": "ft-bad11",
         "command": {
           "command_shape_version": "static-verifier-v1",
           "argv": [

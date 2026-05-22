@@ -35,6 +35,7 @@
           "agent_mail_state": "green",
           "agent_mail_fallback_snapshot": false,
           "in_progress_owners": [],
+          "queued_receipt_owners": [],
           "prerequisite_beads": []
         },
         "rch_admission": {
@@ -89,6 +90,7 @@
           "agent_mail_state": "unavailable",
           "agent_mail_fallback_snapshot": true,
           "in_progress_owners": [],
+          "queued_receipt_owners": [],
           "prerequisite_beads": []
         },
         "rch_admission": {
@@ -151,6 +153,7 @@
           "agent_mail_state": "green",
           "agent_mail_fallback_snapshot": false,
           "in_progress_owners": [],
+          "queued_receipt_owners": [],
           "prerequisite_beads": []
         },
         "rch_admission": {
@@ -221,6 +224,7 @@
               ]
             }
           ],
+          "queued_receipt_owners": [],
           "prerequisite_beads": []
         },
         "rch_admission": {
@@ -276,6 +280,7 @@
           "agent_mail_state": "green",
           "agent_mail_fallback_snapshot": false,
           "in_progress_owners": [],
+          "queued_receipt_owners": [],
           "prerequisite_beads": [
             {
               "bead_id": "ft-5xwsu.3",
@@ -335,6 +340,7 @@
           "agent_mail_state": "unknown",
           "agent_mail_fallback_snapshot": false,
           "in_progress_owners": [],
+          "queued_receipt_owners": [],
           "prerequisite_beads": []
         },
         "rch_admission": {
@@ -389,6 +395,7 @@
           "agent_mail_state": "green",
           "agent_mail_fallback_snapshot": false,
           "in_progress_owners": [],
+          "queued_receipt_owners": [],
           "prerequisite_beads": []
         },
         "rch_admission": {
@@ -418,6 +425,135 @@
       }
     },
     {
+      "case_id": "stale-owner-overlap",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:stale-owner-overlap",
+        "receipt_id": "ft-old77:stale-owner-proof",
+        "bead_id": "ft-old77",
+        "evaluated_at": "2026-05-19T02:42:07Z",
+        "receipt": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/recorder_storage.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "swarm_tick_fallback",
+          "dirty_paths": [],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "unavailable",
+          "agent_mail_fallback_snapshot": true,
+          "in_progress_owners": [
+            {
+              "bead_id": "ft-old77",
+              "assignee": "DormantAgent",
+              "updated_at": "2026-05-18T22:30:00Z",
+              "stale_over_2h": true,
+              "owned_paths": [
+                "crates/frankenterm-core/src/recorder_storage.rs"
+              ]
+            }
+          ],
+          "queued_receipt_owners": [],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "not_required",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "stale",
+          "replay_allowed": false,
+          "reason_codes": [
+            "owner.stale_overlap",
+            "agent_mail.fallback_active"
+          ],
+          "explanation": "A stale in-progress owner still overlaps the receipt paths; clean up or reassign the tracker state before replay."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
+      "case_id": "owner-handoff-multiple-receipts",
+      "gate": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_ownership_gate.v1",
+        "gate_id": "ft-zbnz4.3:owner-handoff-multiple-receipts",
+        "receipt_id": "ft-dupe1:receipt-a",
+        "bead_id": "ft-dupe1",
+        "evaluated_at": "2026-05-19T02:42:08Z",
+        "receipt": {
+          "owned_paths": [
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "dirty_paths_at_capture": [],
+          "freshness_state": "fresh",
+          "replay_allowed_before_gate": true
+        },
+        "current_checkout": {
+          "git_status_source": "git_status_short",
+          "dirty_paths": [],
+          "shared_tracker_dirty": false
+        },
+        "coordination": {
+          "agent_mail_state": "green",
+          "agent_mail_fallback_snapshot": false,
+          "in_progress_owners": [],
+          "queued_receipt_owners": [
+            {
+              "receipt_id": "ft-dupe2:receipt-b",
+              "bead_id": "ft-dupe2",
+              "owned_paths": [
+                "tests/e2e/test_deferred_proof_receipt_contract.sh"
+              ]
+            }
+          ],
+          "prerequisite_beads": []
+        },
+        "rch_admission": {
+          "state": "not_required",
+          "selected_worker": null
+        },
+        "decision": {
+          "state": "owner_handoff_required",
+          "replay_allowed": false,
+          "reason_codes": [
+            "receipt.multiple_owner_overlap"
+          ],
+          "explanation": "Another queued receipt owns the same path, so one receipt must be explicitly selected before replay."
+        },
+        "forbidden_actions": [
+          "delete_files",
+          "destructive_git",
+          "stash_or_reset_worktree",
+          "broad_formatting",
+          "local_cargo_proof",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "build_cancellation",
+          "prove_unowned_dirty_work"
+        ]
+      }
+    },
+    {
       "case_id": "wait-shared-tracker-dirty",
       "gate": {
         "schema_version": 1,
@@ -425,7 +561,7 @@
         "gate_id": "ft-zbnz4.3:wait-shared-tracker-dirty",
         "receipt_id": "ft-trk77:tracker-dirty",
         "bead_id": "ft-trk77",
-        "evaluated_at": "2026-05-19T02:42:07Z",
+        "evaluated_at": "2026-05-19T02:42:09Z",
         "receipt": {
           "owned_paths": [
             "tests/e2e/test_deferred_proof_receipt_contract.sh"
@@ -449,6 +585,7 @@
           "agent_mail_state": "unavailable",
           "agent_mail_fallback_snapshot": true,
           "in_progress_owners": [],
+          "queued_receipt_owners": [],
           "prerequisite_beads": []
         },
         "rch_admission": {

@@ -143,6 +143,7 @@
         "agent_mail_state",
         "agent_mail_fallback_snapshot",
         "in_progress_owners",
+        "queued_receipt_owners",
         "prerequisite_beads"
       ],
       "additionalProperties": false,
@@ -158,6 +159,13 @@
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/in_progress_owner"
+          }
+        },
+        "queued_receipt_owners": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/queued_receipt_owner"
           }
         },
         "prerequisite_beads": {
@@ -254,6 +262,32 @@
         },
         "owned_paths": {
           "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        }
+      }
+    },
+    "queued_receipt_owner": {
+      "type": "object",
+      "required": [
+        "receipt_id",
+        "bead_id",
+        "owned_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "receipt_id": {
+          "type": "string",
+          "pattern": "^ft-[a-z0-9][a-z0-9.-]*:[a-z0-9][a-z0-9._-]*$"
+        },
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "owned_paths": {
+          "type": "array",
+          "minItems": 1,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/path"
