@@ -58,9 +58,10 @@ impl PipelineRun {
     ///
     /// # Invariants checked:
     /// 1. Stages are in pipeline order.
-    /// 2. Timestamps are non-decreasing.
-    /// 3. Total latency matches sum of stage latencies (within tolerance).
-    /// 4. has_overflow matches any stage overflow.
+    /// 2. Timestamps are non-decreasing within and across stages.
+    /// 3. Latencies are finite and non-negative.
+    /// 4. Total latency matches sum of stage latencies (within tolerance).
+    /// 5. has_overflow matches any stage overflow.
     pub fn validate(&self) -> Result<(), Vec<InvariantViolation>> {
         let mut violations = Vec::new();
 
@@ -74,7 +75,18 @@ impl PipelineRun {
             }
         }
 
-        // Check timestamp monotonicity.
+        // Check per-stage timestamp intervals.
+        for stage in &self.stages {
+            if stage.end_epoch_us < stage.start_epoch_us {
+                violations.push(InvariantViolation::StageTimestampRegression {
+                    stage: stage.stage,
+                    start_epoch_us: stage.start_epoch_us,
+                    end_epoch_us: stage.end_epoch_us,
+                });
+            }
+        }
+
+        // Check cross-stage timestamp monotonicity.
         for window in self.stages.windows(2) {
             if window[0].end_epoch_us > window[1].start_epoch_us {
                 violations.push(InvariantViolation::TimestampRegression {
@@ -85,14 +97,53 @@ impl PipelineRun {
             }
         }
 
-        // Check total latency consistency.
-        let sum: f64 = self.stages.iter().map(|s| s.latency_us).sum();
-        let tolerance = 100.0; // 100μs tolerance for measurement overhead
-        if (self.total_latency_us - sum).abs() > tolerance {
-            violations.push(InvariantViolation::TotalMismatch {
-                declared: self.total_latency_us,
-                computed: sum,
+        // Check latency values before any arithmetic. NaN comparisons are
+        // always false, so total-mismatch validation must not see them first.
+        let mut latency_values_valid = true;
+        for stage in &self.stages {
+            if !stage.latency_us.is_finite() {
+                latency_values_valid = false;
+                violations.push(InvariantViolation::InvalidLatency {
+                    stage: Some(stage.stage),
+                    field: "latency_us".to_string(),
+                    reason: "must be finite".to_string(),
+                });
+            } else if stage.latency_us < 0.0 {
+                latency_values_valid = false;
+                violations.push(InvariantViolation::InvalidLatency {
+                    stage: Some(stage.stage),
+                    field: "latency_us".to_string(),
+                    reason: "must be non-negative".to_string(),
+                });
+            }
+        }
+
+        if !self.total_latency_us.is_finite() {
+            latency_values_valid = false;
+            violations.push(InvariantViolation::InvalidLatency {
+                stage: None,
+                field: "total_latency_us".to_string(),
+                reason: "must be finite".to_string(),
             });
+        } else if self.total_latency_us < 0.0 {
+            latency_values_valid = false;
+            violations.push(InvariantViolation::InvalidLatency {
+                stage: None,
+                field: "total_latency_us".to_string(),
+                reason: "must be non-negative".to_string(),
+            });
+        }
+
+        // Check total latency consistency.
+        if latency_values_valid {
+            let sum: f64 = self.stages.iter().map(|s| s.latency_us).sum();
+            let tolerance = 100.0; // 100μs tolerance for measurement overhead
+            if (self.total_latency_us - sum).abs() > tolerance {
+                violations.push(InvariantViolation::TotalMismatch {
+                    declared: self.total_latency_us,
+                    computed: sum,
+                });
+            }
         }
 
         // Check overflow flag consistency.
@@ -126,8 +177,20 @@ pub enum InvariantViolation {
         previous_end: u64,
         current_start: u64,
     },
+    /// A single stage ended before it started.
+    StageTimestampRegression {
+        stage: LatencyStage,
+        start_epoch_us: u64,
+        end_epoch_us: u64,
+    },
     /// Declared total doesn't match sum of stages.
     TotalMismatch { declared: f64, computed: f64 },
+    /// A stage or aggregate latency was non-finite or negative.
+    InvalidLatency {
+        stage: Option<LatencyStage>,
+        field: String,
+        reason: String,
+    },
     /// Overflow flag doesn't match stage overflow states.
     OverflowFlagMismatch { declared: bool, computed: bool },
     /// Budget target is negative.
@@ -156,11 +219,30 @@ impl fmt::Display for InvariantViolation {
                 f,
                 "Timestamp regression at {stage}: prev_end={previous_end} > start={current_start}"
             ),
+            Self::StageTimestampRegression {
+                stage,
+                start_epoch_us,
+                end_epoch_us,
+            } => write!(
+                f,
+                "Timestamp regression within {stage}: end={end_epoch_us} < start={start_epoch_us}"
+            ),
             Self::TotalMismatch { declared, computed } => {
                 write!(
                     f,
                     "Total latency mismatch: declared={declared:.1}μs, computed={computed:.1}μs"
                 )
+            }
+            Self::InvalidLatency {
+                stage,
+                field,
+                reason,
+            } => {
+                if let Some(stage) = stage {
+                    write!(f, "Invalid latency for {stage}.{field}: {reason}")
+                } else {
+                    write!(f, "Invalid latency for run.{field}: {reason}")
+                }
             }
             Self::OverflowFlagMismatch { declared, computed } => {
                 write!(

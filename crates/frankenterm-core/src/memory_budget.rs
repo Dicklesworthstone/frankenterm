@@ -186,6 +186,22 @@ impl Default for MemoryBudgetConfig {
     }
 }
 
+impl MemoryBudgetConfig {
+    #[must_use]
+    fn normalized(mut self) -> Self {
+        self.high_ratio = normalize_high_ratio(self.high_ratio);
+        self
+    }
+}
+
+fn normalize_high_ratio(high_ratio: f64) -> f64 {
+    if high_ratio.is_nan() {
+        MemoryBudgetConfig::default().high_ratio
+    } else {
+        high_ratio.clamp(0.0, 1.0)
+    }
+}
+
 // =============================================================================
 // Per-pane budget state
 // =============================================================================
@@ -212,6 +228,7 @@ pub struct PaneBudget {
 impl PaneBudget {
     /// Create a new budget entry for a pane.
     fn new(pane_id: u64, budget_bytes: u64, high_ratio: f64) -> Self {
+        let high_ratio = normalize_high_ratio(high_ratio);
         let high_bytes = (budget_bytes as f64 * high_ratio) as u64;
         Self {
             pane_id,
@@ -289,6 +306,7 @@ pub struct MemoryBudgetManager {
 impl MemoryBudgetManager {
     /// Create a new manager with the given configuration.
     pub fn new(config: MemoryBudgetConfig) -> Self {
+        let config = config.normalized();
         Self {
             config,
             panes: Mutex::new(HashMap::new()),
@@ -808,6 +826,22 @@ mod tests {
         assert_eq!(parsed.use_cgroups, cfg.use_cgroups);
     }
 
+    #[test]
+    fn manager_normalizes_nan_high_ratio_to_default() {
+        let cfg = MemoryBudgetConfig {
+            high_ratio: f64::NAN,
+            ..test_config()
+        };
+        let mgr = MemoryBudgetManager::new(cfg);
+
+        assert!(
+            (mgr.config().high_ratio - MemoryBudgetConfig::default().high_ratio).abs()
+                < f64::EPSILON
+        );
+        let budget = mgr.register_pane_with_budget(9, None, 1000);
+        assert_eq!(budget.high_bytes, 800);
+    }
+
     // ---- PaneBudget ----
 
     #[test]
@@ -1220,6 +1254,18 @@ mod tests {
         // ratio 0.0 means high == 0
         let b2 = PaneBudget::new(2, 1000, 0.0);
         assert_eq!(b2.high_bytes, 0);
+    }
+
+    #[test]
+    fn pane_budget_normalizes_invalid_high_ratio_before_deriving_high_bytes() {
+        let nan = PaneBudget::new(1, 1000, f64::NAN);
+        assert_eq!(nan.high_bytes, 800);
+
+        let too_high = PaneBudget::new(2, 1000, 2.0);
+        assert_eq!(too_high.high_bytes, 1000);
+
+        let negative = PaneBudget::new(3, 1000, -0.5);
+        assert_eq!(negative.high_bytes, 0);
     }
 
     #[test]

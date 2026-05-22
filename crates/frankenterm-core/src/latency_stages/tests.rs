@@ -513,6 +513,22 @@ fn test_pipeline_run_detects_timestamp_regression() {
 }
 
 #[test]
+fn test_pipeline_run_detects_stage_timestamp_regression() {
+    let mut run = make_valid_run();
+    run.stages[0].end_epoch_us = run.stages[0].start_epoch_us - 1;
+    let result = run.validate();
+    assert!(result.is_err());
+    let violations = result.unwrap_err();
+    assert!(violations.iter().any(|v| matches!(
+        v,
+        InvariantViolation::StageTimestampRegression {
+            stage: LatencyStage::PtyCapture,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn test_pipeline_run_detects_total_mismatch() {
     let mut run = make_valid_run();
     run.total_latency_us = 999_999.0; // way off
@@ -524,6 +540,64 @@ fn test_pipeline_run_detects_total_mismatch() {
             .iter()
             .any(|v| matches!(v, InvariantViolation::TotalMismatch { .. }))
     );
+}
+
+#[test]
+fn test_pipeline_run_rejects_non_finite_latency() {
+    let mut run = make_valid_run();
+    run.stages[0].latency_us = f64::NAN;
+    run.total_latency_us = f64::NAN;
+    let result = run.validate();
+    assert!(result.is_err());
+    let violations = result.unwrap_err();
+    assert!(violations.iter().any(|v| matches!(
+        v,
+        InvariantViolation::InvalidLatency {
+            stage: Some(LatencyStage::PtyCapture),
+            field,
+            reason,
+        } if field == "latency_us" && reason == "must be finite"
+    )));
+    assert!(violations.iter().any(|v| matches!(
+        v,
+        InvariantViolation::InvalidLatency {
+            stage: None,
+            field,
+            reason,
+        } if field == "total_latency_us" && reason == "must be finite"
+    )));
+    assert!(
+        !violations
+            .iter()
+            .any(|v| matches!(v, InvariantViolation::TotalMismatch { .. })),
+        "non-finite values should fail before total-mismatch arithmetic"
+    );
+}
+
+#[test]
+fn test_pipeline_run_rejects_negative_latency() {
+    let mut run = make_valid_run();
+    run.stages[0].latency_us = -1.0;
+    run.total_latency_us = -1.0;
+    let result = run.validate();
+    assert!(result.is_err());
+    let violations = result.unwrap_err();
+    assert!(violations.iter().any(|v| matches!(
+        v,
+        InvariantViolation::InvalidLatency {
+            stage: Some(LatencyStage::PtyCapture),
+            field,
+            reason,
+        } if field == "latency_us" && reason == "must be non-negative"
+    )));
+    assert!(violations.iter().any(|v| matches!(
+        v,
+        InvariantViolation::InvalidLatency {
+            stage: None,
+            field,
+            reason,
+        } if field == "total_latency_us" && reason == "must be non-negative"
+    )));
 }
 
 #[test]

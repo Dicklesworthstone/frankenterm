@@ -513,15 +513,20 @@ impl DiskPressureMonitor {
     /// Take a disk-space sample.
     #[must_use]
     pub fn sample(&self) -> DiskSample {
-        let (available_bytes, total_bytes) = read_disk_space_statvfs(&self.config.root_path)
-            .or_else(|| read_disk_space_df(&self.config.root_path))
-            .unwrap_or((0, 0));
+        let disk_space = read_disk_space_statvfs(&self.config.root_path)
+            .or_else(|| read_disk_space_df(&self.config.root_path));
 
-        let usage_fraction = if total_bytes == 0 {
-            0.0
-        } else {
-            let available = available_bytes.min(total_bytes);
-            (1.0 - (available as f64 / total_bytes as f64)).clamp(0.0, 1.0)
+        let (available_bytes, total_bytes, usage_fraction) = match disk_space {
+            Some((available_bytes, total_bytes)) if total_bytes > 0 => {
+                let available = available_bytes.min(total_bytes);
+                (
+                    available_bytes,
+                    total_bytes,
+                    (1.0 - (available as f64 / total_bytes as f64)).clamp(0.0, 1.0),
+                )
+            }
+            Some((available_bytes, total_bytes)) => (available_bytes, total_bytes, f64::NAN),
+            None => (0, 0, f64::NAN),
         };
 
         DiskSample {
@@ -738,6 +743,7 @@ mod tests {
         DiskPressureConfig, DiskPressureMonitor, DiskPressureTier, DiskSample, EwmaEstimator,
         PidController, PressureThresholds, classify_tier, parse_df_data_line, parse_df_output_kib,
     };
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     fn assert_f64_close(actual: f64, expected: f64) {
@@ -1079,6 +1085,33 @@ mod tests {
         assert!(sample.usage_fraction >= 0.0);
         assert!(sample.usage_fraction <= 1.0);
         assert!(sample.total_bytes >= sample.available_bytes);
+    }
+
+    #[test]
+    fn monitor_sample_unreadable_root_fails_closed_as_nan_usage() {
+        let monitor = DiskPressureMonitor::new(DiskPressureConfig {
+            root_path: PathBuf::from("/definitely/not/a/frankenterm/disk-pressure/root"),
+            ..DiskPressureConfig::default()
+        });
+
+        let sample = monitor.sample();
+        assert_eq!(sample.available_bytes, 0);
+        assert_eq!(sample.total_bytes, 0);
+        assert!(sample.usage_fraction.is_nan());
+    }
+
+    #[test]
+    fn monitor_update_from_unreadable_root_reports_black() {
+        let mut monitor = DiskPressureMonitor::new(DiskPressureConfig {
+            root_path: PathBuf::from("/definitely/not/a/frankenterm/disk-pressure/root"),
+            ..DiskPressureConfig::default()
+        });
+
+        assert_eq!(monitor.update(), DiskPressureTier::Black);
+        assert_eq!(monitor.current_tier(), DiskPressureTier::Black);
+        let telemetry = monitor.telemetry().snapshot();
+        assert_eq!(telemetry.updates, 1);
+        assert_eq!(telemetry.tier_black, 1);
     }
 
     #[test]
