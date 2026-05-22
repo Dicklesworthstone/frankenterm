@@ -11,7 +11,7 @@ Organized by landed capabilities, not raw diff order. Each section describes wha
 
 ## [0.1.0] -- 2026-04-11
 
-First tagged release. Establishes the baseline for what works, what is feature-gated, and what is in progress.
+First feature-complete changelog baseline. Establishes what works, what is feature-gated, and what is in progress.
 
 ### Working (passes end-to-end)
 
@@ -58,9 +58,19 @@ CC=$(xcrun --find clang) CXX=$(xcrun --find clang++) cargo install ...
 
 ---
 
-## [Unreleased] -- development on `main` since v0.1.0
+## [Unreleased] -- development on `main` since the 0.1.0 baseline
 
-> Continued development after the v0.1.0 baseline. Roughly 2,700 commits land between 2026-05-01 and 2026-05-16 across the concurrent agent swarm.
+> Continued development after the 0.1.0 baseline. Roughly 3,550 commits land on `origin/main` between 2026-05-01 and 2026-05-18 across the concurrent agent swarm, with 3,558 commits in the same window on local `main`. Current local `main` is eight commits ahead of `origin/main`; entries marked local-only are not yet GitHub-live.
+
+### RCH pressure, Agent Mail failover, and static proof hardening (2026-05-18)
+
+The newest swarm-operations work turns recurring pressure incidents into explicit, replayable contracts. RCH proof lanes now document why workers are rejected, Agent Mail outages have a no-service fallback path, and the static/golden fixture corpus keeps expanding around proof artifacts that used to live only in operator memory.
+
+- **Worker-storage recovery contracts** — inventory, approval, recovery-proof gate, and operator runbook coverage landed for the RCH worker-storage path ([`0ac9e6260`](https://github.com/Dicklesworthstone/frankenterm/commit/0ac9e6260), [`2f0ebc284`](https://github.com/Dicklesworthstone/frankenterm/commit/2f0ebc284), [`22f9b4ae5`](https://github.com/Dicklesworthstone/frankenterm/commit/22f9b4ae5), [`6a54ffa24`](https://github.com/Dicklesworthstone/frankenterm/commit/6a54ffa24)); the recovery proof command was then canonicalized to the remote-only RCH lane ([`0a8fd958f`](https://github.com/Dicklesworthstone/frankenterm/commit/0a8fd958f)). A follow-up command fixture fix exists locally as `0f60d92d8` and is intentionally unlinked until pushed.
+- **Agent Mail failover became a tested path** — the failover plan now has a snapshot contract, retry classifiers, no-service gate, stale-reopen policy, runbook, completion audit, and retained verifier coverage ([`b2503e532`](https://github.com/Dicklesworthstone/frankenterm/commit/b2503e532), [`eefe81974`](https://github.com/Dicklesworthstone/frankenterm/commit/eefe81974), [`c3dd5fd3c`](https://github.com/Dicklesworthstone/frankenterm/commit/c3dd5fd3c), [`a279a0de3`](https://github.com/Dicklesworthstone/frankenterm/commit/a279a0de3), [`42446024e`](https://github.com/Dicklesworthstone/frankenterm/commit/42446024e), [`b96809e31`](https://github.com/Dicklesworthstone/frankenterm/commit/b96809e31), [`77b744062`](https://github.com/Dicklesworthstone/frankenterm/commit/77b744062)).
+- **Static/golden proof corpus widened** — negative fixtures and artifact-path hardening now cover operating-envelope, mission-planner, RCH worker inventory/approval, task-fit passports, provider quotas, capacity signals, resource cockpit, and disk-guard proof artifacts ([`2c0149e18`](https://github.com/Dicklesworthstone/frankenterm/commit/2c0149e18), [`6600907ab`](https://github.com/Dicklesworthstone/frankenterm/commit/6600907ab), [`18acdbf63`](https://github.com/Dicklesworthstone/frankenterm/commit/18acdbf63), [`70f9784f8`](https://github.com/Dicklesworthstone/frankenterm/commit/70f9784f8), [`f21d3e897`](https://github.com/Dicklesworthstone/frankenterm/commit/f21d3e897)). The local `56382ae10` verifier-command pin is not linked until it is pushed.
+- **Poison-lock and edge-case correctness sweep** — recovery/guard fixes landed across Wayland, X11, scripting, replay, storage, mux, windowing, PTY, font, ARS, promise, event-stream, IO, resize, WASM, audit, and core surfaces; representative correctness fixes include sender-callback lock release, sparse logical-line lookup guards, image byte-count hardening, clipboard pipe IO hardening, and RCH admission scope filtering ([`e2751a849`](https://github.com/Dicklesworthstone/frankenterm/commit/e2751a849), [`ff41a0717`](https://github.com/Dicklesworthstone/frankenterm/commit/ff41a0717), [`e17d09d4f`](https://github.com/Dicklesworthstone/frankenterm/commit/e17d09d4f), [`ddff66f45`](https://github.com/Dicklesworthstone/frankenterm/commit/ddff66f45), [`21a40b110`](https://github.com/Dicklesworthstone/frankenterm/commit/21a40b110)). Local setup-marker validation exists as `d3f4abd94` pending RCH proof/push coordination.
+- **Proof-policy and count refreshes** — docs now require remote-only RCH proof commands, while README/count placeholders and agent-count attestations were restamped from live repository measurements ([`d1db65e42`](https://github.com/Dicklesworthstone/frankenterm/commit/d1db65e42), [`2a9baee39`](https://github.com/Dicklesworthstone/frankenterm/commit/2a9baee39), [`1f2c52002`](https://github.com/Dicklesworthstone/frankenterm/commit/1f2c52002), [`de8b84395`](https://github.com/Dicklesworthstone/frankenterm/commit/de8b84395)). Local-only follow-ups currently cover retained proof commands, NTM proof examples, operator proof examples, RCH admission no-service fixture commands, and README/AGENTS proof examples (`474e7d4c`, `d1938a57a`, `cac9dddb0`, `c803631f`, `48cfde4e`) pending push coordination.
 
 ### Operating envelope + incident-bundle plumbing (2026-05-10 -- 2026-05-16)
 
@@ -650,6 +660,8 @@ Migration: re-run `ft setup --wezterm` to update your `wezterm.lua`. The ft-mana
 
 ## Tags & Releases
 
+Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are changelog milestones reconstructed from history, not published GitHub Releases.
+
 | Tag / Ref | Type | Date | Points to | Description |
 |-----------|------|------|-----------|-------------|
 | `backup-before-rewrite` | Git tag (no GitHub Release) | 2026-02-17 | [`888c17d0`](https://github.com/Dicklesworthstone/frankenterm/commit/888c17d0da2564269df114e4c5d9ecfd8edf85c5) | Snapshot before the major WezTerm source import and codebase rewrite |
@@ -664,7 +676,7 @@ There are no GitHub Releases published for this repository.
 |------|-----------|
 | 2026-01-18 | First commit. Workspace setup, core library, CLI binary, WezTerm client. |
 | 2026-01-19 | Rapid feature buildout: FTS, events, patterns, policy, workflows, robot mode, IPC, CI. |
-| 2026-01-25 | v0.1.0 feature set complete. Agent friendliness report, suggestions engine. |
+| 2026-01-25 | 0.1.0 feature set complete. Agent friendliness report, suggestions engine. |
 | 2026-01-27 | Curl-bash installer, doctor command, action plans, risk scoring. |
 | 2026-01-28 | Remove Lua status hook (BREAKING). SSH setup, chaos testing, backup export/import. |
 | 2026-01-29 | Triage command, pane reservations, browser automation, CASS CLI, data export. |
@@ -688,14 +700,14 @@ There are no GitHub Releases published for this repository.
 | 2026-03-13 | Transaction execution engine. Input-to-display latency framework. |
 | 2026-03-17 | Distributed checkpoint save/restore. Replay forensics with sensitivity tiers. |
 | 2026-03-20 | CASS export feature. 92+ proptest serde roundtrip suites. |
-| 2026-04-11 | **v0.1.0** tagged. First feature-complete baseline. |
+| 2026-04-11 | **0.1.0** changelog baseline. First feature-complete baseline. |
 | 2026-04-12 | Native asupersync cutover begins. tokio dual-runtime seams retired. |
 | 2026-04-25 | Sub-crate carving wave begins (ft-y0loj.*). `frankenterm-core` shedding leaves. |
 | 2026-05-01 | Doctrine epic closes (ft-i2eni): RuntimeProof sealed trait, asupersync_test! macro, cargo-deny tokio ban, vendored fork rename complete. |
 | 2026-05-02 | Substrate audit waves (rubber-stamp `is_safe`, public-field bypass, NaN/sanitization) sweep across the codebase. |
 | 2026-05-10 | Operating-envelope contract (ft-booek) + incident-bundle live collectors (ft-9sy9e family) land. |
 | 2026-05-12 | Reality-check round 2 (ft-tf6g3) opens — final-mile convergence: attestation graph, renderer SLO suite, round-3 statistical elevations. |
-| 2026-05-16 | HEAD. 10,156 total commits (8,271 since `backup-before-rewrite`). 77 workspace members (28 first-party + 47 vendored). 509 top-level core modules. ~1.01M LOC across the core. 952 core test files, 111 Criterion benches, 48 fuzz targets, 265 E2E shell scripts, 426 docs. |
+| 2026-05-18 | HEAD/local `main`. 10,554 total commits; 3,558 since 2026-05-01 locally and 3,550 on `origin/main`. 77 workspace members. 512 top-level core modules. 1,481 tracked core test files, 56 fuzz target files, 265 E2E shell scripts, 628 tracked docs. Local `main` is ahead of `origin/main` by eight commits pending RCH proof/push coordination. |
 
 ---
 
