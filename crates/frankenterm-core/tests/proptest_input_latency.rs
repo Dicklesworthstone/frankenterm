@@ -320,6 +320,72 @@ proptest! {
         prop_assert!(p99 <= p999, "p99 ({p99}) > p999 ({p999})");
     }
 
+    /// Nearest-rank never interpolates: the result must be an actual
+    /// element of the input slice (true even with duplicate values).
+    #[test]
+    fn percentile_nearest_rank_result_is_member(
+        vals in prop::collection::vec(0..1_000_000u64, 1..50),
+        p in arb_percentile(),
+    ) {
+        let mut sorted = vals;
+        sorted.sort_unstable();
+        let result = percentile_nearest_rank(&sorted, p).unwrap();
+        prop_assert!(
+            sorted.contains(&result),
+            "nearest-rank result {result} is not a member of the input slice"
+        );
+    }
+
+    /// The selected value is bounded by the slice min and max for every
+    /// percentile — a percentile can never escape the observed range.
+    #[test]
+    fn percentile_nearest_rank_within_bounds(
+        vals in prop::collection::vec(0..1_000_000u64, 1..50),
+        p in arb_percentile(),
+    ) {
+        let mut sorted = vals;
+        sorted.sort_unstable();
+        let min = *sorted.first().unwrap();
+        let max = *sorted.last().unwrap();
+        let result = percentile_nearest_rank(&sorted, p).unwrap();
+        prop_assert!(min <= result, "result {result} below min {min}");
+        prop_assert!(result <= max, "result {result} above max {max}");
+    }
+
+    /// A constant slice has the same value at every rank, so every
+    /// percentile must return that constant regardless of length.
+    #[test]
+    fn percentile_nearest_rank_constant_slice(
+        val in 0..1_000_000u64,
+        len in 1..50usize,
+        p in arb_percentile(),
+    ) {
+        let slice = vec![val; len];
+        prop_assert_eq!(percentile_nearest_rank(&slice, p), Some(val));
+    }
+
+    /// Metamorphic relation: adding a constant offset to every element
+    /// preserves ordering, so it must shift the selected percentile by
+    /// exactly that offset (order-preserving translation commutes with
+    /// nearest-rank selection). Offsets stay within u64 to avoid overflow.
+    #[test]
+    fn percentile_nearest_rank_commutes_with_translation(
+        vals in prop::collection::vec(0..1_000_000u64, 1..50),
+        offset in 0..1_000_000u64,
+        p in arb_percentile(),
+    ) {
+        let mut sorted = vals;
+        sorted.sort_unstable();
+        let base = percentile_nearest_rank(&sorted, p).unwrap();
+        let shifted: Vec<u64> = sorted.iter().map(|v| v + offset).collect();
+        let shifted_result = percentile_nearest_rank(&shifted, p).unwrap();
+        prop_assert_eq!(
+            shifted_result,
+            base + offset,
+            "translation by {offset} must shift the percentile by the same amount"
+        );
+    }
+
     #[test]
     fn budget_default_has_aggregate_targets(_dummy in 0u8..1) {
         let budget = InputLatencyBudget::default();
