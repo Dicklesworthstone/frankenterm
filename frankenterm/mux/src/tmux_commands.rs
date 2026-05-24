@@ -744,6 +744,66 @@ fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
     Ok(num)
 }
 
+fn parse_list_pane_item(line: &str) -> anyhow::Result<Option<PaneItem>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut fields = line.split_whitespace();
+    // These ids all have various sigils such as `$`, `%`, `@`,
+    // so skip those prior to parsing them
+    let session_id =
+        parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
+    let window_id = parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
+    let pane_id = parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing pane_id"))?)?;
+    let _pane_index = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_index"))?
+        .parse()?;
+    let cursor_x = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing cursor_x"))?
+        .parse()?;
+    let cursor_y = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing cursor_y"))?
+        .parse()?;
+    let pane_width = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_width"))?
+        .parse()?;
+    let pane_height = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_height"))?
+        .parse()?;
+    let pane_left = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_left"))?
+        .parse()?;
+    let pane_top = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_top"))?
+        .parse()?;
+    let pane_active = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_active"))?
+        .parse::<usize>()?;
+
+    Ok(Some(PaneItem {
+        session_id,
+        window_id,
+        pane_id,
+        _pane_index,
+        cursor_x,
+        cursor_y,
+        pane_width,
+        pane_height,
+        pane_left,
+        pane_top,
+        pane_active: pane_active == 1,
+    }))
+}
+
 #[derive(Debug)]
 pub(crate) struct ListAllPanes {
     pub window_id: TmuxWindowId,
@@ -795,69 +855,13 @@ impl TmuxCommand for ListAllPanes {
         }
         let mut items = vec![];
         let mut pane_set = HashSet::new();
-        for line in result.output.split('\n') {
-            if line.is_empty() {
+        for line in result.output.lines() {
+            let Some(item) = parse_list_pane_item(line)? else {
                 continue;
-            }
-            let mut fields = line.split(' ');
-            // These ids all have various sigils such as `$`, `%`, `@`,
-            // so skip those prior to parsing them
-            let session_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
-            let window_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
-            let pane_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing pane_id"))?)?;
-            let _pane_index = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_index"))?
-                .parse()?;
-            let cursor_x = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing cursor_x"))?
-                .parse()?;
-            let cursor_y = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing cursor_y"))?
-                .parse()?;
-            let pane_width = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_width"))?
-                .parse()?;
-            let pane_height = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_height"))?
-                .parse()?;
-            let pane_left = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_left"))?
-                .parse()?;
-            let pane_top = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_top"))?
-                .parse()?;
-            let pane_active = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_active"))?
-                .parse::<usize>()?;
-
-            let pane_active = pane_active == 1;
-
+            };
+            let pane_id = item.pane_id;
             pane_set.insert(pane_id);
-
-            items.push(PaneItem {
-                session_id,
-                window_id,
-                pane_id,
-                _pane_index,
-                cursor_x,
-                cursor_y,
-                pane_width,
-                pane_height,
-                pane_left,
-                pane_top,
-                pane_active,
-            });
+            items.push(item);
         }
 
         log::debug!("panes in domain_id {}: {:?}", domain_id, items);
@@ -1481,6 +1485,30 @@ mod tests {
     #[test]
     fn parse_sigil_number_rejects_unknown_prefix() {
         assert!(parse_sigil_number("x42").is_err());
+    }
+
+    #[test]
+    fn parse_list_pane_item_accepts_repeated_spaces() {
+        let item = parse_list_pane_item("  $7   @8   %9  2  10 20 80 24 0 1 1  ")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(item.session_id, 7);
+        assert_eq!(item.window_id, 8);
+        assert_eq!(item.pane_id, 9);
+        assert_eq!(item._pane_index, 2);
+        assert_eq!(item.cursor_x, 10);
+        assert_eq!(item.cursor_y, 20);
+        assert_eq!(item.pane_width, 80);
+        assert_eq!(item.pane_height, 24);
+        assert_eq!(item.pane_left, 0);
+        assert_eq!(item.pane_top, 1);
+        assert!(item.pane_active);
+    }
+
+    #[test]
+    fn parse_list_pane_item_skips_whitespace_only_lines() {
+        assert!(parse_list_pane_item("   \t  ").unwrap().is_none());
     }
 
     #[test]
