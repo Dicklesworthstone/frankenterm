@@ -200,7 +200,40 @@ pub struct FaultSpec {
 impl FaultSpec {
     /// Load from TOML string.
     pub fn from_toml(toml_str: &str) -> Result<Self, String> {
-        toml::from_str(toml_str).map_err(|e| format!("fault spec parse error: {e}"))
+        let spec: Self =
+            toml::from_str(toml_str).map_err(|e| format!("fault spec parse error: {e}"))?;
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Validate semantic constraints that TOML shape checks cannot express.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("fault spec name must not be empty".to_string());
+        }
+
+        for (index, fault) in self.faults.iter().enumerate() {
+            validate_filter(index, fault.filter())?;
+            match fault {
+                FaultType::Drop { probability, .. } => {
+                    if !probability.is_finite() || !(0.0..=1.0).contains(probability) {
+                        return Err(format!(
+                            "fault {index} drop probability must be finite and between 0.0 and 1.0"
+                        ));
+                    }
+                }
+                FaultType::Reorder { window_size, .. } => {
+                    if *window_size == 0 {
+                        return Err(format!("fault {index} reorder window_size must be > 0"));
+                    }
+                }
+                FaultType::Delay { .. }
+                | FaultType::Corrupt { .. }
+                | FaultType::Duplicate { .. } => {}
+            }
+        }
+
+        Ok(())
     }
 
     /// Number of faults.
@@ -208,6 +241,22 @@ impl FaultSpec {
     pub fn fault_count(&self) -> usize {
         self.faults.len()
     }
+}
+
+fn validate_filter(index: usize, filter: &EventFilter) -> Result<(), String> {
+    if let (Some(start), Some(end)) = (filter.time_range_start_ms, filter.time_range_end_ms) {
+        if start > end {
+            return Err(format!(
+                "fault {index} time range start_ms must be <= end_ms"
+            ));
+        }
+    }
+    if let (Some(start), Some(end)) = (filter.sequence_start, filter.sequence_end) {
+        if start > end {
+            return Err(format!("fault {index} sequence range start must be <= end"));
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -777,6 +826,53 @@ pane_id = "p1"
     fn parse_invalid_toml() {
         let result = FaultSpec::from_toml("not valid {{{");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_drop_probability() {
+        let toml = r#"
+name = "bad-drop"
+seed = 1
+
+[[faults]]
+type = "drop"
+probability = 1.5
+[faults.filter]
+"#;
+        let err = FaultSpec::from_toml(toml).unwrap_err();
+        assert!(err.contains("probability"));
+    }
+
+    #[test]
+    fn parse_rejects_zero_reorder_window() {
+        let toml = r#"
+name = "bad-reorder"
+seed = 1
+
+[[faults]]
+type = "reorder"
+window_size = 0
+[faults.filter]
+"#;
+        let err = FaultSpec::from_toml(toml).unwrap_err();
+        assert!(err.contains("window_size"));
+    }
+
+    #[test]
+    fn parse_rejects_inverted_filter_ranges() {
+        let toml = r#"
+name = "bad-range"
+seed = 1
+
+[[faults]]
+type = "delay"
+duration_ms = 10
+[faults.filter]
+time_range_start_ms = 200
+time_range_end_ms = 100
+"#;
+        let err = FaultSpec::from_toml(toml).unwrap_err();
+        assert!(err.contains("time range"));
     }
 
     // ── FaultInjector ───────────────────────────────────────────────────
