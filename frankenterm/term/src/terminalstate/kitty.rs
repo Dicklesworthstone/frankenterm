@@ -970,7 +970,11 @@ impl TerminalState {
             }
             (Some(id), None) => (id, None),
             (None, Some(no)) => {
-                let id = self.kitty_img.max_image_id + 1;
+                let id = self
+                    .kitty_img
+                    .max_image_id
+                    .checked_add(1)
+                    .context("kitty image id space exhausted")?;
                 self.kitty_img.number_to_id.insert(no, id);
                 (id, Some(no))
             }
@@ -1358,6 +1362,29 @@ mod tests {
         let mut state = KittyImageState::default();
         state.set_max_transmission_bytes(256 * 1024 * 1024);
         assert_eq!(state.max_transmission_bytes(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn kitty_image_number_allocation_rejects_id_overflow() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        terminal.kitty_img.max_image_id = u32::MAX;
+
+        let err = terminal
+            .kitty_img_transmit_inner(KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::DirectBin(vec![0u8; 4]),
+                width: Some(1),
+                height: Some(1),
+                image_id: None,
+                image_number: Some(9),
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+                alt_text: None,
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("image id space exhausted"));
+        assert!(!terminal.kitty_img.number_to_id.contains_key(&9));
     }
 
     #[test]
