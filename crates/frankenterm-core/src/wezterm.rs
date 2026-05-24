@@ -491,8 +491,14 @@ impl CwdInfo {
             return Self::default();
         }
 
-        // Handle file:// scheme
-        if let Some(rest) = uri.strip_prefix("file://") {
+        // Handle file:// scheme; URI schemes are case-insensitive.
+        const FILE_URI_SCHEME: &str = "file://";
+        if uri
+            .as_bytes()
+            .get(..FILE_URI_SCHEME.len())
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(FILE_URI_SCHEME.as_bytes()))
+        {
+            let rest = &uri[FILE_URI_SCHEME.len()..];
             // file:///path -> local (empty host, path starts with /)
             // file://host/path -> remote
             if rest.starts_with('/') {
@@ -4357,6 +4363,20 @@ mod tests {
         assert!(!cwd.is_remote);
         assert_eq!(cwd.host, "");
         assert_eq!(cwd.path, "");
+    }
+
+    #[test]
+    fn cwd_info_accepts_case_insensitive_file_scheme() {
+        let cwd = CwdInfo::parse("FILE://LOCALHOST/home/user/project");
+        assert!(!cwd.is_remote);
+        assert_eq!(cwd.host, "");
+        assert_eq!(cwd.path, "/home/user/project");
+        assert_eq!(cwd.raw_uri, "FILE://LOCALHOST/home/user/project");
+
+        let cwd = CwdInfo::parse("File://remote-server/home/user");
+        assert!(cwd.is_remote);
+        assert_eq!(cwd.host, "remote-server");
+        assert_eq!(cwd.path, "/home/user");
     }
 
     #[test]
