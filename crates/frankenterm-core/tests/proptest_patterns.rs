@@ -1060,6 +1060,22 @@ proptest! {
 
         prop_assert!(PatternLibrary::new(vec![pack]).is_err());
     }
+
+    #[test]
+    fn prop_library_rejects_empty_pack_name(rule_suffix in "[a-z]{3,10}") {
+        let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_NAME");
+        let pack = PatternPack::new(" \t ", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn prop_library_rejects_empty_pack_version(rule_suffix in "[a-z]{3,10}") {
+        let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_VERSION");
+        let pack = PatternPack::new("builtin:empty-version-test", " \t ", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
 }
 
 // ============================================================================
