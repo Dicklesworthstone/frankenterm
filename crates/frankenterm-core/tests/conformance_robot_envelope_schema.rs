@@ -443,6 +443,25 @@ fn synthetic_robot_envelope_with_wrong_mcp_version_must_fail() {
 }
 
 #[test]
+fn synthetic_robot_envelope_with_malformed_version_must_fail() {
+    let schema = load_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "pane_id": 7 },
+        "elapsed_ms": 5,
+        "version": "0.1.0 not-semver",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot envelopes whose `version` is not semver-shaped"
+    );
+}
+
+#[test]
 fn synthetic_robot_envelope_with_unknown_top_level_field_must_fail() {
     let schema = load_envelope_schema();
 
@@ -762,6 +781,26 @@ fn synthetic_mcp_envelope_with_wrong_mcp_version_must_fail() {
     assert!(
         result.is_err(),
         "validator MUST reject MCP envelopes whose `mcp_version` is not `v1`"
+    );
+}
+
+#[test]
+fn synthetic_mcp_envelope_with_malformed_version_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "tool": "wa.search", "matches": [] },
+        "elapsed_ms": 5,
+        "version": "0.1.0 not-semver",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP envelopes whose `version` is not semver-shaped"
     );
 }
 

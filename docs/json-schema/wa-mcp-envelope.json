@@ -37,7 +37,7 @@
     "version": {
       "type": "string",
       "description": "frankenterm version string (semver format).",
-      "pattern": "^\\d+\\.\\d+\\.\\d+.*$"
+      "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[A-Za-z0-9.\\-]+)?(?:\\+[A-Za-z0-9.\\-]+)?$"
     },
     "now": {
       "type": "integer",
