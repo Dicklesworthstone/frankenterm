@@ -42,7 +42,7 @@ against the speaker we actually ship, not the spec we wish we shipped.
 
 | Tool | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
-| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (21/21 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
+| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (23/23 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
 | neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | substrate-pass | parse_send_keys_with_target_and_payload + parse_list_windows_with_session_target | Pane navigator emits `send-keys -t <pane> <keystroke>` — covered by send-keys parse path. End-to-end blocked on ft-l4cef. |
 | vscode tmux extension (`vscode-tmux`) | substrate-pass | parse_attach_session_with_target + response_encode_success_uses_end_trailer | Extension speaks attach-session + capture-pane. Both wire-syntax shapes covered. End-to-end blocked on ft-l4cef. |
 
@@ -60,11 +60,12 @@ integration-test evidence link.
 | ---- | ------ | -------- | ----- |
 | tmuxinator | substrate-pass | parse_send_keys_with_target_and_payload + parse_new_session_with_name | tmuxinator drives ft via `new-session` + scripted `send-keys`. Both verbs are Tier-1, so the substrate already covers it; the YAML config layer is tmuxinator's, not ft's. |
 | fish shell tmux helpers | substrate-pass | parse_list_sessions_takes_no_args + parse_attach_session_with_target | Fish's helpers (`fish_tmux_resize`, etc.) emit `list-sessions` + `attach-session`. Substrate covers; live testing blocked on ft-l4cef. |
-| tmux pipe-pane | TODO | ft-l4cef | `pipe-pane` is Tier-2 but the parser currently routes it through the `Unknown` fallthrough (returns graceful `%error`). Adding a `PipePane{target, command}` variant is straightforward; tracked under ft-l4cef so it is no longer doc-only. |
-| tmux copy-mode | TODO | ft-l4cef | `copy-mode` requires a separate keybinding state machine (vi vs emacs mode) — not just a wire-syntax addition. The control-mode parser/dispatcher status is tracked under ft-l4cef; any full copy-mode implementation should split into a dedicated follow-up if it exceeds that dispatch slice. |
+| tmux pipe-pane | explicit-unsupported | parse_pipe_pane_as_typed_unsupported_tier_two + tmux_control_typed_tier_two_commands_return_safe_tmux_error_frames | `pipe-pane` is Tier-2 and now parses into a typed `PipePane` variant instead of the generic `Unknown` fallthrough. The daemon still returns a tmux `%error` frame without echoing the pipe command payload; full output piping remains follow-up work under ft-l4cef or a narrower child. |
+| tmux copy-mode | explicit-unsupported | parse_copy_mode_as_typed_unsupported_tier_two + tmux_control_typed_tier_two_commands_return_safe_tmux_error_frames | `copy-mode` requires a separate keybinding state machine (vi vs emacs mode), so the daemon still returns a tmux `%error` frame. The command is now a typed parser/dispatcher variant rather than a doc-only TODO; any full copy-mode implementation should split into a dedicated follow-up if it exceeds that dispatch slice. |
 
-**Tier-2 acceptance**: known-status. Two pass at substrate level, two
-documented as TODO with the reason.
+**Tier-2 acceptance**: known-status. Two pass at substrate level; two
+are explicitly parsed and return safe unsupported `%error` frames until
+their live behavior is implemented.
 
 ## Tier 3 — deferred
 
@@ -78,7 +79,7 @@ rationale per row.
 
 ## Substrate verification — wire-syntax golden vectors
 
-The 21 unit tests in `tmux_control_protocol.rs::tests` are the golden
+The 23 unit tests in `tmux_control_protocol.rs::tests` are the golden
 vectors. Each one asserts a single literal tmux wire-syntax string
 parses to the expected `TmuxCommand` variant, plus the response
 encoder produces a `%begin`/`%end` block frame that matches the tmux

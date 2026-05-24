@@ -79,16 +79,17 @@
 //!
 //! Each Tier-1 command has a well-defined argument shape. Pinning
 //! the shape in a typed enum means downstream handlers (filed as
-//! `ft-hs5f6.cont`) can pattern-match exhaustively, and a future
-//! Tier-2 command (e.g. `pipe-pane`) is a new variant the
-//! compiler forces every match site to handle.
+//! `ft-hs5f6.cont`) can pattern-match exhaustively. The Tier-2
+//! commands tracked by `ft-l4cef` also get typed variants even
+//! while daemon support is still `%error`, so compatibility gaps
+//! cannot disappear into the generic unknown-command fallthrough.
 
 use std::fmt;
 
 /// A parsed tmux control-mode command. Variants cover the Tier-1
-/// subset; everything else parses into [`Self::Unknown`] so the
-/// server can return a graceful "unsupported" response rather than
-/// a parser error.
+/// subset and the tracked Tier-2 unsupported set; everything else
+/// parses into [`Self::Unknown`] so the server can return a graceful
+/// "unsupported" response rather than a parser error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TmuxCommand {
     /// `tmux send-keys -t <target> <key>...` — inject input into
@@ -122,6 +123,20 @@ pub enum TmuxCommand {
     AttachSession { target: Option<String> },
     /// `tmux detach` — detach the current client.
     Detach,
+    /// `tmux pipe-pane [-o] [-t <target>] [command...]` — redirect
+    /// pane output. Tracked as Tier-2 but unsupported by the native
+    /// dispatcher today.
+    PipePane {
+        target: Option<String>,
+        only_if_not_piped: bool,
+        command: Vec<String>,
+    },
+    /// `tmux copy-mode [-t <target>] ...` — enter copy mode. Tracked
+    /// as Tier-2 but unsupported by the native dispatcher today.
+    CopyMode {
+        target: Option<String>,
+        args: Vec<String>,
+    },
     /// Anything else — the verb + raw args. Server returns a
     /// graceful "unsupported" `%error` response.
     Unknown { verb: String, args: Vec<String> },
@@ -194,6 +209,8 @@ pub fn parse_command(line: &str) -> Result<TmuxCommand, ParseError> {
         "new-session" => parse_new_session(args),
         "attach-session" => parse_attach_session(args),
         "detach" | "detach-client" => TmuxCommand::Detach,
+        "pipe-pane" => parse_pipe_pane(args),
+        "copy-mode" => parse_copy_mode(args),
         _ => TmuxCommand::Unknown { verb, args },
     })
 }
@@ -371,6 +388,42 @@ fn parse_attach_session(args: Vec<String>) -> TmuxCommand {
     TmuxCommand::AttachSession { target }
 }
 
+fn parse_pipe_pane(args: Vec<String>) -> TmuxCommand {
+    let mut target: Option<String> = None;
+    let mut only_if_not_piped = false;
+    let mut command: Vec<String> = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-t" => target = iter.next(),
+            "-o" => only_if_not_piped = true,
+            _ => command.push(a),
+        }
+    }
+    TmuxCommand::PipePane {
+        target,
+        only_if_not_piped,
+        command,
+    }
+}
+
+fn parse_copy_mode(args: Vec<String>) -> TmuxCommand {
+    let mut target: Option<String> = None;
+    let mut passthrough_args: Vec<String> = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(a) = iter.next() {
+        if a == "-t" {
+            target = iter.next();
+        } else {
+            passthrough_args.push(a);
+        }
+    }
+    TmuxCommand::CopyMode {
+        target,
+        args: passthrough_args,
+    }
+}
+
 /// A control-mode response. Wire shape:
 ///
 /// ```text
@@ -534,6 +587,31 @@ mod tests {
     fn parse_detach_and_detach_client_aliases() {
         assert_eq!(parse_command("detach").unwrap(), TmuxCommand::Detach);
         assert_eq!(parse_command("detach-client").unwrap(), TmuxCommand::Detach);
+    }
+
+    #[test]
+    fn parse_pipe_pane_as_typed_unsupported_tier_two() {
+        let cmd = parse_command("pipe-pane -o -t %1 'cat >/tmp/out'").unwrap();
+        assert_eq!(
+            cmd,
+            TmuxCommand::PipePane {
+                target: Some("%1".to_string()),
+                only_if_not_piped: true,
+                command: vec!["cat >/tmp/out".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_copy_mode_as_typed_unsupported_tier_two() {
+        let cmd = parse_command("copy-mode -t %2 -u").unwrap();
+        assert_eq!(
+            cmd,
+            TmuxCommand::CopyMode {
+                target: Some("%2".to_string()),
+                args: vec!["-u".to_string()],
+            }
+        );
     }
 
     #[test]

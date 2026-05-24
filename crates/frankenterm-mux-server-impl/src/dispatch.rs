@@ -1112,6 +1112,8 @@ fn tmux_command_name(command: &TmuxCommand) -> &'static str {
         TmuxCommand::NewSession { .. } => "new-session",
         TmuxCommand::AttachSession { .. } => "attach-session",
         TmuxCommand::Detach => "detach",
+        TmuxCommand::PipePane { .. } => "pipe-pane",
+        TmuxCommand::CopyMode { .. } => "copy-mode",
         TmuxCommand::Unknown { .. } => "unknown",
     }
 }
@@ -1508,11 +1510,28 @@ mod tests {
 
     #[test]
     fn tmux_control_unknown_commands_return_tmux_error_frames() {
+        let response = tmux_control_response_at(11, 8, "kill-server\n");
+        let encoded = response.encode();
+
+        assert!(encoded.contains("unsupported command: kill-server"));
+        assert!(encoded.ends_with("%error 11 8 0\n"));
+    }
+
+    #[test]
+    fn tmux_control_typed_tier_two_commands_return_safe_tmux_error_frames() {
         let response = tmux_control_response_at(11, 8, "pipe-pane -o 'cat >/tmp/out'\n");
         let encoded = response.encode();
 
-        assert!(encoded.contains("unsupported command: pipe-pane"));
+        assert!(encoded.contains("unsupported command in native tmux dispatcher: pipe-pane"));
+        assert!(!encoded.contains("cat >/tmp/out"));
         assert!(encoded.ends_with("%error 11 8 0\n"));
+
+        let response = tmux_control_response_at(12, 9, "copy-mode -t %1 -u\n");
+        let encoded = response.encode();
+
+        assert!(encoded.contains("unsupported command in native tmux dispatcher: copy-mode"));
+        assert!(!encoded.contains("%1"));
+        assert!(encoded.ends_with("%error 12 9 0\n"));
     }
 
     #[test]
