@@ -246,6 +246,16 @@ fn validate_trigger_values(field: &str, values: &[String], max_len: usize) -> cr
             )),
         ));
     }
+    if values
+        .iter()
+        .any(|value| value.split('.').any(|segment| segment.trim().is_empty()))
+    {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Descriptor trigger {field} value cannot contain empty dot-separated segments"
+            )),
+        ));
+    }
     Ok(())
 }
 
