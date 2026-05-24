@@ -520,11 +520,16 @@ impl CwdInfo {
                 }
             } else {
                 // Just host, no path
+                let is_localhost = rest.eq_ignore_ascii_case("localhost");
                 Self {
                     raw_uri: uri.to_string(),
                     path: String::new(),
-                    host: rest.to_string(),
-                    is_remote: true,
+                    host: if is_localhost {
+                        String::new()
+                    } else {
+                        rest.to_string()
+                    },
+                    is_remote: !is_localhost,
                 }
             }
         } else {
@@ -4347,6 +4352,11 @@ mod tests {
         assert!(!cwd.is_remote);
         assert_eq!(cwd.host, "");
         assert_eq!(cwd.path, "/home/user/project");
+
+        let cwd = CwdInfo::parse("file://LOCALHOST");
+        assert!(!cwd.is_remote);
+        assert_eq!(cwd.host, "");
+        assert_eq!(cwd.path, "");
     }
 
     #[test]
