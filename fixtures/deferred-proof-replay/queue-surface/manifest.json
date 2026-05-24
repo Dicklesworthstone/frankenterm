@@ -5,11 +5,13 @@
   "schema": "docs/json-schema/ft-deferred-proof-queue-surface.json",
   "contract": "docs/robot-contracts/deferred-proof-queue-surface.md",
   "cases": "fixtures/deferred-proof-replay/queue-surface/cases.v1.json",
+  "invalid_fragments": "fixtures/deferred-proof-replay/queue-surface/invalid/fragments.v1.json",
   "golden_summary": {
     "queue_entry_count": 7,
     "queued_count": 6,
     "completed_count": 1,
     "explain_count": 5,
+    "invalid_fragment_count": 11,
     "statuses": [
       "ambiguous",
       "completed",
@@ -29,7 +31,7 @@
     ]
   },
   "verification": [
-    "jq empty docs/json-schema/ft-deferred-proof-queue-surface.json fixtures/deferred-proof-replay/queue-surface/manifest.json fixtures/deferred-proof-replay/queue-surface/cases.v1.json",
+    "jq empty docs/json-schema/ft-deferred-proof-queue-surface.json fixtures/deferred-proof-replay/queue-surface/manifest.json fixtures/deferred-proof-replay/queue-surface/cases.v1.json fixtures/deferred-proof-replay/queue-surface/invalid/fragments.v1.json",
     "bash tests/e2e/test_deferred_proof_queue_surface_contract.sh"
   ]
 }

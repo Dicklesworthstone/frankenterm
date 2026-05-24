@@ -73,6 +73,16 @@ and worker pressure are *deferral* signals (the receipt stays queued under
    command shape) — never a reset, deletion, or worker change.
 5. `ambiguous` entries need human triage; they never auto-queue.
 
+## Negative corpus
+
+`fixtures/deferred-proof-replay/queue-surface/invalid/fragments.v1.json` proves
+the guardrails actually bite. Each case applies a minimal mutation to the golden
+surface (e.g. flipping `forbids_local_cargo` to `false`, allowing replay on a
+blocked entry, stripping `--no-self-healing` from the next-candidate command,
+injecting a "run local cargo" remediation, leaking a `source_text` key, or
+tampering a source digest) and asserts the verifier reports exactly that
+violation. The golden surface itself must report zero violations.
+
 Run:
 
 ```bash

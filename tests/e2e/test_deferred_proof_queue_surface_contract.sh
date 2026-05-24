@@ -9,6 +9,7 @@ SCHEMA="docs/json-schema/ft-deferred-proof-queue-surface.json"
 DOC="docs/robot-contracts/deferred-proof-queue-surface.md"
 MANIFEST="fixtures/deferred-proof-replay/queue-surface/manifest.json"
 CASES="fixtures/deferred-proof-replay/queue-surface/cases.v1.json"
+INVALID="fixtures/deferred-proof-replay/queue-surface/invalid/fragments.v1.json"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 
 fail() {
@@ -30,9 +31,10 @@ require_file "${SCHEMA}"
 require_file "${DOC}"
 require_file "${MANIFEST}"
 require_file "${CASES}"
+require_file "${INVALID}"
 require_file "${PROVENANCE}"
 
-jq empty "${SCHEMA}" "${MANIFEST}" "${CASES}"
+jq empty "${SCHEMA}" "${MANIFEST}" "${CASES}" "${INVALID}"
 
 ruby <<'RUBY'
 require "digest"
@@ -43,6 +45,7 @@ SCHEMA = "docs/json-schema/ft-deferred-proof-queue-surface.json"
 DOC = "docs/robot-contracts/deferred-proof-queue-surface.md"
 MANIFEST = "fixtures/deferred-proof-replay/queue-surface/manifest.json"
 CASES = "fixtures/deferred-proof-replay/queue-surface/cases.v1.json"
+INVALID = "fixtures/deferred-proof-replay/queue-surface/invalid/fragments.v1.json"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 CONTRACT_ID = "ft.deferred_proof_queue_surface.v1"
 
@@ -90,6 +93,10 @@ rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
 end
 
+def deep_dup(node)
+  Marshal.load(Marshal.dump(node))
+end
+
 def collect_keys(node, acc)
   case node
   when Hash
@@ -104,7 +111,7 @@ def collect_keys(node, acc)
 end
 
 def remote_shape_valid?(argv)
-  return false unless argv.first == "rch"
+  return false unless argv.is_a?(Array) && argv.first == "rch"
 
   exec_index = argv.index("exec")
   return false unless exec_index && argv[exec_index + 1] == "--"
@@ -112,9 +119,151 @@ def remote_shape_valid?(argv)
   argv[1...exec_index].include?("--no-self-healing")
 end
 
+# Per-surface-instance invariants. Returns an array of stable violation codes;
+# an empty array means the surface honors every read-only/consistency rule. The
+# golden fixture must yield zero codes; each invalid fragment must yield exactly
+# its expected code.
+def violations(surface)
+  v = []
+  v << "contract_drift" unless surface["contract_id"] == CONTRACT_ID
+
+  # Redaction: no raw source/pane text key anywhere.
+  keys = collect_keys(surface, [])
+  %w[source_text pane_text raw_pane_text raw_pane_content].each do |banned|
+    v << "raw_pane_content" if keys.include?(banned)
+  end
+
+  # Guardrails fail closed; the remediation allowlist is exact.
+  guardrails = surface["guardrails"] || {}
+  %w[forbids_local_cargo forbids_worker_mutation forbids_service_repair forbids_deletion forbids_reset forbids_broad_formatting].each do |flag|
+    v << "guardrail_not_true" unless guardrails[flag] == true
+  end
+  v << "remediation_allowlist_drift" unless (guardrails["remediation_allowlist"] || []).sort == ALLOWLIST.sort
+
+  queue = surface["queue"] || []
+  bead_ids = queue.map { |entry| entry["bead_id"] }
+  v << "bead_dup" unless bead_ids.uniq.length == bead_ids.length
+  v << "queue_unsorted" unless bead_ids == bead_ids.sort
+
+  status_counts = Hash.new(0)
+  queue.each do |entry|
+    status = entry["status"]
+    v << "unknown_status" unless REQUIRED_STATUSES.include?(status)
+    status_counts[status] += 1
+
+    comment_id = entry.dig("source", "comment_id")
+    expected_receipt = "#{entry["bead_id"]}:comment-#{comment_id}"
+    v << "receipt_id_drift" unless entry["receipt_id"] == expected_receipt
+    v << "raw_pane_content" unless entry.dig("source", "raw_pane_content_stored") == false
+    v << "source_digest_mismatch" unless entry.dig("source", "source_text_sha256") == Digest::SHA256.hexdigest(expected_receipt)
+    v << "empty_reason_codes" if (entry["reason_codes"] || []).empty?
+    v << "remediation_mismatch" unless entry["remediation"] == REMEDIATION_BY_STATUS[status]
+    v << "replay_allowed_mismatch" unless entry["replay_allowed"] == (status == "runnable")
+  end
+
+  # Summary reconciles with the queue and keeps queued distinct from completed.
+  summary = surface["summary"] || {}
+  completed = status_counts["completed"]
+  v << "summary_total" unless summary["total"] == queue.length
+  v << "summary_completed" unless summary["completed"] == completed
+  v << "summary_queued" unless summary["queued"] == queue.length - completed
+  REQUIRED_STATUSES.each do |status|
+    v << "by_status_drift" unless summary.dig("by_status", status) == status_counts[status]
+  end
+
+  # Next candidate is the single runnable, replay-allowed receipt (or null).
+  runnable = queue.select { |entry| entry["status"] == "runnable" && entry["replay_allowed"] }
+  nc = surface["next_candidate"]
+  if runnable.empty?
+    v << "next_candidate_should_be_null" unless nc.nil?
+  elsif nc.nil?
+    v << "next_candidate_missing"
+  else
+    entry = runnable.find { |item| item["bead_id"] == nc["bead_id"] }
+    if entry.nil?
+      v << "next_candidate_not_runnable"
+    else
+      v << "next_candidate_receipt_drift" unless nc["receipt_id"] == entry["receipt_id"]
+      v << "next_candidate_target_drift" unless nc["target_dir"] == entry["target_dir"]
+      v << "next_candidate_material_drift" unless nc["material_remote_required"] == entry["material_remote_required"]
+      if nc["material_remote_required"]
+        v << "next_candidate_command_shape" unless remote_shape_valid?(nc["command_preview"])
+        target = nc["target_dir"]
+        v << "next_candidate_target_unpinned" unless target.nil? || (nc["command_preview"] || []).include?("CARGO_TARGET_DIR=#{target}")
+      end
+    end
+  end
+
+  # Explain covers exactly the blocked (non-runnable, non-completed) receipts.
+  blocked = queue.reject { |entry| %w[runnable completed].include?(entry["status"]) }
+  blocked_by_id = blocked.to_h { |entry| [entry["bead_id"], entry] }
+  explain = surface["explain"] || []
+  explain_ids = explain.map { |entry| entry["bead_id"] }
+  v << "explain_dup" unless explain_ids.uniq.length == explain_ids.length
+  v << "explain_coverage" unless explain_ids.sort == blocked_by_id.keys.sort
+  explain.each do |entry|
+    qe = blocked_by_id[entry["bead_id"]]
+    next unless qe
+
+    v << "explain_status_drift" unless entry["status"] == qe["status"]
+    v << "explain_remediation_drift" unless entry["remediation"] == qe["remediation"]
+    v << "explain_reason_drift" unless entry["blocking_reason_codes"] == qe["reason_codes"]
+    v << "forbidden_action_in_why" if entry["why"].to_s.match?(FORBIDDEN)
+  end
+
+  # Robot dispatch mirrors the queue 1:1.
+  dispatch = surface["robot_dispatch"] || []
+  dispatch_ids = dispatch.map { |entry| entry["bead_id"] }
+  v << "dispatch_unsorted" unless dispatch_ids == dispatch_ids.sort
+  v << "dispatch_coverage" unless dispatch_ids.sort == bead_ids.sort
+  queue_by_id = queue.to_h { |entry| [entry["bead_id"], entry] }
+  dispatch.each do |entry|
+    qe = queue_by_id[entry["bead_id"]]
+    next unless qe
+
+    v << "dispatch_mismatch" unless entry["status"] == qe["status"] &&
+                                    entry["target_dir"] == qe["target_dir"] &&
+                                    entry["replay_allowed"] == qe["replay_allowed"]
+  end
+
+  v.uniq
+end
+
+def apply_mutation(surface, op)
+  s = deep_dup(surface)
+  case op
+  when "disable_local_cargo_guardrail"
+    s["guardrails"]["forbids_local_cargo"] = false
+  when "allow_replay_on_wait"
+    s["queue"].find { |e| e["status"] == "wait_rch" }["replay_allowed"] = true
+  when "strip_no_self_healing"
+    s["next_candidate"]["command_preview"].delete("--no-self-healing")
+  when "inject_local_cargo_why"
+    s["explain"].first["why"] = "Just run local cargo build to fix it."
+  when "add_source_text_key"
+    s["queue"].first["source"]["source_text"] = "leaked raw pane text"
+  when "tamper_digest"
+    s["queue"].first["source"]["source_text_sha256"] = "0" * 64
+  when "drop_none_from_allowlist"
+    s["guardrails"]["remediation_allowlist"].delete("none")
+  when "break_summary_total"
+    s["summary"]["total"] = s["queue"].length - 1
+  when "unsort_queue"
+    s["queue"] = s["queue"].reverse
+  when "flip_dispatch_status"
+    s["robot_dispatch"].first["status"] = "runnable"
+  when "drop_explain_entry"
+    s["explain"] = s["explain"][1..]
+  else
+    fail!("unknown invalid-fragment mutation: #{op}")
+  end
+  s
+end
+
 schema = read_json(SCHEMA)
 manifest = read_json(MANIFEST)
 surface = read_json(CASES)
+invalid = read_json(INVALID)
 doc = File.read(DOC)
 provenance = File.read(PROVENANCE)
 
@@ -128,118 +277,32 @@ fail!("schema permits raw pane content") unless schema.dig("$defs", "source", "p
 fail!("manifest contract drifted") unless manifest["contract_id"] == CONTRACT_ID
 fail!("manifest schema path drifted") unless manifest["schema"] == SCHEMA
 fail!("manifest cases path drifted") unless manifest["cases"] == CASES
+fail!("manifest invalid path drifted") unless manifest["invalid_fragments"] == INVALID
 fail!("manifest status coverage drifted") unless manifest.dig("golden_summary", "statuses").sort == REQUIRED_STATUSES.sort
 
-# Surface contract id + redaction (no raw source/pane text anywhere).
-fail!("surface contract drifted") unless surface["contract_id"] == CONTRACT_ID
-keys = collect_keys(surface, [])
-%w[source_text pane_text raw_pane_text raw_pane_content].each do |banned|
-  fail!("surface leaks raw key #{banned}") if keys.include?(banned)
-end
+# The golden surface must satisfy every per-instance invariant.
+golden_violations = violations(surface)
+fail!("golden surface reported violations: #{golden_violations.inspect}") unless golden_violations.empty?
 
-# Guardrails: every fail-closed assertion is true and the allowlist is exact.
-guardrails = surface.fetch("guardrails")
-%w[forbids_local_cargo forbids_worker_mutation forbids_service_repair forbids_deletion forbids_reset forbids_broad_formatting].each do |flag|
-  fail!("guardrail #{flag} is not true") unless guardrails.fetch(flag) == true
-end
-fail!("remediation allowlist drifted") unless guardrails.fetch("remediation_allowlist").sort == ALLOWLIST.sort
-
-queue = surface.fetch("queue")
-bead_ids = queue.map { |entry| entry.fetch("bead_id") }
-fail!("queue bead ids are not unique") unless bead_ids.uniq.length == bead_ids.length
-fail!("queue is not sorted by bead_id") unless bead_ids == bead_ids.sort
-
-# Per-entry invariants.
-status_counts = Hash.new(0)
-queue.each do |entry|
-  bead = entry.fetch("bead_id")
-  status = entry.fetch("status")
-  fail!("#{bead} has unknown status #{status}") unless REQUIRED_STATUSES.include?(status)
-  status_counts[status] += 1
-
-  comment_id = entry.fetch("source").fetch("comment_id")
-  expected_receipt = "#{bead}:comment-#{comment_id}"
-  fail!("#{bead} receipt_id drifted") unless entry.fetch("receipt_id") == expected_receipt
-
-  source = entry.fetch("source")
-  fail!("#{bead} stored raw pane content") unless source.fetch("raw_pane_content_stored") == false
-  expected_digest = Digest::SHA256.hexdigest(expected_receipt)
-  fail!("#{bead} source digest is not provenance-consistent") unless source.fetch("source_text_sha256") == expected_digest
-
-  fail!("#{bead} reason_codes empty") if entry.fetch("reason_codes").empty?
-
-  expected_remediation = REMEDIATION_BY_STATUS.fetch(status)
-  fail!("#{bead} remediation #{entry.fetch("remediation").inspect} != #{expected_remediation.inspect}") unless entry.fetch("remediation") == expected_remediation
-
-  # replay_allowed is true if and only if the entry is runnable.
-  fail!("#{bead} replay_allowed must mirror runnable status") unless entry.fetch("replay_allowed") == (status == "runnable")
-end
-
-# Summary consistency.
-summary = surface.fetch("summary")
-fail!("summary.total drifted") unless summary.fetch("total") == queue.length
-completed = status_counts["completed"]
-fail!("summary.completed drifted") unless summary.fetch("completed") == completed
-fail!("summary.queued drifted") unless summary.fetch("queued") == queue.length - completed
-REQUIRED_STATUSES.each do |status|
-  fail!("summary.by_status.#{status} drifted") unless summary.dig("by_status", status) == status_counts[status]
-end
-present = status_counts.keys.sort
+# Golden completeness: every status bucket is exercised exactly once-or-more.
+present = surface.fetch("queue").map { |entry| entry.fetch("status") }.uniq.sort
 fail!("not all statuses are exercised: #{present.inspect}") unless present == REQUIRED_STATUSES.sort
-
-# Next candidate must be the single runnable, replay-allowed receipt.
-runnable = queue.select { |entry| entry.fetch("status") == "runnable" && entry.fetch("replay_allowed") }
-next_candidate = surface.fetch("next_candidate")
-if runnable.empty?
-  fail!("next_candidate must be null when nothing is runnable") unless next_candidate.nil?
-else
-  fail!("next_candidate must be present when a runnable receipt exists") if next_candidate.nil?
-  entry = runnable.find { |item| item.fetch("bead_id") == next_candidate.fetch("bead_id") }
-  fail!("next_candidate bead is not a runnable queue entry") unless entry
-  fail!("next_candidate receipt_id drifted") unless next_candidate.fetch("receipt_id") == entry.fetch("receipt_id")
-  fail!("next_candidate target_dir drifted") unless next_candidate.fetch("target_dir") == entry.fetch("target_dir")
-  fail!("next_candidate material flag drifted") unless next_candidate.fetch("material_remote_required") == entry.fetch("material_remote_required")
-  argv = next_candidate.fetch("command_preview")
-  if next_candidate.fetch("material_remote_required")
-    fail!("next_candidate command is not remote-only shape") unless remote_shape_valid?(argv)
-    target = next_candidate.fetch("target_dir")
-    fail!("next_candidate command does not pin its target dir") unless target.nil? || argv.include?("CARGO_TARGET_DIR=#{target}")
-  end
-end
-
-# Explain view covers exactly the blocked (non-runnable, non-completed) entries.
-blocked = queue.reject { |entry| %w[runnable completed].include?(entry.fetch("status")) }
-blocked_by_id = blocked.to_h { |entry| [entry.fetch("bead_id"), entry] }
-explain = surface.fetch("explain")
-explain_ids = explain.map { |entry| entry.fetch("bead_id") }
-fail!("explain bead ids are not unique") unless explain_ids.uniq.length == explain_ids.length
-fail!("explain coverage drifted: #{explain_ids.sort.inspect}") unless explain_ids.sort == blocked_by_id.keys.sort
-explain.each do |entry|
-  bead = entry.fetch("bead_id")
-  queue_entry = blocked_by_id.fetch(bead)
-  fail!("explain #{bead} status drifted") unless entry.fetch("status") == queue_entry.fetch("status")
-  fail!("explain #{bead} remediation drifted") unless entry.fetch("remediation") == queue_entry.fetch("remediation")
-  fail!("explain #{bead} blocking reasons drifted") unless entry.fetch("blocking_reason_codes") == queue_entry.fetch("reason_codes")
-  why = entry.fetch("why")
-  fail!("explain #{bead} 'why' proposes an unsafe action") if why.match?(FORBIDDEN)
-end
-
-# Robot dispatch mirrors the queue 1:1.
-dispatch = surface.fetch("robot_dispatch")
-dispatch_ids = dispatch.map { |entry| entry.fetch("bead_id") }
-fail!("robot_dispatch is not sorted by bead_id") unless dispatch_ids == dispatch_ids.sort
-fail!("robot_dispatch coverage drifted") unless dispatch_ids.sort == bead_ids.sort
-queue_by_id = queue.to_h { |entry| [entry.fetch("bead_id"), entry] }
-dispatch.each do |entry|
-  bead = entry.fetch("bead_id")
-  queue_entry = queue_by_id.fetch(bead)
-  fail!("dispatch #{bead} status drifted") unless entry.fetch("status") == queue_entry.fetch("status")
-  fail!("dispatch #{bead} target_dir drifted") unless entry.fetch("target_dir") == queue_entry.fetch("target_dir")
-  fail!("dispatch #{bead} replay_allowed drifted") unless entry.fetch("replay_allowed") == queue_entry.fetch("replay_allowed")
-end
 
 # Determinism: a second parse of the same bytes yields identical canonical JSON.
 fail!("surface is not deterministic across parses") unless JSON.generate(read_json(CASES)) == JSON.generate(surface)
+
+# Negative corpus: each mutation must surface exactly its expected violation,
+# and the violation must be one the golden surface does NOT already report.
+fragments = invalid.fetch("cases")
+fail!("invalid corpus is empty") if fragments.empty?
+expected_codes = fragments.map { |frag| frag.fetch("expected_violation") }
+fail!("invalid corpus has duplicate expected codes") unless expected_codes.uniq.length == expected_codes.length
+fragments.each do |frag|
+  mutated = apply_mutation(surface, frag.fetch("mutation"))
+  found = violations(mutated)
+  expected = frag.fetch("expected_violation")
+  fail!("invalid fragment #{frag.fetch("case_id")} did not raise #{expected} (got #{found.inspect})") unless found.include?(expected)
+end
 
 # Doc + provenance.
 DOC_TERMS.each do |term|
@@ -248,5 +311,6 @@ end
 fail!("provenance missing queue-surface row") unless provenance.include?("`ft-deferred-proof-queue-surface.json`")
 fail!("provenance row missing verifier") unless provenance.include?("bash tests/e2e/test_deferred_proof_queue_surface_contract.sh")
 
-puts "deferred proof queue surface contract: static verifier passed (#{queue.length} entries, #{completed} completed, #{explain.length} explain views)"
+completed = surface.fetch("queue").count { |entry| entry.fetch("status") == "completed" }
+puts "deferred proof queue surface contract: static verifier passed (#{surface.fetch("queue").length} entries, #{completed} completed, #{surface.fetch("explain").length} explain views, #{fragments.length} rejected fragments)"
 RUBY

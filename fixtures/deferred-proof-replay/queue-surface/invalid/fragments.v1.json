@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.deferred_proof_queue_surface.v1",
+  "description": "Negative corpus. Each case names a minimal mutation applied to the golden surface and the single violation code the verifier must report. Mutations are applied programmatically so the corpus stays small and precise.",
+  "cases": [
+    {
+      "case_id": "guardrail-disabled",
+      "mutation": "disable_local_cargo_guardrail",
+      "expected_violation": "guardrail_not_true"
+    },
+    {
+      "case_id": "replay-allowed-on-blocked",
+      "mutation": "allow_replay_on_wait",
+      "expected_violation": "replay_allowed_mismatch"
+    },
+    {
+      "case_id": "stale-next-candidate",
+      "mutation": "strip_no_self_healing",
+      "expected_violation": "next_candidate_command_shape"
+    },
+    {
+      "case_id": "forbidden-action-in-why",
+      "mutation": "inject_local_cargo_why",
+      "expected_violation": "forbidden_action_in_why"
+    },
+    {
+      "case_id": "raw-source-text-leak",
+      "mutation": "add_source_text_key",
+      "expected_violation": "raw_pane_content"
+    },
+    {
+      "case_id": "tampered-source-digest",
+      "mutation": "tamper_digest",
+      "expected_violation": "source_digest_mismatch"
+    },
+    {
+      "case_id": "allowlist-shrunk",
+      "mutation": "drop_none_from_allowlist",
+      "expected_violation": "remediation_allowlist_drift"
+    },
+    {
+      "case_id": "summary-miscount",
+      "mutation": "break_summary_total",
+      "expected_violation": "summary_total"
+    },
+    {
+      "case_id": "unsorted-queue",
+      "mutation": "unsort_queue",
+      "expected_violation": "queue_unsorted"
+    },
+    {
+      "case_id": "dispatch-status-mismatch",
+      "mutation": "flip_dispatch_status",
+      "expected_violation": "dispatch_mismatch"
+    },
+    {
+      "case_id": "explain-coverage-gap",
+      "mutation": "drop_explain_entry",
+      "expected_violation": "explain_coverage"
+    }
+  ]
+}
