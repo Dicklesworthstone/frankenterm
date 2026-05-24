@@ -1,3 +1,4 @@
+use super::usize_to_i64_saturating;
 use crate::{Position, StableRowIndex, TerminalState};
 use anyhow::Context;
 use frankenterm_cell::Cell;
@@ -173,10 +174,21 @@ impl TerminalState {
 
         let cursor_x = self.cursor.x;
 
-        let width_in_cells = fullcells_width + one_or_zero::<usize>(remainder_width_cell > 0);
-        let height_in_cells = fullcells_height + one_or_zero::<usize>(remainder_height_cell > 0);
+        let width_in_cells = checked_cell_count(
+            IMAGE_CELL_SPAN_COLUMNS,
+            fullcells_width,
+            remainder_width_cell > 0,
+        )?;
+        let height_in_cells = checked_cell_count(
+            IMAGE_CELL_SPAN_ROWS,
+            fullcells_height,
+            remainder_height_cell > 0,
+        )?;
         let height_in_cells = if params.do_not_move_cursor {
-            height_in_cells.min(self.screen().physical_rows - self.cursor.y as usize)
+            height_in_cells.min(remaining_rows_from_cursor(
+                self.screen().physical_rows,
+                self.cursor.y,
+            ))
         } else {
             height_in_cells
         };
@@ -204,7 +216,7 @@ impl TerminalState {
 
             let mut xpos = start_xpos;
             let cursor_y = if params.do_not_move_cursor {
-                self.cursor.y + y as i64
+                self.cursor.y.saturating_add(usize_to_i64_saturating(y))
             } else {
                 self.cursor.y
             };
@@ -212,7 +224,7 @@ impl TerminalState {
                 "setting cells for y={} x=[{}..{}]",
                 cursor_y,
                 cursor_x,
-                cursor_x + fullcells_width
+                cursor_x.saturating_add(fullcells_width)
             );
             let mut remain_x = target_pixel_width;
             for x in 0..width_in_cells {
@@ -228,9 +240,10 @@ impl TerminalState {
                     padding_right,
                     padding_bottom
                 );
+                let cell_x = cursor_x.saturating_add(x);
                 let mut cell = self
                     .screen_mut()
-                    .get_cell(cursor_x + x, cursor_y)
+                    .get_cell(cell_x, cursor_y)
                     .cloned()
                     .unwrap_or_else(Cell::blank);
                 let img = Box::new(ImageCell::with_z_index(
@@ -252,8 +265,7 @@ impl TerminalState {
                     }
                 };
 
-                self.screen_mut()
-                    .set_cell(cursor_x + x, cursor_y, &cell, seqno);
+                self.screen_mut().set_cell(cell_x, cursor_y, &cell, seqno);
                 xpos += x_delta;
             }
             ypos += y_delta;
@@ -288,7 +300,9 @@ impl TerminalState {
 
             if bottom_right {
                 self.set_cursor_pos(
-                    &Position::Relative(width_in_cells as i64 + x_padding_shift),
+                    &Position::Relative(
+                        usize_to_i64_saturating(width_in_cells).saturating_add(x_padding_shift),
+                    ),
                     &Position::Relative(y_padding_shift),
                 );
             }
@@ -411,6 +425,17 @@ fn checked_target_pixels(
         .checked_mul(cell_pixels)
         .and_then(|value| value.checked_add(remainder_pixels))
         .ok_or_else(|| anyhow::anyhow!("image placement {axis} target pixel span overflows"))
+}
+
+fn checked_cell_count(axis: &str, full_cells: usize, has_remainder: bool) -> anyhow::Result<usize> {
+    full_cells
+        .checked_add(one_or_zero::<usize>(has_remainder))
+        .ok_or_else(|| anyhow::anyhow!("image placement {axis} cell count overflows"))
+}
+
+fn remaining_rows_from_cursor(physical_rows: usize, cursor_y: i64) -> usize {
+    let cursor_y = usize::try_from(cursor_y.max(0)).unwrap_or(usize::MAX);
+    physical_rows.saturating_sub(cursor_y)
 }
 
 fn checked_padded_image_exceeds_cell_span(
@@ -629,6 +654,18 @@ mod tests {
             checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 1, 0, usize::MAX, 2)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn image_cell_count_and_remaining_rows_are_saturating() {
+        assert_eq!(
+            checked_cell_count(IMAGE_CELL_SPAN_COLUMNS, 4, true).unwrap(),
+            5
+        );
+        assert!(checked_cell_count(IMAGE_CELL_SPAN_COLUMNS, usize::MAX, true).is_err());
+        assert_eq!(remaining_rows_from_cursor(24, -1), 24);
+        assert_eq!(remaining_rows_from_cursor(24, 10), 14);
+        assert_eq!(remaining_rows_from_cursor(24, i64::MAX), 0);
     }
 
     // ── check_image_dimensions ─────────────────────────────
