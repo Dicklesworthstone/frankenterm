@@ -1049,6 +1049,17 @@ proptest! {
 
         prop_assert!(PatternLibrary::new_with_user_packs(vec![pack], &user_packs).is_err());
     }
+
+    #[test]
+    fn prop_library_rejects_custom_prefix_for_non_user_pack(
+        namespace in "[a-z]{3,10}",
+    ) {
+        let mut rule = make_anchor_only_rule("custom_prefix", "CUSTOM_PREFIX");
+        rule.id = format!("custom.{namespace}.rule");
+        let pack = PatternPack::new("builtin:custom-prefix-test", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
 }
 
 // ============================================================================
