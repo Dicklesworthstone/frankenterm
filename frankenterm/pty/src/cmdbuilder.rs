@@ -107,6 +107,16 @@ fn nul_terminated_utf16_from_reg_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u16>>
     Ok(words)
 }
 
+#[cfg(any(windows, test))]
+fn quoted_backslash_escape_count(num_backslashes: usize, before_quote: bool) -> usize {
+    let doubled = num_backslashes.saturating_mul(2);
+    if before_quote {
+        doubled.saturating_add(1)
+    } else {
+        doubled
+    }
+}
+
 fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
     let mut env: BTreeMap<OsString, EnvEntry> = std::env::vars_os()
         .map(|(key, value)| {
@@ -1092,12 +1102,12 @@ impl CommandBuilder {
             }
 
             if i == arg.len() {
-                for _ in 0..num_backslashes * 2 {
+                for _ in 0..quoted_backslash_escape_count(num_backslashes, false) {
                     cmdline.push('\\' as u16);
                 }
                 break;
             } else if arg[i] == b'"' as u16 {
-                for _ in 0..num_backslashes * 2 + 1 {
+                for _ in 0..quoted_backslash_escape_count(num_backslashes, true) {
                     cmdline.push('\\' as u16);
                 }
                 cmdline.push(arg[i]);
@@ -1136,6 +1146,14 @@ mod tests {
         assert!(is_cwd_relative_path("../foo"));
         assert!(!is_cwd_relative_path("foo"));
         assert!(!is_cwd_relative_path("/foo"));
+    }
+
+    #[test]
+    fn quoted_backslash_escape_count_saturates() {
+        assert_eq!(quoted_backslash_escape_count(2, false), 4);
+        assert_eq!(quoted_backslash_escape_count(2, true), 5);
+        assert_eq!(quoted_backslash_escape_count(usize::MAX, false), usize::MAX);
+        assert_eq!(quoted_backslash_escape_count(usize::MAX, true), usize::MAX);
     }
 
     #[test]
