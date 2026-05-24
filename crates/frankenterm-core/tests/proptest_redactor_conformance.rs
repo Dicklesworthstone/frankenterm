@@ -62,6 +62,32 @@ const STRIPE_RK_LIVE: &str = "rk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
 const STRIPE_WHSEC: &str = "whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
 const AWS_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const SLACK_TOKEN: &str = "xoxb-1234567890-aBcDeFgHiJkLmNoPqRsTuVwX";
+
+// Additional provider/token catalog samples. Each clears its regex's
+// body-length floor and uses only its declared charset so the match
+// spans the whole sample (no trailing residue for the no-leak smoke).
+// Bodies are synthetic — no real credential material.
+const GITLAB_TOKEN: &str = "glpat-aBcDeFgHiJkLmNoPqRsTuVwX1234567890"; // glpat- + 34
+const XAI_KEY: &str = "xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH"; // xai- + 44
+const GROQ_KEY: &str = "gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH"; // gsk_ + 44
+const GOOGLE_API_KEY: &str = "AIzaaBcDeFgHiJkLmNoPqRsTuVwXyZ012345678"; // AIza + exactly 35
+const GOOGLE_OAUTH_TOKEN: &str = "ya29.aBcDeFgHiJkLmNoPqRsTuVwXyZ"; // ya29. + 26
+const HUGGINGFACE_TOKEN: &str = "hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345"; // hf_ + 31
+const REPLICATE_TOKEN: &str = "r8_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345"; // r8_ + 31
+const ANYSCALE_KEY: &str = "esecret_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345"; // esecret_ + 31
+const PERPLEXITY_KEY: &str = "pplx-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH"; // pplx- + 44
+const TWILIO_ACCOUNT_SID: &str = "AC0123456789abcdef0123456789abcdef"; // AC + 32 hex
+const SENDGRID_KEY: &str =
+    "SG.aBcDeFgHiJkLmNoPqRsTuV.aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCD"; // SG.<22>.<40>
+const JWT_TOKEN: &str =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXN1YmplY3QifQ.abc123_test-XYZ";
+// Keyed patterns: the secret only redacts with its surrounding key name,
+// so the sample embeds that name (the match span covers name + value).
+const AWS_SECRET_KEY: &str =
+    "aws_secret_access_key=aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd"; // value = exactly 40
+const BEARER_TOKEN: &str = "Bearer aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"; // bearer + 36 body
+const DATADOG_API_KEY: &str = "DATADOG_API_KEY=0123456789abcdef0123456789abcdef"; // 32 hex
+
 /// br-ft-2xkrc: SSH/PEM private-key blocks. The conformance
 /// harness drives `redact()` over envelopes containing each of
 /// these strings, so the multi-line BEGIN/END shape exercises the
@@ -107,7 +133,22 @@ const ALL_KNOWN_FORMATS: &[(&str, &str)] = &[
     ("stripe_rk_live", STRIPE_RK_LIVE),
     ("stripe_whsec", STRIPE_WHSEC),
     ("aws_access_key_id", AWS_ACCESS_KEY),
+    ("aws_secret_key", AWS_SECRET_KEY),
     ("slack_token", SLACK_TOKEN),
+    ("gitlab_token", GITLAB_TOKEN),
+    ("xai_key", XAI_KEY),
+    ("groq_key", GROQ_KEY),
+    ("google_api_key", GOOGLE_API_KEY),
+    ("google_oauth_token", GOOGLE_OAUTH_TOKEN),
+    ("huggingface_token", HUGGINGFACE_TOKEN),
+    ("replicate_token", REPLICATE_TOKEN),
+    ("anyscale_key", ANYSCALE_KEY),
+    ("perplexity_key", PERPLEXITY_KEY),
+    ("twilio_account_sid", TWILIO_ACCOUNT_SID),
+    ("sendgrid_key", SENDGRID_KEY),
+    ("datadog_api_key", DATADOG_API_KEY),
+    ("bearer_token", BEARER_TOKEN),
+    ("jwt_token", JWT_TOKEN),
     ("ssh_private_key_rsa", SSH_PRIVATE_KEY_RSA),
     ("ssh_private_key_openssh", SSH_PRIVATE_KEY_OPENSSH),
     ("ssh_private_key_ed25519", SSH_PRIVATE_KEY_ED25519),
