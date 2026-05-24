@@ -358,6 +358,16 @@ This fixture shape is intentionally small and deterministic so future golden
 tests can validate schema, warning, redaction, and provenance behavior without
 using live private pane text:
 
+> **At-rest static guard.** `tests/e2e/test_incident_bundle_redaction_goldens.sh`
+> (jq + ruby, no compilation) locks the privacy/no-mutation contract these
+> goldens encode — no mutating actions, no Agent Mail repair, read-only process
+> samplers, redaction counts reconciled across the manifest, the redaction
+> report, and the pane summaries, gated pane text, no raw pane/source-text keys,
+> and `warnings.jsonl` reconciled with the manifest. It runs in the CI
+> static-guard job, so the contract stays enforced even when the
+> `ft reproduce replay` runtime checks above are blocked on the remote proof
+> lane.
+
 ```json
 {
   "contract_id": "ft.swarm_incident_bundle.v1",
