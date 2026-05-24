@@ -242,12 +242,18 @@ impl DeadLetterQueue {
     /// Create a new dead-letter queue with the given configuration.
     #[must_use]
     pub fn new(config: DeadLetterQueueConfig) -> Self {
+        let config = Self::normalize_config(config);
         Self {
             config,
             entries: VecDeque::new(),
             next_id: 1,
             telemetry: DeadLetterTelemetry::default(),
         }
+    }
+
+    fn normalize_config(mut config: DeadLetterQueueConfig) -> DeadLetterQueueConfig {
+        config.max_entries = config.max_entries.max(1);
+        config
     }
 
     /// Enqueue a failed action.
@@ -1012,6 +1018,34 @@ mod tests {
         let snap = dlq.telemetry_snapshot();
         assert_eq!(snap.total_enqueued, 5);
         assert_eq!(snap.evictions, 2);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_zero_capacity_does_not_spin() {
+        let config = DeadLetterQueueConfig {
+            max_entries: 0,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+
+        let first = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "first",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+        let second = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "second",
+            ConnectorErrorKind::Transient,
+            2000,
+        );
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(dlq.depth(), 1);
+        assert_eq!(dlq.pending_entries()[0].id, second);
+        assert_eq!(dlq.telemetry_snapshot().evictions, 1);
     }
 
     #[test]
