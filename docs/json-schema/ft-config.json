@@ -168,6 +168,21 @@
                 }
               }
             }
+          },
+          "if": {
+            "required": ["enabled"],
+            "properties": {
+              "enabled": { "const": true }
+            }
+          },
+          "then": {
+            "required": ["socket_paths"],
+            "properties": {
+              "socket_paths": {
+                "type": "array",
+                "minItems": 2
+              }
+            }
           }
         }
       }

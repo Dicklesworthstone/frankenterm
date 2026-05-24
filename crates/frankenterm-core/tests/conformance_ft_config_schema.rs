@@ -589,6 +589,41 @@ fn schema_rejects_blank_documented_path_values() {
     }
 }
 
+/// 4h.2) Falsification: README documents that sharding mode requires
+/// two or more socket paths when enabled.
+#[test]
+fn schema_rejects_enabled_sharding_without_two_socket_paths() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "missing socket_paths",
+            serde_json::json!({
+                "vendored": {
+                    "sharding": {
+                        "enabled": true
+                    }
+                }
+            }),
+        ),
+        (
+            "single socket_path",
+            serde_json::json!({
+                "vendored": {
+                    "sharding": {
+                        "enabled": true,
+                        "socket_paths": ["/tmp/ft-shard-0.sock"]
+                    }
+                }
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject enabled sharding with {surface}"
+        );
+    }
+}
+
 /// 4i) Falsification: documented bounded-size fields that must be at
 /// least one should reject zero. These mirror production semantic
 /// validators for queue sizes and concurrency.
