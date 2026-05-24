@@ -56,7 +56,15 @@ impl OrchestratorConfig {
     #[must_use]
     pub fn gates_to_run(&self) -> Vec<GateId> {
         match &self.gate_filter {
-            Some(filter) => filter.clone(),
+            Some(filter) => {
+                let mut gates = Vec::new();
+                for gate in filter {
+                    if !gates.contains(gate) {
+                        gates.push(*gate);
+                    }
+                }
+                gates
+            }
             None => ALL_GATES.to_vec(),
         }
     }
@@ -485,6 +493,18 @@ mod tests {
     }
 
     #[test]
+    fn config_gates_to_run_deduplicates_filter() {
+        let config = OrchestratorConfig {
+            gate_filter: Some(vec![GateId::Smoke, GateId::Smoke, GateId::Regression]),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.gates_to_run(),
+            vec![GateId::Smoke, GateId::Regression]
+        );
+    }
+
+    #[test]
     fn config_serde_roundtrip() {
         let config = OrchestratorConfig::default();
         let json = serde_json::to_string(&config).unwrap();
@@ -570,6 +590,19 @@ mod tests {
         let result = orchestrate(&config, &reports);
         assert_eq!(result.gates_run, 1);
         assert_eq!(result.overall_status, GateStatus::Pass);
+    }
+
+    #[test]
+    fn orchestrate_duplicate_gate_filter_runs_once() {
+        let config = OrchestratorConfig {
+            gate_filter: Some(vec![GateId::Smoke, GateId::Smoke]),
+            ..Default::default()
+        };
+        let reports = vec![make_pass_report(GateId::Smoke)];
+        let result = orchestrate(&config, &reports);
+        assert_eq!(result.gates_run, 1);
+        assert_eq!(result.total_duration_ms, 100);
+        assert_eq!(result.gate_results.len(), 1);
     }
 
     #[test]
