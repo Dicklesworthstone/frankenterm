@@ -119,6 +119,8 @@ pub enum FstError {
     EmptyKey,
     /// No entries to compile.
     EmptyInput,
+    /// Trigger builder exhausted the reflex ID space.
+    ReflexIdExhausted,
 }
 
 impl std::fmt::Display for FstError {
@@ -130,6 +132,7 @@ impl std::fmt::Display for FstError {
             }
             Self::EmptyKey => write!(f, "empty key"),
             Self::EmptyInput => write!(f, "no entries to compile"),
+            Self::ReflexIdExhausted => write!(f, "reflex ID space exhausted"),
         }
     }
 }
@@ -598,29 +601,43 @@ impl TriggerBuilder {
     }
 
     /// Add a literal string trigger.
-    pub fn add_literal(&mut self, trigger: &str, cluster_id: &str, priority: u32) -> ReflexId {
-        let id = self.next_id;
-        self.next_id += 1;
+    pub fn add_literal(
+        &mut self,
+        trigger: &str,
+        cluster_id: &str,
+        priority: u32,
+    ) -> Result<ReflexId, FstError> {
+        let id = self.allocate_reflex_id()?;
         self.entries.push(TriggerEntry {
             key: trigger.as_bytes().to_vec(),
             reflex_id: id,
             priority,
             cluster_id: cluster_id.to_string(),
         });
-        id
+        Ok(id)
     }
 
     /// Add a MinHash signature trigger.
-    pub fn add_minhash(&mut self, signature: &[u64], cluster_id: &str, priority: u32) -> ReflexId {
-        let id = self.next_id;
-        self.next_id += 1;
+    pub fn add_minhash(
+        &mut self,
+        signature: &[u64],
+        cluster_id: &str,
+        priority: u32,
+    ) -> Result<ReflexId, FstError> {
+        let id = self.allocate_reflex_id()?;
         self.entries.push(TriggerEntry {
             key: minhash_to_key(signature),
             reflex_id: id,
             priority,
             cluster_id: cluster_id.to_string(),
         });
-        id
+        Ok(id)
+    }
+
+    fn allocate_reflex_id(&mut self) -> Result<ReflexId, FstError> {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(FstError::ReflexIdExhausted)?;
+        Ok(id)
     }
 
     /// Get the accumulated entries.
@@ -1005,7 +1022,7 @@ mod tests {
     #[test]
     fn builder_add_literal() {
         let mut builder = TriggerBuilder::new();
-        let id = builder.add_literal("error: crash", "c1", 0);
+        let id = builder.add_literal("error: crash", "c1", 0).unwrap();
         assert_eq!(id, 0);
         assert_eq!(builder.entries().len(), 1);
     }
@@ -1013,7 +1030,7 @@ mod tests {
     #[test]
     fn builder_add_minhash() {
         let mut builder = TriggerBuilder::new();
-        let id = builder.add_minhash(&[1, 2, 3], "c1", 1);
+        let id = builder.add_minhash(&[1, 2, 3], "c1", 1).unwrap();
         assert_eq!(id, 0);
         assert_eq!(builder.entries()[0].key.len(), 24);
     }
@@ -1021,19 +1038,30 @@ mod tests {
     #[test]
     fn builder_ids_increment() {
         let mut builder = TriggerBuilder::new();
-        let id0 = builder.add_literal("a", "c", 0);
-        let id1 = builder.add_literal("b", "c", 0);
-        let id2 = builder.add_minhash(&[1], "c", 0);
+        let id0 = builder.add_literal("a", "c", 0).unwrap();
+        let id1 = builder.add_literal("b", "c", 0).unwrap();
+        let id2 = builder.add_minhash(&[1], "c", 0).unwrap();
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
     }
 
     #[test]
+    fn builder_rejects_reflex_id_exhaustion_without_pushing_entry() {
+        let mut builder = TriggerBuilder::new();
+        builder.next_id = ReflexId::MAX;
+
+        let err = builder.add_literal("overflow", "c", 0).unwrap_err();
+
+        assert_eq!(err, FstError::ReflexIdExhausted);
+        assert!(builder.entries().is_empty());
+    }
+
+    #[test]
     fn builder_compiles() {
         let mut builder = TriggerBuilder::new();
-        builder.add_literal("error: foo", "c1", 0);
-        builder.add_literal("error: bar", "c2", 1);
+        builder.add_literal("error: foo", "c1", 0).unwrap();
+        builder.add_literal("error: bar", "c2", 1).unwrap();
         let compiler = FstCompiler::with_defaults();
         let index = compiler.compile(&builder.build()).unwrap();
         assert_eq!(index.len(), 2);
@@ -1080,6 +1108,11 @@ mod tests {
             FstError::TooManyEntries { count: 10, max: 5 }
                 .to_string()
                 .contains("too many entries")
+        );
+        assert!(
+            FstError::ReflexIdExhausted
+                .to_string()
+                .contains("exhausted")
         );
     }
 
