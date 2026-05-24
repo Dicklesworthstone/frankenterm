@@ -374,6 +374,17 @@ pub fn run_replay_gate(
     let mut go = true;
     let mut reasons = Vec::new();
 
+    // Fail closed on an empty corpus: a migration cutover must not be certified
+    // with zero regression evidence. run_regression_suite reports pass_rate=1.0
+    // for an empty corpus (a sound metric convention), but that must not be
+    // read as a go decision here.
+    if scenarios.is_empty() {
+        go = false;
+        reasons.push(
+            "no regression scenarios — cannot certify migration on an empty corpus".to_string(),
+        );
+    }
+
     if report.artifact.pass_rate < config.min_pass_rate {
         go = false;
         reasons.push(format!(

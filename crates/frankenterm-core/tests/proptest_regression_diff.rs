@@ -220,3 +220,28 @@ proptest! {
         );
     }
 }
+
+#[test]
+fn empty_corpus_fails_closed() {
+    // A migration cutover gate must not return go=true with zero regression
+    // evidence, even though the suite reports pass_rate=1.0 for an empty corpus.
+    let verdict = run_replay_gate(&[], &ReplayGateConfig::default());
+    assert!(!verdict.go, "empty corpus must not certify migration");
+    let reason = verdict.reason.unwrap_or_default();
+    assert!(
+        reason.contains("no regression scenarios"),
+        "unexpected reason: {reason}"
+    );
+}
+
+#[test]
+fn nonempty_corpus_does_not_hit_empty_guard() {
+    // Counterpart: the populated default corpus must not be blocked by the
+    // empty-corpus guard (its verdict depends only on the real checks).
+    let verdict = run_replay_gate(&default_scenarios(), &ReplayGateConfig::default());
+    let hit_empty_guard = verdict
+        .reason
+        .as_deref()
+        .is_some_and(|r| r.contains("no regression scenarios"));
+    assert!(!hit_empty_guard, "non-empty corpus wrongly hit empty guard");
+}
