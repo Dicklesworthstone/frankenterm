@@ -1123,6 +1123,15 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_event_type_whitespace(rule_suffix in "[a-z]{3,10}") {
+        let mut rule = make_anchor_only_rule(&rule_suffix, "EVENT_TYPE_WHITESPACE");
+        rule.event_type = "usage reached".to_string();
+        let pack = PatternPack::new("builtin:event-type-whitespace", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_empty_pack_name(rule_suffix in "[a-z]{3,10}") {
         let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_NAME");
         let pack = PatternPack::new(" \t ", "1.0.0", vec![rule]);

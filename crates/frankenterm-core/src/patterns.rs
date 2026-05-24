@@ -628,6 +628,13 @@ impl RuleDef {
             ))
             .into());
         }
+        if self.event_type.chars().any(char::is_whitespace) {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' has event_type '{}' containing whitespace",
+                self.id, self.event_type
+            ))
+            .into());
+        }
 
         if self.anchors.is_empty() || self.anchors.iter().any(|a| a.trim().is_empty()) {
             return Err(PatternError::InvalidRule(format!(
