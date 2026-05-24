@@ -576,8 +576,12 @@ impl EffectType {
 fn truncate_payload(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         s.to_string()
+    } else if max_len == 0 {
+        String::new()
+    } else if max_len <= 3 {
+        ".".repeat(max_len)
     } else {
-        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        let truncated: String = s.chars().take(max_len - 3).collect();
         format!("{truncated}...")
     }
 }
@@ -1268,6 +1272,14 @@ mod tests {
         let result = truncate_payload("this is a very long string", 10);
         assert!(result.ends_with("..."));
         assert!(result.chars().count() <= 10);
+    }
+
+    #[test]
+    fn truncate_payload_respects_tiny_limits() {
+        assert_eq!(truncate_payload("abcdef", 0), "");
+        assert_eq!(truncate_payload("abcdef", 1), ".");
+        assert_eq!(truncate_payload("abcdef", 2), "..");
+        assert_eq!(truncate_payload("abcdef", 3), "...");
     }
 
     // ── EffectOutcome / OverrideRule serde ───────────────────────────────
