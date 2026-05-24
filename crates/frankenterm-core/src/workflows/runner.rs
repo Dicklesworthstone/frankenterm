@@ -4093,6 +4093,45 @@ mod tests {
             });
         }
 
+        #[test]
+        fn wait_condition_duration_variants_abort_when_timeout_expires() {
+            run_async_test(async {
+                for (condition, expected_reason) in [
+                    (WaitCondition::pane_idle(60), "pane idle wait timed out"),
+                    (
+                        WaitCondition::stable_tail(60),
+                        "stable tail wait timed out",
+                    ),
+                ] {
+                    let start = std::time::Instant::now();
+                    let err = wait_condition_pause_maybe_cx(
+                        None,
+                        &condition,
+                        Duration::from_millis(5),
+                        None,
+                        "test-duration",
+                    )
+                    .await
+                    .expect_err("duration wait longer than timeout must abort");
+                    let elapsed = start.elapsed();
+
+                    match err {
+                        crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                            assert!(
+                                reason.contains(expected_reason),
+                                "unexpected abort reason: {reason}"
+                            );
+                        }
+                        other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                    }
+                    assert!(
+                        elapsed < Duration::from_secs(1),
+                        "timeout abort should not wait for full duration: {elapsed:?}"
+                    );
+                }
+            });
+        }
+
         /// 7. Wait helpers used by `WaitFor` and `SendText(wait_for=...)`
         ///    must surface a cancelled caller context as an aborted
         ///    workflow result instead of falling back to an ambient
