@@ -77,6 +77,10 @@ fn positive_resize_budget(value: usize) -> isize {
     value.min(isize::MAX as usize) as isize
 }
 
+fn usize_to_isize_saturating(value: usize) -> isize {
+    value.min(isize::MAX as usize) as isize
+}
+
 fn negative_resize_budget(value: usize) -> isize {
     if value > isize::MAX as usize {
         isize::MIN
@@ -1242,13 +1246,14 @@ fn adjust_x_size(
                 data.second.dpi = cell_dimensions.dpi;
                 match data.direction {
                     SplitDirection::Vertical => {
-                        let mut new_cols = (data.first.cols as isize)
+                        let mut new_cols = usize_to_isize_saturating(data.first.cols)
                             .saturating_add(x_adjust)
-                            .max(min_x as isize);
+                            .max(usize_to_isize_saturating(min_x));
                         if let Some(max_cols) = max_x {
-                            new_cols = new_cols.min(max_cols as isize);
+                            new_cols = new_cols.min(usize_to_isize_saturating(max_cols));
                         }
-                        x_adjust = new_cols.saturating_sub(data.first.cols as isize);
+                        x_adjust =
+                            new_cols.saturating_sub(usize_to_isize_saturating(data.first.cols));
 
                         if x_adjust != 0 {
                             adjust_x_size(&mut *left, x_adjust, cell_dimensions, overrides);
@@ -1334,13 +1339,14 @@ fn adjust_y_size(
                 data.second.dpi = cell_dimensions.dpi;
                 match data.direction {
                     SplitDirection::Horizontal => {
-                        let mut new_rows = (data.first.rows as isize)
+                        let mut new_rows = usize_to_isize_saturating(data.first.rows)
                             .saturating_add(y_adjust)
-                            .max(min_y as isize);
+                            .max(usize_to_isize_saturating(min_y));
                         if let Some(max_rows) = max_y {
-                            new_rows = new_rows.min(max_rows as isize);
+                            new_rows = new_rows.min(usize_to_isize_saturating(max_rows));
                         }
-                        y_adjust = new_rows.saturating_sub(data.first.rows as isize);
+                        y_adjust =
+                            new_rows.saturating_sub(usize_to_isize_saturating(data.first.rows));
 
                         if y_adjust != 0 {
                             adjust_y_size(&mut *left, y_adjust, cell_dimensions, overrides);
@@ -4362,6 +4368,8 @@ mod test {
         assert_eq!(offset_by_resize_delta(5, -3), 2);
         assert_eq!(offset_by_resize_delta(5, 3), 8);
         assert_eq!(offset_by_resize_delta(5, isize::MIN), 0);
+        assert_eq!(usize_to_isize_saturating(42), 42);
+        assert_eq!(usize_to_isize_saturating(usize::MAX), isize::MAX);
         assert_eq!(positive_resize_budget(usize::MAX), isize::MAX);
         assert_eq!(negative_resize_budget(0), 0);
         assert_eq!(negative_resize_budget(isize::MAX as usize + 1), isize::MIN);
