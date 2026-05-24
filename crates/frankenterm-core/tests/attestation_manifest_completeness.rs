@@ -79,6 +79,9 @@ enum ManifestError {
         category: String,
         fingerprint: String,
     },
+    RequiredCategoryMissing {
+        category: String,
+    },
 }
 
 impl ManifestError {
@@ -96,6 +99,7 @@ impl ManifestError {
             ManifestError::DeferredBeadInactive { .. } => "deferred_bead_not_active",
             ManifestError::DeferredBeadOrphan { .. } => "orphan_deferred_bead",
             ManifestError::DuplicateSlotFingerprint { .. } => "duplicate_slot_fingerprint",
+            ManifestError::RequiredCategoryMissing { .. } => "required_category_missing",
         }
     }
 
@@ -181,6 +185,9 @@ impl ManifestError {
                 fingerprint,
             } => {
                 format!("slot[{slot_index}] {category}: duplicate slot fingerprint {fingerprint:?}")
+            }
+            ManifestError::RequiredCategoryMissing { category } => {
+                format!("required_categories entry {category:?} has no matching slot")
             }
         }
     }
@@ -325,12 +332,14 @@ fn validate_manifest_text(
     let beads = parse_beads_issues_jsonl(issues_text);
     let mut errors = Vec::new();
     let mut seen_slot_fingerprints = HashSet::new();
+    let mut seen_categories = HashSet::new();
 
     for (slot_index, slot) in slots.iter().enumerate() {
         let Some(category) = slot.get("category").and_then(Value::as_str) else {
             errors.push(ManifestError::MissingCategory { slot_index });
             continue;
         };
+        seen_categories.insert(category.to_string());
         let path = slot.get("path").and_then(Value::as_str);
         let deferred = slot.get("deferred_to_bead").and_then(Value::as_str);
         let fingerprint = slot_fingerprint(slot, category);
@@ -404,6 +413,20 @@ fn validate_manifest_text(
                 slot_index,
                 category: category.to_string(),
             }),
+        }
+    }
+
+    for required in manifest
+        .get("required_categories")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !seen_categories.contains(required) {
+            errors.push(ManifestError::RequiredCategoryMissing {
+                category: required.to_string(),
+            });
         }
     }
 
@@ -511,6 +534,23 @@ fn mutation_both_null_is_rejected() {
     let errors = validate_manifest_text(&manifest_with_slot(slot), "", &workspace_root())
         .expect_err("both-null mutation must fail");
     assert_error_contains(&errors, "unfilled_slot", "exact ft-e87u6 NO_BEAD gap");
+}
+
+#[test]
+fn mutation_required_category_without_slot_is_rejected() {
+    let manifest = json!({
+        "$schema": "./schema.json#/$defs/manifestPlaceholder",
+        "required_categories": ["perf/headline-claims", "security/passive-watch"],
+        "slots": [valid_manifest_slot()]
+    })
+    .to_string();
+    let errors = validate_manifest_text(&manifest, "", &workspace_root())
+        .expect_err("missing required category slot mutation must fail");
+    assert_error_contains(
+        &errors,
+        "required_category_missing",
+        "security/passive-watch",
+    );
 }
 
 #[test]
@@ -647,6 +687,7 @@ enum ManifestMutation {
     SameEpicOrphanDeferred,
     WrongIssueEdgeDeferred,
     DuplicateSlot,
+    MissingRequiredCategory,
 }
 
 impl ManifestMutation {
@@ -678,6 +719,7 @@ fn mutation_strategy() -> impl Strategy<Value = ManifestMutation> {
         Just(ManifestMutation::SameEpicOrphanDeferred),
         Just(ManifestMutation::WrongIssueEdgeDeferred),
         Just(ManifestMutation::DuplicateSlot),
+        Just(ManifestMutation::MissingRequiredCategory),
     ]
 }
 
@@ -757,6 +799,17 @@ fn apply_mutation(mutation: &ManifestMutation) -> (String, String) {
                     "$schema": "./schema.json#/$defs/manifestPlaceholder",
                     "required_categories": ["perf/headline-claims"],
                     "slots": [slot.clone(), slot]
+                })
+                .to_string(),
+                issues,
+            );
+        }
+        ManifestMutation::MissingRequiredCategory => {
+            return (
+                json!({
+                    "$schema": "./schema.json#/$defs/manifestPlaceholder",
+                    "required_categories": ["perf/headline-claims", "security/passive-watch"],
+                    "slots": [slot]
                 })
                 .to_string(),
                 issues,
