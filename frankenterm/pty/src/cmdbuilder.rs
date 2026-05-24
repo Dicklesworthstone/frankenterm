@@ -60,7 +60,7 @@ fn passwd_field_to_string(field: *const libc::c_char, field_name: &str) -> anyho
 
 #[cfg(unix)]
 fn get_shell() -> String {
-    use nix::unistd::{access, AccessFlags};
+    use nix::unistd::{AccessFlags, access};
 
     let ent = unsafe { libc::getpwuid(libc::getuid()) };
     if !ent.is_null() {
@@ -85,6 +85,26 @@ fn get_shell() -> String {
         }
     }
     "/bin/sh".into()
+}
+
+#[cfg(any(windows, test))]
+fn nul_terminated_utf16_from_reg_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u16>> {
+    anyhow::ensure!(
+        bytes.len() % 2 == 0,
+        "REG_EXPAND_SZ had odd byte length: {}",
+        bytes.len()
+    );
+
+    let mut words = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+
+    if !matches!(words.last(), Some(0)) {
+        words.push(0);
+    }
+
+    Ok(words)
 }
 
 fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
@@ -121,27 +141,42 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
     {
         use std::os::windows::ffi::OsStringExt;
         use winapi::um::processenv::ExpandEnvironmentStringsW;
-        use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RegType};
         use winreg::types::FromRegValue;
         use winreg::{RegKey, RegValue};
 
         fn reg_value_to_string(value: &RegValue) -> anyhow::Result<OsString> {
             match value.vtype {
                 RegType::REG_EXPAND_SZ => {
-                    let src = unsafe {
-                        std::slice::from_raw_parts(
-                            value.bytes.as_ptr() as *const u16,
-                            value.bytes.len() / 2,
-                        )
-                    };
+                    let src = nul_terminated_utf16_from_reg_bytes(&value.bytes)?;
                     let size =
                         unsafe { ExpandEnvironmentStringsW(src.as_ptr(), std::ptr::null_mut(), 0) };
-                    let mut buf = vec![0u16; size as usize + 1];
-                    unsafe {
+                    if size == 0 {
+                        anyhow::bail!(
+                            "ExpandEnvironmentStringsW failed to size registry value: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+
+                    let mut buf = vec![0u16; size as usize];
+                    let written = unsafe {
                         ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
                     };
+                    if written == 0 {
+                        anyhow::bail!(
+                            "ExpandEnvironmentStringsW failed to expand registry value: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    let written = written as usize;
+                    anyhow::ensure!(
+                        written <= buf.len(),
+                        "expanded registry value grew from {} to {} utf-16 words",
+                        buf.len(),
+                        written
+                    );
 
-                    let mut buf = buf.as_slice();
+                    let mut buf = &buf[..written];
                     while let Some(0) = buf.last() {
                         buf = &buf[0..buf.len() - 1];
                     }
@@ -360,7 +395,7 @@ mod os_string_serde {
 
 #[cfg(feature = "serde_support")]
 mod os_string_vec_serde {
-    use super::{os_string_serde, OsString};
+    use super::{OsString, os_string_serde};
     use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -386,7 +421,7 @@ mod os_string_vec_serde {
 
 #[cfg(feature = "serde_support")]
 mod option_os_string_serde {
-    use super::{os_string_serde, OsString};
+    use super::{OsString, os_string_serde};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub(super) fn serialize<S>(value: &Option<OsString>, serializer: S) -> Result<S::Ok, S::Error>
@@ -423,10 +458,10 @@ mod env_map_serde {
     //! `(OsString, EnvEntry)` pairs rather than a map. Each `OsString` is
     //! encoded through the local platform-tagged adapter, so every pair
     //! roundtrips losslessly regardless of UTF-8 validity.
-    use super::{os_string_serde, BTreeMap, EnvEntry, OsString};
+    use super::{BTreeMap, EnvEntry, OsString, os_string_serde};
+    use serde::Serialize;
     use serde::de::{Deserialize, Deserializer, Error as DeError, SeqAccess, Visitor};
     use serde::ser::{SerializeSeq, SerializeTuple, Serializer};
-    use serde::Serialize;
     use std::fmt;
 
     struct EnvPairRef<'a> {
@@ -750,7 +785,7 @@ impl CommandBuilder {
     }
 
     fn search_path(&self, exe: &OsStr, cwd: &OsStr) -> anyhow::Result<OsString> {
-        use nix::unistd::{access, AccessFlags};
+        use nix::unistd::{AccessFlags, access};
 
         let exe_path: &Path = exe.as_ref();
         if exe_path.is_relative() {
@@ -877,7 +912,7 @@ impl CommandBuilder {
     /// We take the contents of the $SHELL env var first, then
     /// fall back to looking it up from the password database.
     pub fn get_shell(&self) -> String {
-        use nix::unistd::{access, AccessFlags};
+        use nix::unistd::{AccessFlags, access};
 
         if let Some(shell) = self.get_env("SHELL").and_then(OsStr::to_str) {
             match access(shell, AccessFlags::X_OK) {
@@ -1335,9 +1370,10 @@ mod tests {
         cmd.env("CUSTOM_KEY", "custom_value");
         let full: Vec<_> = cmd.iter_full_env_as_str().collect();
         // Should include base env vars (like PATH) plus our custom one
-        assert!(full
-            .iter()
-            .any(|(k, v)| *k == "CUSTOM_KEY" && *v == "custom_value"));
+        assert!(
+            full.iter()
+                .any(|(k, v)| *k == "CUSTOM_KEY" && *v == "custom_value")
+        );
         // Should have more than just our one custom var
         assert!(full.len() > 1);
     }
@@ -1373,6 +1409,24 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         assert_eq!(pathext_suffix(OsStr::from_bytes(b".EXE\xff")), None);
+    }
+
+    #[test]
+    fn reg_expand_utf16_words_appends_missing_nul() {
+        let words = nul_terminated_utf16_from_reg_bytes(&[b'A', 0, b'B', 0]).unwrap();
+        assert_eq!(words, vec![b'A' as u16, b'B' as u16, 0]);
+    }
+
+    #[test]
+    fn reg_expand_utf16_words_preserves_existing_nul() {
+        let words = nul_terminated_utf16_from_reg_bytes(&[b'A', 0, 0, 0]).unwrap();
+        assert_eq!(words, vec![b'A' as u16, 0]);
+    }
+
+    #[test]
+    fn reg_expand_utf16_words_rejects_odd_byte_length() {
+        let err = nul_terminated_utf16_from_reg_bytes(&[b'A']).unwrap_err();
+        assert!(err.to_string().contains("odd byte length"));
     }
 
     // ── CommandBuilder: get_shell ────────────────────────────
