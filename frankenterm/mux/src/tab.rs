@@ -73,16 +73,30 @@ fn offset_by_resize_delta(value: usize, delta: isize) -> usize {
     }
 }
 
+fn positive_resize_budget(value: usize) -> isize {
+    value.min(isize::MAX as usize) as isize
+}
+
+fn negative_resize_budget(value: usize) -> isize {
+    if value > isize::MAX as usize {
+        isize::MIN
+    } else {
+        -(value as isize)
+    }
+}
+
+fn resize_delta_between(next: usize, current: usize) -> isize {
+    if next >= current {
+        positive_resize_budget(next - current)
+    } else {
+        negative_resize_budget(current - next)
+    }
+}
+
 fn resize_delta_for_direction(direction: PaneDirection, amount: usize) -> isize {
     match direction {
-        PaneDirection::Down | PaneDirection::Right => amount.min(isize::MAX as usize) as isize,
-        PaneDirection::Up | PaneDirection::Left => {
-            if amount > isize::MAX as usize {
-                isize::MIN
-            } else {
-                -(amount as isize)
-            }
-        }
+        PaneDirection::Down | PaneDirection::Right => positive_resize_budget(amount),
+        PaneDirection::Up | PaneDirection::Left => negative_resize_budget(amount),
         PaneDirection::Next | PaneDirection::Prev => unreachable!(),
     }
 }
@@ -1046,7 +1060,10 @@ fn compute_split_resize_budget(
             let left_can_grow = left_wc.max.map_or(right_can_shrink, |max| {
                 max.saturating_sub(first_size.cols).min(right_can_shrink)
             });
-            (-(left_can_shrink as isize), left_can_grow as isize)
+            (
+                negative_resize_budget(left_can_shrink),
+                positive_resize_budget(left_can_grow),
+            )
         }
         SplitDirection::Vertical => {
             let left_can_shrink = first_size.rows.saturating_sub(left_hc.min);
@@ -1054,7 +1071,10 @@ fn compute_split_resize_budget(
             let left_can_grow = left_hc.max.map_or(right_can_shrink, |max| {
                 max.saturating_sub(first_size.rows).min(right_can_shrink)
             });
-            (-(left_can_shrink as isize), left_can_grow as isize)
+            (
+                negative_resize_budget(left_can_shrink),
+                positive_resize_budget(left_can_grow),
+            )
         }
     }
 }
@@ -2924,13 +2944,13 @@ impl TabInner {
             // Update the split nodes with adjusted sizes
             adjust_x_size(
                 self.pane.as_mut().unwrap(),
-                cols as isize - current_size.cols as isize,
+                resize_delta_between(cols, current_size.cols),
                 &dims,
                 &self.constraint_overrides,
             );
             adjust_y_size(
                 self.pane.as_mut().unwrap(),
-                rows as isize - current_size.rows as isize,
+                resize_delta_between(rows, current_size.rows),
                 &dims,
                 &self.constraint_overrides,
             );
@@ -4342,6 +4362,13 @@ mod test {
         assert_eq!(offset_by_resize_delta(5, -3), 2);
         assert_eq!(offset_by_resize_delta(5, 3), 8);
         assert_eq!(offset_by_resize_delta(5, isize::MIN), 0);
+        assert_eq!(positive_resize_budget(usize::MAX), isize::MAX);
+        assert_eq!(negative_resize_budget(0), 0);
+        assert_eq!(negative_resize_budget(isize::MAX as usize + 1), isize::MIN);
+        assert_eq!(resize_delta_between(8, 5), 3);
+        assert_eq!(resize_delta_between(5, 8), -3);
+        assert_eq!(resize_delta_between(usize::MAX, 0), isize::MAX);
+        assert_eq!(resize_delta_between(0, usize::MAX), isize::MIN);
         assert_eq!(
             resize_delta_for_direction(PaneDirection::Left, isize::MAX as usize + 1),
             isize::MIN
