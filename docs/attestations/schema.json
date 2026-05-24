@@ -732,11 +732,15 @@
         "sigstore_bundle": { "$ref": "#/$defs/sigstoreBundle" },
         "certificate_identity": {
           "description": "Expected SAN/identity (typically the GitHub Actions workflow ref).",
-          "type": "string"
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "certificate_oidc_issuer": {
           "description": "Expected OIDC issuer (https://token.actions.githubusercontent.com for GitHub).",
           "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
           "format": "uri"
         },
         "signature_path": {
@@ -764,11 +768,15 @@
             "sigstore_bundle": { "$ref": "#/$defs/sigstoreBundle" },
             "certificate_identity": {
               "description": "Expected SAN/identity (typically the GitHub Actions workflow ref).",
-              "type": "string"
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
             },
             "certificate_oidc_issuer": {
               "description": "Expected OIDC issuer (https://token.actions.githubusercontent.com for GitHub).",
               "type": "string",
+              "minLength": 1,
+              "pattern": "\\S",
               "format": "uri"
             }
           },

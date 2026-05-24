@@ -414,6 +414,47 @@ fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
 }
 
 #[test]
+fn bundle_schema_rejects_blank_sigstore_identity_fields() {
+    let validator = bundle_validator();
+    for (surface, mut bundle) in [
+        (
+            "certificate_identity",
+            base_bundle(json!({
+                "method": "sigstore-cosign-keyless",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "sigstore_bundle": {
+                    "path": "docs/attestations/0.2.0.sigstore",
+                    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "size_bytes": 4096
+                },
+                "certificate_identity": "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+                "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+            })),
+        ),
+        (
+            "certificate_oidc_issuer",
+            base_bundle(json!({
+                "method": "sigstore-cosign-keyless",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "sigstore_bundle": {
+                    "path": "docs/attestations/0.2.0.sigstore",
+                    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "size_bytes": 4096
+                },
+                "certificate_identity": "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+                "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+            })),
+        ),
+    ] {
+        bundle["signature"][surface] = json!(" \t");
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "sigstore signature must reject blank {surface}"
+        );
+    }
+}
+
+#[test]
 fn bundle_schema_rejects_blank_generator_version() {
     let validator = bundle_validator();
     let mut bundle = base_bundle(json!({
