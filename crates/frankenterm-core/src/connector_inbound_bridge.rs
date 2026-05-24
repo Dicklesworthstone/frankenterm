@@ -151,10 +151,11 @@ impl ConnectorSignal {
         signal_kind: ConnectorSignalKind,
         payload: serde_json::Value,
     ) -> Self {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = duration_ms_saturating(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
         Self {
             source_connector: source_connector.into(),
             signal_kind,
@@ -508,10 +509,11 @@ impl ConnectorInboundBridge {
         // Use SystemTime::now() so the attacker can't manipulate the
         // dedup clock.
         if let Some(ref cid) = signal.correlation_id {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = duration_ms_saturating(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default(),
+            );
             if !self.deduplicator.check_and_record(cid, now_ms) {
                 self.telemetry.signals_deduplicated =
                     self.telemetry.signals_deduplicated.saturating_add(1);
@@ -901,6 +903,11 @@ mod tests {
             !dedup.check_and_record("id-1", u64::MAX),
             "Duration::MAX must not truncate into a short dedup window"
         );
+    }
+
+    #[test]
+    fn inbound_bridge_duration_millis_saturates() {
+        assert_eq!(duration_ms_saturating(Duration::MAX), u64::MAX);
     }
 
     #[test]
