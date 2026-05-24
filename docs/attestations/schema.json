@@ -644,7 +644,14 @@
     },
     "manifestSlot": {
       "type": "object",
-      "required": ["category", "path", "media_type", "produced_by_bead", "description"],
+      "required": [
+        "category",
+        "path",
+        "media_type",
+        "produced_by_bead",
+        "proof_categories",
+        "description"
+      ],
       "additionalProperties": false,
       "properties": {
         "category": { "$ref": "#/$defs/category" },
@@ -688,9 +695,9 @@
         "proof_categories": {
           "description": "Proof taxonomy category IDs from docs/proof-taxonomy.json that this manifest slot contributes to.",
           "type": "array",
+          "minItems": 1,
           "uniqueItems": true,
-          "items": { "$ref": "#/$defs/proofCategoryId" },
-          "default": []
+          "items": { "$ref": "#/$defs/proofCategoryId" }
         },
         "description": {
           "type": "string",

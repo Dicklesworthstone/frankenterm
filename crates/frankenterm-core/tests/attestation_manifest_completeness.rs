@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use proptest::prelude::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const MANIFEST_REL_PATH: &str = "docs/attestations/manifest.json";
 const ISSUES_REL_PATH: &str = ".beads/issues.jsonl";
@@ -34,6 +34,10 @@ enum ManifestError {
     MissingSlotsArray,
     MissingCategory {
         slot_index: usize,
+    },
+    MissingProofCategories {
+        slot_index: usize,
+        category: String,
     },
     AmbiguousSlot {
         slot_index: usize,
@@ -101,6 +105,7 @@ impl ManifestError {
             ManifestError::JsonParse(_) => "json_parse",
             ManifestError::MissingSlotsArray => "slots_array_missing",
             ManifestError::MissingCategory { .. } => "category_missing",
+            ManifestError::MissingProofCategories { .. } => "proof_categories_missing",
             ManifestError::AmbiguousSlot { .. } => "path_and_deferred_both_set",
             ManifestError::MissingArtifact { .. } => "path_resolves_missing",
             ManifestError::UnsafePath { .. } => "unsafe_repo_relative_path",
@@ -122,6 +127,14 @@ impl ManifestError {
             ManifestError::MissingSlotsArray => "manifest.slots must be an array".to_string(),
             ManifestError::MissingCategory { slot_index } => {
                 format!("slot[{slot_index}] is missing category")
+            }
+            ManifestError::MissingProofCategories {
+                slot_index,
+                category,
+            } => {
+                format!(
+                    "slot[{slot_index}] {category}: proof_categories must be present and non-empty"
+                )
             }
             ManifestError::AmbiguousSlot {
                 slot_index,
@@ -376,6 +389,17 @@ fn validate_manifest_text(
             continue;
         };
         seen_categories.insert(category.to_string());
+        let proof_categories_len = slot
+            .get("proof_categories")
+            .and_then(Value::as_array)
+            .map(|proof_categories| proof_categories.len())
+            .unwrap_or(0);
+        if proof_categories_len == 0 {
+            errors.push(ManifestError::MissingProofCategories {
+                slot_index,
+                category: category.to_string(),
+            });
+        }
         let path = slot.get("path").and_then(Value::as_str);
         let deferred = slot.get("deferred_to_bead").and_then(Value::as_str);
         let producer = slot.get("produced_by_bead").and_then(Value::as_str);
@@ -502,6 +526,7 @@ fn valid_manifest_slot() -> Value {
         "path": "docs/perf/headline-claims.json",
         "media_type": "application/json",
         "produced_by_bead": "ft-syqcz.3",
+        "proof_categories": [5],
         "description": "headline claims matrix"
     })
 }
@@ -659,6 +684,17 @@ fn mutation_required_category_without_slot_is_rejected() {
 }
 
 #[test]
+fn mutation_missing_proof_categories_is_rejected() {
+    let mut slot = valid_manifest_slot();
+    slot.as_object_mut()
+        .expect("slot is object")
+        .remove("proof_categories");
+    let errors = validate_manifest_text(&manifest_with_slot(slot), "", &workspace_root())
+        .expect_err("missing proof_categories mutation must fail");
+    assert_error_contains(&errors, "proof_categories_missing", "proof_categories");
+}
+
+#[test]
 fn mutation_deferred_to_closed_bead_is_rejected() {
     let mut slot = valid_manifest_slot();
     slot["path"] = Value::Null;
@@ -793,6 +829,7 @@ enum ManifestMutation {
     WrongIssueEdgeDeferred,
     DuplicateSlot,
     MissingRequiredCategory,
+    MissingProofCategories,
     MissingProducerBead,
     OpenProducerBead,
 }
@@ -827,6 +864,7 @@ fn mutation_strategy() -> impl Strategy<Value = ManifestMutation> {
         Just(ManifestMutation::WrongIssueEdgeDeferred),
         Just(ManifestMutation::DuplicateSlot),
         Just(ManifestMutation::MissingRequiredCategory),
+        Just(ManifestMutation::MissingProofCategories),
         Just(ManifestMutation::MissingProducerBead),
         Just(ManifestMutation::OpenProducerBead),
     ]
@@ -923,6 +961,11 @@ fn apply_mutation(mutation: &ManifestMutation) -> (String, String) {
                 .to_string(),
                 issues,
             );
+        }
+        ManifestMutation::MissingProofCategories => {
+            slot.as_object_mut()
+                .expect("slot is object")
+                .remove("proof_categories");
         }
         ManifestMutation::MissingProducerBead => {
             issues = json!({

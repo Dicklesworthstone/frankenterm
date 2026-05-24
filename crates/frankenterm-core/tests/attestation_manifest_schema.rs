@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jsonschema::{Draft, Validator};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -87,6 +87,7 @@ fn base_slot(path: Value) -> Value {
         "path": path,
         "media_type": "application/json",
         "produced_by_bead": "ft-syqcz.3",
+        "proof_categories": [5],
         "description": "headline claims matrix"
     })
 }
@@ -316,6 +317,28 @@ fn manifest_schema_rejects_blank_slot_descriptions() {
     assert!(
         !errors.is_empty(),
         "manifest slots must carry non-blank descriptions"
+    );
+}
+
+#[test]
+fn manifest_schema_rejects_missing_or_empty_proof_categories() {
+    let validator = manifest_validator();
+
+    let mut missing_proof_categories = base_slot(json!("docs/perf/headline-claims.json"));
+    missing_proof_categories
+        .as_object_mut()
+        .expect("slot is object")
+        .remove("proof_categories");
+    assert!(
+        !validate(&validator, &base_manifest(missing_proof_categories)).is_empty(),
+        "manifest slots must declare proof_categories"
+    );
+
+    let mut empty_proof_categories = base_slot(json!("docs/perf/headline-claims.json"));
+    empty_proof_categories["proof_categories"] = json!([]);
+    assert!(
+        !validate(&validator, &base_manifest(empty_proof_categories)).is_empty(),
+        "manifest slots must reject empty proof_categories"
     );
 }
 
