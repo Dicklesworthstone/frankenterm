@@ -119,14 +119,39 @@ impl CompletionState {
         let candidate = &self.candidates[self.index];
         line.replace_range(candidate.range.clone(), &candidate.text);
 
-        // To figure the new cursor position do a little math:
-        // "he<TAB>" when the completion is "hello" will set the completion
-        // candidate to replace "he" with "hello", so the difference in the
-        // lengths of these two is how far the cursor needs to move.
-        let range_len = candidate.range.end - candidate.range.start;
-        let new_cursor = self.original_cursor + candidate.text.len() - range_len;
+        let new_cursor = completion_cursor_after_replacement(
+            self.original_cursor,
+            candidate.range.clone(),
+            candidate.text.len(),
+        );
 
         (new_cursor, line)
+    }
+}
+
+fn completion_candidate_is_valid(line: &str, candidate: &CompletionCandidate) -> bool {
+    candidate.range.start <= candidate.range.end
+        && candidate.range.end <= line.len()
+        && line.is_char_boundary(candidate.range.start)
+        && line.is_char_boundary(candidate.range.end)
+}
+
+fn completion_cursor_after_replacement(
+    original_cursor: usize,
+    range: std::ops::Range<usize>,
+    replacement_len: usize,
+) -> usize {
+    if original_cursor <= range.start {
+        original_cursor
+    } else if original_cursor <= range.end {
+        range.start + replacement_len
+    } else {
+        let range_len = range.end - range.start;
+        if replacement_len >= range_len {
+            original_cursor + (replacement_len - range_len)
+        } else {
+            original_cursor - (range_len - replacement_len)
+        }
     }
 }
 
@@ -791,13 +816,21 @@ impl<'term> LineEditor<'term> {
                 self.cancel_search_state();
 
                 if self.completion.is_none() {
-                    let candidates = host.complete(self.line.get_line(), self.line.get_cursor());
+                    let original_line = self.line.get_line().to_string();
+                    let original_cursor = self.line.get_cursor();
+                    let candidates: Vec<_> = host
+                        .complete(self.line.get_line(), self.line.get_cursor())
+                        .into_iter()
+                        .filter(|candidate| {
+                            completion_candidate_is_valid(&original_line, candidate)
+                        })
+                        .collect();
                     if !candidates.is_empty() {
                         let state = CompletionState {
                             candidates,
                             index: 0,
-                            original_line: self.line.get_line().to_string(),
-                            original_cursor: self.line.get_cursor(),
+                            original_line,
+                            original_cursor,
                         };
 
                         let (cursor, line) = state.current();
@@ -929,6 +962,27 @@ mod tests {
         editor
     }
 
+    struct FixedCompletionHost {
+        history: BasicHistory,
+        candidates: Vec<CompletionCandidate>,
+    }
+
+    impl LineEditorHost for FixedCompletionHost {
+        fn history(&mut self) -> &mut dyn History {
+            &mut self.history
+        }
+
+        fn complete(&self, _line: &str, _cursor_position: usize) -> Vec<CompletionCandidate> {
+            self.candidates
+                .iter()
+                .map(|candidate| CompletionCandidate {
+                    range: candidate.range.clone(),
+                    text: candidate.text.clone(),
+                })
+                .collect()
+        }
+    }
+
     #[test]
     fn empty_history_backward_search_preserves_current_input() {
         let line = "draft command";
@@ -957,5 +1011,44 @@ mod tests {
 
         assert_eq!(editor.get_line_and_cursor(), (line, line.len()));
         assert_eq!(editor.state, EditorState::Editing);
+    }
+
+    #[test]
+    fn invalid_completion_range_is_ignored() {
+        let mut terminal = TestTerminal::default();
+        let mut editor = editor_with_line(&mut terminal, "a\u{03b1}");
+        let mut host = FixedCompletionHost {
+            history: BasicHistory::default(),
+            candidates: vec![CompletionCandidate {
+                range: 1..2,
+                text: "x".to_string(),
+            }],
+        };
+
+        editor
+            .apply_action(&mut host, Action::Complete)
+            .expect("invalid completion range should not panic");
+
+        assert_eq!(editor.get_line_and_cursor(), ("a\u{03b1}", 3));
+    }
+
+    #[test]
+    fn completion_after_cursor_keeps_cursor_before_replacement() {
+        let mut terminal = TestTerminal::default();
+        let mut editor = editor_with_line(&mut terminal, "hello world");
+        editor.set_line_and_cursor("hello world", 5);
+        let mut host = FixedCompletionHost {
+            history: BasicHistory::default(),
+            candidates: vec![CompletionCandidate {
+                range: 6..11,
+                text: "x".to_string(),
+            }],
+        };
+
+        editor
+            .apply_action(&mut host, Action::Complete)
+            .expect("valid completion should apply");
+
+        assert_eq!(editor.get_line_and_cursor(), ("hello x", 5));
     }
 }
