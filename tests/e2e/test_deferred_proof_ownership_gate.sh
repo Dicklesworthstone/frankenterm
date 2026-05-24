@@ -153,6 +153,9 @@ fail!("contract const drifted") unless schema.dig("properties", "contract_id", "
 fail!("decision enum drifted") unless schema.dig("$defs", "decision_state", "enum").sort == EXPECTED_STATES.sort
 fail!("forbidden enum drifted") unless schema.dig("$defs", "forbidden_action", "enum").sort == EXPECTED_FORBIDDEN.sort
 fail!("dirty path categories missing owned overlap") unless schema.dig("$defs", "dirty_path", "properties", "category", "enum").include?("owned_overlap")
+# Free-text explanation must be bounded so it cannot become a raw-content sink.
+EXPLANATION_MAX_LEN = 512
+fail!("explanation must pin maxLength #{EXPLANATION_MAX_LEN}") unless schema.dig("$defs", "gate_decision", "properties", "explanation", "maxLength") == EXPLANATION_MAX_LEN
 fail!("coordination schema missing queued receipt owners") unless schema.dig("$defs", "coordination_snapshot", "required").include?("queued_receipt_owners")
 
 fail!("manifest contract drifted") unless manifest["contract_id"] == "ft.deferred_proof_ownership_gate.fixture_manifest.v1"
@@ -182,6 +185,7 @@ fixture_cases.each do |entry|
   fail!("#{case_id} decision drifted") unless decision.fetch("state") == EXPECTED_CASES.fetch(case_id)
   fail!("#{case_id} missing reason codes") if decision.fetch("reason_codes").empty?
   fail!("#{case_id} missing explanation") if decision.fetch("explanation").strip.empty?
+  fail!("#{case_id} explanation exceeds #{EXPLANATION_MAX_LEN} chars") if decision.fetch("explanation").length > EXPLANATION_MAX_LEN
   fail!("#{case_id} owned paths empty") if owned.empty?
   owned.each { |path| fail!("#{case_id} unsafe owned path #{path.inspect}") unless path_safe?(path) }
   dirty_paths(gate).each { |path| fail!("#{case_id} unsafe dirty path #{path.inspect}") unless path_safe?(path) }
