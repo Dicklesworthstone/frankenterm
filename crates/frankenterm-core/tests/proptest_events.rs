@@ -700,6 +700,66 @@ proptest! {
             "pattern '{}' should match '{}'", pattern, value);
     }
 
+    /// Property 33: Consecutive stars collapse — a run of k stars matches
+    /// exactly the same set as a single star, for any value. Exercises the
+    /// trailing-star loop and the backtracking run-handling.
+    #[test]
+    fn prop_glob_consecutive_stars_equal_single(
+        s in "[a-zA-Z0-9._:-]{1,30}",
+        k in 1usize..=5,
+    ) {
+        let stars = "*".repeat(k);
+        prop_assert_eq!(
+            match_rule_glob(&stars, &s),
+            match_rule_glob("*", &s),
+            "'{}' must match the same set as '*' for value '{}'", stars, s
+        );
+    }
+
+    /// Property 34: Inserting a `*` at any boundary of a literal that
+    /// already equals the value preserves the match — a star can always
+    /// absorb zero characters.
+    #[test]
+    fn prop_glob_star_insertion_preserves_self_match(
+        s in "[a-z.]{1,20}",
+        idx in 0usize..=20,
+    ) {
+        let idx = idx.min(s.len()); // ascii: every index is a char boundary
+        let pattern = format!("{}*{}", &s[..idx], &s[idx..]);
+        prop_assert!(match_rule_glob(&pattern, &s),
+            "inserting '*' at {} into '{}' should still match '{}'", idx, pattern, s);
+    }
+
+    /// Property 35: A wildcard-free pattern matches a value iff they are
+    /// equal — covers both the positive (equal) and negative (distinct)
+    /// directions with no `*`/`?` present.
+    #[test]
+    fn prop_glob_wildcard_free_matches_iff_equal(
+        p in "[a-z0-9._:-]{1,20}",
+        v in "[a-z0-9._:-]{1,20}",
+    ) {
+        prop_assert_eq!(
+            match_rule_glob(&p, &v),
+            p == v,
+            "wildcard-free '{}' vs '{}' must match iff equal", p, v
+        );
+    }
+
+    /// Property 36: A run of `?` of length n matches a value iff the value
+    /// is exactly n characters long.
+    #[test]
+    fn prop_glob_question_run_matches_iff_exact_length(
+        base in "[a-z]{1,8}",
+    ) {
+        let n = base.len(); // ascii: byte len == char count
+        let pattern = "?".repeat(n);
+        prop_assert!(match_rule_glob(&pattern, &base),
+            "'{}' (len {}) should match value of exactly {} chars", pattern, n, n);
+        let longer = format!("{}x", base);
+        prop_assert!(!match_rule_glob(&pattern, &longer),
+            "'{}' must NOT match '{}' (length mismatch)", pattern, longer);
+    }
+
     // ========================================================================
     // Property Tests: EventFilter
     // ========================================================================
