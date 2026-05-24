@@ -301,11 +301,23 @@ impl ArsCompiler {
         }
 
         // br-ft-hcvcn: evidence root_hash gate. A valid hash-chain
-        // root must be non-empty; a default `String::new()` cannot
-        // have come from a real ledger and is fail-closed.
-        if input.evidence_digest.root_hash.is_empty() {
+        // root must be a non-empty hex digest; constructible default
+        // or truncated/non-hex values cannot have come from a real
+        // ledger and are fail-closed.
+        let root_hash = input.evidence_digest.root_hash.as_str();
+        if root_hash.is_empty() {
             return Err(CompileError::MalformedEvidenceRoot {
                 reason: "root_hash is empty (no hash-chain anchor)".to_string(),
+            });
+        }
+        if root_hash.len() < 16 {
+            return Err(CompileError::MalformedEvidenceRoot {
+                reason: format!("root_hash is too short: {} < 16", root_hash.len()),
+            });
+        }
+        if !root_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CompileError::MalformedEvidenceRoot {
+                reason: "root_hash must be ASCII hex".to_string(),
             });
         }
 
@@ -977,6 +989,30 @@ mod tests {
         let err = compiler.compile(&input).unwrap_err();
         let is_rejected = matches!(err, CompileError::EvidenceRejected { .. });
         assert!(is_rejected);
+    }
+
+    #[test]
+    fn rejects_short_evidence_root_hash() {
+        let compiler = ArsCompiler::with_defaults();
+        let mut input = test_input(vec![test_command("echo ok", 0)]);
+        input.evidence_digest.root_hash = "abc".to_string();
+
+        let err = compiler.compile(&input).unwrap_err();
+        assert!(
+            matches!(err, CompileError::MalformedEvidenceRoot { reason } if reason.contains("too short"))
+        );
+    }
+
+    #[test]
+    fn rejects_non_hex_evidence_root_hash() {
+        let compiler = ArsCompiler::with_defaults();
+        let mut input = test_input(vec![test_command("echo ok", 0)]);
+        input.evidence_digest.root_hash = "z".repeat(16);
+
+        let err = compiler.compile(&input).unwrap_err();
+        assert!(
+            matches!(err, CompileError::MalformedEvidenceRoot { reason } if reason.contains("ASCII hex"))
+        );
     }
 
     #[test]
