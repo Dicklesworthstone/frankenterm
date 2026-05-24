@@ -103,6 +103,11 @@ const STREAMING_SECRET_ANCHORS: &[&str] = &[
     "databricks",
     "azure_openai",
     "azure-openai",
+    // Collapsed key-name: AI_PROVIDER_KEYED_VALUE accepts `azure[_-]?openai`
+    // with no separator (`azureopenai_key=`, `azureopenaikey=`), but the
+    // separated anchors above never match it, so a value split across a chunk
+    // boundary leaked. Anchor scan is case-insensitive. (ft-b1p6x)
+    "azureopenai",
     "AKIA",
     "aws_secret_access_key",
     "Authorization",
@@ -119,6 +124,11 @@ const STREAMING_SECRET_ANCHORS: &[&str] = &[
     "device-code",
     "user_code",
     "user-code",
+    // Collapsed key-names: DEVICE_CODE accepts `device[_-]?code` /
+    // `user[_-]?code` with no separator (`devicecode=`, `usercode=`), which the
+    // separated anchors above never match — same streaming leak class. (ft-b1p6x)
+    "devicecode",
+    "usercode",
     "access_token",
     "code=",
     "xoxb-",
@@ -1320,6 +1330,42 @@ mod tests {
                 !rendered.contains(value),
                 "split={split} leaked {rendered:?}"
             );
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_catches_collapsed_keyname_secrets_split_at_every_offset() {
+        // ft-b1p6x regression: AI_PROVIDER_KEYED_VALUE and DEVICE_CODE accept
+        // collapsed (no-separator) key-names (`azureopenai_key=`, `devicecode=`,
+        // `usercode=`) that batch redaction caught but STREAMING_SECRET_ANCHORS
+        // only held the separated forms, so a value split across a chunk
+        // boundary leaked. The collapsed anchors now cover them. Mirrors the
+        // DATADOG long-form and uppercase regressions.
+        let value = "deadbeef0123456789abcdef01234567";
+        for key in ["azureopenai_key", "devicecode", "usercode"] {
+            let input = format!("before {key}={value} after");
+            let expected = Redactor::new().redact(&input).into_bytes();
+            assert_ne!(
+                expected,
+                input.as_bytes(),
+                "fixture must actually redact key={key}"
+            );
+
+            for split in 1..input.len() {
+                let mut streaming = StreamingRedactor::new();
+                let mut out = Vec::new();
+
+                out.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
+                out.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+                out.extend(streaming.finish().bytes);
+
+                assert_eq!(out, expected, "key={key} split={split}");
+                let rendered = String::from_utf8(out).unwrap();
+                assert!(
+                    !rendered.contains(value),
+                    "key={key} split={split} leaked {rendered:?}"
+                );
+            }
         }
     }
 
