@@ -248,7 +248,7 @@
           "type": "string",
           "pattern": "^[^/].*$",
           "allOf": [{ "pattern": "\\S" }],
-          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+          "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
         }
       }
     },
@@ -311,7 +311,7 @@
           "type": "string",
           "pattern": "^[^/].*$",
           "allOf": [{ "pattern": "\\S" }],
-          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+          "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
         },
         "media_type": {
           "enum": [
@@ -433,7 +433,7 @@
           "type": "string",
           "pattern": "^[^/].*$",
           "allOf": [{ "pattern": "\\S" }],
-          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+          "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
         },
         "retraction_sha256": {
           "type": "string",
@@ -468,7 +468,7 @@
                 "type": "string",
                 "pattern": "^[^/].*$",
                 "allOf": [{ "pattern": "\\S" }],
-                "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+                "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
               }
             }
           }
@@ -535,7 +535,7 @@
           "type": "string",
           "pattern": "^[^/].*$",
           "allOf": [{ "pattern": "\\S" }],
-          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+          "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
         },
         "category_counts": {
           "type": "array",
@@ -629,7 +629,7 @@
           "type": "string",
           "pattern": "^[^/].*$",
           "allOf": [{ "pattern": "\\S" }],
-          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+          "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
         },
         "sha256": {
           "description": "Lowercase hex SHA-256 of the sigstore bundle bytes. This binds the external .sigstore file to the signed JSON bundle.",
@@ -662,7 +662,7 @@
               "type": "string",
               "pattern": "^[^/].*$",
               "allOf": [{ "pattern": "\\S" }],
-              "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+              "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
             },
             { "type": "null" }
           ]
@@ -712,7 +712,7 @@
               "type": "string",
               "pattern": "^[^/].*$",
               "allOf": [{ "pattern": "\\S" }],
-              "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+              "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
             }
           },
           "not": { "required": ["deferred_to_bead"] }
@@ -777,7 +777,7 @@
           "type": "string",
           "pattern": "^[^/].*$",
           "allOf": [{ "pattern": "\\S" }],
-          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+          "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
         },
         "public_key": {
           "description": "32-byte ed25519 public key, hex-encoded.",
@@ -820,7 +820,7 @@
               "type": "string",
               "pattern": "^[^/].*$",
               "allOf": [{ "pattern": "\\S" }],
-              "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+              "not": { "pattern": "(^|/)(\\.{1,2}|)(/|$)" }
             },
             "public_key": {
               "description": "32-byte ed25519 public key, hex-encoded.",
