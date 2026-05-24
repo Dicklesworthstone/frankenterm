@@ -499,7 +499,7 @@ impl CwdInfo {
                 // Local path
                 Self {
                     raw_uri: uri.to_string(),
-                    path: rest.to_string(),
+                    path: percent_decode_file_uri_path(rest),
                     host: String::new(),
                     is_remote: false,
                 }
@@ -509,7 +509,7 @@ impl CwdInfo {
                 let path = &rest[slash_pos..];
                 Self {
                     raw_uri: uri.to_string(),
-                    path: path.to_string(),
+                    path: percent_decode_file_uri_path(path),
                     host: host.to_string(),
                     is_remote: true,
                 }
@@ -531,6 +531,35 @@ impl CwdInfo {
                 is_remote: false,
             }
         }
+    }
+}
+
+fn percent_decode_file_uri_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
+            {
+                decoded.push((high << 4) | low);
+                idx += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[idx]);
+        idx += 1;
+    }
+
+    String::from_utf8(decoded).unwrap_or_else(|_| path.to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -4292,6 +4321,25 @@ mod tests {
         assert!(cwd.is_remote);
         assert_eq!(cwd.path, "/home/user");
         assert_eq!(cwd.host, "remote-server");
+    }
+
+    #[test]
+    fn cwd_info_percent_decodes_file_uri_paths() {
+        let cwd = CwdInfo::parse("file:///home/user/agent%20workspace/%E2%9C%93");
+        assert!(!cwd.is_remote);
+        assert_eq!(cwd.path, "/home/user/agent workspace/✓");
+        assert_eq!(cwd.raw_uri, "file:///home/user/agent%20workspace/%E2%9C%93");
+
+        let cwd = CwdInfo::parse("file://remote-server/srv/agent%20workspace");
+        assert!(cwd.is_remote);
+        assert_eq!(cwd.host, "remote-server");
+        assert_eq!(cwd.path, "/srv/agent workspace");
+    }
+
+    #[test]
+    fn cwd_info_preserves_invalid_percent_encoded_file_uri_path() {
+        let cwd = CwdInfo::parse("file:///tmp/%FF");
+        assert_eq!(cwd.path, "/tmp/%FF");
     }
 
     #[test]
