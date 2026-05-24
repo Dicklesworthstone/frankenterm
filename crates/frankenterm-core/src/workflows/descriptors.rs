@@ -352,6 +352,13 @@ impl DescriptorMatcher {
     fn validate(&self, limits: &DescriptorLimits) -> crate::Result<()> {
         match self {
             Self::Substring { value } => {
+                if value.trim().is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "Substring matcher cannot be empty".to_string(),
+                        ),
+                    ));
+                }
                 if value.len() > limits.max_match_len {
                     return Err(crate::Error::Config(
                         crate::error::ConfigError::ValidationError(format!(
@@ -363,6 +370,13 @@ impl DescriptorMatcher {
                 }
             }
             Self::Regex { pattern } => {
+                if pattern.trim().is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "Regex matcher cannot be empty".to_string(),
+                        ),
+                    ));
+                }
                 if pattern.len() > limits.max_match_len {
                     return Err(crate::Error::Config(
                         crate::error::ConfigError::ValidationError(format!(

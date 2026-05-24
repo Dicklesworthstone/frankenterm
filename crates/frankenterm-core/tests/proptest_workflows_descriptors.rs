@@ -957,7 +957,7 @@ proptest! {
 
     #[test]
     fn substring_matcher_respects_configured_match_length_limit(
-        max_match_len in 0usize..128,
+        max_match_len in 1usize..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_match_len,
@@ -1007,7 +1007,7 @@ proptest! {
 
     #[test]
     fn regex_matcher_respects_configured_match_length_limit(
-        max_match_len in 0usize..128,
+        max_match_len in 1usize..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_match_len,
@@ -1052,6 +1052,37 @@ proptest! {
         prop_assert!(
             over_limit.validate(&limits).is_err(),
             "regex matcher longer than max_match_len should fail validation"
+        );
+    }
+
+    #[test]
+    fn empty_matchers_fail_validation(matcher_variant in 0u8..2) {
+        let matcher = match matcher_variant {
+            0 => DescriptorMatcher::Substring {
+                value: " \t ".to_string(),
+            },
+            _ => DescriptorMatcher::Regex {
+                pattern: " \t ".to_string(),
+            },
+        };
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "empty_matcher".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::WaitFor {
+                id: "wait".to_string(),
+                description: None,
+                matcher,
+                timeout_ms: None,
+            }],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "descriptor validation must reject empty matchers"
         );
     }
 
