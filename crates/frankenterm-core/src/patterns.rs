@@ -1624,11 +1624,14 @@ struct LoadedPacks {
 
 fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Result<LoadedPacks> {
     let mut packs = Vec::with_capacity(config.packs.len());
-    for pack_id in &config.packs {
-        packs.push(load_pack_from_id(pack_id, root)?);
-    }
-
     let mut user_pack_names = HashSet::new();
+    for pack_id in &config.packs {
+        let pack = load_pack_from_id(pack_id, root)?;
+        if pack_id.starts_with("file:") {
+            user_pack_names.insert(pack.name.clone());
+        }
+        packs.push(pack);
+    }
 
     // Discover user packs from config dir (e.g. ~/.config/wa/patterns/)
     //
@@ -6464,6 +6467,40 @@ description = "Custom org alert"
         let pack = load_pack_from_file(pack_path.to_str().unwrap(), Some(dir.path())).unwrap();
         assert_eq!(pack.rules.len(), 1);
         assert_eq!(pack.rules[0].id, "myorg.custom_alert");
+    }
+
+    #[test]
+    fn config_file_pack_validates_as_user_pack_with_custom_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("config-rules.toml");
+        fs::write(
+            &pack_path,
+            r#"
+name = "user:config-rules"
+version = "1.0.0"
+
+[[rules]]
+id = "myorg.config_alert"
+agent_type = "codex"
+event_type = "custom.alert"
+severity = "warning"
+anchors = ["[MY-CONFIG] Alert:"]
+description = "Custom config alert"
+"#,
+        )
+        .unwrap();
+        let config = PatternsConfig {
+            packs: vec![format!("file:{}", pack_path.display())],
+            user_packs_enabled: false,
+            ..PatternsConfig::default()
+        };
+
+        let engine =
+            PatternEngine::from_config(&config).expect("file: pack should use user validation");
+        let detections = engine.detect("prefix [MY-CONFIG] Alert: suffix");
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "myorg.config_alert");
     }
 
     #[test]
