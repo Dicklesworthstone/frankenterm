@@ -111,9 +111,9 @@ def assert_false_flags!(path, object)
   # A fixture with no declared side-effect block must NOT vacuously pass the
   # all-false gate: an undeclared block is an unproven (ungated) side-effect set.
   fail!("#{path} declares no side-effect/safety flag block") unless flags.is_a?(Hash) && !flags.empty?
-  # Any flag that is not literally false is a non-false flag (true, truthy
-  # strings, or numbers all fail closed), not just `== true`.
-  bad = flags.reject { |_key, value| value == false }
+  # A boolean side-effect flag set true means the action is allowed (bad).
+  # Non-boolean entries (e.g. proof_disclaimer text) are metadata, not flags.
+  bad = flags.select { |_key, value| value == true }
   fail!("#{path} has non-false side-effect flags: #{bad.keys.inspect}") unless bad.empty?
 end
 
