@@ -250,6 +250,38 @@ proptest! {
     }
 }
 
+#[test]
+fn descriptor_validation_rejects_over_recursion_limit_before_compile_truncation() {
+    let mut step = DescriptorStep::Log {
+        id: "leaf".to_string(),
+        description: None,
+        message: "leaf".to_string(),
+    };
+    for depth in (0..70).rev() {
+        step = DescriptorStep::Loop {
+            id: format!("loop_{depth}"),
+            description: None,
+            count: 1,
+            body: vec![step],
+        };
+    }
+
+    let descriptor = WorkflowDescriptor {
+        workflow_schema_version: 1,
+        name: "too_deep".to_string(),
+        description: None,
+        triggers: Vec::new(),
+        steps: vec![step],
+        on_failure: None,
+    };
+
+    let limits = frankenterm_core::workflows::DescriptorLimits::default();
+    assert!(
+        descriptor.validate(&limits).is_err(),
+        "over-deep descriptor trees must fail validation instead of compiling truncated metadata"
+    );
+}
+
 // =============================================================================
 // Structural invariant tests
 // =============================================================================

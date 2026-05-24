@@ -163,7 +163,7 @@ impl WorkflowDescriptor {
 
         let mut seen = std::collections::HashSet::new();
         for step in &self.steps {
-            validate_step_tree(step, limits, &mut seen)?;
+            validate_step_tree(step, limits, &mut seen, 0)?;
         }
 
         Ok(())
@@ -174,7 +174,16 @@ fn validate_step_tree(
     step: &DescriptorStep,
     limits: &DescriptorLimits,
     seen: &mut std::collections::HashSet<String>,
+    depth: usize,
 ) -> crate::Result<()> {
+    if depth > DESCRIPTOR_MAX_RECURSION_DEPTH {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Descriptor nesting too deep ({depth} > max {DESCRIPTOR_MAX_RECURSION_DEPTH})"
+            )),
+        ));
+    }
+
     let id = step.id();
     if id.trim().is_empty() {
         return Err(crate::Error::Config(
@@ -198,15 +207,15 @@ fn validate_step_tree(
             ..
         } => {
             for child in then_steps {
-                validate_step_tree(child, limits, seen)?;
+                validate_step_tree(child, limits, seen, depth + 1)?;
             }
             for child in else_steps {
-                validate_step_tree(child, limits, seen)?;
+                validate_step_tree(child, limits, seen, depth + 1)?;
             }
         }
         DescriptorStep::Loop { body, .. } => {
             for child in body {
-                validate_step_tree(child, limits, seen)?;
+                validate_step_tree(child, limits, seen, depth + 1)?;
             }
         }
         DescriptorStep::WaitFor { .. }
@@ -489,19 +498,8 @@ impl DescriptorStep {
                     ));
                 }
             }
-            Self::Conditional {
-                matcher,
-                then_steps,
-                else_steps,
-                ..
-            } => {
+            Self::Conditional { matcher, .. } => {
                 matcher.validate(limits)?;
-                for step in then_steps {
-                    step.validate(limits)?;
-                }
-                for step in else_steps {
-                    step.validate(limits)?;
-                }
             }
             Self::Loop { count, body, .. } => {
                 if *count > 1000 {
@@ -517,9 +515,6 @@ impl DescriptorStep {
                             "Loop body must contain at least one step".to_string(),
                         ),
                     ));
-                }
-                for step in body {
-                    step.validate(limits)?;
                 }
             }
         }
