@@ -363,7 +363,7 @@ impl SummaryReport {
                     fail: run.fail_count,
                     skip: run
                         .total_count
-                        .saturating_sub(run.pass_count + run.fail_count),
+                        .saturating_sub(run.pass_count.saturating_add(run.fail_count)),
                     duration_ms: run.duration_ms,
                 },
             );
@@ -906,6 +906,36 @@ mod tests {
         let summary = SummaryReport::from_result(&result, "now".into());
         assert_eq!(summary.total_pass(), 0);
         assert_eq!(summary.total_fail(), 0);
+    }
+
+    #[test]
+    fn summary_skip_count_saturates_pass_fail_overflow() {
+        let mut gate_results = BTreeMap::new();
+        gate_results.insert(
+            GateId::Smoke.as_str().to_string(),
+            GateRunResult {
+                gate: GateId::Smoke,
+                status: GateStatus::Pass,
+                pass_count: usize::MAX,
+                fail_count: 1,
+                total_count: usize::MAX,
+                duration_ms: 1,
+            },
+        );
+        let result = OrchestratorResult {
+            gate_results,
+            gates_run: 1,
+            gates_passed: 1,
+            gates_failed: 0,
+            overall_status: GateStatus::Pass,
+            total_duration_ms: 1,
+            fail_fast_triggered: false,
+            evidence_path: None,
+        };
+
+        let summary = SummaryReport::from_result(&result, "now".into());
+
+        assert_eq!(summary.gates[GateId::Smoke.as_str()].skip, 0);
     }
 
     // ── GateRunResult ────────────────────────────────────────────────────
