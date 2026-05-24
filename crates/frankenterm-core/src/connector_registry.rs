@@ -683,7 +683,7 @@ impl ConnectorRegistryClient {
 
         // 2. Verify digest
         if let Err(e) = verify_digest(&manifest.package_id, payload, &manifest.sha256_digest) {
-            self.telemetry.digest_failures += 1;
+            self.telemetry.digest_failures = self.telemetry.digest_failures.saturating_add(1);
             self.record_verification(&manifest, VerificationOutcome::DigestFailed, now_ms);
             return Err(e);
         }
@@ -694,7 +694,8 @@ impl ConnectorRegistryClient {
             Err(e) => {
                 match &e {
                     ConnectorRegistryError::CapabilityNotPermitted { .. } => {
-                        self.telemetry.capability_denials += 1;
+                        self.telemetry.capability_denials =
+                            self.telemetry.capability_denials.saturating_add(1);
                         self.record_verification(
                             &manifest,
                             VerificationOutcome::CapabilityDenied,
@@ -702,7 +703,8 @@ impl ConnectorRegistryClient {
                         );
                     }
                     _ => {
-                        self.telemetry.trust_denials += 1;
+                        self.telemetry.trust_denials =
+                            self.telemetry.trust_denials.saturating_add(1);
                         self.record_verification(
                             &manifest,
                             VerificationOutcome::TrustDenied,
@@ -716,7 +718,8 @@ impl ConnectorRegistryClient {
 
         // 4. Optional transparency check
         if self.transparency_verification_required() {
-            self.telemetry.transparency_checks += 1;
+            self.telemetry.transparency_checks =
+                self.telemetry.transparency_checks.saturating_add(1);
             if let Err(err) = check_transparency(
                 &manifest,
                 &self.config.trust_policy.trusted_transparency_roots,
@@ -758,8 +761,8 @@ impl ConnectorRegistryClient {
 
         // 7. Record successful verification
         self.record_verification(&manifest, VerificationOutcome::Passed, now_ms);
-        self.telemetry.packages_verified += 1;
-        self.telemetry.packages_registered += 1;
+        self.telemetry.packages_verified = self.telemetry.packages_verified.saturating_add(1);
+        self.telemetry.packages_registered = self.telemetry.packages_registered.saturating_add(1);
 
         let package_id = manifest.package_id.clone();
         let entry = PackageEntry {
@@ -791,13 +794,14 @@ impl ConnectorRegistryClient {
         let expected = entry.manifest.sha256_digest.clone();
         let manifest_clone = entry.manifest.clone();
         if let Err(e) = verify_digest(package_id, payload, &expected) {
-            self.telemetry.digest_failures += 1;
+            self.telemetry.digest_failures = self.telemetry.digest_failures.saturating_add(1);
             self.record_verification(&manifest_clone, VerificationOutcome::DigestFailed, now_ms);
             return Err(e);
         }
 
         if self.transparency_verification_required() {
-            self.telemetry.transparency_checks += 1;
+            self.telemetry.transparency_checks =
+                self.telemetry.transparency_checks.saturating_add(1);
             if let Err(err) = check_transparency(
                 &manifest_clone,
                 &self.config.trust_policy.trusted_transparency_roots,
@@ -812,10 +816,10 @@ impl ConnectorRegistryClient {
             }
         }
 
-        self.telemetry.packages_verified += 1;
+        self.telemetry.packages_verified = self.telemetry.packages_verified.saturating_add(1);
         let entry = self.packages.get_mut(package_id).unwrap();
         entry.last_verified_at_ms = now_ms;
-        entry.verification_count += 1;
+        entry.verification_count = entry.verification_count.saturating_add(1);
         let manifest = entry.manifest.clone();
         self.record_verification(&manifest, VerificationOutcome::Passed, now_ms);
         Ok(())
@@ -823,7 +827,7 @@ impl ConnectorRegistryClient {
 
     /// Look up a package by ID.
     pub fn get_package(&mut self, package_id: &str) -> Option<&PackageEntry> {
-        self.telemetry.lookups += 1;
+        self.telemetry.lookups = self.telemetry.lookups.saturating_add(1);
         self.packages.get(package_id)
     }
 
@@ -1301,6 +1305,20 @@ mod tests {
     }
 
     #[test]
+    fn register_package_success_counters_saturate() {
+        let mut client = default_client();
+        client.telemetry.packages_verified = u64::MAX;
+        client.telemetry.packages_registered = u64::MAX;
+        let data = b"connector payload";
+        let m = test_manifest("my-connector", data);
+
+        client.register_package(m, data, 1000).unwrap();
+
+        assert_eq!(client.telemetry().packages_verified, u64::MAX);
+        assert_eq!(client.telemetry().packages_registered, u64::MAX);
+    }
+
+    #[test]
     fn register_package_active_version_conflict() {
         let mut client = default_client();
         let data_v1 = b"connector payload v1";
@@ -1348,6 +1366,19 @@ mod tests {
     }
 
     #[test]
+    fn register_package_bad_digest_counter_saturates() {
+        let mut client = default_client();
+        client.telemetry.digest_failures = u64::MAX;
+        let data = b"connector payload";
+        let m = test_manifest("my-connector", data);
+
+        let err = client.register_package(m, b"wrong data", 1000).unwrap_err();
+
+        assert!(matches!(err, ConnectorRegistryError::DigestMismatch { .. }));
+        assert_eq!(client.telemetry().digest_failures, u64::MAX);
+    }
+
+    #[test]
     fn register_package_unsigned_rejected() {
         let mut client = default_client();
         let data = b"payload";
@@ -1359,6 +1390,23 @@ mod tests {
             ConnectorRegistryError::TrustPolicyDenied { .. }
         ));
         assert_eq!(client.telemetry().trust_denials, 1);
+    }
+
+    #[test]
+    fn register_package_trust_denial_counter_saturates() {
+        let mut client = default_client();
+        client.telemetry.trust_denials = u64::MAX;
+        let data = b"payload";
+        let mut m = test_manifest("pkg", data);
+        m.publisher_signature = None;
+
+        let err = client.register_package(m, data, 1000).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::TrustPolicyDenied { .. }
+        ));
+        assert_eq!(client.telemetry().trust_denials, u64::MAX);
     }
 
     #[test]
@@ -1394,6 +1442,24 @@ mod tests {
     }
 
     #[test]
+    fn register_package_capability_denial_counter_saturates() {
+        let mut config = default_config();
+        config.trust_policy.max_allowed_capabilities = vec![ConnectorCapability::ReadState];
+        let mut client = ConnectorRegistryClient::new(config);
+        client.telemetry.capability_denials = u64::MAX;
+        let data = b"payload";
+        let m = test_manifest("pkg", data);
+
+        let err = client.register_package(m, data, 1000).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::CapabilityNotPermitted { .. }
+        ));
+        assert_eq!(client.telemetry().capability_denials, u64::MAX);
+    }
+
+    #[test]
     fn register_and_lookup() {
         let mut client = default_client();
         let data = b"payload";
@@ -1403,6 +1469,15 @@ mod tests {
         let entry = client.get_package("pkg").unwrap();
         assert_eq!(entry.manifest.package_id, "pkg");
         assert_eq!(client.telemetry().lookups, 1);
+    }
+
+    #[test]
+    fn lookup_counter_saturates() {
+        let mut client = default_client();
+        client.telemetry.lookups = u64::MAX;
+
+        assert!(client.get_package("missing").is_none());
+        assert_eq!(client.telemetry().lookups, u64::MAX);
     }
 
     #[test]
@@ -1475,6 +1550,22 @@ mod tests {
     }
 
     #[test]
+    fn reverify_counters_saturate() {
+        let mut client = default_client();
+        let data = b"payload";
+        let m = test_manifest("pkg", data);
+        client.register_package(m, data, 1000).unwrap();
+        client.telemetry.packages_verified = u64::MAX;
+        client.packages.get_mut("pkg").unwrap().verification_count = u64::MAX;
+
+        client.reverify_package("pkg", data, 2000).unwrap();
+
+        assert_eq!(client.telemetry().packages_verified, u64::MAX);
+        assert_eq!(client.packages["pkg"].verification_count, u64::MAX);
+        assert_eq!(client.packages["pkg"].last_verified_at_ms, 2000);
+    }
+
+    #[test]
     fn reverify_digest_fail() {
         let mut client = default_client();
         let data = b"payload";
@@ -1530,6 +1621,24 @@ mod tests {
                 .map(|record| record.outcome),
             Some(VerificationOutcome::TransparencyFailed)
         );
+    }
+
+    #[test]
+    fn transparency_check_counter_saturates_on_register() {
+        let mut config = default_config();
+        config.enforce_transparency = true;
+        let mut client = ConnectorRegistryClient::new(config);
+        client.telemetry.transparency_checks = u64::MAX;
+
+        let data = b"payload";
+        let mut manifest = test_manifest("pkg", data);
+        let (root_hash, token) = make_transparency_token(&manifest, 8);
+        client.config.trust_policy.trusted_transparency_roots = vec![root_hash];
+        manifest.transparency_token = Some(token);
+
+        client.register_package(manifest, data, 1000).unwrap();
+
+        assert_eq!(client.telemetry().transparency_checks, u64::MAX);
     }
 
     #[test]
