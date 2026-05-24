@@ -514,6 +514,18 @@ impl TerminfoRenderer {
         Ok(())
     }
 
+    fn wrapped_relative_coordinate(current: usize, delta: isize, extent: usize) -> isize {
+        let extent = isize::try_from(extent.max(1)).unwrap_or(isize::MAX);
+        let current = isize::try_from(current % extent as usize).unwrap_or(0);
+        let delta = delta.rem_euclid(extent);
+
+        if current >= extent - delta {
+            current - (extent - delta)
+        } else {
+            current + delta
+        }
+    }
+
     fn update_cursor_position(&mut self, x: &Position, y: &Position, cols: usize, rows: usize) {
         let Some((cursor_x, cursor_y)) = self.cursor_position else {
             return;
@@ -523,7 +535,7 @@ impl TerminfoRenderer {
         let screen_rows = rows.max(1);
 
         let next_x = match x {
-            Position::Relative(dx) => (cursor_x as isize + dx).rem_euclid(screen_cols as isize),
+            Position::Relative(dx) => Self::wrapped_relative_coordinate(cursor_x, *dx, screen_cols),
             Position::Absolute(value) => (value % screen_cols) as isize,
             Position::EndRelative(value) => {
                 (screen_cols.saturating_sub(*value) % screen_cols) as isize
@@ -531,7 +543,7 @@ impl TerminfoRenderer {
         };
 
         let next_y = match y {
-            Position::Relative(dy) => (cursor_y as isize + dy).rem_euclid(screen_rows as isize),
+            Position::Relative(dy) => Self::wrapped_relative_coordinate(cursor_y, *dy, screen_rows),
             Position::Absolute(value) => (value % screen_rows) as isize,
             Position::EndRelative(value) => {
                 (screen_rows.saturating_sub(*value) % screen_rows) as isize
@@ -1687,6 +1699,21 @@ mod test {
         );
 
         assert_eq!(renderer.cursor_position, Some((0, 0)));
+    }
+
+    #[test]
+    fn update_cursor_position_wraps_extreme_relative_offsets_without_overflow() {
+        let mut renderer = TerminfoRenderer::new(xterm_terminfo());
+        renderer.cursor_position = Some((2, 1));
+
+        renderer.update_cursor_position(
+            &Position::Relative(isize::MAX),
+            &Position::Relative(isize::MIN),
+            4,
+            3,
+        );
+
+        assert_eq!(renderer.cursor_position, Some((1, 2)));
     }
 
     #[test]
