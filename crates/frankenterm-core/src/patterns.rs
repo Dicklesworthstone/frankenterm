@@ -705,9 +705,18 @@ impl RuleDef {
             // here but blows the limit downstream would bypass the
             // guard. Using `compile_rule_regex` keeps behaviour
             // identical across validate + build_engine_index.
-            compile_rule_regex(regex).map_err(|e| {
+            let compiled = compile_rule_regex(regex).map_err(|e| {
                 PatternError::InvalidRegex(format!("rule id '{}' has invalid regex: {e}", self.id))
             })?;
+            if compiled.is_match("").map_err(|e| {
+                PatternError::InvalidRegex(format!("rule id '{}' has invalid regex: {e}", self.id))
+            })? {
+                return Err(PatternError::InvalidRegex(format!(
+                    "rule id '{}' has regex that matches empty input",
+                    self.id
+                ))
+                .into());
+            }
         }
 
         Ok(())

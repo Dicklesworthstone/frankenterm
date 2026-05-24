@@ -1123,6 +1123,15 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_empty_matching_rule_regex(rule_suffix in "[a-z]{3,10}") {
+        let mut rule = make_anchor_only_rule(&rule_suffix, "EMPTY_REGEX_MATCH");
+        rule.regex = Some(".*".to_string());
+        let pack = PatternPack::new("builtin:empty-regex-match", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_event_type_whitespace(rule_suffix in "[a-z]{3,10}") {
         let mut rule = make_anchor_only_rule(&rule_suffix, "EVENT_TYPE_WHITESPACE");
         rule.event_type = "usage reached".to_string();
