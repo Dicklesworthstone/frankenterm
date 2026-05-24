@@ -208,6 +208,13 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
     env
 }
 
+#[cfg(any(windows, test))]
+fn pathext_suffix(ext: &OsStr) -> Option<&str> {
+    ext.to_str()?
+        .strip_prefix('.')
+        .filter(|suffix| !suffix.is_empty())
+}
+
 /// `CommandBuilder` is used to prepare a command to be spawned into a pty.
 /// The interface is intentionally similar to that of `std::process::Command`.
 #[derive(Clone, Debug, PartialEq)]
@@ -918,8 +925,10 @@ impl CommandBuilder {
                 for ext in std::env::split_paths(&extensions) {
                     // PATHEXT includes the leading `.`, but `with_extension`
                     // doesn't want that
-                    let ext = ext.to_str().expect("PATHEXT entries must be utf8");
-                    let path = path.join(exe).with_extension(&ext[1..]);
+                    let Some(ext) = pathext_suffix(ext.as_os_str()) else {
+                        continue;
+                    };
+                    let path = path.join(exe).with_extension(ext);
                     if path.exists() {
                         return path.into_os_string();
                     }
@@ -1343,6 +1352,27 @@ mod tests {
         if cfg!(unix) {
             assert_eq!(mapped, key);
         }
+    }
+
+    #[test]
+    fn pathext_suffix_accepts_dot_prefixed_extensions() {
+        assert_eq!(pathext_suffix(OsStr::new(".EXE")), Some("EXE"));
+        assert_eq!(pathext_suffix(OsStr::new(".cmd")), Some("cmd"));
+    }
+
+    #[test]
+    fn pathext_suffix_rejects_malformed_entries() {
+        assert_eq!(pathext_suffix(OsStr::new("")), None);
+        assert_eq!(pathext_suffix(OsStr::new(".")), None);
+        assert_eq!(pathext_suffix(OsStr::new("EXE")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pathext_suffix_rejects_non_utf8_entries() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(pathext_suffix(OsStr::from_bytes(b".EXE\xff")), None);
     }
 
     // ── CommandBuilder: get_shell ────────────────────────────
