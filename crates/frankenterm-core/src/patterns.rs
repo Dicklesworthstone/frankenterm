@@ -676,6 +676,17 @@ impl RuleDef {
             ))
             .into());
         }
+        if self
+            .learn_more_url
+            .as_deref()
+            .is_some_and(|url| url.chars().any(char::is_whitespace))
+        {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' has learn_more_url containing whitespace",
+                self.id
+            ))
+            .into());
+        }
 
         if let Some(ref regex) = self.regex {
             // [ft-xv561] compile via shared builder so the backtrack
