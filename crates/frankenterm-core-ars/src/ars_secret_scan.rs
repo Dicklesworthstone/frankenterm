@@ -126,6 +126,51 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ("datadog_key", "dd-api-"),
     // Cloudflare
     ("cloudflare_key", "cf-"),
+    // ft-ppfgg: parity with the authoritative redactor catalog
+    // (frankenterm-core/src/redactor.rs STREAMING_SECRET_ANCHORS). These are
+    // distinctive known-format prefixes the redactor catches deterministically
+    // but the ARS contamination gate previously left to the probabilistic
+    // entropy backstop (which has length/entropy bounds and misses short,
+    // low-entropy formats). The gate is fail-closed, so added coverage only
+    // ever suppresses learning (fail-safe) — it cannot weaken the gate.
+    //
+    // Intentionally NOT added: the generic AI-provider key-NAME family
+    // (cohere/mistral/together/fireworks/deepinfra/nvidia/databricks/
+    // azure_openai). The redactor only flags those inside a
+    // `provider..._key=value` regex; adding them as bare Aho-Corasick literals
+    // here would abort learning on any benign text merely mentioning the
+    // provider. Closing that sub-gap needs regex-gated handling (tracked under
+    // ft-ppfgg).
+    // GitHub (ARS already had ghp_/gho_/ghs_/ghr_)
+    ("github_user_to_server", "ghu_"),
+    ("github_fine_grained_pat", "github_pat_"),
+    // GitLab
+    ("gitlab_pat", "glpat-"),
+    // xAI / Groq / Perplexity / HuggingFace / Replicate / Anyscale
+    ("xai_key", "xai-"),
+    ("groq_key", "gsk_"),
+    ("perplexity_key", "pplx-"),
+    ("huggingface_key", "hf_"),
+    ("replicate_key", "r8_"),
+    ("anyscale_key", "esecret_"),
+    // Google OAuth 2.0 access token
+    ("google_oauth", "ya29."),
+    // Stripe restricted keys, webhook signing secret, test publishable
+    // (ARS already had sk_live_/sk_test_/pk_live_)
+    ("stripe_restricted_live", "rk_live_"),
+    ("stripe_restricted_test", "rk_test_"),
+    ("stripe_webhook_signing", "whsec_"),
+    ("stripe_pub_test", "pk_test_"),
+    // Slack legacy / refresh (ARS already had xoxb-/xoxp-/xapp-)
+    ("slack_legacy", "xoxa-"),
+    ("slack_refresh", "xoxr-"),
+    // Database URL variants (ARS already had postgres:// and mongodb+srv://)
+    ("postgresql_url", "postgresql://"),
+    ("mongodb_url", "mongodb://"),
+    // OAuth device-flow codes — short, low-entropy, hyphenated values
+    // (e.g. `user_code=WDJB-MJHT`) the entropy detector cannot catch.
+    ("oauth_device_code", "device_code="),
+    ("oauth_user_code", "user_code="),
 ];
 
 // =============================================================================
@@ -531,6 +576,43 @@ fn redact_context(context: &str) -> String {
 mod tests {
     use super::*;
     use frankenterm_core_audit_types::mdl_extraction::CommandBlock;
+
+    /// ft-ppfgg parity regression: the ARS contamination gate must carry the
+    /// distinctive known-format secret prefixes the redactor catalog catches
+    /// deterministically, so the two lists cannot silently drift back apart.
+    /// (The generic AI-provider key-name family is deliberately excluded — see
+    /// the note on BUILTIN_PATTERNS.)
+    #[test]
+    fn builtin_patterns_cover_distinctive_redactor_formats() {
+        let prefixes: Vec<&str> = BUILTIN_PATTERNS.iter().map(|(_, pat)| *pat).collect();
+        for expected in [
+            "ghu_",
+            "github_pat_",
+            "glpat-",
+            "xai-",
+            "gsk_",
+            "pplx-",
+            "hf_",
+            "r8_",
+            "esecret_",
+            "ya29.",
+            "rk_live_",
+            "rk_test_",
+            "whsec_",
+            "pk_test_",
+            "xoxa-",
+            "xoxr-",
+            "postgresql://",
+            "mongodb://",
+            "device_code=",
+            "user_code=",
+        ] {
+            assert!(
+                prefixes.contains(&expected),
+                "BUILTIN_PATTERNS missing redactor-parity prefix `{expected}`"
+            );
+        }
+    }
 
     fn make_cmd(index: u32, command: &str, exit_code: Option<i32>) -> CommandBlock {
         CommandBlock {
