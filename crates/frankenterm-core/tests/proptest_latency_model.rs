@@ -1137,3 +1137,67 @@ proptest! {
         prop_assert!(evaluate_latency_budget(&contract, &obs).is_err());
     }
 }
+
+// =============================================================================
+// Analysis-result serde round-trips (FrankenTermAnalysis / PipelineAnalysis /
+// StageAnalysis were uncovered). Stable inputs keep every bound finite so the
+// round-trip is exact (serde_json maps non-finite f64 to null).
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// PipelineAnalysis serde round-trips for a stable pipeline (service rate
+    /// far above the arrival rate keeps delay/backlog bounds finite).
+    #[test]
+    fn pipeline_analysis_serde_roundtrip(
+        sigma in 0.0_f64..1000.0,
+        rho in 0.001_f64..100.0,
+        latency in arb_latency(),
+        n in 1usize..5,
+    ) {
+        let arr = ArrivalCurve::leaky_bucket(sigma, rho);
+        let stages: Vec<PipelineStage> = (0..n)
+            .map(|i| PipelineStage {
+                name: format!("stage{i}"),
+                service: ServiceCurve::rate_latency(1_000_000.0, latency), // >> rho ⇒ stable
+            })
+            .collect();
+        let analysis = Pipeline::new(stages).analyze(&arr);
+        prop_assume!(analysis.delay_bound.is_finite() && analysis.backlog_bound.is_finite());
+        let back: PipelineAnalysis =
+            serde_json::from_str(&serde_json::to_string(&analysis).unwrap()).unwrap();
+        prop_assert_eq!(analysis, back);
+    }
+
+    /// FrankenTermAnalysis (and its nested StageAnalysis Vec) serde
+    /// round-trips for a stable fleet (low aggregate arrival vs the fixed
+    /// high-capacity pipeline).
+    #[test]
+    fn frankenterm_analysis_serde_roundtrip(
+        n_panes in 1usize..20,
+        burst in 100.0_f64..10_000.0,
+        rate in 10.0_f64..1000.0,
+    ) {
+        let profiles: Vec<PaneOutputProfile> = (0..n_panes)
+            .map(|_| PaneOutputProfile { burst_bytes: burst, sustained_rate_bps: rate })
+            .collect();
+        let config = PipelineConfig {
+            capture_rate_bps: 100_000_000.0,
+            capture_latency_s: 0.001,
+            process_rate_bps: 50_000_000.0,
+            process_latency_s: 0.002,
+            storage_rate_bps: 10_000_000.0,
+            storage_latency_s: 0.003,
+        };
+        let analysis = analyze_frankenterm_pipeline(&profiles, &config);
+        prop_assume!(
+            analysis.is_stable
+                && analysis.max_delay_ms.is_finite()
+                && analysis.max_backlog_bytes.is_finite()
+        );
+        let back: FrankenTermAnalysis =
+            serde_json::from_str(&serde_json::to_string(&analysis).unwrap()).unwrap();
+        prop_assert_eq!(analysis, back);
+    }
+}
