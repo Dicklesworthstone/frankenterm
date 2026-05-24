@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/parent_artifact_path.json",
+  "expected_ok": false,
+  "expected_error_regex": "artifact:../docs/attestations/schema.json: artifact path must be repo-relative without parent traversal",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Parent-traversal artifact paths must be rejected before disk reads."
+}

@@ -4,7 +4,7 @@
       "category": "perf/headline-claims",
       "description": "Headline-claim manifest + 5 must-prove benches (G3).",
       "media_type": "application/json",
-      "path": "docs/perf/headline-claims.json",
+      "path": "docs//attestations/schema.json",
       "produced_by_bead": "ft-syqcz.3",
       "proof_categories": [
         5
@@ -224,7 +224,7 @@
       "proof_categories": [
         5
       ],
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sha256": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
       "size_bytes": 11245
     },
     {

@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/absolute_artifact_path.json",
+  "expected_ok": false,
+  "expected_error_regex": "artifact:/tmp/ft-attestation-outside.json: artifact path must be repo-relative without parent traversal",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Absolute artifact paths must be rejected before disk reads."
+}

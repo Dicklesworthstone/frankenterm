@@ -159,6 +159,34 @@ write_fixture \
   "Unknown artifact category is added with a real path and correct bytes."
 
 write_fixture \
+  "absolute_artifact_path" \
+  "(.artifacts[0].path) = \"/tmp/ft-attestation-outside.json\"" \
+  false \
+  "artifact:/tmp/ft-attestation-outside.json: artifact path must be repo-relative without parent traversal" \
+  "Absolute artifact paths must be rejected before disk reads."
+
+write_fixture \
+  "parent_artifact_path" \
+  "(.artifacts[0].path) = \"../docs/attestations/schema.json\"" \
+  false \
+  "artifact:../docs/attestations/schema.json: artifact path must be repo-relative without parent traversal" \
+  "Parent-traversal artifact paths must be rejected before disk reads."
+
+write_fixture \
+  "dot_segment_artifact_path" \
+  "(.artifacts[0].path) = \"./docs/attestations/schema.json\"" \
+  false \
+  "artifact:./docs/attestations/schema.json: artifact path must be repo-relative without parent traversal" \
+  "Dot-segment artifact paths must be rejected before disk reads."
+
+write_fixture \
+  "empty_segment_artifact_path" \
+  "(.artifacts[0].path) = \"docs//attestations/schema.json\"" \
+  false \
+  "artifact:docs//attestations/schema.json: artifact path must be repo-relative without parent traversal" \
+  "Empty-segment artifact paths must be rejected before disk reads."
+
+write_fixture \
   "swapped_slot_order" \
   "(.artifacts[0] as \$first | .artifacts[1] as \$second | .artifacts[0] = \$second | .artifacts[1] = \$first)" \
   false \
