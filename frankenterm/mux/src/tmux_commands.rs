@@ -1111,7 +1111,7 @@ impl TmuxCommand for CapturePane {
         format!(
             "capture-pane -p -t %{} -e -C -S {}\n",
             self.pane_id,
-            self.history_limit * -1
+            self.history_limit.saturating_neg()
         )
     }
 
@@ -1586,6 +1586,16 @@ mod tests {
         assert!(output.contains("capture-pane"));
         assert!(output.contains("-t %12"));
         assert!(output.contains("-S -1000"));
+    }
+
+    #[test]
+    fn capture_pane_get_command_saturates_min_history_limit() {
+        let cmd = CapturePane {
+            pane_id: 12,
+            history_limit: isize::MIN,
+        };
+        let output = cmd.get_command(0);
+        assert!(output.contains(&format!("-S {}", isize::MAX)));
     }
 
     #[test]
