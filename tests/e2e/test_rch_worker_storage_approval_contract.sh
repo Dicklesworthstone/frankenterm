@@ -102,9 +102,11 @@ SAFE_EVIDENCE_ARTIFACT_PATH_NEGATIVES = [
   "./artifacts/rch-worker-pressure/healthy-complete.json",
   "../artifacts/rch-worker-pressure/healthy-complete.json",
   "fixtures/rch-worker-pressure/valid/healthy-complete.json",
+  "artifacts/rch-worker-pressure/",
   "artifacts//rch-worker-pressure/healthy-complete.json",
   "artifacts/rch-worker-pressure/20260518T030000Z/../healthy-complete.json",
   "artifacts/rch-worker-pressure/20260518T030000Z/./healthy-complete.json",
+  "artifacts/rch-worker-pressure/20260518T030000Z/healthy-complete.json/",
   "artifacts/rch-worker-pressure/20260518T030000Z/.",
   "artifacts/rch-worker-pressure/20260518T030000Z/..",
   "artifacts/rch-worker-pressure/.git/config.json",
@@ -144,7 +146,7 @@ def safe_evidence_artifact_path?(path)
   return false if path.empty? || path.start_with?("/") || path.include?("\\")
   return false unless path.end_with?(".json")
 
-  parts = path.split("/")
+  parts = path.split("/", -1)
   return false if parts.empty? || parts.any?(&:empty?)
   return false if parts.any? { |part| part == "." || part == ".." || part == ".git" }
 
