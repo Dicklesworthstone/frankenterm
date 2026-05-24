@@ -365,12 +365,14 @@ impl ConnectorMesh {
 
     /// Deregister a host.
     pub fn deregister_host(&mut self, host_id: &str) -> Result<MeshHost, ConnectorMeshError> {
-        self.telemetry.hosts_deregistered += 1;
-        self.hosts
+        let host = self
+            .hosts
             .remove(host_id)
             .ok_or_else(|| ConnectorMeshError::HostNotFound {
                 host_id: host_id.to_string(),
-            })
+            })?;
+        self.telemetry.hosts_deregistered += 1;
+        Ok(host)
     }
 
     /// Get a host by ID.
@@ -777,6 +779,7 @@ mod tests {
         let mut mesh = default_mesh();
         let err = mesh.deregister_host("nope").unwrap_err();
         assert!(matches!(err, ConnectorMeshError::HostNotFound { .. }));
+        assert_eq!(mesh.telemetry().hosts_deregistered, 0);
     }
 
     #[test]
