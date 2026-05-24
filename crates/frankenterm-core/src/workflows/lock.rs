@@ -167,8 +167,7 @@ impl LockManagerHealth {
             // case and must NOT report healthy.
             return self.force_releases_total == 0;
         }
-        let force_ratio = self.force_releases_total as f64 / self.releases_total as f64;
-        force_ratio <= 0.05
+        u128::from(self.force_releases_total) * 100 <= u128::from(self.releases_total) * 5
     }
 }
 

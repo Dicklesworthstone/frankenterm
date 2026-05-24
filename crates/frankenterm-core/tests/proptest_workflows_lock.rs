@@ -148,8 +148,8 @@ proptest! {
 
     #[test]
     fn proptest_workflow_lock_health_is_safe_matches_public_ratio_contract(
-        releases_total in 0_u64..10_000,
-        force_releases_total in 0_u64..10_000,
+        releases_total in any::<u64>(),
+        force_releases_total in any::<u64>(),
         mutex_poisoned_recoveries_total in 0_u64..4,
         active_locks in 0_u32..100,
     ) {
