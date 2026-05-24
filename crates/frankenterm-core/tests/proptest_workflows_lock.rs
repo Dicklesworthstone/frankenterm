@@ -235,7 +235,7 @@ proptest! {
 
         let health = manager.health();
         prop_assert_eq!(health.force_releases_total, 1);
-        prop_assert_eq!(health.releases_total, 0);
+        prop_assert_eq!(health.releases_total, 1);
         prop_assert_eq!(health.active_locks, 0);
         prop_assert!(!health.is_safe());
         prop_assert!(manager.is_locked(pane_id).is_none());
