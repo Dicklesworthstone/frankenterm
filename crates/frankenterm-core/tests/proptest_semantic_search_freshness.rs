@@ -8,7 +8,7 @@
 
 use frankenterm_core::search::{
     SemanticSearchFreshnessStatus, SemanticSearchProofCase, SemanticSearchProofCaseInput,
-    classify_semantic_search_freshness,
+    SemanticSearchProofReport, classify_semantic_search_freshness,
 };
 use proptest::prelude::*;
 
@@ -197,5 +197,205 @@ proptest! {
         let back: SemanticSearchProofCase =
             serde_json::from_str(&json).expect("deserialize proof case");
         prop_assert_eq!(case, back);
+    }
+}
+
+// ── Report-level proof-honesty gates ──────────────────────────────────────
+//
+// `SemanticSearchProofReport::distinguishes_required_states` and
+// `contains_false_fresh_stale_claim` gate whether a proof report can be trusted
+// to cover every required state without mislabeling a stale index as fresh.
+
+/// Directly build a proof case with full field control, used to construct
+/// reports that cover specific states (including the dishonest stale-but-fresh
+/// case that `from_input` can never produce).
+fn case_direct(
+    case_id: &str,
+    requested: &str,
+    effective: &str,
+    budget: &str,
+    stale_index: bool,
+    freshness: SemanticSearchFreshnessStatus,
+) -> SemanticSearchProofCase {
+    SemanticSearchProofCase {
+        case_id: case_id.to_string(),
+        requested_mode: requested.to_string(),
+        effective_mode: effective.to_string(),
+        embedder_id: "embedder-1".to_string(),
+        embedder_tier: "fastembed".to_string(),
+        embedder_dimension: 4,
+        latest_segment_id: Some(1),
+        latest_segment_captured_at_ms: Some(0),
+        embedded_segment_ids: vec![1],
+        result_segment_ids: vec![1],
+        observed_at_ms: 0,
+        freshness_window_ms: 1000,
+        freshness_age_ms: Some(0),
+        freshness_status: freshness,
+        fallback_reason: None,
+        semantic_budget_state: budget.to_string(),
+        semantic_cache_hit: false,
+        semantic_rows_scanned: 1,
+        stale_index,
+    }
+}
+
+/// A report covering every required state honestly (lexical, semantic, hybrid,
+/// disabled, and a genuinely stale index), with full provenance.
+fn full_honest_report() -> SemanticSearchProofReport {
+    SemanticSearchProofReport {
+        proof_id: "proof-1".to_string(),
+        generated_at_ms: 0,
+        cases: vec![
+            case_direct(
+                "lex",
+                "lexical",
+                "lexical",
+                "active",
+                false,
+                SemanticSearchFreshnessStatus::Fresh,
+            ),
+            case_direct(
+                "sem",
+                "semantic",
+                "semantic",
+                "active",
+                false,
+                SemanticSearchFreshnessStatus::Fresh,
+            ),
+            case_direct(
+                "hyb",
+                "hybrid",
+                "hybrid",
+                "active",
+                false,
+                SemanticSearchFreshnessStatus::Fresh,
+            ),
+            case_direct(
+                "dis",
+                "semantic",
+                "lexical",
+                "disabled",
+                false,
+                SemanticSearchFreshnessStatus::Unknown,
+            ),
+            case_direct(
+                "stale",
+                "semantic",
+                "lexical",
+                "active",
+                true,
+                SemanticSearchFreshnessStatus::Stale,
+            ),
+        ],
+    }
+}
+
+#[test]
+fn empty_report_does_not_distinguish_states() {
+    let report = SemanticSearchProofReport {
+        proof_id: "empty".to_string(),
+        generated_at_ms: 0,
+        cases: vec![],
+    };
+    assert!(!report.distinguishes_required_states());
+    assert!(!report.contains_false_fresh_stale_claim());
+}
+
+#[test]
+fn full_honest_report_distinguishes_states() {
+    let report = full_honest_report();
+    assert!(report.distinguishes_required_states());
+    assert!(!report.contains_false_fresh_stale_claim());
+}
+
+#[test]
+fn dropping_any_required_state_blocks_distinguish() {
+    // Removing the disabled-state case must collapse the gate to false.
+    let mut report = full_honest_report();
+    report
+        .cases
+        .retain(|case| case.semantic_budget_state != "disabled");
+    assert!(!report.distinguishes_required_states());
+}
+
+#[test]
+fn false_fresh_claim_is_detected_and_blocks_distinguish() {
+    // A stale index mislabeled as Fresh must be flagged and must block the
+    // required-states gate even when all five states are otherwise present.
+    let mut report = full_honest_report();
+    report.cases.push(case_direct(
+        "lie",
+        "semantic",
+        "semantic",
+        "active",
+        true,
+        SemanticSearchFreshnessStatus::Fresh,
+    ));
+    assert!(report.contains_false_fresh_stale_claim());
+    assert!(!report.distinguishes_required_states());
+}
+
+proptest! {
+    /// `from_input` is honest by construction: it can never emit a case that is
+    /// flagged stale-index yet classified Fresh.
+    #[test]
+    fn from_input_never_claims_stale_fresh(
+        latest_id in prop_oneof![Just(None), (0i64..50).prop_map(Some)],
+        embedded in prop::collection::vec(0i64..50, 0..8),
+        captured in prop_oneof![Just(None), any::<i64>().prop_map(Some)],
+        observed in any::<i64>(),
+        window in any::<i64>(),
+    ) {
+        let input = arb_input(latest_id, embedded, captured, observed, window);
+        let case = SemanticSearchProofCase::from_input(input);
+        let false_fresh =
+            case.stale_index && case.freshness_status == SemanticSearchFreshnessStatus::Fresh;
+        prop_assert!(!false_fresh);
+    }
+
+    /// A report assembled purely from `from_input` cases can never contain a
+    /// false fresh/stale claim, regardless of how many cases it holds.
+    #[test]
+    fn report_of_honest_cases_has_no_false_fresh(
+        specs in prop::collection::vec(
+            (
+                prop_oneof![Just(None), (0i64..20).prop_map(Some)],
+                prop::collection::vec(0i64..20, 0..5),
+                any::<i64>(),
+                any::<i64>(),
+            ),
+            0..6,
+        ),
+    ) {
+        let cases = specs
+            .into_iter()
+            .map(|(latest_id, embedded, observed, window)| {
+                SemanticSearchProofCase::from_input(arb_input(
+                    latest_id,
+                    embedded,
+                    Some(0),
+                    observed,
+                    window,
+                ))
+            })
+            .collect();
+        let report = SemanticSearchProofReport {
+            proof_id: "p".to_string(),
+            generated_at_ms: 0,
+            cases,
+        };
+        prop_assert!(!report.contains_false_fresh_stale_claim());
+    }
+
+    /// Reports always round-trip losslessly through JSON.
+    #[test]
+    fn report_serde_roundtrip(generated_at_ms in any::<i64>()) {
+        let mut report = full_honest_report();
+        report.generated_at_ms = generated_at_ms;
+        let json = serde_json::to_string(&report).expect("serialize report");
+        let back: SemanticSearchProofReport =
+            serde_json::from_str(&json).expect("deserialize report");
+        prop_assert_eq!(report, back);
     }
 }
