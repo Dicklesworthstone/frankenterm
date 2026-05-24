@@ -498,7 +498,18 @@ impl DescriptorStep {
                     ));
                 }
             }
-            Self::Conditional { matcher, .. } => {
+            Self::Conditional {
+                test_text, matcher, ..
+            } => {
+                if test_text.len() > limits.max_text_len {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "conditional test_text too large ({} > max {})",
+                            test_text.len(),
+                            limits.max_text_len
+                        )),
+                    ));
+                }
                 matcher.validate(limits)?;
             }
             Self::Loop { count, body, .. } => {

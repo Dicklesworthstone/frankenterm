@@ -516,6 +516,68 @@ proptest! {
     }
 
     #[test]
+    fn conditional_test_text_respects_configured_text_length_limit(
+        max_text_len in 0usize..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "condition_text_limit_at_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Conditional {
+                id: "branch".to_string(),
+                description: None,
+                test_text: "x".repeat(max_text_len),
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                },
+                then_steps: vec![DescriptorStep::Log {
+                    id: "then_log".to_string(),
+                    description: None,
+                    message: String::new(),
+                }],
+                else_steps: Vec::new(),
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "conditional test_text at max_text_len should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "condition_text_limit_over_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Conditional {
+                id: "branch".to_string(),
+                description: None,
+                test_text: "x".repeat(max_text_len.saturating_add(1)),
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                },
+                then_steps: vec![DescriptorStep::Log {
+                    id: "then_log".to_string(),
+                    description: None,
+                    message: String::new(),
+                }],
+                else_steps: Vec::new(),
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "conditional test_text longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();
