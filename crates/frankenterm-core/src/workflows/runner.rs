@@ -63,6 +63,26 @@ async fn wait_duration_maybe_cx(
     Ok(())
 }
 
+async fn wait_required_duration_maybe_cx(
+    cx: Option<&crate::cx::Cx>,
+    required: Duration,
+    timeout: Duration,
+    label: &str,
+    condition: &str,
+) -> Result<(), crate::Error> {
+    wait_duration_maybe_cx(cx, required.min(timeout), label).await?;
+    if required > timeout {
+        return Err(crate::Error::Workflow(
+            crate::error::WorkflowError::Aborted(format!(
+                "{label}: {condition} timed out after {}ms before required {}ms elapsed",
+                timeout.as_millis(),
+                required.as_millis()
+            )),
+        ));
+    }
+    Ok(())
+}
+
 fn cap_wait_by_workflow_deadline(
     requested: Duration,
     workflow_started_at: Instant,
@@ -135,14 +155,14 @@ async fn wait_condition_pause_maybe_cx(
     match condition {
         WaitCondition::PaneIdle {
             idle_threshold_ms, ..
-        } => {
-            wait_duration_maybe_cx(
-                cx,
-                Duration::from_millis(*idle_threshold_ms).min(timeout),
-                label,
-            )
-            .await
-        }
+        } => wait_required_duration_maybe_cx(
+            cx,
+            Duration::from_millis(*idle_threshold_ms),
+            timeout,
+            label,
+            "pane idle wait",
+        )
+        .await,
         WaitCondition::Pattern { .. } | WaitCondition::TextMatch { .. } => {
             wait_duration_maybe_cx(cx, timeout, label).await
         }
@@ -158,17 +178,23 @@ async fn wait_condition_pause_maybe_cx(
             wait_external_signal_maybe_cx(cx, registry, key, timeout, label).await
         }
         WaitCondition::StableTail { stable_for_ms, .. } => {
-            wait_duration_maybe_cx(
+            wait_required_duration_maybe_cx(
                 cx,
-                Duration::from_millis(*stable_for_ms).min(timeout),
+                Duration::from_millis(*stable_for_ms),
+                timeout,
                 label,
+                "stable tail wait",
             )
             .await
         }
-        WaitCondition::Sleep { duration_ms } => {
-            wait_duration_maybe_cx(cx, Duration::from_millis(*duration_ms).min(timeout), label)
-                .await
-        }
+        WaitCondition::Sleep { duration_ms } => wait_required_duration_maybe_cx(
+            cx,
+            Duration::from_millis(*duration_ms),
+            timeout,
+            label,
+            "sleep wait",
+        )
+        .await,
     }
 }
 
@@ -3998,6 +4024,38 @@ mod tests {
                 )
                 .await;
                 assert!(result.is_ok());
+            });
+        }
+
+        #[test]
+        fn wait_condition_sleep_aborts_when_timeout_expires() {
+            run_async_test(async {
+                let cond = WaitCondition::sleep(60);
+                let start = std::time::Instant::now();
+                let err = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_millis(5),
+                    None,
+                    "test-sleep",
+                )
+                .await
+                .expect_err("sleep longer than timeout must abort");
+                let elapsed = start.elapsed();
+
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("sleep wait timed out"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "timeout abort should not wait for full sleep duration: {elapsed:?}"
+                );
             });
         }
 
