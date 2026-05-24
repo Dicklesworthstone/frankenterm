@@ -6908,6 +6908,76 @@ mod tests {
         assert!(result.is_char_boundary(result.len()));
     }
 
+    /// Arbitrary unicode text including multi-byte code points and emoji,
+    /// to exercise the char-boundary snapping in trim_utf8_tail_to_max_bytes.
+    fn arb_unicode_text() -> impl proptest::prelude::Strategy<Value = String> {
+        use proptest::prelude::*;
+        prop::collection::vec(any::<char>(), 0..30).prop_map(|cs| cs.into_iter().collect())
+    }
+
+    proptest::proptest! {
+        /// Core contract (ft-a0up5): the result never exceeds max_bytes,
+        /// regardless of multi-byte boundaries — the byte cap is a hard
+        /// ceiling, not a "last full character" best-effort.
+        #[test]
+        fn prop_trim_utf8_tail_respects_byte_cap(
+            text in arb_unicode_text(),
+            max_bytes in 0usize..40,
+        ) {
+            let result = trim_utf8_tail_to_max_bytes(&text, max_bytes);
+            proptest::prop_assert!(
+                result.len() <= max_bytes,
+                "result {} bytes exceeds cap {} for {:?}", result.len(), max_bytes, text
+            );
+        }
+
+        /// The kept content is always a suffix of the input — the function
+        /// trims from the front to retain the tail, never reorders or
+        /// substitutes bytes.
+        #[test]
+        fn prop_trim_utf8_tail_is_suffix_of_input(
+            text in arb_unicode_text(),
+            max_bytes in 0usize..40,
+        ) {
+            let result = trim_utf8_tail_to_max_bytes(&text, max_bytes);
+            proptest::prop_assert!(
+                text.ends_with(result.as_str()),
+                "result {:?} is not a suffix of input {:?}", result, text
+            );
+        }
+
+        /// When the input already fits, trimming is a no-op: the text is
+        /// returned byte-for-byte unchanged.
+        #[test]
+        fn prop_trim_utf8_tail_noop_within_limit(
+            text in arb_unicode_text(),
+            slack in 0usize..8,
+        ) {
+            let max_bytes = text.len() + slack; // guaranteed >= text.len()
+            let result = trim_utf8_tail_to_max_bytes(&text, max_bytes);
+            proptest::prop_assert_eq!(
+                result.as_str(), text.as_str(),
+                "within-limit trim must be a no-op"
+            );
+        }
+
+        /// Idempotence: trimming an already-trimmed result with the same
+        /// cap yields the same value (the first trim's output already
+        /// satisfies the cap, so the second pass cannot shrink it further).
+        #[test]
+        fn prop_trim_utf8_tail_idempotent(
+            text in arb_unicode_text(),
+            max_bytes in 0usize..40,
+        ) {
+            let once = trim_utf8_tail_to_max_bytes(&text, max_bytes);
+            let twice = trim_utf8_tail_to_max_bytes(&once, max_bytes);
+            proptest::prop_assert_eq!(
+                once.as_str(), twice.as_str(),
+                "trim must be idempotent under a fixed cap"
+            );
+        }
+    }
+
     /// The wrapper enforce_segment_size_for_persistence must NEVER emit
     /// a segment whose content exceeds max_segment_bytes — the gap
     /// reason already captures the oversize signal, and downstream
