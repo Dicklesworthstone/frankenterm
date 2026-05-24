@@ -355,7 +355,15 @@ impl PriorityClassifier {
 
     /// Register a pane for priority tracking.
     pub fn register_pane(&self, pane_id: u64) {
-        let half_life = Duration::from_secs_f64(self.config.rate_half_life_secs);
+        // Fail closed: `Duration::from_secs_f64` panics on NaN, negative, or
+        // overflowing input, and `PriorityConfig` does not normalize
+        // `rate_half_life_secs`. A non-finite / negative value (hostile config
+        // or upstream arithmetic) would panic pane registration. Use the
+        // non-panicking `try_from_secs_f64` and fall back to the 10s default
+        // half-life. Behavior-preserving for valid finite values. Mirrors the
+        // NaN-defence in tailer / disk_pressure (ft-761tz).
+        let half_life = Duration::try_from_secs_f64(self.config.rate_half_life_secs)
+            .unwrap_or(Duration::from_secs(10));
         self.panes.insert_if_absent(
             pane_id,
             PaneClassification {
@@ -732,6 +740,23 @@ mod tests {
         assert_eq!(c.tracked_pane_count(), 1);
         c.unregister_pane(1);
         assert_eq!(c.tracked_pane_count(), 0);
+    }
+
+    /// Fail-closed: a non-finite / negative rate_half_life_secs must not
+    /// panic Duration::from_secs_f64 inside register_pane — registration
+    /// falls back to the default half-life and still succeeds.
+    #[test]
+    fn classifier_register_pane_survives_invalid_half_life() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -5.0] {
+            let config = PriorityConfig {
+                rate_half_life_secs: bad,
+                ..PriorityConfig::default()
+            };
+            let c = PriorityClassifier::new(config);
+            c.register_pane(1); // must not panic
+            assert_eq!(c.tracked_pane_count(), 1,
+                "register_pane must succeed for rate_half_life_secs={bad}");
+        }
     }
 
     #[test]
