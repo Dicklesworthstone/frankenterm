@@ -1024,23 +1024,28 @@ impl GeneralizationStats {
 
     /// Record a generalization result.
     pub fn record(&mut self, result: &GeneralizationResult) {
-        self.total_sessions += 1;
-        self.total_params_detected += result.params_detected as u64;
-        self.total_commands_generalized += result.commands_generalized as u64;
+        self.total_sessions = self.total_sessions.saturating_add(1);
+        self.total_params_detected = self
+            .total_params_detected
+            .saturating_add(u64::try_from(result.params_detected).unwrap_or(u64::MAX));
+        self.total_commands_generalized = self
+            .total_commands_generalized
+            .saturating_add(u64::try_from(result.commands_generalized).unwrap_or(u64::MAX));
 
         for var in &result.all_variables {
             let kind_str = format!("{:?}", var.kind);
-            *self.params_by_kind.entry(kind_str).or_insert(0) += 1;
+            let count = self.params_by_kind.entry(kind_str).or_insert(0);
+            *count = count.saturating_add(1);
         }
     }
 
     /// Record an instantiation attempt.
     pub fn record_instantiation(&mut self, success: bool) {
-        self.instantiation_attempts += 1;
+        self.instantiation_attempts = self.instantiation_attempts.saturating_add(1);
         if success {
-            self.instantiation_successes += 1;
+            self.instantiation_successes = self.instantiation_successes.saturating_add(1);
         } else {
-            self.instantiation_failures += 1;
+            self.instantiation_failures = self.instantiation_failures.saturating_add(1);
         }
     }
 
@@ -1772,6 +1777,37 @@ mod tests {
     }
 
     #[test]
+    fn stats_record_saturates_counts() {
+        let mut stats = GeneralizationStats::new();
+        stats.total_sessions = u64::MAX;
+        stats.total_params_detected = u64::MAX;
+        stats.total_commands_generalized = u64::MAX;
+        stats
+            .params_by_kind
+            .insert("FilePath".to_string(), u64::MAX);
+        let result = GeneralizationResult {
+            commands: vec![],
+            all_variables: vec![TemplateVar {
+                name: "file_0".to_string(),
+                placeholder: "{{cap.file_0}}".to_string(),
+                original: "test.rs".to_string(),
+                kind: ParamKind::FilePath,
+                safety_regex: r"^[a-zA-Z0-9_./-]+$".to_string(),
+            }],
+            pac_bound: PacBayesianBound::perfect(10, 0.05),
+            params_detected: 1,
+            commands_generalized: 1,
+        };
+
+        stats.record(&result);
+
+        assert_eq!(stats.total_sessions, u64::MAX);
+        assert_eq!(stats.total_params_detected, u64::MAX);
+        assert_eq!(stats.total_commands_generalized, u64::MAX);
+        assert_eq!(stats.params_by_kind.get("FilePath"), Some(&u64::MAX));
+    }
+
+    #[test]
     fn stats_instantiation_tracking() {
         let mut stats = GeneralizationStats::new();
         stats.record_instantiation(true);
@@ -1782,6 +1818,21 @@ mod tests {
         assert_eq!(stats.instantiation_failures, 1);
         let rate = stats.instantiation_success_rate();
         assert!((rate - 2.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn stats_instantiation_tracking_saturates() {
+        let mut stats = GeneralizationStats::new();
+        stats.instantiation_attempts = u64::MAX;
+        stats.instantiation_successes = u64::MAX;
+        stats.instantiation_failures = u64::MAX;
+
+        stats.record_instantiation(true);
+        stats.record_instantiation(false);
+
+        assert_eq!(stats.instantiation_attempts, u64::MAX);
+        assert_eq!(stats.instantiation_successes, u64::MAX);
+        assert_eq!(stats.instantiation_failures, u64::MAX);
     }
 
     #[test]
