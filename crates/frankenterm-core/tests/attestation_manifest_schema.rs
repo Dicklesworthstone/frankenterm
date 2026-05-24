@@ -235,6 +235,27 @@ fn manifest_schema_rejects_ambiguous_or_unfilled_slots() {
 }
 
 #[test]
+fn manifest_schema_rejects_empty_required_categories_or_slots() {
+    let validator = manifest_validator();
+    for (surface, mut manifest) in [
+        (
+            "required_categories",
+            base_manifest(base_slot(json!("docs/perf/headline-claims.json"))),
+        ),
+        (
+            "slots",
+            base_manifest(base_slot(json!("docs/perf/headline-claims.json"))),
+        ),
+    ] {
+        manifest[surface] = json!([]);
+        assert!(
+            !validate(&validator, &manifest).is_empty(),
+            "attestation manifest must reject empty {surface}"
+        );
+    }
+}
+
+#[test]
 fn manifest_schema_rejects_parent_directory_paths() {
     let validator = manifest_validator();
 

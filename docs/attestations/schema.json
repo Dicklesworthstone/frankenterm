@@ -721,11 +721,13 @@
         "_comment": { "type": "string" },
         "required_categories": {
           "type": "array",
+          "minItems": 1,
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/category" }
         },
         "slots": {
           "type": "array",
+          "minItems": 1,
           "items": { "$ref": "#/$defs/manifestSlot" }
         }
       }
