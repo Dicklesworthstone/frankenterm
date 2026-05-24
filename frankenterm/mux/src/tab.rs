@@ -81,6 +81,10 @@ fn split_separator_offset(value: usize) -> usize {
     value.saturating_add(1)
 }
 
+fn next_pane_index(value: usize) -> usize {
+    value.saturating_add(1)
+}
+
 fn split_separator_sum(first: usize, second: usize) -> usize {
     first.saturating_add(second).saturating_add(1)
 }
@@ -4214,8 +4218,9 @@ impl TabInner {
             };
 
             if request.target_is_second {
-                self.active = pane_index + 1;
-                self.recency.tag(pane_index + 1);
+                let new_pane_index = next_pane_index(pane_index);
+                self.active = new_pane_index;
+                self.recency.tag(new_pane_index);
             }
         }
 
@@ -4223,7 +4228,7 @@ impl TabInner {
         log::debug!("pane info after split: {:#?}", self.iter_panes());
 
         Ok(if request.target_is_second {
-            pane_index + 1
+            next_pane_index(pane_index)
         } else {
             pane_index
         })
@@ -4400,6 +4405,8 @@ mod test {
         assert_eq!(pixel_span(usize::MAX, 2), usize::MAX);
         assert_eq!(split_separator_offset(4), 5);
         assert_eq!(split_separator_offset(usize::MAX), usize::MAX);
+        assert_eq!(next_pane_index(4), 5);
+        assert_eq!(next_pane_index(usize::MAX), usize::MAX);
         assert_eq!(split_separator_sum(2, 3), 6);
         assert_eq!(split_separator_sum(usize::MAX, 3), usize::MAX);
         assert_eq!(split_separator_sum(usize::MAX - 1, 1), usize::MAX);
