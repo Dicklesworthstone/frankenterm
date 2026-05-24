@@ -1207,6 +1207,10 @@ fn parse_semver_components(version: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+fn duration_millis_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn current_ft_satisfies(min_ft_version: &str) -> Result<bool, String> {
     let current = parse_semver_components(CURRENT_FT_VERSION).ok_or_else(|| {
         format!("current certification runtime version '{CURRENT_FT_VERSION}' is not valid semver")
@@ -1439,7 +1443,7 @@ impl CertificationPipeline {
         phases.push(PhaseResult {
             phase: CertificationPhase::SchemaValidation,
             verdict: schema_verdict,
-            elapsed_ms: phase_start.elapsed().as_millis() as u64,
+            elapsed_ms: duration_millis_saturating(phase_start.elapsed()),
         });
 
         // Phase 2: Lint check
@@ -1471,7 +1475,7 @@ impl CertificationPipeline {
         phases.push(PhaseResult {
             phase: CertificationPhase::LintCheck,
             verdict: lint_verdict,
-            elapsed_ms: phase_start.elapsed().as_millis() as u64,
+            elapsed_ms: duration_millis_saturating(phase_start.elapsed()),
         });
 
         // Phase 3: Digest verification
@@ -1491,7 +1495,7 @@ impl CertificationPipeline {
         phases.push(PhaseResult {
             phase: CertificationPhase::DigestVerification,
             verdict: digest_verdict,
-            elapsed_ms: phase_start.elapsed().as_millis() as u64,
+            elapsed_ms: duration_millis_saturating(phase_start.elapsed()),
         });
 
         // Phase 4: Capability audit
@@ -1516,7 +1520,7 @@ impl CertificationPipeline {
         phases.push(PhaseResult {
             phase: CertificationPhase::CapabilityAudit,
             verdict: cap_verdict,
-            elapsed_ms: phase_start.elapsed().as_millis() as u64,
+            elapsed_ms: duration_millis_saturating(phase_start.elapsed()),
         });
 
         // Phase 5: Trust policy gate
@@ -1556,7 +1560,7 @@ impl CertificationPipeline {
         phases.push(PhaseResult {
             phase: CertificationPhase::TrustPolicyGate,
             verdict: trust_verdict,
-            elapsed_ms: phase_start.elapsed().as_millis() as u64,
+            elapsed_ms: duration_millis_saturating(phase_start.elapsed()),
         });
 
         // Phase 6: Integration probe (sandbox lifecycle + capability round-trip)
@@ -1575,7 +1579,7 @@ impl CertificationPipeline {
         phases.push(PhaseResult {
             phase: CertificationPhase::IntegrationProbe,
             verdict: probe_execution.verdict,
-            elapsed_ms: phase_start.elapsed().as_millis() as u64,
+            elapsed_ms: duration_millis_saturating(phase_start.elapsed()),
         });
 
         // Determine overall verdict
@@ -1587,22 +1591,30 @@ impl CertificationPipeline {
             CertificationVerdict::Certified
         };
 
-        let total_elapsed_ms = start.elapsed().as_millis() as u64;
+        let total_elapsed_ms = duration_millis_saturating(start.elapsed());
 
         // Update telemetry
-        self.telemetry.total_runs += 1;
+        self.telemetry.total_runs = self.telemetry.total_runs.saturating_add(1);
         match verdict {
-            CertificationVerdict::Certified => self.telemetry.certified += 1,
-            CertificationVerdict::ConditionalPass => self.telemetry.conditional_passes += 1,
-            CertificationVerdict::Rejected => self.telemetry.rejections += 1,
+            CertificationVerdict::Certified => {
+                self.telemetry.certified = self.telemetry.certified.saturating_add(1);
+            }
+            CertificationVerdict::ConditionalPass => {
+                self.telemetry.conditional_passes =
+                    self.telemetry.conditional_passes.saturating_add(1);
+            }
+            CertificationVerdict::Rejected => {
+                self.telemetry.rejections = self.telemetry.rejections.saturating_add(1);
+            }
         }
         for p in &phases {
             if matches!(p.verdict, PhaseVerdict::Failed { .. }) {
-                *self
+                let count = self
                     .telemetry
                     .phase_failures
                     .entry(p.phase.as_str().to_string())
-                    .or_insert(0) += 1;
+                    .or_insert(0);
+                *count = count.saturating_add(1);
             }
         }
 
@@ -1807,7 +1819,7 @@ impl ConnectorSimulator {
 
     /// Advance the simulation clock.
     pub fn tick(&mut self, delta_ms: u64) {
-        self.clock_ms += delta_ms;
+        self.clock_ms = self.clock_ms.saturating_add(delta_ms);
     }
 
     /// Current simulation time.
@@ -2468,6 +2480,68 @@ mod tests {
     }
 
     #[test]
+    fn certification_telemetry_counters_saturate() {
+        let policy = permissive_policy();
+        let mut pipeline = CertificationPipeline::new(policy);
+        pipeline.telemetry.total_runs = u64::MAX;
+        pipeline.telemetry.certified = u64::MAX;
+        pipeline.telemetry.rejections = u64::MAX;
+        pipeline
+            .telemetry
+            .phase_failures
+            .insert("digest_verification".to_string(), u64::MAX);
+
+        let payload = test_payload();
+        let good_manifest = ManifestBuilder::new("good-saturated")
+            .version("1.0.0")
+            .publisher_signature("sig")
+            .build_with_digest(&payload)
+            .unwrap();
+        let bad_manifest = ManifestBuilder::new("bad-saturated")
+            .version("1.0.0")
+            .publisher_signature("sig")
+            .build_with_precomputed_digest("0".repeat(64))
+            .unwrap();
+
+        let good = pipeline.certify(&good_manifest, &payload);
+        let bad = pipeline.certify(&bad_manifest, &payload);
+        let telem = pipeline.telemetry_snapshot();
+
+        assert_eq!(good.verdict, CertificationVerdict::Certified);
+        assert_eq!(bad.verdict, CertificationVerdict::Rejected);
+        assert_eq!(telem.total_runs, u64::MAX);
+        assert_eq!(telem.certified, u64::MAX);
+        assert_eq!(telem.rejections, u64::MAX);
+        assert_eq!(
+            telem.phase_failures.get("digest_verification"),
+            Some(&u64::MAX)
+        );
+    }
+
+    #[test]
+    fn certification_conditional_counter_saturates() {
+        let policy = trusted_policy(&[ConnectorCapability::FilesystemRead]);
+        let mut pipeline = CertificationPipeline::new(policy);
+        pipeline.telemetry.total_runs = u64::MAX;
+        pipeline.telemetry.conditional_passes = u64::MAX;
+        let payload = test_payload();
+        let manifest = ManifestBuilder::new("needs-fs-target-saturated")
+            .version("1.0.0")
+            .author("dev@example.com")
+            .publisher_signature("test-sig")
+            .capability(ConnectorCapability::FilesystemRead)
+            .build_with_digest(&payload)
+            .unwrap();
+
+        let report = pipeline.certify(&manifest, &payload);
+        let telem = pipeline.telemetry_snapshot();
+
+        assert_eq!(report.verdict, CertificationVerdict::ConditionalPass);
+        assert_eq!(telem.total_runs, u64::MAX);
+        assert_eq!(telem.conditional_passes, u64::MAX);
+    }
+
+    #[test]
     fn certification_integration_probe_skipped_on_failure() {
         let policy = permissive_policy();
         let mut pipeline = CertificationPipeline::new(policy);
@@ -2647,6 +2721,17 @@ mod tests {
             sim.phase("lifecycle").unwrap(),
             ConnectorLifecyclePhase::Stopped
         );
+    }
+
+    #[test]
+    fn simulator_tick_saturates_clock() {
+        let policy = permissive_policy();
+        let mut sim = ConnectorSimulator::new(policy);
+        sim.clock_ms = u64::MAX - 5;
+
+        sim.tick(10);
+
+        assert_eq!(sim.now(), u64::MAX);
     }
 
     #[test]
