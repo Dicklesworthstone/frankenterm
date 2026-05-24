@@ -167,6 +167,21 @@ fn readme_canonical_toml_parses_through_production_loader() {
     );
 }
 
+/// Step 1b: The README's canonical TOML block must also pass the
+/// semantic validator used by `Config::load_with_overrides`. Parsing
+/// alone is not enough: serde can deserialize a shape that the
+/// runtime later rejects (invalid pane filters, priority rules,
+/// storage safety, etc.).
+#[test]
+fn readme_canonical_toml_validates_through_production_loader() {
+    let toml_str = load_fixture_toml();
+    let mut cfg = frankenterm_core::config::Config::from_toml(&toml_str)
+        .expect("README canonical config must parse");
+    cfg.normalize_paths();
+    cfg.validate()
+        .expect("README canonical config must pass semantic validation");
+}
+
 /// Step 2: Round-trip parse → re-serialize. The re-serialized form must
 /// contain every README-documented top-level section.
 ///
