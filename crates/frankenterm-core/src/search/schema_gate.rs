@@ -386,6 +386,21 @@ fn is_lossy_type_change(source: &str, target: &str) -> bool {
         }
     }
 
+    // Option<T> → Option<U>: optionality is unchanged, so loss depends entirely
+    // on whether the inner type change is lossy. This keeps the optional case
+    // symmetric with the bare case (e.g. Option<u32> → Option<u64> is a safe
+    // widening, just like u32 → u64, while Option<u64> → Option<u32> stays
+    // lossy like u64 → u32).
+    if source.starts_with("Option<")
+        && source.ends_with('>')
+        && target.starts_with("Option<")
+        && target.ends_with('>')
+    {
+        let source_inner = &source[7..source.len() - 1];
+        let target_inner = &target[7..target.len() - 1];
+        return is_lossy_type_change(source_inner, target_inner);
+    }
+
     // Integer widening (safe).
     let widening_pairs = [
         ("u8", "u16"),
@@ -566,6 +581,64 @@ mod tests {
         let result = check_schema_preservation(&source, &target);
         assert!(!result.safe);
         assert_eq!(result.type_mismatches.len(), 1);
+        assert!(result.type_mismatches[0].lossy);
+    }
+
+    #[test]
+    fn optional_type_widening_is_safe() {
+        // Widening an optional integer column mirrors the bare u32 -> u64 case
+        // and must be classified safe, not lossy.
+        let source = SchemaSnapshot {
+            fields: vec![SchemaField::optional("count", "u32")],
+            version: "v1".to_string(),
+            captured_at_ms: 0,
+        };
+        let target = SchemaSnapshot {
+            fields: vec![SchemaField::optional("count", "u64")],
+            version: "v2".to_string(),
+            captured_at_ms: 0,
+        };
+        let result = check_schema_preservation(&source, &target);
+        assert!(result.safe, "summary: {}", result.summary);
+        assert_eq!(result.type_mismatches.len(), 1);
+        assert!(!result.type_mismatches[0].lossy);
+    }
+
+    #[test]
+    fn optional_type_narrowing_is_unsafe() {
+        // Narrowing inside Option stays lossy, mirroring u64 -> u32.
+        let source = SchemaSnapshot {
+            fields: vec![SchemaField::optional("count", "u64")],
+            version: "v1".to_string(),
+            captured_at_ms: 0,
+        };
+        let target = SchemaSnapshot {
+            fields: vec![SchemaField::optional("count", "u32")],
+            version: "v2".to_string(),
+            captured_at_ms: 0,
+        };
+        let result = check_schema_preservation(&source, &target);
+        assert!(!result.safe);
+        assert_eq!(result.type_mismatches.len(), 1);
+        assert!(result.type_mismatches[0].lossy);
+    }
+
+    #[test]
+    fn optional_unrelated_inner_change_is_lossy() {
+        // A genuine type change inside Option (no known-safe transition) stays
+        // lossy under the fail-closed default.
+        let source = SchemaSnapshot {
+            fields: vec![SchemaField::optional("tag", "String")],
+            version: "v1".to_string(),
+            captured_at_ms: 0,
+        };
+        let target = SchemaSnapshot {
+            fields: vec![SchemaField::optional("tag", "u64")],
+            version: "v2".to_string(),
+            captured_at_ms: 0,
+        };
+        let result = check_schema_preservation(&source, &target);
+        assert!(!result.safe);
         assert!(result.type_mismatches[0].lossy);
     }
 
