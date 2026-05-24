@@ -1,10 +1,34 @@
+use crate::TerminalState;
 use crate::input::*;
 use crate::terminalstate::MouseEncoding;
-use crate::TerminalState;
 use anyhow::bail;
 use std::io::Write;
 
+fn sgr_pixel_coord(cell: usize, total_pixels: usize, cells: usize, pixel_offset: isize) -> usize {
+    let cell_pixels = total_pixels / cells.max(1);
+    cell.saturating_mul(cell_pixels)
+        .saturating_add(pixel_offset.max(0) as usize)
+        .saturating_add(1)
+}
+
 impl TerminalState {
+    fn sgr_pixel_coords(&self, event: MouseEvent) -> (usize, usize) {
+        (
+            sgr_pixel_coord(
+                event.x,
+                self.pixel_width,
+                self.screen.physical_cols,
+                event.x_pixel_offset,
+            ),
+            sgr_pixel_coord(
+                event.y.max(0) as usize,
+                self.pixel_height,
+                self.screen.physical_rows,
+                event.y_pixel_offset,
+            ),
+        )
+    }
+
     /// Encode a coordinate value using X10 encoding or Utf8 encoding.
     /// Out of bounds coords are reported as the 0 byte value.
     fn encode_coord(&self, value: i64, dest: &mut Vec<u8>) {
@@ -96,25 +120,9 @@ impl TerminalState {
         } else if self.mouse_encoding == MouseEncoding::SgrPixels
             && (self.mouse_tracking || self.button_event_mouse || self.any_event_mouse)
         {
-            let height = self.screen.physical_rows as usize;
-            let width = self.screen.physical_cols as usize;
-            log::trace!(
-                "wheel {event:?} ESC [<{};{};{}M",
-                button,
-                (event.x * (self.pixel_width / width)) + event.x_pixel_offset.max(0) as usize + 1,
-                (event.y as usize * (self.pixel_height / height))
-                    + event.y_pixel_offset.max(0) as usize
-                    + 1
-            );
-            write!(
-                self.writer,
-                "\x1b[<{};{};{}M",
-                button,
-                (event.x * (self.pixel_width / width)) + event.x_pixel_offset.max(0) as usize + 1,
-                (event.y as usize * (self.pixel_height / height))
-                    + event.y_pixel_offset.max(0) as usize
-                    + 1
-            )?;
+            let (x, y) = self.sgr_pixel_coords(event);
+            log::trace!("wheel {event:?} ESC [<{};{};{}M", button, x, y);
+            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
             self.writer.flush()?;
         } else if self.mouse_tracking || self.button_event_mouse || self.any_event_mouse {
             self.encode_x10_or_utf8(event, button)?;
@@ -161,25 +169,9 @@ impl TerminalState {
             )?;
             self.writer.flush()?;
         } else if self.mouse_encoding == MouseEncoding::SgrPixels {
-            let height = self.screen.physical_rows as usize;
-            let width = self.screen.physical_cols as usize;
-            log::trace!(
-                "press {event:?} ESC [<{};{};{}M",
-                button,
-                (event.x * (self.pixel_width / width)) + event.x_pixel_offset.max(0) as usize + 1,
-                (event.y as usize * (self.pixel_height / height))
-                    + event.y_pixel_offset.max(0) as usize
-                    + 1
-            );
-            write!(
-                self.writer,
-                "\x1b[<{};{};{}M",
-                button,
-                (event.x * (self.pixel_width / width)) + event.x_pixel_offset.max(0) as usize + 1,
-                (event.y as usize * (self.pixel_height / height))
-                    + event.y_pixel_offset.max(0) as usize
-                    + 1
-            )?;
+            let (x, y) = self.sgr_pixel_coords(event);
+            log::trace!("press {event:?} ESC [<{};{};{}M", button, x, y);
+            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
             self.writer.flush()?;
         } else {
             self.encode_x10_or_utf8(event, button)?;
@@ -209,29 +201,9 @@ impl TerminalState {
                     )?;
                     self.writer.flush()?;
                 } else if self.mouse_encoding == MouseEncoding::SgrPixels {
-                    let height = self.screen.physical_rows as usize;
-                    let width = self.screen.physical_cols as usize;
-                    log::trace!(
-                        "release {event:?} ESC [<{};{};{}m",
-                        release_button,
-                        (event.x * (self.pixel_width / width))
-                            + event.x_pixel_offset.max(0) as usize
-                            + 1,
-                        (event.y as usize * (self.pixel_height / height))
-                            + event.y_pixel_offset.max(0) as usize
-                            + 1
-                    );
-                    write!(
-                        self.writer,
-                        "\x1b[<{};{};{}m",
-                        release_button,
-                        (event.x * (self.pixel_width / width))
-                            + event.x_pixel_offset.max(0) as usize
-                            + 1,
-                        (event.y as usize * (self.pixel_height / height))
-                            + event.y_pixel_offset.max(0) as usize
-                            + 1
-                    )?;
+                    let (x, y) = self.sgr_pixel_coords(event);
+                    log::trace!("release {event:?} ESC [<{};{};{}m", release_button, x, y);
+                    write!(self.writer, "\x1b[<{};{};{}m", release_button, x, y)?;
                     self.writer.flush()?;
                 } else {
                     let release_button = 3;
@@ -285,29 +257,9 @@ impl TerminalState {
                 )?;
                 self.writer.flush()?;
             } else if self.mouse_encoding == MouseEncoding::SgrPixels {
-                let height = self.screen.physical_rows as usize;
-                let width = self.screen.physical_cols as usize;
-                log::trace!(
-                    "move {event:?} ESC [<{};{};{}M",
-                    button,
-                    (event.x * (self.pixel_width / width))
-                        + event.x_pixel_offset.max(0) as usize
-                        + 1,
-                    (event.y as usize * (self.pixel_height / height))
-                        + event.y_pixel_offset.max(0) as usize
-                        + 1
-                );
-                write!(
-                    self.writer,
-                    "\x1b[<{};{};{}M",
-                    button,
-                    (event.x * (self.pixel_width / width))
-                        + event.x_pixel_offset.max(0) as usize
-                        + 1,
-                    (event.y as usize * (self.pixel_height / height))
-                        + event.y_pixel_offset.max(0) as usize
-                        + 1
-                )?;
+                let (x, y) = self.sgr_pixel_coords(event);
+                log::trace!("move {event:?} ESC [<{};{};{}M", button, x, y);
+                write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
                 self.writer.flush()?;
             } else {
                 self.encode_x10_or_utf8(event, button)?;
@@ -326,7 +278,7 @@ impl TerminalState {
         // terminal.  The mouse can move over that portion and the gui layer
         // can thus send us out-of-bounds row or column numbers.  We want to
         // make sure that we clamp this and handle it nicely at the model layer.
-        event.y = event.y.min(self.screen().physical_rows as i64 - 1);
+        event.y = event.y.clamp(0, self.screen().physical_rows as i64 - 1);
         event.x = event.x.min(self.screen().physical_cols - 1);
 
         match event {
@@ -360,5 +312,25 @@ impl TerminalState {
                 ..
             } => self.mouse_move(event),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sgr_pixel_coord;
+
+    #[test]
+    fn sgr_pixel_coord_matches_existing_one_based_formula() {
+        assert_eq!(sgr_pixel_coord(4, 80, 10, 3), 36);
+        assert_eq!(sgr_pixel_coord(4, 80, 10, -3), 33);
+    }
+
+    #[test]
+    fn sgr_pixel_coord_saturates_extreme_values() {
+        assert_eq!(
+            sgr_pixel_coord(usize::MAX, usize::MAX, 1, isize::MAX),
+            usize::MAX
+        );
+        assert_eq!(sgr_pixel_coord(2, 9, 0, 0), 19);
     }
 }
