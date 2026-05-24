@@ -62,6 +62,10 @@ pub(crate) enum MouseEncoding {
     SgrPixels,
 }
 
+fn usize_to_i64_saturating(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 impl TabStop {
     fn new(screen_width: usize, tab_width: usize) -> Self {
         let mut tabs = Vec::with_capacity(screen_width);
@@ -1038,59 +1042,64 @@ impl TerminalState {
     /// top left of the visible screen.
     fn set_cursor_pos(&mut self, x: &Position, y: &Position) {
         let x = match *x {
-            Position::Relative(x) => (self.cursor.x as i64 + x)
+            Position::Relative(x) => usize_to_i64_saturating(self.cursor.x)
+                .saturating_add(x)
                 .min(
                     if self.dec_origin_mode {
-                        self.left_and_right_margins.end
+                        usize_to_i64_saturating(self.left_and_right_margins.end)
                     } else {
-                        self.screen().physical_cols
-                    } as i64
-                        - 1,
+                        usize_to_i64_saturating(self.screen().physical_cols)
+                    }
+                    .saturating_sub(1),
                 )
                 .max(0),
-            Position::Absolute(x) => (x + if self.dec_origin_mode {
-                self.left_and_right_margins.start
-            } else {
-                0
-            } as i64)
-                .min(
-                    if self.dec_origin_mode {
-                        self.left_and_right_margins.end
-                    } else {
-                        // We allow 1 extra for the cursor x position
-                        // to account for some resize/rewrap scenarios
-                        // where we don't want to forget that the
-                        // cursor belongs to a wrapped line
-                        self.screen().physical_cols + 1
-                    } as i64
-                        - 1,
-                )
+            Position::Absolute(x) => x
+                .saturating_add(if self.dec_origin_mode {
+                    usize_to_i64_saturating(self.left_and_right_margins.start)
+                } else {
+                    0
+                })
+                .min(if self.dec_origin_mode {
+                    usize_to_i64_saturating(self.left_and_right_margins.end).saturating_sub(1)
+                } else {
+                    // We allow 1 extra for the cursor x position
+                    // to account for some resize/rewrap scenarios
+                    // where we don't want to forget that the
+                    // cursor belongs to a wrapped line.
+                    usize_to_i64_saturating(self.screen().physical_cols)
+                })
                 .max(0),
         };
 
         let y = match *y {
-            Position::Relative(y) => (self.cursor.y + y)
+            Position::Relative(y) => self
+                .cursor
+                .y
+                .saturating_add(y)
                 .min(
                     if self.dec_origin_mode {
                         self.top_and_bottom_margins.end
                     } else {
-                        self.screen().physical_rows as i64
-                    } - 1,
+                        usize_to_i64_saturating(self.screen().physical_rows)
+                    }
+                    .saturating_sub(1),
                 )
                 .max(0),
-            Position::Absolute(y) => (y + if self.dec_origin_mode {
-                self.top_and_bottom_margins.start
-            } else {
-                0
-            })
-            .min(
-                if self.dec_origin_mode {
-                    self.top_and_bottom_margins.end
+            Position::Absolute(y) => y
+                .saturating_add(if self.dec_origin_mode {
+                    self.top_and_bottom_margins.start
                 } else {
-                    self.screen().physical_rows as i64
-                } - 1,
-            )
-            .max(0),
+                    0
+                })
+                .min(
+                    if self.dec_origin_mode {
+                        self.top_and_bottom_margins.end
+                    } else {
+                        usize_to_i64_saturating(self.screen().physical_rows)
+                    }
+                    .saturating_sub(1),
+                )
+                .max(0),
         };
 
         self.set_cursor_position_absolute(x as usize, y);
@@ -3545,6 +3554,12 @@ mod tests {
     fn mouse_encoding_debug() {
         let debug = format!("{:?}", MouseEncoding::SgrPixels);
         assert!(debug.contains("SgrPixels"));
+    }
+
+    #[test]
+    fn usize_to_i64_conversion_saturates_extreme_values() {
+        assert_eq!(usize_to_i64_saturating(42), 42);
+        assert_eq!(usize_to_i64_saturating(usize::MAX), i64::MAX);
     }
 
     // ── ScreenOrAlt ────────────────────────────────────────────
