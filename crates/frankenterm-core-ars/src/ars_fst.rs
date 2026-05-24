@@ -433,7 +433,7 @@ impl FstCompiler {
             }
         }
 
-        let build_duration_us = start.elapsed().as_micros() as u64;
+        let build_duration_us = duration_us_saturating(start.elapsed());
 
         let stats = FstStats {
             entry_count,
@@ -459,6 +459,10 @@ impl FstCompiler {
             config: self.config.clone(),
         })
     }
+}
+
+fn duration_us_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 // =============================================================================
@@ -676,6 +680,11 @@ mod tests {
             priority,
             cluster_id: format!("cluster-{id}"),
         }
+    }
+
+    #[test]
+    fn duration_micros_saturates() {
+        assert_eq!(duration_us_saturating(std::time::Duration::MAX), u64::MAX);
     }
 
     // ---- Basic compilation ----
