@@ -633,6 +633,22 @@ run_case \
   0
 
 run_case \
+  "dot_segment_artifact_path_fails" \
+  1 \
+  '"./docs/attestations/schema.json"' \
+  "" \
+  "" \
+  0
+
+run_case \
+  "empty_segment_artifact_path_fails" \
+  1 \
+  '"docs//attestations/schema.json"' \
+  "" \
+  "" \
+  0
+
+run_case \
   "allow_partial_skips_missing_file" \
   0 \
   '"docs/attestations/does-not-exist-ft-e87u6-2.json"' \
