@@ -106,9 +106,12 @@ file format has been **additive-only since v1**:
 - A REQUIRED field rename or removal is a breaking change and MUST
   be guarded by a `format_version` field bump (deferred until the
   first such change is needed).
-- Enum widening (new `agent_type` variants) is backward-compatible
-  for readers tolerant of unknown variants. The current loader
-  treats unknown variants as `unknown` (the catch-all variant).
+- Enum widening (new `agent_type` or `severity` variants) is a
+  compatibility break for the current first-party loader. The Rust
+  enums are serde-tagged without an `other` catch-all, so unknown
+  variants fail deserialization instead of being coerced to
+  `unknown`. The `unknown` agent type is a literal supported value,
+  not a fallback for unrecognized strings.
 
 When the first breaking change ships, this spec gains a
 `format_version` row in the top-level table; older packs continue to
