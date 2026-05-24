@@ -1,7 +1,7 @@
 //! Working with pseudo-terminals
 
 use crate::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, PtySystem, SlavePty};
-use anyhow::{bail, Error};
+use anyhow::{Error, bail};
 use filedescriptor::FileDescriptor;
 use libc::{self, winsize};
 use std::cell::RefCell;
@@ -15,6 +15,17 @@ use std::path::PathBuf;
 use std::{io, mem, ptr};
 
 pub use std::os::unix::io::RawFd;
+
+const MAX_TTY_NAME_BUFFER_LEN: usize = 64 * 1024;
+
+fn next_tty_name_buffer_len(current_len: usize) -> Option<usize> {
+    if current_len > MAX_TTY_NAME_BUFFER_LEN {
+        return None;
+    }
+    current_len
+        .checked_mul(2)
+        .filter(|next_len| *next_len > current_len)
+}
 
 #[derive(Default)]
 pub struct UnixPtySystem {}
@@ -112,13 +123,13 @@ fn tty_name(fd: RawFd) -> Option<PathBuf> {
         let res = unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) };
 
         if res == libc::ERANGE {
-            if buf.len() > 64 * 1024 {
+            let Some(next_len) = next_tty_name_buffer_len(buf.len()) else {
                 // on macOS, if the buf is "too big", ttyname_r can
                 // return ERANGE, even though that is supposed to
                 // indicate buf is "too small".
                 return None;
-            }
-            buf.resize(buf.len() * 2, 0 as std::ffi::c_char);
+            };
+            buf.resize(next_len, 0 as std::ffi::c_char);
             continue;
         }
 
@@ -410,5 +421,22 @@ impl Write for UnixMasterWriter {
     }
     fn flush(&mut self) -> Result<(), io::Error> {
         self.fd.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tty_name_buffer_growth_is_bounded() {
+        assert_eq!(next_tty_name_buffer_len(128), Some(256));
+        assert_eq!(
+            next_tty_name_buffer_len(MAX_TTY_NAME_BUFFER_LEN),
+            Some(MAX_TTY_NAME_BUFFER_LEN * 2)
+        );
+        assert_eq!(next_tty_name_buffer_len(MAX_TTY_NAME_BUFFER_LEN + 1), None);
+        assert_eq!(next_tty_name_buffer_len(usize::MAX), None);
+        assert_eq!(next_tty_name_buffer_len(0), None);
     }
 }
