@@ -1102,6 +1102,29 @@ proptest! {
             "different rule_ids should produce different keys");
     }
 
+    /// Property 45b: Different event_types produce different keys (the key
+    /// incorporates event_type alongside rule_id). Complements Property 45.
+    #[test]
+    fn prop_identity_key_event_type_differentiation(
+        pane_id in 0..1000u64,
+        rule_id in "[a-z]{1,10}\\.[a-z]{1,10}",
+    ) {
+        let base = |event_type: &str| Detection {
+            rule_id: rule_id.clone(),
+            agent_type: AgentType::Codex,
+            event_type: event_type.to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "test".to_string(),
+            span: (0, 0),
+        };
+        let k1 = event_identity_key(&base("started"), pane_id, None);
+        let k2 = event_identity_key(&base("completed"), pane_id, None);
+        prop_assert_ne!(k1, k2,
+            "different event_types should produce different keys");
+    }
+
     // ========================================================================
     // Property Tests: NotificationGate pipeline
     // ========================================================================
