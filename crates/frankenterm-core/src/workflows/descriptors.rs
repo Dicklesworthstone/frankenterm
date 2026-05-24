@@ -301,6 +301,13 @@ fn validate_step_tree(
             )),
         ));
     }
+    if id.chars().any(char::is_whitespace) {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(
+                "Descriptor step id cannot contain whitespace".to_string(),
+            ),
+        ));
+    }
     if !seen.insert(id.to_string()) {
         return Err(crate::Error::Config(
             crate::error::ConfigError::ValidationError(format!("Duplicate step id: {id}")),

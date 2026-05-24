@@ -532,6 +532,30 @@ proptest! {
     }
 
     #[test]
+    fn step_id_with_whitespace_fails_validation(
+        prefix in "[a-z]{1,8}",
+        suffix in "[a-z]{1,8}",
+    ) {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "step_id_whitespace".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: format!("{prefix} {suffix}"),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "descriptor validation must reject step ids containing whitespace"
+        );
+    }
+
+    #[test]
     fn failure_handler_message_respects_configured_text_length_limit(
         max_text_len in 1usize..128,
         handler_variant in 0u8..3,
