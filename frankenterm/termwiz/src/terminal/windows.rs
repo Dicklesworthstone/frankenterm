@@ -92,6 +92,15 @@ fn input_event_count_to_u32(num_events: usize) -> Result<u32> {
         .map_err(|_| format_err!("console input event count overflow: {num_events}"))
 }
 
+fn received_input_event_count(num_events: u32, capacity: usize) -> Result<usize> {
+    let count = num_events as usize;
+    ensure!(
+        count <= capacity,
+        "ReadConsoleInput returned {count} events for buffer capacity {capacity}"
+    );
+    Ok(count)
+}
+
 fn buffered_write_needs_flush(current_len: usize, incoming_len: usize, capacity: usize) -> bool {
     current_len
         .checked_add(incoming_len)
@@ -221,7 +230,8 @@ impl ConsoleInputHandle for InputHandle {
             bail!("ReadConsoleInput failed: {}", IoError::last_os_error());
         }
 
-        unsafe { res.set_len(num as usize) };
+        let received_events = received_input_event_count(num, res.len())?;
+        unsafe { res.set_len(received_events) };
         Ok(res)
     }
 }
@@ -1165,6 +1175,12 @@ mod tests {
         if usize::BITS > u32::BITS {
             assert!(input_event_count_to_u32(usize::MAX).is_err());
         }
+    }
+
+    #[test]
+    fn received_input_event_count_rejects_counts_beyond_capacity() {
+        assert_eq!(received_input_event_count(3, 3).unwrap(), 3);
+        assert!(received_input_event_count(4, 3).is_err());
     }
 
     #[test]
