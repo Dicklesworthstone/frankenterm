@@ -111,6 +111,15 @@ sha256_stdin() {
     shasum -a 256 | awk '{print $1}'
   fi
 }
+is_repo_relative_path() {
+  local path="$1"
+  [[ -n "$path" && "$path" != /* ]] || return 1
+  IFS='/' read -r -a parts <<< "$path"
+  local part
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != "." && "$part" != ".." ]] || return 1
+  done
+}
 
 [[ -f "$MANIFEST" ]] || { echo "error: manifest not found: $MANIFEST" >&2; exit 1; }
 [[ -f "$SCHEMA_PATH" ]] || { echo "error: schema not found: $SCHEMA_PATH" >&2; exit 1; }
@@ -235,6 +244,12 @@ for ((i=0; i<slot_count; i++)); do
     unfilled+=("$category (produced by ${produced_by_bead:-?})")
     emit_build_json "error.unfilled" "failed" "slot_unfilled" "ATTESTATION-SLOT-UNFILLED" "$category" "" "slot has path=null with no deferred_to_bead"
     continue
+  fi
+
+  if ! is_repo_relative_path "$path"; then
+    emit_build_json "error.unsafe_artifact_path" "failed" "artifact_path_unsafe" "ATTESTATION-ARTIFACT-PATH-UNSAFE" "$category" "" "$path"
+    build_log "error: artifact path must be repo-relative without parent traversal: $path (declared for category $category, bead $produced_by_bead)"
+    exit 1
   fi
 
   abs_path="$REPO_ROOT/$path"

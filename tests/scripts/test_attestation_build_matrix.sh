@@ -517,6 +517,22 @@ run_case \
   0
 
 run_case \
+  "absolute_artifact_path_fails" \
+  1 \
+  '"/tmp/ft-e87u6-2-outside.json"' \
+  "" \
+  "" \
+  0
+
+run_case \
+  "parent_artifact_path_fails" \
+  1 \
+  '"../docs/attestations/schema.json"' \
+  "" \
+  "" \
+  0
+
+run_case \
   "allow_partial_skips_missing_file" \
   0 \
   '"docs/attestations/does-not-exist-ft-e87u6-2.json"' \
