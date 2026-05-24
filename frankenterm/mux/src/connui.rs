@@ -1,15 +1,15 @@
-use crate::termwiztermtab;
 use crate::Mux;
-use anyhow::{anyhow, bail, Context as _};
+use crate::termwiztermtab;
+use anyhow::{Context as _, anyhow, bail};
 use config::configuration;
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_term::TerminalSize;
-use promise::spawn::block_on;
 use promise::Promise;
+use promise::spawn::block_on;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use termwiz::cell::{unicode_column_width, CellAttributes};
+use termwiz::cell::{CellAttributes, unicode_column_width};
 use termwiz::lineedit::*;
 use termwiz::surface::{Change, Position};
 use termwiz::terminal::*;
@@ -149,8 +149,7 @@ impl ConnectionUIImpl {
             let remain = deadline - now;
             let term_width = self.term.get_screen_size().map(|s| s.cols).unwrap_or(80);
             let elapsed_nanos = duration.saturating_sub(remain).as_nanos();
-            let prog_width = term_width as u128 * elapsed_nanos / duration_nanos;
-            let prog_width = prog_width as usize;
+            let prog_width = scaled_progress_width(term_width, elapsed_nanos, duration_nanos);
             let message = format!("{} ({:.0?})", reason, remain);
 
             let mut reversed_string = String::new();
@@ -210,6 +209,25 @@ impl ConnectionUIImpl {
 
         Ok(())
     }
+}
+
+fn scaled_progress_width(term_width: usize, elapsed_nanos: u128, duration_nanos: u128) -> usize {
+    if term_width == 0 || duration_nanos == 0 {
+        return 0;
+    }
+
+    if elapsed_nanos >= duration_nanos {
+        return term_width;
+    }
+
+    if let Some(scaled) = (term_width as u128).checked_mul(elapsed_nanos) {
+        return usize::try_from(scaled / duration_nanos)
+            .unwrap_or(usize::MAX)
+            .min(term_width);
+    }
+
+    let ratio = (elapsed_nanos as f64 / duration_nanos as f64).clamp(0.0, 1.0);
+    (((term_width as f64) * ratio).floor() as usize).min(term_width)
 }
 
 struct HeadlessImpl {
@@ -558,6 +576,16 @@ mod tests {
         assert_eq!(CloseStatus::Explicit, CloseStatus::Explicit);
         assert_eq!(CloseStatus::Implicit, CloseStatus::Implicit);
         assert_ne!(CloseStatus::Explicit, CloseStatus::Implicit);
+    }
+
+    #[test]
+    fn progress_width_scales_without_overflow() {
+        assert_eq!(scaled_progress_width(80, 50, 100), 40);
+        assert_eq!(scaled_progress_width(80, 100, 100), 80);
+        assert_eq!(
+            scaled_progress_width(usize::MAX, u128::MAX - 1, u128::MAX),
+            usize::MAX
+        );
     }
 
     #[test]
