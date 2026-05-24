@@ -1,12 +1,12 @@
-use crate::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
+use crate::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode};
 use crate::istty::IsTty;
 use crate::terminal::ProbeCapabilities;
-use crate::{bail, ensure, format_err, Result};
+use crate::{Result, bail, ensure, format_err};
 use filedescriptor::{FileDescriptor, OwnedHandle};
 use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::{stdin, stdout, Error as IoError, Read, Result as IoResult, Write};
+use std::io::{Error as IoError, Read, Result as IoResult, Write, stdin, stdout};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,25 +17,25 @@ use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::synchapi::{CreateEventW, SetEvent, WaitForMultipleObjects};
 use winapi::um::winbase::{INFINITE, WAIT_FAILED, WAIT_OBJECT_0};
 use winapi::um::wincon::{
-    CreateConsoleScreenBuffer, FillConsoleOutputAttribute, FillConsoleOutputCharacterW,
-    GetConsoleScreenBufferInfo, ReadConsoleOutputW, ScrollConsoleScreenBufferW,
-    SetConsoleActiveScreenBuffer, SetConsoleCP, SetConsoleCursorPosition, SetConsoleOutputCP,
-    SetConsoleScreenBufferSize, SetConsoleTextAttribute, SetConsoleWindowInfo, WriteConsoleOutputW,
     CHAR_INFO, CONSOLE_SCREEN_BUFFER_INFO, CONSOLE_TEXTMODE_BUFFER, COORD,
-    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
-    ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    ENABLE_WINDOW_INPUT, INPUT_RECORD, SMALL_RECT,
+    CreateConsoleScreenBuffer, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+    ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, FillConsoleOutputAttribute,
+    FillConsoleOutputCharacterW, GetConsoleScreenBufferInfo, INPUT_RECORD, ReadConsoleOutputW,
+    SMALL_RECT, ScrollConsoleScreenBufferW, SetConsoleActiveScreenBuffer, SetConsoleCP,
+    SetConsoleCursorPosition, SetConsoleOutputCP, SetConsoleScreenBufferSize,
+    SetConsoleTextAttribute, SetConsoleWindowInfo, WriteConsoleOutputW,
 };
 use winapi::um::winnls::CP_UTF8;
 use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
 
 use crate::caps::Capabilities;
 use crate::input::{InputEvent, InputParser};
+use crate::render::RenderTty;
 use crate::render::terminfo::TerminfoRenderer;
 use crate::render::windows::WindowsConsoleRenderer;
-use crate::render::RenderTty;
 use crate::surface::Change;
-use crate::terminal::{cast, ScreenSize, Terminal};
+use crate::terminal::{ScreenSize, Terminal, cast};
 
 const BUF_SIZE: usize = 128;
 const MAX_FINITE_WAIT_MS: u32 = INFINITE - 1;
@@ -43,6 +43,29 @@ const MAX_FINITE_WAIT_MS: u32 = INFINITE - 1;
 fn wait_timeout_millis(wait: Option<Duration>) -> u32 {
     wait.map(|wait| wait.as_millis().min(MAX_FINITE_WAIT_MS as u128) as u32)
         .unwrap_or(INFINITE)
+}
+
+fn scroll_region_rect(
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+    dx: i16,
+    dy: i16,
+) -> SMALL_RECT {
+    SMALL_RECT {
+        Left: max(left, left.saturating_sub(dx)),
+        Top: max(top, top.saturating_sub(dy)),
+        Right: min(right, right.saturating_sub(dx)),
+        Bottom: min(bottom, bottom.saturating_sub(dy)),
+    }
+}
+
+fn scroll_destination(left: i16, top: i16, dx: i16, dy: i16) -> COORD {
+    COORD {
+        X: max(left, left.saturating_add(dx)),
+        Y: max(top, top.saturating_add(dy)),
+    }
 }
 
 enum Renderer {
@@ -560,12 +583,7 @@ impl ConsoleOutputHandle for OutputHandle {
         dy: i16,
         attr: u16,
     ) -> Result<()> {
-        let scroll_rect = SMALL_RECT {
-            Left: max(left, left - dx),
-            Top: max(top, top - dy),
-            Right: min(right, right - dx),
-            Bottom: min(bottom, bottom - dy),
-        };
+        let scroll_rect = scroll_region_rect(left, top, right, bottom, dx, dy);
         let clip_rect = SMALL_RECT {
             Left: left,
             Top: top,
@@ -585,10 +603,7 @@ impl ConsoleOutputHandle for OutputHandle {
                 self.handle.as_raw_handle() as *mut _,
                 &scroll_rect,
                 &clip_rect,
-                COORD {
-                    X: max(left, left + dx),
-                    Y: max(left, top + dy),
-                },
+                scroll_destination(left, top, dx, dy),
                 &fill,
             )
         } == 0
@@ -921,7 +936,9 @@ impl Terminal for WindowsTerminal {
             Ok(())
         } else {
             let Some(main_output) = self.alternate_main_output.as_mut() else {
-                bail!("native Windows alternate screen is marked active but main buffer handle is missing");
+                bail!(
+                    "native Windows alternate screen is marked active but main buffer handle is missing"
+                );
             };
             main_output.set_active_screen_buffer()?;
 
@@ -1097,6 +1114,22 @@ mod tests {
     fn wait_timeout_saturates_without_using_infinite_sentinel() {
         let overflowing = Duration::from_millis(MAX_FINITE_WAIT_MS as u64 + 1);
         assert_eq!(wait_timeout_millis(Some(overflowing)), MAX_FINITE_WAIT_MS);
+    }
+
+    #[test]
+    fn scroll_destination_clamps_y_against_top_not_left() {
+        let destination = scroll_destination(20, 3, 0, -1);
+
+        assert_eq!((destination.X, destination.Y), (20, 3));
+    }
+
+    #[test]
+    fn scroll_region_math_saturates_extreme_deltas() {
+        let rect = scroll_region_rect(-30_000, -20_000, 30_000, 20_000, i16::MIN, i16::MAX);
+        let destination = scroll_destination(-30_000, -20_000, i16::MIN, i16::MAX);
+
+        assert_eq!(rect_tuple(rect), (2_768, -20_000, 30_000, -12_767));
+        assert_eq!((destination.X, destination.Y), (-30_000, 12_767));
     }
 
     #[test]
