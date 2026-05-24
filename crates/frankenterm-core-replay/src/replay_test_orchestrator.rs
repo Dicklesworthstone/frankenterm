@@ -222,7 +222,9 @@ impl EvidenceManifest {
     /// Create a new manifest from entries.
     #[must_use]
     pub fn new(entries: Vec<ManifestEntry>, generated_at: String, retention_days: u64) -> Self {
-        let total_size_bytes = entries.iter().map(|e| e.size_bytes).sum();
+        let total_size_bytes = entries
+            .iter()
+            .fold(0u64, |total, entry| total.saturating_add(entry.size_bytes));
         Self {
             version: "1".into(),
             generated_at,
@@ -621,6 +623,26 @@ mod tests {
         let manifest = EvidenceManifest::new(entries, "now".into(), 90);
         assert_eq!(manifest.total_size_bytes, 6000);
         assert_eq!(manifest.files.len(), 2);
+    }
+
+    #[test]
+    fn manifest_total_size_saturates_overflow() {
+        let entries = vec![
+            ManifestEntry {
+                path: "huge.log".into(),
+                size_bytes: u64::MAX,
+                checksum: "abc".into(),
+                file_type: ManifestFileType::TestOutput,
+            },
+            ManifestEntry {
+                path: "extra.log".into(),
+                size_bytes: 1,
+                checksum: "def".into(),
+                file_type: ManifestFileType::TestOutput,
+            },
+        ];
+        let manifest = EvidenceManifest::new(entries, "now".into(), 90);
+        assert_eq!(manifest.total_size_bytes, u64::MAX);
     }
 
     #[test]
