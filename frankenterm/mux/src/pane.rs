@@ -196,12 +196,12 @@ impl LogicalLine {
                 return 0;
             }
             if phys_y == y {
-                return offset + x;
+                return offset.saturating_add(x);
             }
-            offset += line.len();
+            offset = offset.saturating_add(line.len());
         }
         // Allow selecting off the end of the line
-        offset + x
+        offset.saturating_add(x)
     }
 
     pub fn logical_x_to_physical_coord(&self, x: usize) -> (StableRowIndex, usize) {
@@ -218,12 +218,16 @@ impl LogicalLine {
                 return (y, x_off);
             }
             let Some(next_y) = y.checked_add(1) else {
-                return (y, x - idx + line_len);
+                return (y, x.saturating_sub(idx).saturating_add(line_len));
             };
             y = next_y;
-            idx += line_len;
+            idx = idx.saturating_add(line_len);
         }
-        (y - 1, x - idx + last_physical_line.len())
+        (
+            y.saturating_sub(1),
+            x.saturating_sub(idx)
+                .saturating_add(last_physical_line.len()),
+        )
     }
 }
 
@@ -1353,6 +1357,35 @@ mod test {
         };
 
         assert_eq!(logical.logical_x_to_physical_coord(3), (7, 3));
+    }
+
+    #[test]
+    fn logical_line_coordinate_conversion_saturates_extreme_offsets() {
+        let attr = Default::default();
+        let logical = LogicalLine {
+            physical_lines: vec![
+                Line::from_text("hello", &attr, SEQ_ZERO, None),
+                Line::from_text("0123456789", &attr, SEQ_ZERO, None),
+            ],
+            logical: Line::from_text("hello0123456789", &attr, SEQ_ZERO, None),
+            first_row: 0,
+        };
+
+        assert_eq!(logical.xy_to_logical_x(usize::MAX, 1), usize::MAX);
+        assert_eq!(
+            logical.logical_x_to_physical_coord(usize::MAX),
+            (1, usize::MAX - 5)
+        );
+
+        let max_row_logical = LogicalLine {
+            physical_lines: vec![Line::from_text("0123456789", &attr, SEQ_ZERO, None)],
+            logical: Line::from_text("0123456789", &attr, SEQ_ZERO, None),
+            first_row: StableRowIndex::MAX,
+        };
+        assert_eq!(
+            max_row_logical.logical_x_to_physical_coord(usize::MAX),
+            (StableRowIndex::MAX, usize::MAX)
+        );
     }
 
     // ── PaneConstraints ──────────────────────────────────────
