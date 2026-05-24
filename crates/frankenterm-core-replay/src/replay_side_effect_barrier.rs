@@ -524,7 +524,8 @@ impl SideEffectBarrier for CounterfactualBarrier {
                 metadata,
             });
 
-            *self.lock_override_count("process") += 1;
+            let mut count = self.lock_override_count("process");
+            *count = count.saturating_add(1);
 
             EffectOutcome {
                 executed: false,
@@ -1139,6 +1140,25 @@ mod tests {
 
         assert!(outcome.overridden);
         assert_eq!(barrier.overrides_applied(), 1);
+    }
+
+    #[test]
+    fn counterfactual_override_count_saturates() {
+        let rule = OverrideRule {
+            effect_type: EffectType::SendKeys,
+            pane_id: Some(1),
+            payload_contains: None,
+            replacement_payload: "saturated".to_string(),
+            description: "saturation guard".to_string(),
+        };
+        let barrier = CounterfactualBarrier::new(vec![rule]);
+        *barrier.lock_override_count("test") = usize::MAX;
+
+        let req = make_request(EffectType::SendKeys, Some(1), "original");
+        let outcome = barrier.process(&req);
+
+        assert!(outcome.overridden);
+        assert_eq!(barrier.overrides_applied(), usize::MAX);
     }
 
     #[test]
