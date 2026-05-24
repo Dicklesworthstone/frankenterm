@@ -128,6 +128,40 @@ proptest! {
             "queue-depth min must equal the recorded value"
         );
     }
+
+    /// record_wait_time_ms and record_retry_latency_ms feed their own
+    /// dedicated histograms (not touched by record_outcome). With N
+    /// identical samples each, both summaries count N and bracket the value.
+    #[test]
+    fn record_wait_and_retry_latency_feed_dedicated_histograms(
+        n in 1u32..20,
+        wait_ms in 0.5f64..1000.0,
+        retry_ms in 0.5f64..1000.0,
+    ) {
+        let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+        let stage = SwarmCapacityStage::IngestCapture;
+        for _ in 0..n {
+            telemetry.record_wait_time_ms(stage, wait_ms);
+            telemetry.record_retry_latency_ms(stage, retry_ms);
+        }
+        let snapshot = telemetry.snapshot();
+        let row = snapshot
+            .stages
+            .iter()
+            .find(|row| row.stage == stage)
+            .expect("targeted stage present");
+
+        prop_assert_eq!(row.wait_time_ms.count, u64::from(n));
+        prop_assert!(
+            row.wait_time_ms.min.is_some_and(|m| (m - wait_ms).abs() < 1e-9),
+            "wait-time min must equal the recorded value"
+        );
+        prop_assert_eq!(row.retry_latency_ms.count, u64::from(n));
+        prop_assert!(
+            row.retry_latency_ms.max.is_some_and(|m| (m - retry_ms).abs() < 1e-9),
+            "retry-latency max must equal the recorded value"
+        );
+    }
 }
 
 /// record_outcome dispatches each outcome to the correct stage counter.
