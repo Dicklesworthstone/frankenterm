@@ -406,6 +406,56 @@ proptest! {
     }
 
     #[test]
+    fn failure_handler_message_respects_configured_text_length_limit(
+        max_text_len in 0usize..128,
+        handler_variant in 0u8..3,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+        let handler = |message: String| match handler_variant {
+            0 => DescriptorFailureHandler::Notify { message },
+            1 => DescriptorFailureHandler::Log { message },
+            _ => DescriptorFailureHandler::Abort { message },
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "failure_handler_limit".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: Some(handler("x".repeat(max_text_len))),
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "failure handler message at max_text_len should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "failure_handler_limit".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: Some(handler("x".repeat(max_text_len.saturating_add(1)))),
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "failure handler message longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
     fn duplicate_top_level_step_ids_fail_validation(
         name in "[a-z_]{3,20}",
         duplicate_id in "[a-z_]{3,15}",

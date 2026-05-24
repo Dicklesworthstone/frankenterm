@@ -165,6 +165,10 @@ impl WorkflowDescriptor {
             validate_trigger_values("rule_ids", &trigger.rule_ids)?;
         }
 
+        if let Some(handler) = &self.on_failure {
+            validate_failure_handler(handler, limits)?;
+        }
+
         if self.steps.len() > limits.max_steps {
             return Err(crate::Error::Config(
                 crate::error::ConfigError::ValidationError(format!(
@@ -198,6 +202,27 @@ fn validate_trigger_values(field: &str, values: &[String]) -> crate::Result<()> 
         return Err(crate::Error::Config(
             crate::error::ConfigError::ValidationError(format!(
                 "Descriptor trigger {field} cannot contain empty values"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_failure_handler(
+    handler: &DescriptorFailureHandler,
+    limits: &DescriptorLimits,
+) -> crate::Result<()> {
+    let message = match handler {
+        DescriptorFailureHandler::Notify { message }
+        | DescriptorFailureHandler::Log { message }
+        | DescriptorFailureHandler::Abort { message } => message,
+    };
+    if message.len() > limits.max_text_len {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Failure handler message too long ({} > max {})",
+                message.len(),
+                limits.max_text_len
             )),
         ));
     }
