@@ -89,7 +89,18 @@ FT_ATTESTATION_RETRACTIONS_ROOT="$RETRACTIONS_ROOT" \
     --retracted-by-release 0.0.1-corrigendum \
     --sign ed25519 > "$RUN_ROOT/retract.out" 2>&1
 cat "$RUN_ROOT/retract.out"
-cp "$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts.json" \
+RETRACTION_PATH="$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts.json"
+RETRACTION_SIG_REL="$(jq -r '.retraction_signature.signature_path // ""' "$RETRACTION_PATH")"
+EXPECTED_RETRACTION_SIG_REL="${RETRACTIONS_ROOT#"$REPO_ROOT"/}/$BUNDLE_SHA/doctrine__agents-md-counts.ed25519.sig.hex"
+if [[ "$RETRACTION_SIG_REL" != "$EXPECTED_RETRACTION_SIG_REL" ]]; then
+  echo "FAIL: expected retraction signature path $EXPECTED_RETRACTION_SIG_REL, got $RETRACTION_SIG_REL"
+  exit 1
+fi
+if [[ ! -f "$REPO_ROOT/$RETRACTION_SIG_REL" ]]; then
+  echo "FAIL: retraction signature path is not verifier-resolvable: $RETRACTION_SIG_REL"
+  exit 1
+fi
+cp "$RETRACTION_PATH" \
   "$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts-duplicate.json"
 
 echo

@@ -88,8 +88,11 @@ repo_relative_path() {
   local path="$1"
   if [[ "$path" == "$REPO_ROOT/"* ]]; then
     printf '%s\n' "${path#"$REPO_ROOT"/}"
-  else
+  elif [[ "$path" != /* ]]; then
     printf '%s\n' "$path"
+  else
+    echo "error: signed retraction output must be inside the repository so the verifier can resolve it: $path" >&2
+    exit 1
   fi
 }
 
