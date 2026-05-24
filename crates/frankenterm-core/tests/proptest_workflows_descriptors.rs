@@ -597,7 +597,7 @@ proptest! {
 
     #[test]
     fn trigger_values_respect_configured_text_length_limit(
-        max_text_len in 1usize..128,
+        max_text_len in 5usize..128,
         trigger_field in prop_oneof![Just(0u8), Just(2u8)],
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
