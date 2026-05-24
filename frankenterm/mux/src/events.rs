@@ -9,8 +9,8 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Event types
@@ -218,7 +218,7 @@ impl EventBus {
         filter: Option<EventType>,
         handler: Arc<HandlerFn>,
     ) -> HandlerId {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_handler_id();
         let record = HandlerRecord {
             id,
             priority,
@@ -230,6 +230,22 @@ impl EventBus {
         // Maintain sort by priority so dispatch is a simple linear scan.
         handlers.sort_by_key(|r| r.priority);
         id
+    }
+
+    fn next_handler_id(&self) -> HandlerId {
+        let mut current = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(1);
+            match self.next_id.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return current,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Remove a previously registered handler.
@@ -360,6 +376,15 @@ mod tests {
                 message: "fired".into()
             }
         );
+    }
+
+    #[test]
+    fn handler_id_allocator_saturates_instead_of_wrapping_to_zero() {
+        let bus = EventBus::new();
+        bus.next_id.store(u64::MAX, Ordering::Relaxed);
+
+        assert_eq!(bus.next_handler_id(), u64::MAX);
+        assert_eq!(bus.next_id.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
@@ -1046,8 +1071,8 @@ mod tests {
     // Concurrent stress tests
     // ===================================================================
 
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
 
     /// Multiple threads fire events concurrently on a shared bus.
     /// Verifies no panics, no lost actions, and handler count is consistent.
