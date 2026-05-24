@@ -248,6 +248,19 @@ fn manifest_schema_rejects_parent_directory_paths() {
 }
 
 #[test]
+fn manifest_schema_rejects_blank_slot_paths() {
+    let validator = manifest_validator();
+
+    let mut blank_path_slot = base_slot(json!(" \t"));
+    blank_path_slot["description"] = json!("synthetic blank path regression");
+    let errors = validate(&validator, &base_manifest(blank_path_slot));
+    assert!(
+        !errors.is_empty(),
+        "manifest slot paths must reject whitespace-only paths"
+    );
+}
+
+#[test]
 fn manifest_schema_rejects_blank_deferred_reasons() {
     let validator = manifest_validator();
 
@@ -602,6 +615,111 @@ fn bundle_schema_rejects_unsafe_reference_paths() {
         !validate(&validator, &unsafe_retraction_path).is_empty(),
         "retraction_path must reject parent-directory traversal"
     );
+}
+
+#[test]
+fn bundle_schema_rejects_blank_repo_relative_paths() {
+    let validator = bundle_validator();
+    for (surface, bundle) in [
+        (
+            "artifacts[].path",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["artifacts"] = json!([
+                    {
+                        "category": "perf/headline-claims",
+                        "path": " \t",
+                        "media_type": "application/json",
+                        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                        "size_bytes": 1,
+                        "produced_by_bead": "ft-e87u6.2",
+                        "description": "synthetic blank path regression"
+                    }
+                ]);
+                bundle
+            },
+        ),
+        (
+            "taxonomy_path",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["taxonomy_coverage"]["taxonomy_path"] = json!(" \t");
+                bundle
+            },
+        ),
+        (
+            "source_artifact_path",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["confidence_summary"]["records"][0]["source_artifact_path"] = json!("\n");
+                bundle
+            },
+        ),
+        (
+            "retraction_path",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["retractions"] = json!([
+                    {
+                        "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                        "affected_slot": "perf/headline-claims",
+                        "retracted_at": "2026-05-12T00:00:00Z",
+                        "retracted_by_release": "0.2.1",
+                        "retraction_rationale": "synthetic blank path regression",
+                        "retraction_path": " \t",
+                        "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                        "size_bytes": 1,
+                        "corrected_claim_value": null
+                    }
+                ]);
+                bundle
+            },
+        ),
+        (
+            "sigstore_bundle.path",
+            base_bundle(json!({
+                "method": "sigstore-cosign-keyless",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "sigstore_bundle": {
+                    "path": " \t",
+                    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "size_bytes": 4096
+                },
+                "certificate_identity": "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+                "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+            })),
+        ),
+        (
+            "signature_path",
+            base_bundle(json!({
+                "method": "ed25519",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "signature_path": " \t",
+                "public_key": "3333333333333333333333333333333333333333333333333333333333333333"
+            })),
+        ),
+    ] {
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "bundle must reject blank repo-relative path at {surface}"
+        );
+    }
 }
 
 #[test]

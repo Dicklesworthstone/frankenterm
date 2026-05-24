@@ -247,6 +247,7 @@
           "description": "Optional repo-relative source artifact path for operator navigation.",
           "type": "string",
           "pattern": "^[^/].*$",
+          "allOf": [{ "pattern": "\\S" }],
           "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         }
       }
@@ -307,6 +308,7 @@
           "description": "Repo-relative POSIX path to the artifact at the bundle's git commit.",
           "type": "string",
           "pattern": "^[^/].*$",
+          "allOf": [{ "pattern": "\\S" }],
           "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "media_type": {
@@ -428,6 +430,7 @@
         "retraction_path": {
           "type": "string",
           "pattern": "^[^/].*$",
+          "allOf": [{ "pattern": "\\S" }],
           "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "retraction_sha256": {
@@ -523,6 +526,7 @@
           "description": "Repo-relative path to the proof taxonomy registry used by the builder.",
           "type": "string",
           "pattern": "^[^/].*$",
+          "allOf": [{ "pattern": "\\S" }],
           "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "category_counts": {
@@ -611,6 +615,7 @@
           "description": "Repo-relative path to the cosign sigstore bundle emitted beside the release attestation JSON.",
           "type": "string",
           "pattern": "^[^/].*$",
+          "allOf": [{ "pattern": "\\S" }],
           "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "sha256": {
@@ -636,6 +641,7 @@
             {
               "type": "string",
               "pattern": "^[^/].*$",
+              "allOf": [{ "pattern": "\\S" }],
               "not": { "pattern": "(^|/)\\.\\.(/|$)" }
             },
             { "type": "null" }
@@ -685,6 +691,7 @@
             "path": {
               "type": "string",
               "pattern": "^[^/].*$",
+              "allOf": [{ "pattern": "\\S" }],
               "not": { "pattern": "(^|/)\\.\\.(/|$)" }
             }
           },
@@ -747,6 +754,7 @@
           "description": "Repo-relative path to the raw 64-byte ed25519 signature, hex-encoded.",
           "type": "string",
           "pattern": "^[^/].*$",
+          "allOf": [{ "pattern": "\\S" }],
           "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "public_key": {
@@ -789,6 +797,7 @@
               "description": "Repo-relative path to the raw 64-byte ed25519 signature, hex-encoded.",
               "type": "string",
               "pattern": "^[^/].*$",
+              "allOf": [{ "pattern": "\\S" }],
               "not": { "pattern": "(^|/)\\.\\.(/|$)" }
             },
             "public_key": {
