@@ -114,6 +114,7 @@ EXPECTED_FAILURE_CLASSES = %w[
   unknown
 ].freeze
 SAFE_ARTIFACT_PATH_NEGATIVES = [
+  nil,
   "",
   "/tmp/agent-mail-failover.json",
   "./fixtures/agent-mail-failover/valid/healthy-agent-mail.json",
@@ -124,7 +125,10 @@ SAFE_ARTIFACT_PATH_NEGATIVES = [
   "fixtures/agent-mail-failover/valid/..",
   ".git/config",
   "fixtures/.git/config",
-  "fixtures/agent-mail-failover//valid/healthy-agent-mail.json"
+  "fixtures/agent-mail-failover//valid/healthy-agent-mail.json",
+  "fixtures/agent-mail-failover/valid/healthy-agent-mail.json/",
+  "https://example.invalid/agent-mail-failover.json",
+  "fixtures\\agent-mail-failover\\valid\\healthy-agent-mail.json"
 ].freeze
 
 def fail!(message)
