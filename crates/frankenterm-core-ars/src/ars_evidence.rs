@@ -314,14 +314,6 @@ impl EvidenceLedger {
             };
         }
 
-        if !self.config.hash_chain_enabled {
-            return ChainVerification {
-                is_valid: true,
-                entries_checked: self.entries.len(),
-                first_invalid_seq: None,
-            };
-        }
-
         let genesis = "0".repeat(64);
 
         for (i, entry) in self.entries.iter().enumerate() {
@@ -366,16 +358,20 @@ impl EvidenceLedger {
                 };
             }
 
-            // Check that the entry hash actually matches the contents.
-            let computed_hash = compute_entry_hash(
-                entry.seq,
-                entry.category,
-                entry.timestamp_us,
-                &entry.summary,
-                &entry.payload,
-                &entry.prev_hash,
-            );
-            if entry.entry_hash != computed_hash {
+            let expected_entry_hash = if self.config.hash_chain_enabled {
+                compute_entry_hash(
+                    entry.seq,
+                    entry.category,
+                    entry.timestamp_us,
+                    &entry.summary,
+                    &entry.payload,
+                    &entry.prev_hash,
+                )
+            } else {
+                format!("unhashed-{}", entry.seq)
+            };
+
+            if entry.entry_hash != expected_entry_hash {
                 return ChainVerification {
                     is_valid: false,
                     entries_checked: i + 1,
@@ -1492,6 +1488,58 @@ mod tests {
         );
         let verification = ledger.verify_chain();
         assert!(verification.is_valid);
+        assert_eq!(ledger.entries[0].entry_hash, "unhashed-0");
+    }
+
+    #[test]
+    fn disabled_hash_chain_still_rejects_sequence_tamper() {
+        let mut ledger = EvidenceLedger::new(EvidenceConfig {
+            hash_chain_enabled: false,
+            ..Default::default()
+        });
+        ledger.append(
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "first".to_string(),
+            BTreeMap::new(),
+            EvidenceVerdict::Support,
+        );
+        ledger.append(
+            EvidenceCategory::SafetyProof,
+            2000,
+            "second".to_string(),
+            BTreeMap::new(),
+            EvidenceVerdict::Support,
+        );
+        ledger.entries[1].seq = 99;
+
+        let verification = ledger.verify_chain();
+        assert!(!verification.is_valid);
+        assert_eq!(verification.entries_checked, 2);
+        assert_eq!(verification.first_invalid_seq, Some(99));
+    }
+
+    #[test]
+    fn disabled_hash_chain_still_rejects_invalid_payload_tamper() {
+        let mut ledger = EvidenceLedger::new(EvidenceConfig {
+            hash_chain_enabled: false,
+            ..Default::default()
+        });
+        ledger.append(
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "finite score".to_string(),
+            BTreeMap::new(),
+            EvidenceVerdict::Support,
+        );
+        ledger.entries[0]
+            .payload
+            .insert("score".to_string(), EvidenceValue::Number(f64::NAN));
+
+        let verification = ledger.verify_chain();
+        assert!(!verification.is_valid);
+        assert_eq!(verification.entries_checked, 1);
+        assert_eq!(verification.first_invalid_seq, Some(0));
     }
 
     // =========================================================================
