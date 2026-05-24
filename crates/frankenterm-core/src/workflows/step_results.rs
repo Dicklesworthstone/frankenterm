@@ -186,6 +186,16 @@ pub enum TextMatch {
     Regex { pattern: String },
 }
 
+const TEXT_MATCH_REGEX_BACKTRACK_LIMIT: usize = 10_000_000;
+
+fn compile_text_match_regex(
+    pattern: &str,
+) -> std::result::Result<fancy_regex::Regex, fancy_regex::Error> {
+    fancy_regex::RegexBuilder::new(pattern)
+        .backtrack_limit(TEXT_MATCH_REGEX_BACKTRACK_LIMIT)
+        .build()
+}
+
 impl TextMatch {
     /// Create a substring matcher.
     #[must_use]
@@ -207,7 +217,7 @@ impl TextMatch {
         match self {
             Self::Substring { value } => Ok(WaitMatcher::substring(value.clone())),
             Self::Regex { pattern } => {
-                let regex = fancy_regex::Regex::new(pattern)
+                let regex = compile_text_match_regex(pattern)
                     .map_err(|e| crate::error::PatternError::InvalidRegex(e.to_string()))?;
                 Ok(WaitMatcher::regex(regex))
             }
@@ -596,6 +606,24 @@ mod tests {
         let m = TextMatch::regex(r"[invalid");
         let wm = m.to_wait_matcher();
         assert!(wm.is_err());
+    }
+
+    #[test]
+    fn compile_text_match_regex_ejects_redos_pattern_within_100ms() {
+        let regex = compile_text_match_regex("^(a+)+b$").expect("pattern compiles");
+        let pathological = "a".repeat(25) + "X";
+        let start = std::time::Instant::now();
+        let result = regex.is_match(&pathological);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "text-match regex should hit the backtrack limit in <100ms, took {elapsed:?}"
+        );
+        assert!(
+            !matches!(result, Ok(true)),
+            "text-match regex must not match pathological input: {result:?}"
+        );
     }
 
     // ========================================================================
