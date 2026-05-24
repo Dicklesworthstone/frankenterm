@@ -187,5 +187,33 @@ unless dupe_names.empty?
   MSG
 end
 
-puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored, #{registered.length} regexes all registered, #{names.length} pattern names unique + well-formed)"
+# --- 7. Golden catalog pin: silent catalog shrinkage is a security regression. -
+# Steps 5-6 catch a regex defined-but-unwired or a name collision, but deleting
+# a whole pattern — both the `static FOO: LazyLock<Regex>` AND its SECRET_PATTERNS
+# entry, together — passes every check above: the counts simply drop and that
+# secret class stops being scrubbed with no compile error and no guard failure.
+# Pin the exact pattern-name set as a golden so any catalog change (add OR
+# remove) is a deliberate, reviewed edit. To intentionally change the catalog,
+# update GOLDEN_NAMES below to match the new set; the failure message lists the
+# precise delta.
+GOLDEN_NAMES = %w[
+  ai_provider_keyed_value anthropic_key anyscale_key aws_access_key_id
+  aws_secret_key bearer_token database_url datadog_api_key device_code
+  generic_api_key generic_password generic_secret generic_token
+  github_fine_grained_pat github_token gitlab_token google_api_key
+  google_oauth_token groq_key huggingface_token jwt_token oauth_url
+  openai_key perplexity_key pgp_block replicate_token sendgrid_key
+  slack_token ssh_private_key stripe_key twilio_account_sid xai_key
+].sort
+current_names = names.sort
+unless current_names == GOLDEN_NAMES
+  added = current_names - GOLDEN_NAMES
+  removed = GOLDEN_NAMES - current_names
+  fail!(<<~MSG.chomp)
+    SECRET_PATTERNS catalog drift vs golden: added=#{added.inspect} removed=#{removed.inspect}
+    A removed pattern silently stops scrubbing its entire secret class (no compile error). If this change is intentional, update GOLDEN_NAMES in this guard to match the new catalog.
+  MSG
+end
+
+puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored, #{registered.length} regexes all registered, #{names.length} pattern names unique + well-formed, catalog matches #{GOLDEN_NAMES.length}-entry golden)"
 RUBY
