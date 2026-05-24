@@ -540,6 +540,54 @@ proptest! {
             );
         }
     }
+
+    /// Byte-API UTF-8 closure: the one-shot `redact_bytes_with_evidence`
+    /// must always return valid UTF-8, even for arbitrary input bytes
+    /// (including invalid UTF-8 sequences). The cold-tier pipeline,
+    /// search index, and audit chain all assume the redactor's output
+    /// is valid UTF-8; the lossy-decode contract (invalid bytes →
+    /// U+FFFD) must hold for every byte string, not just the curated
+    /// `[0xFF,0xFE]` unit fixture. Existing proptests feed `String`
+    /// only, so this is the sole property exercising the raw-bytes path.
+    #[test]
+    fn redact_bytes_one_shot_is_always_valid_utf8(
+        bytes in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let out = Redactor::new().redact_bytes_with_evidence(&bytes).bytes;
+        prop_assert!(
+            String::from_utf8(out.clone()).is_ok(),
+            "redact_bytes_with_evidence emitted invalid UTF-8 for input={:?} out={:?}",
+            bytes,
+            out
+        );
+    }
+
+    /// Streaming UTF-8 closure: feeding arbitrary bytes to
+    /// `redact_chunk` split at an arbitrary byte index — including a
+    /// cut through the middle of a multibyte scalar — must still yield
+    /// a fully valid-UTF-8 stream after `finish()`. (Each chunk is
+    /// lossy-decoded independently, so a mid-scalar byte cut degrades
+    /// to U+FFFD rather than tearing the output; this pins that the
+    /// degradation stays valid UTF-8.)
+    #[test]
+    fn streaming_redact_bytes_is_always_valid_utf8(
+        bytes in prop::collection::vec(any::<u8>(), 0..256),
+        split in 0usize..256,
+    ) {
+        let split = split.min(bytes.len());
+        let mut streaming = StreamingRedactor::new();
+        let mut out = Vec::new();
+        out.extend(streaming.redact_chunk(&bytes[..split]).bytes);
+        out.extend(streaming.redact_chunk(&bytes[split..]).bytes);
+        out.extend(streaming.finish().bytes);
+        prop_assert!(
+            String::from_utf8(out.clone()).is_ok(),
+            "streaming byte redaction emitted invalid UTF-8: bytes={:?} split={} out={:?}",
+            bytes,
+            split,
+            out
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
