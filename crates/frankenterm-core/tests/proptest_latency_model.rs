@@ -880,3 +880,88 @@ proptest! {
         prop_assert!(!analysis.is_stable, "should be unstable");
     }
 }
+
+// =============================================================================
+// QuantileBudgetMs — validation + element-wise algebra (was uncovered)
+// =============================================================================
+
+/// A valid budget: four non-negative finite values in ascending order
+/// (p50 <= p95 <= p99 <= p999), built through the validating constructor.
+fn arb_ordered_budget() -> impl Strategy<Value = QuantileBudgetMs> {
+    prop::collection::vec(0.0_f64..1000.0, 4..=4).prop_map(|mut v| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        QuantileBudgetMs::try_new(v[0], v[1], v[2], v[3]).expect("ordered non-neg budget is valid")
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// try_new accepts ordered non-negative finite values and the accessors
+    /// echo them back unchanged.
+    #[test]
+    fn quantile_budget_try_new_accepts_ordered(b in arb_ordered_budget()) {
+        prop_assert!(b.p50_ms() <= b.p95_ms());
+        prop_assert!(b.p95_ms() <= b.p99_ms());
+        prop_assert!(b.p99_ms() <= b.p999_ms());
+        prop_assert!(b.p50_ms() >= 0.0);
+    }
+
+    /// A negative quantile is rejected.
+    #[test]
+    fn quantile_budget_rejects_negative(neg in -1000.0_f64..-0.001) {
+        prop_assert!(QuantileBudgetMs::try_new(neg, 1.0, 2.0, 3.0).is_err());
+    }
+
+    /// A non-finite quantile (NaN / +Inf) is rejected.
+    #[test]
+    fn quantile_budget_rejects_non_finite(_dummy in 0u8..1) {
+        prop_assert!(QuantileBudgetMs::try_new(f64::NAN, 1.0, 2.0, 3.0).is_err());
+        prop_assert!(QuantileBudgetMs::try_new(1.0, f64::INFINITY, 2.0, 3.0).is_err());
+        prop_assert!(QuantileBudgetMs::try_new(1.0, 2.0, 3.0, f64::NEG_INFINITY).is_err());
+    }
+
+    /// An out-of-order budget (p50 > p95) is rejected.
+    #[test]
+    fn quantile_budget_rejects_out_of_order(hi in 1.0_f64..1000.0) {
+        // p50 = hi strictly exceeds p95 = 0.0 → invalid ordering.
+        prop_assert!(QuantileBudgetMs::try_new(hi, 0.0, 0.0, 0.0).is_err());
+    }
+
+    /// sum_with is element-wise addition and commutative.
+    #[test]
+    fn quantile_budget_sum_with_elementwise_commutative(
+        a in arb_ordered_budget(),
+        b in arb_ordered_budget(),
+    ) {
+        let ab = a.sum_with(b);
+        let ba = b.sum_with(a);
+        prop_assert_eq!(ab, ba);
+        prop_assert!((ab.p50_ms() - (a.p50_ms() + b.p50_ms())).abs() < 1e-9);
+        prop_assert!((ab.p999_ms() - (a.p999_ms() + b.p999_ms())).abs() < 1e-9);
+    }
+
+    /// headroom and overflow are complementary: for each quantile,
+    /// headroom - overflow == self - rhs (one of the two is always zero).
+    #[test]
+    fn quantile_budget_headroom_minus_overflow_equals_difference(
+        a in arb_ordered_budget(),
+        b in arb_ordered_budget(),
+    ) {
+        let h = a.headroom_against(b);
+        let o = a.overflow_against(b);
+        prop_assert!(((h.p50_ms() - o.p50_ms()) - (a.p50_ms() - b.p50_ms())).abs() < 1e-9);
+        prop_assert!(((h.p99_ms() - o.p99_ms()) - (a.p99_ms() - b.p99_ms())).abs() < 1e-9);
+        // headroom and overflow are each non-negative.
+        prop_assert!(h.p50_ms() >= 0.0 && o.p50_ms() >= 0.0);
+    }
+
+    /// zero() is the additive identity-shaped empty budget.
+    #[test]
+    fn quantile_budget_zero_is_empty(_dummy in 0u8..1) {
+        let z = QuantileBudgetMs::zero();
+        prop_assert_eq!(z.p50_ms(), 0.0);
+        prop_assert_eq!(z.p999_ms(), 0.0);
+        prop_assert!(!z.any_positive());
+    }
+}
