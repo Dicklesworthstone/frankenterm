@@ -1533,6 +1533,18 @@ mod tests {
     }
 
     #[test]
+    fn protocol_probe_waits_for_partial_utf8_tmux_control_line() {
+        assert_eq!(
+            classify_protocol_probe(b"send-keys caf\xc3"),
+            ProtocolProbe::NeedMore
+        );
+        assert_eq!(
+            classify_protocol_probe(b"send-keys caf\xc3\xa9"),
+            ProtocolProbe::NeedMore
+        );
+    }
+
+    #[test]
     fn protocol_probe_keeps_binary_pdu_prefixes_on_pdu_path() {
         assert_eq!(classify_protocol_probe(&[0]), ProtocolProbe::BinaryPdu);
         assert_eq!(classify_protocol_probe(b"d\0"), ProtocolProbe::BinaryPdu);
