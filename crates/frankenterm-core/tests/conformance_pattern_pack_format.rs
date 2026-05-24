@@ -463,6 +463,79 @@ fn synthetic_pack_unknown_rule_property_must_fail() {
 }
 
 #[test]
+fn synthetic_pack_empty_required_strings_must_fail() {
+    let validator = load_schema();
+    for (field, bad) in [
+        (
+            "name",
+            serde_json::json!({
+                "name": "",
+                "version": "1.0.0",
+                "rules": []
+            }),
+        ),
+        (
+            "version",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "",
+                "rules": []
+            }),
+        ),
+        (
+            "rule.id",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_empty_id",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying an empty id."
+                }]
+            }),
+        ),
+        (
+            "rule.event_type",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.empty_event_type",
+                    "agent_type": "codex",
+                    "event_type": "",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying an empty event_type."
+                }]
+            }),
+        ),
+        (
+            "rule.description",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.empty_description",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_empty_description",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": ""
+                }]
+            }),
+        ),
+    ] {
+        assert!(
+            validator.validate(&bad).is_err(),
+            "schema validator accepted empty required string for {field}"
+        );
+    }
+}
+
+#[test]
 fn synthetic_pack_invalid_rule_enums_must_fail() {
     let validator = load_schema();
     for (field, bad) in [
