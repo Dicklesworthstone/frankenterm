@@ -67,7 +67,11 @@ pub trait LineEditorHost {
     /// as well as textual output.
     /// The default implementation returns the line as-is with no coloring.
     fn highlight_line(&self, line: &str, cursor_position: usize) -> (Vec<OutputElement>, usize) {
-        let cursor_x_pos = crate::cell::unicode_column_width(&line[0..cursor_position], None);
+        let mut prefix_end = cursor_position.min(line.len());
+        while !line.is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
+        let cursor_x_pos = crate::cell::unicode_column_width(&line[..prefix_end], None);
         (vec![OutputElement::Text(line.to_owned())], cursor_x_pos)
     }
 
@@ -170,6 +174,20 @@ mod tests {
         let host = NopLineEditorHost::default();
         let elements = host.render_preview("some input");
         assert!(elements.is_empty());
+    }
+
+    #[test]
+    fn nop_host_highlight_line_clamps_cursor_inside_unicode() {
+        let host = NopLineEditorHost::default();
+        let (_elements, cursor_x) = host.highlight_line("a\u{03b1}b", 2);
+        assert_eq!(cursor_x, 1);
+    }
+
+    #[test]
+    fn nop_host_highlight_line_clamps_cursor_past_end() {
+        let host = NopLineEditorHost::default();
+        let (_elements, cursor_x) = host.highlight_line("abc", usize::MAX);
+        assert_eq!(cursor_x, 3);
     }
 
     #[test]
