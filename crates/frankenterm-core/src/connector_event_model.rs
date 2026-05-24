@@ -7,6 +7,7 @@
 //! Part of ft-3681t.5.12.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ use crate::connector_outbound_bridge::{
 
 /// Current schema version for the canonical event model.
 pub const CANONICAL_SCHEMA_VERSION: u32 = 1;
+
+static EVENT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Schema version metadata for evolution tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,11 +193,12 @@ impl CanonicalConnectorEvent {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let event_id = generate_event_id(now_ms);
         Self {
             schema_version: SchemaVersion::current(),
             direction,
-            event_id: generate_event_id(now_ms),
-            correlation_id: generate_event_id(now_ms),
+            event_id: event_id.clone(),
+            correlation_id: event_id,
             timestamp_ms: now_ms,
             connector_id: connector_id.into(),
             connector_name: None,
@@ -335,13 +339,10 @@ impl CanonicalConnectorEvent {
     }
 }
 
-/// Generate a unique event ID based on timestamp and random suffix.
+/// Generate a unique event ID based on timestamp and a process-local sequence.
 fn generate_event_id(timestamp_ms: u64) -> String {
-    // Simple deterministic-ish ID for reproducibility in tests
-    format!(
-        "evt-{timestamp_ms}-{:04x}",
-        timestamp_ms.wrapping_mul(2654435761) as u16
-    )
+    let seq = EVENT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("evt-{timestamp_ms}-{seq:016x}")
 }
 
 // =============================================================================
@@ -965,6 +966,16 @@ mod tests {
             event.metadata.get("repo").map(|s| s.as_str()),
             Some("frankenterm")
         );
+    }
+
+    #[test]
+    fn connector_event_model_event_ids_are_unique_within_same_millisecond() {
+        let first = generate_event_id(1234);
+        let second = generate_event_id(1234);
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("evt-1234-"));
+        assert!(second.starts_with("evt-1234-"));
     }
 
     #[test]
