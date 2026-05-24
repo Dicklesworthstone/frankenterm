@@ -969,12 +969,23 @@ fn validate_pack_identity(name: &str, version: &str) -> Result<()> {
             PatternError::InvalidRule("pack name cannot contain whitespace".to_string()).into(),
         );
     }
+    if name.split(':').any(|segment| segment.trim().is_empty()) {
+        return Err(
+            PatternError::InvalidRule("pack name cannot contain empty segments".to_string()).into(),
+        );
+    }
     if version.trim().is_empty() {
         return Err(PatternError::InvalidRule("pack version cannot be empty".to_string()).into());
     }
     if version.chars().any(char::is_whitespace) {
         return Err(
             PatternError::InvalidRule("pack version cannot contain whitespace".to_string()).into(),
+        );
+    }
+    if version.split('.').any(|segment| segment.trim().is_empty()) {
+        return Err(
+            PatternError::InvalidRule("pack version cannot contain empty segments".to_string())
+                .into(),
         );
     }
     Ok(())
