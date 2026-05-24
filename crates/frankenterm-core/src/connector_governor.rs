@@ -1063,13 +1063,13 @@ impl ConnectorGovernor {
     /// only committed after all checks pass so rejected/throttled actions don't
     /// leak capacity from unrelated global budgets.
     pub fn evaluate(&mut self, action: &ConnectorAction, now_ms: u64) -> GovernorDecision {
-        self.telemetry.evaluations += 1;
+        self.telemetry.evaluations = self.telemetry.evaluations.saturating_add(1);
         let connector_id = action.target_connector.clone();
         let action_kind = action_kind_str(action.action_kind);
 
         // 1. Queue backpressure — hard reject
         if self.queue.should_reject() {
-            self.telemetry.rejections += 1;
+            self.telemetry.rejections = self.telemetry.rejections.saturating_add(1);
             self.queue.record_rejection();
             return GovernorDecision::reject(
                 &connector_id,
@@ -1081,7 +1081,7 @@ impl ConnectorGovernor {
 
         // 2. Queue throttle zone
         if self.queue.should_throttle() {
-            self.telemetry.throttles += 1;
+            self.telemetry.throttles = self.telemetry.throttles.saturating_add(1);
             return GovernorDecision::throttle(
                 &connector_id,
                 action_kind,
@@ -1104,7 +1104,7 @@ impl ConnectorGovernor {
             }
         };
         if let Some(delay) = backoff_delay {
-            self.telemetry.throttles += 1;
+            self.telemetry.throttles = self.telemetry.throttles.saturating_add(1);
             return GovernorDecision::throttle(
                 &connector_id,
                 action_kind,
@@ -1116,7 +1116,7 @@ impl ConnectorGovernor {
 
         // 4. Global rate availability
         if self.global_rate.available(now_ms) == 0 {
-            self.telemetry.throttles += 1;
+            self.telemetry.throttles = self.telemetry.throttles.saturating_add(1);
             let delay = self.global_rate.time_until_available(now_ms);
             return GovernorDecision::throttle(
                 &connector_id,
@@ -1137,7 +1137,7 @@ impl ConnectorGovernor {
             }
         };
         if let Some(delay) = rate_delay {
-            self.telemetry.throttles += 1;
+            self.telemetry.throttles = self.telemetry.throttles.saturating_add(1);
             return GovernorDecision::throttle(
                 &connector_id,
                 action_kind,
@@ -1149,7 +1149,7 @@ impl ConnectorGovernor {
 
         // 6. Global quota availability
         if self.global_quota.is_exhausted(now_ms) {
-            self.telemetry.rejections += 1;
+            self.telemetry.rejections = self.telemetry.rejections.saturating_add(1);
             return GovernorDecision::reject(
                 &connector_id,
                 action_kind,
@@ -1164,7 +1164,7 @@ impl ConnectorGovernor {
             state.quota.is_exhausted(now_ms)
         };
         if quota_exhausted {
-            self.telemetry.rejections += 1;
+            self.telemetry.rejections = self.telemetry.rejections.saturating_add(1);
             return GovernorDecision::reject(
                 &connector_id,
                 action_kind,
@@ -1180,7 +1180,7 @@ impl ConnectorGovernor {
             state.cost.remaining_cents(now_ms) < estimated
         };
         if budget_exceeded {
-            self.telemetry.rejections += 1;
+            self.telemetry.rejections = self.telemetry.rejections.saturating_add(1);
             return GovernorDecision::reject(
                 &connector_id,
                 action_kind,
@@ -1237,7 +1237,7 @@ impl ConnectorGovernor {
         }
 
         // All checks passed
-        self.telemetry.allows += 1;
+        self.telemetry.allows = self.telemetry.allows.saturating_add(1);
         GovernorDecision::allow(&connector_id, action_kind, now_ms)
     }
 
@@ -2139,6 +2139,33 @@ mod tests {
         assert_eq!(snap.telemetry.allows, 1);
         assert_eq!(snap.telemetry.throttles, 0);
         assert_eq!(snap.telemetry.rejections, 0);
+    }
+
+    #[test]
+    fn governor_telemetry_counters_saturate() {
+        let mut gov = ConnectorGovernor::new(ConnectorGovernorConfig::default());
+        gov.telemetry = GovernorTelemetry {
+            evaluations: u64::MAX,
+            allows: u64::MAX,
+            throttles: u64::MAX,
+            rejections: u64::MAX,
+        };
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+
+        assert_eq!(gov.evaluate(&action, 1000).verdict, GovernorVerdict::Allow);
+        gov.update_queue_depth(4_000);
+        assert_eq!(
+            gov.evaluate(&action, 2000).verdict,
+            GovernorVerdict::Throttle
+        );
+        gov.update_queue_depth(5_000);
+        assert_eq!(gov.evaluate(&action, 3000).verdict, GovernorVerdict::Reject);
+
+        let snap = gov.snapshot(3000);
+        assert_eq!(snap.telemetry.evaluations, u64::MAX);
+        assert_eq!(snap.telemetry.allows, u64::MAX);
+        assert_eq!(snap.telemetry.throttles, u64::MAX);
+        assert_eq!(snap.telemetry.rejections, u64::MAX);
     }
 
     #[test]
