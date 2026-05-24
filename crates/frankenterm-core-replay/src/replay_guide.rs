@@ -274,8 +274,11 @@ impl GuideProgress {
     pub fn update(&mut self, processed: u64, total: u64, elapsed_ms: u64) {
         self.events_processed = processed;
         self.events_total = total;
+        self.eta_ms = 0;
         if total > 0 {
-            self.progress = (processed as f64) / (total as f64);
+            self.progress = (processed.min(total) as f64) / (total as f64);
+        } else {
+            self.progress = 0.0;
         }
         if elapsed_ms > 0 {
             self.events_per_sec = (processed as f64) / (elapsed_ms as f64) * 1000.0;
@@ -1095,6 +1098,29 @@ mod tests {
         let mut p = GuideProgress::new(GuideWorkflow::Investigate, 1);
         p.update(1000, 1000, 2000);
         assert!(p.is_complete());
+    }
+
+    #[test]
+    fn progress_update_clears_eta_when_complete() {
+        let mut p = GuideProgress::new(GuideWorkflow::Investigate, 1);
+        p.update(500, 1000, 1000);
+        assert!(p.eta_ms > 0);
+
+        p.update(1000, 1000, 2000);
+        assert_eq!(p.eta_ms, 0);
+        assert!((p.progress - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_update_clamps_overshoot_and_resets_unknown_total() {
+        let mut p = GuideProgress::new(GuideWorkflow::Investigate, 1);
+        p.update(1200, 1000, 1000);
+        assert!((p.progress - 1.0).abs() < f64::EPSILON);
+        assert_eq!(p.eta_ms, 0);
+
+        p.update(0, 0, 0);
+        assert_eq!(p.progress, 0.0);
+        assert_eq!(p.eta_ms, 0);
     }
 
     #[test]
