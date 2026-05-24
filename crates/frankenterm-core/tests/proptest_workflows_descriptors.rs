@@ -1054,6 +1054,37 @@ proptest! {
     }
 
     #[test]
+    fn empty_conditional_test_text_fails_validation() {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "conditional_blank".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Conditional {
+                id: "b".to_string(),
+                description: None,
+                test_text: " \t ".to_string(),
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                },
+                then_steps: vec![DescriptorStep::Log {
+                    id: "t".to_string(),
+                    description: None,
+                    message: "matched".to_string(),
+                }],
+                else_steps: Vec::new(),
+            }],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "conditional steps must test non-empty text"
+        );
+    }
+
+    #[test]
     fn nested_steps_count_against_configured_step_limit(
         max_steps in 2usize..16,
     ) {

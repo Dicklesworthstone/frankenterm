@@ -695,6 +695,13 @@ impl DescriptorStep {
             Self::Conditional {
                 test_text, matcher, ..
             } => {
+                if test_text.trim().is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "conditional test_text cannot be empty".to_string(),
+                        ),
+                    ));
+                }
                 if test_text.len() > limits.max_text_len {
                     return Err(crate::Error::Config(
                         crate::error::ConfigError::ValidationError(format!(
