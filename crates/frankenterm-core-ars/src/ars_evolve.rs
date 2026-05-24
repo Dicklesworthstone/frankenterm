@@ -297,13 +297,13 @@ impl EvolutionEngine {
 
         self.versions.insert(new_id, new_version);
         self.lineage.insert(new_id, request.parent_reflex_id);
-        self.total_evolutions += 1;
+        self.total_evolutions = self.total_evolutions.saturating_add(1);
 
         // Auto-deprecate parent.
         if self.config.auto_deprecate_parent {
             if let Some(p) = self.versions.get_mut(&request.parent_reflex_id) {
                 p.status = VersionStatus::Deprecated;
-                self.total_deprecations += 1;
+                self.total_deprecations = self.total_deprecations.saturating_add(1);
                 debug!(
                     reflex_id = request.parent_reflex_id,
                     "deprecated parent reflex"
@@ -353,7 +353,7 @@ impl EvolutionEngine {
         if let Some(v) = self.versions.get_mut(&reflex_id) {
             if v.status.is_usable() {
                 v.status = VersionStatus::Deprecated;
-                self.total_deprecations += 1;
+                self.total_deprecations = self.total_deprecations.saturating_add(1);
                 warn!(reflex_id, "reflex manually deprecated");
                 return true;
             }
@@ -791,6 +791,31 @@ mod tests {
         assert_eq!(stats.total_evolutions, 1);
         assert_eq!(stats.total_deprecations, 1);
         assert_eq!(stats.max_lineage_depth, 1);
+    }
+
+    #[test]
+    fn stats_evolution_counters_saturate() {
+        let mut engine = make_engine();
+        let v1 = engine.register_original("c1", vec![1], vec!["a".into()], 1000);
+        engine.total_evolutions = u64::MAX;
+        engine.total_deprecations = u64::MAX;
+
+        assert!(engine.evolve(&make_request(v1)).is_evolved());
+        let stats = engine.stats();
+
+        assert_eq!(stats.total_evolutions, u64::MAX);
+        assert_eq!(stats.total_deprecations, u64::MAX);
+    }
+
+    #[test]
+    fn manual_deprecation_counter_saturates() {
+        let mut engine = make_engine();
+        let v1 = engine.register_original("c1", vec![1], vec!["a".into()], 1000);
+        engine.total_deprecations = u64::MAX;
+
+        assert!(engine.deprecate(v1));
+
+        assert_eq!(engine.stats().total_deprecations, u64::MAX);
     }
 
     // ---- Serde roundtrips ----
