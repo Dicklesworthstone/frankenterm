@@ -3940,55 +3940,57 @@ impl PatternEngine {
         let bytes = text.as_bytes();
         let text_len = text.len();
 
-        // Collect positions where anchor first-bytes appear.
-        // This is O(n) but very fast with memchr's SIMD implementation.
-        let mut byte_match_positions: Vec<usize> = Vec::new();
-        for &byte in &index.quick_bytes {
-            let mut pos = 0;
-            while let Some(offset) = memchr(byte, &bytes[pos..]) {
-                byte_match_positions.push(pos + offset);
-                pos += offset + 1;
-            }
-        }
-
-        if byte_match_positions.is_empty() {
-            return false;
-        }
-
         // If we have a Bloom filter, check substrings only at positions where
-        // a first-byte matched. This is O(m*k) where m = match count, k = anchor lengths.
+        // a first-byte matched. This streams candidates rather than storing every
+        // byte hit, so a pane full of common anchor first-bytes cannot allocate
+        // O(text length) temporary positions.
         if let Some(ref bloom) = index.bloom {
-            for &start in &byte_match_positions {
-                // Ensure we start at a valid UTF-8 boundary
-                if !text.is_char_boundary(start) {
-                    continue;
-                }
-                for &anchor_len in &index.anchor_lengths {
-                    let end = start + anchor_len;
-                    // Skip if this substring extends past the text
-                    if end > text_len {
-                        break;
-                    }
-                    // Ensure we end at a valid UTF-8 boundary
-                    if !text.is_char_boundary(end) {
+            let mut saw_byte_match = false;
+            for &byte in &index.quick_bytes {
+                let mut pos = 0;
+                while let Some(offset) = memchr(byte, &bytes[pos..]) {
+                    let start = pos + offset;
+                    saw_byte_match = true;
+                    pos = start + 1;
+
+                    // Ensure we start at a valid UTF-8 boundary.
+                    if !text.is_char_boundary(start) {
                         continue;
                     }
-                    let window = &text[start..end];
-                    telemetry.bloom_checks.fetch_add(1, Ordering::Relaxed);
-                    if bloom.check(window) {
-                        telemetry.bloom_positives.fetch_add(1, Ordering::Relaxed);
-                        // Bloom says "possibly present" - need full matching
-                        return true;
+                    for &anchor_len in &index.anchor_lengths {
+                        let Some(end) = start.checked_add(anchor_len) else {
+                            break;
+                        };
+                        // Skip if this substring extends past the text.
+                        if end > text_len {
+                            break;
+                        }
+                        // Ensure we end at a valid UTF-8 boundary.
+                        if !text.is_char_boundary(end) {
+                            continue;
+                        }
+                        let window = &text[start..end];
+                        telemetry.bloom_checks.fetch_add(1, Ordering::Relaxed);
+                        if bloom.check(window) {
+                            telemetry.bloom_positives.fetch_add(1, Ordering::Relaxed);
+                            // Bloom says "possibly present" - need full matching.
+                            return true;
+                        }
                     }
                 }
+            }
+            if !saw_byte_match {
+                return false;
             }
             // Bloom filter rejected all candidate substrings - definitely no match
             telemetry.bloom_rejects.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
-        // No Bloom filter available, but we found matching bytes
-        true
+        index
+            .quick_bytes
+            .iter()
+            .any(|&byte| memchr(byte, bytes).is_some())
     }
 
     /// Access the merged rule library
@@ -4758,6 +4760,24 @@ rules:
         assert!(!engine.quick_reject("gx")); // 'g' matches but "gx" is shorter than "gamma"
         assert!(!engine.quick_reject("alphx")); // close to "alpha" but different
         assert!(!engine.quick_reject("betx")); // close to "beta" but different
+    }
+
+    #[test]
+    fn quick_reject_rejects_dense_first_byte_streaming_candidates() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.dense_first_byte",
+            "zabcdef",
+            None,
+        )]);
+        let text = "z".repeat(4096);
+
+        assert!(!engine.quick_reject(&text));
+        let snapshot = engine.telemetry().snapshot();
+        assert_eq!(snapshot.bloom_rejects, 1);
+        assert!(
+            snapshot.bloom_checks > 1000,
+            "dense first-byte input should exercise many streamed Bloom checks"
+        );
     }
 
     #[test]
