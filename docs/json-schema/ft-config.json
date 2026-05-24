@@ -176,7 +176,7 @@
           "additionalProperties": true,
           "properties": {
             "enabled": { "type": "boolean" },
-            "schedule": { "type": "string" },
+            "schedule": { "type": "string", "minLength": 1, "pattern": "\\S" },
             "retention_days": { "type": "integer", "minimum": 0 },
             "max_backups": { "type": "integer", "minimum": 0 },
             "destination": { "type": "string" }
@@ -188,14 +188,20 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "packs": { "type": "array", "items": { "type": "string" } }
+        "packs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+        }
       }
     },
     "workflows": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "enabled": { "type": "array", "items": { "type": "string" } },
+        "enabled": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+        },
         "max_concurrent": { "type": "integer", "minimum": 1 }
       }
     },

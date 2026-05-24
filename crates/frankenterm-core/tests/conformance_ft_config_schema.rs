@@ -435,6 +435,46 @@ fn schema_rejects_empty_or_blank_pane_matcher_values() {
     }
 }
 
+/// 4h) Falsification: documented free-form strings that name schedules,
+/// pattern packs, or workflows must not be blank.
+#[test]
+fn schema_rejects_blank_documented_string_values() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "backup.scheduled.schedule",
+            serde_json::json!({
+                "backup": {
+                    "scheduled": {
+                        "schedule": " \t"
+                    }
+                }
+            }),
+        ),
+        (
+            "patterns.packs[]",
+            serde_json::json!({
+                "patterns": {
+                    "packs": ["builtin:core", ""]
+                }
+            }),
+        ),
+        (
+            "workflows.enabled[]",
+            serde_json::json!({
+                "workflows": {
+                    "enabled": ["handle_compaction", "\n"]
+                }
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject blank documented string at {surface}"
+        );
+    }
+}
+
 /// Pin the documented-but-unreachable list. If the README↔code
 /// reconciliation lands and the unreachable section starts round-
 /// tripping, this test fails and the maintainer must move the entry
