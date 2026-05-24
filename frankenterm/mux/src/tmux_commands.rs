@@ -30,6 +30,10 @@ fn u64_to_usize_saturating(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaneItem {
     session_id: TmuxSessionId,
@@ -206,8 +210,8 @@ impl TmuxDomainState {
     fn set_pane_cursor_position(&self, pane: &Arc<dyn Pane>, x: usize, y: usize) {
         pane.perform_actions(vec![Action::CSI(CSI::Cursor(
             Cursor::CharacterAndLinePosition {
-                col: OneBased::from_zero_based(x as u32),
-                line: OneBased::from_zero_based(y as u32),
+                col: OneBased::from_zero_based(usize_to_u32_saturating(x)),
+                line: OneBased::from_zero_based(usize_to_u32_saturating(y)),
             },
         ))]);
     }
@@ -246,8 +250,8 @@ impl TmuxDomainState {
         let writer = WriterWrapper::new(pane_pty.take_writer()?);
 
         let size = TerminalSize {
-            rows: pane.pane_height as usize,
-            cols: pane.pane_width as usize,
+            rows: u64_to_usize_saturating(pane.pane_height),
+            cols: u64_to_usize_saturating(pane.pane_width),
             pixel_width: 0,
             pixel_height: 0,
             dpi: 0,
@@ -451,8 +455,8 @@ impl TmuxDomainState {
             }
 
             let size = TerminalSize {
-                rows: window.window_height as usize,
-                cols: window.window_width as usize,
+                rows: u64_to_usize_saturating(window.window_height),
+                cols: u64_to_usize_saturating(window.window_width),
                 pixel_width: 0,
                 pixel_height: 0,
                 dpi: 0,
@@ -535,9 +539,9 @@ impl TmuxDomainState {
                                 top_level: false,
                                 size: SplitSize::Cells(
                                     if split_direction == SplitDirection::Horizontal {
-                                        p.pane_width as usize
+                                        u64_to_usize_saturating(p.pane_width)
                                     } else {
-                                        p.pane_height as usize
+                                        u64_to_usize_saturating(p.pane_height)
                                     },
                                 ),
                             },
@@ -1784,6 +1788,14 @@ mod tests {
         assert_eq!(u64_to_usize_saturating(42), 42);
         if usize::BITS < u64::BITS {
             assert_eq!(u64_to_usize_saturating(u64::MAX), usize::MAX);
+        }
+    }
+
+    #[test]
+    fn usize_to_u32_saturates_overflowing_cursor_values() {
+        assert_eq!(usize_to_u32_saturating(42), 42);
+        if usize::BITS > u32::BITS {
+            assert_eq!(usize_to_u32_saturating(usize::MAX), u32::MAX);
         }
     }
 }
