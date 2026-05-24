@@ -50,11 +50,15 @@ pub enum LayoutArrangement {
 }
 
 impl LayoutArrangement {
+    fn add_slot_counts(first: usize, second: usize) -> usize {
+        first.saturating_add(second)
+    }
+
     /// Count the number of leaf slots in this arrangement.
     pub fn slot_count(&self) -> usize {
         match self {
             LayoutArrangement::Split { first, second, .. } => {
-                first.slot_count() + second.slot_count()
+                Self::add_slot_counts(first.slot_count(), second.slot_count())
             }
             LayoutArrangement::Slot { .. } => 1,
         }
@@ -697,6 +701,15 @@ mod tests {
     fn slot_count_grid() {
         let layout = grid_4();
         assert_eq!(layout.arrangement.slot_count(), 4);
+    }
+
+    #[test]
+    fn slot_count_addition_saturates() {
+        assert_eq!(LayoutArrangement::add_slot_counts(2, 3), 5);
+        assert_eq!(
+            LayoutArrangement::add_slot_counts(usize::MAX, 1),
+            usize::MAX
+        );
     }
 
     #[test]
