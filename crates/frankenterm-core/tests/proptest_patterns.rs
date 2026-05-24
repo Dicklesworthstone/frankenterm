@@ -668,6 +668,46 @@ proptest! {
         let result = rule.get_preview_command(pane_id, None).unwrap();
         prop_assert!(result.contains(&pane_id.to_string()));
     }
+
+    /// get_manual_fix returns None when no manual_fix is set.
+    #[test]
+    fn prop_manual_fix_none(rule in arb_rule_def()) {
+        // arb_rule_def sets manual_fix to None
+        let result = rule.get_manual_fix(1, None);
+        prop_assert!(result.is_none());
+    }
+
+    /// get_manual_fix returns interpolated string when set.
+    #[test]
+    fn prop_manual_fix_interpolated(
+        pane_id in 0u64..10000,
+        event_id in 0i64..100000,
+        rule_id in "[a-z_.]{5,20}",
+    ) {
+        let rule = RuleDef {
+            id: rule_id.clone(),
+            agent_type: AgentType::Codex,
+            event_type: "error".to_string(),
+            severity: Severity::Warning,
+            anchors: vec!["anchor".to_string()],
+            regex: None,
+            description: "test".to_string(),
+            remediation: None,
+            workflow: None,
+            manual_fix: Some(
+                "Check pane {pane}, event {event_id}, agent {agent}, rule {rule_id}".to_string(),
+            ),
+            preview_command: None,
+            learn_more_url: None,
+        };
+        let result = rule.get_manual_fix(pane_id, Some(event_id)).unwrap();
+        prop_assert!(result.contains(&pane_id.to_string()));
+        prop_assert!(result.contains(&event_id.to_string()));
+        prop_assert!(result.contains("codex"));
+        prop_assert!(result.contains(&rule_id));
+        prop_assert!(!result.contains('{'));
+        prop_assert!(!result.contains('}'));
+    }
 }
 
 // ============================================================================
