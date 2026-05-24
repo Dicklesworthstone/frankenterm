@@ -17,9 +17,9 @@
       ],
       "properties": {
         "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
-        "domain": { "type": "string", "minLength": 1 },
-        "title": { "type": "string", "minLength": 1 },
-        "cwd": { "type": "string", "minLength": 1 }
+        "domain": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "title": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "cwd": { "type": "string", "minLength": 1, "pattern": "\\S" }
       }
     }
   },
@@ -86,9 +86,9 @@
                 "properties": {
                   "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
                   "priority": { "type": "integer", "minimum": 0 },
-                  "title": { "type": "string", "minLength": 1 },
-                  "domain": { "type": "string", "minLength": 1 },
-                  "cwd": { "type": "string", "minLength": 1 }
+                  "title": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                  "domain": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                  "cwd": { "type": "string", "minLength": 1, "pattern": "\\S" }
                 }
               }
             }

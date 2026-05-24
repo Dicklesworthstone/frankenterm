@@ -358,10 +358,10 @@ fn schema_rejects_matcherless_pane_rules() {
     }
 }
 
-/// 4g) Falsification: matcher strings must be non-empty, because an
-/// empty title substring would otherwise match every pane.
+/// 4g) Falsification: matcher strings must be non-empty and non-blank,
+/// because an empty title substring would otherwise match every pane.
 #[test]
-fn schema_rejects_empty_pane_matcher_values() {
+fn schema_rejects_empty_or_blank_pane_matcher_values() {
     let schema = compile_config_schema();
     for (surface, bad) in [
         (
@@ -371,6 +371,18 @@ fn schema_rejects_empty_pane_matcher_values() {
                     "panes": {
                         "include": [
                             { "id": "empty_title", "title": "" }
+                        ]
+                    }
+                }
+            }),
+        ),
+        (
+            "ingest.panes.include.domain",
+            serde_json::json!({
+                "ingest": {
+                    "panes": {
+                        "include": [
+                            { "id": "blank_domain", "domain": " \t" }
                         ]
                     }
                 }
@@ -388,10 +400,22 @@ fn schema_rejects_empty_pane_matcher_values() {
                 }
             }),
         ),
+        (
+            "ingest.priorities.rules.title",
+            serde_json::json!({
+                "ingest": {
+                    "priorities": {
+                        "rules": [
+                            { "id": "blank_title", "priority": 10, "title": "\n" }
+                        ]
+                    }
+                }
+            }),
+        ),
     ] {
         assert!(
             schema.validate(&bad).is_err(),
-            "schema MUST reject empty matcher string at {surface}"
+            "schema MUST reject empty or blank matcher string at {surface}"
         );
     }
 }
