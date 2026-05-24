@@ -149,6 +149,10 @@ fn wait_remaining(deadline: Option<Instant>, now: Instant, fallback: Duration) -
         .unwrap_or(fallback)
 }
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn wait_cancelled(label: &str, err: impl std::fmt::Display) -> crate::Error {
     crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
         "{label} cancelled: {err}"
@@ -342,13 +346,13 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             WaitCondition::Sleep { duration_ms } => {
                 let dur = Duration::from_millis(*duration_ms);
                 if dur > timeout {
+                    let timeout_ms = duration_millis_u64(timeout);
                     wait_sleep_maybe_cx(cx, timeout, "sleep wait condition").await?;
                     return Ok(WaitConditionResult::TimedOut {
-                        elapsed_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                        elapsed_ms: timeout_ms,
                         polls: 0,
                         last_observed: Some(format!(
-                            "sleep duration {duration_ms}ms exceeded timeout {}ms",
-                            timeout.as_millis()
+                            "sleep duration {duration_ms}ms exceeded timeout {timeout_ms}ms"
                         )),
                     });
                 }
@@ -378,7 +382,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                     wait_checkpoint_maybe_cx(cx, "external signal wait")?;
                     if registry.is_signaled(key) {
                         return Ok(WaitConditionResult::Satisfied {
-                            elapsed_ms: start.elapsed().as_millis() as u64,
+                            elapsed_ms: elapsed_ms(start),
                             polls,
                             context: Some(format!("external signal '{key}' fired")),
                         });
@@ -425,8 +429,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         let mut interval = self.options.poll_initial;
         let mut last_detection_summary: Option<String> = None;
 
-        #[allow(clippy::cast_possible_truncation)]
-        let timeout_ms = timeout.as_millis() as u64;
+        let timeout_ms = duration_millis_u64(timeout);
         tracing::info!(pane_id, rule_id, timeout_ms, "pattern_wait start");
 
         // ft-xbnl0.2.3 tick 264: cx-first pattern-wait poll loop.
@@ -518,8 +521,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         #[allow(unused_assignments)]
         let mut last_state_desc: Option<String> = None;
 
-        #[allow(clippy::cast_possible_truncation)]
-        let timeout_ms = timeout.as_millis() as u64;
+        let timeout_ms = duration_millis_u64(timeout);
         tracing::info!(
             pane_id,
             idle_threshold_ms,
@@ -645,8 +647,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         let mut last_change_at = Instant::now();
         let mut last_tail_len: usize = 0;
 
-        #[allow(clippy::cast_possible_truncation)]
-        let timeout_ms = timeout.as_millis() as u64;
+        let timeout_ms = duration_millis_u64(timeout);
         tracing::info!(pane_id, stable_for_ms, timeout_ms, "stable_tail_wait start");
 
         loop {
@@ -1000,6 +1001,12 @@ mod tests {
         assert_eq!(opts.tail_lines, 50);
         assert_eq!(opts.poll_initial, Duration::from_millis(10));
         assert!(!opts.allow_idle_heuristics);
+    }
+
+    #[test]
+    fn duration_millis_u64_saturates_huge_duration() {
+        assert_eq!(duration_millis_u64(Duration::from_millis(42)), 42);
+        assert_eq!(duration_millis_u64(Duration::from_secs(u64::MAX)), u64::MAX);
     }
 
     // ========================================================================
