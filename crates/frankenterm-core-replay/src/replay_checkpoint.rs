@@ -230,6 +230,10 @@ pub struct ReplayCheckpointer {
     inner: Mutex<CheckpointerInner>,
 }
 
+fn increment_u64(value: &mut u64) {
+    *value = value.saturating_add(1);
+}
+
 struct CheckpointerInner {
     /// Current state.
     state: CheckpointState,
@@ -313,16 +317,17 @@ impl ReplayCheckpointer {
             return ProcessResult::Halted("replay already halted".into());
         }
 
-        inner.state.event_position += 1;
+        increment_u64(&mut inner.state.event_position);
         inner.state.virtual_clock_ms = virtual_clock_ms;
-        inner.events_since_checkpoint += 1;
+        increment_u64(&mut inner.events_since_checkpoint);
 
         // Check if checkpoint is needed.
         let event_trigger = self.config.event_interval > 0
             && inner.events_since_checkpoint >= self.config.event_interval;
         let time_trigger = self.config.time_interval_ms > 0
             && inner.last_checkpoint_wall_ms > 0
-            && wall_clock_ms >= inner.last_checkpoint_wall_ms + self.config.time_interval_ms;
+            && wall_clock_ms.saturating_sub(inner.last_checkpoint_wall_ms)
+                >= self.config.time_interval_ms;
 
         if event_trigger || time_trigger {
             inner.state.checkpoint_created_ms = wall_clock_ms;
@@ -344,19 +349,19 @@ impl ReplayCheckpointer {
     /// Record a decision.
     pub fn record_decision(&self) {
         let mut inner = self.lock_inner();
-        inner.state.decisions_made += 1;
+        increment_u64(&mut inner.state.decisions_made);
     }
 
     /// Record a side effect logged.
     pub fn record_effect(&self) {
         let mut inner = self.lock_inner();
-        inner.state.effects_logged += 1;
+        increment_u64(&mut inner.state.effects_logged);
     }
 
     /// Record an anomaly.
     pub fn record_anomaly(&self) {
         let mut inner = self.lock_inner();
-        inner.state.anomalies_detected += 1;
+        increment_u64(&mut inner.state.anomalies_detected);
     }
 
     /// Handle an error during replay.
@@ -379,7 +384,7 @@ impl ReplayCheckpointer {
             }
             FailureMode::Lenient => {
                 // Skip and continue.
-                inner.state.events_skipped += 1;
+                increment_u64(&mut inner.state.events_skipped);
                 ProcessResult::Skipped
             }
             FailureMode::Strict => {
@@ -659,6 +664,24 @@ mod tests {
     }
 
     #[test]
+    fn checkpointer_time_interval_does_not_wrap_near_u64_max() {
+        let config = CheckpointConfig {
+            event_interval: 0,
+            time_interval_ms: 20,
+            ..Default::default()
+        };
+        let ckpt = ReplayCheckpointer::new("run_time_wrap".into(), config, FailureMode::Default);
+        let mut state = CheckpointState::new("run_time_wrap".into());
+        state.checkpoint_created_ms = u64::MAX - 5;
+        ckpt.resume_from(&state)
+            .expect("matching run id + version must accept");
+
+        let result = ckpt.advance(1, u64::MAX);
+        assert_eq!(result, ProcessResult::Continue);
+        assert_eq!(ckpt.checkpoint_count(), 0);
+    }
+
+    #[test]
     fn checkpointer_saves_virtual_clock() {
         let config = CheckpointConfig {
             event_interval: 3,
@@ -923,6 +946,40 @@ mod tests {
         let state = ckpt.current_state();
         assert_eq!(state.effects_logged, 2);
         assert_eq!(state.anomalies_detected, 1);
+    }
+
+    #[test]
+    fn replay_progress_counters_saturate_at_u64_max() {
+        let config = CheckpointConfig {
+            event_interval: 0,
+            time_interval_ms: 0,
+            ..Default::default()
+        };
+        let ckpt = ReplayCheckpointer::new("run_sat".into(), config, FailureMode::Lenient);
+        let mut state = CheckpointState::new("run_sat".into());
+        state.event_position = u64::MAX;
+        state.decisions_made = u64::MAX;
+        state.effects_logged = u64::MAX;
+        state.anomalies_detected = u64::MAX;
+        state.events_skipped = u64::MAX;
+        ckpt.resume_from(&state)
+            .expect("matching run id + version must accept");
+
+        assert_eq!(ckpt.advance(10, 10), ProcessResult::Continue);
+        ckpt.record_decision();
+        ckpt.record_effect();
+        ckpt.record_anomaly();
+        assert_eq!(
+            ckpt.handle_error(make_error(u64::MAX, ReplayErrorKind::CorruptEvent), 10),
+            ProcessResult::Skipped
+        );
+
+        let state = ckpt.current_state();
+        assert_eq!(state.event_position, u64::MAX);
+        assert_eq!(state.decisions_made, u64::MAX);
+        assert_eq!(state.effects_logged, u64::MAX);
+        assert_eq!(state.anomalies_detected, u64::MAX);
+        assert_eq!(state.events_skipped, u64::MAX);
     }
 
     #[test]
