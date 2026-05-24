@@ -450,6 +450,88 @@ proptest! {
     }
 
     #[test]
+    fn trigger_values_respect_configured_text_length_limit(
+        max_text_len in 1usize..128,
+        trigger_field in 0u8..3,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+        let build_trigger = |value: String| {
+            let mut trigger = DescriptorTrigger {
+                event_types: vec!["e".to_string()],
+                agent_types: vec!["a".to_string()],
+                rule_ids: vec!["r".to_string()],
+            };
+            match trigger_field {
+                0 => trigger.event_types = vec![value],
+                1 => trigger.agent_types = vec![value],
+                _ => trigger.rule_ids = vec![value],
+            }
+            trigger
+        };
+        let build_descriptor = |trigger: DescriptorTrigger| WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "x".to_string(),
+            description: None,
+            triggers: vec![trigger],
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "s".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+
+        let at_limit = build_descriptor(build_trigger("x".repeat(max_text_len)));
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "trigger value at max_text_len should validate"
+        );
+
+        let over_limit =
+            build_descriptor(build_trigger("x".repeat(max_text_len.saturating_add(1))));
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "trigger value longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
+    fn step_id_respects_configured_text_length_limit(max_text_len in 1usize..128) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let build_descriptor = |id: String| WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "x".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id,
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+
+        let at_limit = build_descriptor("x".repeat(max_text_len));
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "step id at max_text_len should validate"
+        );
+
+        let over_limit = build_descriptor("x".repeat(max_text_len.saturating_add(1)));
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "step id longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
     fn failure_handler_message_respects_configured_text_length_limit(
         max_text_len in 1usize..128,
         handler_variant in 0u8..3,

@@ -175,9 +175,9 @@ impl WorkflowDescriptor {
         }
 
         for trigger in &self.triggers {
-            validate_trigger_values("event_types", &trigger.event_types)?;
-            validate_trigger_values("agent_types", &trigger.agent_types)?;
-            validate_trigger_values("rule_ids", &trigger.rule_ids)?;
+            validate_trigger_values("event_types", &trigger.event_types, limits.max_text_len)?;
+            validate_trigger_values("agent_types", &trigger.agent_types, limits.max_text_len)?;
+            validate_trigger_values("rule_ids", &trigger.rule_ids, limits.max_text_len)?;
         }
 
         if let Some(handler) = &self.on_failure {
@@ -212,11 +212,20 @@ impl WorkflowDescriptor {
     }
 }
 
-fn validate_trigger_values(field: &str, values: &[String]) -> crate::Result<()> {
+fn validate_trigger_values(field: &str, values: &[String], max_len: usize) -> crate::Result<()> {
     if values.iter().any(|value| value.trim().is_empty()) {
         return Err(crate::Error::Config(
             crate::error::ConfigError::ValidationError(format!(
                 "Descriptor trigger {field} cannot contain empty values"
+            )),
+        ));
+    }
+    if let Some(value) = values.iter().find(|value| value.len() > max_len) {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Descriptor trigger {field} value too long ({} > max {})",
+                value.len(),
+                max_len
             )),
         ));
     }
@@ -283,6 +292,15 @@ fn validate_step_tree(
             crate::error::ConfigError::ValidationError(
                 "Descriptor step id cannot be empty".to_string(),
             ),
+        ));
+    }
+    if id.len() > limits.max_text_len {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Descriptor step id too long ({} > max {})",
+                id.len(),
+                limits.max_text_len
+            )),
         ));
     }
     if !seen.insert(id.to_string()) {
