@@ -797,6 +797,15 @@ proptest! {
             mode == PatternPackActionMode::ActionTriggering
         );
     }
+
+    #[test]
+    fn prop_pattern_pack_action_mode_serde_roundtrip(
+        mode in arb_pattern_pack_action_mode(),
+    ) {
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: PatternPackActionMode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, mode);
+    }
 }
 
 // ============================================================================
