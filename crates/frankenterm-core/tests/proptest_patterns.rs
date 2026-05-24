@@ -1150,6 +1150,15 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_workflow_target_whitespace(rule_suffix in "[a-z]{3,10}") {
+        let mut rule = make_anchor_only_rule(&rule_suffix, "WORKFLOW_TARGET_WHITESPACE");
+        rule.workflow = Some("handle bad workflow".to_string());
+        let pack = PatternPack::new("builtin:bad-workflow-target", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_empty_pack_name(rule_suffix in "[a-z]{3,10}") {
         let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_NAME");
         let pack = PatternPack::new(" \t ", "1.0.0", vec![rule]);

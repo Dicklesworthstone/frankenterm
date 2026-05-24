@@ -665,6 +665,17 @@ impl RuleDef {
             "learn_more_url",
             self.learn_more_url.as_deref(),
         )?;
+        if self
+            .workflow
+            .as_deref()
+            .is_some_and(|workflow| workflow.chars().any(char::is_whitespace))
+        {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' has workflow target containing whitespace",
+                self.id
+            ))
+            .into());
+        }
 
         if let Some(ref regex) = self.regex {
             // [ft-xv561] compile via shared builder so the backtrack
