@@ -496,6 +496,47 @@ run_external_signed_output_case() {
   echo "PASS ${name}"
 }
 
+run_parent_signed_output_case() {
+  local fake_bin="${ARTIFACT_ROOT}/fake-cosign-parent-bin"
+  install_fake_cosign "${fake_bin}"
+
+  local name="signed_output_parent_traversal_fails"
+  local case_dir="${ARTIFACT_ROOT}/${name}"
+  local manifest="${case_dir}/manifest.json"
+  local parent_out_dir="${case_dir}/out-parent/../escaped"
+  local version="0.0.0-parent-signed-output"
+  local rc=0
+  mkdir -p "${case_dir}"
+  write_manifest "${manifest}" "$(json_slot '"docs/attestations/schema.json"' "" "")"
+
+  set +e
+  PATH="${fake_bin}:$PATH" \
+  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
+  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  FT_ATTESTATION_MANIFEST="${manifest}" \
+  FT_ATTESTATION_OUT_DIR="${parent_out_dir}" \
+  FT_BEAD_ID="ft-e87u6.2" \
+  FT_SCENARIO_ID="attestation_parent_signed_output_guard" \
+    bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version "${version}" \
+      --channel stable \
+      --sign cosign >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
+  rc=$?
+  set -e
+
+  total=$((total + 1))
+  if [[ "${rc}" == "0" ]] || ! grep -q "repo-relative without parent traversal" "${case_dir}/stderr.txt"; then
+    fail=$((fail + 1))
+    record_result "${name}" "nonzero_parent_output_rejection" "${rc}" "failed" "${case_dir}"
+    echo "FAIL ${name}: parent traversal signed output was not rejected" >&2
+    return 0
+  fi
+
+  pass=$((pass + 1))
+  record_result "${name}" "nonzero_parent_output_rejection" "${rc}" "passed" "${case_dir}"
+  echo "PASS ${name}"
+}
+
 require_cmd bash
 require_cmd jq
 require_cmd git
@@ -585,6 +626,7 @@ run_case \
 
 run_sigstore_cases
 run_external_signed_output_case
+run_parent_signed_output_case
 
 jq -n \
   --arg bead_id "ft-e87u6.2" \

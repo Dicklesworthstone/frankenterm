@@ -621,23 +621,32 @@ bundle_no_sig="$(jq -n \
     confidence_summary: $confidence_summary
   }')"
 
-# Canonical signing payload: bundle (without .signature) sorted-keys + compact.
-canonical_payload="$(jq -S -c '.' <<<"$bundle_no_sig")"
-canonical_sha="$(printf '%s' "$canonical_payload" | sha256_stdin)"
-
-mkdir -p "$OUT_DIR"
-
 repo_relative_output_path() {
   local path="$1"
+  local rel_path
   if [[ "$path" == "$REPO_ROOT/"* ]]; then
-    printf '%s\n' "${path#"$REPO_ROOT"/}"
+    rel_path="${path#"$REPO_ROOT"/}"
   elif [[ "$path" != /* ]]; then
-    printf '%s\n' "$path"
+    rel_path="$path"
   else
     echo "error: signed attestation output must be inside the repository so the verifier can resolve it: $path" >&2
     exit 1
   fi
+  if ! is_repo_relative_path "$rel_path"; then
+    echo "error: signed attestation output path must be repo-relative without parent traversal: $rel_path (from $path)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$rel_path"
 }
+
+# Canonical signing payload: bundle (without .signature) sorted-keys + compact.
+canonical_payload="$(jq -S -c '.' <<<"$bundle_no_sig")"
+canonical_sha="$(printf '%s' "$canonical_payload" | sha256_stdin)"
+
+if [[ "$SIGN_METHOD" != "unsigned" ]]; then
+  repo_relative_output_path "$OUT_DIR" >/dev/null
+fi
+mkdir -p "$OUT_DIR"
 
 case "$SIGN_METHOD" in
   cosign)
