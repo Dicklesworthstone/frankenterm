@@ -333,6 +333,23 @@ fn checked_in_dev_bundle_validates_against_schema() {
 }
 
 #[test]
+fn bundle_schema_rejects_malformed_release_tags() {
+    let validator = bundle_validator();
+    for (label, tag) in [("missing_v_prefix", "0.2.0"), ("blank_version", "v ")] {
+        let mut bundle = base_bundle(json!({
+            "method": "unsigned",
+            "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "reason": "dev bundle tracked by ft-e87u6.2"
+        }));
+        bundle["release"]["tag"] = json!(tag);
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "bundle release.tag must reject {label} tag shapes"
+        );
+    }
+}
+
+#[test]
 fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({
