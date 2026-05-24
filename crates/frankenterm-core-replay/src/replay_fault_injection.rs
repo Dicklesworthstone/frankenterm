@@ -538,10 +538,12 @@ impl FaultInjector {
                 }
                 FaultType::Duplicate { count, .. } => {
                     let mut copies = Vec::new();
-                    for i in 0..*count {
-                        let mut copy = event.clone();
-                        copy.event_id = format!("{}_dup_{i}", event.event_id);
-                        copies.push(copy);
+                    for evt in &results {
+                        for i in 0..*count {
+                            let mut copy = evt.clone();
+                            copy.event_id = format!("{}_dup_{i}", evt.event_id);
+                            copies.push(copy);
+                        }
                     }
                     self.log.record(
                         "duplicate",
@@ -1031,6 +1033,32 @@ time_range_end_ms = 100
         assert_eq!(result[1].event_id, "e1_dup_0");
         assert_eq!(result[2].event_id, "e1_dup_1");
         assert_eq!(result[3].event_id, "e1_dup_2");
+    }
+
+    #[test]
+    fn duplicate_preserves_prior_fault_mutations() {
+        let spec = FaultSpec {
+            name: "test".into(),
+            description: String::new(),
+            seed: 0,
+            faults: vec![
+                FaultType::Delay {
+                    filter: EventFilter::match_all(),
+                    duration_ms: 500,
+                },
+                FaultType::Duplicate {
+                    filter: EventFilter::match_all(),
+                    count: 2,
+                },
+            ],
+        };
+        let mut inj = FaultInjector::new(spec);
+        let result = inj.process(make_event("e1", "p1", "data", 100, 0));
+        assert_eq!(result.len(), 3);
+        assert!(result.iter().all(|event| event.timestamp_ms == 600));
+        assert_eq!(result[0].event_id, "e1");
+        assert_eq!(result[1].event_id, "e1_dup_0");
+        assert_eq!(result[2].event_id, "e1_dup_1");
     }
 
     #[test]
