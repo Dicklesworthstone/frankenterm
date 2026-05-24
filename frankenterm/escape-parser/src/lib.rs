@@ -597,7 +597,9 @@ impl OneBased {
     }
 
     pub fn from_zero_based(value: u32) -> Self {
-        Self { value: value + 1 }
+        Self {
+            value: value.saturating_add(1),
+        }
     }
 
     /// Map a value from an escape sequence parameter.
@@ -674,6 +676,13 @@ mod tests {
         let ob = OneBased::from_zero_based(99);
         assert_eq!(ob.as_one_based(), 100);
         assert_eq!(ob.as_zero_based(), 99);
+    }
+
+    #[test]
+    fn one_based_from_zero_based_saturates_at_u32_max() {
+        let ob = OneBased::from_zero_based(u32::MAX);
+        assert_eq!(ob.as_one_based(), u32::MAX);
+        assert_eq!(ob.as_zero_based(), u32::MAX - 1);
     }
 
     #[test]
