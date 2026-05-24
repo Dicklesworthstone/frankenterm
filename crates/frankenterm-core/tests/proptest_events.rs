@@ -652,6 +652,51 @@ proptest! {
         }
     }
 
+    /// Property 25b: Cooldown eviction is FIFO — once at capacity, a novel
+    /// key evicts the OLDEST tracked key. The evicted key returns Send(0)
+    /// again, while the newest key still Suppresses. Property 25 only bounds
+    /// len; this pins eviction order (mirrors EventDeduplicator 17b).
+    #[test]
+    fn prop_cooldown_eviction_is_fifo(max_cap in 2..20usize) {
+        let mut cd = NotificationCooldown::with_config(Duration::from_secs(300), max_cap);
+        // max_cap+1 distinct keys: fills to capacity, final insert evicts key_0.
+        for i in 0..=max_cap {
+            cd.check(&format!("key_{i}"));
+        }
+        // Newest key still tracked → Suppress on re-check.
+        let newest = format!("key_{max_cap}");
+        prop_assert_eq!(
+            cd.check(&newest),
+            CooldownVerdict::Suppress { total_suppressed: 1 },
+            "newest key '{}' must be retained after eviction", newest
+        );
+        // key_0 was oldest → evicted → Send(0) again.
+        prop_assert_eq!(
+            cd.check("key_0"),
+            CooldownVerdict::Send { suppressed_since_last: 0 },
+            "oldest key 'key_0' must have been evicted (FIFO)"
+        );
+    }
+
+    /// Property 25c: Zero capacity disables cooldown tracking (ft-w80kj).
+    /// Every check returns Send(0) — even immediate repeats — and nothing
+    /// is stored. Guards against the 1-slot "ghost cooldown" regression.
+    #[test]
+    fn prop_cooldown_zero_capacity_disables(
+        keys in proptest::collection::vec(arb_dedup_key(), 1..15),
+    ) {
+        let mut cd = NotificationCooldown::with_config(Duration::from_secs(300), 0);
+        for key in &keys {
+            prop_assert_eq!(cd.check(key),
+                CooldownVerdict::Send { suppressed_since_last: 0 },
+                "zero-capacity cooldown must always Send for '{}'", key);
+        }
+        prop_assert_eq!(cd.check(&keys[0]),
+            CooldownVerdict::Send { suppressed_since_last: 0 },
+            "zero-capacity cooldown must not suppress immediate repeats");
+        prop_assert_eq!(cd.len(), 0, "zero-capacity cooldown must store nothing");
+    }
+
     /// Property 26: After clear, all keys return Send(0).
     #[test]
     fn prop_cooldown_clear_resets(
