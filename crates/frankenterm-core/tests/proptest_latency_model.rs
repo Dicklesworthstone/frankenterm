@@ -604,6 +604,32 @@ proptest! {
             "backlog changed with rate: {} vs {}", b1, b2
         );
     }
+
+    /// Increasing service latency T raises the backlog bound by exactly
+    /// ρ·ΔT: for leaky-bucket + rate-latency, B = σ + ρ·T, so ∂B/∂T = ρ.
+    #[test]
+    fn backlog_monotone_in_latency(
+        sigma in arb_sigma(),
+        rho in arb_rho(),
+        rate_mult in 2.0f64..100.0,
+        latency1 in arb_latency(),
+        latency_extra in 0.0f64..1.0,
+    ) {
+        let rate = rho * rate_mult; // rate > rho ⇒ stable, finite backlog
+        let arr = ArrivalCurve::leaky_bucket(sigma, rho);
+        let b1 = backlog_bound(&arr, &ServiceCurve::rate_latency(rate, latency1));
+        let b2 = backlog_bound(&arr, &ServiceCurve::rate_latency(rate, latency1 + latency_extra));
+        prop_assert!(
+            b2 >= b1 - 1e-9,
+            "more service latency gave less backlog: {} < {}", b2, b1
+        );
+        let expected_delta = rho * latency_extra;
+        prop_assert!(
+            (b2 - b1 - expected_delta).abs() <= 1e-6 * b1.abs().max(1.0),
+            "backlog must increase by exactly rho*delta ({}): {} -> {}",
+            expected_delta, b1, b2
+        );
+    }
 }
 
 // ── Pipeline properties ─────────────────────────────────────────────
