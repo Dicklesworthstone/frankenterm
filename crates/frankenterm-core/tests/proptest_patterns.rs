@@ -1132,6 +1132,24 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_blank_optional_rule_text(
+        rule_suffix in "[a-z]{3,10}",
+        field_index in 0u8..5,
+    ) {
+        let mut rule = make_anchor_only_rule(&rule_suffix, "BLANK_OPTIONAL_RULE_TEXT");
+        match field_index {
+            0 => rule.remediation = Some(" \t ".to_string()),
+            1 => rule.workflow = Some(" \t ".to_string()),
+            2 => rule.manual_fix = Some(" \t ".to_string()),
+            3 => rule.preview_command = Some(" \t ".to_string()),
+            _ => rule.learn_more_url = Some(" \t ".to_string()),
+        }
+        let pack = PatternPack::new("builtin:blank-optional-rule-text", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_empty_pack_name(rule_suffix in "[a-z]{3,10}") {
         let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_NAME");
         let pack = PatternPack::new(" \t ", "1.0.0", vec![rule]);

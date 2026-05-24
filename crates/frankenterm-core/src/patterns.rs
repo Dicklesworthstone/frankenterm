@@ -652,6 +652,20 @@ impl RuleDef {
             .into());
         }
 
+        validate_optional_rule_text(&self.id, "remediation", self.remediation.as_deref())?;
+        validate_optional_rule_text(&self.id, "workflow", self.workflow.as_deref())?;
+        validate_optional_rule_text(&self.id, "manual_fix", self.manual_fix.as_deref())?;
+        validate_optional_rule_text(
+            &self.id,
+            "preview_command",
+            self.preview_command.as_deref(),
+        )?;
+        validate_optional_rule_text(
+            &self.id,
+            "learn_more_url",
+            self.learn_more_url.as_deref(),
+        )?;
+
         if let Some(ref regex) = self.regex {
             // [ft-xv561] compile via shared builder so the backtrack
             // cap applies to validation too — a rule that compiles
@@ -706,6 +720,16 @@ impl RuleDef {
             Self::interpolate_template(fix, pane_id, event_id, &self.agent_type, &self.id)
         })
     }
+}
+
+fn validate_optional_rule_text(rule_id: &str, field: &str, value: Option<&str>) -> Result<()> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(PatternError::InvalidRule(format!(
+            "rule id '{rule_id}' has empty optional field '{field}'"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Pattern pack containing a set of rules
