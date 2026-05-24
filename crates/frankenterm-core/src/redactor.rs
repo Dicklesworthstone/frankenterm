@@ -898,10 +898,19 @@ impl StreamingRedactor {
             current_boundary.saturating_sub(self.effective_tail_bytes()),
         );
         let suffix = &self.pending[scan_start..current_boundary];
+        // br-ft-zbnz4: anchors are matched case-insensitively. The keyed secret
+        // patterns are `(?i)` (e.g. `API_KEY=`, `TOKEN=`, `MISTRAL_API_KEY=`,
+        // `AWS_SECRET_ACCESS_KEY=`), so an UPPERCASE env-var-style key name split
+        // across a chunk boundary must still trigger tail retention; a
+        // case-sensitive `rfind` missed those and leaked the split value.
+        // `to_ascii_lowercase` preserves byte length (every anchor is ASCII), so
+        // offsets in `suffix_lower` map 1:1 back into `self.pending`.
+        let suffix_lower = suffix.to_ascii_lowercase();
         let mut earliest = current_boundary;
 
         for anchor in STREAMING_SECRET_ANCHORS {
-            if let Some(offset) = suffix.rfind(anchor) {
+            let anchor_lower = anchor.to_ascii_lowercase();
+            if let Some(offset) = suffix_lower.rfind(anchor_lower.as_str()) {
                 let candidate = scan_start + offset;
                 let covered_by_complete_detection = detections.iter().any(|(_, start, end)| {
                     *start == candidate && candidate < *end && *end < current_boundary
@@ -912,8 +921,8 @@ impl StreamingRedactor {
             }
 
             for prefix_len in 1..anchor.len() {
-                let prefix = &anchor[..prefix_len];
-                if suffix.ends_with(prefix) {
+                let prefix = &anchor_lower[..prefix_len];
+                if suffix_lower.ends_with(prefix) {
                     earliest = earliest.min(current_boundary - prefix.len());
                 }
             }
@@ -1252,6 +1261,34 @@ mod tests {
         // `DD_API_KEY=` form was already anchored; this guards the long form.
         let value = "deadbeef0123456789abcdef01234567";
         let input = format!("before DATADOG_API_KEY={value} after");
+        let expected = Redactor::new().redact(&input).into_bytes();
+        assert_ne!(expected, input.as_bytes(), "fixture must actually redact");
+
+        for split in 1..input.len() {
+            let mut streaming = StreamingRedactor::new();
+            let mut out = Vec::new();
+
+            out.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
+            out.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+            out.extend(streaming.finish().bytes);
+
+            assert_eq!(out, expected, "split={split}");
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(
+                !rendered.contains(value),
+                "split={split} leaked {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_catches_uppercase_keyed_secret_split_at_every_offset() {
+        // br-ft-zbnz4 regression: keyed patterns are (?i), but streaming anchors
+        // were matched case-sensitively, so an UPPERCASE env-var-style key name
+        // (`API_KEY=`) split mid-value produced no anchor hit and leaked. Anchor
+        // matching is now case-insensitive; this guards that.
+        let value = "abcdef0123456789ABCDEFGH";
+        let input = format!("before API_KEY={value} after");
         let expected = Redactor::new().redact(&input).into_bytes();
         assert_ne!(expected, input.as_bytes(), "fixture must actually redact");
 
