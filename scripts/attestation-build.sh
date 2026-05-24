@@ -533,8 +533,15 @@ if [[ -d "$RETRACTIONS_ROOT" ]]; then
     retraction_size="$(wc -c < "$retraction_path" | tr -d ' ')"
     if [[ "$retraction_path" == "$REPO_ROOT/"* ]]; then
       retraction_rel_path="${retraction_path#"$REPO_ROOT"/}"
-    else
+    elif [[ "$retraction_path" != /* ]]; then
       retraction_rel_path="$retraction_path"
+    else
+      build_log "warning: skipping retraction outside repository: $retraction_path"
+      continue
+    fi
+    if ! is_repo_relative_path "$retraction_rel_path"; then
+      build_log "warning: skipping retraction with unsafe repo-relative path: $retraction_rel_path"
+      continue
     fi
     retraction_obj="$(jq -n \
       --arg original_bundle_sha256 "$original_bundle_sha256" \

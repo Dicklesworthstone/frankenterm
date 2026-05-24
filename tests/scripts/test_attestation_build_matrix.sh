@@ -537,6 +537,65 @@ run_parent_signed_output_case() {
   echo "PASS ${name}"
 }
 
+run_unsafe_retraction_path_index_case() {
+  local name="unsafe_retraction_path_is_not_indexed"
+  local case_dir="${ARTIFACT_ROOT}/${name}"
+  local manifest="${case_dir}/manifest.json"
+  local out_dir="${case_dir}/out"
+  local retraction_root="${case_dir}/retractions-parent/../unsafe-retractions"
+  local bundle_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local retraction_dir="${retraction_root}/${bundle_sha}"
+  local version="0.0.0-unsafe-retraction-path"
+  local rc=0
+  mkdir -p "${case_dir}" "${out_dir}" "${retraction_dir}"
+  write_manifest "${manifest}" "$(json_slot '"docs/attestations/schema.json"' "" "")"
+
+  cat >"${retraction_dir}/perf__headline-claims.json" <<JSON
+{
+  "original_bundle_sha256": "${bundle_sha}",
+  "affected_slot": "perf/headline-claims",
+  "retracted_at": "2026-05-24T00:00:00Z",
+  "retracted_by_release": "0.0.1-corrigendum",
+  "retraction_rationale": "fixture path uses parent traversal and must not be indexed",
+  "corrected_claim_value": null
+}
+JSON
+
+  set +e
+  FT_ATTESTATION_MANIFEST="${manifest}" \
+  FT_ATTESTATION_OUT_DIR="${out_dir}" \
+  FT_ATTESTATION_RETRACTIONS_ROOT="${retraction_root}" \
+  FT_BEAD_ID="ft-e87u6.2" \
+  FT_SCENARIO_ID="attestation_unsafe_retraction_path_guard" \
+    bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version "${version}" \
+      --channel dev \
+      --sign unsigned >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
+  rc=$?
+  set -e
+
+  total=$((total + 1))
+  if [[ "${rc}" != "0" ]]; then
+    fail=$((fail + 1))
+    record_result "${name}" "0" "${rc}" "failed" "${case_dir}"
+    echo "FAIL ${name}: build rejected unsafe indexed retraction instead of skipping it" >&2
+    return 0
+  fi
+
+  local bundle="${out_dir}/${version}.json"
+  if ! jq -e '(.retractions // []) | length == 0' "${bundle}" >/dev/null \
+    || ! grep -q "skipping retraction with unsafe repo-relative path" "${case_dir}/stderr.txt"; then
+    fail=$((fail + 1))
+    record_result "${name}" "skip_unsafe_retraction_path" "${rc}" "failed" "${case_dir}"
+    echo "FAIL ${name}: unsafe retraction path was indexed or warning was missing" >&2
+    return 0
+  fi
+
+  pass=$((pass + 1))
+  record_result "${name}" "skip_unsafe_retraction_path" "${rc}" "passed" "${case_dir}"
+  echo "PASS ${name}"
+}
+
 require_cmd bash
 require_cmd jq
 require_cmd git
@@ -624,6 +683,7 @@ run_case \
   0 \
   --allow-partial
 
+run_unsafe_retraction_path_index_case
 run_sigstore_cases
 run_external_signed_output_case
 run_parent_signed_output_case
