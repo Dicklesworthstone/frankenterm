@@ -76,6 +76,7 @@ Fixtures live under `fixtures/rch-worker-storage-recovery-proof/`:
 
 - `valid/passed-remote-smoke.json`
 - `valid/blocked-no-admissible-worker.json`
+- `valid/blocked-hard-preflight-no-admissible.json`
 - `valid/blocked-topology-preflight.json`
 - `valid/blocked-new-reason.json`
 - `valid/failed-remote-smoke.json`
@@ -83,11 +84,15 @@ Fixtures live under `fixtures/rch-worker-storage-recovery-proof/`:
 
 All fixtures are schema-valid. Only `passed-remote-smoke.json` allows
 `ft4tp7g` closeout. The blocked fixtures require remote-smoke skip evidence and
-a stable reason code. The `blocked-topology-preflight` fixture proves that
-selecting a worker is not enough when remote topology setup fails before Cargo,
-rustc, or the test binary is reached. The failed-smoke fixture proves that
-selecting a worker is not enough; the material remote smoke must complete
-successfully. The
+a stable reason code. The `blocked-hard-preflight-no-admissible` fixture covers
+the compound case where the dry-run selected a worker, but the material
+remote-required smoke re-ran admission and stopped before transfer or Cargo with
+`insufficient_slots=3,hard_preflight=1`; this remains a blocked no-admissible
+worker result, not a topology-preflight source verdict. The
+`blocked-topology-preflight` fixture proves that selecting a worker is not
+enough when remote topology setup fails before Cargo, rustc, or the test binary
+is reached. The failed-smoke fixture proves that selecting a worker is not
+enough; the material remote smoke must complete successfully. The
 `invalid-missing-approval` fixture covers `invalid_missing_approval`: without an
 approval artifact and operator recovery reference, the proof gate is invalid,
 remote-required proof commands remain not-attempted, and `ft-4tp7g` closeout is

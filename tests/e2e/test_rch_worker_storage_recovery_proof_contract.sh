@@ -40,6 +40,7 @@ MANIFEST = "fixtures/rch-worker-storage-recovery-proof/manifest.json"
 EXPECTED_FIXTURE_IDS = %w[
   passed-remote-smoke
   blocked-no-admissible-worker
+  blocked-hard-preflight-no-admissible
   blocked-topology-preflight
   blocked-new-reason
   failed-remote-smoke
@@ -48,6 +49,7 @@ EXPECTED_FIXTURE_IDS = %w[
 EXPECTED_RESULTS = {
   "passed-remote-smoke" => "passed_remote_smoke",
   "blocked-no-admissible-worker" => "blocked_no_admissible_worker",
+  "blocked-hard-preflight-no-admissible" => "blocked_no_admissible_worker",
   "blocked-topology-preflight" => "blocked_topology_preflight",
   "blocked-new-reason" => "blocked_new_reason",
   "failed-remote-smoke" => "failed_remote_smoke",
@@ -131,10 +133,13 @@ fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-rch-worker-stora
 fail!("contract id const missing") unless schema.dig("properties", "contract_id", "const") == "ft.rch_worker_storage_recovery_proof.v1"
 fail!("source bead const missing") unless schema.dig("properties", "source_bead", "const") == "ft-5xwsu.3"
 fail!("approval contract const missing") unless schema.dig("properties", "approval_contract_id", "const") == "ft.rch_worker_storage_approval.v1"
-fail!("gate result enum drifted") unless schema.dig("$defs", "gate_result", "enum").sort == EXPECTED_RESULTS.values.sort
+fail!("gate result enum drifted") unless schema.dig("$defs", "gate_result", "enum").sort == EXPECTED_RESULTS.values.uniq.sort
 fail!("forbidden-action enum drifted") unless schema.dig("$defs", "forbidden_action", "enum").sort == EXPECTED_FORBIDDEN.sort
 fail!("RCH status command const drifted") unless schema.dig("$defs", "rch_status", "properties", "command", "const") == STATUS_COMMAND
 fail!("br dep cycles count const missing") unless schema.dig("$defs", "br_dep_cycles", "properties", "count", "const") == 0
+%w[remote_cargo_reached remote_rustc_reached test_binary_reached].each do |field|
+  fail!("RCH probe schema missing #{field}") unless schema.dig("$defs", "rch_probe", "properties", field)
+end
 
 manifest_expected_verifier = "bash tests/e2e/test_rch_worker_storage_recovery_proof_contract.sh"
 fail!("manifest schema_version drifted") unless manifest["schema_version"] == 1
@@ -272,6 +277,23 @@ fail!("blocked smoke must be skipped") unless blocked.dig("remote_required_smoke
 fail!("blocked smoke transfer drifted") unless blocked.dig("remote_required_smoke", "transfer_state") == "skipped_no_worker"
 fail!("blocked status lacks critical pressure workers") unless blocked.dig("rch_status", "critical_pressure_workers") > 0
 
+hard_preflight = payloads.fetch("blocked-hard-preflight-no-admissible")
+fail!("hard-preflight fixture should not recover admission") unless hard_preflight["admission_recovered"] == false
+fail!("hard-preflight fixture should not close ft-4tp7g") unless hard_preflight["ft4tp7g_closeout_allowed"] == false
+fail!("hard-preflight fixture reason drifted") unless hard_preflight["stable_reason_code"] == "insufficient_slots=3,hard_preflight=1"
+fail!("hard-preflight fixture should not report critical pressure") unless hard_preflight.dig("rch_status", "critical_pressure_workers") == 0
+fail!("hard-preflight dry-run must select worker") unless hard_preflight.dig("remote_required_dry_run", "selected_worker") == "vmi1264463"
+fail!("hard-preflight dry-run transfer should be dry-run skipped") unless hard_preflight.dig("remote_required_dry_run", "transfer_state") == "skipped_dry_run_only"
+fail!("hard-preflight smoke must be required after dry-run selection") unless hard_preflight.dig("remote_required_smoke", "required") == true
+fail!("hard-preflight smoke must not retain a selected worker") unless hard_preflight.dig("remote_required_smoke", "selected_worker").nil?
+fail!("hard-preflight smoke selection reason drifted") unless hard_preflight.dig("remote_required_smoke", "selection_reason") == "no_admissible_workers=insufficient_slots=3,hard_preflight=1"
+fail!("hard-preflight smoke transfer drifted") unless hard_preflight.dig("remote_required_smoke", "transfer_state") == "skipped_no_worker"
+fail!("hard-preflight smoke remote execution drifted") unless hard_preflight.dig("remote_required_smoke", "remote_execution_state") == "skipped_no_worker"
+fail!("hard-preflight smoke exit should be nonzero") unless hard_preflight.dig("remote_required_smoke", "exit_status").to_i > 0
+fail!("hard-preflight fixture must prove Cargo was not reached") unless hard_preflight.dig("remote_required_smoke", "remote_cargo_reached") == false
+fail!("hard-preflight fixture must prove rustc was not reached") unless hard_preflight.dig("remote_required_smoke", "remote_rustc_reached") == false
+fail!("hard-preflight fixture must prove test binary was not reached") unless hard_preflight.dig("remote_required_smoke", "test_binary_reached") == false
+
 new_reason = payloads.fetch("blocked-new-reason")
 fail!("new-reason fixture still reports critical pressure") unless new_reason.dig("rch_status", "critical_pressure_workers") == 0
 fail!("new-reason fixture missing stable reason") unless new_reason.fetch("stable_reason_code").start_with?("ssh_unreachable=")
@@ -317,6 +339,8 @@ fail!("doc missing ft-4tp7g closeout rule") unless doc.include?("ft-4tp7g")
 fail!("doc missing local Cargo prohibition") unless doc.include?("Local Cargo")
 fail!("doc missing missing-approval fixture") unless doc.include?("invalid-missing-approval")
 fail!("doc missing missing-approval gate result") unless doc.include?("invalid_missing_approval")
+fail!("doc missing hard-preflight fixture") unless doc.include?("blocked-hard-preflight-no-admissible")
+fail!("doc missing hard-preflight reason") unless doc.include?("insufficient_slots=3,hard_preflight=1")
 fail!("doc missing topology-preflight fixture") unless doc.include?("blocked-topology-preflight")
 fail!("doc missing topology-preflight gate result") unless doc.include?("blocked_topology_preflight")
 

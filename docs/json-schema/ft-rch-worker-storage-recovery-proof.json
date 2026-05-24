@@ -409,6 +409,24 @@
         },
         "artifact_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "remote_cargo_reached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "remote_rustc_reached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "test_binary_reached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },
