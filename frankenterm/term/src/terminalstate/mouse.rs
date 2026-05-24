@@ -22,6 +22,21 @@ fn x10_encoded_coord_value(value: i64) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
+fn clamp_mouse_coords(x: usize, y: i64, cols: usize, rows: usize) -> (usize, i64) {
+    let x = match cols.checked_sub(1) {
+        Some(max_x) => x.min(max_x),
+        None => 0,
+    };
+    let y = match rows
+        .checked_sub(1)
+        .and_then(|max_y| i64::try_from(max_y).ok())
+    {
+        Some(max_y) => y.clamp(0, max_y),
+        None => 0,
+    };
+    (x, y)
+}
+
 impl TerminalState {
     fn sgr_pixel_coords(&self, event: MouseEvent) -> (usize, usize) {
         (
@@ -252,8 +267,14 @@ impl TerminalState {
         // terminal.  The mouse can move over that portion and the gui layer
         // can thus send us out-of-bounds row or column numbers.  We want to
         // make sure that we clamp this and handle it nicely at the model layer.
-        event.y = event.y.clamp(0, self.screen().physical_rows as i64 - 1);
-        event.x = event.x.min(self.screen().physical_cols - 1);
+        let (x, y) = clamp_mouse_coords(
+            event.x,
+            event.y,
+            self.screen().physical_cols,
+            self.screen().physical_rows,
+        );
+        event.x = x;
+        event.y = y;
 
         match event {
             MouseEvent {
@@ -291,7 +312,7 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
-    use super::{sgr_cell_coords, sgr_pixel_coord, x10_encoded_coord_value};
+    use super::{clamp_mouse_coords, sgr_cell_coords, sgr_pixel_coord, x10_encoded_coord_value};
     use crate::input::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     #[test]
@@ -329,5 +350,12 @@ mod tests {
         assert_eq!(x10_encoded_coord_value(0), Some(33));
         assert_eq!(x10_encoded_coord_value(-40), None);
         assert_eq!(x10_encoded_coord_value(i64::MAX), None);
+    }
+
+    #[test]
+    fn clamp_mouse_coords_handles_zero_sized_screens() {
+        assert_eq!(clamp_mouse_coords(12, 34, 0, 0), (0, 0));
+        assert_eq!(clamp_mouse_coords(12, -5, 10, 4), (9, 0));
+        assert_eq!(clamp_mouse_coords(12, 9, 10, 4), (9, 3));
     }
 }
