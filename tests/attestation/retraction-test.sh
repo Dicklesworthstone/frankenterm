@@ -142,6 +142,46 @@ if [[ "$rc" -eq 0 ]] || ! grep -q "repo-relative without parent traversal" "$RUN
   exit 1
 fi
 
+echo
+echo "=== dot segment retraction root is rejected for signed output ==="
+DOT_RETRACTIONS_ROOT="$RUN_ROOT/retractions-dot/./nested"
+set +e
+ED25519_PRIVATE_KEY_PATH="$KEY" \
+FT_ATTESTATION_RETRACTIONS_ROOT="$DOT_RETRACTIONS_ROOT" \
+  bash scripts/retract-bundle-slot.sh \
+    --bundle "$BUNDLE" \
+    --slot doctrine/agents-md-counts \
+    --rationale-file "$RATIONALE" \
+    --retracted-by-release 0.0.1-dot-root \
+    --sign ed25519 > "$RUN_ROOT/retract-dot.out" 2>&1
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] || ! grep -q "repo-relative without parent traversal" "$RUN_ROOT/retract-dot.out"; then
+  echo "FAIL: dot segment signed retraction root was not rejected with the expected error"
+  cat "$RUN_ROOT/retract-dot.out"
+  exit 1
+fi
+
+echo
+echo "=== empty segment retraction root is rejected for signed output ==="
+EMPTY_SEGMENT_RETRACTIONS_ROOT="$RUN_ROOT/retractions-empty//nested"
+set +e
+ED25519_PRIVATE_KEY_PATH="$KEY" \
+FT_ATTESTATION_RETRACTIONS_ROOT="$EMPTY_SEGMENT_RETRACTIONS_ROOT" \
+  bash scripts/retract-bundle-slot.sh \
+    --bundle "$BUNDLE" \
+    --slot doctrine/agents-md-counts \
+    --rationale-file "$RATIONALE" \
+    --retracted-by-release 0.0.1-empty-segment-root \
+    --sign ed25519 > "$RUN_ROOT/retract-empty-segment.out" 2>&1
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] || ! grep -q "repo-relative without parent traversal" "$RUN_ROOT/retract-empty-segment.out"; then
+  echo "FAIL: empty segment signed retraction root was not rejected with the expected error"
+  cat "$RUN_ROOT/retract-empty-segment.out"
+  exit 1
+fi
+
 cp "$RETRACTION_PATH" \
   "$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts-duplicate.json"
 
