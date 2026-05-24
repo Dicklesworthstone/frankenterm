@@ -191,7 +191,11 @@ fn every_valid_fixture_parses_into_pattern_pack() {
 fn every_valid_fixture_is_accepted_by_pattern_library() {
     for path in discover_fixtures("valid") {
         let pack = parse_to_pack(&path);
-        frankenterm_core::patterns::PatternLibrary::new(vec![pack])
+        let user_pack_names = std::collections::HashSet::from([pack.name.clone()]);
+        frankenterm_core::patterns::PatternLibrary::new_with_user_packs(
+            vec![pack],
+            &user_pack_names,
+        )
             .unwrap_or_else(|err| panic!("fixture {} failed validation: {err}", path.display()));
     }
 }
