@@ -484,7 +484,7 @@ fn evaluate_assertion(assertion: &RelevanceAssertion, results: &SearchResults) -
                 } else {
                     match pos {
                         Some(p) => Some(format!(
-                            "event_id '{event_id}' at position {} (expected < {n})",
+                            "event_id '{event_id}' at rank {} (expected within top {n})",
                             p + 1
                         )),
                         None => Some(format!("event_id '{event_id}' not found in results")),
