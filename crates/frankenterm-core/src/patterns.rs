@@ -6219,6 +6219,26 @@ rules:
     }
 
     #[test]
+    fn clear_seen_resets_seen_order_and_tail_buffer() {
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "partial anchor".to_string();
+        assert!(ctx.mark_seen_key("codex.test:one".to_string()));
+        assert!(ctx.mark_seen_key("codex.test:two".to_string()));
+        assert_eq!(ctx.seen_count(), 2);
+        assert_eq!(ctx.seen_order.len(), 2);
+
+        ctx.clear_seen();
+
+        assert_eq!(ctx.seen_count(), 0);
+        assert!(ctx.seen_order.is_empty());
+        assert!(ctx.tail_buffer.is_empty());
+
+        assert!(ctx.mark_seen_key("codex.test:one".to_string()));
+        assert_eq!(ctx.seen_count(), 1);
+        assert_eq!(ctx.seen_order.len(), 1);
+    }
+
+    #[test]
     fn detection_dedup_key_includes_extracted() {
         let d1 = Detection {
             rule_id: "test.rule".into(),
