@@ -516,18 +516,7 @@ impl DiskPressureMonitor {
         let disk_space = read_disk_space_statvfs(&self.config.root_path)
             .or_else(|| read_disk_space_df(&self.config.root_path));
 
-        let (available_bytes, total_bytes, usage_fraction) = match disk_space {
-            Some((available_bytes, total_bytes)) if total_bytes > 0 => {
-                let available = available_bytes.min(total_bytes);
-                (
-                    available_bytes,
-                    total_bytes,
-                    (1.0 - (available as f64 / total_bytes as f64)).clamp(0.0, 1.0),
-                )
-            }
-            Some((available_bytes, total_bytes)) => (available_bytes, total_bytes, f64::NAN),
-            None => (0, 0, f64::NAN),
-        };
+        let (available_bytes, total_bytes, usage_fraction) = derive_disk_sample_fields(disk_space);
 
         DiskSample {
             available_bytes,
@@ -658,6 +647,30 @@ impl DiskPressureMonitor {
 /// silently producing timestamp=0 on every disk-pressure event.
 fn now_epoch_ms() -> u64 {
     crate::clock_anomaly::epoch_ms_u64("ft.disk_pressure.clock")
+}
+
+/// Map a raw `(available_bytes, total_bytes)` reading into the
+/// `(available, total, usage_fraction)` triple stored on a `DiskSample`.
+///
+/// [ft-j4fnv] Fail closed when disk state cannot be proven safe. Both
+/// I/O failure (`None`) and a zero `total_bytes` (which makes the usage
+/// fraction undefined) encode `usage_fraction = NaN` so the existing
+/// fail-closed path in `update_inner`/`classify_tier` classifies the
+/// sample as `Black` rather than fabricating a healthy `0.0` Green
+/// reading from unreadable disk state.
+fn derive_disk_sample_fields(disk_space: Option<(u64, u64)>) -> (u64, u64, f64) {
+    match disk_space {
+        Some((available_bytes, total_bytes)) if total_bytes > 0 => {
+            let available = available_bytes.min(total_bytes);
+            (
+                available_bytes,
+                total_bytes,
+                (1.0 - (available as f64 / total_bytes as f64)).clamp(0.0, 1.0),
+            )
+        }
+        Some((available_bytes, total_bytes)) => (available_bytes, total_bytes, f64::NAN),
+        None => (0, 0, f64::NAN),
+    }
 }
 
 fn classify_tier(usage_fraction: f64, thresholds: PressureThresholds) -> DiskPressureTier {
@@ -1112,6 +1125,67 @@ mod tests {
         let telemetry = monitor.telemetry().snapshot();
         assert_eq!(telemetry.updates, 1);
         assert_eq!(telemetry.tier_black, 1);
+    }
+
+    /// [ft-j4fnv] A zero `total_bytes` reading makes the usage fraction
+    /// undefined; `sample()` cannot reach this branch from real disk I/O,
+    /// so exercise the pure mapping with a synthetic zero-total tuple.
+    /// It must encode NaN (fail closed), not a fabricated 0.0 Green.
+    #[test]
+    fn derive_zero_total_synthetic_sample_fails_closed_as_nan() {
+        let (available, total, usage) = derive_disk_sample_fields(Some((1234, 0)));
+        assert_eq!(available, 1234);
+        assert_eq!(total, 0);
+        assert!(
+            usage.is_nan(),
+            "zero total_bytes must encode NaN usage, got {usage}"
+        );
+    }
+
+    /// [ft-j4fnv] Sampling failure (`None`, e.g. nonexistent root after
+    /// both statvfs and df fail) collapses to a zero-byte sample with NaN
+    /// usage so the classifier treats unreadable disk state as Black.
+    #[test]
+    fn derive_io_failure_sample_fails_closed_as_nan() {
+        let (available, total, usage) = derive_disk_sample_fields(None);
+        assert_eq!(available, 0);
+        assert_eq!(total, 0);
+        assert!(usage.is_nan(), "I/O failure must encode NaN usage, got {usage}");
+    }
+
+    /// [ft-j4fnv] A healthy reading still derives a finite, clamped usage
+    /// fraction; available is clamped to total to keep the fraction in
+    /// `[0.0, 1.0]` even if a reader over-reports free space.
+    #[test]
+    fn derive_healthy_sample_yields_clamped_finite_usage() {
+        let (available, total, usage) = derive_disk_sample_fields(Some((250, 1000)));
+        assert_eq!(available, 250);
+        assert_eq!(total, 1000);
+        assert!((usage - 0.75).abs() < 1e-9, "expected 0.75 usage, got {usage}");
+
+        // available > total (hostile reader) clamps to 0.0, not negative.
+        let (_, _, over) = derive_disk_sample_fields(Some((2000, 1000)));
+        assert_eq!(over, 0.0, "available>total must clamp usage to 0.0, got {over}");
+    }
+
+    /// [ft-j4fnv] End-to-end: a zero-total sample routed through
+    /// `update_with_sample` must surface Black, confirming the NaN encoding
+    /// reaches the fail-closed classifier rather than reporting Green.
+    #[test]
+    fn monitor_update_from_zero_total_sample_reports_black() {
+        let mut monitor = DiskPressureMonitor::new(DiskPressureConfig {
+            enabled: true,
+            ..DiskPressureConfig::default()
+        });
+        let (available_bytes, total_bytes, usage_fraction) =
+            derive_disk_sample_fields(Some((512, 0)));
+        let sample = DiskSample {
+            available_bytes,
+            total_bytes,
+            usage_fraction,
+            sampled_at: Instant::now(),
+        };
+        assert_eq!(monitor.update_with_sample(sample), DiskPressureTier::Black);
     }
 
     #[test]
