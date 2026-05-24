@@ -145,13 +145,27 @@ policy.fetch("retention_policy").each do |surface, rule|
   fail!("#{surface} retention does not forbid raw pane text") if surface == "snapshots" && !forbidden.include?("raw_pane_text")
 end
 
-policy.fetch("failure_behaviors").each do |name, behavior|
+# Pin the required key sets so an empty/trimmed map cannot vacuously satisfy
+# the all-true / fail-closed loops below (a missing behavior or requirement is
+# an ungated failure mode, not a pass).
+EXPECTED_FAILURE_BEHAVIORS = %w[contradictory missing stale unredacted].freeze
+EXPECTED_OUTPUT_REQUIREMENTS = %w[
+  approval_does_not_grant_live_mutation
+  every_output_carries_forbidden_actions
+  every_output_marks_simulated
+  raw_inputs_rejected_before_replay
+].freeze
+
+failure_behaviors = policy.fetch("failure_behaviors")
+fail!("failure behavior set drifted: #{failure_behaviors.keys.sort.inspect}") unless failure_behaviors.keys.sort == EXPECTED_FAILURE_BEHAVIORS.sort
+failure_behaviors.each do |name, behavior|
   fail!("#{name} failure behavior must fail closed") unless behavior.fetch("fail_closed") == true
   fail!("#{name} reason code drifted") unless behavior.fetch("reason_code").start_with?("mission_twin.")
 end
 fail!("unredacted input must be rejected") unless policy.dig("failure_behaviors", "unredacted", "outcome") == "reject"
 
 requirements = policy.fetch("output_requirements")
+fail!("output requirement set drifted: #{requirements.keys.sort.inspect}") unless requirements.keys.sort == EXPECTED_OUTPUT_REQUIREMENTS.sort
 requirements.each do |name, value|
   fail!("output requirement #{name} must be true") unless value == true
 end
