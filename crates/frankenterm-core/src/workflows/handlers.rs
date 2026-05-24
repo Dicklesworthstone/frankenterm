@@ -45,6 +45,10 @@ fn parse_cost_usd_field(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
+fn cooldown_query_since_ms(now_ms: i64, cooldown_ms: i64) -> i64 {
+    now_ms.saturating_sub(cooldown_ms.max(0))
+}
+
 fn new_workflow_handler_audit_context(
     action_kind: &str,
     workflow_name: &str,
@@ -1817,7 +1821,7 @@ impl Workflow for HandleSessionStartContext {
             match step_idx {
                 // Step 0: Check cooldown to prevent repeated session-start injection spam.
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("session_start_context".to_string()),
@@ -1970,7 +1974,7 @@ impl Workflow for HandleSessionStartContext {
             match step_idx {
                 // Step 0: Cooldown check (cx-first read)
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("session_start_context".to_string()),
@@ -2568,7 +2572,7 @@ impl Workflow for HandleOnErrorCassSearch {
             match step_idx {
                 // Step 0: Check cooldown
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("on_error_cass_search".to_string()),
@@ -2738,7 +2742,7 @@ impl Workflow for HandleOnErrorCassSearch {
             match step_idx {
                 // Step 0: Cooldown check (cx-first read)
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("on_error_cass_search".to_string()),
@@ -2997,7 +3001,7 @@ impl Workflow for HandleSwarmLearningIndex {
             match step_idx {
                 // Step 0: Check cooldown
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("swarm_learning_index".to_string()),
@@ -3150,7 +3154,7 @@ impl Workflow for HandleSwarmLearningIndex {
             match step_idx {
                 // Step 0: Cooldown check (cx-first read)
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("swarm_learning_index".to_string()),
@@ -3728,7 +3732,7 @@ impl Workflow for HandleAuthRequired {
             match step_idx {
                 // Step 0: Check cooldown — query audit log for recent auth events
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("auth_required".to_string()),
@@ -3912,7 +3916,7 @@ impl Workflow for HandleAuthRequired {
             match step_idx {
                 // Step 0: Cooldown check (cx-first read)
                 0 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("auth_required".to_string()),
@@ -4270,7 +4274,7 @@ impl Workflow for HandleClaudeCodeLimits {
 
                 // Step 1: Cooldown check
                 1 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("claude_code_usage_limit".to_string()),
@@ -4449,7 +4453,7 @@ impl Workflow for HandleClaudeCodeLimits {
 
                 // Step 1: Cooldown check (cx-first read)
                 1 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("claude_code_usage_limit".to_string()),
@@ -4753,7 +4757,7 @@ impl Workflow for HandleGeminiQuota {
                 }
 
                 1 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("gemini_quota_limit".to_string()),
@@ -4930,7 +4934,7 @@ impl Workflow for HandleGeminiQuota {
 
                 // Step 1: Cooldown check (cx-first read)
                 1 => {
-                    let since = now_ms() - cooldown_ms;
+                    let since = cooldown_query_since_ms(now_ms(), cooldown_ms);
                     let query = crate::storage::AuditQuery {
                         pane_id: Some(pane_id),
                         action_kind: Some("gemini_quota_limit".to_string()),
@@ -5801,6 +5805,21 @@ mod tests {
             .iter()
             .map(|entry| (entry.key.clone(), entry.value.clone()))
             .collect()
+    }
+
+    #[test]
+    fn cooldown_query_since_ms_clamps_negative_cooldown_to_now() {
+        assert_eq!(cooldown_query_since_ms(10_000, -5_000), 10_000);
+    }
+
+    #[test]
+    fn cooldown_query_since_ms_saturates_huge_cooldown() {
+        assert_eq!(cooldown_query_since_ms(10_000, i64::MAX), 0);
+    }
+
+    #[test]
+    fn cooldown_query_since_ms_subtracts_positive_cooldown() {
+        assert_eq!(cooldown_query_since_ms(10_000, 2_500), 7_500);
     }
 
     // ========================================================================
