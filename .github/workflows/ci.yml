@@ -214,14 +214,20 @@ jobs:
       - name: Codec version release-note guard (ft-8smkj)
         run: scripts/check_codec_version_release_notes.sh
 
-      # ft-b1p6x — redactor streaming anchor-coverage + registration guard.
-      # Fences the recurring streaming-leak bug class (ft-b1p6x azureopenai /
-      # devicecode / usercode, DATADOG long-form, uppercase-anchor): every
-      # keyed-secret regex key-name with an `[_-]?` collapsible separator must,
-      # fully collapsed, contain a STREAMING_SECRET_ANCHORS entry, and every
-      # `static …: LazyLock<Regex>` must be wired into SECRET_PATTERNS. Both
-      # invariants are derived from redactor.rs, so the guard cannot drift from
-      # the catalog. Static; no compilation required.
+      # ft-b1p6x — redactor catalog + streaming anchor-coverage guard.
+      # All invariants are derived from redactor.rs, so the guard cannot drift
+      # from the catalog. Static; no compilation required. Enforces:
+      #   - anchor coverage: every keyed-secret regex key-name with a collapsible
+      #     optional separator (any spelling — `[_-]?`, `[-_]?`, `[_\- ]?`) must,
+      #     fully collapsed, contain a STREAMING_SECRET_ANCHORS entry. Fences the
+      #     recurring streaming-leak class (ft-b1p6x azureopenai / devicecode /
+      #     usercode, DATADOG long-form, uppercase-anchor).
+      #   - registration: every `static …: LazyLock<Regex>` is wired into
+      #     SECRET_PATTERNS (a defined-but-unwired regex silently leaks its class).
+      #   - name hygiene: every SecretPattern.name is unique snake_case (it keys
+      #     detect() attribution, secret_pattern_names(), and `[REDACTED:{name}]`).
+      #   - golden pin: the pattern-name set matches an inline 32-entry golden, so
+      #     deleting a whole pattern (silent security regression) fails loudly.
       - name: Redactor streaming anchor-coverage guard (ft-b1p6x)
         run: |
           bash tests/e2e/test_redactor_streaming_anchor_coverage.sh
