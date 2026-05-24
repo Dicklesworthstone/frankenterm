@@ -31,8 +31,8 @@ ok="$(printf '%s' "${json_output}" | jq -r '.ok')"
   echo "expected at least 7 live registry claims, got ${claim_count}" >&2
   exit 1
 }
-[[ "${fixture_count}" -eq 6 ]] || {
-  echo "expected 6 golden fixture cases, got ${fixture_count}" >&2
+[[ "${fixture_count}" -eq 7 ]] || {
+  echo "expected 7 golden fixture cases, got ${fixture_count}" >&2
   exit 1
 }
 
@@ -54,6 +54,7 @@ for case_id in \
   stale-count \
   dirty-worktree-release-count \
   missing-attestation-path \
+  missing-artifact-file \
   planned-only-advertised-supported \
   unsupported-command-advertised-supported
 do
@@ -72,6 +73,10 @@ printf '%s' "${json_output}" | jq -e '
 printf '%s' "${json_output}" | jq -e '
   .checks[] |
   select(.claim_id == "missing-attestation-path" and .actual.reason_codes[] == "fixture.artifact_path_null")
+' >/dev/null
+printf '%s' "${json_output}" | jq -e '
+  .checks[] |
+  select(.claim_id == "missing-artifact-file" and .actual.reason_codes[] == "fixture.artifact_missing")
 ' >/dev/null
 printf '%s' "${json_output}" | jq -e '
   .checks[] |

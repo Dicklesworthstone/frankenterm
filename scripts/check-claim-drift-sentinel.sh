@@ -371,6 +371,7 @@ class Sentinel
       stale-count
       dirty-worktree-release-count
       missing-attestation-path
+      missing-artifact-file
       planned-only-advertised-supported
       unsupported-command-advertised-supported
     ]

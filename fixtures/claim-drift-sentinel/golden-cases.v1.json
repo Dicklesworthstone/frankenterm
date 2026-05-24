@@ -91,6 +91,25 @@
       }
     },
     {
+      "case_id": "missing-artifact-file",
+      "title": "Declared attestation path does not resolve to a retained artifact",
+      "observed": {
+        "wording_state": "supported",
+        "release_source_required": true,
+        "source_mode": "head",
+        "dirty_worktree_measurement": false,
+        "artifact_present": false,
+        "artifact_path_null": false,
+        "advertised_as_supported": true
+      },
+      "expected": {
+        "verdict": "fail",
+        "reason_codes": [
+          "fixture.artifact_missing"
+        ]
+      }
+    },
+    {
       "case_id": "planned-only-advertised-supported",
       "title": "Planned-only contract wording is advertised as supported",
       "observed": {
