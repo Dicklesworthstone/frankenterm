@@ -67,6 +67,8 @@ REQUIRED_CASES = %w[
   operator-cancelled-ineligible
   dirty-overlap-ineligible
   code-failure-ineligible
+  missing-owned-paths-ineligible
+  local-fallback-evidence-ineligible
 ].freeze
 REQUIRED_STATES = %w[
   duplicate
@@ -78,6 +80,8 @@ REQUIRED_REASONS = %w[
   code_test_failure
   dirty_overlap
   duplicate_comment
+  local_fallback_evidence
+  missing_owned_paths
   operator_cancelled
   receipt_emitted
   stale_command_shape

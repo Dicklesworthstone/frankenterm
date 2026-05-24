@@ -146,6 +146,38 @@
       "expected_reason_codes": [
         "code_test_failure"
       ]
+    },
+    {
+      "case_id": "missing-owned-paths-ineligible",
+      "bead_id": "ft-mop1",
+      "source_comment": {
+        "kind": "beads_comment",
+        "comment_id": 6210,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T02:40:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "Proof-State: static_clean\nCommand: bash tests/e2e/test_disk_guard_contract.sh"
+      },
+      "expected_state": "ineligible",
+      "expected_reason_codes": [
+        "missing_owned_paths"
+      ]
+    },
+    {
+      "case_id": "local-fallback-evidence-ineligible",
+      "bead_id": "ft-lfe1",
+      "source_comment": {
+        "kind": "beads_comment",
+        "comment_id": 6211,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T02:45:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "Proof-State: static_clean\nCommand: bash tests/e2e/test_disk_guard_contract.sh\nOwned-Paths: tests/e2e/test_disk_guard_contract.sh\nNote: prior attempt hit [RCH] local and refused local fallback"
+      },
+      "expected_state": "ineligible",
+      "expected_reason_codes": [
+        "local_fallback_evidence"
+      ]
     }
   ]
 }
