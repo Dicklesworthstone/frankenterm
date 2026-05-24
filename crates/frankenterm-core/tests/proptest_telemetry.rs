@@ -341,6 +341,29 @@ proptest! {
         prop_assert_eq!(latest.pid, (n - 1) as u32);
         prop_assert_eq!(latest.timestamp_secs, (n - 1) as u64 * 100);
     }
+
+    /// snapshots() returns exactly the most-recent min(count, capacity)
+    /// pushes, oldest-first (FIFO eviction drops the front). Each push is
+    /// tagged with its index as timestamp_secs so the retained window's
+    /// identity and order are both checked.
+    #[test]
+    fn buffer_snapshots_are_most_recent_in_fifo_order(
+        capacity in 1_usize..20,
+        count in 0_usize..60,
+    ) {
+        let buf = CircularMetricBuffer::new(capacity);
+        for i in 0..count {
+            buf.push(arb_snapshot(1, i as u64));
+        }
+        let snaps = buf.snapshots();
+        let expected_len = count.min(capacity);
+        prop_assert_eq!(snaps.len(), expected_len);
+        let first_ts = (count - expected_len) as u64;
+        for (offset, s) in snaps.iter().enumerate() {
+            prop_assert_eq!(s.timestamp_secs, first_ts + offset as u64,
+                "snapshot at offset {} out of FIFO order", offset);
+        }
+    }
 }
 
 // =============================================================================
