@@ -516,26 +516,40 @@ impl PolicyRecommendationReport {
 
         for receipt in &self.receipts {
             match receipt.outcome {
-                PolicyRecommendationOutcome::Allow => summary.allow += 1,
-                PolicyRecommendationOutcome::Deny => summary.deny += 1,
-                PolicyRecommendationOutcome::RequireApproval => summary.require_approval += 1,
-                PolicyRecommendationOutcome::Delay => summary.delay += 1,
-                PolicyRecommendationOutcome::Degrade => summary.degrade += 1,
-                PolicyRecommendationOutcome::AskHuman => summary.ask_human += 1,
+                PolicyRecommendationOutcome::Allow => {
+                    summary.allow = summary.allow.saturating_add(1);
+                }
+                PolicyRecommendationOutcome::Deny => {
+                    summary.deny = summary.deny.saturating_add(1);
+                }
+                PolicyRecommendationOutcome::RequireApproval => {
+                    summary.require_approval = summary.require_approval.saturating_add(1);
+                }
+                PolicyRecommendationOutcome::Delay => {
+                    summary.delay = summary.delay.saturating_add(1);
+                }
+                PolicyRecommendationOutcome::Degrade => {
+                    summary.degrade = summary.degrade.saturating_add(1);
+                }
+                PolicyRecommendationOutcome::AskHuman => {
+                    summary.ask_human = summary.ask_human.saturating_add(1);
+                }
             }
             if receipt.policy_gate_required {
-                summary.policy_gated_receipts += 1;
+                summary.policy_gated_receipts = summary.policy_gated_receipts.saturating_add(1);
             }
             if receipt.approval_preview.is_some() {
-                summary.approval_previews += 1;
+                summary.approval_previews = summary.approval_previews.saturating_add(1);
             }
             if receipt.issues_approval_token {
-                summary.issued_approval_tokens += 1;
+                summary.issued_approval_tokens = summary.issued_approval_tokens.saturating_add(1);
             }
             if receipt.executes_action {
-                summary.executed_actions += 1;
+                summary.executed_actions = summary.executed_actions.saturating_add(1);
             }
-            summary.redacted_evidence_fields += receipt.redacted_evidence_fields;
+            summary.redacted_evidence_fields = summary
+                .redacted_evidence_fields
+                .saturating_add(receipt.redacted_evidence_fields);
         }
 
         summary.operator_summary = format!(
@@ -889,6 +903,25 @@ mod tests {
             .unwrap()
     }
 
+    fn synthetic_receipt(
+        outcome: PolicyRecommendationOutcome,
+        redacted_evidence_fields: usize,
+    ) -> PolicyRecommendationReceipt {
+        PolicyRecommendationReceipt {
+            receipt_id: "synthetic-receipt".to_string(),
+            candidate_id: "synthetic-candidate".to_string(),
+            outcome,
+            reason_codes: Vec::new(),
+            evidence: Vec::new(),
+            approval_preview: None,
+            policy_gate_required: false,
+            executes_action: false,
+            issues_approval_token: false,
+            redacted_evidence_fields,
+            operator_summary: String::new(),
+        }
+    }
+
     #[test]
     fn policy_recommendation_safe_read_allows_without_side_effects() {
         let report = golden_report();
@@ -1021,6 +1054,29 @@ mod tests {
                 .evidence
                 .iter()
                 .any(|item| item.detail.contains("secret transcript"))
+        );
+    }
+
+    #[test]
+    fn policy_recommendation_summary_saturates_redacted_field_total() {
+        let report = PolicyRecommendationReport {
+            schema_version: POLICY_RECOMMENDATION_SCHEMA_VERSION,
+            receipts: vec![
+                synthetic_receipt(PolicyRecommendationOutcome::Allow, usize::MAX),
+                synthetic_receipt(PolicyRecommendationOutcome::Deny, 1),
+            ],
+        };
+
+        let summary = report.summary();
+
+        assert_eq!(summary.total_candidates, 2);
+        assert_eq!(summary.allow, 1);
+        assert_eq!(summary.deny, 1);
+        assert_eq!(summary.redacted_evidence_fields, usize::MAX);
+        assert!(
+            summary
+                .operator_summary
+                .contains(&format!("redacted_fields={}", usize::MAX))
         );
     }
 
