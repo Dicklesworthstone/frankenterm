@@ -112,6 +112,37 @@ SAFE_ARTIFACT_ROOTS = %w[
   fixtures/deferred-proof-replay/receipt/
   tests/e2e/
 ].freeze
+SAFE_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/proof.json",
+  "./tests/e2e/proof.json",
+  "../tests/e2e/proof.json",
+  "tests/e2e//proof.json",
+  "tests/e2e/../proof.json",
+  "tests/e2e/./proof.json",
+  "tests/e2e/.",
+  "tests/e2e/..",
+  "tests/e2e/.git/config",
+  "tests\\e2e\\proof.json"
+].freeze
+SAFE_ARTIFACT_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/proof.json",
+  "./tests/e2e/test_deferred_proof_receipt_contract.sh",
+  "../tests/e2e/test_deferred_proof_receipt_contract.sh",
+  "tests/e2e//test_deferred_proof_receipt_contract.sh",
+  "tests/e2e/../test_deferred_proof_receipt_contract.sh",
+  "tests/e2e/./test_deferred_proof_receipt_contract.sh",
+  "tests/e2e/.",
+  "tests/e2e/..",
+  "tests/e2e/.git/config.json",
+  "tests/e2e/proof.txt",
+  "docs/json-schema/",
+  "fixtures/deferred-proof-replay/ownership-gate/cases.v1.json",
+  "fixtures\\deferred-proof-replay\\receipt\\valid\\cases.v1.json"
+].freeze
 
 def fail!(message)
   warn "deferred proof receipt contract: #{message}"
@@ -168,6 +199,16 @@ def artifact_path_safe?(path)
     path.match?(/\.(json|md|sh)\z/) &&
     SAFE_ARTIFACT_ROOTS.any? { |root| path.start_with?(root) && path.length > root.length }
 end
+
+SAFE_PATH_NEGATIVES.each do |path|
+  fail!("path_safe? accepted unsafe path #{path.inspect}") if path_safe?(path)
+end
+fail!("path_safe? rejected known-good repo path") unless path_safe?("tests/e2e/test_deferred_proof_receipt_contract.sh")
+
+SAFE_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("artifact_path_safe? accepted unsafe path #{path.inspect}") if artifact_path_safe?(path)
+end
+fail!("artifact_path_safe? rejected known-good artifact path") unless artifact_path_safe?("tests/e2e/test_deferred_proof_receipt_contract.sh")
 
 def local_fallback_text?(receipt)
   JSON.generate(receipt).match?(/\[RCH\] local|running locally|local fallback/i)
