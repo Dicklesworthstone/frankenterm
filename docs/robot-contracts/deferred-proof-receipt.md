@@ -27,6 +27,9 @@ fixture corpus lives under `fixtures/deferred-proof-replay/receipt/`.
   Cargo/test must use `rch_admission_state: topology_preflight_failed`, preserve
   `selected_worker` and `rch_job_id` when known, and keep
   `remote_failure_phase: topology_preflight`.
+- A `topology_preflight_failed` receipt must never claim `eligibility.state:
+  eligible` — topology preflight never reached Cargo, so the proof is not
+  replayable and the verifier rejects it as `topology_preflight_not_eligible`.
 - Artifact paths are repository-relative and may only point under
   `docs/json-schema/`, `docs/robot-contracts/`,
   `fixtures/deferred-proof-replay/receipt/`, or `tests/e2e/`.
@@ -68,6 +71,7 @@ The static verifier freezes valid and invalid examples:
 - `operator-cancelled-replayable`
 - `prerequisite-bypass`
 - `duplicate-env-allowlist`
+- `topology-preflight-eligible-bypass`
 
 Run:
 

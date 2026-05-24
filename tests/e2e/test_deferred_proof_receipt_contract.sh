@@ -71,6 +71,7 @@ REQUIRED_INVALID = %w[
   operator-cancelled-replayable
   prerequisite-bypass
   duplicate-env-allowlist
+  topology-preflight-eligible-bypass
 ].freeze
 REQUIRED_FORBIDDEN = %w[
   local_cargo_proof
@@ -206,6 +207,7 @@ def rejection_reasons(receipt)
   reasons << "ambiguous_dirty_overlap" if overlap.any? && eligibility["state"] != "dirty_overlap"
   reasons << "prerequisite_blocked" if coordination.fetch("prerequisite_beads", []).any? && eligibility["state"] == "eligible"
   reasons << "operator_cancelled" if coordination["operator_cancelled"] == true && eligibility["replay_allowed"] != false
+  reasons << "topology_preflight_not_eligible" if coordination["rch_admission_state"] == "topology_preflight_failed" && eligibility["state"] == "eligible"
   Array(paths.fetch("artifact_paths", [])).each do |path|
     reasons << "unsafe_artifact_path" unless artifact_path_safe?(path) && File.file?(path)
   end
