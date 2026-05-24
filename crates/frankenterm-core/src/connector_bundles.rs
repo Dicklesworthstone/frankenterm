@@ -540,7 +540,7 @@ impl IngestionPipeline {
 
         // Rate limit.
         if self.config.max_ingest_per_sec > 0 {
-            if now_ms >= self.window_start_ms + 1000 {
+            if now_ms.saturating_sub(self.window_start_ms) >= 1000 {
                 self.window_start_ms = now_ms;
                 self.window_count = 0;
             }
@@ -1603,6 +1603,27 @@ mod tests {
         assert!(matches!(outcome, IngestionOutcome::Rejected { .. }));
         // New window at 2000ms.
         assert_eq!(pipeline.ingest(&event, 2000), IngestionOutcome::Recorded);
+    }
+
+    #[test]
+    fn ingest_rate_limit_window_saturates_timestamp_overflow() {
+        let config = IngestionPipelineConfig {
+            max_ingest_per_sec: 1,
+            ..Default::default()
+        };
+        let mut pipeline = IngestionPipeline::new(config);
+        let event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
+        assert_eq!(
+            pipeline.ingest(&event, u64::MAX - 1),
+            IngestionOutcome::Recorded
+        );
+        let outcome = pipeline.ingest(&event, u64::MAX);
+        assert!(matches!(outcome, IngestionOutcome::Rejected { .. }));
     }
 
     #[test]
