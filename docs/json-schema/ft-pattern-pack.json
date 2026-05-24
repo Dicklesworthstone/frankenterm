@@ -10,11 +10,13 @@
     "name": {
       "type": "string",
       "minLength": 1,
+      "pattern": "\\S",
       "description": "Pack identifier. Built-in packs use a `builtin:` prefix; user packs use a plain or namespaced name. MUST be non-empty after trimming."
     },
     "version": {
       "type": "string",
       "minLength": 1,
+      "pattern": "\\S",
       "description": "Pack version. Treated as opaque by the loader; semver-like strings are conventional."
     },
     "rules": {
@@ -39,12 +41,14 @@
         "id": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "description": "Stable rule identifier. SHOULD use a `<agent>.<feature>.<event>` dotted convention."
         },
         "agent_type": { "$ref": "#/$defs/AgentType" },
         "event_type": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "description": "Event-type label emitted on match (e.g. `usage_limit`, `compaction_required`)."
         },
         "severity": { "$ref": "#/$defs/Severity" },
@@ -53,7 +57,8 @@
           "minItems": 1,
           "items": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S"
           },
           "description": "Literal substrings used by the Aho-Corasick quick-reject pass. SHOULD include at least one anchor."
         },
@@ -64,6 +69,7 @@
         "description": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "description": "Human-readable description shown in `ft why <rule_id>`."
         },
         "remediation": {

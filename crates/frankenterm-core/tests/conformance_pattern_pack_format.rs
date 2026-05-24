@@ -536,6 +536,108 @@ fn synthetic_pack_empty_required_strings_must_fail() {
 }
 
 #[test]
+fn synthetic_pack_whitespace_required_strings_must_fail() {
+    let validator = load_schema();
+    for (field, bad) in [
+        (
+            "name",
+            serde_json::json!({
+                "name": "   ",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.whitespace_name",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_whitespace_name",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule in a whitespace-named pack."
+                }]
+            }),
+        ),
+        (
+            "version",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "\t",
+                "rules": [{
+                    "id": "codex.synthetic.whitespace_version",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_whitespace_version",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule in a whitespace-versioned pack."
+                }]
+            }),
+        ),
+        (
+            "rule.id",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": " ",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_whitespace_id",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying a whitespace id."
+                }]
+            }),
+        ),
+        (
+            "rule.event_type",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.whitespace_event_type",
+                    "agent_type": "codex",
+                    "event_type": "\n",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying a whitespace event_type."
+                }]
+            }),
+        ),
+        (
+            "rule.description",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.whitespace_description",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_whitespace_description",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": " \t "
+                }]
+            }),
+        ),
+        (
+            "rule.anchors[]",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.whitespace_anchor",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_whitespace_anchor",
+                    "severity": "warning",
+                    "anchors": [" \t "],
+                    "description": "Synthetic rule carrying a whitespace anchor."
+                }]
+            }),
+        ),
+    ] {
+        assert!(
+            validator.validate(&bad).is_err(),
+            "schema validator accepted whitespace-only required string for {field}"
+        );
+    }
+}
+
+#[test]
 fn synthetic_pack_invalid_rule_enums_must_fail() {
     let validator = load_schema();
     for (field, bad) in [
