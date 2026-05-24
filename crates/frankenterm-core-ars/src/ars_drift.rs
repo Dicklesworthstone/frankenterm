@@ -217,7 +217,7 @@ impl EValueMonitor {
                 }
             };
         }
-        self.total_observations += 1;
+        self.total_observations = self.total_observations.saturating_add(1);
         let outcome = outcome.clamp(0.0, 1.0);
 
         // Phase 1: Calibration.
@@ -255,9 +255,9 @@ impl EValueMonitor {
         }
 
         // Phase 2: E-value accumulation.
-        self.post_cal_observations += 1;
+        self.post_cal_observations = self.post_cal_observations.saturating_add(1);
         if outcome > 0.5 {
-            self.post_cal_successes += 1;
+            self.post_cal_successes = self.post_cal_successes.saturating_add(1);
         }
 
         // Adaptive lambda: bet on the difference between observed and null rate.
@@ -281,7 +281,7 @@ impl EValueMonitor {
 
         // Check for drift.
         if self.e_value >= config.threshold() {
-            self.drift_count += 1;
+            self.drift_count = self.drift_count.saturating_add(1);
             let verdict = DriftVerdict::Drifted {
                 e_value: self.e_value,
                 null_rate: self.null_rate,
@@ -463,7 +463,7 @@ impl ArsDriftDetector {
     /// Observe an execution outcome for a reflex.
     /// Returns a drift event if drift was detected.
     pub fn observe(&mut self, reflex_id: ReflexId, success: bool) -> Option<ArsDriftEvent> {
-        self.total_observations += 1;
+        self.total_observations = self.total_observations.saturating_add(1);
         let outcome = if success { 1.0 } else { 0.0 };
 
         let monitor = self
@@ -480,7 +480,7 @@ impl ArsDriftDetector {
             observations,
         } = verdict
         {
-            self.total_drifts += 1;
+            self.total_drifts = self.total_drifts.saturating_add(1);
             Some(ArsDriftEvent {
                 reflex_id,
                 cluster_id: monitor.cluster_id().to_string(),
@@ -930,6 +930,53 @@ mod tests {
         let stats = detector.stats();
         assert_eq!(stats.registered_reflexes, 2);
         assert_eq!(stats.total_observations, 10);
+    }
+
+    #[test]
+    fn monitor_counters_saturate() {
+        let config = EValueConfig {
+            alpha: 1.0,
+            decay: 1.0,
+            auto_reset_on_drift: false,
+            ..quick_config()
+        };
+        let mut monitor = EValueMonitor::new("c1");
+        monitor.calibrated = true;
+        monitor.null_rate = 0.01;
+        monitor.e_value = 1.0;
+        monitor.total_observations = usize::MAX;
+        monitor.post_cal_observations = usize::MAX;
+        monitor.post_cal_successes = usize::MAX;
+        monitor.drift_count = usize::MAX;
+
+        assert!(monitor.observe(1.0, &config).is_drifted());
+        assert_eq!(monitor.total_observations, usize::MAX);
+        assert_eq!(monitor.post_cal_observations, usize::MAX);
+        assert_eq!(monitor.post_cal_successes, usize::MAX);
+        assert_eq!(monitor.drift_count, usize::MAX);
+    }
+
+    #[test]
+    fn detector_totals_saturate() {
+        let config = EValueConfig {
+            alpha: 1.0,
+            decay: 1.0,
+            auto_reset_on_drift: false,
+            ..quick_config()
+        };
+        let mut detector = ArsDriftDetector::new(config);
+        detector.total_observations = u64::MAX;
+        detector.total_drifts = u64::MAX;
+        detector.register_reflex(1, "c1");
+        let monitor = detector.monitors.get_mut(&1).unwrap();
+        monitor.calibrated = true;
+        monitor.null_rate = 0.01;
+        monitor.e_value = 1.0;
+
+        assert!(detector.observe(1, true).is_some());
+        let stats = detector.stats();
+        assert_eq!(stats.total_observations, u64::MAX);
+        assert_eq!(stats.total_drifts, u64::MAX);
     }
 
     #[test]
