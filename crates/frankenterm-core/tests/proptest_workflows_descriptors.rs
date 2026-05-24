@@ -382,6 +382,30 @@ proptest! {
     }
 
     #[test]
+    fn empty_trigger_values_fail_validation(
+        mut val in arb_workflow_descriptor(),
+        trigger_field in 0u8..3,
+    ) {
+        let mut trigger = DescriptorTrigger {
+            event_types: vec!["session.compaction".to_string()],
+            agent_types: vec!["codex".to_string()],
+            rule_ids: vec!["compaction.detected".to_string()],
+        };
+        match trigger_field {
+            0 => trigger.event_types = vec![" \t ".to_string()],
+            1 => trigger.agent_types = vec![" \t ".to_string()],
+            _ => trigger.rule_ids = vec![" \t ".to_string()],
+        }
+        val.triggers = vec![trigger];
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            val.validate(&limits).is_err(),
+            "descriptor validation must reject empty trigger values"
+        );
+    }
+
+    #[test]
     fn duplicate_top_level_step_ids_fail_validation(
         name in "[a-z_]{3,20}",
         duplicate_id in "[a-z_]{3,15}",

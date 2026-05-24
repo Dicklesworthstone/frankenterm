@@ -159,6 +159,12 @@ impl WorkflowDescriptor {
             ));
         }
 
+        for trigger in &self.triggers {
+            validate_trigger_values("event_types", &trigger.event_types)?;
+            validate_trigger_values("agent_types", &trigger.agent_types)?;
+            validate_trigger_values("rule_ids", &trigger.rule_ids)?;
+        }
+
         if self.steps.len() > limits.max_steps {
             return Err(crate::Error::Config(
                 crate::error::ConfigError::ValidationError(format!(
@@ -185,6 +191,17 @@ impl WorkflowDescriptor {
 
         Ok(())
     }
+}
+
+fn validate_trigger_values(field: &str, values: &[String]) -> crate::Result<()> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Descriptor trigger {field} cannot contain empty values"
+            )),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_step_tree(
