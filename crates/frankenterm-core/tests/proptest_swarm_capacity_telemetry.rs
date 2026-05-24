@@ -47,6 +47,45 @@ proptest! {
                 "non-targeted stage {:?} must not accumulate arrivals", row.stage);
         }
     }
+
+    /// in_flight_estimate is the saturating difference between arrivals and
+    /// terminal outcomes (completions + cancellations + timeouts + errors).
+    /// record_outcome does not bump arrivals, so the conservation relation
+    /// is exact: in_flight == max(0, arrivals - terminals).
+    #[test]
+    fn in_flight_estimate_is_arrivals_minus_terminals(
+        arrivals in 0u32..30,
+        completions in 0u32..15,
+        cancellations in 0u32..15,
+    ) {
+        let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+        let stage = SwarmCapacityStage::IngestCapture;
+        for _ in 0..arrivals {
+            telemetry.record_arrival(stage, 1);
+        }
+        for _ in 0..completions {
+            telemetry.record_outcome(stage, SwarmCapacityOutcome::Completed, 1.0, 1);
+        }
+        for _ in 0..cancellations {
+            telemetry.record_outcome(stage, SwarmCapacityOutcome::Cancelled, 1.0, 1);
+        }
+        let snapshot = telemetry.snapshot();
+        let row = snapshot
+            .stages
+            .iter()
+            .find(|row| row.stage == stage)
+            .expect("targeted stage present");
+
+        prop_assert_eq!(row.arrivals, u64::from(arrivals));
+        prop_assert_eq!(row.completions, u64::from(completions));
+        prop_assert_eq!(row.cancellations, u64::from(cancellations));
+        let terminals = u64::from(completions) + u64::from(cancellations);
+        prop_assert_eq!(
+            row.in_flight_estimate,
+            u64::from(arrivals).saturating_sub(terminals),
+            "in_flight must be arrivals minus terminal outcomes (saturating)"
+        );
+    }
 }
 
 /// record_outcome dispatches each outcome to the correct stage counter.
