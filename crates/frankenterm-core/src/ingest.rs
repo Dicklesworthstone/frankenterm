@@ -1934,7 +1934,8 @@ struct PaneCacheState {
 pub struct OutputCache {
     config: OutputCacheConfig,
     global_hashes: HashMap<u64, i64>,
-    /// LRU order tracking - uses VecDeque for O(1) removal from front
+    /// LRU order tracking (front = least recently used). Eviction pops the
+    /// front in O(1); access moves the hash to the back in O(n) (ft-fesg7).
     lru_order: VecDeque<u64>,
     pane_states: HashMap<u64, PaneCacheState>,
     hits: u64,
@@ -2008,10 +2009,19 @@ impl OutputCache {
     fn update_global_lru(&mut self, hash: u64, now: i64) {
         if let Entry::Occupied(mut entry) = self.global_hashes.entry(hash) {
             entry.insert(now);
+            // ft-fesg7: refresh recency on access. Without moving the hash to
+            // the back of `lru_order`, the deque stays in INSERTION order and
+            // capacity eviction (`pop_front`) is FIFO, not LRU — a hot, early
+            // hash would be evicted ahead of colder, later-inserted ones. Move
+            // it to the back so eviction reflects access recency.
+            if let Some(pos) = self.lru_order.iter().position(|&h| h == hash) {
+                self.lru_order.remove(pos);
+            }
+            self.lru_order.push_back(hash);
             return;
         }
 
-        // Evict oldest entries if at capacity - O(1) with VecDeque
+        // Evict least-recently-used entries if at capacity - O(1) pop from front
         while self.lru_order.len() >= self.config.global_lru_capacity {
             if let Some(oldest_hash) = self.lru_order.pop_front() {
                 self.global_hashes.remove(&oldest_hash);
@@ -5026,6 +5036,38 @@ mod tests {
 
         // Content A should be treated as new again (evicted from global)
         assert!(cache.is_new(2, "content A\n"));
+    }
+
+    #[test]
+    fn output_cache_lru_refreshes_on_access() {
+        // ft-fesg7: eviction must be LRU, not FIFO. Re-accessing an early hash
+        // must keep it alive when a new hash forces an eviction; the colder,
+        // un-accessed hash should be evicted instead.
+        let config = OutputCacheConfig {
+            global_lru_capacity: 3,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+
+        // Insert A, B, C (A is the oldest by insertion).
+        assert!(cache.is_new(1, "content A\n"));
+        assert!(cache.is_new(1, "content B\n"));
+        assert!(cache.is_new(1, "content C\n"));
+        assert_eq!(cache.stats().global_entries, 3);
+
+        // Access A again via a fresh pane (bypasses the per-pane fast path so
+        // the global-LRU recency is refreshed). A is now most-recently-used.
+        assert!(!cache.is_new(2, "content A\n"));
+
+        // Insert D at capacity: the least-recently-used is now B, not A.
+        assert!(cache.is_new(3, "content D\n"));
+        assert_eq!(cache.stats().global_entries, 3);
+
+        // A survived because it was refreshed on access (would be a miss under
+        // FIFO eviction).
+        assert!(!cache.is_new(4, "content A\n"));
+        // B was evicted as the genuine least-recently-used entry.
+        assert!(cache.is_new(5, "content B\n"));
     }
 
     #[test]
