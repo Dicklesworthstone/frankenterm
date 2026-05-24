@@ -717,7 +717,7 @@
       "required": ["required_categories", "slots"],
       "additionalProperties": false,
       "properties": {
-        "$schema": { "type": "string" },
+        "$schema": { "const": "./schema.json#/$defs/manifestPlaceholder" },
         "_comment": { "type": "string" },
         "required_categories": {
           "type": "array",

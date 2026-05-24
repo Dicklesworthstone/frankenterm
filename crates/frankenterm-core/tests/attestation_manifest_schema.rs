@@ -256,6 +256,17 @@ fn manifest_schema_rejects_empty_required_categories_or_slots() {
 }
 
 #[test]
+fn manifest_schema_rejects_wrong_schema_marker() {
+    let validator = manifest_validator();
+    let mut manifest = base_manifest(base_slot(json!("docs/perf/headline-claims.json")));
+    manifest["$schema"] = json!("./schema.json");
+    assert!(
+        !validate(&validator, &manifest).is_empty(),
+        "attestation manifest must use the manifestPlaceholder schema marker"
+    );
+}
+
+#[test]
 fn manifest_schema_rejects_parent_directory_paths() {
     let validator = manifest_validator();
 
