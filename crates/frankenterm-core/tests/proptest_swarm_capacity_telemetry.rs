@@ -86,6 +86,48 @@ proptest! {
             "in_flight must be arrivals minus terminal outcomes (saturating)"
         );
     }
+
+    /// record_outcome feeds the per-stage service-time and queue-depth
+    /// histograms once per call (before the outcome dispatch). With N
+    /// identical samples, total count == N and min/max/mean all equal the
+    /// recorded value (true regardless of the retained-sample cap, since
+    /// every sample is identical).
+    #[test]
+    fn record_outcome_feeds_service_time_and_queue_histograms(
+        n in 1u32..20,
+        service_ms in 0.5f64..1000.0,
+        queue in 1u64..5000,
+    ) {
+        let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+        let stage = SwarmCapacityStage::IngestCapture;
+        for _ in 0..n {
+            telemetry.record_outcome(stage, SwarmCapacityOutcome::Completed, service_ms, queue);
+        }
+        let snapshot = telemetry.snapshot();
+        let row = snapshot
+            .stages
+            .iter()
+            .find(|row| row.stage == stage)
+            .expect("targeted stage present");
+
+        prop_assert_eq!(row.service_time_ms.count, u64::from(n),
+            "service-time histogram must count every record_outcome sample");
+        prop_assert!(
+            row.service_time_ms.min.is_some_and(|m| (m - service_ms).abs() < 1e-9),
+            "service-time min must equal the recorded value"
+        );
+        prop_assert!(
+            row.service_time_ms.max.is_some_and(|m| (m - service_ms).abs() < 1e-9),
+            "service-time max must equal the recorded value"
+        );
+
+        prop_assert_eq!(row.queue_depth.count, u64::from(n),
+            "queue-depth histogram must count every record_outcome sample");
+        prop_assert!(
+            row.queue_depth.min.is_some_and(|m| (m - queue as f64).abs() < 1e-9),
+            "queue-depth min must equal the recorded value"
+        );
+    }
 }
 
 /// record_outcome dispatches each outcome to the correct stage counter.
