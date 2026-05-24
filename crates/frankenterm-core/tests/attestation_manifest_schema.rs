@@ -219,6 +219,20 @@ fn manifest_schema_rejects_parent_directory_paths() {
 }
 
 #[test]
+fn manifest_schema_rejects_blank_deferred_reasons() {
+    let validator = manifest_validator();
+
+    let mut deferred_slot = base_slot(Value::Null);
+    deferred_slot["deferred_to_bead"] = json!("ft-e87u6.9");
+    deferred_slot["deferred_reason"] = json!(" \t\n");
+    let errors = validate(&validator, &base_manifest(deferred_slot));
+    assert!(
+        !errors.is_empty(),
+        "manifest slot deferrals must carry a non-blank deferred_reason"
+    );
+}
+
+#[test]
 fn checked_in_manifest_validates_against_deferred_slot_schema() {
     let validator = manifest_validator();
     let path = workspace_root()
