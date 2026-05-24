@@ -1491,6 +1491,24 @@ fn redact_mcp_pane_state_fields(states: &mut [McpPaneState]) {
     }
 }
 
+/// Redact secret-shaped tokens from any text that will appear in an MCP
+/// tool response — data fields *or* error messages. The MCP error path can
+/// echo caller-supplied input: the `wait_for` pattern in particular is
+/// reflected verbatim by `fancy_regex`/`regex` into compile-error strings
+/// (e.g. `regex parse error:\n    sk-ant-…\n    ^`), so a secret embedded in
+/// an invalid pattern would otherwise leak through the error envelope. Every
+/// operator-visible string is funnelled through the shared redactor before it
+/// leaves the process. See ft-qde8p for the remote-error precedent.
+fn redact_mcp_output_secrets(text: &str) -> String {
+    static REDACTOR: LazyLock<crate::redactor::Redactor> =
+        LazyLock::new(crate::redactor::Redactor::new);
+    REDACTOR.redact(text)
+}
+
+fn redact_mcp_wait_pattern_for_output(pattern: &str) -> String {
+    redact_mcp_output_secrets(pattern)
+}
+
 impl WaStateTool {
     pub(super) fn new(filter: PaneFilterConfig, db_path: Option<Arc<PathBuf>>) -> Self {
         Self { filter, db_path }
@@ -1995,7 +2013,7 @@ impl ToolHandler for WaWaitForTool {
             Err(err) => {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
-                    format!("Invalid regex pattern: {err}"),
+                    redact_mcp_output_secrets(&format!("Invalid regex pattern: {err}")),
                     Some("Check the regex syntax".to_string()),
                     elapsed_ms(start),
                 );
@@ -2152,6 +2170,7 @@ impl ToolHandler for WaWaitForTool {
                 .map_err(McpToolError::from_error)
         });
 
+        let redacted_pattern = redact_mcp_wait_pattern_for_output(&pattern);
         match result {
             Ok(WaitResult::Matched {
                 elapsed_ms: wait_elapsed_ms,
@@ -2159,7 +2178,7 @@ impl ToolHandler for WaWaitForTool {
             }) => {
                 let data = McpWaitForData {
                     pane_id,
-                    pattern,
+                    pattern: redacted_pattern.clone(),
                     matched: true,
                     elapsed_ms: wait_elapsed_ms,
                     polls,
@@ -2176,7 +2195,7 @@ impl ToolHandler for WaWaitForTool {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_TIMEOUT,
                     format!(
-                        "Timeout waiting for pattern '{pattern}' after {wait_elapsed_ms}ms ({polls} polls)"
+                        "Timeout waiting for pattern '{redacted_pattern}' after {wait_elapsed_ms}ms ({polls} polls)"
                     ),
                     Some("Increase timeout_secs or verify the pattern.".to_string()),
                     elapsed_ms(start),
@@ -2989,6 +3008,10 @@ impl ToolHandler for WaSendTool {
                 input = input.with_pane_cwd(cwd.clone());
             }
 
+            let redacted_wait_for = params
+                .wait_for
+                .as_ref()
+                .map(|pattern| redact_mcp_wait_pattern_for_output(pattern));
             let wait_matcher = match params.wait_for.as_ref() {
                 Some(pattern) => Some(crate::wezterm::compile_wait_matcher(
                     pattern,
@@ -3065,9 +3088,13 @@ impl ToolHandler for WaSendTool {
                     let timeout = std::time::Duration::from_secs(params.timeout_secs);
                     match waiter.wait_for(params.pane_id, matcher, timeout).await {
                         Ok(WaitResult::Matched { elapsed_ms, polls }) => {
+                            let pattern_out = redacted_wait_for
+                                .as_deref()
+                                .unwrap_or(pattern)
+                                .to_string();
                             wait_for_data = Some(McpWaitForData {
                                 pane_id: params.pane_id,
-                                pattern: pattern.clone(),
+                                pattern: pattern_out,
                                 matched: true,
                                 elapsed_ms,
                                 polls,
@@ -3077,21 +3104,29 @@ impl ToolHandler for WaSendTool {
                         Ok(WaitResult::TimedOut {
                             elapsed_ms, polls, ..
                         }) => {
+                            let pattern_out = redacted_wait_for
+                                .as_deref()
+                                .unwrap_or(pattern)
+                                .to_string();
                             wait_for_data = Some(McpWaitForData {
                                 pane_id: params.pane_id,
-                                pattern: pattern.clone(),
+                                pattern: pattern_out.clone(),
                                 matched: false,
                                 elapsed_ms,
                                 polls,
                                 is_regex: params.wait_for_regex,
                             });
                             verification_error =
-                                Some(format!("Timeout waiting for pattern '{pattern}'"));
+                                Some(format!("Timeout waiting for pattern '{pattern_out}'"));
                         }
                         Ok(WaitResult::Cancelled { reason, polls }) => {
+                            let pattern_out = redacted_wait_for
+                                .as_deref()
+                                .unwrap_or(pattern)
+                                .to_string();
                             wait_for_data = Some(McpWaitForData {
                                 pane_id: params.pane_id,
-                                pattern: pattern.clone(),
+                                pattern: pattern_out,
                                 matched: false,
                                 elapsed_ms: 0,
                                 polls,
@@ -3122,8 +3157,11 @@ impl ToolHandler for WaSendTool {
             }
             Err(err) => {
                 let (code, hint) = map_mcp_error(&err);
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                // The wait_for compile error (and any other error from this
+                // block) is reflected verbatim into the message; redact
+                // secret-shaped tokens before they reach the MCP client.
+                let message = redact_mcp_output_secrets(&err.to_string());
+                let envelope = McpEnvelope::<()>::error(code, message, hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -9443,6 +9481,79 @@ exit 17",
             assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
             assert_eq!(envelope["error"], "wait-for reads are blocked");
         });
+    }
+
+    #[test]
+    fn wait_for_pattern_output_redaction_masks_secret_tokens() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let redacted = redact_mcp_wait_pattern_for_output(&format!("ready {secret}"));
+
+        assert!(
+            !redacted.contains(&secret),
+            "raw secret leaked in MCP wait-for pattern output"
+        );
+        assert!(
+            redacted.contains("[REDACTED]"),
+            "expected redaction marker in MCP wait-for pattern output"
+        );
+    }
+
+    #[test]
+    fn invalid_regex_compile_error_does_not_leak_secret_in_pattern() {
+        // A wait_for pattern that is an invalid regex AND carries a secret can
+        // leak: the `regex` crate (reached via fancy_regex's delegated
+        // `CompileError::InnerError`) reflects the offending pattern source
+        // verbatim into a code-frame compile error. Both WaWaitForTool (the
+        // `Invalid regex pattern: {err}` envelope) and WaSendTool (the
+        // `err.to_string()` catch-all) now route that string through
+        // `redact_mcp_output_secrets`, so the secret must not survive.
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        // Faithfully model the `regex`-crate compile-error shape that echoes
+        // the pattern source verbatim (this is the exact text that would reach
+        // the MCP client through `Error::CompileError` -> "Regex error: ...").
+        let raw_message = format!(
+            "Invalid regex pattern: Error compiling regex: Regex error: \
+             regex parse error:\n    {secret}{{\n    ^\nerror: repetition \
+             quantifier expects a valid decimal"
+        );
+        // Non-vacuous: the unredacted message really does echo the secret.
+        assert!(
+            raw_message.contains(&secret),
+            "test precondition: regex compile error echoes the pattern source"
+        );
+
+        let redacted = redact_mcp_output_secrets(&raw_message);
+        assert!(
+            !redacted.contains(&secret),
+            "secret leaked through invalid-regex MCP error message"
+        );
+        assert!(
+            redacted.contains("[REDACTED]"),
+            "expected redaction marker in invalid-regex MCP error message"
+        );
+
+        // Exercise a real compile failure end-to-end: whatever fancy_regex
+        // emits for a malformed pattern, the operator-visible string is
+        // redaction-safe and the call never panics.
+        let live_err = crate::wezterm::compile_wait_matcher(&format!("(?P<g>{secret}"), true)
+            .expect_err("unclosed group must fail to compile");
+        let live_redacted = redact_mcp_output_secrets(&format!("Invalid regex pattern: {live_err}"));
+        assert!(
+            !live_redacted.contains(&secret),
+            "secret leaked through live fancy_regex compile error"
+        );
     }
 
     #[test]
