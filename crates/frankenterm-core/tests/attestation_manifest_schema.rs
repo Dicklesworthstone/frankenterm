@@ -51,6 +51,19 @@ fn bundle_validator() -> Validator {
         .unwrap_or_else(|err| panic!("bundle schema failed to compile: {err}"))
 }
 
+fn retraction_validator() -> Validator {
+    let schema = load_attestation_schema();
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema.get("$defs").expect("attestation schema has $defs"),
+        "$ref": "#/$defs/attestationRetraction"
+    });
+    Validator::options()
+        .with_draft(Draft::Draft202012)
+        .build(&schema)
+        .unwrap_or_else(|err| panic!("retraction schema failed to compile: {err}"))
+}
+
 fn validate(schema: &Validator, instance: &Value) -> Vec<String> {
     match schema.validate(instance) {
         Ok(()) => Vec::new(),
@@ -102,6 +115,22 @@ fn base_bundle(signature: Value) -> Value {
         "taxonomy_coverage": base_taxonomy_coverage(),
         "confidence_summary": base_confidence_summary(),
         "signature": signature
+    })
+}
+
+fn base_retraction(signature: Value) -> Value {
+    json!({
+        "schema_version": "1.0.0",
+        "retracted_at": "2026-05-12T00:00:00Z",
+        "retracted_by_release": "0.2.1",
+        "retraction_rationale": "synthetic retraction signature regression",
+        "affected_slot": "perf/headline-claims",
+        "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "original_claim_value": {
+            "status": "claimed"
+        },
+        "corrected_claim_value": null,
+        "retraction_signature": signature
     })
 }
 
@@ -462,5 +491,30 @@ fn bundle_schema_rejects_unsigned_reason_without_tracking_bead() {
     assert!(
         !validate(&validator, &bundle).is_empty(),
         "unsigned bundle reason must include a tracking bead ID"
+    );
+}
+
+#[test]
+fn attestation_retraction_schema_rejects_unsigned_signatures() {
+    let validator = retraction_validator();
+    let signed = base_retraction(json!({
+        "method": "ed25519",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signature_path": "docs/attestations/retractions/0.2.1.sig",
+        "public_key": "3333333333333333333333333333333333333333333333333333333333333333"
+    }));
+    assert!(
+        validate(&validator, &signed).is_empty(),
+        "signed retraction should validate"
+    );
+
+    let unsigned = base_retraction(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "synthetic retraction signature gap tracked by ft-e87u6.2"
+    }));
+    assert!(
+        !validate(&validator, &unsigned).is_empty(),
+        "retraction_signature must reject unsigned signatures"
     );
 }
