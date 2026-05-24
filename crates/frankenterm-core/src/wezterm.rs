@@ -6482,7 +6482,9 @@ pub fn discover_mux_socket(config_socket_path: Option<&str>) -> Option<std::path
     #[cfg(all(feature = "vendored", unix))]
     {
         if let Some(path) = crate::vendored::discover_canonical_mux_socket() {
-            return Some(path);
+            if mux_socket_path_is_usable(&path) {
+                return Some(path);
+            }
         }
     }
 
