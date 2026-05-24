@@ -198,6 +198,23 @@ EXPECTED_ARTIFACT_PATH_PREFIXES = [
   "docs/json-schema/",
   "fixtures/mission-planner/agent-task-fit-passport/"
 ].freeze
+SAFE_ARTIFACT_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/agent-task-fit-passport/cases.v1.json",
+  "./fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+  "../fixtures/mission-planner/agent-task-fit-passport/cases.v1.json",
+  "fixtures/mission-planner/agent-task-fit-passport//cases.v1.json",
+  "fixtures/mission-planner/agent-task-fit-passport/../cases.v1.json",
+  "fixtures/mission-planner/agent-task-fit-passport/./cases.v1.json",
+  "fixtures/mission-planner/agent-task-fit-passport/.",
+  "fixtures/mission-planner/agent-task-fit-passport/..",
+  "fixtures/mission-planner/agent-task-fit-passport/.git/config.json",
+  "docs/json-schema/.git/ft-agent-task-fit-passport.json",
+  "docs/robot-contracts/agent-task-fit-passport.md",
+  "fixtures/mission-planner/provider-quota-assignment/cases.v1.json",
+  "fixtures\\mission-planner\\agent-task-fit-passport\\cases.v1.json"
+].freeze
 
 def fail!(message)
   warn "agent task-fit passport contract: #{message}"
@@ -227,6 +244,10 @@ end
 def safe_artifact_path?(path)
   safe_repo_relative_json_path?(path) &&
     EXPECTED_ARTIFACT_PATH_PREFIXES.any? { |prefix| path.start_with?(prefix) }
+end
+
+SAFE_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("unsafe artifact path accepted: #{path.inspect}") if safe_artifact_path?(path)
 end
 
 schema = read_json(SCHEMA)
