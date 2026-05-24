@@ -924,6 +924,7 @@ impl PatternPack {
     pub fn enforce_verification_report(self, report: &PatternPackVerificationReport) -> Self {
         if report.pack_name == self.name
             && report.verified
+            && report.issues.is_empty()
             && report.action_mode.allows_action_triggers()
         {
             self

@@ -1534,6 +1534,36 @@ fn verification_report_mismatch_or_unverified_action_forces_observe_only() {
     );
 }
 
+#[test]
+fn verification_report_with_issues_forces_observe_only() {
+    let mut rule = make_anchor_only_rule("verification_report_issues", "VERIFY_ISSUES");
+    rule.workflow = Some("usage_limit_response".to_string());
+    rule.preview_command = Some("ft workflow preview usage-limit".to_string());
+    rule.manual_fix = Some("Recover pane {pane}".to_string());
+
+    let report = PatternPackVerificationReport {
+        pack_name: "verification-issues".to_string(),
+        verified: true,
+        action_mode: PatternPackActionMode::ActionTriggering,
+        signature_checked: true,
+        fixture_hashes_checked: 0,
+        regex_budget_checked: true,
+        issues: vec![PatternPackVerificationIssue {
+            category: "fixture".to_string(),
+            message: "fixture mismatch".to_string(),
+        }],
+    };
+    let pack = PatternPack::new("verification-issues", "1.0.0", vec![rule])
+        .enforce_verification_report(&report);
+
+    assert_eq!(pack.rules[0].workflow, None);
+    assert_eq!(pack.rules[0].preview_command, None);
+    assert_eq!(
+        pack.rules[0].get_manual_fix(5, None).as_deref(),
+        Some("Recover pane 5")
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
