@@ -10,7 +10,7 @@
 //! NotificationGate (pipeline ordering).
 
 use frankenterm_core::events::*;
-use frankenterm_core::events_dedup_cuckoo::EventCuckooDedup;
+use frankenterm_core::events_dedup_cuckoo::{CuckooDedupVerdict, EventCuckooDedup};
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use proptest::prelude::*;
 use std::sync::atomic::Ordering;
@@ -1451,5 +1451,68 @@ proptest! {
         let check_d2 = matches!(r2, NotifyDecision::Send { .. });
         prop_assert!(check_d2,
             "d2 first check should Send, got: {:?}", r2);
+    }
+}
+
+proptest! {
+    // ========================================================================
+    // Property Tests: EventCuckooDedup (cuckoo-filter delta dedup)
+    // ========================================================================
+
+    /// A fresh filter never reports PossibleDuplicate on first sight of a key
+    /// — the verdict is New (recorded) or NewButFull (filter saturated).
+    #[test]
+    fn prop_cuckoo_first_check_is_not_duplicate(key in arb_dedup_key()) {
+        let mut dedup = EventCuckooDedup::default();
+        let verdict = dedup.check(&key);
+        prop_assert!(
+            matches!(verdict, CuckooDedupVerdict::New | CuckooDedupVerdict::NewButFull),
+            "first sight of a key must not be PossibleDuplicate, got {:?}", verdict
+        );
+    }
+
+    /// No false negatives: a key recorded as New is recognised on re-check.
+    /// (Cuckoo filters may false-positive on PossibleDuplicate but never
+    /// false-negate a recorded key.)
+    #[test]
+    fn prop_cuckoo_no_false_negative(key in arb_dedup_key()) {
+        let mut dedup = EventCuckooDedup::default();
+        if dedup.check(&key) == CuckooDedupVerdict::New {
+            prop_assert_eq!(
+                dedup.check(&key),
+                CuckooDedupVerdict::PossibleDuplicate,
+                "a recorded key must be recognised on re-check (no false negative)"
+            );
+        }
+    }
+
+    /// forget removes a recorded key: it reports present, after which the
+    /// key is treated as New again.
+    #[test]
+    fn prop_cuckoo_forget_removes_recorded_key(key in arb_dedup_key()) {
+        let mut dedup = EventCuckooDedup::default();
+        if dedup.check(&key) == CuckooDedupVerdict::New {
+            prop_assert!(dedup.forget(&key), "forget must report the key was present");
+            prop_assert_eq!(
+                dedup.check(&key),
+                CuckooDedupVerdict::New,
+                "a forgotten key must be treated as New again"
+            );
+        }
+    }
+
+    /// clear empties the filter and the load factor is always a probability.
+    #[test]
+    fn prop_cuckoo_clear_and_load_factor(keys in proptest::collection::vec(arb_dedup_key(), 0..30)) {
+        let mut dedup = EventCuckooDedup::default();
+        for key in &keys {
+            dedup.check(key);
+        }
+        let lf = dedup.load_factor();
+        prop_assert!((0.0..=1.0).contains(&lf), "load_factor {} must be in [0, 1]", lf);
+        dedup.clear();
+        prop_assert_eq!(dedup.count(), 0, "clear must empty the filter");
+        prop_assert!((dedup.load_factor() - 0.0).abs() < f64::EPSILON,
+            "load_factor must be 0 after clear");
     }
 }
