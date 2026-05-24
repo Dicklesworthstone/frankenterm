@@ -1,6 +1,6 @@
+use crate::DomainId;
 use crate::tmux::{RefTmuxRemotePane, TmuxCmdQueue, TmuxDomainState};
 use crate::tmux_commands::{KillPane, Resize, SendKeys};
-use crate::DomainId;
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty};
@@ -15,6 +15,10 @@ pub(crate) struct TmuxPty {
     pub master_pane: RefTmuxRemotePane,
     pub reader: FileDescriptor,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
+}
+
+fn u64_to_u16_saturating(value: u64) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 struct TmuxPtyWriter {
@@ -201,8 +205,8 @@ impl MasterPty for TmuxPty {
     fn get_size(&self) -> Result<portable_pty::PtySize, anyhow::Error> {
         let pane = self.master_pane.lock();
         Ok(portable_pty::PtySize {
-            rows: pane.pane_height as u16,
-            cols: pane.pane_width as u16,
+            rows: u64_to_u16_saturating(pane.pane_height),
+            cols: u64_to_u16_saturating(pane.pane_width),
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -294,6 +298,12 @@ mod tests {
             .expect("try_wait after signal")
             .expect("exit status");
         assert_eq!(status.exit_code(), 0);
+    }
+
+    #[test]
+    fn tmux_pty_size_conversion_saturates() {
+        assert_eq!(u64_to_u16_saturating(24), 24);
+        assert_eq!(u64_to_u16_saturating(u64::from(u16::MAX) + 1), u16::MAX);
     }
 
     #[test]
