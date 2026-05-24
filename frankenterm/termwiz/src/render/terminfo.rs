@@ -525,13 +525,17 @@ impl TerminfoRenderer {
         let next_x = match x {
             Position::Relative(dx) => (cursor_x as isize + dx).rem_euclid(screen_cols as isize),
             Position::Absolute(value) => (value % screen_cols) as isize,
-            Position::EndRelative(value) => ((screen_cols - value) % screen_cols) as isize,
+            Position::EndRelative(value) => {
+                (screen_cols.saturating_sub(*value) % screen_cols) as isize
+            }
         };
 
         let next_y = match y {
             Position::Relative(dy) => (cursor_y as isize + dy).rem_euclid(screen_rows as isize),
             Position::Absolute(value) => (value % screen_rows) as isize,
-            Position::EndRelative(value) => ((screen_rows - value) % screen_rows) as isize,
+            Position::EndRelative(value) => {
+                (screen_rows.saturating_sub(*value) % screen_rows) as isize
+            }
         };
 
         self.cursor_position = Some((next_x as usize, next_y as usize));
@@ -1662,6 +1666,21 @@ mod test {
         );
 
         assert_eq!(out.renderer.current_attr, CellAttributes::default());
+    }
+
+    #[test]
+    fn update_cursor_position_saturates_oversized_end_relative_offsets() {
+        let mut renderer = TerminfoRenderer::new(xterm_terminfo());
+        renderer.cursor_position = Some((2, 1));
+
+        renderer.update_cursor_position(
+            &Position::EndRelative(usize::MAX),
+            &Position::EndRelative(usize::MAX),
+            4,
+            3,
+        );
+
+        assert_eq!(renderer.cursor_position, Some((0, 0)));
     }
 
     #[test]
