@@ -239,6 +239,43 @@ proptest! {
     }
 
     #[test]
+    fn proptest_workflow_lock_owned_guard_defuse_preserves_lock_until_manual_release(
+        pane_id in 1u64..10_000,
+        workflow_name in arb_label(),
+        execution_id in arb_label(),
+        wrong_execution_id in arb_label(),
+    ) {
+        prop_assume!(execution_id != wrong_execution_id);
+
+        let manager = Arc::new(PaneWorkflowLockManager::new());
+        let guard = manager
+            .try_acquire_owned_guarded(pane_id, &workflow_name, &execution_id)
+            .expect("owned guard should acquire");
+
+        prop_assert_eq!(manager.active_count(), 1);
+        guard.defuse();
+
+        let health_after_defuse = manager.health();
+        prop_assert_eq!(health_after_defuse.releases_total, 0);
+        prop_assert_eq!(health_after_defuse.active_locks, 1);
+        let lock = manager
+            .is_locked(pane_id)
+            .expect("defused guard leaves lock held for downstream handoff");
+        prop_assert_eq!(lock.workflow_name, workflow_name);
+        prop_assert_eq!(lock.execution_id, execution_id);
+
+        prop_assert!(!manager.release(pane_id, &wrong_execution_id));
+        prop_assert_eq!(manager.active_count(), 1);
+        prop_assert!(manager.release(pane_id, &execution_id));
+
+        let health_after_release = manager.health();
+        prop_assert_eq!(health_after_release.release_mismatched_total, 1);
+        prop_assert_eq!(health_after_release.releases_total, 1);
+        prop_assert_eq!(health_after_release.active_locks, 0);
+        prop_assert!(manager.is_locked(pane_id).is_none());
+    }
+
+    #[test]
     fn proptest_workflow_lock_owned_full_preserves_conflict_details_before_limit_errors(
         pane_ids in prop::collection::btree_set(1u64..10_000, 2..8),
         requested_limit in 1usize..8,
