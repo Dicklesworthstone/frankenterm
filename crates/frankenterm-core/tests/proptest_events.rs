@@ -994,6 +994,26 @@ proptest! {
             "a '*' exclude must block every detection (exclude wins)");
     }
 
+    /// Property 40d: min_severity is monotone — raising the severity floor
+    /// (Info < Warning < Critical) can only filter more out. With other
+    /// config held equal, a stricter floor matching a detection implies a
+    /// looser floor also matches it.
+    #[test]
+    fn prop_filter_min_severity_is_monotone(
+        detection in arb_detection(),
+        a in 0_usize..3,
+        b in 0_usize..3,
+    ) {
+        let sevs = ["info", "warning", "critical"];
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let f_lo = EventFilter::from_config(&[], &[], Some(sevs[lo]), &[]);
+        let f_hi = EventFilter::from_config(&[], &[], Some(sevs[hi]), &[]);
+        if f_hi.matches(&detection) {
+            prop_assert!(f_lo.matches(&detection),
+                "raising min_severity {}->{} added a match", sevs[lo], sevs[hi]);
+        }
+    }
+
     // ========================================================================
     // Property Tests: event_identity_key
     // ========================================================================
