@@ -329,7 +329,7 @@ impl ConnectorMesh {
                 zone_id: zone.zone_id,
             });
         }
-        self.telemetry.zones_created += 1;
+        self.telemetry.zones_created = self.telemetry.zones_created.saturating_add(1);
         self.zones.insert(zone.zone_id.clone(), zone);
         Ok(())
     }
@@ -358,7 +358,7 @@ impl ConnectorMesh {
                 host_id: host.host_id,
             });
         }
-        self.telemetry.hosts_registered += 1;
+        self.telemetry.hosts_registered = self.telemetry.hosts_registered.saturating_add(1);
         self.hosts.insert(host.host_id.clone(), host);
         Ok(())
     }
@@ -371,7 +371,7 @@ impl ConnectorMesh {
             .ok_or_else(|| ConnectorMeshError::HostNotFound {
                 host_id: host_id.to_string(),
             })?;
-        self.telemetry.hosts_deregistered += 1;
+        self.telemetry.hosts_deregistered = self.telemetry.hosts_deregistered.saturating_add(1);
         Ok(host)
     }
 
@@ -406,7 +406,7 @@ impl ConnectorMesh {
                 host_id: host_id.to_string(),
             })?;
         host.health = health;
-        self.telemetry.health_updates += 1;
+        self.telemetry.health_updates = self.telemetry.health_updates.saturating_add(1);
         Ok(())
     }
 
@@ -426,7 +426,7 @@ impl ConnectorMesh {
         if host.health == HostHealth::Unreachable {
             host.health = HostHealth::Degraded;
         }
-        self.telemetry.heartbeats_received += 1;
+        self.telemetry.heartbeats_received = self.telemetry.heartbeats_received.saturating_add(1);
         Ok(())
     }
 
@@ -454,13 +454,13 @@ impl ConnectorMesh {
         request: &RoutingRequest,
         now_ms: u64,
     ) -> Result<RoutingDecision, ConnectorMeshError> {
-        self.telemetry.routing_requests += 1;
+        self.telemetry.routing_requests = self.telemetry.routing_requests.saturating_add(1);
         let strategy = request.strategy.unwrap_or(self.config.default_strategy);
 
         let candidates = self.find_candidates(request);
 
         if candidates.is_empty() {
-            self.telemetry.routing_failures += 1;
+            self.telemetry.routing_failures = self.telemetry.routing_failures.saturating_add(1);
             return Err(ConnectorMeshError::RoutingFailed {
                 reason: "no eligible hosts found".to_string(),
             });
@@ -475,7 +475,7 @@ impl ConnectorMesh {
         };
 
         let Some(host_id) = selected else {
-            self.telemetry.routing_failures += 1;
+            self.telemetry.routing_failures = self.telemetry.routing_failures.saturating_add(1);
             return Err(ConnectorMeshError::RoutingFailed {
                 reason: format!("strategy {} found no suitable host", strategy),
             });
@@ -497,10 +497,10 @@ impl ConnectorMesh {
 
         // Increment host load
         if let Some(h) = self.hosts.get_mut(&host_id) {
-            h.active_connectors += 1;
+            h.active_connectors = h.active_connectors.saturating_add(1);
         }
 
-        self.telemetry.routing_successes += 1;
+        self.telemetry.routing_successes = self.telemetry.routing_successes.saturating_add(1);
         Ok(decision)
     }
 
@@ -518,7 +518,7 @@ impl ConnectorMesh {
 
     /// Record a failure event.
     pub fn record_failure(&mut self, event: MeshFailureEvent) {
-        self.telemetry.failure_events += 1;
+        self.telemetry.failure_events = self.telemetry.failure_events.saturating_add(1);
         self.failure_history.push_back(event);
         while self.failure_history.len() > self.config.max_failure_history {
             self.failure_history.pop_front();
@@ -1183,6 +1183,71 @@ mod tests {
         assert_eq!(snap.zones_created, 1);
         assert_eq!(snap.routing_requests, 1);
         assert_eq!(snap.routing_successes, 1);
+    }
+
+    #[test]
+    fn telemetry_counters_saturate() {
+        let mut mesh = default_mesh();
+        mesh.telemetry.zones_created = u64::MAX;
+        mesh.register_zone(make_zone("z1")).unwrap();
+
+        mesh.telemetry.hosts_registered = u64::MAX;
+        mesh.register_host(make_host("h1", "z1")).unwrap();
+
+        mesh.telemetry.health_updates = u64::MAX;
+        mesh.update_health("h1", HostHealth::Degraded).unwrap();
+
+        mesh.telemetry.heartbeats_received = u64::MAX;
+        mesh.record_heartbeat("h1", 5000).unwrap();
+
+        mesh.telemetry.routing_requests = u64::MAX;
+        mesh.telemetry.routing_successes = u64::MAX;
+        mesh.route(&make_request("c1"), 6000).unwrap();
+
+        mesh.telemetry.routing_failures = u64::MAX;
+        let mut unroutable = make_request("c2");
+        unroutable.required_capabilities = vec![ConnectorCapability::ProcessExec];
+        assert!(matches!(
+            mesh.route(&unroutable, 6001),
+            Err(ConnectorMeshError::RoutingFailed { .. })
+        ));
+
+        mesh.telemetry.failure_events = u64::MAX;
+        mesh.record_failure(MeshFailureEvent {
+            host_id: "h1".to_string(),
+            zone_id: "z1".to_string(),
+            failure_class: ConnectorFailureClass::Network,
+            description: "connection refused".to_string(),
+            timestamp_ms: 7000,
+        });
+
+        mesh.telemetry.hosts_deregistered = u64::MAX;
+        mesh.deregister_host("h1").unwrap();
+
+        let snap = mesh.telemetry().snapshot();
+        assert_eq!(snap.zones_created, u64::MAX);
+        assert_eq!(snap.hosts_registered, u64::MAX);
+        assert_eq!(snap.hosts_deregistered, u64::MAX);
+        assert_eq!(snap.health_updates, u64::MAX);
+        assert_eq!(snap.heartbeats_received, u64::MAX);
+        assert_eq!(snap.routing_requests, u64::MAX);
+        assert_eq!(snap.routing_successes, u64::MAX);
+        assert_eq!(snap.routing_failures, u64::MAX);
+        assert_eq!(snap.failure_events, u64::MAX);
+    }
+
+    #[test]
+    fn route_host_active_counter_saturates_at_capacity() {
+        let mut mesh = default_mesh();
+        mesh.register_zone(make_zone("z1")).unwrap();
+        let mut host = make_host("h1", "z1");
+        host.max_connectors = usize::MAX;
+        host.active_connectors = usize::MAX - 1;
+        mesh.register_host(host).unwrap();
+
+        mesh.route(&make_request("c1"), 1000).unwrap();
+
+        assert_eq!(mesh.get_host("h1").unwrap().active_connectors, usize::MAX);
     }
 
     #[test]
