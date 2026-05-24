@@ -1057,6 +1057,26 @@ fn observe_only_pack_marks_supply_chain_rollout_observe_only() {
 }
 
 #[test]
+fn zero_ttl_context_allows_immediate_redetection() {
+    let detection = Detection {
+        rule_id: "codex.zero_ttl".to_string(),
+        agent_type: AgentType::Codex,
+        event_type: "test.zero_ttl".to_string(),
+        severity: Severity::Info,
+        confidence: 1.0,
+        extracted: serde_json::json!({}),
+        matched_text: "ZERO_TTL".to_string(),
+        span: (0, 8),
+    };
+    let mut ctx = DetectionContext::new();
+    ctx.set_ttl(Duration::from_secs(0));
+
+    assert!(ctx.mark_seen(&detection));
+    assert!(!ctx.is_seen(&detection));
+    assert!(ctx.mark_seen(&detection));
+}
+
+#[test]
 fn verification_report_action_mode_controls_pack_action_surfaces() {
     let mut rule = make_anchor_only_rule("verification_mode", "VERIFY_ME");
     rule.workflow = Some("usage_limit_response".to_string());
