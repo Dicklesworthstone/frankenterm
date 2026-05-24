@@ -15,20 +15,20 @@
 #   scripts/regenerate-attestation-verify-fixtures.sh
 #
 # Workflow:
-#   1. Build a fresh self-test bundle from current HEAD via
-#      scripts/attestation-build.sh --version 0.0.0-self-test
-#      --channel dev --sign unsigned --allow-partial.
-#   2. Copy it as the positive-control fixture.
-#   3. Apply the 8 documented jq mutations to derive the tampered variants.
-#   4. Delete the transient docs/attestations/0.0.0-self-test.json (it's
-#      not a release artifact; only the fixture copies are durable).
+#   1. Build a fresh positive-control fixture from current HEAD via
+#      scripts/attestation-build.sh --version all_sections_present_valid
+#      --channel dev --sign unsigned --allow-partial, writing directly into
+#      the fixture directory.
+#   2. Apply the 8 documented jq mutations to derive the tampered variants.
+#   3. Refresh the unsigned canonical hash for every tamper whose expected
+#      failure is not itself a signature/canonical-hash failure.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CANON="${REPO_ROOT}/docs/attestations/0.0.0-self-test.json"
 FIX="${REPO_ROOT}/tests/fixtures/attestation-verify-self-test/fixtures"
+POSITIVE="${FIX}/all_sections_present_valid.json"
 
 command -v jq >/dev/null || { echo "jq required" >&2; exit 2; }
 [[ -x "${REPO_ROOT}/scripts/attestation-build.sh" ]] || {
@@ -38,35 +38,63 @@ command -v jq >/dev/null || { echo "jq required" >&2; exit 2; }
 
 cd "$REPO_ROOT"
 
-echo "1/4: Building fresh 0.0.0-self-test bundle from current HEAD..." >&2
-./scripts/attestation-build.sh --version 0.0.0-self-test --channel dev --sign unsigned --allow-partial >/dev/null
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
 
-[[ -f "$CANON" ]] || { echo "build did not produce $CANON" >&2; exit 1; }
+refresh_unsigned_canonical_sha() {
+  local fixture="$1"
+  local canonical_payload canonical_sha tmp
 
-echo "2/4: Copying positive control..." >&2
-cp "$CANON" "$FIX/all_sections_present_valid.json"
+  canonical_payload="$(jq -S -c 'del(.signature)' "${fixture}")"
+  canonical_sha="$(printf '%s' "${canonical_payload}" | sha256_stdin)"
+  tmp="${fixture}.next"
+  jq --arg canonical_sha "${canonical_sha}" \
+    '.signature.canonical_sha256 = $canonical_sha' \
+    "${fixture}" > "${tmp}"
+  mv "${tmp}" "${fixture}"
+}
 
-echo "3/4: Applying 8 jq mutations to derive tampered variants..." >&2
+echo "1/3: Building fresh positive-control fixture from current HEAD..." >&2
+FT_ATTESTATION_OUT_DIR="${FIX}" \
+  ./scripts/attestation-build.sh \
+    --version all_sections_present_valid \
+    --channel dev \
+    --sign unsigned \
+    --allow-partial >/dev/null
+
+[[ -f "$POSITIVE" ]] || { echo "build did not produce $POSITIVE" >&2; exit 1; }
+
+echo "2/3: Applying 8 jq mutations to derive tampered variants..." >&2
 jq '.artifacts[0].sha256 = "tampered000000000000000000000000000000000000000000000000000000"' \
-  "$CANON" > "$FIX/tampered_artifact_hash.json"
+  "$POSITIVE" > "$FIX/tampered_artifact_hash.json"
+refresh_unsigned_canonical_sha "$FIX/tampered_artifact_hash.json"
 jq '.signature.canonical_sha256 = "tampered000000000000000000000000000000000000000000000000000000"' \
-  "$CANON" > "$FIX/tampered_signature_canonical_hash.json"
-jq 'del(.artifacts[0])' "$CANON" > "$FIX/missing_required_slot.json"
+  "$POSITIVE" > "$FIX/tampered_signature_canonical_hash.json"
+jq '.artifacts |= map(select(.category != "doctrine/agents-md-counts"))' \
+  "$POSITIVE" > "$FIX/missing_required_slot.json"
+refresh_unsigned_canonical_sha "$FIX/missing_required_slot.json"
 jq '.artifacts += [{"category":"unknown/forbidden","description":"injected","path":"fake","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":0,"proof_categories":[]}]' \
-  "$CANON" > "$FIX/extra_unknown_slot.json"
-jq '.schema_version = "9.9.9"' "$CANON" > "$FIX/wrong_schema_version.json"
-jq 'del(.release)' "$CANON" > "$FIX/missing_release_block.json"
+  "$POSITIVE" > "$FIX/extra_unknown_slot.json"
+refresh_unsigned_canonical_sha "$FIX/extra_unknown_slot.json"
+jq '.schema_version = "9.9.9"' "$POSITIVE" > "$FIX/wrong_schema_version.json"
+refresh_unsigned_canonical_sha "$FIX/wrong_schema_version.json"
+jq 'del(.release)' "$POSITIVE" > "$FIX/missing_release_block.json"
+refresh_unsigned_canonical_sha "$FIX/missing_release_block.json"
 jq '.taxonomy_coverage = {"1":99,"7":99,"12":99}' \
-  "$CANON" > "$FIX/inflated_taxonomy_coverage.json"
+  "$POSITIVE" > "$FIX/inflated_taxonomy_coverage.json"
+refresh_unsigned_canonical_sha "$FIX/inflated_taxonomy_coverage.json"
 jq '.confidence_summary = {"records":[],"best_confidence_by_category":[],"tampered":true}' \
-  "$CANON" > "$FIX/tampered_confidence_summary.json"
+  "$POSITIVE" > "$FIX/tampered_confidence_summary.json"
+refresh_unsigned_canonical_sha "$FIX/tampered_confidence_summary.json"
 # empty_bundle.json and malformed_json.json are bit-stable across regens
 # (a 3-byte "{}" stub and a literal malformed string). Re-write to be safe.
 echo '{}' > "$FIX/empty_bundle.json"
 echo '{ this is not valid json' > "$FIX/malformed_json.json"
-
-echo "4/4: Removing transient bundle..." >&2
-rm -f "$CANON"
 
 echo "Done. Verifying positive control..." >&2
 verdict=$("${REPO_ROOT}/scripts/attestation-verify.sh" "$FIX/all_sections_present_valid.json" --json | jq -r '.ok')

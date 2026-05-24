@@ -13,6 +13,19 @@
       "size_bytes": 5985
     },
     {
+      "category": "perf/headline-claims",
+      "description": "Fail-closed high-core swarm capacity envelope. Optional until the target-class gauntlet retains a non-skipped linux-x86_64-high-core artifact; while status is blocked_target_class_not_proven it documents why high-scale memory-envelope wording cannot graduate.",
+      "media_type": "application/json",
+      "path": "docs/attestations/perf/swarm-capacity-envelope.json",
+      "produced_by_bead": "ft-b94bx.8",
+      "proof_categories": [
+        4,
+        5
+      ],
+      "sha256": "d38b124d923a5245febd03b34d86068f3397ec6ca533fcf61a317ddda871c15d",
+      "size_bytes": 4719
+    },
+    {
       "category": "perf/competitor-matrix",
       "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3). Recovery artifact published by ft-e87u6.9 (closed); substrate provenance traces to the ft-t101b deterministic competitor-bench fixture under ft-syqcz.5. Producer attribution corrected from the original null-slot misattribution to ft-syqcz.4 per the artifact's recommended_produced_by_bead field.",
       "media_type": "application/json",
@@ -47,8 +60,8 @@
         4,
         9
       ],
-      "sha256": "9ac6633ebf80b0e6241a95f57def18bf6ab05a3365d29b39a48340f74bb7b34d",
-      "size_bytes": 7339
+      "sha256": "e469161dc96b4f5fb778b760f377fb59da340bd5f7a0c83af77528ad9ee34007",
+      "size_bytes": 14214
     },
     {
       "category": "tui/render-parity",
@@ -65,15 +78,15 @@
     },
     {
       "category": "tui/render-parity",
-      "description": "Continuous FrankenTerm-vs-upstream-WezTerm render differential slot. The checked-in artifact records the allowlist gate and pending first real frame run; production evidence requires a workflow run with frames_compared_total > 0 and novel_divergence_count == 0.",
+      "description": "Continuous FrankenTerm-vs-upstream-WezTerm render differential slot. The checked-in artifact records the allowlist gate and latest retained workflow evidence; it is production evidence only when frames_compared_total > 0 and novel_divergence_count == 0.",
       "media_type": "application/json",
       "path": "docs/attestations/tui/wezterm-divergence.json",
       "produced_by_bead": "ft-tf6g3.21",
       "proof_categories": [
         9
       ],
-      "sha256": "74a4e558521d755f651dab0679398ad840855eb4c4148c08cd2d10d482f96717",
-      "size_bytes": 1379
+      "sha256": "1a6fbb5766cc3dc0c31967d966e7bd355d75cb659d594c8fc25cd699c1eed5a9",
+      "size_bytes": 1072
     },
     {
       "category": "tui/render-parity",
@@ -148,8 +161,8 @@
         3,
         6
       ],
-      "sha256": "c4131f0dc2f5738f564f52ff38bd748fd173c2ef86fa7175cd9d5792a00e5fea",
-      "size_bytes": 13200
+      "sha256": "35dc228f87a19c6bd9115dd61fae265780f007ae157687b6a7dd474da6f235c0",
+      "size_bytes": 13728
     },
     {
       "category": "proofs/runtime-proof-trait",
@@ -211,8 +224,8 @@
       "proof_categories": [
         5
       ],
-      "sha256": "e9f910eb67cc9a2005fead0825b33d98ec740e9e46f29e260ec10b1632629eee",
-      "size_bytes": 14420
+      "sha256": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
+      "size_bytes": 11245
     },
     {
       "category": "doctrine/vendored-provenance",
@@ -336,7 +349,7 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 5
+          "value": 6
         },
         "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
         "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
@@ -359,9 +372,9 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 6
+          "value": 7
         },
-        "source_artifact_hash": "e9f910eb67cc9a2005fead0825b33d98ec740e9e46f29e260ec10b1632629eee",
+        "source_artifact_hash": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
         "source_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -384,7 +397,7 @@
           "unit": "delivered_artifacts",
           "value": 2
         },
-        "source_artifact_hash": "c4131f0dc2f5738f564f52ff38bd748fd173c2ef86fa7175cd9d5792a00e5fea",
+        "source_artifact_hash": "35dc228f87a19c6bd9115dd61fae265780f007ae157687b6a7dd474da6f235c0",
         "source_artifact_path": "docs/attestations/proofs/runtime-async-cancel-traces.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -591,7 +604,7 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 5
+          "value": 6
         },
         "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
         "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
@@ -614,9 +627,9 @@
         "sample_size_or_state_count": {
           "kind": "artifact_count",
           "unit": "delivered_artifacts",
-          "value": 6
+          "value": 7
         },
-        "source_artifact_hash": "e9f910eb67cc9a2005fead0825b33d98ec740e9e46f29e260ec10b1632629eee",
+        "source_artifact_hash": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
         "source_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -639,7 +652,7 @@
           "unit": "delivered_artifacts",
           "value": 2
         },
-        "source_artifact_hash": "c4131f0dc2f5738f564f52ff38bd748fd173c2ef86fa7175cd9d5792a00e5fea",
+        "source_artifact_hash": "35dc228f87a19c6bd9115dd61fae265780f007ae157687b6a7dd474da6f235c0",
         "source_artifact_path": "docs/attestations/proofs/runtime-async-cancel-traces.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -767,15 +780,15 @@
     "schema_version": "1.0.0"
   },
   "deferred_slots": [],
-  "generated_at": "2026-05-13T23:21:20Z",
+  "generated_at": "2026-05-24T22:55:41Z",
   "generator": {
     "name": "scripts/attestation-build.sh",
     "version": "1.5.0"
   },
   "git": {
     "branch": "main",
-    "commit": "0e2d71c9aabaa251385ef137d1a0566b0f6642a9",
-    "tree": "ba3ce8eded7c0a89297cd9a4ff28b1cc922be4ae"
+    "commit": "9c9a10a74d9df6734433e122b61b60295348dbd2",
+    "tree": "b7a295a4af371ad7828b2aa0ec62ab527dfe3e8c"
   },
   "required_categories": [
     "perf/headline-claims",
@@ -795,7 +808,7 @@
   "retractions": [],
   "schema_version": "1.0.0",
   "signature": {
-    "canonical_sha256": "a5f48804f49e5a5da712eef2d8fd32c6a6fe49f2636a7d0510ce0478425c8518",
+    "canonical_sha256": "39411fd20781dfc07732a51e2f8f00417911c1d474927df0a1d896f74cc07dcd",
     "method": "unsigned",
     "reason": "dev channel bundle — production releases must use --sign cosign or --sign ed25519"
   },
@@ -830,7 +843,7 @@
         "slug": "loom"
       },
       {
-        "artifact_count": 5,
+        "artifact_count": 6,
         "below_threshold": false,
         "bridge_plan_core": true,
         "deferred_slot_count": 0,
@@ -839,7 +852,7 @@
         "slug": "conformance"
       },
       {
-        "artifact_count": 6,
+        "artifact_count": 7,
         "below_threshold": false,
         "bridge_plan_core": true,
         "deferred_slot_count": 0,
@@ -923,13 +936,13 @@
           "slug": "loom"
         },
         {
-          "artifact_delta": 5,
+          "artifact_delta": 6,
           "deferred_slot_delta": 0,
           "id": 4,
           "slug": "conformance"
         },
         {
-          "artifact_delta": 6,
+          "artifact_delta": 7,
           "deferred_slot_delta": 0,
           "id": 5,
           "slug": "quantitative-attestation"
