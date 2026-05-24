@@ -171,6 +171,13 @@ fn stable_row_span(row: StableRowIndex, len: usize) -> Option<Range<StableRowInd
     Some(row..end)
 }
 
+fn logical_len_exceeds_limit(current: usize, additional: usize, limit: usize) -> bool {
+    match current.checked_add(additional) {
+        Some(total) => total > limit,
+        None => true,
+    }
+}
+
 impl LogicalLine {
     pub fn contains_y(&self, y: StableRowIndex) -> bool {
         if y < self.first_row {
@@ -536,10 +543,10 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
         if !back[0].last_cell_was_wrapped() {
             break;
         }
-        if back[0].len() + back_len > MAX_LOGICAL_LINE_LEN {
+        if logical_len_exceeds_limit(back_len, back[0].len(), MAX_LOGICAL_LINE_LEN) {
             break;
         }
-        back_len += back[0].len();
+        back_len = back_len.saturating_add(back[0].len());
         first = prior;
         for (idx, line) in back.into_iter().enumerate() {
             phys.insert(idx, line);
@@ -905,6 +912,13 @@ mod test {
             writer.flush().unwrap();
         }
         assert_eq!(&*pane.writes.lock(), b"captured");
+    }
+
+    #[test]
+    fn logical_len_limit_check_treats_overflow_as_exceeded() {
+        assert!(!logical_len_exceeds_limit(10, 5, 20));
+        assert!(logical_len_exceeds_limit(10, 11, 20));
+        assert!(logical_len_exceeds_limit(usize::MAX, 1, usize::MAX));
     }
 
     #[test]
