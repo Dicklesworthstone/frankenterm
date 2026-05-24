@@ -704,10 +704,13 @@ impl PaneInfo {
     #[must_use]
     pub fn inferred_domain(&self) -> String {
         // First try explicit domain_name
-        if let Some(ref name) = self.domain_name {
-            if !name.is_empty() {
-                return name.clone();
-            }
+        if let Some(name) = self
+            .domain_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
         }
 
         // Try to infer from cwd URI
@@ -5904,6 +5907,25 @@ mod tests {
         let pane: PaneInfo = serde_json::from_str(json).unwrap();
         // Empty domain_name should fall through to cwd inference → "local"
         assert_eq!(pane.inferred_domain(), "local");
+    }
+
+    #[test]
+    fn pane_info_inferred_domain_trims_explicit_domain_name() {
+        let json = r#"{
+            "pane_id": 0, "tab_id": 0, "window_id": 0,
+            "domain_name": " ssh:remote ",
+            "cwd": "file://ignored-host/home/user"
+        }"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(pane.inferred_domain(), "ssh:remote");
+
+        let json = r#"{
+            "pane_id": 0, "tab_id": 0, "window_id": 0,
+            "domain_name": "   ",
+            "cwd": "file://fallback-host/home/user"
+        }"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(pane.inferred_domain(), "ssh:fallback-host");
     }
 
     #[test]
