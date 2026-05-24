@@ -87,6 +87,11 @@ fn checked_cell_count(cols: usize, rows: usize) -> Result<usize> {
         .ok_or_else(|| format_err!("console cell count overflow: cols={cols} rows={rows}"))
 }
 
+fn input_event_count_to_u32(num_events: usize) -> Result<u32> {
+    u32::try_from(num_events)
+        .map_err(|_| format_err!("console input event count overflow: {num_events}"))
+}
+
 fn buffered_write_needs_flush(current_len: usize, incoming_len: usize, capacity: usize) -> bool {
     current_len
         .checked_add(incoming_len)
@@ -197,6 +202,7 @@ impl ConsoleInputHandle for InputHandle {
     }
 
     fn read_console_input(&mut self, num_events: usize) -> Result<Vec<INPUT_RECORD>> {
+        let requested_events = input_event_count_to_u32(num_events)?;
         let mut res = Vec::with_capacity(num_events);
         let empty_record: INPUT_RECORD = unsafe { mem::zeroed() };
         res.resize(num_events, empty_record);
@@ -207,7 +213,7 @@ impl ConsoleInputHandle for InputHandle {
             consoleapi::ReadConsoleInputW(
                 self.handle.as_raw_handle() as *mut _,
                 res.as_mut_ptr(),
-                num_events as u32,
+                requested_events,
                 &mut num,
             )
         } == 0
@@ -1151,6 +1157,14 @@ mod tests {
     fn wait_timeout_saturates_without_using_infinite_sentinel() {
         let overflowing = Duration::from_millis(MAX_FINITE_WAIT_MS as u64 + 1);
         assert_eq!(wait_timeout_millis(Some(overflowing)), MAX_FINITE_WAIT_MS);
+    }
+
+    #[test]
+    fn input_event_count_to_u32_rejects_overflowing_values() {
+        assert_eq!(input_event_count_to_u32(42).unwrap(), 42);
+        if usize::BITS > u32::BITS {
+            assert!(input_event_count_to_u32(usize::MAX).is_err());
+        }
     }
 
     #[test]
