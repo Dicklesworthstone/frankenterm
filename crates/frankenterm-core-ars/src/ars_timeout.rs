@@ -462,18 +462,18 @@ impl TimeoutTracker {
                 self.observations.pop_front();
             }
             self.observations.push_back(duration_ms);
-            self.total_recorded += 1;
+            self.total_recorded = self.total_recorded.saturating_add(1);
         }
     }
 
     /// Record a timeout event (reflex was killed due to timeout).
     pub fn record_timeout(&mut self) {
-        self.total_timeouts += 1;
+        self.total_timeouts = self.total_timeouts.saturating_add(1);
     }
 
     /// Record a premature kill (reflex was killed but would have succeeded).
     pub fn record_premature_kill(&mut self) {
-        self.total_premature_kills += 1;
+        self.total_premature_kills = self.total_premature_kills.saturating_add(1);
     }
 
     /// Get the current recommended timeout.
@@ -1002,6 +1002,22 @@ mod tests {
         tracker.record(100.0);
         assert_eq!(tracker.observation_count(), 1);
         assert_eq!(tracker.total_observations(), 1);
+    }
+
+    #[test]
+    fn tracker_counters_saturate() {
+        let mut tracker = TimeoutTracker::with_defaults();
+        tracker.total_recorded = u64::MAX;
+        tracker.total_timeouts = u64::MAX;
+        tracker.total_premature_kills = u64::MAX;
+
+        tracker.record(100.0);
+        tracker.record_timeout();
+        tracker.record_premature_kill();
+
+        assert_eq!(tracker.total_recorded, u64::MAX);
+        assert_eq!(tracker.total_timeouts, u64::MAX);
+        assert_eq!(tracker.total_premature_kills, u64::MAX);
     }
 
     #[test]
