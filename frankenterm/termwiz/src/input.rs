@@ -1546,7 +1546,7 @@ impl InputParser {
                     if let Some(idx) = self.buf.find_subsequence(offset, end_paste) {
                         let pasted =
                             String::from_utf8_lossy(&self.buf.as_slice()[0..idx]).to_string();
-                        self.buf.advance(pasted.len() + end_paste.len());
+                        self.buf.advance(idx.saturating_add(end_paste.len()));
                         callback(InputEvent::Paste(pasted));
                         self.state = InputState::Normal;
                     } else {
@@ -2996,6 +2996,22 @@ mod test {
         let mut p = InputParser::new();
         let inputs = p.parse_as_vec(b"\x1b[200~pasted text\x1b[201~", NO_MORE);
         assert_eq!(inputs, vec![InputEvent::Paste("pasted text".to_owned())]);
+    }
+
+    #[test]
+    fn parse_bracketed_paste_invalid_utf8_preserves_following_input() {
+        let mut p = InputParser::new();
+        let inputs = p.parse_as_vec(b"\x1b[200~\xff\x1b[201~A", NO_MORE);
+        assert_eq!(
+            inputs,
+            vec![
+                InputEvent::Paste("\u{fffd}".to_owned()),
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('A'),
+                    modifiers: Modifiers::NONE,
+                }),
+            ]
+        );
     }
 
     #[test]
