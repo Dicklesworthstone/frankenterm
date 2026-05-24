@@ -11,6 +11,17 @@ fn sgr_pixel_coord(cell: usize, total_pixels: usize, cells: usize, pixel_offset:
         .saturating_add(1)
 }
 
+fn sgr_cell_coords(event: &MouseEvent) -> (usize, i64) {
+    (event.x.saturating_add(1), event.y.saturating_add(1))
+}
+
+fn x10_encoded_coord_value(value: i64) -> Option<u32> {
+    value
+        .checked_add(1)
+        .and_then(|value| value.checked_add(32))
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 impl TerminalState {
     fn sgr_pixel_coords(&self, event: MouseEvent) -> (usize, usize) {
         (
@@ -33,11 +44,14 @@ impl TerminalState {
     /// Out of bounds coords are reported as the 0 byte value.
     fn encode_coord(&self, value: i64, dest: &mut Vec<u8>) {
         // Convert to 1-based and offset into the printable character range
-        let value = value + 1 + 32;
+        let Some(value) = x10_encoded_coord_value(value) else {
+            dest.push(0);
+            return;
+        };
         if self.mouse_encoding == MouseEncoding::Utf8 {
             if value < 0x800 {
                 let mut utf8 = [0; 2];
-                if let Some(ch) = char::from_u32(value as u32) {
+                if let Some(ch) = char::from_u32(value) {
                     dest.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
                 } else {
                     dest.push(0);
@@ -46,8 +60,8 @@ impl TerminalState {
                 // out of range
                 dest.push(0);
             }
-        } else if value < 0x100 {
-            dest.push(value as u8);
+        } else if let Ok(value) = u8::try_from(value) {
+            dest.push(value);
         } else {
             // out of range
             dest.push(0);
@@ -103,19 +117,9 @@ impl TerminalState {
         if self.mouse_encoding == MouseEncoding::SGR
             && (self.mouse_tracking || self.button_event_mouse || self.any_event_mouse)
         {
-            log::trace!(
-                "wheel {event:?} ESC [<{};{};{}M",
-                button,
-                event.x + 1,
-                event.y + 1
-            );
-            write!(
-                self.writer,
-                "\x1b[<{};{};{}M",
-                button,
-                event.x + 1,
-                event.y + 1
-            )?;
+            let (x, y) = sgr_cell_coords(&event);
+            log::trace!("wheel {event:?} ESC [<{};{};{}M", button, x, y);
+            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
             self.writer.flush()?;
         } else if self.mouse_encoding == MouseEncoding::SgrPixels
             && (self.mouse_tracking || self.button_event_mouse || self.any_event_mouse)
@@ -154,19 +158,9 @@ impl TerminalState {
         }
 
         if self.mouse_encoding == MouseEncoding::SGR {
-            log::trace!(
-                "press {event:?} ESC [<{};{};{}M",
-                button,
-                event.x + 1,
-                event.y + 1
-            );
-            write!(
-                self.writer,
-                "\x1b[<{};{};{}M",
-                button,
-                event.x + 1,
-                event.y + 1
-            )?;
+            let (x, y) = sgr_cell_coords(&event);
+            log::trace!("press {event:?} ESC [<{};{};{}M", button, x, y);
+            write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
             self.writer.flush()?;
         } else if self.mouse_encoding == MouseEncoding::SgrPixels {
             let (x, y) = self.sgr_pixel_coords(event);
@@ -186,19 +180,9 @@ impl TerminalState {
             self.current_mouse_buttons.retain(|&b| b != button);
             if self.mouse_tracking || self.button_event_mouse || self.any_event_mouse {
                 if self.mouse_encoding == MouseEncoding::SGR {
-                    log::trace!(
-                        "release {event:?} ESC [<{};{};{}m",
-                        release_button,
-                        event.x + 1,
-                        event.y + 1
-                    );
-                    write!(
-                        self.writer,
-                        "\x1b[<{};{};{}m",
-                        release_button,
-                        event.x + 1,
-                        event.y + 1
-                    )?;
+                    let (x, y) = sgr_cell_coords(&event);
+                    log::trace!("release {event:?} ESC [<{};{};{}m", release_button, x, y);
+                    write!(self.writer, "\x1b[<{};{};{}m", release_button, x, y)?;
                     self.writer.flush()?;
                 } else if self.mouse_encoding == MouseEncoding::SgrPixels {
                     let (x, y) = self.sgr_pixel_coords(event);
@@ -242,19 +226,9 @@ impl TerminalState {
             let button = 32 + button;
 
             if self.mouse_encoding == MouseEncoding::SGR {
-                log::trace!(
-                    "move {event:?} ESC [<{};{};{}M",
-                    button,
-                    event.x + 1,
-                    event.y + 1
-                );
-                write!(
-                    self.writer,
-                    "\x1b[<{};{};{}M",
-                    button,
-                    event.x + 1,
-                    event.y + 1
-                )?;
+                let (x, y) = sgr_cell_coords(&event);
+                log::trace!("move {event:?} ESC [<{};{};{}M", button, x, y);
+                write!(self.writer, "\x1b[<{};{};{}M", button, x, y)?;
                 self.writer.flush()?;
             } else if self.mouse_encoding == MouseEncoding::SgrPixels {
                 let (x, y) = self.sgr_pixel_coords(event);
@@ -317,7 +291,8 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
-    use super::sgr_pixel_coord;
+    use super::{sgr_cell_coords, sgr_pixel_coord, x10_encoded_coord_value};
+    use crate::input::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     #[test]
     fn sgr_pixel_coord_matches_existing_one_based_formula() {
@@ -332,5 +307,27 @@ mod tests {
             usize::MAX
         );
         assert_eq!(sgr_pixel_coord(2, 9, 0, 0), 19);
+    }
+
+    #[test]
+    fn sgr_cell_coords_saturate_one_based_conversion() {
+        let event = MouseEvent {
+            x: usize::MAX,
+            y: i64::MAX,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            button: MouseButton::None,
+            modifiers: KeyModifiers::NONE,
+            kind: MouseEventKind::Move,
+        };
+
+        assert_eq!(sgr_cell_coords(&event), (usize::MAX, i64::MAX));
+    }
+
+    #[test]
+    fn x10_coord_offset_rejects_overflow_and_negative_values() {
+        assert_eq!(x10_encoded_coord_value(0), Some(33));
+        assert_eq!(x10_encoded_coord_value(-40), None);
+        assert_eq!(x10_encoded_coord_value(i64::MAX), None);
     }
 }
