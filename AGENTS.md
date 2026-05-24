@@ -435,7 +435,7 @@ frankenterm/
 │   │   # <!--count:core_subcrates-->19<!--/count--> sub-crates extracted (ft-hdvvo + post-hdvvo work). For the live
 │   │   # count and module totals, run: ls -d crates/frankenterm-core-* | wc -l
 │   │   # and: find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l
-│   │   # (currently <!--count:core_top_level_modules-->511<!--/count--> top-level modules at last stamp).
+│   │   # (currently <!--count:core_top_level_modules-->512<!--/count--> top-level modules at last stamp).
 │   │   # Hand-edited stat figures here drift fast (ft-d3awp / ft-1b0rn /
 │   │   # ft-f1vcd); the commands above are the source of truth.
 │   │   # Type-only leaves have zero first-party deps; cluster sub-crates depend on

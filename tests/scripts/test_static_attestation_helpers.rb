@@ -2,6 +2,8 @@
 # frozen_string_literal: true
 
 require "json"
+require "open3"
+require "shellwords"
 require "stringio"
 
 root = File.expand_path("../..", __dir__)
@@ -18,6 +20,15 @@ rescue StandardError => error
 end
 
 StaticAttestation.configure(log_io: StringIO.new, log_enabled: true)
+
+run_shell_helper = lambda do |body|
+  script = <<~BASH
+    set -euo pipefail
+    source tests/scripts/static_attestation_helpers.sh
+    #{body}
+  BASH
+  Open3.capture3({ "FRANKENTERM_REPO_ROOT" => root }, "bash", "-c", script, chdir: root)
+end
 
 check("repo-relative path guard rejects absolute, parent traversal, empty, and NUL paths") do
   StaticAttestation.repo_relative_path!("docs/security/passive-watch-attestation.json")
@@ -152,6 +163,22 @@ check("shell helper exposes the expected sourceable API") do
     ],
     source: "tests/scripts/static_attestation_helpers.sh",
   )
+end
+
+check("shell helper path guards fail cleanly under strict mode") do
+  [
+    ["static_attestation_require_command", "", "command name is empty"],
+    ["static_attestation_require_repo_relative_path", "", "path is empty"],
+    ["static_attestation_require_repo_relative_path", "/tmp/nope", "absolute path is forbidden"],
+    ["static_attestation_require_repo_relative_path", "docs/../secret", "parent traversal is forbidden"],
+    ["static_attestation_require_file", "", "path is empty"],
+    ["static_attestation_require_executable_script", "", "path is empty"],
+  ].each do |function_name, argument, expected_error|
+    _stdout, stderr, status = run_shell_helper.call("#{function_name} #{argument.shellescape}")
+    raise "#{function_name} unexpectedly passed" if status.success?
+    raise "#{function_name} raised Bash unbound-variable noise" if stderr.include?("unbound variable")
+    raise "#{function_name} did not report #{expected_error.inspect}: #{stderr}" unless stderr.include?(expected_error)
+  end
 end
 
 puts "static-attestation helpers: self-test passed"
