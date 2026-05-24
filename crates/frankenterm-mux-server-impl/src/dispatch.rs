@@ -982,17 +982,31 @@ fn classify_protocol_probe(bytes: &[u8]) -> ProtocolProbe {
     if !first.is_ascii_alphabetic() {
         return ProtocolProbe::BinaryPdu;
     }
-    for byte in rest {
-        match *byte {
-            b'\n' => return ProtocolProbe::TmuxControl,
-            b'\r' | b'\t' | b' '..=b'~' => {}
-            _ => return ProtocolProbe::BinaryPdu,
+
+    if bytes.contains(&b'\n') {
+        if tmux_control_probe_prefix_is_text(bytes) {
+            return ProtocolProbe::TmuxControl;
         }
+        return ProtocolProbe::BinaryPdu;
     }
+
+    if !tmux_control_probe_prefix_is_text(rest) {
+        return ProtocolProbe::BinaryPdu;
+    }
+
     if bytes.len() >= TMUX_CONTROL_MAX_LINE_BYTES {
         ProtocolProbe::BinaryPdu
     } else {
         ProtocolProbe::NeedMore
+    }
+}
+
+fn tmux_control_probe_prefix_is_text(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text
+            .chars()
+            .all(|c| c == '\n' || c == '\r' || c == '\t' || !c.is_control()),
+        Err(err) => err.error_len().is_none(),
     }
 }
 
@@ -1004,10 +1018,12 @@ where
     loop {
         while let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') {
             let line = buffer.drain(..=line_end).collect::<Vec<_>>();
-            let line = String::from_utf8_lossy(&line);
             command_id = command_id.saturating_add(1);
-            let response =
-                tmux_control_response_at(current_unix_timestamp_secs(), command_id, &line);
+            let response = tmux_control_response_for_line_bytes(
+                current_unix_timestamp_secs(),
+                command_id,
+                line,
+            );
             write_tmux_response(&mut stream, response).await?;
         }
 
@@ -1034,6 +1050,21 @@ where
             return Ok(());
         }
         buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn tmux_control_response_for_line_bytes(
+    timestamp_secs: u64,
+    command_id: u64,
+    line: Vec<u8>,
+) -> TmuxResponse {
+    match String::from_utf8(line) {
+        Ok(line) => tmux_control_response_at(timestamp_secs, command_id, &line),
+        Err(_) => tmux_error_response(
+            timestamp_secs,
+            command_id,
+            "parse error: invalid utf-8 in tmux control command",
+        ),
     }
 }
 
@@ -1494,9 +1525,31 @@ mod tests {
     }
 
     #[test]
+    fn protocol_probe_recognizes_utf8_tmux_control_line() {
+        assert_eq!(
+            classify_protocol_probe(b"send-keys caf\xc3\xa9\n"),
+            ProtocolProbe::TmuxControl
+        );
+    }
+
+    #[test]
     fn protocol_probe_keeps_binary_pdu_prefixes_on_pdu_path() {
         assert_eq!(classify_protocol_probe(&[0]), ProtocolProbe::BinaryPdu);
         assert_eq!(classify_protocol_probe(b"d\0"), ProtocolProbe::BinaryPdu);
+        assert_eq!(
+            classify_protocol_probe(b"send-keys caf\xc3(\n"),
+            ProtocolProbe::BinaryPdu
+        );
+    }
+
+    #[test]
+    fn tmux_control_invalid_utf8_lines_are_framed_errors() {
+        let response =
+            tmux_control_response_for_line_bytes(10, 7, b"send-keys caf\xc3(\n".to_vec());
+        let encoded = response.encode();
+
+        assert!(encoded.contains("parse error: invalid utf-8 in tmux control command"));
+        assert!(encoded.ends_with("%error 10 7 0\n"));
     }
 
     #[test]
