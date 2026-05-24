@@ -1048,3 +1048,92 @@ proptest! {
         prop_assert_eq!(slack, back);
     }
 }
+
+// =============================================================================
+// evaluate_latency_budget — slack-algebra invariants (was uncovered)
+// =============================================================================
+
+fn strict_stage(i: usize, target: QuantileBudgetMs) -> LatencyStageContract {
+    LatencyStageContract {
+        stage_id: format!("s{i}"),
+        interface_in: format!("i{i}"),
+        interface_out: format!("o{i}"),
+        target_ms: target,
+        slack_policy: StageSlackPolicy::Strict,
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Strict stages never borrow, so per quantile: overflow = max(observed -
+    /// target, 0), headroom = max(target - observed, 0), borrowed = 0, and
+    /// residual_overflow == overflow. Aggregate observed is the element-wise
+    /// sum of stage observations.
+    #[test]
+    fn evaluate_strict_overflow_and_headroom_invariants(
+        pairs in prop::collection::vec((arb_ordered_budget(), arb_ordered_budget()), 1..5),
+    ) {
+        let stages: Vec<LatencyStageContract> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (target, _))| strict_stage(i, *target))
+            .collect();
+        let obs: Vec<StageLatencyObservation> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, observed))| StageLatencyObservation {
+                stage_id: format!("s{i}"),
+                observed_ms: *observed,
+            })
+            .collect();
+        let contract = LatencyPathContract::new("p", stages).unwrap();
+        let eval = evaluate_latency_budget(&contract, &obs).unwrap();
+
+        prop_assert_eq!(eval.stage_deltas.len(), pairs.len());
+        for (delta, (target, observed)) in eval.stage_deltas.iter().zip(pairs.iter()) {
+            let exp_overflow = (observed.p50_ms() - target.p50_ms()).max(0.0);
+            prop_assert!((delta.overflow_ms.p50_ms() - exp_overflow).abs() < 1e-9,
+                "overflow must be max(observed-target, 0)");
+            let exp_headroom = (target.p999_ms() - observed.p999_ms()).max(0.0);
+            prop_assert!((delta.headroom_ms.p999_ms() - exp_headroom).abs() < 1e-9,
+                "headroom must be max(target-observed, 0)");
+            // Strict → no borrowing.
+            prop_assert_eq!(delta.borrowed_ms.p50_ms(), 0.0);
+            prop_assert_eq!(delta.borrowed_ms.p999_ms(), 0.0);
+            // borrowed + residual == overflow (per quantile, always).
+            prop_assert!(((delta.borrowed_ms.p99_ms() + delta.residual_overflow_ms.p99_ms())
+                - delta.overflow_ms.p99_ms()).abs() < 1e-9);
+        }
+
+        let sum_obs_p999: f64 = pairs.iter().map(|(_, o)| o.p999_ms()).sum();
+        prop_assert!((eval.aggregate_observed_ms.p999_ms() - sum_obs_p999).abs() < 1e-6,
+            "aggregate observed must be the element-wise sum of observations");
+    }
+
+    /// A stage without a matching observation is rejected.
+    #[test]
+    fn evaluate_rejects_missing_observation(budget in arb_ordered_budget()) {
+        let contract = LatencyPathContract::new(
+            "p",
+            vec![strict_stage(0, budget), strict_stage(1, budget)],
+        ).unwrap();
+        // Observe only s0; s1 is missing.
+        let obs = vec![StageLatencyObservation {
+            stage_id: "s0".to_string(),
+            observed_ms: budget,
+        }];
+        prop_assert!(evaluate_latency_budget(&contract, &obs).is_err());
+    }
+
+    /// An observation for a stage not in the contract is rejected.
+    #[test]
+    fn evaluate_rejects_unknown_observation(budget in arb_ordered_budget()) {
+        let contract = LatencyPathContract::new("p", vec![strict_stage(0, budget)]).unwrap();
+        let obs = vec![
+            StageLatencyObservation { stage_id: "s0".to_string(), observed_ms: budget },
+            StageLatencyObservation { stage_id: "ghost".to_string(), observed_ms: budget },
+        ];
+        prop_assert!(evaluate_latency_budget(&contract, &obs).is_err());
+    }
+}
