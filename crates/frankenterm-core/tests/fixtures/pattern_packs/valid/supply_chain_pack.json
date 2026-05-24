@@ -40,7 +40,7 @@
     "signature": {
       "algorithm": "frankenterm.sha256-attestation.v1",
       "signer": "local-test-signer",
-      "payload_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "payload_sha256": "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
       "value": "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
     }
   }

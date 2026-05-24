@@ -103,7 +103,7 @@ is optional. When present, it has the following fields.
 | `rollout.stage` | string | **MUST** | Rollout stage name. MUST be non-empty after trimming. |
 | `rollout.dry_run_match_telemetry` | boolean | **MUST** | Whether dry-run match telemetry was collected. |
 | `rollout.observe_only_until_verified` | boolean | **MUST** | Whether actions must stay observe-only until verification passes. |
-| `signature` | object | MAY | Optional signature object with `algorithm`, `signer`, `payload_sha256`, and `value`. |
+| `signature` | object | MAY | Optional signature object with `algorithm`, non-empty `signer`, `payload_sha256` (`sha256:<hex>`), and `value` (`sha256:<hex>`). |
 
 ## Validation
 
