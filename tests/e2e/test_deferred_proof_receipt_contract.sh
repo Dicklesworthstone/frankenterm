@@ -121,6 +121,7 @@ SAFE_PATH_NEGATIVES = [
   "tests/e2e//proof.json",
   "tests/e2e/../proof.json",
   "tests/e2e/./proof.json",
+  "tests/e2e/",
   "tests/e2e/.",
   "tests/e2e/..",
   "tests/e2e/.git/config",
@@ -189,7 +190,7 @@ end
 def path_safe?(path)
   return false unless path.is_a?(String)
   return false if path.empty? || path.start_with?("/") || path.include?("\\")
-  return false if path.split("/").any? { |part| part.empty? || part == "." || part == ".." || part == ".git" }
+  return false if path.split("/", -1).any? { |part| part.empty? || part == "." || part == ".." || part == ".git" }
 
   true
 end

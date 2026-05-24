@@ -94,7 +94,7 @@ def path_safe?(path)
     !path.empty? &&
     !path.start_with?("/") &&
     !path.include?("\\") &&
-    path.split("/").none? { |part| part.empty? || part == "." || part == ".." || part == ".git" }
+    path.split("/", -1).none? { |part| part.empty? || part == "." || part == ".." || part == ".git" }
 end
 
 def dirty_paths(gate)
@@ -271,7 +271,22 @@ base = clean.fetch("gate")
 fail!("negative-corpus base is not a clean allow") unless base.fetch("decision").fetch("state") == "allow"
 
 # 1. path_safe? must reject absolute, traversal, .git, and empty-segment paths.
-["/etc/passwd", "../escape", ".git/config", "foo//bar", "foo/./bar", ""].each do |bad|
+[
+  nil,
+  "",
+  "/etc/passwd",
+  "./tests/e2e/test_deferred_proof_ownership_gate.sh",
+  "../escape",
+  "tests/e2e/../escape",
+  "tests/e2e/./test_deferred_proof_ownership_gate.sh",
+  "tests/e2e/",
+  "tests/e2e/.",
+  "tests/e2e/..",
+  ".git/config",
+  "tests/e2e/.git/config",
+  "foo//bar",
+  "tests\\e2e\\test_deferred_proof_ownership_gate.sh"
+].each do |bad|
   fail!("path_safe? accepted unsafe path #{bad.inspect}") if path_safe?(bad)
 end
 fail!("path_safe? rejected a known-good repo path") unless path_safe?("tests/e2e/test_deferred_proof_ownership_gate.sh")
