@@ -412,7 +412,7 @@ impl ConnectorCredentialBroker {
         let provider_id = config.provider_id.clone();
         let provider = SecretProvider::new(config, now_ms);
         self.providers.insert(provider_id.clone(), provider);
-        self.telemetry.providers_registered += 1;
+        self.telemetry.providers_registered = self.telemetry.providers_registered.saturating_add(1);
         self.emit_audit(CredentialAuditEvent {
             timestamp_ms: now_ms,
             event_type: CredentialAuditType::ProviderRegistered,
@@ -491,7 +491,8 @@ impl ConnectorCredentialBroker {
         }
         let cred_id = credential.credential_id.clone();
         self.credentials.insert(cred_id.clone(), credential);
-        self.telemetry.credentials_registered += 1;
+        self.telemetry.credentials_registered =
+            self.telemetry.credentials_registered.saturating_add(1);
         self.emit_audit(CredentialAuditEvent {
             timestamp_ms: now_ms,
             event_type: CredentialAuditType::CredentialRegistered,
@@ -573,7 +574,7 @@ impl ConnectorCredentialBroker {
             .iter()
             .any(|scope| requested_scope.is_subset_of(scope));
         if !scope_allowed_by_credential {
-            self.telemetry.access_denied += 1;
+            self.telemetry.access_denied = self.telemetry.access_denied.saturating_add(1);
             self.emit_audit(CredentialAuditEvent {
                 timestamp_ms: now_ms,
                 event_type: CredentialAuditType::AccessDenied,
@@ -592,7 +593,7 @@ impl ConnectorCredentialBroker {
 
         // Check authorization
         if !self.is_authorized(connector_id, &requested_scope, credential.sensitivity) {
-            self.telemetry.access_denied += 1;
+            self.telemetry.access_denied = self.telemetry.access_denied.saturating_add(1);
             self.emit_audit(CredentialAuditEvent {
                 timestamp_ms: now_ms,
                 event_type: CredentialAuditType::AccessDenied,
@@ -669,13 +670,13 @@ impl ConnectorCredentialBroker {
 
         // Update counters
         if let Some(cred) = self.credentials.get_mut(credential_id) {
-            cred.active_lease_count += 1;
+            cred.active_lease_count = cred.active_lease_count.saturating_add(1);
         }
         if let Some(prov) = self.providers.get_mut(&credential_provider_id) {
-            prov.active_leases += 1;
-            prov.total_issued += 1;
+            prov.active_leases = prov.active_leases.saturating_add(1);
+            prov.total_issued = prov.total_issued.saturating_add(1);
         }
-        self.telemetry.leases_issued += 1;
+        self.telemetry.leases_issued = self.telemetry.leases_issued.saturating_add(1);
 
         let result = lease.clone();
         self.leases.insert(lease_id.clone(), lease);
@@ -732,10 +733,10 @@ impl ConnectorCredentialBroker {
         if let Some(cred) = self.credentials.get(&credential_id) {
             if let Some(prov) = self.providers.get_mut(&cred.provider_id) {
                 prov.active_leases = prov.active_leases.saturating_sub(1);
-                prov.total_revoked += 1;
+                prov.total_revoked = prov.total_revoked.saturating_add(1);
             }
         }
-        self.telemetry.leases_revoked += 1;
+        self.telemetry.leases_revoked = self.telemetry.leases_revoked.saturating_add(1);
 
         self.emit_audit(CredentialAuditEvent {
             timestamp_ms: now_ms,
@@ -769,7 +770,7 @@ impl ConnectorCredentialBroker {
                     prov.active_leases = prov.active_leases.saturating_sub(1);
                 }
             }
-            self.telemetry.leases_expired += 1;
+            self.telemetry.leases_expired = self.telemetry.leases_expired.saturating_add(1);
             self.emit_audit(CredentialAuditEvent {
                 timestamp_ms: now_ms,
                 event_type: CredentialAuditType::LeaseExpired,
@@ -801,15 +802,15 @@ impl ConnectorCredentialBroker {
             });
         }
         cred.state = CredentialState::Rotating;
-        cred.version += 1;
+        cred.version = cred.version.saturating_add(1);
         cred.last_rotated_at_ms = now_ms;
         let new_version = cred.version;
         let provider_id = cred.provider_id.clone();
 
         if let Some(prov) = self.providers.get_mut(&provider_id) {
-            prov.total_rotations += 1;
+            prov.total_rotations = prov.total_rotations.saturating_add(1);
         }
-        self.telemetry.rotations_completed += 1;
+        self.telemetry.rotations_completed = self.telemetry.rotations_completed.saturating_add(1);
 
         self.emit_audit(CredentialAuditEvent {
             timestamp_ms: now_ms,
@@ -852,7 +853,7 @@ impl ConnectorCredentialBroker {
         cred.state = CredentialState::Revoked;
         cred.active_lease_count = 0;
         let provider_id = cred.provider_id.clone();
-        self.telemetry.credentials_revoked += 1;
+        self.telemetry.credentials_revoked = self.telemetry.credentials_revoked.saturating_add(1);
 
         // Revoke all active leases for this credential
         let mut revoked_leases = Vec::new();
@@ -860,7 +861,7 @@ impl ConnectorCredentialBroker {
             if lease.credential_id == credential_id && lease.state == LeaseState::Active {
                 lease.state = LeaseState::Revoked;
                 revoked_leases.push(lease_id.clone());
-                self.telemetry.leases_revoked += 1;
+                self.telemetry.leases_revoked = self.telemetry.leases_revoked.saturating_add(1);
             }
         }
 
@@ -1121,6 +1122,17 @@ mod tests {
     }
 
     #[test]
+    fn register_provider_counter_saturates() {
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.telemetry.providers_registered = u64::MAX;
+        broker
+            .register_provider(test_provider_config("p1"), 100)
+            .unwrap();
+
+        assert_eq!(broker.telemetry.providers_registered, u64::MAX);
+    }
+
+    #[test]
     fn update_provider_status() {
         let mut broker = ConnectorCredentialBroker::new();
         broker
@@ -1160,6 +1172,20 @@ mod tests {
             .unwrap();
         assert!(broker.get_credential("c1").is_some());
         assert_eq!(broker.telemetry.credentials_registered, 1);
+    }
+
+    #[test]
+    fn register_credential_counter_saturates() {
+        let mut broker = ConnectorCredentialBroker::new();
+        broker
+            .register_provider(test_provider_config("v1"), 100)
+            .unwrap();
+        broker.telemetry.credentials_registered = u64::MAX;
+        broker
+            .register_credential(test_credential("c1", "v1"), 100)
+            .unwrap();
+
+        assert_eq!(broker.telemetry.credentials_registered, u64::MAX);
     }
 
     #[test]
@@ -1235,6 +1261,38 @@ mod tests {
     }
 
     #[test]
+    fn request_lease_counters_saturate() {
+        let mut broker = setup_broker();
+        broker.telemetry.leases_issued = u64::MAX;
+        broker.providers.get_mut("vault-1").unwrap().active_leases = u32::MAX;
+        broker.providers.get_mut("vault-1").unwrap().total_issued = u64::MAX;
+        broker
+            .credentials
+            .get_mut("cred-1")
+            .unwrap()
+            .active_lease_count = u32::MAX;
+
+        let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
+        broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
+
+        assert_eq!(broker.telemetry.leases_issued, u64::MAX);
+        assert_eq!(
+            broker.get_provider("vault-1").unwrap().active_leases,
+            u32::MAX
+        );
+        assert_eq!(
+            broker.get_provider("vault-1").unwrap().total_issued,
+            u64::MAX
+        );
+        assert_eq!(
+            broker.get_credential("cred-1").unwrap().active_lease_count,
+            u32::MAX
+        );
+    }
+
+    #[test]
     fn lease_id_wraparound_skips_active_ids() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
@@ -1263,6 +1321,19 @@ mod tests {
             err,
             CredentialBrokerError::CredentialNotFound { .. }
         ));
+    }
+
+    #[test]
+    fn access_denied_counter_saturates() {
+        let mut broker = setup_broker();
+        broker.telemetry.access_denied = u64::MAX;
+        let scope = CredentialScope::new("github", "repos/private", vec!["admin".into()]);
+        let err = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialBrokerError::NotAuthorized { .. }));
+        assert_eq!(broker.telemetry.access_denied, u64::MAX);
     }
 
     #[test]
@@ -1411,6 +1482,25 @@ mod tests {
     }
 
     #[test]
+    fn revoke_lease_counters_saturate() {
+        let mut broker = setup_broker();
+        let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
+        let lease = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
+        broker.telemetry.leases_revoked = u64::MAX;
+        broker.providers.get_mut("vault-1").unwrap().total_revoked = u64::MAX;
+
+        broker.revoke_lease(&lease.lease_id, 3000).unwrap();
+
+        assert_eq!(broker.telemetry.leases_revoked, u64::MAX);
+        assert_eq!(
+            broker.get_provider("vault-1").unwrap().total_revoked,
+            u64::MAX
+        );
+    }
+
+    #[test]
     fn expire_leases_past_ttl() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
@@ -1422,6 +1512,21 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], lease.lease_id);
         assert_eq!(broker.telemetry.leases_expired, 1);
+    }
+
+    #[test]
+    fn expire_lease_counter_saturates() {
+        let mut broker = setup_broker();
+        let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
+        let lease = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
+        broker.telemetry.leases_expired = u64::MAX;
+
+        let expired = broker.expire_leases(lease.expires_at_ms.saturating_add(1));
+
+        assert_eq!(expired, vec![lease.lease_id]);
+        assert_eq!(broker.telemetry.leases_expired, u64::MAX);
     }
 
     #[test]
@@ -1447,6 +1552,24 @@ mod tests {
             CredentialState::Rotating
         );
         assert_eq!(broker.telemetry.rotations_completed, 1);
+    }
+
+    #[test]
+    fn rotate_credential_counters_saturate() {
+        let mut broker = setup_broker();
+        broker.credentials.get_mut("cred-1").unwrap().version = u32::MAX;
+        broker.providers.get_mut("vault-1").unwrap().total_rotations = u64::MAX;
+        broker.telemetry.rotations_completed = u64::MAX;
+
+        let new_version = broker.rotate_credential("cred-1", 5000).unwrap();
+
+        assert_eq!(new_version, u32::MAX);
+        assert_eq!(broker.get_credential("cred-1").unwrap().version, u32::MAX);
+        assert_eq!(
+            broker.get_provider("vault-1").unwrap().total_rotations,
+            u64::MAX
+        );
+        assert_eq!(broker.telemetry.rotations_completed, u64::MAX);
     }
 
     #[test]
@@ -1498,6 +1621,28 @@ mod tests {
         assert!(broker.active_leases_for_credential("cred-1").is_empty());
         assert_eq!(broker.telemetry.credentials_revoked, 1);
         assert_eq!(broker.telemetry.leases_revoked, 2);
+    }
+
+    #[test]
+    fn revoke_credential_counters_saturate() {
+        let mut broker = setup_broker();
+        let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
+        broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
+        broker.telemetry.credentials_revoked = u64::MAX;
+        broker.telemetry.leases_revoked = u64::MAX;
+        broker.providers.get_mut("vault-1").unwrap().total_revoked = u64::MAX;
+
+        let revoked = broker.revoke_credential("cred-1", 3000).unwrap();
+
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(broker.telemetry.credentials_revoked, u64::MAX);
+        assert_eq!(broker.telemetry.leases_revoked, u64::MAX);
+        assert_eq!(
+            broker.get_provider("vault-1").unwrap().total_revoked,
+            u64::MAX
+        );
     }
 
     // ---- Query helper tests ----
