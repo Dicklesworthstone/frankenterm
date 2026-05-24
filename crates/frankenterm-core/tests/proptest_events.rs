@@ -473,6 +473,53 @@ proptest! {
         }
     }
 
+    /// Property 17b: Capacity eviction is FIFO — once at capacity, inserting
+    /// a novel key evicts the OLDEST inserted key (not an arbitrary one).
+    /// The evicted key checks `New` again, while a newer key still checks
+    /// `Duplicate`. Property 17 only bounds `len`; this pins eviction order.
+    #[test]
+    fn prop_dedup_eviction_is_fifo(max_cap in 2..20usize) {
+        // Long window so nothing expires during the test.
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), max_cap);
+        // Insert max_cap+1 distinct keys: fills to capacity, then the final
+        // insert evicts key_0 (the front of the insertion order).
+        for i in 0..=max_cap {
+            dedup.check(&format!("key_{i}"));
+        }
+        // The newest key is still tracked → Duplicate on re-check.
+        let newest = format!("key_{max_cap}");
+        prop_assert_eq!(
+            dedup.check(&newest),
+            DedupeVerdict::Duplicate { suppressed_count: 1 },
+            "newest key '{}' must be retained after eviction", newest
+        );
+        // key_0 was the oldest → evicted → New again on re-check.
+        prop_assert_eq!(
+            dedup.check("key_0"),
+            DedupeVerdict::New,
+            "oldest key 'key_0' must have been evicted (FIFO)"
+        );
+    }
+
+    /// Property 17c: Zero capacity disables deduplication entirely
+    /// (ft-61kg4). Every check returns `New` — even an immediate repeat of
+    /// the same key — and nothing is stored. Guards against the regressed
+    /// 1-slot "ghost cache" where alternating keys toggled New/Duplicate.
+    #[test]
+    fn prop_dedup_zero_capacity_disables(
+        keys in proptest::collection::vec(arb_dedup_key(), 1..15),
+    ) {
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), 0);
+        for key in &keys {
+            prop_assert_eq!(dedup.check(key), DedupeVerdict::New,
+                "zero-capacity dedup must always return New for '{}'", key);
+        }
+        // Immediate repeat of the first key must also be New, not Duplicate.
+        prop_assert_eq!(dedup.check(&keys[0]), DedupeVerdict::New,
+            "zero-capacity dedup must not suppress immediate repeats");
+        prop_assert_eq!(dedup.len(), 0, "zero-capacity dedup must store nothing");
+    }
+
     /// Property 18: After clear, all keys return New.
     #[test]
     fn prop_dedup_clear_resets(
