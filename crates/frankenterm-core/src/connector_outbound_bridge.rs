@@ -1024,7 +1024,7 @@ impl ConnectorOutboundBridge {
         &mut self,
         event: &OutboundEvent,
     ) -> Result<OutboundDispatchResult, OutboundBridgeError> {
-        self.telemetry.events_received += 1;
+        self.telemetry.events_received = self.telemetry.events_received.saturating_add(1);
 
         // Generate or use existing correlation ID
         let correlation_id = event.correlation_id.clone().unwrap_or_else(|| {
@@ -1059,7 +1059,8 @@ impl ConnectorOutboundBridge {
                 .deduplicator
                 .check_and_record(&correlation_id, dedup_now_ms)
         {
-            self.telemetry.events_deduplicated += 1;
+            self.telemetry.events_deduplicated =
+                self.telemetry.events_deduplicated.saturating_add(1);
             debug!(
                 correlation_id = %correlation_id,
                 source = %event.source,
@@ -1083,7 +1084,7 @@ impl ConnectorOutboundBridge {
             .collect();
 
         if matched_rules.is_empty() {
-            self.telemetry.events_unmatched += 1;
+            self.telemetry.events_unmatched = self.telemetry.events_unmatched.saturating_add(1);
             if self.config.reject_unmatched_events {
                 warn!(
                     event_type = %event.event_type,
@@ -1117,7 +1118,8 @@ impl ConnectorOutboundBridge {
                 match ConnectorCredentialActionRequest::from_payload(&event.payload) {
                     Ok(request) => Some(request),
                     Err(reason) => {
-                        self.telemetry.actions_blocked_policy += 1;
+                        self.telemetry.actions_blocked_policy =
+                            self.telemetry.actions_blocked_policy.saturating_add(1);
                         blocked.push(BlockedAction {
                             rule_id: rule.rule_id.clone(),
                             target_connector: rule.target_connector.clone(),
@@ -1143,7 +1145,8 @@ impl ConnectorOutboundBridge {
                 self.policy.authorize(&policy_input)
             };
             if !policy_decision.is_allowed() {
-                self.telemetry.actions_blocked_policy += 1;
+                self.telemetry.actions_blocked_policy =
+                    self.telemetry.actions_blocked_policy.saturating_add(1);
                 let decision_kind = policy_decision.as_str();
                 let reason = policy_decision
                     .reason()
@@ -1177,7 +1180,8 @@ impl ConnectorOutboundBridge {
                 {
                     SandboxCheckResult::Allowed => {}
                     SandboxCheckResult::Denied { zone_id, reason } => {
-                        self.telemetry.actions_blocked_sandbox += 1;
+                        self.telemetry.actions_blocked_sandbox =
+                            self.telemetry.actions_blocked_sandbox.saturating_add(1);
                         warn!(
                             rule_id = %rule.rule_id,
                             connector = %rule.target_connector,
@@ -1208,7 +1212,8 @@ impl ConnectorOutboundBridge {
                         })
                     }),
                     Err(reason) => {
-                        self.telemetry.actions_blocked_policy += 1;
+                        self.telemetry.actions_blocked_policy =
+                            self.telemetry.actions_blocked_policy.saturating_add(1);
                         blocked.push(BlockedAction {
                             rule_id: rule.rule_id.clone(),
                             target_connector: rule.target_connector.clone(),
@@ -1232,7 +1237,8 @@ impl ConnectorOutboundBridge {
 
             // 3d. Enqueue
             if self.config.dispatch_queue_capacity == 0 {
-                self.telemetry.dispatch_queue_overflows += 1;
+                self.telemetry.dispatch_queue_overflows =
+                    self.telemetry.dispatch_queue_overflows.saturating_add(1);
                 warn!("outbound dispatch queue capacity is zero, blocking action");
                 blocked.push(BlockedAction {
                     rule_id: rule.rule_id.clone(),
@@ -1244,7 +1250,8 @@ impl ConnectorOutboundBridge {
                 continue;
             }
             if self.dispatch_queue.len() >= self.config.dispatch_queue_capacity {
-                self.telemetry.dispatch_queue_overflows += 1;
+                self.telemetry.dispatch_queue_overflows =
+                    self.telemetry.dispatch_queue_overflows.saturating_add(1);
                 warn!(
                     capacity = self.config.dispatch_queue_capacity,
                     "outbound dispatch queue full, dropping oldest"
@@ -1253,7 +1260,7 @@ impl ConnectorOutboundBridge {
             }
             self.dispatch_queue.push_back(action);
 
-            self.telemetry.actions_dispatched += 1;
+            self.telemetry.actions_dispatched = self.telemetry.actions_dispatched.saturating_add(1);
             dispatched.push(DispatchedAction {
                 rule_id: rule.rule_id.clone(),
                 target_connector: rule.target_connector.clone(),
@@ -1271,7 +1278,7 @@ impl ConnectorOutboundBridge {
             );
         }
 
-        self.telemetry.events_routed += 1;
+        self.telemetry.events_routed = self.telemetry.events_routed.saturating_add(1);
 
         // 4. Record history
         let entry = DispatchHistoryEntry {
@@ -2390,6 +2397,67 @@ mod tests {
         assert_eq!(tel.events_deduplicated, 1); // second event3
         assert_eq!(tel.actions_dispatched, 2); // slack from event1 + event3
         assert_eq!(tel.actions_blocked_sandbox, 2); // locked from event1 + event3
+    }
+
+    #[test]
+    fn connector_outbound_bridge_telemetry_counters_saturate() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.register_sandbox_zone("locked", restrictive_zone());
+        bridge.add_rule(make_rule(
+            "dispatch",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+        bridge.add_rule(make_rule(
+            "sandbox",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "locked",
+            ConnectorActionKind::Invoke,
+        ));
+        bridge.add_rule(make_rule(
+            "policy",
+            Some(OutboundEventSource::PatternDetected),
+            None,
+            "slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+        bridge.telemetry = OutboundBridgeTelemetry {
+            events_received: u64::MAX,
+            events_routed: u64::MAX,
+            events_deduplicated: u64::MAX,
+            events_unmatched: u64::MAX,
+            actions_dispatched: u64::MAX,
+            actions_blocked_policy: u64::MAX,
+            actions_blocked_sandbox: u64::MAX,
+            dispatch_queue_overflows: u64::MAX,
+        };
+
+        let event =
+            make_event("test", OutboundEventSource::PatternDetected).with_correlation_id("same");
+        bridge.process_event(&event).unwrap();
+        bridge.process_event(&event).unwrap();
+
+        let unmatched = make_event("test", OutboundEventSource::WorkflowLifecycle);
+        bridge.process_event(&unmatched).unwrap();
+
+        bridge.config.dispatch_queue_capacity = 0;
+        let overflow = make_event("test", OutboundEventSource::PatternDetected)
+            .with_correlation_id("overflow");
+        bridge.process_event(&overflow).unwrap();
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.events_received, u64::MAX);
+        assert_eq!(tel.events_routed, u64::MAX);
+        assert_eq!(tel.events_deduplicated, u64::MAX);
+        assert_eq!(tel.events_unmatched, u64::MAX);
+        assert_eq!(tel.actions_dispatched, u64::MAX);
+        assert_eq!(tel.actions_blocked_policy, u64::MAX);
+        assert_eq!(tel.actions_blocked_sandbox, u64::MAX);
+        assert_eq!(tel.dispatch_queue_overflows, u64::MAX);
     }
 
     #[test]
