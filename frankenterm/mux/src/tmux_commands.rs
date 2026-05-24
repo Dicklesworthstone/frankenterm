@@ -859,6 +859,13 @@ fn parse_list_window_item(line: &str) -> anyhow::Result<Option<WindowItem>> {
     }))
 }
 
+fn normalize_capture_pane_output(unescaped: &str) -> String {
+    unescaped
+        .strip_suffix('\n')
+        .unwrap_or(unescaped)
+        .replace('\n', "\r\n")
+}
+
 #[derive(Debug)]
 pub(crate) struct ListAllPanes {
     pub window_id: TmuxWindowId,
@@ -1123,8 +1130,8 @@ impl TmuxCommand for CapturePane {
         };
 
         let unescaped = termwiz::tmux_cc::unvis(&result.output).context("unescape pane content")?;
-        // capturep contents returned from guarded lines which always contain a tailing '\n'
-        let unescaped = &unescaped[0..unescaped.len().saturating_sub(1)].replace("\n", "\r\n");
+        // capture-pane contents usually include a trailing newline from the guarded response.
+        let unescaped = normalize_capture_pane_output(&unescaped);
 
         let pane_map = tmux_domain.inner.remote_panes.lock();
         if let Some(pane) = pane_map.get(&self.pane_id) {
@@ -1594,6 +1601,22 @@ mod tests {
         assert_eq!(
             cmd.get_command(0),
             "list-windows -F '#{session_id}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window_active}\t#{window_name}\t#{window_layout}\t#{history_limit}' -t $9\n"
+        );
+    }
+
+    #[test]
+    fn normalize_capture_pane_output_strips_only_trailing_newline() {
+        assert_eq!(
+            normalize_capture_pane_output("alpha\nbeta\n"),
+            "alpha\r\nbeta"
+        );
+    }
+
+    #[test]
+    fn normalize_capture_pane_output_handles_unicode_without_newline() {
+        assert_eq!(
+            normalize_capture_pane_output("pane \u{03b1}"),
+            "pane \u{03b1}"
         );
     }
 
