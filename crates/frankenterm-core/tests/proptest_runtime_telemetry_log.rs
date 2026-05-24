@@ -7,7 +7,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::runtime_telemetry::{
-    RuntimeTelemetryEventBuilder, RuntimeTelemetryKind, RuntimeTelemetryLog,
+    HealthTier, RuntimeTelemetryEventBuilder, RuntimeTelemetryKind, RuntimeTelemetryLog,
     RuntimeTelemetryLogConfig,
 };
 
@@ -86,6 +86,26 @@ proptest! {
         prop_assert_eq!(started.len(), b);
         prop_assert_eq!(created.len() + started.len(), log.len(),
             "the two kind-partitions must cover every retained event");
+    }
+
+    /// The builder's fields survive emit unchanged into the stored event
+    /// (component, kind, scope_id, health tier round-trip).
+    #[test]
+    fn telemetry_log_builder_preserves_fields(
+        comp in "[a-z]{1,8}",
+        scope in "[a-z0-9]{1,10}",
+    ) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        log.emit(
+            RuntimeTelemetryEventBuilder::new(&comp, RuntimeTelemetryKind::ScopeStarted)
+                .scope_id(&scope)
+                .tier(HealthTier::Yellow),
+        );
+        let ev = log.events().pop().expect("exactly one event was emitted");
+        prop_assert_eq!(ev.component, comp);
+        prop_assert_eq!(ev.event_kind, RuntimeTelemetryKind::ScopeStarted);
+        prop_assert_eq!(ev.scope_id, Some(scope));
+        prop_assert_eq!(ev.health_tier, HealthTier::Yellow);
     }
 
     /// drain() returns the retained events and leaves the log empty.
