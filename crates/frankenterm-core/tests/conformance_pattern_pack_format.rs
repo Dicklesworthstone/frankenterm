@@ -362,3 +362,68 @@ fn synthetic_pack_unknown_rule_property_must_fail() {
          (Rule.additionalProperties: false should kick)"
     );
 }
+
+#[test]
+fn synthetic_pack_invalid_rule_enums_must_fail() {
+    let validator = load_schema();
+    for (field, bad) in [
+        (
+            "agent_type",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.invalid_agent_type",
+                    "agent_type": "not_an_agent",
+                    "event_type": "synthetic_invalid_agent_type",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying an invalid agent_type."
+                }]
+            }),
+        ),
+        (
+            "severity",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.invalid_severity",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_invalid_severity",
+                    "severity": "not_a_severity",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying an invalid severity."
+                }]
+            }),
+        ),
+    ] {
+        let result = validator.validate(&bad);
+        assert!(
+            result.is_err(),
+            "schema validator accepted a rule with an invalid {field} value"
+        );
+    }
+}
+
+#[test]
+fn synthetic_pack_empty_anchor_must_fail() {
+    let validator = load_schema();
+    let bad = serde_json::json!({
+        "name": "synthetic",
+        "version": "1.0.0",
+        "rules": [{
+            "id": "codex.synthetic.empty_anchor",
+            "agent_type": "codex",
+            "event_type": "synthetic_empty_anchor",
+            "severity": "warning",
+            "anchors": [""],
+            "description": "Synthetic rule carrying an empty anchor."
+        }]
+    });
+    let result = validator.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema validator accepted a rule with an empty anchor"
+    );
+}
