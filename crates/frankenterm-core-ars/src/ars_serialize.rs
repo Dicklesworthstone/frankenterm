@@ -279,7 +279,7 @@ impl PruneEngine {
         blacklist: &HashSet<ReflexId>,
         now_ms: u64,
     ) -> PruneResult {
-        self.total_prune_runs += 1;
+        self.total_prune_runs = self.total_prune_runs.saturating_add(1);
 
         let mut result = PruneResult {
             e_value_pruned: Vec::new(),
@@ -367,8 +367,12 @@ impl PruneEngine {
             }
         }
 
-        self.total_pruned += result.total_pruned() as u64;
-        self.total_blacklisted += result.blacklisted.len() as u64;
+        self.total_pruned = self
+            .total_pruned
+            .saturating_add(u64::try_from(result.total_pruned()).unwrap_or(u64::MAX));
+        self.total_blacklisted = self
+            .total_blacklisted
+            .saturating_add(u64::try_from(result.blacklisted.len()).unwrap_or(u64::MAX));
 
         result
     }
@@ -1069,6 +1073,30 @@ mod tests {
         assert_eq!(stats.total_prune_runs, 1);
         assert_eq!(stats.total_pruned, 1);
         assert_eq!(stats.total_blacklisted, 1);
+    }
+
+    #[test]
+    fn prune_stats_saturate() {
+        let mut store = ReflexStore::new();
+        let mut r = make_record(1, "c1", MaturityTier::Incubating);
+        r.drift_state.e_value = 0.001;
+        r.drift_state.calibrated = true;
+        r.created_at_ms = 0;
+        store.upsert(r);
+
+        let mut engine = PruneEngine::with_defaults();
+        engine.total_prune_runs = u64::MAX;
+        engine.total_pruned = u64::MAX;
+        engine.total_blacklisted = u64::MAX;
+
+        let result = store.prune(&mut engine, 10_000_000);
+        let stats = engine.stats();
+
+        assert_eq!(result.total_pruned(), 1);
+        assert_eq!(result.blacklisted.len(), 1);
+        assert_eq!(stats.total_prune_runs, u64::MAX);
+        assert_eq!(stats.total_pruned, u64::MAX);
+        assert_eq!(stats.total_blacklisted, u64::MAX);
     }
 
     #[test]
