@@ -121,6 +121,9 @@ impl ReplayPerformanceBudgets {
     #[must_use]
     pub fn within_budget(&self, metric: ReplayPerformanceMetric, value: f64) -> bool {
         let budget = self.value_for(metric);
+        if !value.is_finite() || !budget.is_finite() {
+            return false;
+        }
         if metric.lower_is_better() {
             value <= budget
         } else {
@@ -497,6 +500,19 @@ mod tests {
     }
 
     #[test]
+    fn within_budget_non_finite_values_fail_closed() {
+        let budgets = ReplayPerformanceBudgets::default();
+        assert!(!budgets.within_budget(
+            ReplayPerformanceMetric::ReplayThroughputEventsPerSec,
+            f64::INFINITY,
+        ));
+        assert!(!budgets.within_budget(
+            ReplayPerformanceMetric::CaptureOverheadMsPerEvent,
+            f64::NEG_INFINITY,
+        ));
+    }
+
+    #[test]
     fn within_budget_diff_boundary_passes() {
         let budgets = ReplayPerformanceBudgets::default();
         assert!(budgets.within_budget(
@@ -682,6 +698,20 @@ mod tests {
         );
         assert_eq!(row.status, ReplayPerformanceStatus::Blocking);
         assert_eq!(row.reason_code, "budget_exceeded");
+    }
+
+    #[test]
+    fn classify_metric_non_finite_current_value_blocks() {
+        let budgets = ReplayPerformanceBudgets::default();
+        let row = classify_metric_result(
+            &budgets,
+            ReplayPerformanceMetric::ReplayThroughputEventsPerSec,
+            f64::INFINITY,
+            None,
+        );
+        assert_eq!(row.status, ReplayPerformanceStatus::Blocking);
+        assert_eq!(row.reason_code, "budget_exceeded");
+        assert!(!row.within_budget);
     }
 
     #[test]
