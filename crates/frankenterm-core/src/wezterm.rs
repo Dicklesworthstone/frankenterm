@@ -662,7 +662,11 @@ impl PaneInfo {
     /// Get the effective domain name, falling back to "local" if not specified
     #[must_use]
     pub fn effective_domain(&self) -> &str {
-        self.domain_name.as_deref().unwrap_or("local")
+        self.domain_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("local")
     }
 
     /// Get the effective number of rows
@@ -5872,6 +5876,23 @@ mod tests {
         let json = r#"{"pane_id": 0, "tab_id": 0, "window_id": 0}"#;
         let pane: PaneInfo = serde_json::from_str(json).unwrap();
         assert_eq!(pane.effective_title(), "");
+    }
+
+    #[test]
+    fn pane_info_effective_domain_empty_or_whitespace_defaults_local() {
+        let json = r#"{
+            "pane_id": 0, "tab_id": 0, "window_id": 0,
+            "domain_name": "   "
+        }"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(pane.effective_domain(), "local");
+
+        let json = r#"{
+            "pane_id": 0, "tab_id": 0, "window_id": 0,
+            "domain_name": " ssh:remote "
+        }"#;
+        let pane: PaneInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(pane.effective_domain(), "ssh:remote");
     }
 
     #[test]
