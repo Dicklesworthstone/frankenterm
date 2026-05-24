@@ -40,6 +40,8 @@
         },
         "data_dir": {
           "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
           "description": "Data directory for database and locks"
         }
       }
@@ -134,7 +136,7 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "mux_socket_path": { "type": "string" },
+        "mux_socket_path": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "mux_pool": {
           "type": "object",
           "additionalProperties": true,
@@ -144,7 +146,7 @@
             "acquire_timeout_seconds": { "type": "integer", "minimum": 0 },
             "pipeline_depth": { "type": "integer", "minimum": 1 },
             "pipeline_timeout_ms": { "type": "integer", "minimum": 0 },
-            "compression": { "type": "string" }
+            "compression": { "type": "string", "minLength": 1, "pattern": "\\S" }
           }
         },
         "sharding": {
@@ -152,7 +154,10 @@
           "additionalProperties": true,
           "properties": {
             "enabled": { "type": "boolean" },
-            "socket_paths": { "type": "array", "items": { "type": "string" } },
+            "socket_paths": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+            },
             "assignment": {
               "type": "object",
               "additionalProperties": true,
@@ -179,7 +184,7 @@
             "schedule": { "type": "string", "minLength": 1, "pattern": "\\S" },
             "retention_days": { "type": "integer", "minimum": 0 },
             "max_backups": { "type": "integer", "minimum": 0 },
-            "destination": { "type": "string" }
+            "destination": { "type": "string", "minLength": 1, "pattern": "\\S" }
           }
         }
       }

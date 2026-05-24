@@ -529,6 +529,66 @@ fn schema_rejects_blank_documented_string_values() {
     }
 }
 
+/// 4h.1) Falsification: documented path-like strings must not be
+/// whitespace-only. A blank path in ft.toml is never a usable location.
+#[test]
+fn schema_rejects_blank_documented_path_values() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "general.data_dir",
+            serde_json::json!({
+                "general": {
+                    "data_dir": " \t"
+                }
+            }),
+        ),
+        (
+            "vendored.mux_socket_path",
+            serde_json::json!({
+                "vendored": {
+                    "mux_socket_path": "\n"
+                }
+            }),
+        ),
+        (
+            "vendored.mux_pool.compression",
+            serde_json::json!({
+                "vendored": {
+                    "mux_pool": {
+                        "compression": " "
+                    }
+                }
+            }),
+        ),
+        (
+            "vendored.sharding.socket_paths[]",
+            serde_json::json!({
+                "vendored": {
+                    "sharding": {
+                        "socket_paths": ["/tmp/ft-shard-0.sock", " \t"]
+                    }
+                }
+            }),
+        ),
+        (
+            "backup.scheduled.destination",
+            serde_json::json!({
+                "backup": {
+                    "scheduled": {
+                        "destination": " \t"
+                    }
+                }
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject blank documented path-like string at {surface}"
+        );
+    }
+}
+
 /// 4i) Falsification: documented bounded-size fields that must be at
 /// least one should reject zero. These mirror production semantic
 /// validators for queue sizes and concurrency.
