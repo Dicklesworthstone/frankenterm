@@ -250,6 +250,18 @@ jobs:
           bash tests/e2e/test_redactor_coverage_report_integrity.sh
           bash tests/e2e/test_redactor_coverage_report_integrity.sh --self-test
 
+      # Swarm incident-bundle privacy/no-mutation goldens (ft.swarm_incident_bundle.v1
+      # / ft-1nqye shape). The Rust consumer (incident_bundle_golden_fixtures.rs)
+      # needs cargo; this static guard keeps the privacy contract those goldens
+      # encode enforced while the remote proof lane is down: incident collection
+      # never mutates state / repairs Agent Mail / uses a non-read-only sampler,
+      # redaction counts reconcile across manifest + report + payloads, pane text
+      # is gated (disabled => no pane source; else summaries-only + partial
+      # redaction), and no source payload carries a raw pane/source-text key.
+      # Static; no compilation.
+      - name: Incident-bundle redaction goldens guard (ft-1nqye)
+        run: bash tests/e2e/test_incident_bundle_redaction_goldens.sh
+
       # ft-zbnz4 — deferred RCH proof replay queue static contract family.
       # These verifiers prove the receipt/extractor/ownership/queue/replay
       # semantics WITHOUT live RCH (jq + ruby only), so they stay green even
