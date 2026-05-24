@@ -150,6 +150,15 @@ impl WorkflowDescriptor {
                 ),
             ));
         }
+        if self.name.len() > limits.max_text_len {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(format!(
+                    "Descriptor name too long ({} > max {})",
+                    self.name.len(),
+                    limits.max_text_len
+                )),
+            ));
+        }
 
         validate_optional_text_len(
             "Descriptor description",

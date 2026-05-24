@@ -382,6 +382,50 @@ proptest! {
     }
 
     #[test]
+    fn workflow_name_respects_configured_text_length_limit(
+        max_text_len in 1usize..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "x".repeat(max_text_len),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "workflow name at max_text_len should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "x".repeat(max_text_len.saturating_add(1)),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "workflow name longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
     fn empty_trigger_values_fail_validation(
         mut val in arb_workflow_descriptor(),
         trigger_field in 0u8..3,
