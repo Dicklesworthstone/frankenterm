@@ -10,6 +10,7 @@ use frankenterm_core::chaos_scale_harness::FailureClass;
 use frankenterm_core::runtime_telemetry::{
     SwarmCapacityCertificateConfig, SwarmCapacityOutcome, SwarmCapacityRegressionBudget,
     SwarmCapacityRegressionGateStatus, SwarmCapacityStage, SwarmCapacityTelemetry,
+    SwarmTailRiskMonitorConfig, SwarmTailRiskStatus,
 };
 
 proptest! {
@@ -242,5 +243,25 @@ fn regression_gate_does_not_flag_certificate_against_itself() {
         report.status,
         SwarmCapacityRegressionGateStatus::Fail,
         "a certificate must never regress against its own identical baseline"
+    );
+}
+
+/// The tail-risk monitor must not flag a violation when a certificate is
+/// compared against its own identical baseline — there is no excess tail
+/// risk relative to itself. (Complements the regression-gate reflexivity.)
+#[test]
+fn tail_risk_report_does_not_violate_certificate_against_itself() {
+    let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
+    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    let snapshot = telemetry.snapshot();
+    let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
+
+    let report = cert.tail_risk_report(&cert, SwarmTailRiskMonitorConfig::default());
+
+    assert_ne!(
+        report.status,
+        SwarmTailRiskStatus::Violated,
+        "a certificate must not show violated tail risk against its own baseline"
     );
 }
