@@ -237,16 +237,14 @@ fn validate_optional_text_len(
     value: Option<&str>,
     max_len: usize,
 ) -> crate::Result<()> {
-    if let Some(value) = value {
-        if value.len() > max_len {
-            return Err(crate::Error::Config(
-                crate::error::ConfigError::ValidationError(format!(
-                    "{label} too long ({} > max {})",
-                    value.len(),
-                    max_len
-                )),
-            ));
-        }
+    if let Some(value) = value.filter(|value| value.len() > max_len) {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "{label} too long ({} > max {})",
+                value.len(),
+                max_len
+            )),
+        ));
     }
     Ok(())
 }
