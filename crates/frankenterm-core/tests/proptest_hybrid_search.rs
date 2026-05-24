@@ -1115,3 +1115,35 @@ proptest! {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// RRF two-lane presence boost (metamorphic)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// An item present in BOTH lanes scores strictly higher than the same item
+    /// in only one lane: RRF sums per-lane reciprocal-rank contributions, so the
+    /// second lane adds a positive 1/(k+rank+1) term. Distinct from the weight
+    /// and rank-provenance properties.
+    #[test]
+    fn rrf_fuse_two_lane_presence_boosts_score(
+        id in 1u64..=100,
+        lex_score in 0.1f32..100.0,
+        sem_score in 0.1f32..100.0,
+        k in 1u32..=120,
+    ) {
+        let single = rrf_fuse(&[(id, lex_score)], &[], k);
+        let both = rrf_fuse(&[(id, lex_score)], &[(id, sem_score)], k);
+
+        let s_single = single.iter().find(|r| r.id == id).map(|r| r.score);
+        let s_both = both.iter().find(|r| r.id == id).map(|r| r.score);
+        prop_assert!(s_single.is_some() && s_both.is_some(), "item missing from fusion");
+        prop_assert!(
+            s_both.unwrap() > s_single.unwrap(),
+            "two-lane presence did not boost score: single={}, both={}",
+            s_single.unwrap(), s_both.unwrap()
+        );
+    }
+}
