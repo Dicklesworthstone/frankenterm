@@ -507,11 +507,16 @@ impl CwdInfo {
                 // Remote path: host/path
                 let host = &rest[..slash_pos];
                 let path = &rest[slash_pos..];
+                let is_localhost = host.eq_ignore_ascii_case("localhost");
                 Self {
                     raw_uri: uri.to_string(),
                     path: percent_decode_file_uri_path(path),
-                    host: host.to_string(),
-                    is_remote: true,
+                    host: if is_localhost {
+                        String::new()
+                    } else {
+                        host.to_string()
+                    },
+                    is_remote: !is_localhost,
                 }
             } else {
                 // Just host, no path
@@ -4334,6 +4339,14 @@ mod tests {
         assert!(cwd.is_remote);
         assert_eq!(cwd.host, "remote-server");
         assert_eq!(cwd.path, "/srv/agent workspace");
+    }
+
+    #[test]
+    fn cwd_info_treats_file_uri_localhost_as_local() {
+        let cwd = CwdInfo::parse("file://localhost/home/user/project");
+        assert!(!cwd.is_remote);
+        assert_eq!(cwd.host, "");
+        assert_eq!(cwd.path, "/home/user/project");
     }
 
     #[test]
