@@ -215,10 +215,32 @@ impl TextMatch {
 
     pub(super) fn to_wait_matcher(&self) -> crate::Result<WaitMatcher> {
         match self {
-            Self::Substring { value } => Ok(WaitMatcher::substring(value.clone())),
+            Self::Substring { value } => {
+                if value.trim().is_empty() {
+                    return Err(crate::error::PatternError::InvalidRule(
+                        "text match substring cannot be empty".to_string(),
+                    )
+                    .into());
+                }
+                Ok(WaitMatcher::substring(value.clone()))
+            }
             Self::Regex { pattern } => {
+                if pattern.trim().is_empty() {
+                    return Err(crate::error::PatternError::InvalidRegex(
+                        "text match regex cannot be empty".to_string(),
+                    )
+                    .into());
+                }
                 let regex = compile_text_match_regex(pattern)
                     .map_err(|e| crate::error::PatternError::InvalidRegex(e.to_string()))?;
+                if regex.is_match("").map_err(|e| {
+                    crate::error::PatternError::InvalidRegex(e.to_string())
+                })? {
+                    return Err(crate::error::PatternError::InvalidRegex(
+                        "text match regex cannot match empty input".to_string(),
+                    )
+                    .into());
+                }
                 Ok(WaitMatcher::regex(regex))
             }
         }
@@ -606,6 +628,20 @@ mod tests {
         let m = TextMatch::regex(r"[invalid");
         let wm = m.to_wait_matcher();
         assert!(wm.is_err());
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_rejects_empty_substring() {
+        let m = TextMatch::substring("   ");
+        let err = m.to_wait_matcher().unwrap_err();
+        assert!(format!("{err}").contains("substring cannot be empty"));
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_rejects_empty_matching_regex() {
+        let m = TextMatch::regex(".*");
+        let err = m.to_wait_matcher().unwrap_err();
+        assert!(format!("{err}").contains("cannot match empty input"));
     }
 
     #[test]
