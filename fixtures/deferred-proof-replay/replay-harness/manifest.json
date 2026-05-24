@@ -11,7 +11,7 @@
     "input_contract_id": "ft.deferred_proof_replay_harness.input.v1",
     "tamper_contract_id": "ft.deferred_proof_replay_harness.tamper.v1",
     "receipt_count": 9,
-    "tamper_case_count": 6,
+    "tamper_case_count": 9,
     "next_candidate": "ft-stat1",
     "decision_counts": {
       "run_static_now": 1,

@@ -413,8 +413,12 @@ REQUIRED_TAMPER = %w[
   topology-preflight-not-no-worker
   stale-shape-never-runnable
   forged-green-without-remote-exit
+  dirty-overlap-forged-eligible
+  prerequisite-forged-eligible
+  cancelled-overrides-admitted-eligible
 ].freeze
 fail!("tamper coverage drifted: #{tamper_ids.sort.inspect}") unless tamper_ids.sort == REQUIRED_TAMPER.sort
+fail!("manifest tamper_case_count drift") unless manifest.dig("golden_summary", "tamper_case_count") == cases.length
 
 cases.each do |kase|
   receipt = kase.fetch("receipt")

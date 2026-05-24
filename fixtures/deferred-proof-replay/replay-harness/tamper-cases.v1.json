@@ -133,6 +133,73 @@
         "coordination": {"rch_admission_state": "admitted", "operator_cancelled": false, "prerequisite_beads": []},
         "eligibility": {"state": "eligible", "replay_allowed": true}
       }
+    },
+    {
+      "case_id": "dirty-overlap-forged-eligible",
+      "note": "An admitted, canonical, remote-only receipt that nonetheless captured a dirty tree must defer on overlap. A forged eligible/replay_allowed/green must not let it run; the coordination blocker overrides self-declared eligibility.",
+      "expected_decision": "defer_dirty_overlap",
+      "forbidden_decisions": ["would_run_remote", "run_static_now"],
+      "must_include_blocker": ["overlap.dirty_paths"],
+      "receipt": {
+        "bead_id": "ft-tamper-dirty-eligible",
+        "receipt_id": "ft-tamper-dirty-eligible:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-tamper-dirty", "cargo", "test", "-p", "frankenterm-core", "redactor"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}, {"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-dirty",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "green"},
+        "paths": {"dirty_paths_at_capture": ["crates/frankenterm-core/src/redactor.rs"]},
+        "coordination": {"rch_admission_state": "admitted", "operator_cancelled": false, "prerequisite_beads": []},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
+    },
+    {
+      "case_id": "prerequisite-forged-eligible",
+      "note": "An admitted, canonical, clean receipt with an open prerequisite bead must defer on the prerequisite. A forged eligible/replay_allowed must not let it run ahead of its dependency.",
+      "expected_decision": "defer_prerequisite",
+      "forbidden_decisions": ["would_run_remote", "run_static_now"],
+      "must_include_blocker": ["prereq.bead_open"],
+      "must_exclude_blocker": ["overlap.dirty_paths"],
+      "receipt": {
+        "bead_id": "ft-tamper-prereq-eligible",
+        "receipt_id": "ft-tamper-prereq-eligible:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-tamper-prereq", "cargo", "test", "-p", "frankenterm-core", "mcp"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}, {"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-prereq",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "blocked_infra"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "admitted", "operator_cancelled": false, "prerequisite_beads": ["ft-tamper-prereq-0"]},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
+    },
+    {
+      "case_id": "cancelled-overrides-admitted-eligible",
+      "note": "Operator cancellation is the highest-precedence outcome: an admitted, canonical, clean, forged-eligible receipt that the operator cancelled must never auto-queue, even with replay_allowed forged true.",
+      "expected_decision": "cancelled",
+      "forbidden_decisions": ["would_run_remote", "run_static_now", "defer_remote_blocked"],
+      "must_include_blocker": ["operator.cancelled"],
+      "receipt": {
+        "bead_id": "ft-tamper-cancelled-eligible",
+        "receipt_id": "ft-tamper-cancelled-eligible:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-tamper-cancel", "cargo", "test", "-p", "frankenterm-core", "policy"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}, {"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-cancel",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "green"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "admitted", "operator_cancelled": true, "prerequisite_beads": []},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
     }
   ]
 }
