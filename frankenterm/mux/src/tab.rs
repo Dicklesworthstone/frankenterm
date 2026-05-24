@@ -915,7 +915,7 @@ fn split_dimension_for_request(
 fn requested_split_target_axis_size(dim: usize, request: SplitRequest) -> usize {
     match request.size {
         SplitSize::Cells(n) => n,
-        SplitSize::Percent(n) => (dim * (n as usize)) / 100,
+        SplitSize::Percent(n) => dim.saturating_mul(n as usize) / 100,
     }
     .max(1)
 }
@@ -6096,6 +6096,19 @@ mod test {
         let s3 = s.clone(); // Clone
         assert_eq!(s, s2);
         assert_eq!(s, s3);
+    }
+
+    #[test]
+    fn split_percent_request_saturates_oversized_dimensions() {
+        let requested = requested_split_target_axis_size(
+            usize::MAX,
+            SplitRequest {
+                size: SplitSize::Percent(u8::MAX),
+                ..SplitRequest::default()
+            },
+        );
+
+        assert_eq!(requested, usize::MAX / 100);
     }
 
     // ── SplitRequest ─────────────────────────────────────────
