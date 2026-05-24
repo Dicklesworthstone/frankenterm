@@ -115,6 +115,40 @@ proptest! {
                 "non-finite samples must not change quantile at q={}", q);
         }
     }
+
+    /// merge_from preserves exact aggregates: merging b into a equals
+    /// recording a's values followed by b's values into one histogram.
+    /// count and min/max are exact; mean matches within float tolerance
+    /// (sum order differs, and f64 addition is not associative). Large
+    /// capacity (> total) so no eviction.
+    #[test]
+    fn histogram_merge_from_matches_concatenated_recording(
+        values_a in proptest::collection::vec(arb_value(), 1..40),
+        values_b in proptest::collection::vec(arb_value(), 1..40),
+    ) {
+        let mut a = Histogram::new("a", 1000);
+        for &v in &values_a { a.record(v); }
+        let mut b = Histogram::new("b", 1000);
+        for &v in &values_b { b.record(v); }
+
+        let mut combined = Histogram::new("combined", 1000);
+        for &v in values_a.iter().chain(values_b.iter()) { combined.record(v); }
+
+        a.merge_from(&b);
+
+        prop_assert_eq!(a.count(), combined.count(),
+            "merged count must equal concatenated count");
+        prop_assert_eq!(a.retained(), combined.retained(),
+            "merged retained must equal concatenated retained (no eviction)");
+        prop_assert_eq!(a.min_max(), combined.min_max(),
+            "merged min/max must equal concatenated min/max");
+
+        let am = a.mean().unwrap();
+        let cm = combined.mean().unwrap();
+        let tol = 1e-6 * cm.abs().max(1.0);
+        prop_assert!((am - cm).abs() <= tol,
+            "merged mean {} must match concatenated mean {} within {}", am, cm, tol);
+    }
 }
 
 // =============================================================================
