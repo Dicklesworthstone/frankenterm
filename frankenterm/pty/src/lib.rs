@@ -38,7 +38,7 @@
 //! ```
 //!
 use anyhow::Error;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 use std::io::Result as IoResult;
@@ -225,11 +225,10 @@ impl From<std::process::ExitStatus> for ExitStatus {
             }
         }
 
-        let code =
-            status
-                .code()
-                .map(|c| c as u32)
-                .unwrap_or_else(|| if status.success() { 0 } else { 1 });
+        let code = status
+            .code()
+            .map(|c| c as u32)
+            .unwrap_or_else(|| if status.success() { 0 } else { 1 });
 
         ExitStatus { code, signal: None }
     }
@@ -293,6 +292,16 @@ struct ProcessSignaller {
     handle: Option<filedescriptor::OwnedHandle>,
 }
 
+#[cfg(unix)]
+fn u32_to_pid_t(pid: u32) -> IoResult<libc::pid_t> {
+    libc::pid_t::try_from(pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("process id {pid} exceeds pid_t range"),
+        )
+    })
+}
+
 #[cfg(windows)]
 impl ChildKiller for ProcessSignaller {
     fn kill(&mut self) -> IoResult<()> {
@@ -319,7 +328,8 @@ impl ChildKiller for ProcessSignaller {
 impl ChildKiller for ProcessSignaller {
     fn kill(&mut self) -> IoResult<()> {
         if let Some(pid) = self.pid {
-            let result = unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+            let pid = u32_to_pid_t(pid)?;
+            let result = unsafe { libc::kill(pid, libc::SIGHUP) };
             if result != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -339,7 +349,8 @@ impl ChildKiller for std::process::Child {
             // On unix, we send the SIGHUP signal instead of trying to kill
             // the process. The default behavior of a process receiving this
             // signal is to be killed unless it configured a signal handler.
-            let result = unsafe { libc::kill(self.id() as i32, libc::SIGHUP) };
+            let pid = u32_to_pid_t(self.id())?;
+            let result = unsafe { libc::kill(pid, libc::SIGHUP) };
             if result != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -406,6 +417,17 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_conversion_rejects_values_outside_pid_t_range() {
+        assert!(u32_to_pid_t(1).is_ok());
+
+        let first_out_of_range = (libc::pid_t::MAX as u128).saturating_add(1);
+        if first_out_of_range <= u128::from(u32::MAX) {
+            assert!(u32_to_pid_t(first_out_of_range as u32).is_err());
+        }
+    }
 
     // ── PtySize ─────────────────────────────────────────────
 
