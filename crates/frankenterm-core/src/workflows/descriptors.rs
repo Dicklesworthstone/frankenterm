@@ -650,6 +650,13 @@ impl DescriptorStep {
             }
             Self::SendCtrl { .. } => {}
             Self::Notify { message, .. } | Self::Log { message, .. } => {
+                if message.trim().is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "Message cannot be empty".to_string(),
+                        ),
+                    ));
+                }
                 if message.len() > limits.max_text_len {
                     return Err(crate::Error::Config(
                         crate::error::ConfigError::ValidationError(format!(
@@ -661,6 +668,13 @@ impl DescriptorStep {
                 }
             }
             Self::Abort { reason, .. } => {
+                if reason.trim().is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "Abort reason cannot be empty".to_string(),
+                        ),
+                    ));
+                }
                 if reason.len() > limits.max_text_len {
                     return Err(crate::Error::Config(
                         crate::error::ConfigError::ValidationError(format!(

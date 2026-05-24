@@ -701,6 +701,41 @@ proptest! {
     }
 
     #[test]
+    fn empty_terminal_step_messages_fail_validation(step_variant in 0u8..3) {
+        let step = match step_variant {
+            0 => DescriptorStep::Notify {
+                id: "s".to_string(),
+                description: None,
+                message: " \t ".to_string(),
+            },
+            1 => DescriptorStep::Log {
+                id: "s".to_string(),
+                description: None,
+                message: " \t ".to_string(),
+            },
+            _ => DescriptorStep::Abort {
+                id: "s".to_string(),
+                description: None,
+                reason: " \t ".to_string(),
+            },
+        };
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "terminal_step_blank".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![step],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "terminal workflow steps must carry non-empty operator-facing text"
+        );
+    }
+
+    #[test]
     fn workflow_description_respects_configured_text_length_limit(
         max_text_len in 1usize..128,
     ) {
@@ -956,7 +991,7 @@ proptest! {
                 then_steps: vec![DescriptorStep::Log {
                     id: "t".to_string(),
                     description: None,
-                    message: String::new(),
+                    message: "matched".to_string(),
                 }],
                 else_steps: Vec::new(),
             }],
@@ -982,7 +1017,7 @@ proptest! {
                 then_steps: vec![DescriptorStep::Log {
                     id: "t".to_string(),
                     description: None,
-                    message: String::new(),
+                    message: "matched".to_string(),
                 }],
                 else_steps: Vec::new(),
             }],
