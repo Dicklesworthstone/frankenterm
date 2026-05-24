@@ -541,6 +541,45 @@ fn bundle_schema_requires_canonical_confidence_summary() {
 }
 
 #[test]
+fn bundle_schema_rejects_blank_confidence_summary_text() {
+    let validator = bundle_validator();
+    let valid = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle tracked by ft-e87u6.2"
+    }));
+
+    for (surface, mut bundle) in [
+        ("claim", valid.clone()),
+        ("confidence_value.reason", valid.clone()),
+        ("sample_size_or_state_count.unit", valid.clone()),
+        ("methodology_url", valid),
+    ] {
+        match surface {
+            "claim" => {
+                bundle["confidence_summary"]["records"][0]["claim"] = json!(" \t");
+            }
+            "confidence_value.reason" => {
+                bundle["confidence_summary"]["records"][0]["confidence_value"]["reason"] =
+                    json!("\n");
+            }
+            "sample_size_or_state_count.unit" => {
+                bundle["confidence_summary"]["records"][0]["sample_size_or_state_count"]["unit"] =
+                    json!(" \t");
+            }
+            "methodology_url" => {
+                bundle["confidence_summary"]["records"][0]["methodology_url"] = json!("\n");
+            }
+            _ => unreachable!("test case is exhaustive"),
+        }
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "bundle confidence summary must reject blank {surface}"
+        );
+    }
+}
+
+#[test]
 fn bundle_schema_rejects_unsigned_reason_without_tracking_bead() {
     let validator = bundle_validator();
     let bundle = base_bundle(json!({

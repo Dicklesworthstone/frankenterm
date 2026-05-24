@@ -124,6 +124,7 @@
             "reason": {
               "type": "string",
               "minLength": 1,
+              "pattern": "\\S",
               "maxLength": 500
             }
           }
@@ -158,6 +159,7 @@
             "unit": {
               "type": "string",
               "minLength": 1,
+              "pattern": "\\S",
               "maxLength": 80
             }
           }
@@ -212,6 +214,7 @@
         "claim": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "maxLength": 1000
         },
         "confidence_type": { "$ref": "#/$defs/confidenceType" },
@@ -224,6 +227,7 @@
           "description": "Repo-relative documentation URL, fragment, or absolute URI explaining the method.",
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "maxLength": 500
         },
         "source_artifact_hash": {
