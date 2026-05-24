@@ -952,7 +952,11 @@ impl PatternPack {
             && report.regex_budget_checked
             && report.action_mode.allows_action_triggers()
         {
-            self
+            let mut pack = self;
+            if let Some(supply_chain) = pack.supply_chain.as_mut() {
+                supply_chain.rollout.observe_only_until_verified = false;
+            }
+            pack
         } else {
             self.into_observe_only()
         }
@@ -4493,6 +4497,38 @@ rules:
             .find(|rule| rule.id == "codex.signed_file")
             .expect("signed file rule");
         assert_eq!(rule.workflow.as_deref(), Some("signed_pack_workflow"));
+    }
+
+    #[test]
+    fn successful_verification_clears_observe_only_rollout_flag() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.verified_actions");
+        rule.workflow = Some("signed_pack_workflow".to_string());
+        let pack = signed_test_pack(rule, &fixture_hash);
+        assert!(
+            pack.supply_chain
+                .as_ref()
+                .expect("supply chain")
+                .rollout
+                .observe_only_until_verified
+        );
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+        let enforced = pack.enforce_verification_report(&report);
+
+        assert_eq!(
+            enforced.rules[0].workflow.as_deref(),
+            Some("signed_pack_workflow")
+        );
+        assert!(
+            !enforced
+                .supply_chain
+                .as_ref()
+                .expect("supply chain")
+                .rollout
+                .observe_only_until_verified
+        );
     }
 
     #[test]
