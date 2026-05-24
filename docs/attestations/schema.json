@@ -463,7 +463,13 @@
             },
             "superseded_paths": {
               "type": "array",
-              "items": { "type": "string" }
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "pattern": "^[^/].*$",
+                "allOf": [{ "pattern": "\\S" }],
+                "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+              }
             }
           }
         }

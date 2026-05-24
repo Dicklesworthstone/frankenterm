@@ -755,6 +755,44 @@ fn bundle_schema_rejects_blank_repo_relative_paths() {
 }
 
 #[test]
+fn bundle_schema_rejects_invalid_retraction_conflict_paths() {
+    let validator = bundle_validator();
+    for (surface, superseded_paths) in [
+        ("empty list", json!([])),
+        ("blank path", json!([" \t"])),
+        ("traversal path", json!(["../archive/retraction.json"])),
+    ] {
+        let mut bundle = base_bundle(json!({
+            "method": "unsigned",
+            "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "reason": "dev bundle tracked by ft-e87u6.2"
+        }));
+        bundle["retractions"] = json!([
+            {
+                "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                "affected_slot": "perf/headline-claims",
+                "retracted_at": "2026-05-12T00:00:00Z",
+                "retracted_by_release": "0.2.1",
+                "retraction_rationale": "synthetic conflict path regression",
+                "retraction_path": "docs/attestations/retractions/synthetic.json",
+                "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                "size_bytes": 1,
+                "corrected_claim_value": null,
+                "retraction_conflict": {
+                    "competing_retractions": 2,
+                    "selected_by": "retracted_at_then_path",
+                    "superseded_paths": superseded_paths
+                }
+            }
+        ]);
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "bundle must reject retraction_conflict superseded_paths with {surface}"
+        );
+    }
+}
+
+#[test]
 fn bundle_schema_rejects_blank_retraction_summary_metadata() {
     let validator = bundle_validator();
     for (surface, bundle) in [
