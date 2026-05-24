@@ -346,6 +346,62 @@ fn schema_rejects_negative_documented_nonnegative_fields() {
     }
 }
 
+/// 4c.3) Falsification: pane priority and ingest budget fields are
+/// documented nonnegative counters and should fail on negative values.
+#[test]
+fn schema_rejects_negative_priority_and_budget_fields() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "ingest.priorities.default_priority",
+            serde_json::json!({
+                "ingest": {
+                    "priorities": {
+                        "default_priority": -1
+                    }
+                }
+            }),
+        ),
+        (
+            "ingest.priorities.rules[].priority",
+            serde_json::json!({
+                "ingest": {
+                    "priorities": {
+                        "rules": [
+                            { "id": "bad_priority", "title": "codex", "priority": -1 }
+                        ]
+                    }
+                }
+            }),
+        ),
+        (
+            "ingest.budgets.max_captures_per_sec",
+            serde_json::json!({
+                "ingest": {
+                    "budgets": {
+                        "max_captures_per_sec": -1
+                    }
+                }
+            }),
+        ),
+        (
+            "ingest.budgets.max_bytes_per_sec",
+            serde_json::json!({
+                "ingest": {
+                    "budgets": {
+                        "max_bytes_per_sec": -1
+                    }
+                }
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject negative priority or budget field {surface}"
+        );
+    }
+}
+
 /// 4d) Falsification: `vendored.sharding.assignment.strategy` is an
 /// enum; an unknown strategy MUST be rejected.
 #[test]
