@@ -719,7 +719,8 @@
         "reason": {
           "description": "Why this bundle is unsigned. Must include a bead ID tracking the gap.",
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "ft-[a-z0-9]+(?:\\.[a-z0-9]+)*"
         }
       },
       "oneOf": [
@@ -760,7 +761,8 @@
             "reason": {
               "description": "Why this bundle is unsigned. Must include a bead ID tracking the gap.",
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "pattern": "ft-[a-z0-9]+(?:\\.[a-z0-9]+)*"
             }
           },
           "required": ["method", "reason"]

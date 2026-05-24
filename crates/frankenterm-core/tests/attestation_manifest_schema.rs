@@ -272,6 +272,25 @@ fn checked_in_manifest_validates_against_deferred_slot_schema() {
 }
 
 #[test]
+fn checked_in_dev_bundle_validates_against_schema() {
+    let validator = bundle_validator();
+    let path = workspace_root()
+        .join("docs")
+        .join("attestations")
+        .join("0.0.0-dev.json");
+    let bundle = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let bundle: Value = serde_json::from_str(&bundle)
+        .unwrap_or_else(|err| panic!("bundle {} is not JSON: {err}", path.display()));
+    let errors = validate(&validator, &bundle);
+    assert!(
+        errors.is_empty(),
+        "checked-in dev bundle failed validation:\n{}",
+        errors.join("\n")
+    );
+}
+
+#[test]
 fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({
@@ -326,7 +345,7 @@ fn bundle_schema_requires_canonical_confidence_summary() {
     let valid = base_bundle(json!({
         "method": "unsigned",
         "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-        "reason": "dev bundle"
+        "reason": "dev bundle tracked by ft-e87u6.2"
     }));
     assert!(
         validate(&validator, &valid).is_empty(),
@@ -349,5 +368,19 @@ fn bundle_schema_requires_canonical_confidence_summary() {
     assert!(
         !validate(&validator, &bad_hash).is_empty(),
         "confidence record without a SHA-256 source hash should fail validation"
+    );
+}
+
+#[test]
+fn bundle_schema_rejects_unsigned_reason_without_tracking_bead() {
+    let validator = bundle_validator();
+    let bundle = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle"
+    }));
+    assert!(
+        !validate(&validator, &bundle).is_empty(),
+        "unsigned bundle reason must include a tracking bead ID"
     );
 }
