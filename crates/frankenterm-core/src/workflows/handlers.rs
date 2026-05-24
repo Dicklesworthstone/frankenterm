@@ -919,6 +919,10 @@ impl HandleProcessTriageLifecycle {
     }
 
     fn plan_stats(plan: &serde_json::Value) -> Result<ProcessTriagePlanStats, String> {
+        if !plan.is_object() {
+            return Err("triage plan must be an object".to_string());
+        }
+
         let entries: Vec<&serde_json::Value> = match plan.get("entries") {
             Some(raw) => raw
                 .as_array()
@@ -934,6 +938,9 @@ impl HandleProcessTriageLifecycle {
         let mut has_protected_destructive = false;
 
         for entry in &entries {
+            if !entry.is_object() {
+                return Err("triage plan entries must be objects".to_string());
+            }
             let category = entry
                 .get("category")
                 .and_then(|v| v.as_str())
@@ -7128,6 +7135,30 @@ mod tests {
         let stats = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger).unwrap();
         assert_eq!(stats.entry_count, 1);
         assert_eq!(stats.auto_safe_count, 1);
+    }
+
+    #[test]
+    fn process_triage_plan_stats_rejects_non_object_plan() {
+        let trigger = serde_json::json!({
+            "triage_plan": "not a plan object"
+        });
+        let err = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger)
+            .expect_err("present triage_plan must be an object");
+        assert!(err.contains("triage plan must be an object"));
+    }
+
+    #[test]
+    fn process_triage_plan_stats_rejects_non_object_entries() {
+        let trigger = serde_json::json!({
+            "process_triage": {
+                "plan": {
+                    "entries": ["not an entry object"]
+                }
+            }
+        });
+        let err = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger)
+            .expect_err("triage plan entries must be objects");
+        assert!(err.contains("triage plan entries must be objects"));
     }
 
     #[test]
