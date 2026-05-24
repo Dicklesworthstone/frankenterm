@@ -3,11 +3,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOURCE_BUNDLE="${FT_ATTESTATION_SELF_TEST_SOURCE:-${ROOT_DIR}/docs/attestations/0.0.0-dev.json}"
 OUT_DIR="${FT_ATTESTATION_SELF_TEST_DIR:-${ROOT_DIR}/tests/attestation_verify_self_test}"
 FIXTURE_DIR="${OUT_DIR}/fixtures"
 EXPECTED_DIR="${OUT_DIR}/expected"
 SIGNATURE_DIR="${OUT_DIR}/signatures"
+RUN_ID="${FT_ATTESTATION_SELF_TEST_ROTATE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+SOURCE_BUNDLE="${FT_ATTESTATION_SELF_TEST_SOURCE:-}"
+SOURCE_BUILD_DIR="${FT_ATTESTATION_SELF_TEST_SOURCE_DIR:-${ROOT_DIR}/target/test-artifacts/attestation-verify-self-test-source/${RUN_ID}}"
 
 require_cmd() {
   local cmd="$1"
@@ -56,6 +58,18 @@ write_fixture() {
 }
 
 require_cmd jq
+
+if [[ -z "$SOURCE_BUNDLE" ]]; then
+  mkdir -p "$SOURCE_BUILD_DIR"
+  FT_ATTESTATION_OUT_DIR="$SOURCE_BUILD_DIR" \
+    "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version 0.0.0-dev \
+      --channel dev \
+      --sign unsigned \
+      --allow-partial >/dev/null
+  SOURCE_BUNDLE="${SOURCE_BUILD_DIR}/0.0.0-dev.json"
+fi
+
 [[ -f "$SOURCE_BUNDLE" ]] || { echo "source bundle not found: $SOURCE_BUNDLE" >&2; exit 1; }
 
 if ! "${ROOT_DIR}/scripts/attestation-verify.sh" "$SOURCE_BUNDLE" --json --strict-required --strict-deferred >/dev/null; then
