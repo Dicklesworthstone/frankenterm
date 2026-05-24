@@ -2239,6 +2239,17 @@ impl Screen {
             .unwrap_or(StableRowIndex::MAX)
     }
 
+    fn stable_row_index_for_removed_top(&self, removed_from_top: usize) -> StableRowIndex {
+        self.stable_row_index_offset
+            .checked_add(removed_from_top)
+            .and_then(|idx| StableRowIndex::try_from(idx).ok())
+            .unwrap_or(StableRowIndex::MAX)
+    }
+
+    fn advance_stable_row_index_offset(&mut self, delta: usize) {
+        self.stable_row_index_offset = self.stable_row_index_offset.saturating_add(delta);
+    }
+
     #[inline]
     pub fn stable_row_to_phys(&self, stable: StableRowIndex) -> Option<PhysRowIndex> {
         let offset = StableRowIndex::try_from(self.stable_row_index_offset).ok()?;
@@ -2430,8 +2441,7 @@ impl Screen {
                     None => break,
                 };
                 if remove_idx == 0 && scrollback_ok {
-                    let stable_row = self.stable_row_index_offset as StableRowIndex
-                        + removed_from_top as StableRowIndex;
+                    let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
                     self.record_scrollback_spill(stable_row, &line, seqno);
                     removed_from_top = removed_from_top.saturating_add(1);
                 }
@@ -2458,8 +2468,7 @@ impl Screen {
         for _ in 0..to_remove {
             if let Some(removed) = self.lines.remove(remove_idx) {
                 if remove_idx == 0 && scrollback_ok {
-                    let stable_row = self.stable_row_index_offset as StableRowIndex
-                        + removed_from_top as StableRowIndex;
+                    let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
                     self.record_scrollback_spill(stable_row, &removed, seqno);
                     removed_from_top = removed_from_top.saturating_add(1);
                 }
@@ -2467,7 +2476,7 @@ impl Screen {
         }
 
         if remove_idx == 0 && scrollback_ok {
-            self.stable_row_index_offset += lines_removed;
+            self.advance_stable_row_index_offset(lines_removed);
         }
 
         for _ in 0..to_add {
@@ -2515,7 +2524,7 @@ impl Screen {
         for _ in 0..to_clear {
             self.lines.pop_front();
             if self.allow_scrollback {
-                self.stable_row_index_offset += 1;
+                self.advance_stable_row_index_offset(1);
             }
         }
         self.scrollback_tiering.reset();
@@ -3121,6 +3130,19 @@ mod tests {
 
         assert_eq!(screen.stable_row_to_phys(0), None);
         assert_eq!(screen.phys_to_stable_row_index(0), StableRowIndex::MAX);
+    }
+
+    #[test]
+    fn stable_row_offset_helpers_saturate_at_numeric_limits() {
+        let mut screen = test_screen(3, 8, 96);
+        screen.stable_row_index_offset = usize::MAX;
+
+        assert_eq!(
+            screen.stable_row_index_for_removed_top(1),
+            StableRowIndex::MAX
+        );
+        screen.advance_stable_row_index_offset(1);
+        assert_eq!(screen.stable_row_index_offset, usize::MAX);
     }
 
     #[derive(Debug, Default)]
