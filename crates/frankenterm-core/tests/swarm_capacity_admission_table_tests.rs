@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use frankenterm_core::runtime_telemetry::{
+    swarm_capacity_resource_budget_dry_run_examples,
     swarm_capacity_workload_admission_dry_run_examples, swarm_capacity_workload_admission_table,
     SwarmCapacityAdmissionAction, SwarmCapacityAgentWorkloadClass,
 };
@@ -106,5 +107,34 @@ fn workload_admission_dry_run_plan_is_deterministic() {
         swarm_capacity_workload_admission_dry_run_examples(1_700_000_000_000),
         swarm_capacity_workload_admission_dry_run_examples(1_700_000_000_000),
         "dry-run example plan must be deterministic for a fixed timestamp"
+    );
+}
+
+#[test]
+fn resource_budget_dry_run_plans_are_safe() {
+    for ts in [0_u64, 1, 1_700_000_000_000, u64::MAX] {
+        let plans = swarm_capacity_resource_budget_dry_run_examples(ts);
+        assert!(!plans.is_empty(), "resource-budget dry-run must produce example plans");
+        for plan in &plans {
+            assert!(plan.dry_run, "resource-budget plan must set dry_run (id={})", plan.contract_id);
+            assert!(
+                !plan.side_effects_executed,
+                "resource-budget planning must not execute side effects (id={})",
+                plan.contract_id
+            );
+            assert_eq!(
+                plan.generated_at_ms, ts,
+                "generated_at_ms must echo the input (id={})", plan.contract_id
+            );
+        }
+    }
+}
+
+#[test]
+fn resource_budget_dry_run_plans_are_deterministic() {
+    assert_eq!(
+        swarm_capacity_resource_budget_dry_run_examples(1_700_000_000_000),
+        swarm_capacity_resource_budget_dry_run_examples(1_700_000_000_000),
+        "resource-budget dry-run plans must be deterministic for a fixed timestamp"
     );
 }
