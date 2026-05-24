@@ -23,6 +23,15 @@ const DESCRIPTOR_MAX_SLEEP_MS: u64 = crate::tuning_config::WorkflowsTuning::DEFA
 const DESCRIPTOR_MAX_TEXT_LEN: usize = crate::tuning_config::WorkflowsTuning::DEFAULT_MAX_TEXT_LEN;
 const DESCRIPTOR_MAX_MATCH_LEN: usize =
     crate::tuning_config::WorkflowsTuning::DEFAULT_MAX_MATCH_LEN;
+const DESCRIPTOR_REGEX_BACKTRACK_LIMIT: usize = 10_000_000;
+
+fn compile_descriptor_regex(
+    pattern: &str,
+) -> std::result::Result<fancy_regex::Regex, fancy_regex::Error> {
+    fancy_regex::RegexBuilder::new(pattern)
+        .backtrack_limit(DESCRIPTOR_REGEX_BACKTRACK_LIMIT)
+        .build()
+}
 
 /// Limits for descriptor validation.
 #[derive(Debug, Clone)]
@@ -487,7 +496,7 @@ impl DescriptorMatcher {
                         )),
                     ));
                 }
-                let regex = fancy_regex::Regex::new(pattern).map_err(|e| {
+                let regex = compile_descriptor_regex(pattern).map_err(|e| {
                     crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
                         "Invalid regex pattern: {e}"
                     )))
@@ -1055,7 +1064,7 @@ impl Workflow for DescriptorWorkflow {
                                 if let Some(re) = cache.get(&pattern) {
                                     return re.is_match(&actual_text).unwrap_or(false);
                                 }
-                                if let Ok(re) = fancy_regex::Regex::new(&pattern) {
+                                if let Ok(re) = compile_descriptor_regex(&pattern) {
                                     let is_match = re.is_match(&actual_text).unwrap_or(false);
                                     cache.put(pattern.clone(), re);
                                     return is_match;
@@ -1559,6 +1568,24 @@ steps:
         let err = m.validate(&DescriptorLimits::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("Regex matcher too long"), "got: {msg}");
+    }
+
+    #[test]
+    fn compile_descriptor_regex_ejects_redos_pattern_within_100ms() {
+        let regex = compile_descriptor_regex("^(a+)+b$").expect("pattern compiles");
+        let pathological = "a".repeat(25) + "X";
+        let start = std::time::Instant::now();
+        let result = regex.is_match(&pathological);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "descriptor regex should hit the backtrack limit in <100ms, took {elapsed:?}"
+        );
+        assert!(
+            !matches!(result, Ok(true)),
+            "descriptor regex must not match pathological input: {result:?}"
+        );
     }
 
     // ========================================================================
