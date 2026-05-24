@@ -572,6 +572,28 @@ impl<'a> FleetLauncher<'a> {
         if spec.mix.is_empty() {
             return Err(FleetLaunchError::EmptyMix);
         }
+        if spec.name.trim().is_empty() {
+            return Err(FleetLaunchError::ValidationFailed(
+                "fleet name must not be empty".to_string(),
+            ));
+        }
+        if spec.workspace_id.trim().is_empty() {
+            return Err(FleetLaunchError::ValidationFailed(
+                "workspace_id must not be empty".to_string(),
+            ));
+        }
+        if spec.domain.trim().is_empty() {
+            return Err(FleetLaunchError::ValidationFailed(
+                "domain must not be empty".to_string(),
+            ));
+        }
+        for (i, entry) in spec.mix.iter().enumerate() {
+            if entry.program.trim().is_empty() {
+                return Err(FleetLaunchError::ValidationFailed(format!(
+                    "mix entry {i} program must not be empty"
+                )));
+            }
+        }
 
         let total_weight: u64 = spec.mix.iter().map(|entry| u64::from(entry.weight)).sum();
         if total_weight == 0 {
@@ -1321,6 +1343,44 @@ mod tests {
             launcher.plan(&spec).unwrap_err(),
             FleetLaunchError::ZeroWeight
         );
+    }
+
+    #[test]
+    fn plan_empty_identity_fields_fail_validation() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+
+        let mut spec = basic_spec(" ", vec![agent_mix("a", 1)]);
+        assert!(matches!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::ValidationFailed(msg) if msg.contains("fleet name")
+        ));
+
+        spec = basic_spec("bad-workspace", vec![agent_mix("a", 1)]);
+        spec.workspace_id = "\t".to_string();
+        assert!(matches!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::ValidationFailed(msg) if msg.contains("workspace_id")
+        ));
+
+        spec = basic_spec("bad-domain", vec![agent_mix("a", 1)]);
+        spec.domain = "\n".to_string();
+        assert!(matches!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::ValidationFailed(msg) if msg.contains("domain")
+        ));
+    }
+
+    #[test]
+    fn plan_empty_program_fails_validation() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("bad-program", vec![agent_mix("  ", 1)]);
+
+        assert!(matches!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::ValidationFailed(msg) if msg.contains("program")
+        ));
     }
 
     #[test]
