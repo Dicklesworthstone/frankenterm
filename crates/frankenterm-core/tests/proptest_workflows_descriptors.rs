@@ -396,7 +396,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: None,
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -413,7 +413,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: None,
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -552,7 +552,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: None,
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -569,7 +569,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: None,
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -596,7 +596,7 @@ proptest! {
             description: Some("x".repeat(max_text_len)),
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: None,
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -613,7 +613,7 @@ proptest! {
             description: Some("x".repeat(max_text_len.saturating_add(1))),
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: None,
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -640,7 +640,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: Some("x".repeat(max_text_len)),
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -657,7 +657,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
-                id: "step".to_string(),
+                id: "s".to_string(),
                 description: Some("x".repeat(max_text_len.saturating_add(1))),
                 key: DescriptorControlKey::CtrlC,
             }],
@@ -780,7 +780,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendText {
-                id: "send".to_string(),
+                id: "s".to_string(),
                 description: None,
                 text: "x".repeat(max_text_len),
                 wait_for: None,
@@ -799,7 +799,7 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendText {
-                id: "send".to_string(),
+                id: "s".to_string(),
                 description: None,
                 text: "x".repeat(max_text_len.saturating_add(1)),
                 wait_for: None,
@@ -828,14 +828,14 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::Conditional {
-                id: "branch".to_string(),
+                id: "b".to_string(),
                 description: None,
                 test_text: "x".repeat(max_text_len),
                 matcher: DescriptorMatcher::Substring {
                     value: "x".to_string(),
                 },
                 then_steps: vec![DescriptorStep::Log {
-                    id: "then_log".to_string(),
+                    id: "t".to_string(),
                     description: None,
                     message: String::new(),
                 }],
@@ -854,14 +854,14 @@ proptest! {
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::Conditional {
-                id: "branch".to_string(),
+                id: "b".to_string(),
                 description: None,
                 test_text: "x".repeat(max_text_len.saturating_add(1)),
                 matcher: DescriptorMatcher::Substring {
                     value: "x".to_string(),
                 },
                 then_steps: vec![DescriptorStep::Log {
-                    id: "then_log".to_string(),
+                    id: "t".to_string(),
                     description: None,
                     message: String::new(),
                 }],
