@@ -545,8 +545,13 @@ impl ConnectorMesh {
             .values()
             .filter(|h| h.health == HostHealth::Unreachable)
             .count();
-        let total_capacity: usize = self.hosts.values().map(|h| h.max_connectors).sum();
-        let total_active: usize = self.hosts.values().map(|h| h.active_connectors).sum();
+        let total_capacity = self
+            .hosts
+            .values()
+            .fold(0usize, |sum, host| sum.saturating_add(host.max_connectors));
+        let total_active = self.hosts.values().fold(0usize, |sum, host| {
+            sum.saturating_add(host.active_connectors)
+        });
 
         MeshHealthSnapshot {
             total_hosts,
@@ -662,7 +667,7 @@ impl MeshHealthSnapshot {
         if self.total_capacity == 0 {
             return 0.0;
         }
-        self.total_active as f64 / self.total_capacity as f64
+        (self.total_active as f64 / self.total_capacity as f64).min(1.0)
     }
 }
 
@@ -1093,6 +1098,26 @@ mod tests {
     }
 
     #[test]
+    fn health_snapshot_saturates_capacity_totals() {
+        let mut mesh = default_mesh();
+        mesh.register_zone(make_zone("z1")).unwrap();
+
+        let mut h1 = make_host("h1", "z1");
+        h1.max_connectors = usize::MAX;
+        h1.active_connectors = usize::MAX;
+        mesh.register_host(h1).unwrap();
+
+        let mut h2 = make_host("h2", "z1");
+        h2.max_connectors = 1;
+        h2.active_connectors = 1;
+        mesh.register_host(h2).unwrap();
+
+        let snap = mesh.health_snapshot();
+        assert_eq!(snap.total_capacity, usize::MAX);
+        assert_eq!(snap.total_active, usize::MAX);
+    }
+
+    #[test]
     fn health_snapshot_utilization() {
         let snap = MeshHealthSnapshot {
             total_hosts: 2,
@@ -1104,6 +1129,20 @@ mod tests {
             total_active: 10,
         };
         assert!((snap.utilization() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn health_snapshot_utilization_clamps_over_capacity() {
+        let snap = MeshHealthSnapshot {
+            total_hosts: 1,
+            healthy_hosts: 1,
+            degraded_hosts: 0,
+            unreachable_hosts: 0,
+            total_zones: 1,
+            total_capacity: 10,
+            total_active: 15,
+        };
+        assert!((snap.utilization() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
