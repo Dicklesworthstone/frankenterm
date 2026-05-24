@@ -5,6 +5,7 @@
   "description": "Standard JSON envelope for all wa robot mode responses. Every robot command returns this structure with command-specific data in the 'data' field.",
   "type": "object",
   "required": ["ok", "elapsed_ms", "version", "now"],
+  "additionalProperties": false,
   "properties": {
     "ok": {
       "type": "boolean",

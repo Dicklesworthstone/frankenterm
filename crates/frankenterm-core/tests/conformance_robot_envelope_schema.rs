@@ -401,6 +401,27 @@ fn synthetic_robot_envelope_with_wrong_mcp_version_must_fail() {
     );
 }
 
+#[test]
+fn synthetic_robot_envelope_with_unknown_top_level_field_must_fail() {
+    let schema = load_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "pane_id": 7 },
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+        "unexpected_top_level": "this is not part of the robot envelope contract",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot envelopes with unknown top-level fields"
+    );
+}
+
 #[allow(deprecated)]
 fn panic_validation_errors(label: &str, errors: jsonschema::ErrorIterator<'_>) {
     let collected: Vec<String> = errors
