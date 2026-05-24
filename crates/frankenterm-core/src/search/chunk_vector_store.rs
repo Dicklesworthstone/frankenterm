@@ -509,8 +509,15 @@ impl ChunkVectorStore {
         query_vector: &[f32],
         limit: usize,
     ) -> Result<Vec<ChunkVectorHit>> {
+        // ft-kt3yw: reject empty query vectors with a structured error so
+        // direct semantic search callers can distinguish a broken
+        // embedder/query pipeline from a valid no-hit result. This matches the
+        // segment-embedding backend (`search_semantic_backend_with_scan_limit`)
+        // and the adjacent non-finite guard below.
         if query_vector.is_empty() {
-            return Ok(Vec::new());
+            return Err(ChunkVectorStoreError::InvalidVector(
+                "query vector is empty".to_string(),
+            ));
         }
         if query_vector.iter().any(|v| !v.is_finite()) {
             return Err(ChunkVectorStoreError::InvalidVector(
@@ -1476,10 +1483,17 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_empty_query_returns_empty() {
+    fn semantic_search_empty_query_fails() {
+        // ft-kt3yw: an empty query vector is an invalid query, not a valid
+        // no-hit result. It must be rejected with a structured error, matching
+        // the non-finite guard and the segment-embedding backend.
         let store = open_in_memory();
-        let hits = store.semantic_search("prof-1", "gen-1", &[], 10).unwrap();
-        assert!(hits.is_empty());
+        let result = store.semantic_search("prof-1", "gen-1", &[], 10);
+        let rejected = matches!(result, Err(ChunkVectorStoreError::InvalidVector(_)));
+        assert!(
+            rejected,
+            "empty query vector must be rejected with InvalidVector, got {result:?}"
+        );
     }
 
     #[test]
