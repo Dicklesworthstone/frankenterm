@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 // ============================================================================
@@ -691,10 +692,46 @@ pub fn verify_chain(entries: &[ReplayAuditEntry]) -> AuditChainVerification {
 
 /// Compute SHA-256 hash of a JSON value.
 fn compute_hash(data: &serde_json::Value) -> String {
-    let canonical = serde_json::to_string(data).unwrap_or_default();
+    let canonical = canonical_json_string(data);
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn canonical_json_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => {
+            serde_json::to_string(value).expect("string value serializes")
+        }
+        serde_json::Value::Array(values) => {
+            let mut out = String::from("[");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonical_json_string(value));
+            }
+            out.push(']');
+            out
+        }
+        serde_json::Value::Object(values) => {
+            let mut out = String::from("{");
+            let sorted: BTreeMap<&String, &serde_json::Value> = values.iter().collect();
+            for (index, (key, value)) in sorted.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).expect("object key serializes"));
+                out.push(':');
+                out.push_str(&canonical_json_string(value));
+            }
+            out.push('}');
+            out
+        }
+    }
 }
 
 // ============================================================================
@@ -1331,5 +1368,35 @@ mod tests {
         });
         let entries = emitter.entries();
         assert_ne!(entries[0].input_hash, entries[1].input_hash);
+    }
+
+    #[test]
+    fn input_hash_is_object_key_order_invariant() {
+        let emitter = ReplayProvenanceEmitter::with_defaults("run_order".into());
+        emitter.record(ProvenanceRecordParams {
+            event_id: "e1".into(),
+            decision_type: DecisionType::PatternMatch,
+            rule_id: "r".into(),
+            definition_hash: "dh".into(),
+            output_summary: "ok".into(),
+            wall_clock_ms: 100,
+            virtual_clock_ms: 50,
+            input_data: json!({"a": 1, "b": [{"c": true, "d": "x"}]}),
+            event_context: None,
+        });
+        emitter.record(ProvenanceRecordParams {
+            event_id: "e2".into(),
+            decision_type: DecisionType::PatternMatch,
+            rule_id: "r".into(),
+            definition_hash: "dh".into(),
+            output_summary: "ok".into(),
+            wall_clock_ms: 100,
+            virtual_clock_ms: 50,
+            input_data: json!({"b": [{"d": "x", "c": true}], "a": 1}),
+            event_context: None,
+        });
+
+        let entries = emitter.entries();
+        assert_eq!(entries[0].input_hash, entries[1].input_hash);
     }
 }
