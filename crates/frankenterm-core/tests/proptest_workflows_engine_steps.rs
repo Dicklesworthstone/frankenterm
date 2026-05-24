@@ -277,6 +277,10 @@ proptest! {
     fn step_result_jump_to_not_terminal(step in 0usize..100) {
         let r = StepResult::jump_to(step);
         prop_assert!(!r.is_terminal());
+        match r {
+            StepResult::JumpTo { step: actual_step } => prop_assert_eq!(actual_step, step),
+            other => prop_assert!(false, "expected JumpTo, got {other:?}"),
+        }
     }
 
     #[test]
