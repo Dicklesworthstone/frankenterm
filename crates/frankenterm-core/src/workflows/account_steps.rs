@@ -317,6 +317,13 @@ pub(super) static DEVICE_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:https?://[^\s]+(?:device|auth|activate)[^\s]*)").expect("device url regex")
 });
 
+fn clean_device_url(raw: &str) -> String {
+    raw.trim_end_matches(|ch: char| {
+        matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
+    })
+        .to_string()
+}
+
 /// Parse device code from pane tail text.
 ///
 /// Looks for patterns like:
@@ -335,7 +342,7 @@ pub fn parse_device_code(tail: &str) -> Result<DeviceCode, DeviceCodeParseError>
         .map(|m| m.as_str().to_uppercase());
 
     // Try to find the URL (optional)
-    let url = DEVICE_URL_RE.find(tail).map(|m| m.as_str().to_string());
+    let url = DEVICE_URL_RE.find(tail).map(|m| clean_device_url(m.as_str()));
 
     match code {
         Some(code) => Ok(DeviceCode { code, url }),
@@ -407,6 +414,16 @@ mod tests {
         // (depends on whether "device" appears in the URL)
         assert!(result.url.is_some());
         assert!(result.url.unwrap().contains("device"));
+    }
+
+    #[test]
+    fn parse_device_code_trims_url_sentence_punctuation() {
+        let input = "Visit https://login.example.com/device.\nEnter code: ABCD-1234";
+        let result = parse_device_code(input).unwrap();
+        assert_eq!(
+            result.url.as_deref(),
+            Some("https://login.example.com/device")
+        );
     }
 
     #[test]
