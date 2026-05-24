@@ -122,6 +122,26 @@ if [[ "$rc" -eq 0 ]] || ! grep -q "signed retraction output must be inside the r
   exit 1
 fi
 
+echo
+echo "=== parent traversal retraction root is rejected for signed output ==="
+PARENT_RETRACTIONS_ROOT="$RUN_ROOT/retractions-parent/../escaped"
+set +e
+ED25519_PRIVATE_KEY_PATH="$KEY" \
+FT_ATTESTATION_RETRACTIONS_ROOT="$PARENT_RETRACTIONS_ROOT" \
+  bash scripts/retract-bundle-slot.sh \
+    --bundle "$BUNDLE" \
+    --slot doctrine/agents-md-counts \
+    --rationale-file "$RATIONALE" \
+    --retracted-by-release 0.0.1-parent-root \
+    --sign ed25519 > "$RUN_ROOT/retract-parent.out" 2>&1
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] || ! grep -q "repo-relative without parent traversal" "$RUN_ROOT/retract-parent.out"; then
+  echo "FAIL: parent traversal signed retraction root was not rejected with the expected error"
+  cat "$RUN_ROOT/retract-parent.out"
+  exit 1
+fi
+
 cp "$RETRACTION_PATH" \
   "$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts-duplicate.json"
 

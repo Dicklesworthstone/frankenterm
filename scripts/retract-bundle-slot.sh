@@ -84,16 +84,31 @@ sha256_stdin() {
     shasum -a 256 | awk '{print $1}'
   fi
 }
+is_repo_relative_path() {
+  local path="$1"
+  [[ -n "$path" && "$path" != /* ]] || return 1
+  IFS='/' read -r -a parts <<< "$path"
+  local part
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != "." && "$part" != ".." ]] || return 1
+  done
+}
 repo_relative_path() {
   local path="$1"
+  local rel_path
   if [[ "$path" == "$REPO_ROOT/"* ]]; then
-    printf '%s\n' "${path#"$REPO_ROOT"/}"
+    rel_path="${path#"$REPO_ROOT"/}"
   elif [[ "$path" != /* ]]; then
-    printf '%s\n' "$path"
+    rel_path="$path"
   else
     echo "error: signed retraction output must be inside the repository so the verifier can resolve it: $path" >&2
     exit 1
   fi
+  if ! is_repo_relative_path "$rel_path"; then
+    echo "error: signed retraction output path must be repo-relative without parent traversal: $rel_path (from $path)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$rel_path"
 }
 
 bundle_json="$(cat "$BUNDLE")"
@@ -116,6 +131,7 @@ safe_slot="${SLOT//\//__}"
 safe_slot="${safe_slot//:/__}"
 out_dir="$RETRACTIONS_ROOT/$bundle_sha"
 out_path="$out_dir/${safe_slot}.json"
+repo_relative_path "$out_dir" >/dev/null
 mkdir -p "$out_dir"
 
 retraction_no_sig="$(jq -n \
