@@ -624,6 +624,24 @@ fn schema_rejects_enabled_sharding_without_two_socket_paths() {
     }
 }
 
+/// 4h.3) Falsification: enabling scheduled backups requires a
+/// concrete schedule string.
+#[test]
+fn schema_rejects_enabled_scheduled_backup_without_schedule() {
+    let schema = compile_config_schema();
+    let bad = serde_json::json!({
+        "backup": {
+            "scheduled": {
+                "enabled": true
+            }
+        }
+    });
+    assert!(
+        schema.validate(&bad).is_err(),
+        "schema MUST reject backup.scheduled.enabled=true without schedule"
+    );
+}
+
 /// 4i) Falsification: documented bounded-size fields that must be at
 /// least one should reject zero. These mirror production semantic
 /// validators for queue sizes and concurrency.

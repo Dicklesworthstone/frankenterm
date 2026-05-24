@@ -200,6 +200,15 @@
             "retention_days": { "type": "integer", "minimum": 0 },
             "max_backups": { "type": "integer", "minimum": 0 },
             "destination": { "type": "string", "minLength": 1, "pattern": "\\S" }
+          },
+          "if": {
+            "required": ["enabled"],
+            "properties": {
+              "enabled": { "const": true }
+            }
+          },
+          "then": {
+            "required": ["schedule"]
           }
         }
       }
