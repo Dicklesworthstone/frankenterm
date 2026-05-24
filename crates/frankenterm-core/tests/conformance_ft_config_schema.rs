@@ -475,6 +475,57 @@ fn schema_rejects_blank_documented_string_values() {
     }
 }
 
+/// 4i) Falsification: documented bounded-size fields that must be at
+/// least one should reject zero. These mirror production semantic
+/// validators for queue sizes and concurrency.
+#[test]
+fn schema_rejects_zero_for_documented_minimum_one_fields() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "storage.writer_queue_size",
+            serde_json::json!({
+                "storage": {
+                    "writer_queue_size": 0
+                }
+            }),
+        ),
+        (
+            "workflows.max_concurrent",
+            serde_json::json!({
+                "workflows": {
+                    "max_concurrent": 0
+                }
+            }),
+        ),
+        (
+            "vendored.mux_pool.max_connections",
+            serde_json::json!({
+                "vendored": {
+                    "mux_pool": {
+                        "max_connections": 0
+                    }
+                }
+            }),
+        ),
+        (
+            "vendored.mux_pool.pipeline_depth",
+            serde_json::json!({
+                "vendored": {
+                    "mux_pool": {
+                        "pipeline_depth": 0
+                    }
+                }
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject zero for documented minimum-one field {surface}"
+        );
+    }
+}
+
 /// Pin the documented-but-unreachable list. If the README↔code
 /// reconciliation lands and the unreachable section starts round-
 /// tripping, this test fails and the maintainer must move the entry
