@@ -474,6 +474,44 @@ proptest! {
     }
 
     #[test]
+    fn trigger_values_with_whitespace_fail_validation(
+        prefix in "[a-z]{1,8}",
+        suffix in "[a-z]{1,8}",
+        trigger_field in 0u8..3,
+    ) {
+        let mut trigger = DescriptorTrigger {
+            event_types: vec!["session.compaction".to_string()],
+            agent_types: vec!["codex".to_string()],
+            rule_ids: vec!["compaction.detected".to_string()],
+        };
+        let whitespace_value = format!("{prefix} {suffix}");
+        match trigger_field {
+            0 => trigger.event_types = vec![whitespace_value],
+            1 => trigger.agent_types = vec![whitespace_value],
+            _ => trigger.rule_ids = vec![whitespace_value],
+        }
+
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "trigger_value_whitespace".to_string(),
+            description: None,
+            triggers: vec![trigger],
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "s".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "descriptor validation must reject trigger values containing whitespace"
+        );
+    }
+
+    #[test]
     fn trigger_values_respect_configured_text_length_limit(
         max_text_len in 1usize..128,
         trigger_field in 0u8..3,

@@ -236,6 +236,16 @@ fn validate_trigger_values(field: &str, values: &[String], max_len: usize) -> cr
             )),
         ));
     }
+    if values
+        .iter()
+        .any(|value| value.chars().any(char::is_whitespace))
+    {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Descriptor trigger {field} value cannot contain whitespace"
+            )),
+        ));
+    }
     Ok(())
 }
 
