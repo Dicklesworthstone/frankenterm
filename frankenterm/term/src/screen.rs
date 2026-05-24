@@ -2227,17 +2227,21 @@ impl Screen {
 
     #[inline]
     pub fn phys_to_stable_row_index(&self, phys: PhysRowIndex) -> StableRowIndex {
-        (phys + self.stable_row_index_offset) as StableRowIndex
+        phys.checked_add(self.stable_row_index_offset)
+            .and_then(|idx| StableRowIndex::try_from(idx).ok())
+            .unwrap_or(StableRowIndex::MAX)
     }
 
     #[inline]
     pub fn stable_row_to_phys(&self, stable: StableRowIndex) -> Option<PhysRowIndex> {
-        let idx = stable - self.stable_row_index_offset as isize;
-        if idx < 0 || idx >= self.lines.len() as isize {
+        let offset = StableRowIndex::try_from(self.stable_row_index_offset).ok()?;
+        let idx = stable.checked_sub(offset)?;
+        let idx = usize::try_from(idx).ok()?;
+        if idx >= self.lines.len() {
             // Index is no longer valid
             None
         } else {
-            Some(idx as PhysRowIndex)
+            Some(idx)
         }
     }
 
@@ -3092,6 +3096,17 @@ mod tests {
 
         assert_eq!(screen.stable_range(&(2..2)), 0..0);
         assert_eq!(screen.stable_range(&(2..1)), 0..0);
+    }
+
+    #[test]
+    fn stable_row_conversions_reject_unrepresentable_offsets() {
+        let mut screen = test_screen(3, 8, 96);
+        screen.stable_row_index_offset = usize::try_from(StableRowIndex::MAX)
+            .unwrap()
+            .saturating_add(1);
+
+        assert_eq!(screen.stable_row_to_phys(0), None);
+        assert_eq!(screen.phys_to_stable_row_index(0), StableRowIndex::MAX);
     }
 
     #[derive(Debug, Default)]
