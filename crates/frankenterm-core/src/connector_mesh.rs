@@ -951,6 +951,34 @@ mod tests {
     }
 
     #[test]
+    fn route_round_robin_skips_hosts_at_capacity() {
+        let mut mesh = default_mesh();
+        mesh.register_zone(make_zone("z1")).unwrap();
+
+        let mut full_host = make_host("h1", "z1");
+        full_host.active_connectors = full_host.max_connectors;
+        mesh.register_host(full_host).unwrap();
+
+        let mut one_slot_host = make_host("h2", "z1");
+        one_slot_host.max_connectors = 1;
+        mesh.register_host(one_slot_host).unwrap();
+
+        let mut req = make_request("c1");
+        req.strategy = Some(RoutingStrategy::RoundRobin);
+
+        let decision = mesh.route(&req, 1000).unwrap();
+        assert_eq!(decision.host_id, "h2");
+        assert_eq!(mesh.get_host("h1").unwrap().active_connectors, 10);
+        assert_eq!(mesh.get_host("h2").unwrap().active_connectors, 1);
+
+        req.connector_id = "c2".to_string();
+        let err = mesh.route(&req, 1001).unwrap_err();
+        assert!(matches!(err, ConnectorMeshError::RoutingFailed { .. }));
+        assert_eq!(mesh.get_host("h1").unwrap().active_connectors, 10);
+        assert_eq!(mesh.get_host("h2").unwrap().active_connectors, 1);
+    }
+
+    #[test]
     fn route_no_candidates() {
         let mut mesh = default_mesh();
         mesh.register_zone(make_zone("z1")).unwrap();
