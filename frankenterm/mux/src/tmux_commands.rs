@@ -860,10 +860,12 @@ fn parse_list_window_item(line: &str) -> anyhow::Result<Option<WindowItem>> {
 }
 
 fn normalize_capture_pane_output(unescaped: &str) -> String {
-    unescaped
-        .strip_suffix('\n')
-        .unwrap_or(unescaped)
-        .replace('\n', "\r\n")
+    let unescaped = unescaped
+        .strip_suffix("\r\n")
+        .or_else(|| unescaped.strip_suffix('\n'))
+        .unwrap_or(unescaped);
+
+    unescaped.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
 #[derive(Debug)]
@@ -1608,6 +1610,14 @@ mod tests {
     fn normalize_capture_pane_output_strips_only_trailing_newline() {
         assert_eq!(
             normalize_capture_pane_output("alpha\nbeta\n"),
+            "alpha\r\nbeta"
+        );
+    }
+
+    #[test]
+    fn normalize_capture_pane_output_preserves_existing_crlf() {
+        assert_eq!(
+            normalize_capture_pane_output("alpha\r\nbeta\r\n"),
             "alpha\r\nbeta"
         );
     }
