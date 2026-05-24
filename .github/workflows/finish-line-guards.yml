@@ -229,8 +229,11 @@ jobs:
 
       - name: Run ft-e87u6.2 attestation build matrix
         env:
-          FT_E87U6_2_ARTIFACT_DIR: ${{ runner.temp }}/ft-e87u6-2-attestation-build-matrix
+          FT_E87U6_2_ARTIFACT_DIR: target/test-artifacts/ft-e87u6-2-attestation-build-matrix-ci
         run: bash tests/scripts/test_attestation_build_matrix.sh
+
+      - name: Run attestation verifier fixture self-test
+        run: bash tests/scripts/test_attestation_verify_self_test.sh
 
       - name: Upload E2E artifact bundle
         if: always()

@@ -139,16 +139,20 @@ scripts/attestation-verify.sh docs/attestations/0.2.0.json --json
 scripts/attestation-verify.sh docs/attestations/0.2.0.json --strict-required --strict-deferred
 ```
 
-The verifier has a self-test corpus under
-`tests/attestation_verify_self_test/`. It includes the current strict-passing
-dev bundle as a positive twin plus known-bad bundles for tampered perf, TUI,
-security, doctrine, proof, missing-slot, unknown-slot, ordering, Ed25519, and
-Sigstore failure classes. Regenerate and run the corpus after intentional schema
-evolution with:
+The verifier has self-test corpora under `tests/attestation_verify_self_test/`
+and `tests/fixtures/attestation-verify-self-test/`. The legacy corpus includes
+a freshly generated strict-passing dev bundle as a positive twin plus known-bad
+bundles for tampered perf, TUI, security, doctrine, proof, missing-slot,
+unknown-slot, ordering, Ed25519, and Sigstore failure classes. The smaller
+fixture corpus covers schema, canonical-hash, confidence-summary, and malformed
+JSON failure classes. Regenerate and run them after intentional schema evolution
+with:
 
 ```bash
 scripts/rotate-attestation-self-test.sh
 tests/attestation/verify-self-test.sh
+scripts/regenerate-attestation-verify-fixtures.sh
+tests/scripts/test_attestation_verify_self_test.sh
 ```
 
 If a signed retraction targets the bundle's SHA-256, verification returns
