@@ -331,6 +331,54 @@ proptest! {
     }
 
     #[test]
+    fn send_text_step_respects_configured_text_length_limit(
+        max_text_len in 0usize..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "text_limit_at_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendText {
+                id: "send".to_string(),
+                description: None,
+                text: "x".repeat(max_text_len),
+                wait_for: None,
+                wait_timeout_ms: None,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "send_text at max_text_len should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "text_limit_over_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendText {
+                id: "send".to_string(),
+                description: None,
+                text: "x".repeat(max_text_len.saturating_add(1)),
+                wait_for: None,
+                wait_timeout_ms: None,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "send_text longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();
