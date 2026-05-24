@@ -1085,6 +1085,8 @@ pub fn verify_pattern_pack_supply_chain(
         });
     }
 
+    validate_supply_chain_attestation(supply_chain, &mut issues);
+
     if supply_chain.compatibility_target != policy.compatibility_target {
         issues.push(PatternPackVerificationIssue {
             category: "compatibility".to_string(),
@@ -1160,6 +1162,12 @@ pub fn verify_pattern_pack_supply_chain(
         Some(signature) => {
             signature_checked = true;
             let expected = sign_pattern_pack_supply_chain(pack, &signature.signer);
+            if signature.signer.trim().is_empty() {
+                issues.push(PatternPackVerificationIssue {
+                    category: "signature".to_string(),
+                    message: "pattern pack signature signer cannot be empty".to_string(),
+                });
+            }
             if signature.algorithm != PATTERN_PACK_SIGNATURE_ALGORITHM {
                 issues.push(PatternPackVerificationIssue {
                     category: "signature".to_string(),
@@ -1197,6 +1205,67 @@ pub fn verify_pattern_pack_supply_chain(
         fixture_hashes_checked,
         regex_budget_checked,
         issues,
+    }
+}
+
+fn validate_supply_chain_attestation(
+    supply_chain: &PatternPackSupplyChain,
+    issues: &mut Vec<PatternPackVerificationIssue>,
+) {
+    push_blank_attestation_issue(
+        issues,
+        "provenance",
+        "provenance.author",
+        &supply_chain.provenance.author,
+    );
+    push_blank_attestation_issue(
+        issues,
+        "provenance",
+        "provenance.source",
+        &supply_chain.provenance.source,
+    );
+    push_blank_attestation_issue(
+        issues,
+        "provenance",
+        "provenance.revision",
+        &supply_chain.provenance.revision,
+    );
+    push_blank_attestation_issue(
+        issues,
+        "compatibility",
+        "compatibility_target",
+        &supply_chain.compatibility_target,
+    );
+    push_blank_attestation_issue(issues, "rollout", "rollout.stage", &supply_chain.rollout.stage);
+
+    for (fixture, expected_hash) in &supply_chain.fixture_hashes {
+        push_blank_attestation_issue(issues, "fixture_hash", "fixture_hashes key", fixture);
+        push_blank_attestation_issue(
+            issues,
+            "fixture_hash",
+            "fixture_hashes value",
+            expected_hash,
+        );
+    }
+    for error in &supply_chain.lint.errors {
+        push_blank_attestation_issue(issues, "lint", "lint.errors entry", error);
+    }
+    for warning in &supply_chain.lint.warnings {
+        push_blank_attestation_issue(issues, "lint", "lint.warnings entry", warning);
+    }
+}
+
+fn push_blank_attestation_issue(
+    issues: &mut Vec<PatternPackVerificationIssue>,
+    category: &str,
+    field: &str,
+    value: &str,
+) {
+    if value.trim().is_empty() {
+        issues.push(PatternPackVerificationIssue {
+            category: category.to_string(),
+            message: format!("{field} cannot be empty"),
+        });
     }
 }
 
@@ -4468,6 +4537,37 @@ rules:
                 .any(|issue| issue.category == "validation"),
             "{report:#?}"
         );
+    }
+
+    #[test]
+    fn blank_pattern_pack_attestation_fields_force_observe_only() {
+        let mut fixture_hashes = BTreeMap::new();
+        fixture_hashes.insert(" \t ".to_string(), " \t ".to_string());
+        let mut supply_chain = sample_supply_chain(fixture_hashes);
+        supply_chain.provenance.author = " \t ".to_string();
+        supply_chain.lint.warnings.push(" \t ".to_string());
+        supply_chain.rollout.stage = " \t ".to_string();
+        let mut pack = PatternPack::new(
+            "test-blank-attestations",
+            "1.0.0",
+            vec![sample_rule("codex.blank_attestation")],
+        )
+        .with_supply_chain(supply_chain);
+        let signature = sign_pattern_pack_supply_chain(&pack, " \t ");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+
+        let mut policy = PatternPackVerificationPolicy::default();
+        policy.fixture_hashes.insert(" \t ".to_string(), " \t ".to_string());
+        let report = verify_pattern_pack_supply_chain(&pack, &policy);
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        for category in ["provenance", "fixture_hash", "lint", "rollout", "signature"] {
+            assert!(
+                report.issues.iter().any(|issue| issue.category == category),
+                "missing {category} issue in {report:#?}"
+            );
+        }
     }
 
     #[test]
