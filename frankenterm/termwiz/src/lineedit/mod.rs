@@ -796,8 +796,10 @@ impl<'term> LineEditor<'term> {
                         self.history_pos = Some(next_idx);
                         self.line.set_line_and_cursor(&next, next.len());
                     } else if let Some(bottom) = self.bottom_line.take() {
+                        self.history_pos = None;
                         self.line.set_line_and_cursor(&bottom, bottom.len());
                     } else {
+                        self.history_pos = None;
                         self.line.clear();
                     }
                 }
@@ -1048,6 +1050,33 @@ mod tests {
             .expect("valid completion should apply");
 
         assert_eq!(editor.get_line_and_cursor(), ("hello x", 5));
+    }
+
+    #[test]
+    fn history_next_to_bottom_resets_history_position() {
+        let mut terminal = TestTerminal::default();
+        let mut editor = editor_with_line(&mut terminal, "draft command");
+        let mut host = NopLineEditorHost::default();
+        host.history().add("first command");
+        host.history().add("second command");
+
+        editor
+            .apply_action(&mut host, Action::HistoryPrevious)
+            .expect("history previous should load latest entry");
+        assert_eq!(editor.get_line_and_cursor(), ("second command", 14));
+        assert_eq!(editor.history_pos, Some(1));
+
+        editor
+            .apply_action(&mut host, Action::HistoryNext)
+            .expect("history next should restore bottom line");
+        assert_eq!(editor.get_line_and_cursor(), ("draft command", 13));
+        assert_eq!(editor.history_pos, None);
+
+        editor
+            .apply_action(&mut host, Action::HistoryPrevious)
+            .expect("history previous should load latest entry again");
+        assert_eq!(editor.get_line_and_cursor(), ("second command", 14));
+        assert_eq!(editor.history_pos, Some(1));
     }
 
     #[test]
