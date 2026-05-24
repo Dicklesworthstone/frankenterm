@@ -141,6 +141,7 @@
       "enum": [
         "passed_remote_smoke",
         "blocked_no_admissible_worker",
+        "blocked_topology_preflight",
         "blocked_new_reason",
         "failed_remote_smoke",
         "invalid_missing_approval"
@@ -169,6 +170,7 @@
       "enum": [
         "completed",
         "failed",
+        "failed_topology_preflight",
         "skipped_no_worker",
         "skipped_dry_run_only",
         "not_attempted"
@@ -311,6 +313,24 @@
         },
         "artifact_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "remote_cargo_reached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "remote_rustc_reached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "test_binary_reached": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },

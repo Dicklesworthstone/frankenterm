@@ -187,7 +187,7 @@
       "receipt_id": "ft-wt1:comment-7002",
       "status": "wait_rch",
       "reason_codes": [
-        "rch.worker_pressure"
+        "rch.topology_preflight_failed"
       ],
       "target_dir": "/tmp/ft-wt1-latency",
       "material_remote_required": true,
@@ -202,7 +202,7 @@
       },
       "latest_replay": {
         "attempted_at": "2026-05-24T20:20:42Z",
-        "outcome": "refused_local_fallback",
+        "outcome": "failed_topology_preflight",
         "rch_admission_state": "blocked_worker_pressure"
       }
     }
@@ -247,9 +247,9 @@
     {
       "bead_id": "ft-wt1",
       "status": "wait_rch",
-      "why": "RCH admission is under worker pressure; the receipt waits for a remote worker to admit.",
+      "why": "RCH selected a worker, but remote topology preflight failed before Cargo; the receipt waits for RCH admission/topology recovery.",
       "blocking_reason_codes": [
-        "rch.worker_pressure"
+        "rch.topology_preflight_failed"
       ],
       "remediation": "wait_for_rch_admission"
     }

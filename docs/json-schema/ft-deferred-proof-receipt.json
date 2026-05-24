@@ -302,12 +302,49 @@
             "critical_pressure",
             "no_admissible_workers",
             "telemetry_gap",
+            "topology_preflight_failed",
             "not_required",
             "unknown"
           ]
         },
         "operator_cancelled": {
           "type": "boolean"
+        },
+        "selected_worker": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "rch_job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^j-[0-9]+$"
+        },
+        "remote_failure_phase": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "admission",
+            "topology_preflight",
+            "cargo",
+            "test_binary",
+            "not_applicable",
+            null
+          ]
+        },
+        "remote_failure_detail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 256
         }
       }
     },

@@ -23,6 +23,10 @@ fixture corpus lives under `fixtures/deferred-proof-replay/receipt/`.
   `eligible`.
 - Operator cancellation must set `operator_cancelled` and `replay_allowed:
   false`.
+- A receipt where RCH selected a worker but failed remote topology setup before
+  Cargo/test must use `rch_admission_state: topology_preflight_failed`, preserve
+  `selected_worker` and `rch_job_id` when known, and keep
+  `remote_failure_phase: topology_preflight`.
 - Artifact paths are repository-relative and may only point under
   `docs/json-schema/`, `docs/robot-contracts/`,
   `fixtures/deferred-proof-replay/receipt/`, or `tests/e2e/`.
@@ -32,7 +36,7 @@ fixture corpus lives under `fixtures/deferred-proof-replay/receipt/`.
 | State | Meaning |
 | --- | --- |
 | `eligible` | The receipt is structurally replayable in a clean ownership state. |
-| `wait_rch` | The command is valid but RCH admission is currently blocked. |
+| `wait_rch` | The command is valid but RCH admission or remote topology setup is currently blocked. |
 | `dirty_overlap` | Current or captured dirty paths overlap the receipt ownership slice. |
 | `stale_command_shape` | The command omits required remote/no-self-healing shape. |
 | `prerequisite_blocked` | One or more prerequisite beads remain unresolved. |
@@ -44,6 +48,7 @@ fixture corpus lives under `fixtures/deferred-proof-replay/receipt/`.
 The static verifier freezes valid and invalid examples:
 
 - `remote-required-cargo-proof`
+- `selected-worker-topology-preflight-block`
 - `static-only-proof`
 - `dirty-overlap-block`
 - `prerequisite-bead-block`
@@ -59,6 +64,10 @@ The static verifier freezes valid and invalid examples:
 - `payload-env-not-allowlisted`
 - `target-dir-drift`
 - `unsafe-artifact-path`
+- `missing-require-remote`
+- `operator-cancelled-replayable`
+- `prerequisite-bypass`
+- `duplicate-env-allowlist`
 
 Run:
 

@@ -33,16 +33,18 @@ completed proof:
 | Status | Meaning | Remediation |
 | --- | --- | --- |
 | `runnable` | RCH admitted; the receipt can replay now. | `none` |
-| `wait_rch` | RCH admission is under worker pressure. | `wait_for_rch_admission` |
+| `wait_rch` | RCH admission is under worker pressure, or a selected worker failed remote topology preflight before Cargo. | `wait_for_rch_admission` |
 | `dirty_overlap` | Captured tree had dirty paths outside the owned set. | `resolve_dirty_overlap` |
 | `prerequisite_blocked` | A prerequisite bead has not landed its proof. | `complete_prerequisite_bead` |
 | `stale_command` | Command lacks the remote-only RCH flags or exec shape. | `refresh_command_shape` |
 | `ambiguous` | Footer carried prose, not a structured command. | `request_human_triage` |
 | `completed` | Proof already replayed and passed. | `none` |
 
-`replay_allowed` is `true` only for `runnable` entries. RCH admission failure
-and worker pressure are *deferral* signals (the receipt stays queued under
-`wait_rch`), never an instruction to repair RCH.
+`replay_allowed` is `true` only for `runnable` entries. RCH admission failure,
+worker pressure, and selected-worker topology preflight failure
+(`failed_topology_preflight` / `rch.topology_preflight_failed`) are *deferral*
+signals (the receipt stays queued under `wait_rch`), never an instruction to
+repair RCH or mutate workers.
 
 ## Views
 
@@ -66,8 +68,8 @@ and worker pressure are *deferral* signals (the receipt stays queued under
 2. Take `next_candidate.command_preview` verbatim and run it through RCH
    (`RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- …`).
    Do not substitute local Cargo and do not edit the command shape.
-3. For `wait_rch` entries, re-poll the surface; admission recovery flips them to
-   `runnable` without operator action.
+3. For `wait_rch` entries, re-poll the surface; admission or topology recovery
+   flips them to `runnable` without operator action.
 4. For `dirty_overlap`, `prerequisite_blocked`, or `stale_command`, apply the
    listed remediation (resolve overlap, land the prerequisite, refresh the
    command shape) — never a reset, deletion, or worker change.

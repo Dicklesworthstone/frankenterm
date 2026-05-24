@@ -78,7 +78,10 @@ DOC_TERMS = [
   "stale_command",
   "ambiguous",
   "completed",
+  "failed_topology_preflight",
   "local Cargo",
+  "rch.topology_preflight_failed",
+  "topology preflight",
   "fixtures/deferred-proof-replay/queue-surface/"
 ].freeze
 
@@ -319,6 +322,7 @@ fail!("schema id drifted") unless schema["$id"]&.end_with?("/ft-deferred-proof-q
 fail!("schema contract const drifted") unless schema.dig("properties", "contract_id", "const") == CONTRACT_ID
 fail!("schema source digest pattern missing") unless schema.dig("$defs", "source", "properties", "source_text_sha256", "pattern") == "^[0-9a-f]{64}$"
 fail!("schema permits raw pane content") unless schema.dig("$defs", "source", "properties", "raw_pane_content_stored", "const") == false
+fail!("schema missing topology preflight outcome") unless schema.dig("$defs", "latest_replay", "properties", "outcome", "enum").include?("failed_topology_preflight")
 
 # Manifest sanity.
 fail!("manifest contract drifted") unless manifest["contract_id"] == CONTRACT_ID
@@ -334,6 +338,15 @@ fail!("golden surface reported violations: #{golden_violations.inspect}") unless
 # Golden completeness: every status bucket is exercised exactly once-or-more.
 present = surface.fetch("queue").map { |entry| entry.fetch("status") }.uniq.sort
 fail!("not all statuses are exercised: #{present.inspect}") unless present == REQUIRED_STATUSES.sort
+wait_rch = surface.fetch("queue").find { |entry| entry.fetch("status") == "wait_rch" }
+fail!("wait_rch fixture missing") unless wait_rch
+fail!("wait_rch fixture missing topology preflight reason") unless wait_rch.fetch("reason_codes").include?("rch.topology_preflight_failed")
+fail!("wait_rch fixture missing topology preflight outcome") unless wait_rch.dig("latest_replay", "outcome") == "failed_topology_preflight"
+fail!("wait_rch fixture must keep coarse admission projection") unless wait_rch.dig("latest_replay", "rch_admission_state") == "blocked_worker_pressure"
+explain_wait = surface.fetch("explain").find { |entry| entry.fetch("bead_id") == wait_rch.fetch("bead_id") }
+fail!("wait_rch explain entry missing") unless explain_wait
+fail!("wait_rch explain missing topology preflight wording") unless explain_wait.fetch("why").include?("topology preflight")
+fail!("wait_rch explain reason drift") unless explain_wait.fetch("blocking_reason_codes") == wait_rch.fetch("reason_codes")
 
 # Determinism: a second parse of the same bytes yields identical canonical JSON.
 fail!("surface is not deterministic across parses") unless JSON.generate(read_json(CASES)) == JSON.generate(surface)

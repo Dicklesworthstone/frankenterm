@@ -265,6 +265,7 @@
           "enum": [
             "passed",
             "failed",
+            "failed_topology_preflight",
             "refused_no_worker",
             "refused_local_fallback",
             "never_attempted"

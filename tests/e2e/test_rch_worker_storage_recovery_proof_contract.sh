@@ -40,6 +40,7 @@ MANIFEST = "fixtures/rch-worker-storage-recovery-proof/manifest.json"
 EXPECTED_FIXTURE_IDS = %w[
   passed-remote-smoke
   blocked-no-admissible-worker
+  blocked-topology-preflight
   blocked-new-reason
   failed-remote-smoke
   invalid-missing-approval
@@ -47,6 +48,7 @@ EXPECTED_FIXTURE_IDS = %w[
 EXPECTED_RESULTS = {
   "passed-remote-smoke" => "passed_remote_smoke",
   "blocked-no-admissible-worker" => "blocked_no_admissible_worker",
+  "blocked-topology-preflight" => "blocked_topology_preflight",
   "blocked-new-reason" => "blocked_new_reason",
   "failed-remote-smoke" => "failed_remote_smoke",
   "invalid-missing-approval" => "invalid_missing_approval"
@@ -220,6 +222,20 @@ fail!("new-reason fixture missing stable reason") unless new_reason.fetch("stabl
 fail!("new-reason fixture should not close ft-4tp7g") unless new_reason["ft4tp7g_closeout_allowed"] == false
 fail!("new-reason smoke must be skipped") unless new_reason.dig("remote_required_smoke", "required") == false
 
+topology = payloads.fetch("blocked-topology-preflight")
+fail!("topology fixture should not recover admission") unless topology["admission_recovered"] == false
+fail!("topology fixture should not close ft-4tp7g") unless topology["ft4tp7g_closeout_allowed"] == false
+fail!("topology fixture missing stable reason") unless topology["stable_reason_code"] == "topology_preflight_failed=ln_already_exists"
+fail!("topology dry-run must select worker") unless topology.dig("remote_required_dry_run", "selected_worker")
+fail!("topology smoke must be required") unless topology.dig("remote_required_smoke", "required") == true
+fail!("topology smoke worker must match dry-run") unless topology.dig("remote_required_smoke", "selected_worker") == topology.dig("remote_required_dry_run", "selected_worker")
+fail!("topology transfer should fail") unless topology.dig("remote_required_smoke", "transfer_state") == "failed"
+fail!("topology remote execution state drifted") unless topology.dig("remote_required_smoke", "remote_execution_state") == "failed_topology_preflight"
+fail!("topology smoke exit should be nonzero") unless topology.dig("remote_required_smoke", "exit_status").to_i > 0
+fail!("topology fixture must prove Cargo was not reached") unless topology.dig("remote_required_smoke", "remote_cargo_reached") == false
+fail!("topology fixture must prove rustc was not reached") unless topology.dig("remote_required_smoke", "remote_rustc_reached") == false
+fail!("topology fixture must prove test binary was not reached") unless topology.dig("remote_required_smoke", "test_binary_reached") == false
+
 failed = payloads.fetch("failed-remote-smoke")
 fail!("failed fixture should not recover admission") unless failed["admission_recovered"] == false
 fail!("failed fixture should not close ft-4tp7g") unless failed["ft4tp7g_closeout_allowed"] == false
@@ -245,6 +261,8 @@ fail!("doc missing ft-4tp7g closeout rule") unless doc.include?("ft-4tp7g")
 fail!("doc missing local Cargo prohibition") unless doc.include?("Local Cargo")
 fail!("doc missing missing-approval fixture") unless doc.include?("invalid-missing-approval")
 fail!("doc missing missing-approval gate result") unless doc.include?("invalid_missing_approval")
+fail!("doc missing topology-preflight fixture") unless doc.include?("blocked-topology-preflight")
+fail!("doc missing topology-preflight gate result") unless doc.include?("blocked_topology_preflight")
 
 puts "rch worker storage recovery proof contract: static verifier passed (#{fixture_paths.length} fixtures, #{EXPECTED_FORBIDDEN.length} forbidden actions)"
 RUBY

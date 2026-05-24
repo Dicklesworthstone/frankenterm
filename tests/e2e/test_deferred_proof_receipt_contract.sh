@@ -49,6 +49,7 @@ PROVENANCE = "docs/json-schema/PROVENANCE.md"
 CONTRACT_ID = "ft.deferred_proof_receipt.v1"
 REQUIRED_VALID = %w[
   remote-required-cargo-proof
+  selected-worker-topology-preflight-block
   static-only-proof
   dirty-overlap-block
   prerequisite-bead-block
@@ -225,6 +226,7 @@ fail!("schema required missing eligibility") unless schema.fetch("required").inc
 fail!("schema forbidden enum drifted") unless schema.dig("$defs", "forbidden_action", "enum").sort == REQUIRED_FORBIDDEN.sort
 fail!("schema command shape enum drifted") unless schema.dig("$defs", "command_receipt", "properties", "command_shape_version", "enum").sort == [REMOTE_SHAPE, STATIC_SHAPE].sort
 fail!("schema artifact path pattern missing safe roots") unless SAFE_ARTIFACT_ROOTS.all? { |root| schema.dig("$defs", "artifact_path", "pattern").include?(root.delete_suffix("/")) }
+fail!("schema missing topology preflight admission state") unless schema.dig("$defs", "coordination_snapshot", "properties", "rch_admission_state", "enum").include?("topology_preflight_failed")
 
 fail!("manifest contract drifted") unless manifest["contract_id"] == CONTRACT_ID
 fail!("manifest schema path drifted") unless manifest["schema_path"] == SCHEMA
@@ -239,6 +241,7 @@ fail!("valid fixture coverage drifted: #{valid_ids.sort.inspect}") unless valid_
 fail!("valid fixture ids are not unique") unless valid_ids.uniq.length == valid_ids.length
 
 valid_cases.each do |entry|
+  case_id = entry.fetch("case_id")
   receipt = entry.fetch("receipt")
   receipt_id = receipt.fetch("receipt_id")
   fail!("#{receipt_id} contract drifted") unless receipt["contract_id"] == CONTRACT_ID
@@ -251,6 +254,19 @@ valid_cases.each do |entry|
   else
     fail!("#{receipt_id} static proof should not require RCH target dir") unless receipt.dig("command", "target_dir").nil?
   end
+  next unless case_id == "selected-worker-topology-preflight-block"
+
+  coordination = receipt.fetch("coordination")
+  reason_codes = receipt.fetch("eligibility").fetch("reason_codes")
+  fail!("#{receipt_id} must classify topology preflight separately") unless coordination["rch_admission_state"] == "topology_preflight_failed"
+  fail!("#{receipt_id} must preserve selected worker") unless coordination["selected_worker"].to_s.match?(/\Avmi[0-9]+\z/)
+  fail!("#{receipt_id} must preserve RCH job id") unless coordination["rch_job_id"].to_s.match?(/\Aj-[0-9]+\z/)
+  fail!("#{receipt_id} must identify pre-Cargo remote phase") unless coordination["remote_failure_phase"] == "topology_preflight"
+  fail!("#{receipt_id} must retain bounded preflight detail") unless coordination["remote_failure_detail"].to_s.include?("ln: Already exists")
+  fail!("#{receipt_id} must not be treated as critical pressure") if reason_codes.include?("rch.critical_pressure")
+  fail!("#{receipt_id} must record topology preflight reason") unless reason_codes.include?("rch.topology_preflight_failed")
+  fail!("#{receipt_id} must record worker selection reason") unless reason_codes.include?("rch.worker_selected")
+  fail!("#{receipt_id} must record Cargo did not start") unless reason_codes.include?("proof.cargo_not_reached")
 end
 
 invalid_cases = invalid.fetch("cases")
@@ -270,6 +286,9 @@ end
   "local fallback",
   "dirty_overlap",
   "operator_cancelled",
+  "selected-worker-topology-preflight-block",
+  "topology_preflight_failed",
+  "selected_worker",
   "fixtures/deferred-proof-replay/receipt/"
 ].each do |term|
   fail!("doc missing contract term #{term}") unless doc.include?(term)
