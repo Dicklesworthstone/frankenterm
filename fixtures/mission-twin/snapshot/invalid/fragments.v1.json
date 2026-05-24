@@ -38,6 +38,8 @@
           ".git/config",
           "/tmp/mission-twin.json",
           "https://example.invalid/snapshot.json",
+          "./fixtures/mission-twin/snapshot.json",
+          "fixtures//mission-twin/snapshot.json",
           "fixtures/mission-twin/snapshot/"
         ]
       }

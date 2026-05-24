@@ -207,7 +207,10 @@ fail!("live permission fragment drifted") unless authority.dig("invalid_fragment
 unsafe_paths = by_id.fetch("unsafe-artifact-path").dig("invalid_fragment", "artifact_paths")
 fail!("unsafe path fixture lacks absolute and traversal examples") unless unsafe_paths.any? { |path| path.start_with?("/") } &&
   unsafe_paths.any? { |path| path.start_with?("../") } &&
-  unsafe_paths.any? { |path| path.start_with?(".git/") }
+  unsafe_paths.any? { |path| path.start_with?(".git/") } &&
+  unsafe_paths.any? { |path| path.start_with?("./") } &&
+  unsafe_paths.any? { |path| path.include?("//") } &&
+  unsafe_paths.any? { |path| path.end_with?("/") }
 unsafe_paths.each do |path|
   fail!("unsafe path accepted by predicate: #{path}") if safe_repo_relative_path?(path)
 end

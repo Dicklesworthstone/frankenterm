@@ -59,7 +59,10 @@
         "artifact_paths": [
           "../outside.json",
           ".git/config",
-          "/tmp/mission-twin.json"
+          "/tmp/mission-twin.json",
+          "./fixtures/mission-twin.json",
+          "fixtures//mission-twin.json",
+          "fixtures/mission-twin/"
         ]
       }
     }

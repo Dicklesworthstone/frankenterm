@@ -237,6 +237,8 @@ fail!("unsafe path fixture lacks coverage") unless unsafe_paths.any? { |path| pa
   unsafe_paths.any? { |path| path.start_with?("../") } &&
   unsafe_paths.any? { |path| path.start_with?(".git/") } &&
   unsafe_paths.any? { |path| path.include?("://") } &&
+  unsafe_paths.any? { |path| path.start_with?("./") } &&
+  unsafe_paths.any? { |path| path.include?("//") } &&
   unsafe_paths.any? { |path| path.end_with?("/") }
 unsafe_paths.each do |path|
   fail!("unsafe path accepted by predicate", "path" => path) if safe_repo_relative_path?(path)
