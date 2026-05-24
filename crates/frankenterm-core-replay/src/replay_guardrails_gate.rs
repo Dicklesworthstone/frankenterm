@@ -125,13 +125,13 @@ pub struct ExpectedDivergenceAnnotation {
 impl ExpectedDivergenceAnnotation {
     /// Validate the annotation. Returns error message if invalid.
     pub fn validate(&self) -> Result<(), String> {
-        if self.pr_reference.is_empty() {
+        if self.pr_reference.trim().is_empty() {
             return Err(format!(
                 "annotation at position {} missing pr_reference",
                 self.position
             ));
         }
-        if self.reason.is_empty() {
+        if self.reason.trim().is_empty() {
             return Err(format!(
                 "annotation at position {} missing reason",
                 self.position
@@ -678,6 +678,25 @@ mod tests {
             definition_change_hash: String::new(),
         };
         assert!(ann.validate().is_err());
+    }
+
+    #[test]
+    fn whitespace_only_annotation_fields_invalid() {
+        let blank_pr = ExpectedDivergenceAnnotation {
+            position: 0,
+            reason: "intentional".into(),
+            pr_reference: " \t\n ".into(),
+            definition_change_hash: String::new(),
+        };
+        assert!(blank_pr.validate().is_err());
+
+        let blank_reason = ExpectedDivergenceAnnotation {
+            position: 1,
+            reason: " \t\n ".into(),
+            pr_reference: "PR-1".into(),
+            definition_change_hash: String::new(),
+        };
+        assert!(blank_reason.validate().is_err());
     }
 
     // ── Invalid annotation doesn't exclude ────────────────────────────
