@@ -162,6 +162,8 @@ pub enum ParseError {
     },
     /// Bad escape in a double-quoted string (e.g. `"\x"`).
     BadEscape { at: usize, observed: char },
+    /// An option that requires a following value was the final token.
+    MissingOptionValue { option: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +186,9 @@ impl fmt::Display for ParseError {
             Self::BadEscape { at, observed } => {
                 write!(f, "bad escape `\\{observed}` at offset {at}")
             }
+            Self::MissingOptionValue { option } => {
+                write!(f, "missing value for option `{option}`")
+            }
         }
     }
 }
@@ -201,16 +206,16 @@ pub fn parse_command(line: &str) -> Result<TmuxCommand, ParseError> {
     let verb = iter.next().ok_or(ParseError::Empty)?;
     let args: Vec<String> = iter.collect();
     Ok(match verb.as_str() {
-        "send-keys" => parse_send_keys(args),
-        "list-windows" => parse_list_windows(args),
+        "send-keys" => parse_send_keys(args)?,
+        "list-windows" => parse_list_windows(args)?,
         "list-sessions" => TmuxCommand::ListSessions,
-        "capture-pane" => parse_capture_pane(args),
-        "split-window" => parse_split_window(args),
-        "new-session" => parse_new_session(args),
-        "attach-session" => parse_attach_session(args),
+        "capture-pane" => parse_capture_pane(args)?,
+        "split-window" => parse_split_window(args)?,
+        "new-session" => parse_new_session(args)?,
+        "attach-session" => parse_attach_session(args)?,
         "detach" | "detach-client" => TmuxCommand::Detach,
-        "pipe-pane" => parse_pipe_pane(args),
-        "copy-mode" => parse_copy_mode(args),
+        "pipe-pane" => parse_pipe_pane(args)?,
+        "copy-mode" => parse_copy_mode(args)?,
         _ => TmuxCommand::Unknown { verb, args },
     })
 }
@@ -313,115 +318,124 @@ fn tokenize(line: &str) -> Result<Vec<String>, ParseError> {
     Ok(tokens)
 }
 
-fn parse_send_keys(args: Vec<String>) -> TmuxCommand {
+fn take_option_value(
+    iter: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, ParseError> {
+    iter.next().ok_or_else(|| ParseError::MissingOptionValue {
+        option: option.to_string(),
+    })
+}
+
+fn parse_send_keys(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target: Option<String> = None;
     let mut keys: Vec<String> = Vec::new();
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "-t" => target = iter.next(),
+            "-t" => target = Some(take_option_value(&mut iter, "-t")?),
             _ => keys.push(a),
         }
     }
-    TmuxCommand::SendKeys { target, keys }
+    Ok(TmuxCommand::SendKeys { target, keys })
 }
 
-fn parse_list_windows(args: Vec<String>) -> TmuxCommand {
+fn parse_list_windows(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target_session: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         if a == "-t" {
-            target_session = iter.next();
+            target_session = Some(take_option_value(&mut iter, "-t")?);
         }
     }
-    TmuxCommand::ListWindows { target_session }
+    Ok(TmuxCommand::ListWindows { target_session })
 }
 
-fn parse_capture_pane(args: Vec<String>) -> TmuxCommand {
+fn parse_capture_pane(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target: Option<String> = None;
     let mut print = false;
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "-t" => target = iter.next(),
+            "-t" => target = Some(take_option_value(&mut iter, "-t")?),
             "-p" => print = true,
             _ => {} // ignore unknown flags for now
         }
     }
-    TmuxCommand::CapturePane { target, print }
+    Ok(TmuxCommand::CapturePane { target, print })
 }
 
-fn parse_split_window(args: Vec<String>) -> TmuxCommand {
+fn parse_split_window(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target: Option<String> = None;
     let mut direction: Option<SplitDirection> = None;
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "-t" => target = iter.next(),
+            "-t" => target = Some(take_option_value(&mut iter, "-t")?),
             "-h" => direction = Some(SplitDirection::Horizontal),
             "-v" => direction = Some(SplitDirection::Vertical),
             _ => {}
         }
     }
-    TmuxCommand::SplitWindow { target, direction }
+    Ok(TmuxCommand::SplitWindow { target, direction })
 }
 
-fn parse_new_session(args: Vec<String>) -> TmuxCommand {
+fn parse_new_session(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut name: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         if a == "-s" {
-            name = iter.next();
+            name = Some(take_option_value(&mut iter, "-s")?);
         }
     }
-    TmuxCommand::NewSession { name }
+    Ok(TmuxCommand::NewSession { name })
 }
 
-fn parse_attach_session(args: Vec<String>) -> TmuxCommand {
+fn parse_attach_session(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         if a == "-t" {
-            target = iter.next();
+            target = Some(take_option_value(&mut iter, "-t")?);
         }
     }
-    TmuxCommand::AttachSession { target }
+    Ok(TmuxCommand::AttachSession { target })
 }
 
-fn parse_pipe_pane(args: Vec<String>) -> TmuxCommand {
+fn parse_pipe_pane(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target: Option<String> = None;
     let mut only_if_not_piped = false;
     let mut command: Vec<String> = Vec::new();
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "-t" => target = iter.next(),
+            "-t" => target = Some(take_option_value(&mut iter, "-t")?),
             "-o" => only_if_not_piped = true,
             _ => command.push(a),
         }
     }
-    TmuxCommand::PipePane {
+    Ok(TmuxCommand::PipePane {
         target,
         only_if_not_piped,
         command,
-    }
+    })
 }
 
-fn parse_copy_mode(args: Vec<String>) -> TmuxCommand {
+fn parse_copy_mode(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target: Option<String> = None;
     let mut passthrough_args: Vec<String> = Vec::new();
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         if a == "-t" {
-            target = iter.next();
+            target = Some(take_option_value(&mut iter, "-t")?);
         } else {
             passthrough_args.push(a);
         }
     }
-    TmuxCommand::CopyMode {
+    Ok(TmuxCommand::CopyMode {
         target,
         args: passthrough_args,
-    }
+    })
 }
 
 /// A control-mode response. Wire shape:
@@ -521,6 +535,22 @@ mod tests {
             cmd,
             TmuxCommand::ListWindows {
                 target_session: Some("backend".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_missing_option_value_errors() {
+        assert_eq!(
+            parse_command("list-windows -t").unwrap_err(),
+            ParseError::MissingOptionValue {
+                option: "-t".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_command("new-session -s").unwrap_err(),
+            ParseError::MissingOptionValue {
+                option: "-s".to_string(),
             }
         );
     }
