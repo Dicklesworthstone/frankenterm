@@ -416,6 +416,56 @@ proptest! {
         prop_assert!(report.budget_check.is_none());
     }
 
+    /// Metamorphic relation: loosening a budget (raising any budget_us)
+    /// can never turn a passing check into a failing one, because
+    /// `passed = measured <= floor(budget_us * threshold)` is monotonic
+    /// non-decreasing in budget_us for a fixed measurement and threshold.
+    /// Both per-percentile passes and the overall AND must be preserved.
+    #[test]
+    fn evaluate_budget_loosening_preserves_passes(
+        count in 1..10usize,
+        base_us in 100..20_000u64,
+        delta in 0..20_000u64,
+    ) {
+        let mut collector = InputLatencyCollector::new(100);
+        for i in 0..count {
+            let mut m = collector.begin_measurement();
+            m.record_stage(InputLatencyStage::KeyEvent, (i as u64) * 10);
+            m.record_stage(InputLatencyStage::GpuPresent, (i as u64) * 10 + base_us);
+            collector.record(m);
+        }
+        let strict = InputLatencyBudget::default();
+        let mut loose = strict.clone();
+        for v in loose.aggregate.values_mut() {
+            *v = v.saturating_add(delta);
+        }
+        let strict_result = evaluate_budget(&collector, &strict);
+        let loose_result = evaluate_budget(&collector, &loose);
+
+        // Per-percentile: a strict pass must remain a pass when loosened.
+        for sd in &strict_result.details {
+            if sd.passed {
+                let ld = loose_result
+                    .details
+                    .iter()
+                    .find(|d| d.percentile == sd.percentile)
+                    .expect("loose result must cover the same percentiles");
+                prop_assert!(
+                    ld.passed,
+                    "loosening percentile {:?} (budget +{}) broke a pass",
+                    sd.percentile, delta
+                );
+            }
+        }
+        // Overall AND is likewise monotonic: strict-pass implies loose-pass.
+        if strict_result.passed {
+            prop_assert!(
+                loose_result.passed,
+                "loosening every budget by {} broke the overall pass", delta
+            );
+        }
+    }
+
     #[test]
     fn generate_report_with_budget_includes_check(count in 1..10usize) {
         let mut collector = InputLatencyCollector::new(100);
