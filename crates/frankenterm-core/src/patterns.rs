@@ -612,6 +612,16 @@ impl RuleDef {
             .into());
         }
 
+        if let Some(expected_agent_type) = reserved_rule_prefix_agent_type(&self.id) {
+            if self.agent_type != expected_agent_type {
+                return Err(PatternError::InvalidRule(format!(
+                    "rule id '{}' has reserved prefix for agent_type '{}' but declares '{}'",
+                    self.id, expected_agent_type, self.agent_type
+                ))
+                .into());
+            }
+        }
+
         // Even user packs need a dotted namespace (e.g., "myorg.some_rule")
         if allow_custom_prefix && !self.id.contains('.') {
             return Err(PatternError::InvalidRule(format!(
@@ -772,6 +782,20 @@ fn validate_optional_rule_text(rule_id: &str, field: &str, value: Option<&str>) 
         .into());
     }
     Ok(())
+}
+
+fn reserved_rule_prefix_agent_type(rule_id: &str) -> Option<AgentType> {
+    if rule_id.starts_with("codex.") {
+        Some(AgentType::Codex)
+    } else if rule_id.starts_with("claude_code.") {
+        Some(AgentType::ClaudeCode)
+    } else if rule_id.starts_with("gemini.") {
+        Some(AgentType::Gemini)
+    } else if rule_id.starts_with("wezterm.") {
+        Some(AgentType::Wezterm)
+    } else {
+        None
+    }
 }
 
 /// Pattern pack containing a set of rules

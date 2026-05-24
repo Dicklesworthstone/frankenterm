@@ -1062,6 +1062,18 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_reserved_rule_prefix_agent_type_mismatch(
+        rule_suffix in "[a-z]{3,10}",
+    ) {
+        let mut rule = make_anchor_only_rule(&rule_suffix, "PREFIX_MISMATCH");
+        rule.id = format!("codex.{rule_suffix}");
+        rule.agent_type = AgentType::Gemini;
+        let pack = PatternPack::new("builtin:prefix-agent-mismatch", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_empty_builtin_rule_id_segments(
         suffix in "[a-z]{3,10}",
     ) {
