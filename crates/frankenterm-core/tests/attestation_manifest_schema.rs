@@ -848,6 +848,21 @@ fn bundle_schema_rejects_empty_required_summary_arrays() {
 }
 
 #[test]
+fn bundle_schema_rejects_blank_taxonomy_category_names() {
+    let validator = bundle_validator();
+    let mut bundle = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle tracked by ft-e87u6.2"
+    }));
+    bundle["taxonomy_coverage"]["category_counts"][0]["name"] = json!(" \t");
+    assert!(
+        !validate(&validator, &bundle).is_empty(),
+        "taxonomy coverage category names must reject blank text"
+    );
+}
+
+#[test]
 fn bundle_schema_rejects_blank_confidence_summary_text() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({
