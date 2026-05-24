@@ -492,7 +492,7 @@ impl ConnectorInboundBridge {
         &mut self,
         signal: &ConnectorSignal,
     ) -> Result<BridgeRouteResult, ConnectorBridgeError> {
-        self.telemetry.signals_received += 1;
+        self.telemetry.signals_received = self.telemetry.signals_received.saturating_add(1);
 
         // 1. Deduplication
         //
@@ -513,7 +513,8 @@ impl ConnectorInboundBridge {
                 .unwrap_or_default()
                 .as_millis() as u64;
             if !self.deduplicator.check_and_record(cid, now_ms) {
-                self.telemetry.signals_deduplicated += 1;
+                self.telemetry.signals_deduplicated =
+                    self.telemetry.signals_deduplicated.saturating_add(1);
                 debug!(
                     correlation_id = %cid,
                     source = %signal.source_connector,
@@ -531,7 +532,7 @@ impl ConnectorInboundBridge {
 
         // 2. Unknown-kind rejection
         if self.config.reject_unknown_kinds && signal.signal_kind == ConnectorSignalKind::Custom {
-            self.telemetry.signals_rejected += 1;
+            self.telemetry.signals_rejected = self.telemetry.signals_rejected.saturating_add(1);
             warn!(
                 source = %signal.source_connector,
                 kind = %signal.signal_kind,
@@ -566,7 +567,7 @@ impl ConnectorInboundBridge {
 
         match &decision {
             IngestionDecision::Reject { reason } => {
-                self.telemetry.signals_rejected += 1;
+                self.telemetry.signals_rejected = self.telemetry.signals_rejected.saturating_add(1);
                 warn!(
                     rule_id = %rule_id,
                     source = %signal.source_connector,
@@ -583,7 +584,7 @@ impl ConnectorInboundBridge {
                 });
             }
             IngestionDecision::Quarantine { reason } => {
-                self.telemetry.signals_rejected += 1;
+                self.telemetry.signals_rejected = self.telemetry.signals_rejected.saturating_add(1);
                 warn!(
                     rule_id = %rule_id,
                     source = %signal.source_connector,
@@ -616,8 +617,8 @@ impl ConnectorInboundBridge {
         };
 
         let delivered = self.event_bus.publish(event);
-        self.telemetry.signals_routed += 1;
-        self.telemetry.events_published += 1;
+        self.telemetry.signals_routed = self.telemetry.signals_routed.saturating_add(1);
+        self.telemetry.events_published = self.telemetry.events_published.saturating_add(1);
 
         info!(
             rule_id = %rule_id,
@@ -1409,6 +1410,40 @@ mod tests {
         assert_eq!(snap.signals_routed, 5);
         assert_eq!(snap.events_published, 5);
         assert_eq!(snap.signals_deduplicated, 0);
+    }
+
+    #[test]
+    fn telemetry_counters_saturate() {
+        let bus = make_bus();
+        let _sub = bus.subscribe_detections();
+        let mut bridge = default_bridge(bus);
+        bridge.telemetry = ConnectorBridgeTelemetry {
+            signals_received: u64::MAX,
+            signals_routed: u64::MAX,
+            signals_deduplicated: u64::MAX,
+            signals_rejected: u64::MAX,
+            events_published: u64::MAX,
+        };
+
+        let routed = test_signal("x", ConnectorSignalKind::Webhook)
+            .with_correlation_id("same")
+            .with_timestamp_ms(1000);
+        bridge.route_signal(&routed).unwrap();
+        bridge.route_signal(&routed).unwrap();
+
+        bridge.config.reject_unknown_kinds = true;
+        let rejected = test_signal("x", ConnectorSignalKind::Custom).with_timestamp_ms(1001);
+        assert!(matches!(
+            bridge.route_signal(&rejected),
+            Err(ConnectorBridgeError::UnknownKindRejected)
+        ));
+
+        let snap = bridge.telemetry_snapshot();
+        assert_eq!(snap.signals_received, u64::MAX);
+        assert_eq!(snap.signals_routed, u64::MAX);
+        assert_eq!(snap.signals_deduplicated, u64::MAX);
+        assert_eq!(snap.signals_rejected, u64::MAX);
+        assert_eq!(snap.events_published, u64::MAX);
     }
 
     // ── Serialization ───────────────────────────────────────────────────
