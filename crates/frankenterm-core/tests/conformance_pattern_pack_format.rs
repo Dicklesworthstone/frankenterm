@@ -246,6 +246,48 @@ fn invalid_fixtures_are_rejected_by_the_loader_or_validator() {
     }
 }
 
+#[test]
+fn production_loader_rejects_unknown_enum_values() {
+    for (field, body) in [
+        (
+            "agent_type",
+            r#"{
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.invalid_agent_type",
+                    "agent_type": "not_an_agent",
+                    "event_type": "synthetic_invalid_agent_type",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying an invalid agent_type."
+                }]
+            }"#,
+        ),
+        (
+            "severity",
+            r#"{
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.invalid_severity",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_invalid_severity",
+                    "severity": "not_a_severity",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying an invalid severity."
+                }]
+            }"#,
+        ),
+    ] {
+        let result = serde_json::from_str::<PatternPack>(body);
+        assert!(
+            result.is_err(),
+            "production loader accepted unknown {field} enum value"
+        );
+    }
+}
+
 // ── Coverage meta-test ──────────────────────────────────────────────────────
 
 #[test]
