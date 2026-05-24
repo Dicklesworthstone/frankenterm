@@ -1212,7 +1212,7 @@ async fn execute_atomic_descriptor_step(
 /// parses each as a `WorkflowDescriptor`, wraps it in a `DescriptorWorkflow`,
 /// and returns the collection. Files that fail to parse are logged and skipped.
 ///
-/// The canonical user directory is `~/.config/wa/workflows/`.
+/// The canonical user directory is `~/.config/ft/workflows/`.
 pub fn load_workflows_from_dir(
     dir: &std::path::Path,
 ) -> Vec<(DescriptorWorkflow, std::path::PathBuf)> {
@@ -1226,16 +1226,35 @@ pub fn load_workflows_from_dir(
         }
     };
 
-    for entry in entries.flatten() {
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "failed to read workflow directory entry");
+                continue;
+            }
+        };
         let path = entry.path();
-        if !path.is_file() {
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to inspect workflow file type");
+                continue;
+            }
+        };
+        if !file_type.is_file() {
             continue;
         }
+
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+        if !matches!(ext.as_str(), "yaml" | "yml" | "toml") {
+            continue;
+        }
 
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -1245,10 +1264,10 @@ pub fn load_workflows_from_dir(
             }
         };
 
-        let result = match ext.as_str() {
-            "yaml" | "yml" => DescriptorWorkflow::from_yaml_str(&content),
-            "toml" => DescriptorWorkflow::from_toml_str(&content),
-            _ => continue,
+        let result = if ext == "toml" {
+            DescriptorWorkflow::from_toml_str(&content)
+        } else {
+            DescriptorWorkflow::from_yaml_str(&content)
         };
 
         match result {
@@ -1812,6 +1831,20 @@ steps:
         assert_eq!(loaded.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_workflows_skips_symlinked_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("linked.yaml");
+        std::fs::write(&target, minimal_yaml()).unwrap();
+
+        std::os::unix::fs::symlink(&target, root.path().join("linked.yaml")).unwrap();
+
+        let loaded = load_workflows_from_dir(root.path());
+        assert!(loaded.is_empty());
     }
 
     // ========================================================================
