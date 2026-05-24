@@ -242,10 +242,11 @@ impl OutboundEvent {
         event_type: impl Into<String>,
         payload: serde_json::Value,
     ) -> Self {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = duration_ms_saturating(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
         Self {
             source,
             event_type: event_type.into(),
@@ -1050,10 +1051,11 @@ impl ConnectorOutboundBridge {
         // webhook/etc.). Same fix shape as ft-dijpe (inbound bridge,
         // commit 0716e112). SystemTime::now() keeps the dedup clock
         // under local control.
-        let dedup_now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let dedup_now_ms = duration_ms_saturating(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
         if event.correlation_id.is_some()
             && !self
                 .deduplicator
@@ -1583,6 +1585,11 @@ mod tests {
             "Duration::MAX must not truncate into a short dedup window"
         );
         assert_eq!(dedup.len(), 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_duration_millis_saturates() {
+        assert_eq!(duration_ms_saturating(Duration::MAX), u64::MAX);
     }
 
     #[test]
