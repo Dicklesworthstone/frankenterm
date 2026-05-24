@@ -210,8 +210,8 @@ impl ScreenRelativeCoords {
 
     pub fn offset_by(&self, rel: &ParentRelativeCoords) -> Self {
         Self {
-            x: self.x + rel.x,
-            y: self.y + rel.y,
+            x: self.x.saturating_add(rel.x),
+            y: self.y.saturating_add(rel.y),
         }
     }
 }
@@ -548,8 +548,8 @@ impl<'widget> Ui<'widget> {
                     screen
                         .draw_from_screen_with_dirty_rects(
                             surface,
-                            abs_coords.x + render_data.coordinates.x,
-                            abs_coords.y + render_data.coordinates.y,
+                            abs_coords.x.saturating_add(render_data.coordinates.x),
+                            abs_coords.y.saturating_add(render_data.coordinates.y),
                         )
                         .1
                 }
@@ -560,8 +560,8 @@ impl<'widget> Ui<'widget> {
                     screen
                         .draw_from_screen_with_dirty_tiles(
                             surface,
-                            abs_coords.x + render_data.coordinates.x,
-                            abs_coords.y + render_data.coordinates.y,
+                            abs_coords.x.saturating_add(render_data.coordinates.x),
+                            abs_coords.y.saturating_add(render_data.coordinates.y),
                             tile_width,
                             tile_height,
                         )
@@ -597,7 +597,10 @@ impl<'widget> Ui<'widget> {
             self.render_recursive(
                 child,
                 screen,
-                &ScreenRelativeCoords::new(coords.x + abs_coords.x, coords.y + abs_coords.y),
+                &ScreenRelativeCoords::new(
+                    coords.x.saturating_add(abs_coords.x),
+                    coords.y.saturating_add(abs_coords.y),
+                ),
                 mode,
                 telemetry,
             )?;
@@ -803,7 +806,7 @@ impl<'widget> Ui<'widget> {
         widget: WidgetId,
         coords: &ParentRelativeCoords,
     ) -> ScreenRelativeCoords {
-        let (x, y) = self.coord_walk(widget, coords.x, coords.y, |a, b| a + b);
+        let (x, y) = self.coord_walk(widget, coords.x, coords.y, usize::saturating_add);
         ScreenRelativeCoords { x, y }
     }
 
@@ -814,7 +817,7 @@ impl<'widget> Ui<'widget> {
         widget: WidgetId,
         coords: &ScreenRelativeCoords,
     ) -> ParentRelativeCoords {
-        let (x, y) = self.coord_walk(widget, coords.x, coords.y, |a, b| a - b);
+        let (x, y) = self.coord_walk(widget, coords.x, coords.y, usize::saturating_sub);
         ParentRelativeCoords { x, y }
     }
 }
@@ -1369,6 +1372,37 @@ mod test {
         assert_eq!(
             ui.to_widget_coords(child, &ScreenRelativeCoords::new(6, 0)),
             ParentRelativeCoords::new(1, 0)
+        );
+    }
+
+    #[test]
+    fn coordinate_offsets_saturate_on_overflow() {
+        let origin = ScreenRelativeCoords::new(usize::MAX - 1, 4);
+        let offset = ParentRelativeCoords::new(7, usize::MAX);
+
+        assert_eq!(
+            origin.offset_by(&offset),
+            ScreenRelativeCoords::new(usize::MAX, usize::MAX)
+        );
+    }
+
+    #[test]
+    fn coordinate_conversion_saturates_extreme_nested_offsets() {
+        let mut ui = Ui::new();
+        let root = ui.set_root(PaintCell);
+        let child = ui.add_child(root, PaintCell);
+
+        ui.render.get_mut(&root).unwrap().coordinates = ParentRelativeCoords::new(9, 11);
+        ui.render.get_mut(&child).unwrap().coordinates =
+            ParentRelativeCoords::new(usize::MAX - 4, 17);
+
+        assert_eq!(
+            ui.to_screen_coords(child, &ParentRelativeCoords::new(8, usize::MAX)),
+            ScreenRelativeCoords::new(usize::MAX, usize::MAX)
+        );
+        assert_eq!(
+            ui.to_widget_coords(child, &ScreenRelativeCoords::new(3, 5)),
+            ParentRelativeCoords::new(0, 0)
         );
     }
 
