@@ -1074,6 +1074,13 @@ pub fn verify_pattern_pack_supply_chain(
     };
 
     regex_budget_checked = true;
+    if let Err(error) = pack.validate_as_user_pack() {
+        issues.push(PatternPackVerificationIssue {
+            category: "validation".to_string(),
+            message: format!("pattern pack validation failed: {error}"),
+        });
+    }
+
     if supply_chain.compatibility_target != policy.compatibility_target {
         issues.push(PatternPackVerificationIssue {
             category: "compatibility".to_string(),
@@ -4432,6 +4439,29 @@ rules:
                 .issues
                 .iter()
                 .any(|issue| issue.category == "compatibility"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn pattern_pack_validation_failure_forces_observe_only_even_when_signed() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.invalid_signed");
+        rule.description = " \t ".to_string();
+        let mut pack = signed_test_pack(rule, &fixture_hash);
+        let signature = sign_pattern_pack_supply_chain(&pack, "local-test-signer");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "validation"),
             "{report:#?}"
         );
     }
