@@ -30,19 +30,43 @@ Options:
 USAGE
 }
 
+require_arg() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "error: $flag requires a value" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
+require_non_negative_integer() {
+  local flag="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "error: $flag must be a non-negative integer (got: $value)" >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) OUTPUT_MODE="json"; shift ;;
     --strict) STRICT=1; shift ;;
-    --as-of) AS_OF="$2"; shift 2 ;;
-    --open-threshold) OPEN_THRESHOLD="$2"; shift 2 ;;
-    --contract-diff-threshold) CONTRACT_DIFF_THRESHOLD="$2"; shift 2 ;;
-    --claim-growth-threshold) CLAIM_GROWTH_THRESHOLD="$2"; shift 2 ;;
-    --calendar-days) CALENDAR_DAYS="$2"; shift 2 ;;
+    --as-of) require_arg "$1" "${2-}"; AS_OF="$2"; shift 2 ;;
+    --open-threshold) require_arg "$1" "${2-}"; OPEN_THRESHOLD="$2"; shift 2 ;;
+    --contract-diff-threshold) require_arg "$1" "${2-}"; CONTRACT_DIFF_THRESHOLD="$2"; shift 2 ;;
+    --claim-growth-threshold) require_arg "$1" "${2-}"; CLAIM_GROWTH_THRESHOLD="$2"; shift 2 ;;
+    --calendar-days) require_arg "$1" "${2-}"; CALENDAR_DAYS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+require_non_negative_integer "--open-threshold" "$OPEN_THRESHOLD"
+require_non_negative_integer "--contract-diff-threshold" "$CONTRACT_DIFF_THRESHOLD"
+require_non_negative_integer "--claim-growth-threshold" "$CLAIM_GROWTH_THRESHOLD"
+require_non_negative_integer "--calendar-days" "$CALENDAR_DAYS"
 
 command -v git >/dev/null 2>&1 || { echo "error: git required" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "error: jq required" >&2; exit 2; }
@@ -168,8 +192,14 @@ if [[ -z "$latest_date" ]]; then
   exit 2
 fi
 
-as_of_epoch="$(epoch_for_date "$AS_OF")"
-latest_epoch="$(epoch_for_date "$latest_date")"
+if ! as_of_epoch="$(epoch_for_date "$AS_OF")"; then
+  echo "error: --as-of must be a valid YYYY-MM-DD date (got: $AS_OF)" >&2
+  exit 2
+fi
+if ! latest_epoch="$(epoch_for_date "$latest_date")"; then
+  echo "error: latest reality-check date is invalid: $latest_date" >&2
+  exit 2
+fi
 days_since=$(( (as_of_epoch - latest_epoch) / 86400 ))
 if [[ "$days_since" -lt 0 ]]; then
   days_since=0

@@ -41,6 +41,29 @@ assert_json() {
   fi
 }
 
+assert_clean_cli_error() {
+  local label="$1" expected_rc="$2" expected_text="$3"
+  shift 3
+  local out
+  set +e
+  out=$("$SUT" "$@" 2>&1 >/dev/null)
+  local rc=$?
+  set -e
+  if [[ $rc -ne $expected_rc ]]; then
+    fail "$label" "expected exit code $expected_rc, got $rc; output=$out"
+    return
+  fi
+  if [[ "$out" != *"$expected_text"* ]]; then
+    fail "$label" "expected error text ${expected_text}; output=$out"
+    return
+  fi
+  if [[ "$out" == *"unbound variable"* || "$out" == *"integer expression expected"* || "$out" == *"syntax error"* ]]; then
+    fail "$label" "leaked raw shell error: $out"
+    return
+  fi
+  pass "$label"
+}
+
 # ----------------------------------------------------------------------------
 # Trigger 1: calendar (quarterly minimum, default 90 days)
 # ----------------------------------------------------------------------------
@@ -125,11 +148,18 @@ t_due_composite_any_trigger() {
 }
 
 t_due_false_when_no_trigger_fires() {
-  # Push every threshold high enough to silence all triggers + an as-of
-  # date matching the latest reality-check.
+  # Push every thresholded trigger high enough to silence it + an as-of
+  # date matching the latest reality-check. The minor-version signal is
+  # intentionally unthresholded, so assert whatever the live repo reports.
   local out
   out=$("$SUT" --json --as-of "2026-05-12" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000)
-  assert_json "due is false when no trigger fires" "$out" '.due' 'false'
+  local minor_due
+  minor_due=$(printf '%s' "$out" | jq -r '.signals.minor_version.triggered')
+  if [[ "$minor_due" == "true" ]]; then
+    assert_json "due is true when only minor-version fires" "$out" '.due' 'true'
+  else
+    assert_json "due is false when no trigger fires" "$out" '.due' 'false'
+  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -149,14 +179,21 @@ t_strict_exits_nonzero_when_due() {
 }
 
 t_strict_exits_zero_when_not_due() {
+  local out expected_rc
+  out=$("$SUT" --json --as-of "2026-05-12" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000)
+  if [[ "$(printf '%s' "$out" | jq -r '.due')" == "true" ]]; then
+    expected_rc=1
+  else
+    expected_rc=0
+  fi
   set +e
   "$SUT" --strict --as-of "2026-05-12" --calendar-days 100000 --open-threshold 1000000 --contract-diff-threshold 1000000 --claim-growth-threshold 1000 >/dev/null 2>&1
   local rc=$?
   set -e
-  if [[ $rc -eq 0 ]]; then
-    pass "strict mode exits 0 when due=false"
+  if [[ $rc -eq $expected_rc ]]; then
+    pass "strict mode exit matches computed due=$([[ $expected_rc -eq 1 ]] && echo true || echo false)"
   else
-    fail "strict mode exits 0 when due=false" "got exit code $rc"
+    fail "strict mode exit matches computed due" "expected exit code $expected_rc, got $rc"
   fi
 }
 
@@ -208,6 +245,18 @@ t_help_mode_exits_zero() {
   fi
 }
 
+t_missing_option_value_fails_cleanly() {
+  assert_clean_cli_error "missing --as-of value exits 2 cleanly" 2 "error: --as-of requires a value" --as-of
+}
+
+t_non_numeric_threshold_fails_cleanly() {
+  assert_clean_cli_error "non-numeric threshold exits 2 cleanly" 2 "error: --open-threshold must be a non-negative integer" --open-threshold nope
+}
+
+t_invalid_as_of_date_fails_cleanly() {
+  assert_clean_cli_error "invalid --as-of date exits 2 cleanly" 2 "error: --as-of must be a valid YYYY-MM-DD date" --as-of not-a-date
+}
+
 # ----------------------------------------------------------------------------
 # Run all tests
 # ----------------------------------------------------------------------------
@@ -226,6 +275,9 @@ t_strict_exits_zero_when_not_due
 t_json_top_level_keys_present
 t_json_all_five_signals_present
 t_help_mode_exits_zero
+t_missing_option_value_fails_cleanly
+t_non_numeric_threshold_fails_cleanly
+t_invalid_as_of_date_fails_cleanly
 
 printf '\n---\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
