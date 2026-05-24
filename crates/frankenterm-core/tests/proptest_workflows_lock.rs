@@ -215,6 +215,33 @@ proptest! {
     }
 
     #[test]
+    fn proptest_workflow_lock_force_release_updates_health(
+        pane_id in 1u64..10_000,
+        workflow_name in arb_label(),
+        execution_id in arb_label(),
+    ) {
+        let manager = PaneWorkflowLockManager::new();
+        prop_assert_eq!(
+            manager.try_acquire(pane_id, &workflow_name, &execution_id),
+            LockAcquisitionResult::Acquired
+        );
+
+        let removed = manager
+            .force_release(pane_id)
+            .expect("force release should return the held lock");
+        prop_assert_eq!(removed.pane_id, pane_id);
+        prop_assert_eq!(removed.workflow_name, workflow_name);
+        prop_assert_eq!(removed.execution_id, execution_id);
+
+        let health = manager.health();
+        prop_assert_eq!(health.force_releases_total, 1);
+        prop_assert_eq!(health.releases_total, 0);
+        prop_assert_eq!(health.active_locks, 0);
+        prop_assert!(!health.is_safe());
+        prop_assert!(manager.is_locked(pane_id).is_none());
+    }
+
+    #[test]
     fn proptest_workflow_lock_owned_guard_drop_restores_unlocked_state(
         pane_id in 1u64..10_000,
         workflow_name in arb_label(),
