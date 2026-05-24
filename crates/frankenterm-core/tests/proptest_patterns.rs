@@ -41,6 +41,13 @@ fn arb_severity() -> impl Strategy<Value = Severity> {
     ]
 }
 
+fn arb_pattern_pack_action_mode() -> impl Strategy<Value = PatternPackActionMode> {
+    prop_oneof![
+        Just(PatternPackActionMode::ActionTriggering),
+        Just(PatternPackActionMode::ObserveOnly),
+    ]
+}
+
 fn arb_detection() -> impl Strategy<Value = Detection> {
     (
         "[a-z_.]{5,30}",
@@ -779,6 +786,16 @@ proptest! {
         prop_assert_eq!(&back.name, &name);
         prop_assert_eq!(&back.version, &version);
         prop_assert!(back.rules.is_empty());
+    }
+
+    #[test]
+    fn prop_pattern_pack_action_mode_allows_only_action_triggering(
+        mode in arb_pattern_pack_action_mode(),
+    ) {
+        prop_assert_eq!(
+            mode.allows_action_triggers(),
+            mode == PatternPackActionMode::ActionTriggering
+        );
     }
 }
 
