@@ -848,18 +848,31 @@ fn parse_event_counts(bytes: &[u8]) -> (u64, u64) {
 }
 
 fn truncate_path(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
+    } else if max <= 3 {
+        ".".repeat(max)
     } else {
-        format!("...{}", &s[s.len() - (max - 3)..])
+        let suffix: String = s
+            .chars()
+            .rev()
+            .take(max - 3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("...{suffix}")
     }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
+    } else if max <= 3 {
+        ".".repeat(max)
     } else {
-        format!("{}...", &s[..max - 3])
+        let prefix: String = s.chars().take(max - 3).collect();
+        format!("{prefix}...")
     }
 }
 
@@ -1688,6 +1701,24 @@ mod tests {
         assert!(table.contains("LABEL"));
         assert!(table.contains("TIER"));
         assert!(table.contains("a.ftreplay"));
+    }
+
+    #[test]
+    fn render_table_truncates_multibyte_path_and_label_safely() {
+        let content = b"data";
+        let entry = make_entry(
+            "fixtures/replay/éééééééééééééééééééé/artifact.ftreplay",
+            "résumé-évidence-label",
+            content,
+        );
+        let fs = MockFs::new();
+        let reg = setup_registry(vec![entry], fs);
+
+        let table = reg.render_table(&ListFilter::default());
+
+        assert!(table.contains("PATH"));
+        assert!(table.contains("..."));
+        assert!(table.contains("résumé-évide..."));
     }
 
     #[test]
