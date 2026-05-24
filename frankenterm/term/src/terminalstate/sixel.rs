@@ -1,10 +1,14 @@
-use crate::terminalstate::image::*;
-use crate::terminalstate::{default_color_map, ImageAttachParams};
 use crate::TerminalState;
+use crate::terminalstate::image::*;
+use crate::terminalstate::{ImageAttachParams, default_color_map};
 use ::image::RgbaImage;
 use frankenterm_cell::color::RgbColor;
 use frankenterm_cell::image::ImageDataType;
 use frankenterm_escape_parser::{Sixel, SixelData};
+
+fn sixel_pixel_row(y: u32, bitno: u32, height: u32) -> Option<u32> {
+    y.checked_add(bitno).filter(|row| *row < height)
+}
 
 impl TerminalState {
     pub(crate) fn sixel(&mut self, sixel: Box<Sixel>) {
@@ -44,12 +48,12 @@ impl TerminalState {
             }
             let (red, green, blue) = foreground_color.to_tuple_rgb8();
             for bitno in 0..6 {
-                if y + bitno >= height {
+                let Some(row) = sixel_pixel_row(y, bitno, height) else {
                     break;
-                }
+                };
                 let on = (d & (1 << bitno)) != 0;
                 if on {
-                    image.get_pixel_mut(x, y + bitno).0 = [red, green, blue, 0xffu8];
+                    image.get_pixel_mut(x, row).0 = [red, green, blue, 0xffu8];
                 }
             }
         };
@@ -167,5 +171,23 @@ impl TerminalState {
         if self.sixel_display_mode {
             self.cursor = old_cursor;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sixel_pixel_row_stops_at_image_height() {
+        assert_eq!(sixel_pixel_row(8, 0, 10), Some(8));
+        assert_eq!(sixel_pixel_row(8, 1, 10), Some(9));
+        assert_eq!(sixel_pixel_row(8, 2, 10), None);
+    }
+
+    #[test]
+    fn sixel_pixel_row_rejects_overflowing_rows() {
+        assert_eq!(sixel_pixel_row(u32::MAX, 0, u32::MAX), None);
+        assert_eq!(sixel_pixel_row(u32::MAX, 1, u32::MAX), None);
     }
 }
