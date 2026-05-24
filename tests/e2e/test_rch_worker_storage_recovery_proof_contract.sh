@@ -83,6 +83,28 @@ EXPECTED_SIDE_EFFECT_FLAGS = %w[
 STATUS_COMMAND = "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs".freeze
 REMOTE_REQUIRED_PREFIX = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing".freeze
 SHA256 = /\A[0-9a-f]{64}\z/
+SAFE_ARTIFACT_ROOTS = %w[
+  artifacts/rch-worker-storage-approval/
+  artifacts/rch-worker-storage-recovery-proof/
+].freeze
+SAFE_ARTIFACT_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/rch-worker-storage-recovery-proof/status-workers-jobs.json",
+  "./artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/status-workers-jobs.json",
+  "../artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/status-workers-jobs.json",
+  "artifacts/rch-worker-storage-recovery-proof/",
+  "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z//status-workers-jobs.json",
+  "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/../status-workers-jobs.json",
+  "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/./status-workers-jobs.json",
+  "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/status-workers-jobs.json/",
+  "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/.",
+  "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/..",
+  "artifacts/rch-worker-storage-recovery-proof/.git/config.json",
+  "artifacts/rch-worker-storage-recovery-proof/20260518T050000Z/status-workers-jobs.txt",
+  "fixtures/rch-worker-storage-recovery-proof/valid/passed-remote-smoke.json",
+  "artifacts\\rch-worker-storage-recovery-proof\\20260518T050000Z\\status-workers-jobs.json"
+].freeze
 
 def fail!(message)
   warn "rch worker storage recovery proof contract: #{message}"
@@ -97,6 +119,21 @@ end
 
 def assert_sha!(value, message)
   fail!(message) unless SHA256.match?(value)
+end
+
+def safe_artifact_path?(path)
+  return false unless path.is_a?(String) && !path.empty?
+  return false if path.start_with?("/", "./", "../") || path.include?("\\")
+  return false unless path.end_with?(".json")
+
+  segments = path.split("/", -1)
+  return false if segments.any? { |segment| segment.empty? || segment == "." || segment == ".." || segment == ".git" }
+
+  SAFE_ARTIFACT_ROOTS.any? { |root| path.start_with?(root) && path.length > root.length }
+end
+
+SAFE_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("unsafe artifact path accepted: #{path.inspect}") if safe_artifact_path?(path)
 end
 
 # Cross-cutting safety invariants protecting the one property the whole
@@ -168,6 +205,7 @@ payloads.each do |fixture_id, payload|
     fail!("invalid fixture must not cite an approval hash") unless payload["approval_artifact_sha256"].nil?
   else
     fail!("#{fixture_id} missing approval artifact path") if payload.fetch("approval_artifact_path").empty?
+    fail!("#{fixture_id} unsafe approval artifact path") unless safe_artifact_path?(payload.fetch("approval_artifact_path"))
     assert_sha!(payload.fetch("approval_artifact_sha256"), "#{fixture_id} approval hash invalid")
   end
 
@@ -184,9 +222,15 @@ payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} negative worker count") if status.fetch("workers_total").negative?
   assert_sha!(status.fetch("artifact_sha256"), "#{fixture_id} status artifact hash invalid")
 
-  artifact_set = payload.fetch("artifact_paths").to_set
+  artifact_paths = payload.fetch("artifact_paths")
+  fail!("#{fixture_id} missing retained artifacts") if artifact_paths.empty?
+  artifact_paths.each do |artifact|
+    fail!("#{fixture_id} unsafe retained artifact path: #{artifact.inspect}") unless safe_artifact_path?(artifact)
+  end
+  artifact_set = artifact_paths.to_set
   %w[rch_status remote_required_dry_run remote_required_smoke br_dep_cycles].each do |section|
     artifact = payload.fetch(section).fetch("artifact_path")
+    fail!("#{fixture_id} #{section} unsafe artifact path: #{artifact.inspect}") unless safe_artifact_path?(artifact)
     fail!("#{fixture_id} #{section} artifact not retained: #{artifact}") unless artifact_set.include?(artifact)
     assert_sha!(payload.fetch(section).fetch("artifact_sha256"), "#{fixture_id} #{section} hash invalid")
   end
