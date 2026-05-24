@@ -583,6 +583,14 @@ impl RuleDef {
             return Err(PatternError::InvalidRule("rule id cannot be empty".to_string()).into());
         }
 
+        if self.id.split('.').any(|segment| segment.trim().is_empty()) {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must not contain empty dot-separated segments",
+                self.id
+            ))
+            .into());
+        }
+
         if !allow_custom_prefix
             && !ALLOWED_RULE_PREFIXES
                 .iter()

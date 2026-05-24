@@ -1062,6 +1062,48 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_empty_builtin_rule_id_segments(
+        suffix in "[a-z]{3,10}",
+    ) {
+        let mut trailing_empty = make_anchor_only_rule("empty_segment_a", "EMPTY_SEG_A");
+        trailing_empty.id = "codex.".to_string();
+        let mut doubled_dot = make_anchor_only_rule("empty_segment_b", "EMPTY_SEG_B");
+        doubled_dot.id = format!("codex..{suffix}");
+
+        let trailing_pack =
+            PatternPack::new("builtin:empty-segment-a", "1.0.0", vec![trailing_empty]);
+        let doubled_pack =
+            PatternPack::new("builtin:empty-segment-b", "1.0.0", vec![doubled_dot]);
+
+        prop_assert!(PatternLibrary::new(vec![trailing_pack]).is_err());
+        prop_assert!(PatternLibrary::new(vec![doubled_pack]).is_err());
+    }
+
+    #[test]
+    fn prop_library_rejects_empty_user_rule_id_segments(
+        namespace in "[a-z]{3,10}",
+    ) {
+        let pack_name = format!("user:{namespace}");
+        let mut empty_namespace = make_anchor_only_rule("empty_user_segment_a", "USER_SEG_A");
+        empty_namespace.id = format!(".{namespace}");
+        let mut trailing_empty = make_anchor_only_rule("empty_user_segment_b", "USER_SEG_B");
+        trailing_empty.id = format!("custom.{namespace}.");
+        let user_packs: std::collections::HashSet<String> =
+            std::iter::once(pack_name.clone()).collect();
+
+        let namespace_pack =
+            PatternPack::new(&pack_name, "1.0.0", vec![empty_namespace]);
+        let trailing_pack = PatternPack::new(&pack_name, "1.0.0", vec![trailing_empty]);
+
+        prop_assert!(
+            PatternLibrary::new_with_user_packs(vec![namespace_pack], &user_packs).is_err()
+        );
+        prop_assert!(
+            PatternLibrary::new_with_user_packs(vec![trailing_pack], &user_packs).is_err()
+        );
+    }
+
+    #[test]
     fn prop_library_rejects_empty_pack_name(rule_suffix in "[a-z]{3,10}") {
         let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_NAME");
         let pack = PatternPack::new(" \t ", "1.0.0", vec![rule]);
