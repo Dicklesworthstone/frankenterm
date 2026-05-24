@@ -804,6 +804,61 @@ fn parse_list_pane_item(line: &str) -> anyhow::Result<Option<PaneItem>> {
     }))
 }
 
+const LIST_WINDOWS_FIELD_SEPARATOR: char = '\t';
+
+fn parse_list_window_item(line: &str) -> anyhow::Result<Option<WindowItem>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut fields = line.split(LIST_WINDOWS_FIELD_SEPARATOR);
+    let session_id =
+        parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
+    let window_id = parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
+    let window_width = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing window_width"))?
+        .parse()?;
+    let window_height = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing window_height"))?
+        .parse()?;
+    let window_active = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing window_active"))?
+        .parse::<usize>()?;
+    let window_name = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing window_name"))?
+        .to_string();
+    let window_layout = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing window_layout"))?;
+    let history_limit = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing history_limit"))?
+        .parse::<isize>()?;
+
+    let (layout_csum, window_layout) = window_layout
+        .split_once(',')
+        .ok_or_else(|| anyhow!("missing window_layout body"))?;
+    anyhow::ensure!(layout_csum.len() == 4, "invalid window_layout checksum");
+
+    let layout = parse_layout(window_layout)?;
+
+    Ok(Some(WindowItem {
+        session_id,
+        window_id,
+        window_width,
+        window_height,
+        window_active: window_active == 1,
+        window_name,
+        layout,
+        layout_csum: layout_csum.to_string(),
+        history_limit,
+    }))
+}
+
 #[derive(Debug)]
 pub(crate) struct ListAllPanes {
     pub window_id: TmuxWindowId,
@@ -890,13 +945,17 @@ pub(crate) struct ListAllWindows {
 impl TmuxCommand for ListAllWindows {
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
-            "list-windows -F \
-                '#{{session_id}} #{{window_id}} \
-                #{{window_width}} #{{window_height}} \
-                #{{window_active}} \
-                #{{window_name}} \
-                #{{window_layout}} \
-                #{{history_limit}}' -t ${}\n",
+            concat!(
+                "list-windows -F '",
+                "#{{session_id}}\t",
+                "#{{window_id}}\t",
+                "#{{window_width}}\t",
+                "#{{window_height}}\t",
+                "#{{window_active}}\t",
+                "#{{window_name}}\t",
+                "#{{window_layout}}\t",
+                "#{{history_limit}}' -t ${}\n",
+            ),
             self.session_id
         )
     }
@@ -909,69 +968,18 @@ impl TmuxCommand for ListAllWindows {
         }
         let mut items = vec![];
 
-        for line in result.output.split('\n') {
-            if line.is_empty() {
+        for line in result.output.lines() {
+            let Some(item) = parse_list_window_item(line)? else {
                 continue;
-            }
-            let mut fields = line.split(' ');
-            let session_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
-            let window_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
-            let window_width = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_width"))?
-                .parse()?;
-            let window_height = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_height"))?
-                .parse()?;
-            let window_active = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_active"))?
-                .parse::<usize>()?;
-
-            let window_name = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_name"))?;
-
-            let window_layout = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-
-            let history_limit = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing history_limit"))?
-                .parse::<isize>()?;
-
-            let window_active = window_active == 1;
+            };
 
             if let Some(x) = self.window_id {
-                if x != window_id {
+                if x != item.window_id {
                     continue;
                 }
             }
 
-            let layout_csum = window_layout
-                .get(0..4)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-            let window_layout = window_layout
-                .get(5..)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-
-            let layout = parse_layout(window_layout)?;
-
-            items.push(WindowItem {
-                session_id,
-                window_id,
-                window_width,
-                window_height,
-                window_active,
-                window_name: window_name.to_string(),
-                layout,
-                layout_csum: layout_csum.to_string(),
-                history_limit,
-            });
+            items.push(item);
         }
 
         log::debug!("layout in domain_id {}: {:#?}", domain_id, items);
@@ -1512,6 +1520,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_list_window_item_preserves_spaced_window_name() {
+        let item =
+            parse_list_window_item("$7\t@8\t120\t40\t1\tbuild logs\tabcd,158x40,0,0,72\t2000")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(item.session_id, 7);
+        assert_eq!(item.window_id, 8);
+        assert_eq!(item.window_width, 120);
+        assert_eq!(item.window_height, 40);
+        assert!(item.window_active);
+        assert_eq!(item.window_name, "build logs");
+        assert_eq!(item.layout_csum, "abcd");
+        assert_eq!(item.history_limit, 2000);
+        assert_eq!(item.layout.len(), 1);
+    }
+
+    #[test]
+    fn parse_list_window_item_rejects_layout_without_separator() {
+        assert!(
+            parse_list_window_item("$7\t@8\t120\t40\t1\tbuild logs\tabcd158x40,0,0,72\t2000")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn send_keys_get_command_formats_hex_bytes() {
         let cmd = SendKeys {
             keys: vec![0x48, 0x69],
@@ -1549,6 +1583,18 @@ mod tests {
     fn list_commands_get_command() {
         let cmd = ListCommands;
         assert_eq!(cmd.get_command(0), "list-commands\n");
+    }
+
+    #[test]
+    fn list_all_windows_get_command_uses_tab_delimiters() {
+        let cmd = ListAllWindows {
+            session_id: 9,
+            window_id: None,
+        };
+        assert_eq!(
+            cmd.get_command(0),
+            "list-windows -F '#{session_id}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window_active}\t#{window_name}\t#{window_layout}\t#{history_limit}' -t $9\n"
+        );
     }
 
     #[test]
