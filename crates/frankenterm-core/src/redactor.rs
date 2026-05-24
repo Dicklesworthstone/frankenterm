@@ -813,6 +813,20 @@ impl StreamingRedactor {
     /// partial-secret prefixes that straddle the cut boundary. The trade-off
     /// is bounded leakage versus unbounded heap growth (OOM); operators are
     /// expected to monitor the counter and investigate runaway producers.
+    ///
+    /// # Chunk boundaries
+    ///
+    /// Each chunk is lossy-decoded independently
+    /// (`String::from_utf8_lossy`) before being appended to the pending
+    /// buffer, so a chunk boundary that falls in the *middle* of a valid
+    /// multibyte UTF-8 scalar degrades that scalar to `U+FFFD` (one
+    /// replacement char per orphaned byte) rather than carrying the
+    /// trailing bytes into the next chunk. The output stays valid UTF-8
+    /// in all cases, but callers that need byte-exact passthrough of
+    /// multibyte content (rather than redaction-grade fidelity) should
+    /// align chunk boundaries to scalar boundaries. Secret detection is
+    /// unaffected: every catalog pattern is ASCII-prefixed, so a scalar
+    /// mangled at a chunk seam never masks a credential.
     #[must_use]
     pub fn redact_chunk(&mut self, bytes: &[u8]) -> RedactionResult {
         let lossy = String::from_utf8_lossy(bytes);
