@@ -2129,7 +2129,7 @@ impl TerminalState {
                 let ch = cell.str().chars().next().unwrap_or(' ') as u32;
                 // debug!("y={} col={} ch={:x} cell={:?}", y + y_origin, col, ch, cell);
 
-                checksum += u16::from(ch as u8);
+                checksum = checksum.wrapping_add(u16::from(ch as u8));
             }
         }
 
@@ -3043,6 +3043,20 @@ mod tests {
             String::from_utf8_lossy(&output),
         );
         assert!(output.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn checksum_rectangular_area_wraps_large_sums() {
+        let (mut terminal, _output) = terminal_state_with_capture(true);
+
+        for _ in 0..(80 * 24) {
+            crate::terminalstate::performer::Performer::new(&mut terminal)
+                .perform(frankenterm_escape_parser::Action::Print('A'));
+        }
+
+        let checksum = terminal.checksum_rectangle(0, 0, 79, 23);
+
+        assert_eq!(checksum, ((u32::from(b'A') * 80 * 24) & 0xffff) as u16);
     }
 
     /// Per ft-mv27v (cont of ft-d1pv3): TerminalConfiguration test
