@@ -710,6 +710,16 @@ impl RuleDef {
         }
 
         if let Some(ref regex) = self.regex {
+            if allow_custom_prefix {
+                if let Some(backreference) = first_numeric_backreference(regex) {
+                    return Err(PatternError::InvalidRegex(format!(
+                        "rule id '{}' has user-pack regex containing unsupported numeric backreference '{}'",
+                        self.id, backreference
+                    ))
+                    .into());
+                }
+            }
+
             // [ft-xv561] compile via shared builder so the backtrack
             // cap applies to validation too — a rule that compiles
             // here but blows the limit downstream would bypass the
@@ -772,6 +782,30 @@ impl RuleDef {
             Self::interpolate_template(fix, pane_id, event_id, &self.agent_type, &self.id)
         })
     }
+}
+
+fn first_numeric_backreference(pattern: &str) -> Option<String> {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+
+        let slash_start = index;
+        while index < bytes.len() && bytes[index] == b'\\' {
+            index += 1;
+        }
+
+        if index < bytes.len()
+            && matches!(bytes[index], b'1'..=b'9')
+            && (index - slash_start) % 2 == 1
+        {
+            return Some(format!("\\{}", char::from(bytes[index])));
+        }
+    }
+    None
 }
 
 fn validate_optional_rule_text(rule_id: &str, field: &str, value: Option<&str>) -> Result<()> {
@@ -6548,6 +6582,63 @@ description = "Custom config alert"
             }],
         );
         assert!(pack.validate_as_user_pack().is_err());
+    }
+
+    #[test]
+    fn user_pack_rejects_numeric_backreference_regex() {
+        let pack = PatternPack::new(
+            "user:backref",
+            "1.0.0",
+            vec![RuleDef {
+                id: "myorg.backref".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["repeat".to_string()],
+                regex: Some(r"(repeat)\s+\1".to_string()),
+                description: "Backreference rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+
+        let error = pack
+            .validate_as_user_pack()
+            .expect_err("user pack regex backreferences must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported numeric backreference"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn user_pack_allows_escaped_numeric_literal_regex() {
+        let pack = PatternPack::new(
+            "user:escaped-backref",
+            "1.0.0",
+            vec![RuleDef {
+                id: "myorg.escaped_backref".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["literal".to_string()],
+                regex: Some(r"literal \\1".to_string()),
+                description: "Escaped numeric literal rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+
+        pack.validate_as_user_pack()
+            .expect("escaped numeric literals are not backreferences");
     }
 
     #[test]
