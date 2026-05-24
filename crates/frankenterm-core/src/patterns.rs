@@ -4047,6 +4047,7 @@ impl PatternEngine {
 mod tests {
     use super::*;
     use crate::config::{PackOverride, PatternsConfig};
+    use proptest::prelude::*;
     use serde::Deserialize;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -8320,6 +8321,35 @@ rules:
                 }
             })
             .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_context_trace_matches_plain_context_detection(
+            prefix in "[a-z0-9 _.,:-]{0,40}",
+            code in 0u16..10_000,
+            suffix in "[a-z0-9 _.,:-]{0,40}",
+        ) {
+            let rule_id = "codex.trace_plain_mr";
+            let anchor = "TRACE_EQUIV";
+            let regex = r"TRACE_EQUIV (?P<code>\d{1,5})";
+            let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+            let text = format!("{prefix}{anchor} {code}{suffix}");
+
+            let mut plain_context = DetectionContext::with_agent_type(AgentType::Codex);
+            let plain = engine.detect_with_context(&text, &mut plain_context);
+
+            let mut trace_context = DetectionContext::with_agent_type(AgentType::Codex);
+            let (traced, traces) = engine.detect_with_context_and_trace(
+                &text,
+                &mut trace_context,
+                &TraceOptions::default(),
+            );
+
+            prop_assert_eq!(detection_fingerprints(&traced), detection_fingerprints(&plain));
+            prop_assert_eq!(traces.len(), traced.len());
+            prop_assert!(traces.iter().all(|trace| trace.eligible));
+        }
     }
 
     #[test]
