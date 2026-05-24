@@ -66,6 +66,14 @@ fn usize_to_i64_saturating(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn add_u32_to_usize_saturating(value: usize, delta: u32) -> usize {
+    value.saturating_add(delta as usize)
+}
+
+fn add_u32_to_i64_saturating(value: i64, delta: u32) -> i64 {
+    value.saturating_add(i64::from(delta))
+}
+
 impl TabStop {
     fn new(screen_width: usize, tab_width: usize) -> Self {
         let mut tabs = Vec::with_capacity(screen_width);
@@ -2226,7 +2234,7 @@ impl TerminalState {
         let row_range = match erase {
             EraseInDisplay::EraseToEndOfDisplay => {
                 self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine));
-                cy + 1..rows
+                cy.saturating_add(1)..rows
             }
             EraseInDisplay::EraseToStartOfDisplay => {
                 self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToStartOfLine));
@@ -2270,7 +2278,7 @@ impl TerminalState {
 
                 if x >= self.left_and_right_margins.start && x < self.left_and_right_margins.end {
                     let right_margin = self.left_and_right_margins.end;
-                    let limit = (x + n as usize).min(right_margin);
+                    let limit = add_u32_to_usize_saturating(x, n).min(right_margin);
 
                     let blank_attr = self.pen.clone_sgr_only();
                     let screen = self.screen_mut();
@@ -2300,7 +2308,7 @@ impl TerminalState {
             Edit::EraseCharacter(n) => {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
-                let limit = (x + n as usize).min(self.screen().physical_cols);
+                let limit = add_u32_to_usize_saturating(x, n).min(self.screen().physical_cols);
                 {
                     let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
                     let screen = self.screen_mut();
@@ -2527,10 +2535,11 @@ impl TerminalState {
                 let cols = self.screen().physical_cols;
                 let new_x = if self.cursor.x >= self.left_and_right_margins.end {
                     // outside the margin, so allow movement to screen edge
-                    (self.cursor.x + n as usize).min(cols - 1)
+                    add_u32_to_usize_saturating(self.cursor.x, n).min(cols - 1)
                 } else {
                     // Else constrain to margin
-                    (self.cursor.x + n as usize).min(self.left_and_right_margins.end - 1)
+                    add_u32_to_usize_saturating(self.cursor.x, n)
+                        .min(self.left_and_right_margins.end - 1)
                 };
 
                 self.cursor.x = new_x;
@@ -2567,10 +2576,12 @@ impl TerminalState {
                 let new_y = if self.cursor.y >= self.top_and_bottom_margins.end {
                     // below the bottom margin, so allow movement to
                     // bottom of screen
-                    (self.cursor.y + i64::from(n)).min(rows as i64 - 1)
+                    add_u32_to_i64_saturating(self.cursor.y, n)
+                        .min(usize_to_i64_saturating(rows).saturating_sub(1))
                 } else {
                     // Else constrain to bottom margin
-                    (self.cursor.y + i64::from(n)).min(self.top_and_bottom_margins.end - 1)
+                    add_u32_to_i64_saturating(self.cursor.y, n)
+                        .min(self.top_and_bottom_margins.end - 1)
                 };
 
                 self.cursor.y = new_y;
@@ -2591,7 +2602,7 @@ impl TerminalState {
             Cursor::CharacterPositionAbsolute(col) => {
                 let col = col.as_zero_based() as usize;
                 let col = if self.dec_origin_mode {
-                    col + self.left_and_right_margins.start
+                    col.saturating_add(self.left_and_right_margins.start)
                 } else {
                     col
                 };
@@ -2624,10 +2635,12 @@ impl TerminalState {
                 let new_y = if self.cursor.y >= self.top_and_bottom_margins.end {
                     // below the bottom margin, so allow movement to
                     // bottom of screen
-                    (self.cursor.y + i64::from(n)).min(rows as i64 - 1)
+                    add_u32_to_i64_saturating(self.cursor.y, n)
+                        .min(usize_to_i64_saturating(rows).saturating_sub(1))
                 } else {
                     // Else constrain to bottom margin
-                    (self.cursor.y + i64::from(n)).min(self.top_and_bottom_margins.end - 1)
+                    add_u32_to_i64_saturating(self.cursor.y, n)
+                        .min(self.top_and_bottom_margins.end - 1)
                 };
 
                 self.cursor.y = new_y;
@@ -3560,6 +3573,14 @@ mod tests {
     fn usize_to_i64_conversion_saturates_extreme_values() {
         assert_eq!(usize_to_i64_saturating(42), 42);
         assert_eq!(usize_to_i64_saturating(usize::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn cursor_add_helpers_saturate_extreme_values() {
+        assert_eq!(add_u32_to_usize_saturating(5, 3), 8);
+        assert_eq!(add_u32_to_usize_saturating(usize::MAX, 3), usize::MAX);
+        assert_eq!(add_u32_to_i64_saturating(5, 3), 8);
+        assert_eq!(add_u32_to_i64_saturating(i64::MAX, 3), i64::MAX);
     }
 
     // ── ScreenOrAlt ────────────────────────────────────────────

@@ -200,12 +200,13 @@ impl<'a> Performer<'a> {
 
             let pen = self.pen.clone();
 
-            let wrappable = x + print_width >= width;
+            let next_x = x.saturating_add(print_width);
+            let wrappable = next_x >= width;
 
             if self.insert {
                 let margin = self.left_and_right_margins.end;
                 let screen = self.screen_mut();
-                for _ in x..x + print_width as usize {
+                for _ in x..next_x {
                     screen.insert_cell(x, y, margin, seqno);
                 }
             }
@@ -224,7 +225,7 @@ impl<'a> Performer<'a> {
                 .set_cell_grapheme(x, y, g, print_width, pen, seqno);
 
             if !wrappable {
-                self.cursor.x += print_width;
+                self.cursor.x = next_x;
                 self.wrap_next = false;
             } else {
                 self.wrap_next = self.dec_auto_wrap;
