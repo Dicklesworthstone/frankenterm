@@ -732,6 +732,58 @@ proptest! {
     }
 
     #[test]
+    fn send_text_wait_timeout_respects_configured_limit(
+        max_wait_timeout_ms in 0u64..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_wait_timeout_ms,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "send_wait_timeout_at_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendText {
+                id: "send".to_string(),
+                description: None,
+                text: "x".to_string(),
+                wait_for: Some(DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                }),
+                wait_timeout_ms: Some(max_wait_timeout_ms),
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "send_text wait_timeout_ms at max_wait_timeout_ms should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "send_wait_timeout_over_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendText {
+                id: "send".to_string(),
+                description: None,
+                text: "x".to_string(),
+                wait_for: Some(DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                }),
+                wait_timeout_ms: Some(max_wait_timeout_ms.saturating_add(1)),
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "send_text wait_timeout_ms longer than max_wait_timeout_ms should fail validation"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();
