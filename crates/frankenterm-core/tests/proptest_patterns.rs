@@ -956,6 +956,58 @@ fn make_test_engine(rules: Vec<RuleDef>) -> PatternEngine {
     PatternEngine::with_packs(vec![pack]).expect("valid test engine")
 }
 
+#[test]
+fn pattern_library_later_pack_override_drives_detection_and_pack_mapping() {
+    let mut base_rule = make_anchor_only_rule("override_me", "OLDANCHOR");
+    base_rule.event_type = "base.event".to_string();
+    let base_pack = PatternPack::new("override:base", "1.0.0", vec![base_rule]);
+
+    let mut override_rule = make_anchor_only_rule("override_me", "NEWANCHOR");
+    override_rule.event_type = "override.event".to_string();
+    let override_pack = PatternPack::new("override:new", "1.0.0", vec![override_rule]);
+
+    let library = PatternLibrary::new(vec![base_pack.clone(), override_pack.clone()])
+        .expect("override pack library should load");
+    assert_eq!(library.rules().len(), 1);
+    assert_eq!(
+        library.pack_for_rule("codex.override_me"),
+        Some("override:new")
+    );
+    assert_eq!(library.rules()[0].anchors, vec!["NEWANCHOR".to_string()]);
+    assert_eq!(library.rules()[0].event_type, "override.event");
+
+    let engine = PatternEngine::with_packs(vec![base_pack, override_pack])
+        .expect("override pack engine should load");
+    assert!(engine.detect("prefix OLDANCHOR suffix").is_empty());
+
+    let detections = engine.detect("prefix NEWANCHOR suffix");
+    assert_eq!(detections.len(), 1);
+    assert_eq!(detections[0].rule_id, "codex.override_me");
+    assert_eq!(detections[0].event_type, "override.event");
+}
+
+#[test]
+fn observe_only_pack_preserves_manual_fix_but_removes_action_surfaces() {
+    let mut rule = make_anchor_only_rule("observe_only", "OBSERVE_ME");
+    rule.workflow = Some("usage_limit_response".to_string());
+    rule.preview_command = Some("ft workflow preview usage-limit".to_string());
+    rule.manual_fix = Some("Recover pane {pane} after event {event_id}".to_string());
+
+    let pack = PatternPack::new("observe-only", "1.0.0", vec![rule]).into_observe_only();
+    let observe_rule = &pack.rules[0];
+    assert_eq!(observe_rule.workflow, None);
+    assert_eq!(observe_rule.preview_command, None);
+    assert_eq!(
+        observe_rule.get_manual_fix(7, Some(42)).as_deref(),
+        Some("Recover pane 7 after event 42")
+    );
+
+    let engine = PatternEngine::with_packs(vec![pack]).expect("observe-only pack should load");
+    let detections = engine.detect("OBSERVE_ME");
+    assert_eq!(detections.len(), 1);
+    assert_eq!(detections[0].rule_id, "codex.observe_only");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
