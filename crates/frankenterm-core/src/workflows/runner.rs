@@ -163,9 +163,19 @@ async fn wait_condition_pause_maybe_cx(
             "pane idle wait",
         )
         .await,
-        WaitCondition::Pattern { .. } | WaitCondition::TextMatch { .. } => {
-            wait_duration_maybe_cx(cx, timeout, label).await
-        }
+        WaitCondition::Pattern { rule_id, .. } => Err(crate::Error::Workflow(
+            crate::error::WorkflowError::Aborted(format!(
+                "{label}: pattern wait '{rule_id}' requires a pane text source; use \
+                 WaitConditionExecutor instead of the WorkflowRunner timeout-sleep fallback"
+            )),
+        )),
+        WaitCondition::TextMatch { matcher, .. } => Err(crate::Error::Workflow(
+            crate::error::WorkflowError::Aborted(format!(
+                "{label}: text-match wait {} requires a pane text source; use \
+                 WaitConditionExecutor instead of the WorkflowRunner timeout-sleep fallback",
+                matcher.description()
+            )),
+        )),
         WaitCondition::External { key } => {
             if key.trim().is_empty() {
                 return Err(crate::Error::Workflow(
@@ -4135,6 +4145,46 @@ mod tests {
                         elapsed < Duration::from_secs(1),
                         "timeout abort should not wait for full duration: {elapsed:?}"
                     );
+                }
+            });
+        }
+
+        #[test]
+        fn pattern_and_text_match_waits_require_observable_pane_text() {
+            run_async_test(async {
+                for (condition, expected_reason) in [
+                    (
+                        WaitCondition::pattern("prompt.ready"),
+                        "pattern wait 'prompt.ready' requires a pane text source",
+                    ),
+                    (
+                        WaitCondition::text_match(TextMatch::substring("done")),
+                        "text-match wait substring(len=4",
+                    ),
+                ] {
+                    let err = wait_condition_pause_maybe_cx(
+                        None,
+                        &condition,
+                        Duration::from_secs(60),
+                        None,
+                        "workflow wait condition",
+                    )
+                    .await
+                    .expect_err("unobservable wait must abort instead of advancing");
+
+                    match err {
+                        crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                            assert!(
+                                reason.contains(expected_reason),
+                                "unexpected abort reason: {reason}"
+                            );
+                            assert!(
+                                reason.contains("WaitConditionExecutor"),
+                                "abort reason should point to the observable wait executor: {reason}"
+                            );
+                        }
+                        other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                    }
                 }
             });
         }
