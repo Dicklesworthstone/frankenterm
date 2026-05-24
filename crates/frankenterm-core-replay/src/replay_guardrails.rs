@@ -383,7 +383,7 @@ impl ConcurrencyGate {
             self.current.fetch_sub(1, Ordering::Relaxed);
             return Err(LimitViolation::MaxConcurrent {
                 limit: self.max_concurrent,
-                current: current as u32,
+                current: u64_to_u32_saturating(current),
             });
         }
         Ok(ConcurrencyToken { gate: self })
@@ -392,8 +392,12 @@ impl ConcurrencyGate {
     /// Current count.
     #[must_use]
     pub fn current(&self) -> u32 {
-        self.current.load(Ordering::Relaxed) as u32
+        u64_to_u32_saturating(self.current.load(Ordering::Relaxed))
     }
+}
+
+fn u64_to_u32_saturating(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 // ============================================================================
@@ -739,6 +743,23 @@ watchdog_timeout_ms = 5000
         assert!(result.is_err());
         let is_concurrent = matches!(result.unwrap_err(), LimitViolation::MaxConcurrent { .. });
         assert!(is_concurrent);
+    }
+
+    #[test]
+    fn concurrency_gate_reports_saturated_current_count() {
+        let gate = ConcurrencyGate::new(u32::MAX);
+        gate.current.store(u64::from(u32::MAX), Ordering::Relaxed);
+
+        let result = gate.try_acquire();
+
+        assert!(matches!(
+            result,
+            Err(LimitViolation::MaxConcurrent {
+                limit: u32::MAX,
+                current: u32::MAX,
+            })
+        ));
+        assert_eq!(gate.current(), u32::MAX);
     }
 
     #[test]
