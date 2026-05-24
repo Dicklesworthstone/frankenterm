@@ -537,6 +537,48 @@ run_parent_signed_output_case() {
   echo "PASS ${name}"
 }
 
+run_signed_output_relative_guard_case() {
+  local name="$1"
+  local unsafe_out_dir="$2"
+  local version="$3"
+  local scenario_id="$4"
+  local fake_bin="${ARTIFACT_ROOT}/fake-cosign-${name}-bin"
+  install_fake_cosign "${fake_bin}"
+
+  local case_dir="${ARTIFACT_ROOT}/${name}"
+  local manifest="${case_dir}/manifest.json"
+  local rc=0
+  mkdir -p "${case_dir}"
+  write_manifest "${manifest}" "$(json_slot '"docs/attestations/schema.json"' "" "")"
+
+  set +e
+  PATH="${fake_bin}:$PATH" \
+  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
+  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  FT_ATTESTATION_MANIFEST="${manifest}" \
+  FT_ATTESTATION_OUT_DIR="${unsafe_out_dir}" \
+  FT_BEAD_ID="ft-e87u6.2" \
+  FT_SCENARIO_ID="${scenario_id}" \
+    bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version "${version}" \
+      --channel stable \
+      --sign cosign >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
+  rc=$?
+  set -e
+
+  total=$((total + 1))
+  if [[ "${rc}" == "0" ]] || ! grep -q "repo-relative without parent traversal" "${case_dir}/stderr.txt"; then
+    fail=$((fail + 1))
+    record_result "${name}" "nonzero_repo_relative_output_rejection" "${rc}" "failed" "${case_dir}"
+    echo "FAIL ${name}: unsafe signed output path was not rejected" >&2
+    return 0
+  fi
+
+  pass=$((pass + 1))
+  record_result "${name}" "nonzero_repo_relative_output_rejection" "${rc}" "passed" "${case_dir}"
+  echo "PASS ${name}"
+}
+
 run_unsafe_retraction_path_index_case() {
   local name="unsafe_retraction_path_is_not_indexed"
   local case_dir="${ARTIFACT_ROOT}/${name}"
@@ -703,6 +745,16 @@ run_unsafe_retraction_path_index_case
 run_sigstore_cases
 run_external_signed_output_case
 run_parent_signed_output_case
+run_signed_output_relative_guard_case \
+  "signed_output_dot_segment_fails" \
+  "${ARTIFACT_ROOT}/signed-output-dot/./out" \
+  "0.0.0-dot-signed-output" \
+  "attestation_dot_signed_output_guard"
+run_signed_output_relative_guard_case \
+  "signed_output_empty_segment_fails" \
+  "${ARTIFACT_ROOT}/signed-output-empty//out" \
+  "0.0.0-empty-segment-signed-output" \
+  "attestation_empty_segment_signed_output_guard"
 
 jq -n \
   --arg bead_id "ft-e87u6.2" \
