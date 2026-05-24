@@ -5,7 +5,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_cell::color::ColorAttribute;
 #[cfg(feature = "use_image")]
 pub use frankenterm_cell::image::{ImageData, TextureCoordinate};
-use frankenterm_cell::{unicode_column_width, AttributeChange, CellAttributes};
+use frankenterm_cell::{AttributeChange, CellAttributes, unicode_column_width};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,30 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+
+fn wrapped_relative_coordinate(current: usize, delta: isize, extent: usize) -> usize {
+    if extent == 0 {
+        return 0;
+    }
+
+    let extent = isize::try_from(extent).unwrap_or(isize::MAX);
+    let current = isize::try_from(current % extent as usize).unwrap_or(0);
+    let delta = delta.rem_euclid(extent);
+
+    if current >= extent - delta {
+        (current - (extent - delta)) as usize
+    } else {
+        (current + delta) as usize
+    }
+}
+
+fn wrapped_end_relative_coordinate(extent: usize, delta: usize) -> usize {
+    if extent == 0 {
+        return 0;
+    }
+
+    extent.saturating_sub(delta.saturating_add(1)) % extent
+}
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -254,19 +278,34 @@ impl ChangeSequence {
             Change::CursorPosition { x, y } => {
                 self.cursor_x = match x {
                     Position::Relative(x) => {
-                        ((self.cursor_x as isize + x) % self.screen_cols as isize) as usize
+                        wrapped_relative_coordinate(self.cursor_x, x, self.screen_cols)
                     }
-                    Position::Absolute(x) => x % self.screen_cols,
-                    Position::EndRelative(x) => (self.screen_cols - x) % self.screen_cols,
+                    Position::Absolute(x) => {
+                        if self.screen_cols == 0 {
+                            0
+                        } else {
+                            x % self.screen_cols
+                        }
+                    }
+                    Position::EndRelative(x) => {
+                        wrapped_end_relative_coordinate(self.screen_cols, x)
+                    }
                 };
 
                 self.cursor_y = match y {
                     Position::Relative(y) => {
-                        (self.cursor_y as isize + y) % self.screen_rows as isize
+                        wrapped_relative_coordinate(self.cursor_y as usize, y, self.screen_rows)
+                            as isize
                     }
-                    Position::Absolute(y) => (y % self.screen_rows) as isize,
+                    Position::Absolute(y) => {
+                        if self.screen_rows == 0 {
+                            0
+                        } else {
+                            (y % self.screen_rows) as isize
+                        }
+                    }
                     Position::EndRelative(y) => {
-                        ((self.screen_rows - y) % self.screen_rows) as isize
+                        wrapped_end_relative_coordinate(self.screen_rows, y) as isize
                     }
                 };
                 self.update_render_height();
@@ -536,13 +575,47 @@ mod test {
     }
 
     #[test]
+    fn change_sequence_cursor_position_extreme_relative_wraps() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add(Change::CursorPosition {
+            x: Position::Absolute(2),
+            y: Position::Absolute(1),
+        });
+        cs.add(Change::CursorPosition {
+            x: Position::Relative(isize::MIN),
+            y: Position::Relative(isize::MAX),
+        });
+        assert_eq!(cs.current_cursor_position(), (34, 8));
+    }
+
+    #[test]
     fn change_sequence_cursor_position_end_relative() {
         let mut cs = ChangeSequence::new(24, 80);
         cs.add(Change::CursorPosition {
             x: Position::EndRelative(5),
             y: Position::EndRelative(3),
         });
-        assert_eq!(cs.current_cursor_position(), (75, 21));
+        assert_eq!(cs.current_cursor_position(), (74, 20));
+    }
+
+    #[test]
+    fn change_sequence_cursor_position_end_relative_zero_uses_last_cell() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add(Change::CursorPosition {
+            x: Position::EndRelative(0),
+            y: Position::EndRelative(0),
+        });
+        assert_eq!(cs.current_cursor_position(), (79, 23));
+    }
+
+    #[test]
+    fn change_sequence_cursor_position_oversized_end_relative_saturates() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add(Change::CursorPosition {
+            x: Position::EndRelative(usize::MAX),
+            y: Position::EndRelative(usize::MAX),
+        });
+        assert_eq!(cs.current_cursor_position(), (0, 0));
     }
 
     #[test]

@@ -1168,11 +1168,11 @@ fn compute_position_change(current: usize, pos: &Position, limit: usize) -> usiz
                     limit.saturating_sub(1),
                 )
             } else {
-                current.saturating_sub((*delta).abs() as usize)
+                current.saturating_sub(delta.unsigned_abs())
             }
         }
         Absolute(abs) => min(*abs, limit.saturating_sub(1)),
-        EndRelative(delta) => limit.saturating_sub(*delta),
+        EndRelative(delta) => limit.saturating_sub(delta.saturating_add(1)),
     }
 }
 
@@ -2333,6 +2333,12 @@ mod test {
     }
 
     #[test]
+    fn compute_position_relative_min_saturates_at_zero() {
+        let result = compute_position_change(2, &Position::Relative(isize::MIN), 10);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
     fn compute_position_absolute() {
         let result = compute_position_change(0, &Position::Absolute(7), 10);
         assert_eq!(result, 7);
@@ -2347,13 +2353,19 @@ mod test {
     #[test]
     fn compute_position_end_relative() {
         let result = compute_position_change(0, &Position::EndRelative(2), 10);
-        assert_eq!(result, 8); // limit - delta
+        assert_eq!(result, 7); // last position minus delta
     }
 
     #[test]
     fn compute_position_end_relative_zero() {
         let result = compute_position_change(0, &Position::EndRelative(0), 10);
-        assert_eq!(result, 10); // limit - 0
+        assert_eq!(result, 9); // last position
+    }
+
+    #[test]
+    fn compute_position_end_relative_oversized_saturates_at_zero() {
+        let result = compute_position_change(0, &Position::EndRelative(usize::MAX), 10);
+        assert_eq!(result, 0);
     }
 
     // === Surface constructor and accessor tests ===
