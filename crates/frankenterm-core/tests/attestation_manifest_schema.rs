@@ -262,6 +262,19 @@ fn manifest_schema_rejects_blank_deferred_reasons() {
 }
 
 #[test]
+fn manifest_schema_rejects_blank_slot_descriptions() {
+    let validator = manifest_validator();
+
+    let mut blank_description_slot = base_slot(json!("docs/perf/headline-claims.json"));
+    blank_description_slot["description"] = json!(" \t");
+    let errors = validate(&validator, &base_manifest(blank_description_slot));
+    assert!(
+        !errors.is_empty(),
+        "manifest slots must carry non-blank descriptions"
+    );
+}
+
+#[test]
 fn manifest_schema_rejects_malformed_bead_ids() {
     let validator = manifest_validator();
 
@@ -381,6 +394,61 @@ fn bundle_schema_rejects_blank_generator_version() {
         !validate(&validator, &bundle).is_empty(),
         "bundle generator.version must reject blank provenance text"
     );
+}
+
+#[test]
+fn bundle_schema_rejects_blank_artifact_and_deferred_slot_descriptions() {
+    let validator = bundle_validator();
+    for (surface, bundle) in [
+        (
+            "artifacts[].description",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["artifacts"] = json!([
+                    {
+                        "category": "perf/headline-claims",
+                        "path": "docs/perf/headline-claims.json",
+                        "media_type": "application/json",
+                        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                        "size_bytes": 1,
+                        "produced_by_bead": "ft-e87u6.2",
+                        "description": " \t"
+                    }
+                ]);
+                bundle
+            },
+        ),
+        (
+            "deferred_slots[].description",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["deferred_slots"] = json!([
+                    {
+                        "category": "perf/headline-claims",
+                        "media_type": "application/json",
+                        "produced_by_bead": "ft-e87u6.2",
+                        "deferred_to_bead": "ft-e87u6.9",
+                        "deferred_reason": "synthetic deferred slot",
+                        "description": "\n"
+                    }
+                ]);
+                bundle
+            },
+        ),
+    ] {
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "bundle must reject blank {surface}"
+        );
+    }
 }
 
 #[test]
