@@ -164,6 +164,9 @@ pub enum ParseError {
     BadEscape { at: usize, observed: char },
     /// An option that requires a following value was the final token.
     MissingOptionValue { option: String },
+    /// A syntactically valid command option is not implemented by
+    /// this tmux control subset and must not be silently ignored.
+    UnsupportedOption { command: String, option: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +192,9 @@ impl fmt::Display for ParseError {
             Self::MissingOptionValue { option } => {
                 write!(f, "missing value for option `{option}`")
             }
+            Self::UnsupportedOption { command, option } => {
+                write!(f, "unsupported option `{option}` for command `{command}`")
+            }
         }
     }
 }
@@ -208,7 +214,7 @@ pub fn parse_command(line: &str) -> Result<TmuxCommand, ParseError> {
     Ok(match verb.as_str() {
         "send-keys" | "send" => parse_send_keys(args)?,
         "list-windows" | "lsw" => parse_list_windows(args)?,
-        "list-sessions" | "ls" => TmuxCommand::ListSessions,
+        "list-sessions" | "ls" => parse_list_sessions(args)?,
         "capture-pane" | "capturep" => parse_capture_pane(args)?,
         "split-window" | "splitw" => parse_split_window(args)?,
         "new-session" | "new" => parse_new_session(args)?,
@@ -344,11 +350,30 @@ fn parse_list_windows(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
     let mut target_session: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
-        if a == "-t" {
-            target_session = Some(take_option_value(&mut iter, "-t")?);
+        match a.as_str() {
+            "-t" => target_session = Some(take_option_value(&mut iter, "-t")?),
+            option if option.starts_with('-') => {
+                return Err(ParseError::UnsupportedOption {
+                    command: "list-windows".to_string(),
+                    option: option.to_string(),
+                });
+            }
+            _ => {}
         }
     }
     Ok(TmuxCommand::ListWindows { target_session })
+}
+
+fn parse_list_sessions(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
+    for arg in args {
+        if arg.starts_with('-') {
+            return Err(ParseError::UnsupportedOption {
+                command: "list-sessions".to_string(),
+                option: arg,
+            });
+        }
+    }
+    Ok(TmuxCommand::ListSessions)
 }
 
 fn parse_capture_pane(args: Vec<String>) -> Result<TmuxCommand, ParseError> {
@@ -551,6 +576,24 @@ mod tests {
             parse_command("new-session -s").unwrap_err(),
             ParseError::MissingOptionValue {
                 option: "-s".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_read_only_commands_reject_unsupported_options() {
+        assert_eq!(
+            parse_command("list-windows -a").unwrap_err(),
+            ParseError::UnsupportedOption {
+                command: "list-windows".to_string(),
+                option: "-a".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_command("list-sessions -F '#{session_name}'").unwrap_err(),
+            ParseError::UnsupportedOption {
+                command: "list-sessions".to_string(),
+                option: "-F".to_string(),
             }
         );
     }

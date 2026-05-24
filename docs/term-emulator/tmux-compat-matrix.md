@@ -42,7 +42,7 @@ against the speaker we actually ship, not the spec we wish we shipped.
 
 | Tool | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
-| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (27/27 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
+| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (28/28 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
 | neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | substrate-pass | parse_send_keys_with_target_and_payload + parse_list_windows_with_session_target | Pane navigator emits `send-keys -t <pane> <keystroke>` — covered by send-keys parse path. End-to-end blocked on ft-l4cef. |
 | vscode tmux extension (`vscode-tmux`) | substrate-pass | parse_attach_session_with_target + response_encode_success_uses_end_trailer | Extension speaks attach-session + capture-pane. Both wire-syntax shapes covered. End-to-end blocked on ft-l4cef. |
 
@@ -79,7 +79,7 @@ rationale per row.
 
 ## Substrate verification — wire-syntax golden vectors
 
-The 27 unit tests in `tmux_control_protocol.rs::tests` are the golden
+The 28 unit tests in `tmux_control_protocol.rs::tests` are the golden
 vectors. Each one asserts a single literal tmux wire-syntax string
 parses to the expected `TmuxCommand` variant, plus the response
 encoder produces a `%begin`/`%end` block frame that matches the tmux
@@ -111,6 +111,7 @@ Wire-syntax edge cases:
 | --------- | ---- |
 | Trailing `\r\n` stripped | `parse_tolerates_trailing_newline` |
 | Empty input → `Empty` error | `parse_empty_line_errors` |
+| Unsupported read-only command options fail instead of returning wrong default output | `parse_read_only_commands_reject_unsupported_options` |
 | Single-quoted args preserve spaces literally | `tokenize_single_quoted_arg_preserves_spaces` |
 | Double-quoted args honor `\\`, `\"`, `\n`, `\t` | `tokenize_double_quoted_arg_honors_escapes` |
 | Unterminated single quote → diagnostic | `tokenize_unterminated_single_quote_errors` |
