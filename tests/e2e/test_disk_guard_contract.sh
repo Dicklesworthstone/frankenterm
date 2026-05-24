@@ -94,6 +94,37 @@ EXPECTED_DECISIONS = %w[
   proceed
   static_only
 ].freeze
+REPO_ARTIFACT_ROOTS = %w[
+  docs/json-schema/
+  docs/robot-contracts/
+  fixtures/disk-guard/
+  tests/artifacts/disk-guard/
+].freeze
+EXTERNAL_SCRATCH_ARTIFACT_ROOT = "/Volumes/USB_NVME/".freeze
+SAFE_ARTIFACT_EXTENSION = /\.(json|jsonl|md)\z/
+SAFE_ARTIFACT_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/disk-guard/evidence.json",
+  "/Volumes/USB_NVME/",
+  "/Volumes/USB_NVME/../evidence.md",
+  "/Volumes/USB_NVME/./evidence.md",
+  "/Volumes/USB_NVME/.git/config.md",
+  "/Volumes/USB_NVME/evidence.txt",
+  "/Volumes/USB_NVME/evidence.md/",
+  "/Volumes/USB_NVME/reports//evidence.md",
+  "./fixtures/disk-guard/valid/healthy.json",
+  "../fixtures/disk-guard/valid/healthy.json",
+  "fixtures/disk-guard/",
+  "fixtures/disk-guard/valid//healthy.json",
+  "fixtures/disk-guard/valid/../healthy.json",
+  "fixtures/disk-guard/valid/./healthy.json",
+  "fixtures/disk-guard/valid/.",
+  "fixtures/disk-guard/valid/..",
+  "fixtures/disk-guard/.git/config.json",
+  "fixtures/disk-guard/valid/healthy.txt",
+  "fixtures\\disk-guard\\valid\\healthy.json"
+].freeze
 
 def fail!(message)
   warn "disk guard contract: #{message}"
@@ -104,6 +135,53 @@ def read_json(path)
   JSON.parse(File.read(path))
 rescue JSON::ParserError => error
   fail!("#{path} does not parse as JSON: #{error.message}")
+end
+
+def safe_segments?(path)
+  path.split("/", -1).none? { |part| part.empty? || part == "." || part == ".." || part == ".git" }
+end
+
+def safe_repo_artifact_path?(path)
+  return false unless path.is_a?(String) && !path.empty?
+  return false if path.start_with?("/", "./", "../") || path.include?("\\")
+  return false unless path.match?(SAFE_ARTIFACT_EXTENSION)
+  return false unless safe_segments?(path)
+
+  REPO_ARTIFACT_ROOTS.any? { |root| path.start_with?(root) && path.length > root.length }
+end
+
+def safe_external_scratch_artifact_path?(path)
+  return false unless path.is_a?(String) && !path.empty?
+  return false unless path.start_with?(EXTERNAL_SCRATCH_ARTIFACT_ROOT)
+  return false if path.include?("\\")
+  return false unless path.match?(SAFE_ARTIFACT_EXTENSION)
+
+  tail = path.delete_prefix(EXTERNAL_SCRATCH_ARTIFACT_ROOT)
+  !tail.empty? && safe_segments?(tail)
+end
+
+def safe_artifact_path?(path)
+  safe_repo_artifact_path?(path) || safe_external_scratch_artifact_path?(path)
+end
+
+def collect_artifact_paths(node, acc = [])
+  case node
+  when Hash
+    node.each do |key, value|
+      if key == "artifact_paths"
+        value.each { |path| acc << path }
+      else
+        collect_artifact_paths(value, acc)
+      end
+    end
+  when Array
+    node.each { |item| collect_artifact_paths(item, acc) }
+  end
+  acc
+end
+
+SAFE_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("unsafe artifact path accepted: #{path.inspect}") if safe_artifact_path?(path)
 end
 
 schema = read_json(SCHEMA)
@@ -171,6 +249,9 @@ fixtures = EXPECTED_VALID_FIXTURES.map do |path|
   fail!("#{path} forbidden actions drifted") unless policy.fetch("forbidden_actions").sort == EXPECTED_FORBIDDEN_ACTIONS.sort
   fail!("#{path} emitted deletion command text") if fixture.to_json.downcase.include?("rm -rf")
   fail!("#{path} has no artifact path") if fixture.fetch("artifact_paths").empty?
+  collect_artifact_paths(fixture).each do |artifact_path|
+    fail!("#{path} unsafe artifact path: #{artifact_path.inspect}") unless safe_artifact_path?(artifact_path)
+  end
   fail!("#{path} missing policy cleanup reason") unless fixture.fetch("reason_codes").include?("policy.cleanup_requires_operator_approval")
   fixture
 end
