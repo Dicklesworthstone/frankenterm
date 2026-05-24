@@ -370,6 +370,43 @@ proptest! {
         );
     }
 
+    /// Invariant #2 in debug-marker mode. `with_debug_markers()`
+    /// emits `[REDACTED:<name>]` instead of the bare `[REDACTED]`;
+    /// those longer markers embed catalog words ("secret", "token",
+    /// "password", "url") that could in principle re-trip the
+    /// catalog. This pins two things: (a) debug-mode redaction still
+    /// zeroes contains_secrets — markers never re-match — and (b)
+    /// every emitted marker names a live catalog pattern from
+    /// secret_pattern_names(), never a stale/bogus label.
+    #[test]
+    fn debug_markers_zero_contains_secrets_and_carry_valid_names(text in mixed_text()) {
+        let r = Redactor::with_debug_markers();
+        let redacted = r.redact(&text);
+
+        prop_assert!(
+            !r.contains_secrets(&redacted),
+            "debug-mode redaction left a residue contains_secrets caught: \
+             input={:?} redacted={:?}",
+            text,
+            redacted
+        );
+
+        let catalog: Vec<&str> = frankenterm_core::redactor::secret_pattern_names().collect();
+        let mut rest = redacted.as_str();
+        while let Some(idx) = rest.find("[REDACTED:") {
+            let after = &rest[idx + "[REDACTED:".len()..];
+            let Some(close) = after.find(']') else { break };
+            let name = &after[..close];
+            prop_assert!(
+                catalog.contains(&name),
+                "marker carried a non-catalog pattern name {:?}: redacted={:?}",
+                name,
+                redacted
+            );
+            rest = &after[close + 1..];
+        }
+    }
+
     /// Invariant #4 (partial): detect spans monotonically non-
     /// decreasing in start order. The Redactor::detect contract
     /// (`detections.sort_by_key(|(_, start, _)| *start)` at the
