@@ -87,8 +87,12 @@ def forbidden_hits(strings, patterns)
 end
 
 def assert_false_flags!(path, object)
-  flags = object.fetch("side_effects", object.fetch("safety", object.fetch("side_effect_policy", {})))
-  bad = flags.select { |_key, value| value == true }
+  flags = object["side_effects"] || object["safety"] || object["side_effect_policy"]
+  # A fixture with no declared side-effect block must NOT vacuously pass the
+  # all-false gate: an undeclared block is an unproven (ungated) side-effect set.
+  fail!("#{path} declares no side-effect/safety flag block") unless flags.is_a?(Hash) && !flags.empty?
+  # Any flag not literally false is non-false (true, truthy strings, numbers).
+  bad = flags.reject { |_key, value| value == false }
   fail!("#{path} has non-false side-effect flags: #{bad.keys.inspect}") unless bad.empty?
 end
 
