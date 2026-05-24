@@ -159,5 +159,23 @@ jq -e '
     and .safe_next_action == "record_unavailable_git_dirty_tree_source"
 ' "${FIXTURE}" >/dev/null || fail "git-metadata-unavailable case drifted"
 
+# Content-leak guard (ft-ip124 / ft-1nqye class): a dirty-tree snapshot must
+# carry only path metadata, never file contents or diffs. The per-case loop
+# above validates the four allowed path_summary fields but does not forbid
+# EXTRA keys, so a smuggled diff/content field would slip through. Assert every
+# path_summary has exactly the metadata key set and that the bundle stores no
+# full diff, then prove the guard bites against a smuggled content field.
+jq -e '
+  def metadata_only($c):
+    $c.summary.full_diff_stored == false
+    and $c.summary.truncated == false
+    and all($c.path_summaries[]; (keys - ["category", "path", "severity", "status"]) == []);
+  (all(.cases[]; metadata_only(.)))
+  and (.cases[] | select((.path_summaries | length) > 0) | [.] ) as $withpaths
+  | ($withpaths[0] as $p
+    | (metadata_only($p | .summary.full_diff_stored = true) | not)
+    and (metadata_only($p | .path_summaries[0].diff = "leaked file contents") | not))
+' "${FIXTURE}" >/dev/null || fail "git dirty-tree content-leak guard does not bite"
+
 case_count="$(jq -r '.cases | length' "${FIXTURE}")"
 printf 'incident git_dirty_tree fixture corpus: static verifier passed (%s cases)\n' "${case_count}"
