@@ -965,3 +965,86 @@ proptest! {
         prop_assert!(!z.any_positive());
     }
 }
+
+// =============================================================================
+// LatencyPathContract::new validation + deterministic budget composition
+// =============================================================================
+
+fn arb_slack_policy() -> impl Strategy<Value = StageSlackPolicy> {
+    prop_oneof![
+        Just(StageSlackPolicy::Strict),
+        (0.0_f64..100.0).prop_map(|m| StageSlackPolicy::BorrowUpTo { max_extra_ms: m }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// new accepts stages with unique non-empty ids and composes the
+    /// aggregate target as the element-wise SUM of stage targets.
+    #[test]
+    fn path_contract_new_accepts_and_sums(
+        inputs in prop::collection::vec((arb_ordered_budget(), arb_slack_policy()), 1..6),
+    ) {
+        let stages: Vec<LatencyStageContract> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, (target, slack))| LatencyStageContract {
+                stage_id: format!("stage{i}"),
+                interface_in: format!("in{i}"),
+                interface_out: format!("out{i}"),
+                target_ms: *target,
+                slack_policy: *slack,
+            })
+            .collect();
+        let sum_p50: f64 = stages.iter().map(|s| s.target_ms.p50_ms()).sum();
+        let sum_p999: f64 = stages.iter().map(|s| s.target_ms.p999_ms()).sum();
+
+        let contract = LatencyPathContract::new("path", stages)
+            .expect("unique valid stages must be accepted");
+        prop_assert!((contract.aggregate_target_ms.p50_ms() - sum_p50).abs() < 1e-6,
+            "aggregate p50 must be the sum of stage p50 targets");
+        prop_assert!((contract.aggregate_target_ms.p999_ms() - sum_p999).abs() < 1e-6,
+            "aggregate p999 must be the sum of stage p999 targets");
+    }
+
+    /// new rejects an empty stage list.
+    #[test]
+    fn path_contract_new_rejects_empty(_dummy in 0u8..1) {
+        prop_assert!(LatencyPathContract::new("p", vec![]).is_err());
+    }
+
+    /// new rejects duplicate stage ids.
+    #[test]
+    fn path_contract_new_rejects_duplicate_ids(budget in arb_ordered_budget()) {
+        let mk = |id: &str| LatencyStageContract {
+            stage_id: id.to_string(),
+            interface_in: "i".to_string(),
+            interface_out: "o".to_string(),
+            target_ms: budget,
+            slack_policy: StageSlackPolicy::Strict,
+        };
+        prop_assert!(LatencyPathContract::new("p", vec![mk("dup"), mk("dup")]).is_err());
+    }
+
+    /// new rejects a blank stage id.
+    #[test]
+    fn path_contract_new_rejects_blank_stage_id(budget in arb_ordered_budget()) {
+        let stage = LatencyStageContract {
+            stage_id: "   ".to_string(),
+            interface_in: "i".to_string(),
+            interface_out: "o".to_string(),
+            target_ms: budget,
+            slack_policy: StageSlackPolicy::Strict,
+        };
+        prop_assert!(LatencyPathContract::new("p", vec![stage]).is_err());
+    }
+
+    /// StageSlackPolicy serde round-trips (snake_case enum, both variants).
+    #[test]
+    fn slack_policy_serde_roundtrip(slack in arb_slack_policy()) {
+        let back: StageSlackPolicy =
+            serde_json::from_str(&serde_json::to_string(&slack).unwrap()).unwrap();
+        prop_assert_eq!(slack, back);
+    }
+}
