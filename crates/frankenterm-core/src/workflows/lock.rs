@@ -1751,46 +1751,45 @@ mod tests {
         assert_eq!(mgr.is_locked(1).unwrap().execution_id, "new-exec");
     }
 
-    /// `try_acquire_with_limit(_, _, _, max_active=0)` treats 0 as
-    /// "no limit" per the `filter(|limit| *limit > 0)` clause. Pin
-    /// this so a future tightening that interprets 0 as
-    /// reject-everything doesn't silently break callers passing 0
-    /// as the disabled-limit signal.
+    /// `try_acquire_with_limit(_, _, _, max_active=0)` is a fail-closed
+    /// configuration: no new lock may be acquired. This prevents a missing or
+    /// zeroed workflow concurrency limit from accidentally disabling the guard.
     #[test]
-    fn try_acquire_with_limit_zero_is_unbounded() {
+    fn try_acquire_with_limit_zero_blocks_guarded_variants() {
         let mgr = PaneWorkflowLockManager::new();
-        // Acquire many panes with limit=0; all should succeed.
-        for i in 0..50u64 {
-            let result = mgr.try_acquire_with_limit(
-                i,
-                "wf",
-                &format!("exec-{i}"),
-                0, // disabled-limit signal
-            );
-            match result {
-                Ok(LockAcquisitionResult::Acquired) => {}
-                other => panic!("limit=0 must permit acquire, got {other:?}"),
-            }
-        }
+        let err = mgr
+            .try_acquire_with_limit_guarded(1, "wf", "exec-1", 0)
+            .expect_err("zero active-lock limit should block borrowed guard acquisition");
+        assert_eq!(err.active, 0);
+        assert_eq!(err.limit, 0);
+        assert!(mgr.active_locks().is_empty());
+
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let err = mgr
+            .try_acquire_with_limit_owned_guarded(1, "wf", "exec-1", 0)
+            .expect_err("zero active-lock limit should block owned guard acquisition");
+        assert_eq!(err.active, 0);
+        assert_eq!(err.limit, 0);
         assert_eq!(
-            mgr.active_locks().len(),
-            50,
-            "limit=0 should permit unbounded growth"
+            mgr.health().concurrency_limit_blocks_total,
+            1,
+            "owned zero-limit rejection should be counted"
         );
     }
 
     #[test]
-    fn try_acquire_with_limit_zero_still_rejects_already_locked() {
-        // limit=0 disables the active-count gate, but the
-        // already-locked check still fires (single-owner-per-pane
-        // invariant is independent of the limit).
+    fn try_acquire_with_limit_zero_preserves_existing_lock_conflict() {
         let mgr = PaneWorkflowLockManager::new();
-        let _ = mgr.try_acquire_with_limit(1, "wf", "exec-1", 0);
+        assert!(mgr.try_acquire(1, "wf", "exec-1").is_acquired());
         let second = mgr.try_acquire_with_limit(1, "wf", "exec-2", 0);
         match second {
             Ok(LockAcquisitionResult::AlreadyLocked { .. }) => {}
-            other => panic!("limit=0 must not bypass already-locked check, got {other:?}"),
+            other => panic!("zero limit must not mask already-locked conflict, got {other:?}"),
         }
+
+        let h = mgr.health();
+        assert_eq!(h.concurrency_limit_blocks_total, 0);
+        assert_eq!(h.pane_already_locked_total, 1);
     }
 
     /// ft-ismxr regression guard: previously `is_safe()` returned
