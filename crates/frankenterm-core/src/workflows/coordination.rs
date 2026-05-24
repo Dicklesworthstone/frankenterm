@@ -924,6 +924,28 @@ static TEXT_SCAN_SUPPRESSED_ERROR: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"let\s+_\s*=.*\?|let\s+_\s*=.*\.unwrap").expect("valid regex")
 });
 
+/// Hard cap for the text fallback scanner before buffering a file.
+///
+/// The unstick workflow may scan an operator-selected repository root. A
+/// generated source file or hostile checkout should not be able to force the
+/// scanner to allocate unbounded memory through `read_to_string`.
+pub const MAX_UNSTICK_SCAN_FILE_BYTES: u64 = 1024 * 1024;
+
+fn unstick_scan_file_exceeds_size_limit(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_UNSTICK_SCAN_FILE_BYTES => {
+            tracing::debug!(
+                path = %path.display(),
+                len = metadata.len(),
+                max = MAX_UNSTICK_SCAN_FILE_BYTES,
+                "skipping oversized unstick scan file"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 impl Default for TextScanPatterns {
     fn default() -> Self {
         Self {
@@ -949,10 +971,24 @@ pub fn scan_file_text(
     max_per_kind: usize,
     kind_counts: &mut std::collections::HashMap<UnstickFindingKind, usize>,
 ) -> Vec<UnstickFinding> {
+    if unstick_scan_file_exceeds_size_limit(path) {
+        return Vec::new();
+    }
+
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
+    let content_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    if content_len > MAX_UNSTICK_SCAN_FILE_BYTES {
+        tracing::debug!(
+            path = %path.display(),
+            len = content_len,
+            max = MAX_UNSTICK_SCAN_FILE_BYTES,
+            "skipping oversized unstick scan file after read"
+        );
+        return Vec::new();
+    }
 
     let rel_path = path
         .strip_prefix(root)
@@ -1113,6 +1149,10 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
             }
 
             if !file_type.is_file() {
+                continue;
+            }
+
+            if unstick_scan_file_exceeds_size_limit(&path) {
                 continue;
             }
 
@@ -1778,6 +1818,34 @@ mod tests {
         assert_eq!(todo_count, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unstick_text_scan_skips_oversized_files() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("huge.rs");
+        let mut content = b"// TODO should not be scanned from oversized file\n".to_vec();
+        content.resize(
+            usize::try_from(MAX_UNSTICK_SCAN_FILE_BYTES).unwrap() + 1,
+            b'a',
+        );
+        std::fs::write(&file, content).unwrap();
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = HashMap::new();
+        let findings = scan_file_text(&file, root.path(), &patterns, 10, &mut kind_counts);
+        assert!(findings.is_empty());
+        assert!(kind_counts.is_empty());
+
+        let report = run_unstick_scan_text(&UnstickConfig {
+            root: root.path().to_path_buf(),
+            max_findings_per_kind: 10,
+            max_total_findings: 25,
+            extensions: vec!["rs".to_string()],
+        });
+        assert_eq!(report.files_scanned, 0);
+        assert!(report.findings.is_empty());
+        assert!(report.counts.is_empty());
     }
 
     #[cfg(unix)]
