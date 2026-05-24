@@ -4,6 +4,7 @@ use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::plan::StepAction;
 use frankenterm_core::workflows::{
     BoxFuture, StepResult, Workflow, WorkflowContext, WorkflowInfo, WorkflowStep,
+    WorkflowTriggerPolicy,
 };
 use proptest::prelude::*;
 
@@ -154,6 +155,21 @@ proptest! {
                 other => prop_assert!(false, "expected custom step action, got {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn workflow_trigger_policy_allowlist_matches_generated_set(
+        allowed_panes in prop::collection::btree_set(0u64..10_000, 0..8),
+        probe_pane in 0u64..10_000,
+    ) {
+        let allow_all = WorkflowTriggerPolicy::allow_all();
+        prop_assert!(allow_all.allows_source_pane(probe_pane));
+
+        let scoped = WorkflowTriggerPolicy::allowlist(allowed_panes.iter().copied());
+        prop_assert_eq!(
+            scoped.allows_source_pane(probe_pane),
+            allowed_panes.contains(&probe_pane)
+        );
     }
 }
 
