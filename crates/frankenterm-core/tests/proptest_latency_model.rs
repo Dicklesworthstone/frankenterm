@@ -485,6 +485,32 @@ proptest! {
         );
     }
 
+    /// Increasing service latency T raises the delay bound by exactly the
+    /// same amount: for rate-latency service, D = σ/(R-ρ) + T, so
+    /// ∂D/∂T = 1. Complements delay_monotone_in_rate / _in_burst.
+    #[test]
+    fn delay_monotone_in_latency(
+        sigma in arb_sigma(),
+        rho in arb_rho(),
+        rate_mult in 2.0f64..100.0,
+        latency1 in arb_latency(),
+        latency_extra in 0.0f64..1.0,
+    ) {
+        let rate = rho * rate_mult; // rate > rho ⇒ stable, finite delay
+        let arr = ArrivalCurve::leaky_bucket(sigma, rho);
+        let d1 = delay_bound(&arr, &ServiceCurve::rate_latency(rate, latency1));
+        let d2 = delay_bound(&arr, &ServiceCurve::rate_latency(rate, latency1 + latency_extra));
+        prop_assert!(
+            d2 >= d1 - 1e-9,
+            "more service latency gave less delay: {} < {}", d2, d1
+        );
+        prop_assert!(
+            (d2 - d1 - latency_extra).abs() <= 1e-6 * d1.abs().max(1.0),
+            "delay must increase by exactly the latency delta {}: {} -> {}",
+            latency_extra, d1, d2
+        );
+    }
+
     /// Closed-form delay: D = σ/(R-ρ) + T.
     #[test]
     fn delay_bound_closed_form(
