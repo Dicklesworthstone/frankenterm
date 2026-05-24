@@ -66,6 +66,10 @@ REQUIRED_INVALID = %w[
   payload-env-not-allowlisted
   target-dir-drift
   unsafe-artifact-path
+  missing-require-remote
+  operator-cancelled-replayable
+  prerequisite-bypass
+  duplicate-env-allowlist
 ].freeze
 REQUIRED_FORBIDDEN = %w[
   local_cargo_proof

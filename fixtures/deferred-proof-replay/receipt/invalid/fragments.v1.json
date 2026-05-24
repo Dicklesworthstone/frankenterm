@@ -563,6 +563,379 @@
           "replay_allowed": true
         }
       }
+    },
+    {
+      "case_id": "missing-require-remote",
+      "expected_rejection": "missing_require_remote",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad6:missing-require-remote",
+        "bead_id": "ft-bad6",
+        "captured_at": "2026-05-19T02:00:43Z",
+        "source": {
+          "commit": "d1938a57a",
+          "tree": "d1938a57",
+          "source_state": "source_landed",
+          "commit_pushed": false
+        },
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_BUILD_JOBS=1",
+            "CARGO_INCREMENTAL=0",
+            "CARGO_TARGET_DIR=/tmp/ft-ssy4x-20260519T0200Z",
+            "cargo",
+            "test",
+            "-p",
+            "frankenterm-core",
+            "slot",
+            "--lib"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "0"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_BUILD_JOBS",
+            "CARGO_INCREMENTAL",
+            "CARGO_TARGET_DIR",
+            "RCH_NO_SELF_HEALING",
+            "RCH_REQUIRE_REMOTE"
+          ],
+          "target_dir": "/tmp/ft-ssy4x-20260519T0200Z",
+          "material_remote_required": true
+        },
+        "proof": {
+          "expected_kind": "cargo_test",
+          "package": "frankenterm-core",
+          "test_filter": "slot",
+          "feature_set": [],
+          "material_cargo_required": true,
+          "evidence_classification": "blocked_infra"
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/recorder_storage.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json",
+            "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "agent_mail_state": "green",
+          "rch_admission_state": "critical_pressure",
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "wait_rch",
+          "reason_codes": [
+            "rch.critical_pressure",
+            "proof.remote_required"
+          ],
+          "freshness_deadline": "2026-05-20T02:00:43Z",
+          "replay_allowed": false
+        },
+        "forbidden_actions": [
+          "local_cargo_proof",
+          "local_heavy_cargo_fallback",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "delete_files",
+          "destructive_git",
+          "build_cancellation",
+          "raw_pane_text_storage",
+          "secret_storage"
+        ]
+      }
+    },
+    {
+      "case_id": "operator-cancelled-replayable",
+      "expected_rejection": "operator_cancelled",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad7:operator-cancelled-replayable",
+        "bead_id": "ft-bad7",
+        "captured_at": "2026-05-19T02:30:27Z",
+        "source": {
+          "commit": "c803631f3",
+          "tree": "c803631f",
+          "source_state": "static_clean",
+          "commit_pushed": false
+        },
+        "command": {
+          "command_shape_version": "static-verifier-v1",
+          "argv": [
+            "bash",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "env": [],
+          "env_allowlist": [],
+          "target_dir": null,
+          "material_remote_required": false
+        },
+        "proof": {
+          "expected_kind": "static_verifier",
+          "package": null,
+          "test_filter": "deferred_proof_receipt_contract",
+          "feature_set": [],
+          "material_cargo_required": false,
+          "evidence_classification": "static_only_clean"
+        },
+        "paths": {
+          "owned_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "agent_mail_state": "green",
+          "rch_admission_state": "not_required",
+          "operator_cancelled": true
+        },
+        "eligibility": {
+          "state": "operator_cancelled",
+          "reason_codes": [
+            "operator.cancelled"
+          ],
+          "freshness_deadline": "2026-05-20T02:30:27Z",
+          "replay_allowed": true
+        },
+        "forbidden_actions": [
+          "local_cargo_proof",
+          "local_heavy_cargo_fallback",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "delete_files",
+          "destructive_git",
+          "build_cancellation",
+          "raw_pane_text_storage",
+          "secret_storage"
+        ]
+      }
+    },
+    {
+      "case_id": "prerequisite-bypass",
+      "expected_rejection": "prerequisite_blocked",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad8:prerequisite-bypass",
+        "bead_id": "ft-bad8",
+        "captured_at": "2026-05-19T02:21:46Z",
+        "source": {
+          "commit": "c803631f3",
+          "tree": "c803631f",
+          "source_state": "planning_only",
+          "commit_pushed": false
+        },
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_BUILD_JOBS=1",
+            "CARGO_INCREMENTAL=0",
+            "CARGO_TARGET_DIR=/tmp/ft-4tp7g-scheduler",
+            "cargo",
+            "check",
+            "-p",
+            "frankenterm-core",
+            "--lib"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_BUILD_JOBS",
+            "CARGO_INCREMENTAL",
+            "CARGO_TARGET_DIR",
+            "RCH_NO_SELF_HEALING",
+            "RCH_REQUIRE_REMOTE"
+          ],
+          "target_dir": "/tmp/ft-4tp7g-scheduler",
+          "material_remote_required": true
+        },
+        "proof": {
+          "expected_kind": "cargo_check",
+          "package": "frankenterm-core",
+          "test_filter": null,
+          "feature_set": [],
+          "material_cargo_required": true,
+          "evidence_classification": "remote_required_pending"
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/rch_admission.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "docs/robot-contracts/deferred-proof-receipt.md"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [
+            "ft-5xwsu.3"
+          ],
+          "agent_mail_state": "degraded_read_only",
+          "rch_admission_state": "critical_pressure",
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "eligible",
+          "reason_codes": [
+            "beads.prerequisite_blocked",
+            "rch.critical_pressure"
+          ],
+          "freshness_deadline": "2026-05-20T02:21:46Z",
+          "replay_allowed": false
+        },
+        "forbidden_actions": [
+          "local_cargo_proof",
+          "local_heavy_cargo_fallback",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "delete_files",
+          "destructive_git",
+          "build_cancellation",
+          "raw_pane_text_storage",
+          "secret_storage"
+        ]
+      }
+    },
+    {
+      "case_id": "duplicate-env-allowlist",
+      "expected_rejection": "duplicate_env_allowlist",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-bad9:duplicate-env-allowlist",
+        "bead_id": "ft-bad9",
+        "captured_at": "2026-05-19T02:00:43Z",
+        "source": {
+          "commit": "d1938a57a",
+          "tree": "d1938a57",
+          "source_state": "source_landed",
+          "commit_pushed": false
+        },
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_BUILD_JOBS=1",
+            "CARGO_INCREMENTAL=0",
+            "CARGO_TARGET_DIR=/tmp/ft-ssy4x-20260519T0200Z",
+            "cargo",
+            "test",
+            "-p",
+            "frankenterm-core",
+            "slot",
+            "--lib"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_BUILD_JOBS",
+            "CARGO_INCREMENTAL",
+            "CARGO_TARGET_DIR",
+            "RCH_NO_SELF_HEALING",
+            "RCH_REQUIRE_REMOTE",
+            "CARGO_TARGET_DIR"
+          ],
+          "target_dir": "/tmp/ft-ssy4x-20260519T0200Z",
+          "material_remote_required": true
+        },
+        "proof": {
+          "expected_kind": "cargo_test",
+          "package": "frankenterm-core",
+          "test_filter": "slot",
+          "feature_set": [],
+          "material_cargo_required": true,
+          "evidence_classification": "blocked_infra"
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core/src/recorder_storage.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json",
+            "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "agent_mail_state": "green",
+          "rch_admission_state": "critical_pressure",
+          "operator_cancelled": false
+        },
+        "eligibility": {
+          "state": "wait_rch",
+          "reason_codes": [
+            "rch.critical_pressure",
+            "proof.remote_required"
+          ],
+          "freshness_deadline": "2026-05-20T02:00:43Z",
+          "replay_allowed": false
+        },
+        "forbidden_actions": [
+          "local_cargo_proof",
+          "local_heavy_cargo_fallback",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "delete_files",
+          "destructive_git",
+          "build_cancellation",
+          "raw_pane_text_storage",
+          "secret_storage"
+        ]
+      }
     }
   ]
 }

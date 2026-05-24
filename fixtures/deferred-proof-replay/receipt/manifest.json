@@ -8,7 +8,7 @@
   "invalid_fragments": "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json",
   "golden_summary": {
     "valid_case_count": 5,
-    "invalid_case_count": 11,
+    "invalid_case_count": 15,
     "command_shape_versions": [
       "rch-no-self-healing-v1",
       "static-verifier-v1"
