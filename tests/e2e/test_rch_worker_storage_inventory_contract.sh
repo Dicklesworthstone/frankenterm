@@ -99,6 +99,38 @@ LEGACY_RCH_COMMAND_FRAGMENTS = [
   "rch exec --no-self-healing",
   "rch diagnose --json --dry-run"
 ].freeze
+SAFE_FIXTURE_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/rch-worker-pressure/healthy-complete.json",
+  "./fixtures/rch-worker-pressure/valid/healthy-complete.json",
+  "../fixtures/rch-worker-pressure/valid/healthy-complete.json",
+  "fixtures/rch-worker-pressure/valid//healthy-complete.json",
+  "fixtures/rch-worker-pressure/valid/../healthy-complete.json",
+  "fixtures/rch-worker-pressure/valid/./healthy-complete.json",
+  "fixtures/rch-worker-pressure/valid/.",
+  "fixtures/rch-worker-pressure/valid/..",
+  "fixtures/rch-worker-pressure/.git/config.json",
+  "fixtures/rch-worker-pressure/valid/healthy-complete.txt",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
+  "fixtures\\rch-worker-pressure\\valid\\healthy-complete.json"
+].freeze
+SAFE_RETAINED_ARTIFACT_PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
+  "./tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
+  "../tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure//healthy-complete/vmi1227854-df.json",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/../vmi1227854-df.json",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/./vmi1227854-df.json",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/.",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/..",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/.git/config.json",
+  "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.txt",
+  "fixtures/rch-worker-pressure/valid/healthy-complete.json",
+  "tests\\e2e\\artifacts\\retained\\ft-5xwsu.1\\rch-worker-pressure\\healthy-complete\\vmi1227854-df.json"
+].freeze
 
 def fail!(message)
   warn "rch worker storage inventory contract: #{message}"
@@ -167,6 +199,14 @@ def safe_retained_artifact_path?(path)
   safe_repo_relative_path?(path) &&
     path.start_with?(EXPECTED_RETAINED_ARTIFACT_PREFIX) &&
     path.end_with?(".json")
+end
+
+SAFE_FIXTURE_PATH_NEGATIVES.each do |path|
+  fail!("unsafe fixture path accepted: #{path.inspect}") if safe_fixture_path?(path)
+end
+
+SAFE_RETAINED_ARTIFACT_PATH_NEGATIVES.each do |path|
+  fail!("unsafe retained artifact path accepted: #{path.inspect}") if safe_retained_artifact_path?(path)
 end
 
 def scan_records(payload)
