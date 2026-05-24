@@ -139,7 +139,12 @@ policy.fetch("artifact_paths").each do |path|
   fail!("policy artifact path is not tracked: #{path}") unless $?.success?
 end
 
-policy.fetch("retention_policy").each do |surface, rule|
+EXPECTED_RETENTION_SURFACES = %w[artifacts plan_outputs replay_logs snapshots].freeze
+retention_policy = policy.fetch("retention_policy")
+# Pin retention surfaces so an empty/trimmed map cannot vacuously pass the
+# no-raw-content gate (and so the snapshots raw_pane_text guard always runs).
+fail!("retention surface set drifted: #{retention_policy.keys.sort.inspect}") unless retention_policy.keys.sort == EXPECTED_RETENTION_SURFACES.sort
+retention_policy.each do |surface, rule|
   fail!("#{surface} retention may contain raw content") unless rule.fetch("max_contains_raw_content") == false
   forbidden = rule.fetch("forbidden_fields")
   fail!("#{surface} retention does not forbid raw pane text") if surface == "snapshots" && !forbidden.include?("raw_pane_text")
