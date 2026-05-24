@@ -218,10 +218,14 @@ proptest! {
 
     #[test]
     fn step_result_abort_is_terminal(reason in "[a-z ]{5,30}") {
-        let r = StepResult::abort(reason);
+        let r = StepResult::abort(reason.clone());
         prop_assert!(r.is_terminal());
         prop_assert!(!r.is_continue());
         prop_assert!(!r.is_done());
+        match r {
+            StepResult::Abort { reason: actual_reason } => prop_assert_eq!(actual_reason, reason),
+            other => prop_assert!(false, "expected Abort, got {other:?}"),
+        }
     }
 
     #[test]
