@@ -26,6 +26,10 @@ fn tmux_mux() -> anyhow::Result<Arc<Mux>> {
     Mux::try_get().ok_or_else(|| anyhow!("tmux command requires active mux"))
 }
 
+fn u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaneItem {
     session_id: TmuxSessionId,
@@ -363,7 +367,7 @@ impl TmuxDomainState {
             if let Some(local_pane) = local_pane {
                 let c = local_pane.get_cursor_position();
                 // no capture, output case
-                if (c.x + c.y as usize) == 0 {
+                if c.x == 0 && c.y == 0 {
                     if let Some(text) = self.backlog.lock().remove(&pane.pane_id) {
                         if let Some(ref_pane) = pane_map.get(&pane.pane_id) {
                             let mut ref_pane = ref_pane.lock();
@@ -375,11 +379,11 @@ impl TmuxDomainState {
                 } else {
                     // we have capture, so remove the backlog
                     let _ = self.backlog.lock().remove(&pane.pane_id);
-                    if (pane.cursor_x + pane.cursor_y) != 0 {
+                    if pane.cursor_x != 0 || pane.cursor_y != 0 {
                         self.set_pane_cursor_position(
                             &local_pane,
-                            pane.cursor_x as usize,
-                            pane.cursor_y as usize,
+                            u64_to_usize_saturating(pane.cursor_x),
+                            u64_to_usize_saturating(pane.cursor_y),
                         );
                     }
                 }
@@ -1773,5 +1777,13 @@ mod tests {
         let debug = format!("{:?}", item);
         assert!(debug.contains("session_id: 1"));
         assert!(debug.contains("pane_active: true"));
+    }
+
+    #[test]
+    fn u64_to_usize_saturates_overflowing_cursor_values() {
+        assert_eq!(u64_to_usize_saturating(42), 42);
+        if usize::BITS < u64::BITS {
+            assert_eq!(u64_to_usize_saturating(u64::MAX), usize::MAX);
+        }
     }
 }
