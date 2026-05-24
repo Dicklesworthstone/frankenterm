@@ -63,6 +63,23 @@ async fn wait_duration_maybe_cx(
     Ok(())
 }
 
+fn cap_wait_by_workflow_deadline(
+    requested: Duration,
+    workflow_started_at: Instant,
+    workflow_total_deadline_ms: u64,
+) -> Duration {
+    if workflow_total_deadline_ms == 0 {
+        return requested;
+    }
+
+    let Some(deadline) =
+        workflow_started_at.checked_add(Duration::from_millis(workflow_total_deadline_ms))
+    else {
+        return requested;
+    };
+    requested.min(deadline.saturating_duration_since(Instant::now()))
+}
+
 async fn wait_external_signal_maybe_cx(
     cx: Option<&crate::cx::Cx>,
     registry: &ExternalSignalRegistry,
@@ -1420,7 +1437,11 @@ impl WorkflowRunner {
                     // of sleeping until the retry delay elapses.
                     if let Err(e) = wait_duration_maybe_cx(
                         cx,
-                        Duration::from_millis(delay_ms),
+                        cap_wait_by_workflow_deadline(
+                            Duration::from_millis(delay_ms),
+                            start_time,
+                            self.config.workflow_total_deadline_ms,
+                        ),
                         "workflow retry backoff",
                     )
                     .await
@@ -1553,6 +1574,11 @@ impl WorkflowRunner {
                     let timeout = timeout_ms.map_or_else(
                         || Duration::from_millis(self.config.step_timeout_ms),
                         Duration::from_millis,
+                    );
+                    let timeout = cap_wait_by_workflow_deadline(
+                        timeout,
+                        start_time,
+                        self.config.workflow_total_deadline_ms,
                     );
 
                     if let Err(e) = wait_condition_pause_maybe_cx(
@@ -1708,6 +1734,11 @@ impl WorkflowRunner {
                                 let timeout = wait_timeout_ms.map_or_else(
                                     || Duration::from_millis(self.config.step_timeout_ms),
                                     Duration::from_millis,
+                                );
+                                let timeout = cap_wait_by_workflow_deadline(
+                                    timeout,
+                                    start_time,
+                                    self.config.workflow_total_deadline_ms,
                                 );
 
                                 if let Err(e) = wait_condition_pause_maybe_cx(
@@ -3905,6 +3936,47 @@ mod tests {
                 let result = wait_duration_maybe_cx(None, Duration::ZERO, "test-zero").await;
                 assert!(result.is_ok());
             });
+        }
+
+        #[test]
+        fn workflow_deadline_cap_leaves_waits_uncapped_when_disabled() {
+            let requested = Duration::from_secs(60);
+            let started_at = Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .expect("test instant subtracts");
+
+            assert_eq!(
+                cap_wait_by_workflow_deadline(requested, started_at, 0),
+                requested
+            );
+        }
+
+        #[test]
+        fn workflow_deadline_cap_limits_wait_to_remaining_budget() {
+            let requested = Duration::from_secs(60);
+            let started_at = Instant::now()
+                .checked_sub(Duration::from_millis(900))
+                .expect("test instant subtracts");
+
+            let capped = cap_wait_by_workflow_deadline(requested, started_at, 1_000);
+
+            assert!(
+                capped <= Duration::from_millis(100),
+                "wait cap should not exceed remaining workflow deadline budget: {capped:?}"
+            );
+        }
+
+        #[test]
+        fn workflow_deadline_cap_returns_zero_after_deadline() {
+            let requested = Duration::from_secs(60);
+            let started_at = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("test instant subtracts");
+
+            assert_eq!(
+                cap_wait_by_workflow_deadline(requested, started_at, 1_000),
+                Duration::ZERO
+            );
         }
 
         /// wait_condition_pause_maybe_cx dispatches Sleep variant correctly.
