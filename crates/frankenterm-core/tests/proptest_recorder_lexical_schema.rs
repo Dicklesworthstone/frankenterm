@@ -8,7 +8,7 @@
 
 use frankenterm_core_tantivy::recorder_lexical_schema::{
     TOKENIZER_TERMINAL_SYMBOLS, TOKENIZER_TERMINAL_TEXT, build_lexical_schema_v1,
-    fields_to_document, register_tokenizers, schema_fingerprint,
+    document_to_fields, fields_to_document, register_tokenizers, schema_fingerprint,
 };
 use frankenterm_core_tantivy::tantivy_ingest::{IndexDocumentFields, LEXICAL_SCHEMA_VERSION};
 use proptest::prelude::*;
@@ -724,5 +724,44 @@ proptest! {
         let (schema, _handles) = build_lexical_schema_v1();
         let fp = schema_fingerprint(&schema);
         prop_assert!(!fp.is_empty(), "fingerprint should be non-empty");
+    }
+
+    /// document_to_fields reverses fields_to_document for an in-memory document:
+    /// every field-handle is wired symmetrically (no swaps or omissions). This
+    /// is the production search-path conversion (tantivy_query retrieval) which
+    /// previously had no direct test. `text_symbols` is indexed-but-not-stored
+    /// and is reconstructed from `text` on read, so it equals the source `text`.
+    #[test]
+    fn document_field_handles_roundtrip(fields in arb_document_fields()) {
+        let (_schema, handles) = build_lexical_schema_v1();
+        let doc = fields_to_document(&fields, &handles);
+        let recovered = document_to_fields(&doc, &handles);
+
+        prop_assert_eq!(&recovered.schema_version, &fields.schema_version);
+        prop_assert_eq!(&recovered.lexical_schema_version, &fields.lexical_schema_version);
+        prop_assert_eq!(&recovered.event_id, &fields.event_id);
+        prop_assert_eq!(recovered.pane_id, fields.pane_id);
+        prop_assert_eq!(&recovered.session_id, &fields.session_id);
+        prop_assert_eq!(&recovered.workflow_id, &fields.workflow_id);
+        prop_assert_eq!(&recovered.correlation_id, &fields.correlation_id);
+        prop_assert_eq!(&recovered.parent_event_id, &fields.parent_event_id);
+        prop_assert_eq!(&recovered.trigger_event_id, &fields.trigger_event_id);
+        prop_assert_eq!(&recovered.root_event_id, &fields.root_event_id);
+        prop_assert_eq!(&recovered.source, &fields.source);
+        prop_assert_eq!(&recovered.event_type, &fields.event_type);
+        prop_assert_eq!(&recovered.ingress_kind, &fields.ingress_kind);
+        prop_assert_eq!(&recovered.segment_kind, &fields.segment_kind);
+        prop_assert_eq!(&recovered.control_marker_type, &fields.control_marker_type);
+        prop_assert_eq!(&recovered.lifecycle_phase, &fields.lifecycle_phase);
+        prop_assert_eq!(recovered.is_gap, fields.is_gap);
+        prop_assert_eq!(&recovered.redaction, &fields.redaction);
+        prop_assert_eq!(recovered.occurred_at_ms, fields.occurred_at_ms);
+        prop_assert_eq!(recovered.recorded_at_ms, fields.recorded_at_ms);
+        prop_assert_eq!(recovered.sequence, fields.sequence);
+        prop_assert_eq!(recovered.log_offset, fields.log_offset);
+        prop_assert_eq!(&recovered.text, &fields.text);
+        prop_assert_eq!(&recovered.details_json, &fields.details_json);
+        // text_symbols is not stored; reconstructed from text on read.
+        prop_assert_eq!(&recovered.text_symbols, &fields.text);
     }
 }
