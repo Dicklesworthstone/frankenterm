@@ -262,7 +262,8 @@ pub(super) fn extract_token_usage(line: &str) -> CodexTokenUsage {
 
 #[allow(dead_code)]
 pub(super) fn find_token_usage_line(tail: &str) -> Option<&str> {
-    tail.lines().rfind(|line| line.contains("Token usage:"))
+    tail.lines()
+        .rfind(|line| line.to_ascii_lowercase().contains("token usage:"))
 }
 
 #[allow(dead_code)]
@@ -526,6 +527,14 @@ mod tests {
     fn find_token_usage_line_missing() {
         let tail = "No token usage here\nJust regular text\n";
         assert!(find_token_usage_line(tail).is_none());
+    }
+
+    #[test]
+    fn find_token_usage_line_is_case_insensitive() {
+        let tail = "some output\nTOKEN USAGE: total = 5000\n";
+        let line = find_token_usage_line(tail);
+        assert!(line.is_some());
+        assert!(line.unwrap().contains("5000"));
     }
 
     #[test]
