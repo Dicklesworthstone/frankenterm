@@ -46,10 +46,20 @@
     "properties": { "ok": { "const": true } }
   },
   "then": {
-    "required": ["data"]
+    "required": ["data"],
+    "not": {
+      "anyOf": [
+        { "required": ["error"] },
+        { "required": ["error_code"] },
+        { "required": ["hint"] }
+      ]
+    }
   },
   "else": {
-    "required": ["error", "error_code"]
+    "required": ["error", "error_code"],
+    "not": {
+      "required": ["data"]
+    }
   },
   "$defs": {
     "error_codes": {
