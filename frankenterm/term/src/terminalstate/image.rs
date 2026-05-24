@@ -85,10 +85,10 @@ impl TerminalState {
         }
         let cell_padding_left = params
             .cell_padding_left
-            .min(cell_pixel_width.saturating_sub(1) as u16);
+            .min(usize_to_u16_saturating(cell_pixel_width.saturating_sub(1)));
         let cell_padding_top = params
             .cell_padding_top
-            .min(cell_pixel_height.saturating_sub(1) as u16);
+            .min(usize_to_u16_saturating(cell_pixel_height.saturating_sub(1)));
         if params.image_width == 0 || params.image_height == 0 {
             anyhow::bail!("image has zero dimensions");
         }
@@ -455,6 +455,10 @@ fn checked_padded_image_exceeds_cell_span(
     Ok(drawn_with_padding > cell_span)
 }
 
+fn usize_to_u16_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +644,13 @@ mod tests {
             .expect("bounded placement should attach");
         assert_eq!(info.cols, 2);
         assert_eq!(info.rows, 2);
+    }
+
+    #[test]
+    fn image_cell_padding_limit_saturates_for_wide_cells() {
+        assert_eq!(usize_to_u16_saturating(0), 0);
+        assert_eq!(usize_to_u16_saturating(u16::MAX as usize), u16::MAX);
+        assert_eq!(usize_to_u16_saturating((u16::MAX as usize) + 1), u16::MAX);
     }
 
     #[test]
