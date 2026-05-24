@@ -42,7 +42,7 @@ against the speaker we actually ship, not the spec we wish we shipped.
 
 | Tool | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
-| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (26/26 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
+| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (27/27 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
 | neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | substrate-pass | parse_send_keys_with_target_and_payload + parse_list_windows_with_session_target | Pane navigator emits `send-keys -t <pane> <keystroke>` — covered by send-keys parse path. End-to-end blocked on ft-l4cef. |
 | vscode tmux extension (`vscode-tmux`) | substrate-pass | parse_attach_session_with_target + response_encode_success_uses_end_trailer | Extension speaks attach-session + capture-pane. Both wire-syntax shapes covered. End-to-end blocked on ft-l4cef. |
 
@@ -79,7 +79,7 @@ rationale per row.
 
 ## Substrate verification — wire-syntax golden vectors
 
-The 26 unit tests in `tmux_control_protocol.rs::tests` are the golden
+The 27 unit tests in `tmux_control_protocol.rs::tests` are the golden
 vectors. Each one asserts a single literal tmux wire-syntax string
 parses to the expected `TmuxCommand` variant, plus the response
 encoder produces a `%begin`/`%end` block frame that matches the tmux
@@ -99,6 +99,7 @@ Tier-1 coverage by command:
 | `new-session -s <name>` | `parse_new_session_with_name` |
 | `attach-session -t <target>` | `parse_attach_session_with_target` |
 | `detach` / `detach-client` | `parse_detach_and_detach_client_aliases` |
+| tmux aliases (`send`, `lsw`, `ls`, `capturep`, `splitw`, `new`, `attach`, `pipep`) | `parse_tmux_command_aliases` |
 | Unknown verb fallthrough | `parse_unknown_verb_preserves_raw_args` |
 | `%begin/%end` success frame | `response_encode_success_uses_end_trailer` |
 | `%begin/%error` failure frame | `response_encode_error_uses_error_trailer` |

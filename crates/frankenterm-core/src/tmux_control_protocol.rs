@@ -206,15 +206,15 @@ pub fn parse_command(line: &str) -> Result<TmuxCommand, ParseError> {
     let verb = iter.next().ok_or(ParseError::Empty)?;
     let args: Vec<String> = iter.collect();
     Ok(match verb.as_str() {
-        "send-keys" => parse_send_keys(args)?,
-        "list-windows" => parse_list_windows(args)?,
-        "list-sessions" => TmuxCommand::ListSessions,
-        "capture-pane" => parse_capture_pane(args)?,
-        "split-window" => parse_split_window(args)?,
-        "new-session" => parse_new_session(args)?,
-        "attach-session" => parse_attach_session(args)?,
+        "send-keys" | "send" => parse_send_keys(args)?,
+        "list-windows" | "lsw" => parse_list_windows(args)?,
+        "list-sessions" | "ls" => TmuxCommand::ListSessions,
+        "capture-pane" | "capturep" => parse_capture_pane(args)?,
+        "split-window" | "splitw" => parse_split_window(args)?,
+        "new-session" | "new" => parse_new_session(args)?,
+        "attach-session" | "attach" => parse_attach_session(args)?,
         "detach" | "detach-client" => TmuxCommand::Detach,
-        "pipe-pane" => parse_pipe_pane(args)?,
+        "pipe-pane" | "pipep" => parse_pipe_pane(args)?,
         "copy-mode" => parse_copy_mode(args)?,
         _ => TmuxCommand::Unknown { verb, args },
     })
@@ -617,6 +617,58 @@ mod tests {
     fn parse_detach_and_detach_client_aliases() {
         assert_eq!(parse_command("detach").unwrap(), TmuxCommand::Detach);
         assert_eq!(parse_command("detach-client").unwrap(), TmuxCommand::Detach);
+    }
+
+    #[test]
+    fn parse_tmux_command_aliases() {
+        assert_eq!(
+            parse_command("send -t %1 Enter").unwrap(),
+            TmuxCommand::SendKeys {
+                target: Some("%1".to_string()),
+                keys: vec!["Enter".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_command("lsw -t dev").unwrap(),
+            TmuxCommand::ListWindows {
+                target_session: Some("dev".to_string()),
+            }
+        );
+        assert_eq!(parse_command("ls").unwrap(), TmuxCommand::ListSessions);
+        assert_eq!(
+            parse_command("capturep -t %1 -p").unwrap(),
+            TmuxCommand::CapturePane {
+                target: Some("%1".to_string()),
+                print: true,
+            }
+        );
+        assert_eq!(
+            parse_command("splitw -h").unwrap(),
+            TmuxCommand::SplitWindow {
+                target: None,
+                direction: Some(SplitDirection::Horizontal),
+            }
+        );
+        assert_eq!(
+            parse_command("new -s scratch").unwrap(),
+            TmuxCommand::NewSession {
+                name: Some("scratch".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_command("attach -t dev").unwrap(),
+            TmuxCommand::AttachSession {
+                target: Some("dev".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_command("pipep -o echo").unwrap(),
+            TmuxCommand::PipePane {
+                target: None,
+                only_if_not_piped: true,
+                command: vec!["echo".to_string()],
+            }
+        );
     }
 
     #[test]
