@@ -638,6 +638,36 @@ fn synthetic_pack_whitespace_required_strings_must_fail() {
 }
 
 #[test]
+fn synthetic_pack_whitespace_optional_text_must_fail() {
+    let validator = load_schema();
+    for field in [
+        "remediation",
+        "workflow",
+        "manual_fix",
+        "preview_command",
+        "learn_more_url",
+    ] {
+        let mut bad = serde_json::json!({
+            "name": "synthetic",
+            "version": "1.0.0",
+            "rules": [{
+                "id": format!("codex.synthetic.whitespace_optional_{field}"),
+                "agent_type": "codex",
+                "event_type": format!("synthetic_whitespace_optional_{field}"),
+                "severity": "warning",
+                "anchors": ["synthetic"],
+                "description": "Synthetic rule carrying a whitespace optional text field."
+            }]
+        });
+        bad["rules"][0][field] = serde_json::json!(" \t ");
+        assert!(
+            validator.validate(&bad).is_err(),
+            "schema validator accepted whitespace-only optional text for {field}"
+        );
+    }
+}
+
+#[test]
 fn synthetic_pack_invalid_rule_enums_must_fail() {
     let validator = load_schema();
     for (field, bad) in [

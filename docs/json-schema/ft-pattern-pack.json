@@ -74,22 +74,32 @@
         },
         "remediation": {
           "type": ["string", "null"],
+          "minLength": 1,
+          "pattern": "\\S",
           "description": "Suggested remediation text."
         },
         "workflow": {
           "type": ["string", "null"],
+          "minLength": 1,
+          "pattern": "\\S",
           "description": "Suggested workflow name to invoke (e.g. `handle_usage_limits`)."
         },
         "manual_fix": {
           "type": ["string", "null"],
+          "minLength": 1,
+          "pattern": "\\S",
           "description": "Manual fix instructions for environments where workflow execution is unavailable."
         },
         "preview_command": {
           "type": ["string", "null"],
+          "minLength": 1,
+          "pattern": "\\S",
           "description": "Preview command template supporting `{pane}`, `{event_id}`, `{agent}` interpolation."
         },
         "learn_more_url": {
           "type": ["string", "null"],
+          "minLength": 1,
+          "pattern": "\\S",
           "description": "URL for additional documentation about this rule."
         }
       }

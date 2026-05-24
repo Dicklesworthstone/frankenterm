@@ -67,11 +67,11 @@ A rule (Rust: `RuleDef`) has the following fields. `MUST` /
 | `anchors` | array of string | **MUST** | Literal substrings used by the Aho-Corasick quick-reject pass. MUST include at least one non-empty anchor. |
 | `regex` | string | MAY | Optional extraction regex. Named captures (`(?P<name>...)`) are preferred; unnamed groups MAY be used but are not surfaced as `extracted` fields. |
 | `description` | string | **MUST** | Human-readable description shown in `ft why <rule_id>` and the doctor pack listing. MUST be non-empty after trimming. |
-| `remediation` | string | MAY | Suggested remediation text. Surfaced in the rendered event template. |
-| `workflow` | string | MAY | Suggested workflow name to invoke (e.g. `handle_usage_limits`). |
-| `manual_fix` | string | MAY | Manual fix instructions for environments where workflow execution is unavailable. Stored as `Option<String>`; absent in the serialized form when null. |
-| `preview_command` | string | MAY | Preview command template supporting `{pane}`, `{event_id}`, `{agent}` interpolation. |
-| `learn_more_url` | string | MAY | URL for additional documentation about this rule. |
+| `remediation` | string | MAY | Suggested remediation text. Surfaced in the rendered event template. If present, MUST be non-empty after trimming. |
+| `workflow` | string | MAY | Suggested workflow name to invoke (e.g. `handle_usage_limits`). If present, MUST be non-empty after trimming. |
+| `manual_fix` | string | MAY | Manual fix instructions for environments where workflow execution is unavailable. Stored as `Option<String>`; absent in the serialized form when null. If present, MUST be non-empty after trimming. |
+| `preview_command` | string | MAY | Preview command template supporting `{pane}`, `{event_id}`, `{agent}` interpolation. If present, MUST be non-empty after trimming. |
+| `learn_more_url` | string | MAY | URL for additional documentation about this rule. If present, MUST be non-empty after trimming. |
 
 Unknown rule fields are tolerated by the parser (silent drop), but
 the conformance gate enforces the JSON Schema `additionalProperties`
