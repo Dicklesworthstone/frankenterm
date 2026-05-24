@@ -573,7 +573,7 @@ impl<'a> FleetLauncher<'a> {
             return Err(FleetLaunchError::EmptyMix);
         }
 
-        let total_weight: u32 = spec.mix.iter().map(|e| e.weight).sum();
+        let total_weight: u64 = spec.mix.iter().map(|entry| u64::from(entry.weight)).sum();
         if total_weight == 0 {
             return Err(FleetLaunchError::ZeroWeight);
         }
@@ -582,7 +582,11 @@ impl<'a> FleetLauncher<'a> {
         let total_panes = if spec.total_panes > 0 {
             spec.total_panes
         } else {
-            total_weight
+            u32::try_from(total_weight).map_err(|_| {
+                FleetLaunchError::ValidationFailed(format!(
+                    "derived pane count {total_weight} exceeds u32::MAX; set total_panes explicitly"
+                ))
+            })?
         };
 
         // Validate referenced profiles
@@ -971,13 +975,11 @@ impl<'a> FleetLauncher<'a> {
 /// Uses largest-remainder method (Hamilton's method) for deterministic,
 /// proportionally fair allocation with no wasted slots.
 ///
-/// br-ft-4x6de: weights are summed via `saturating_add` so a hostile
-/// or malformed `AgentMix` (operator-controlled TOML / CLI flags
-/// / persisted state) can never produce a wrap-around `total_weight`.
-/// The pre-fix unchecked `sum()` panicked in debug and wrapped to a
-/// small number in release, then the quotas blew up to absurd
-/// values. Saturating at `u32::MAX` keeps the largest-remainder
-/// math finite and the resulting allocation grossly proportional.
+/// br-ft-4x6de: weights are promoted before summing so a hostile or
+/// malformed `AgentMix` (operator-controlled TOML / CLI flags /
+/// persisted state) can never produce a wrap-around `total_weight`.
+/// The pre-fix unchecked `u32` sum panicked in debug and wrapped to a
+/// small number in release, then the quotas blew up to absurd values.
 fn allocate_weighted(total: u32, mix: &[AgentMixEntry]) -> Vec<u32> {
     if mix.is_empty() || total == 0 {
         return vec![0; mix.len()];
@@ -1318,6 +1320,49 @@ mod tests {
         assert_eq!(
             launcher.plan(&spec).unwrap_err(),
             FleetLaunchError::ZeroWeight
+        );
+    }
+
+    #[test]
+    fn plan_derived_total_rejects_overflowing_weight_sum() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec(
+            "overflow-derived",
+            vec![agent_mix("a", u32::MAX), agent_mix("b", 1)],
+        );
+
+        let err = launcher.plan(&spec).unwrap_err();
+        assert!(
+            matches!(err, FleetLaunchError::ValidationFailed(msg) if msg.contains("derived pane count"))
+        );
+    }
+
+    #[test]
+    fn plan_explicit_total_accepts_large_weight_sum() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut spec = basic_spec(
+            "overflow-explicit",
+            vec![agent_mix("a", u32::MAX), agent_mix("b", u32::MAX)],
+        );
+        spec.total_panes = 8;
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert_eq!(plan.slots.len(), 8);
+        assert_eq!(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.agent_identity.program == "a")
+                .count(),
+            4
+        );
+        assert_eq!(
+            plan.slots
+                .iter()
+                .filter(|slot| slot.agent_identity.program == "b")
+                .count(),
+            4
         );
     }
 
