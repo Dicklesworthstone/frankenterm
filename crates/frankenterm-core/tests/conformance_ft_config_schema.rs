@@ -298,6 +298,27 @@ fn schema_rejects_unknown_sharding_strategy() {
     );
 }
 
+/// 4e) Falsification: pane filter rule IDs are required by the
+/// production `PaneFilterRule` validator and must not be empty.
+#[test]
+fn schema_rejects_empty_pane_filter_rule_id() {
+    let schema = compile_config_schema();
+    let bad = serde_json::json!({
+        "ingest": {
+            "panes": {
+                "include": [
+                    { "id": "", "title": "codex" }
+                ]
+            }
+        }
+    });
+    let result = schema.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema MUST reject ingest.panes.include entries with empty IDs"
+    );
+}
+
 /// Pin the documented-but-unreachable list. If the README↔code
 /// reconciliation lands and the unreachable section starts round-
 /// tripping, this test fails and the maintainer must move the entry

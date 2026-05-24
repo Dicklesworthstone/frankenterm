@@ -11,7 +11,7 @@
       "additionalProperties": true,
       "required": ["id"],
       "properties": {
-        "id": { "type": "string" },
+        "id": { "type": "string", "minLength": 1 },
         "domain": { "type": "string" },
         "title": { "type": "string" },
         "cwd": { "type": "string" }
