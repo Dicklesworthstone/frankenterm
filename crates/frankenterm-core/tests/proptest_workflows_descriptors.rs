@@ -1213,6 +1213,37 @@ proptest! {
     }
 
     #[test]
+    fn empty_conditional_then_steps_fails_validation() {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "conditional_empty_then".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Conditional {
+                id: "b".to_string(),
+                description: None,
+                test_text: "x".to_string(),
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                },
+                then_steps: Vec::new(),
+                else_steps: vec![DescriptorStep::Log {
+                    id: "else".to_string(),
+                    description: None,
+                    message: "not matched".to_string(),
+                }],
+            }],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "conditional then_steps must be non-empty to avoid no-op control flow"
+        );
+    }
+
+    #[test]
     fn nested_steps_count_against_configured_step_limit(
         max_steps in 2usize..16,
     ) {

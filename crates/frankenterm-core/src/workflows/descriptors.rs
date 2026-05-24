@@ -770,7 +770,10 @@ impl DescriptorStep {
                 }
             }
             Self::Conditional {
-                test_text, matcher, ..
+                test_text,
+                matcher,
+                then_steps,
+                ..
             } => {
                 if test_text.trim().is_empty() {
                     return Err(crate::Error::Config(
@@ -786,6 +789,13 @@ impl DescriptorStep {
                             test_text.len(),
                             limits.max_text_len
                         )),
+                    ));
+                }
+                if then_steps.is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "Conditional then_steps must contain at least one step".to_string(),
+                        ),
                     ));
                 }
                 matcher.validate(limits)?;
