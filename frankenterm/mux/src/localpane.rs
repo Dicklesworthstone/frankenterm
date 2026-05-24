@@ -295,6 +295,10 @@ fn retry_backoff_for_attempt(policy: ResizeRetryPolicy, attempt: usize) -> Durat
         .min(policy.max_backoff)
 }
 
+fn next_search_grapheme_idx(last_grapheme_idx: usize) -> usize {
+    last_grapheme_idx.saturating_add(1)
+}
+
 fn retry_with_backoff<T, E, F>(
     policy: ResizeRetryPolicy,
     mut op: F,
@@ -1111,7 +1115,7 @@ impl Pane for LocalPane {
                     };
                 };
                 Coord {
-                    grapheme_idx: last.grapheme_idx + 1,
+                    grapheme_idx: next_search_grapheme_idx(last.grapheme_idx),
                     ..*last
                 }
             });
@@ -2141,6 +2145,12 @@ mod tests {
 
         assert_eq!(stats.attempts, 3);
         assert_eq!(stats.backoff_elapsed, Duration::MAX);
+    }
+
+    #[test]
+    fn search_end_grapheme_index_saturates() {
+        assert_eq!(next_search_grapheme_idx(0), 1);
+        assert_eq!(next_search_grapheme_idx(usize::MAX), usize::MAX);
     }
 
     #[test]
