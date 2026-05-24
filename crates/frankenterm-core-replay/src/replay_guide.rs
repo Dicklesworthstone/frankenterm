@@ -453,9 +453,6 @@ pub fn execute_step(input: &GuideStepInput) -> GuideStepOutput {
         .unwrap_or_else(|| GuideStepInfo::new(input.step, "unknown", "Unknown step"));
 
     let total_steps = input.workflow.step_count();
-    let has_next = input.step + 1 < total_steps;
-    let next_step = if has_next { Some(input.step + 1) } else { None };
-
     if input.step >= total_steps {
         return GuideStepOutput {
             workflow: input.workflow,
@@ -471,6 +468,9 @@ pub fn execute_step(input: &GuideStepInput) -> GuideStepOutput {
             next_step: None,
         };
     }
+
+    let has_next = input.step + 1 < total_steps;
+    let next_step = if has_next { Some(input.step + 1) } else { None };
 
     match input.workflow {
         GuideWorkflow::Investigate => {
@@ -1144,6 +1144,20 @@ mod tests {
         let output = execute_step(&input);
         assert_eq!(output.status, GuideStepStatus::Error);
         assert!(!output.has_next);
+    }
+
+    #[test]
+    fn max_step_returns_error_without_overflow() {
+        let input = GuideStepInput {
+            workflow: GuideWorkflow::Investigate,
+            step: usize::MAX,
+            context: GuideContext::default(),
+        };
+        let output = execute_step(&input);
+        assert_eq!(output.status, GuideStepStatus::Error);
+        assert_eq!(output.data["error"], "step_out_of_range");
+        assert!(!output.has_next);
+        assert_eq!(output.next_step, None);
     }
 
     // ── Investigate workflow ────────────────────────────────────────
