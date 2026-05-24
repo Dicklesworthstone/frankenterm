@@ -47,6 +47,46 @@ pub struct TabStackState {
     visible_by_stack: HashMap<TabStackId, usize>,
 }
 
+fn wrapped_index_delta(current: usize, len: usize, delta: isize) -> usize {
+    debug_assert!(len > 0);
+    let current = current % len;
+    let offset = delta.unsigned_abs() % len;
+
+    if delta >= 0 {
+        if current >= len - offset {
+            current - (len - offset)
+        } else {
+            current + offset
+        }
+    } else if current >= offset {
+        current - offset
+    } else {
+        len - (offset - current)
+    }
+}
+
+fn offset_by_resize_delta(value: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        value.saturating_add(delta as usize)
+    } else {
+        value.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn resize_delta_for_direction(direction: PaneDirection, amount: usize) -> isize {
+    match direction {
+        PaneDirection::Down | PaneDirection::Right => amount.min(isize::MAX as usize) as isize,
+        PaneDirection::Up | PaneDirection::Left => {
+            if amount > isize::MAX as usize {
+                isize::MIN
+            } else {
+                -(amount as isize)
+            }
+        }
+        PaneDirection::Next | PaneDirection::Prev => unreachable!(),
+    }
+}
+
 impl TabStackState {
     pub fn create_stack(
         &mut self,
@@ -97,9 +137,11 @@ impl TabStackState {
         if tabs.is_empty() {
             return None;
         }
-        let len = tabs.len() as isize;
-        let current = self.visible_by_stack.get(&stack_id).copied().unwrap_or(0) as isize;
-        let next = (current + delta).rem_euclid(len) as usize;
+        let next = wrapped_index_delta(
+            self.visible_by_stack.get(&stack_id).copied().unwrap_or(0),
+            tabs.len(),
+            delta,
+        );
         self.visible_by_stack.insert(stack_id, next);
         tabs.get(next).copied()
     }
@@ -3104,11 +3146,7 @@ impl TabInner {
             match node.direction {
                 SplitDirection::Horizontal => {
                     let width = node.width();
-                    let preferred_cols = if delta >= 0 {
-                        node.first.cols.saturating_add(delta as usize)
-                    } else {
-                        node.first.cols.saturating_sub((-delta) as usize)
-                    };
+                    let preferred_cols = offset_by_resize_delta(node.first.cols, delta);
                     if let Some((first_cols, second_cols)) = split_allocation(
                         width,
                         left_width_constraints,
@@ -3125,11 +3163,7 @@ impl TabInner {
                 }
                 SplitDirection::Vertical => {
                     let height = node.height();
-                    let preferred_rows = if delta >= 0 {
-                        node.first.rows.saturating_add(delta as usize)
-                    } else {
-                        node.first.rows.saturating_sub((-delta) as usize)
-                    };
+                    let preferred_rows = offset_by_resize_delta(node.first.rows, delta);
                     if let Some((first_rows, second_rows)) = split_allocation(
                         height,
                         left_height_constraints,
@@ -3226,11 +3260,7 @@ impl TabInner {
             PaneDirection::Up | PaneDirection::Down => SplitDirection::Vertical,
             PaneDirection::Next | PaneDirection::Prev => unreachable!(),
         };
-        let delta = match direction {
-            PaneDirection::Down | PaneDirection::Right => amount as isize,
-            PaneDirection::Up | PaneDirection::Left => -(amount as isize),
-            PaneDirection::Next | PaneDirection::Prev => unreachable!(),
-        };
+        let delta = resize_delta_for_direction(direction, amount);
         loop {
             match cursor.go_up() {
                 Ok(mut c) => {
@@ -4288,6 +4318,38 @@ mod test {
         assert_eq!(state.cycle_visible(TabStackId(7), 1), Some(30));
         assert_eq!(state.cycle_visible(TabStackId(7), 1), Some(10));
         assert_eq!(state.cycle_visible(TabStackId(7), -1), Some(30));
+    }
+
+    #[test]
+    fn tab_stack_state_cycles_extreme_deltas_without_overflow() {
+        let mut state = TabStackState::default();
+        state
+            .create_stack(TabStackId(7), vec![10, 20, 30])
+            .expect("create tab stack");
+
+        assert_eq!(state.cycle_visible(TabStackId(7), isize::MAX), Some(20));
+        assert_eq!(state.cycle_visible(TabStackId(7), isize::MIN), Some(30));
+
+        let mut single = TabStackState::default();
+        single
+            .create_stack(TabStackId(1), vec![99])
+            .expect("create single-tab stack");
+        assert_eq!(single.cycle_visible(TabStackId(1), isize::MIN), Some(99));
+    }
+
+    #[test]
+    fn resize_delta_helpers_handle_extreme_inputs() {
+        assert_eq!(offset_by_resize_delta(5, -3), 2);
+        assert_eq!(offset_by_resize_delta(5, 3), 8);
+        assert_eq!(offset_by_resize_delta(5, isize::MIN), 0);
+        assert_eq!(
+            resize_delta_for_direction(PaneDirection::Left, isize::MAX as usize + 1),
+            isize::MIN
+        );
+        assert_eq!(
+            resize_delta_for_direction(PaneDirection::Right, usize::MAX),
+            isize::MAX
+        );
     }
 
     #[test]
