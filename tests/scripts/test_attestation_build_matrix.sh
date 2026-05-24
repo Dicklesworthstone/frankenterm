@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")"
-ARTIFACT_ROOT="${FT_E87U6_2_ARTIFACT_DIR:-${TMPDIR:-/tmp}/ft-e87u6-2-attestation-build-matrix-${RUN_ID}}"
+ARTIFACT_ROOT="${FT_E87U6_2_ARTIFACT_DIR:-${ROOT_DIR}/target/test-artifacts/ft-e87u6-2-attestation-build-matrix-${RUN_ID}}"
 mkdir -p "${ARTIFACT_ROOT}"
 
 SUMMARY_FILE="${ARTIFACT_ROOT}/summary.json"
@@ -267,15 +267,17 @@ run_sigstore_cases() {
   fi
   local built_bundle="${out_dir}/${version}.json"
   local built_sigstore="${out_dir}/${version}.sigstore"
-  local recorded_hash recorded_size actual_hash actual_size
+  local recorded_path recorded_hash recorded_size actual_path actual_hash actual_size
+  recorded_path="$(jq -r '.signature.sigstore_bundle.path // ""' "${built_bundle}")"
   recorded_hash="$(jq -r '.signature.sigstore_bundle.sha256 // ""' "${built_bundle}")"
   recorded_size="$(jq -r '.signature.sigstore_bundle.size_bytes // ""' "${built_bundle}")"
+  actual_path="${built_sigstore#"${ROOT_DIR}/"}"
   actual_hash="$(sha256_file "${built_sigstore}")"
   actual_size="$(wc -c < "${built_sigstore}" | tr -d ' ')"
-  if [[ "${recorded_hash}" != "${actual_hash}" || "${recorded_size}" != "${actual_size}" ]]; then
+  if [[ "${recorded_path}" != "${actual_path}" || "${recorded_hash}" != "${actual_hash}" || "${recorded_size}" != "${actual_size}" ]]; then
     fail=$((fail + 1))
     record_result "${build_name}" "0" "metadata_mismatch" "failed" "${build_dir}"
-    echo "FAIL ${build_name}: sigstore hash/size metadata mismatch" >&2
+    echo "FAIL ${build_name}: sigstore path/hash/size metadata mismatch" >&2
     return 0
   fi
   pass=$((pass + 1))

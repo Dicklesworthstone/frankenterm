@@ -612,6 +612,18 @@ canonical_sha="$(printf '%s' "$canonical_payload" | sha256_stdin)"
 
 mkdir -p "$OUT_DIR"
 
+repo_relative_output_path() {
+  local path="$1"
+  if [[ "$path" == "$REPO_ROOT/"* ]]; then
+    printf '%s\n' "${path#"$REPO_ROOT"/}"
+  elif [[ "$path" != /* ]]; then
+    printf '%s\n' "$path"
+  else
+    echo "error: signed attestation output must be inside the repository so the verifier can resolve it: $path" >&2
+    exit 1
+  fi
+}
+
 case "$SIGN_METHOD" in
   cosign)
     command -v cosign >/dev/null 2>&1 || { echo "error: cosign not installed; pass --sign unsigned or install sigstore/cosign" >&2; exit 1; }
@@ -628,10 +640,11 @@ case "$SIGN_METHOD" in
     sigstore_hash="$(sha256_file "$sig_path")"
     sigstore_size="$(wc -c < "$sig_path" | tr -d ' ')"
 
+    sigstore_rel_path="$(repo_relative_output_path "$sig_path")"
     sig_obj="$(jq -n \
       --arg method "sigstore-cosign-keyless" \
       --arg canonical_sha256 "$canonical_sha" \
-      --arg sigstore_path "docs/attestations/${VERSION}.sigstore" \
+      --arg sigstore_path "$sigstore_rel_path" \
       --arg sigstore_sha256 "$sigstore_hash" \
       --argjson sigstore_size_bytes "$sigstore_size" \
       --arg certificate_identity "$COSIGN_IDENTITY" \
@@ -674,10 +687,11 @@ case "$SIGN_METHOD" in
     xxd -p -c 256 "$sig_bin_tmp" > "$sig_path"
     rm -f "$pubkey_der_tmp" "$sig_bin_tmp"
 
+    signature_rel_path="$(repo_relative_output_path "$sig_path")"
     sig_obj="$(jq -n \
       --arg method "ed25519" \
       --arg canonical_sha256 "$canonical_sha" \
-      --arg signature_path "docs/attestations/${VERSION}.ed25519.sig.hex" \
+      --arg signature_path "$signature_rel_path" \
       --arg public_key "$public_key" \
       '{method:$method, canonical_sha256:$canonical_sha256, signature_path:$signature_path, public_key:$public_key}')"
     ;;
