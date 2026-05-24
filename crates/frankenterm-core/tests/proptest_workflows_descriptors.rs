@@ -65,7 +65,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
     prop_oneof![
         (
             "[a-z_]{3,10}",
-            prop::option::of("[a-z ]{5,20}"),
+            prop::option::of("[a-z][a-z ]{4,19}"),
             arb_descriptor_matcher(),
             prop::option::of(1000u64..120_000),
         )
@@ -79,7 +79,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
             }),
         (
             "[a-z_]{3,10}",
-            prop::option::of("[a-z ]{5,20}"),
+            prop::option::of("[a-z][a-z ]{4,19}"),
             100u64..30_000
         )
             .prop_map(|(id, description, duration_ms)| {
@@ -91,7 +91,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
             }),
         (
             "[a-z_]{3,10}",
-            prop::option::of("[a-z ]{5,20}"),
+            prop::option::of("[a-z][a-z ]{4,19}"),
             "[a-z][a-z ]{2,49}",
             prop::option::of(arb_descriptor_matcher()),
             prop::option::of(1000u64..120_000),
@@ -107,7 +107,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
             }),
         (
             "[a-z_]{3,10}",
-            prop::option::of("[a-z ]{5,20}"),
+            prop::option::of("[a-z][a-z ]{4,19}"),
             arb_descriptor_control_key()
         )
             .prop_map(|(id, description, key)| DescriptorStep::SendCtrl {
@@ -117,7 +117,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
             }),
         (
             "[a-z_]{3,10}",
-            prop::option::of("[a-z ]{5,20}"),
+            prop::option::of("[a-z][a-z ]{4,19}"),
             "[a-z][a-z ]{4,49}"
         )
             .prop_map(|(id, description, message)| DescriptorStep::Notify {
@@ -127,7 +127,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
             }),
         (
             "[a-z_]{3,10}",
-            prop::option::of("[a-z ]{5,20}"),
+            prop::option::of("[a-z][a-z ]{4,19}"),
             "[a-z][a-z ]{4,49}"
         )
             .prop_map(|(id, description, message)| DescriptorStep::Log {
@@ -137,7 +137,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
             }),
         (
             "[a-z_]{3,10}",
-            prop::option::of("[a-z ]{5,20}"),
+            prop::option::of("[a-z][a-z ]{4,19}"),
             "[a-z][a-z ]{4,49}"
         )
             .prop_map(|(id, description, reason)| DescriptorStep::Abort {
@@ -152,7 +152,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
 fn arb_workflow_descriptor() -> impl Strategy<Value = WorkflowDescriptor> {
     (
         "[a-z_]{3,20}",
-        prop::option::of("[a-z ]{10,40}"),
+        prop::option::of("[a-z][a-z ]{9,39}"),
         prop::collection::vec(arb_descriptor_trigger(), 0..3),
         // 1..5 leaf steps with unique IDs generated from indices
         (1usize..5).prop_flat_map(|count| {
@@ -780,6 +780,28 @@ proptest! {
     }
 
     #[test]
+    fn empty_workflow_description_fails_validation() {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "workflow_description_blank".to_string(),
+            description: Some(" \t ".to_string()),
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "s".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "workflow descriptions must be omitted rather than blank"
+        );
+    }
+
+    #[test]
     fn step_description_respects_configured_text_length_limit(
         max_text_len in 1usize..128,
     ) {
@@ -820,6 +842,28 @@ proptest! {
         prop_assert!(
             over_limit.validate(&limits).is_err(),
             "step description longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
+    fn empty_step_description_fails_validation() {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "step_description_blank".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "s".to_string(),
+                description: Some(" \t ".to_string()),
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "step descriptions must be omitted rather than blank"
         );
     }
 

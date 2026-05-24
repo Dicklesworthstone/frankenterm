@@ -254,6 +254,11 @@ fn validate_optional_text_len(
     value: Option<&str>,
     max_len: usize,
 ) -> crate::Result<()> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!("{label} cannot be empty")),
+        ));
+    }
     if let Some(value) = value.filter(|value| value.len() > max_len) {
         return Err(crate::Error::Config(
             crate::error::ConfigError::ValidationError(format!(
