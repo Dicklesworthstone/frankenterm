@@ -313,15 +313,25 @@ proptest! {
     #[test]
     fn text_match_substring_constructor(value in "[a-z ]{3,20}") {
         let m = TextMatch::substring(value.clone());
-        let check = matches!(m, TextMatch::Substring { .. });
-        prop_assert!(check);
+        match m {
+            TextMatch::Substring { value: actual_value } => {
+                prop_assert_eq!(actual_value, value);
+            }
+            other => prop_assert!(false, "expected Substring, got {other:?}"),
+        }
     }
 
     #[test]
     fn text_match_regex_constructor(pattern in "[a-z]+") {
         let m = TextMatch::regex(pattern.clone());
-        let check = matches!(m, TextMatch::Regex { .. });
-        prop_assert!(check);
+        match m {
+            TextMatch::Regex {
+                pattern: actual_pattern,
+            } => {
+                prop_assert_eq!(actual_pattern, pattern);
+            }
+            other => prop_assert!(false, "expected Regex, got {other:?}"),
+        }
     }
 
     #[test]
