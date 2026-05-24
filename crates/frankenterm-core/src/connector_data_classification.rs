@@ -562,9 +562,9 @@ impl ClassificationTelemetry {
     #[must_use]
     pub fn total_events(&self) -> u64 {
         self.events_accepted
-            + self.events_accepted_redacted
-            + self.events_rejected
-            + self.events_quarantined
+            .saturating_add(self.events_accepted_redacted)
+            .saturating_add(self.events_rejected)
+            .saturating_add(self.events_quarantined)
     }
 
     /// Redaction rate as a fraction (0.0 - 1.0).
@@ -573,7 +573,11 @@ impl ClassificationTelemetry {
         if self.fields_classified == 0 {
             return 0.0;
         }
-        (self.fields_redacted + self.fields_removed) as f64 / self.fields_classified as f64
+        let redaction_actions = self
+            .fields_redacted
+            .saturating_add(self.fields_removed)
+            .min(self.fields_classified);
+        redaction_actions as f64 / self.fields_classified as f64
     }
 }
 

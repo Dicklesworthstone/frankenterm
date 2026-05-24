@@ -471,7 +471,32 @@ proptest! {
     /// total_events equals sum of accepted + accepted_redacted + rejected + quarantined.
     #[test]
     fn telemetry_total_events_correct(t in arb_telemetry()) {
-        let expected = t.events_accepted + t.events_accepted_redacted + t.events_rejected + t.events_quarantined;
+        let expected = t.events_accepted
+            .saturating_add(t.events_accepted_redacted)
+            .saturating_add(t.events_rejected)
+            .saturating_add(t.events_quarantined);
+        prop_assert_eq!(t.total_events(), expected);
+    }
+
+    /// total_events saturates instead of wrapping on long-running counters.
+    #[test]
+    fn telemetry_total_events_saturates(
+        accepted in any::<u64>(),
+        accepted_redacted in any::<u64>(),
+        rejected in any::<u64>(),
+        quarantined in any::<u64>(),
+    ) {
+        let t = ClassificationTelemetry {
+            events_accepted: accepted,
+            events_accepted_redacted: accepted_redacted,
+            events_rejected: rejected,
+            events_quarantined: quarantined,
+            ..ClassificationTelemetry::default()
+        };
+        let expected = accepted
+            .saturating_add(accepted_redacted)
+            .saturating_add(rejected)
+            .saturating_add(quarantined);
         prop_assert_eq!(t.total_events(), expected);
     }
 
@@ -507,6 +532,24 @@ proptest! {
         let rate = t.redaction_rate();
         prop_assert!(rate >= 0.0);
         prop_assert!(rate <= 1.0 + f64::EPSILON);
+    }
+
+    /// redaction_rate stays finite and bounded for overflow-scale action counters.
+    #[test]
+    fn telemetry_redaction_rate_saturates_action_overflow(
+        classified in 1u64..=10_000,
+        redacted in any::<u64>(),
+        removed in any::<u64>(),
+    ) {
+        let t = ClassificationTelemetry {
+            fields_classified: classified,
+            fields_redacted: redacted,
+            fields_removed: removed,
+            ..ClassificationTelemetry::default()
+        };
+        let rate = t.redaction_rate();
+        prop_assert!(rate.is_finite());
+        prop_assert!((0.0..=1.0).contains(&rate));
     }
 
     /// Serde roundtrip.
