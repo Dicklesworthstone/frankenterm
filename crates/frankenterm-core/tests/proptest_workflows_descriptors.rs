@@ -372,6 +372,16 @@ proptest! {
     }
 
     #[test]
+    fn empty_workflow_name_fails_validation(mut val in arb_workflow_descriptor()) {
+        val.name = " \t ".to_string();
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            val.validate(&limits).is_err(),
+            "descriptor validation must reject empty workflow names"
+        );
+    }
+
+    #[test]
     fn duplicate_top_level_step_ids_fail_validation(
         name in "[a-z_]{3,20}",
         duplicate_id in "[a-z_]{3,15}",

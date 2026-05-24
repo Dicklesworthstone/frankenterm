@@ -143,6 +143,14 @@ impl WorkflowDescriptor {
             ));
         }
 
+        if self.name.trim().is_empty() {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(
+                    "Descriptor name cannot be empty".to_string(),
+                ),
+            ));
+        }
+
         if self.steps.is_empty() {
             return Err(crate::Error::Config(
                 crate::error::ConfigError::ValidationError(
