@@ -79,8 +79,17 @@ DOC_TERMS = [
   "ambiguous",
   "completed",
   "failed_topology_preflight",
+  "refused_active_project_exclusion",
+  "refused_insufficient_slots",
+  "refused_telemetry_gap",
   "local Cargo",
   "rch.topology_preflight_failed",
+  "rch.active_project_exclusion",
+  "rch.insufficient_slots",
+  "rch.telemetry_gap",
+  "active-project exclusion",
+  "insufficient slots",
+  "telemetry gap",
   "topology preflight",
   "fixtures/deferred-proof-replay/queue-surface/"
 ].freeze
@@ -166,6 +175,9 @@ def violations(surface)
     # completion: that outcome may only ride a wait_rch entry.
     outcome = entry.dig("latest_replay", "outcome")
     v << "topology_outcome_status_drift" if outcome == "failed_topology_preflight" && status != "wait_rch"
+    v << "active_project_outcome_status_drift" if outcome == "refused_active_project_exclusion" && status != "wait_rch"
+    v << "insufficient_slots_outcome_status_drift" if outcome == "refused_insufficient_slots" && status != "wait_rch"
+    v << "telemetry_gap_outcome_status_drift" if outcome == "refused_telemetry_gap" && status != "wait_rch"
   end
 
   # Summary reconciles with the queue and keeps queued distinct from completed.
@@ -310,6 +322,12 @@ def apply_mutation(surface, op)
     s["queue"].find { |e| e["status"] == "runnable" }["replay_allowed"] = false
   when "complete_topology_failed_entry"
     s["queue"].find { |e| e["status"] == "completed" }["latest_replay"]["outcome"] = "failed_topology_preflight"
+  when "complete_active_project_entry"
+    s["queue"].find { |e| e["status"] == "completed" }["latest_replay"]["outcome"] = "refused_active_project_exclusion"
+  when "complete_insufficient_slots_entry"
+    s["queue"].find { |e| e["status"] == "completed" }["latest_replay"]["outcome"] = "refused_insufficient_slots"
+  when "complete_telemetry_gap_entry"
+    s["queue"].find { |e| e["status"] == "completed" }["latest_replay"]["outcome"] = "refused_telemetry_gap"
   else
     fail!("unknown invalid-fragment mutation: #{op}")
   end
@@ -329,6 +347,9 @@ fail!("schema contract const drifted") unless schema.dig("properties", "contract
 fail!("schema source digest pattern missing") unless schema.dig("$defs", "source", "properties", "source_text_sha256", "pattern") == "^[0-9a-f]{64}$"
 fail!("schema permits raw pane content") unless schema.dig("$defs", "source", "properties", "raw_pane_content_stored", "const") == false
 fail!("schema missing topology preflight outcome") unless schema.dig("$defs", "latest_replay", "properties", "outcome", "enum").include?("failed_topology_preflight")
+fail!("schema missing active project exclusion outcome") unless schema.dig("$defs", "latest_replay", "properties", "outcome", "enum").include?("refused_active_project_exclusion")
+fail!("schema missing insufficient slots outcome") unless schema.dig("$defs", "latest_replay", "properties", "outcome", "enum").include?("refused_insufficient_slots")
+fail!("schema missing telemetry gap outcome") unless schema.dig("$defs", "latest_replay", "properties", "outcome", "enum").include?("refused_telemetry_gap")
 
 # Manifest sanity.
 fail!("manifest contract drifted") unless manifest["contract_id"] == CONTRACT_ID
@@ -353,6 +374,28 @@ explain_wait = surface.fetch("explain").find { |entry| entry.fetch("bead_id") ==
 fail!("wait_rch explain entry missing") unless explain_wait
 fail!("wait_rch explain missing topology preflight wording") unless explain_wait.fetch("why").include?("topology preflight")
 fail!("wait_rch explain reason drift") unless explain_wait.fetch("blocking_reason_codes") == wait_rch.fetch("reason_codes")
+active_project = surface.fetch("queue").find { |entry| entry.fetch("reason_codes").include?("rch.active_project_exclusion") }
+fail!("active-project wait_rch fixture missing") unless active_project
+fail!("active-project fixture must wait on RCH") unless active_project.fetch("status") == "wait_rch"
+fail!("active-project fixture must not replay") if active_project.fetch("replay_allowed")
+fail!("active-project fixture wrong outcome") unless active_project.dig("latest_replay", "outcome") == "refused_active_project_exclusion"
+fail!("active-project fixture must keep coarse admission projection") unless active_project.dig("latest_replay", "rch_admission_state") == "blocked_worker_pressure"
+explain_active = surface.fetch("explain").find { |entry| entry.fetch("bead_id") == active_project.fetch("bead_id") }
+fail!("active-project explain entry missing") unless explain_active
+fail!("active-project explain missing wording") unless explain_active.fetch("why").include?("active-project exclusion")
+fail!("active-project explain reason drift") unless explain_active.fetch("blocking_reason_codes") == active_project.fetch("reason_codes")
+insufficient_slots = surface.fetch("queue").find { |entry| entry.fetch("reason_codes").include?("rch.insufficient_slots") }
+fail!("insufficient-slots wait_rch fixture missing") unless insufficient_slots
+fail!("insufficient-slots fixture must wait on RCH") unless insufficient_slots.fetch("status") == "wait_rch"
+fail!("insufficient-slots fixture must not replay") if insufficient_slots.fetch("replay_allowed")
+fail!("insufficient-slots fixture wrong outcome") unless insufficient_slots.dig("latest_replay", "outcome") == "refused_insufficient_slots"
+fail!("insufficient-slots fixture must keep coarse admission projection") unless insufficient_slots.dig("latest_replay", "rch_admission_state") == "blocked_worker_pressure"
+telemetry_gap = surface.fetch("queue").find { |entry| entry.fetch("reason_codes").include?("rch.telemetry_gap") }
+fail!("telemetry-gap wait_rch fixture missing") unless telemetry_gap
+fail!("telemetry-gap fixture must wait on RCH") unless telemetry_gap.fetch("status") == "wait_rch"
+fail!("telemetry-gap fixture must not replay") if telemetry_gap.fetch("replay_allowed")
+fail!("telemetry-gap fixture wrong outcome") unless telemetry_gap.dig("latest_replay", "outcome") == "refused_telemetry_gap"
+fail!("telemetry-gap fixture must keep coarse admission projection") unless telemetry_gap.dig("latest_replay", "rch_admission_state") == "blocked_worker_pressure"
 
 # Determinism: a second parse of the same bytes yields identical canonical JSON.
 fail!("surface is not deterministic across parses") unless JSON.generate(read_json(CASES)) == JSON.generate(surface)

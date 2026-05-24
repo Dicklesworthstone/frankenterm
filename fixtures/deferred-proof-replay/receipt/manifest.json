@@ -7,8 +7,8 @@
   "valid_cases": "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json",
   "invalid_fragments": "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json",
   "golden_summary": {
-    "valid_case_count": 6,
-    "invalid_case_count": 16,
+    "valid_case_count": 9,
+    "invalid_case_count": 19,
     "command_shape_versions": [
       "rch-no-self-healing-v1",
       "static-verifier-v1"

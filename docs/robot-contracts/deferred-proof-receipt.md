@@ -30,6 +30,15 @@ fixture corpus lives under `fixtures/deferred-proof-replay/receipt/`.
 - A `topology_preflight_failed` receipt must never claim `eligibility.state:
   eligible` — topology preflight never reached Cargo, so the proof is not
   replayable and the verifier rejects it as `topology_preflight_not_eligible`.
+- `active_project_exclusion` is also an RCH wait state. It means another
+  FrankenTerm proof lane currently owns the project admission window, so the
+  receipt must stay `wait_rch` with reason `rch.active_project_exclusion` and
+  must not suggest worker mutation, build cancellation, or service repair.
+- `insufficient_slots` and `telemetry_gap` are RCH wait states. The rich
+  receipt state must be preserved, while extractor and queue surfaces project
+  both to coarse `blocked_worker_pressure`; each receipt must stay `wait_rch`
+  with `proof.remote_required`, the specific `rch.insufficient_slots` or
+  `rch.telemetry_gap` reason code, and `replay_allowed: false`.
 - Artifact paths are repository-relative and may only point under
   `docs/json-schema/`, `docs/robot-contracts/`,
   `fixtures/deferred-proof-replay/receipt/`, or `tests/e2e/`.
@@ -52,6 +61,9 @@ The static verifier freezes valid and invalid examples:
 
 - `remote-required-cargo-proof`
 - `selected-worker-topology-preflight-block`
+- `active-project-exclusion-block`
+- `insufficient-slots-block`
+- `telemetry-gap-block`
 - `static-only-proof`
 - `dirty-overlap-block`
 - `prerequisite-bead-block`
@@ -72,6 +84,9 @@ The static verifier freezes valid and invalid examples:
 - `prerequisite-bypass`
 - `duplicate-env-allowlist`
 - `topology-preflight-eligible-bypass`
+- `active-project-exclusion-eligible-bypass`
+- `insufficient-slots-eligible-bypass`
+- `telemetry-gap-eligible-bypass`
 
 Run:
 

@@ -61,6 +61,10 @@ REQUIRED_CASES = %w[
   remote-rch-blocked-closeout
   static-only-closeout
   mixed-static-rch-closeout
+  selected-worker-topology-preflight-closeout
+  active-project-exclusion-closeout
+  insufficient-slots-closeout
+  telemetry-gap-closeout
   ambiguous-prose-ineligible
   stale-command-ineligible
   duplicate-comment-ineligible
@@ -182,16 +186,31 @@ end
 def rch_state(fields)
   admission = fields.fetch("rch_admission", "unknown")
   return "not_required" if admission == "not_required"
-  return "blocked_worker_pressure" if admission.include?("critical_pressure") || admission.include?("no_admissible_workers")
+  return "blocked_worker_pressure" if admission.include?("critical_pressure") ||
+                                     admission.include?("no_admissible_workers") ||
+                                     admission.include?("insufficient_slots") ||
+                                     admission.include?("telemetry_gap") ||
+                                     admission.include?("active_project_exclusion") ||
+                                     admission.include?("topology_preflight_failed")
   return "admitted" if admission == "admitted"
 
   "unknown"
 end
 
+def wait_rch_reason_codes(fields)
+  admission = fields.fetch("rch_admission", "unknown")
+  return ["rch.topology_preflight_failed"] if admission.include?("topology_preflight_failed")
+  return ["rch.active_project_exclusion"] if admission.include?("active_project_exclusion")
+  return ["rch.insufficient_slots"] if admission.include?("insufficient_slots")
+  return ["rch.telemetry_gap"] if admission.include?("telemetry_gap")
+
+  ["rch.worker_pressure"]
+end
+
 def eligibility_for(fields)
   if material_cargo?(fields)
     if rch_state(fields) == "blocked_worker_pressure"
-      ["wait_rch", ["rch.worker_pressure"], false, "blocked_infra"]
+      ["wait_rch", wait_rch_reason_codes(fields), false, "blocked_infra"]
     else
       ["eligible", ["rch.admitted"], true, "remote_required_pending"]
     end
@@ -405,6 +424,34 @@ emitted.each do |entry|
   receipt = entry.fetch("receipt")
   fail!("#{entry.fetch("record_id")} missing receipt") unless receipt
   fail!("#{entry.fetch("record_id")} receipt contract drifted") unless receipt.fetch("contract_id") == RECEIPT_CONTRACT_ID
+  if entry.fetch("record_id") == "selected-worker-topology-preflight-closeout"
+    fail!("topology preflight closeout must stay wait_rch") unless receipt.dig("eligibility", "state") == "wait_rch"
+    fail!("topology preflight closeout must keep coarse blocked projection") unless receipt.dig("coordination", "rch_admission_state") == "blocked_worker_pressure"
+    fail!("topology preflight closeout must not be replayable") if receipt.dig("eligibility", "replay_allowed")
+    fail!("topology preflight closeout missing reason") unless receipt.dig("eligibility", "reason_codes").include?("rch.topology_preflight_failed")
+    fail!("topology preflight closeout collapsed to worker pressure") if receipt.dig("eligibility", "reason_codes").include?("rch.worker_pressure")
+  end
+  if entry.fetch("record_id") == "active-project-exclusion-closeout"
+    fail!("active project closeout must stay wait_rch") unless receipt.dig("eligibility", "state") == "wait_rch"
+    fail!("active project closeout must keep coarse blocked projection") unless receipt.dig("coordination", "rch_admission_state") == "blocked_worker_pressure"
+    fail!("active project closeout must not be replayable") if receipt.dig("eligibility", "replay_allowed")
+    fail!("active project closeout missing reason") unless receipt.dig("eligibility", "reason_codes").include?("rch.active_project_exclusion")
+    fail!("active project closeout collapsed to worker pressure") if receipt.dig("eligibility", "reason_codes").include?("rch.worker_pressure")
+  end
+  if entry.fetch("record_id") == "insufficient-slots-closeout"
+    fail!("insufficient slots closeout must stay wait_rch") unless receipt.dig("eligibility", "state") == "wait_rch"
+    fail!("insufficient slots closeout must keep coarse blocked projection") unless receipt.dig("coordination", "rch_admission_state") == "blocked_worker_pressure"
+    fail!("insufficient slots closeout must not be replayable") if receipt.dig("eligibility", "replay_allowed")
+    fail!("insufficient slots closeout missing reason") unless receipt.dig("eligibility", "reason_codes").include?("rch.insufficient_slots")
+    fail!("insufficient slots closeout collapsed to worker pressure") if receipt.dig("eligibility", "reason_codes").include?("rch.worker_pressure")
+  end
+  if entry.fetch("record_id") == "telemetry-gap-closeout"
+    fail!("telemetry gap closeout must stay wait_rch") unless receipt.dig("eligibility", "state") == "wait_rch"
+    fail!("telemetry gap closeout must keep coarse blocked projection") unless receipt.dig("coordination", "rch_admission_state") == "blocked_worker_pressure"
+    fail!("telemetry gap closeout must not be replayable") if receipt.dig("eligibility", "replay_allowed")
+    fail!("telemetry gap closeout missing reason") unless receipt.dig("eligibility", "reason_codes").include?("rch.telemetry_gap")
+    fail!("telemetry gap closeout collapsed to worker pressure") if receipt.dig("eligibility", "reason_codes").include?("rch.worker_pressure")
+  end
   if receipt.dig("proof", "material_cargo_required")
     fail!("#{entry.fetch("record_id")} material receipt missing remote command") unless remote_shape_valid?(receipt.dig("command", "argv"))
     fail!("#{entry.fetch("record_id")} material receipt unexpectedly replayable under blocked RCH") if receipt.dig("coordination", "rch_admission_state") == "blocked_worker_pressure" && receipt.dig("eligibility", "replay_allowed")
@@ -424,6 +471,14 @@ end
   "source_text_sha256",
   "RCH_REQUIRE_REMOTE=1",
   "RCH_NO_SELF_HEALING=1",
+  "topology_preflight_failed",
+  "rch.topology_preflight_failed",
+  "active_project_exclusion",
+  "rch.active_project_exclusion",
+  "insufficient_slots",
+  "rch.insufficient_slots",
+  "telemetry_gap",
+  "rch.telemetry_gap",
   "duplicate",
   "ambiguous",
   "fixtures/deferred-proof-replay/extractor/"

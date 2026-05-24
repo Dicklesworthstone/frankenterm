@@ -266,6 +266,9 @@
             "passed",
             "failed",
             "failed_topology_preflight",
+            "refused_active_project_exclusion",
+            "refused_insufficient_slots",
+            "refused_telemetry_gap",
             "refused_no_worker",
             "refused_local_fallback",
             "never_attempted"

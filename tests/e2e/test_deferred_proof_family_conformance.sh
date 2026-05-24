@@ -50,10 +50,11 @@ CANONICAL_COMMAND_SHAPE = %w[rch-no-self-healing-v1 static-verifier-v1].freeze
 # The coarse, derived admission vocabulary the extractor projection and the queue
 # surface share. Intentionally distinct from the receipt's richer *captured*
 # vocabulary (admissible / critical_pressure / no_admissible_workers /
-# telemetry_gap / topology_preflight_failed), which records raw RCH signals
-# before they are coarsened.
+# insufficient_slots / telemetry_gap / active_project_exclusion /
+# topology_preflight_failed), which
+# records raw RCH signals before they are coarsened.
 COARSE_ADMISSION = %w[admitted blocked_worker_pressure not_required unknown].freeze
-RICH_ADMISSION = %w[admissible critical_pressure no_admissible_workers telemetry_gap topology_preflight_failed not_required unknown].freeze
+RICH_ADMISSION = %w[admissible critical_pressure no_admissible_workers insufficient_slots telemetry_gap active_project_exclusion topology_preflight_failed not_required unknown].freeze
 BANNED_RAW_KEYS = %w[source_text pane_text raw_pane_text raw_pane_content].freeze
 
 def fail!(message)

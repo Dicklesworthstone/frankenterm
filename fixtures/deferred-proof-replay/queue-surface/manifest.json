@@ -7,11 +7,11 @@
   "cases": "fixtures/deferred-proof-replay/queue-surface/cases.v1.json",
   "invalid_fragments": "fixtures/deferred-proof-replay/queue-surface/invalid/fragments.v1.json",
   "golden_summary": {
-    "queue_entry_count": 7,
-    "queued_count": 6,
+    "queue_entry_count": 10,
+    "queued_count": 9,
     "completed_count": 1,
-    "explain_count": 5,
-    "invalid_fragment_count": 34,
+    "explain_count": 8,
+    "invalid_fragment_count": 37,
     "statuses": [
       "ambiguous",
       "completed",

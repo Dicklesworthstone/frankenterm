@@ -1044,6 +1044,234 @@
           "secret_storage"
         ]
       }
+    },
+    {
+      "case_id": "active-project-exclusion-eligible-bypass",
+      "expected_rejection": "active_project_exclusion_not_eligible",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-5xwsu.3:active-project-eligible-bypass",
+        "bead_id": "ft-5xwsu.3",
+        "captured_at": "2026-05-24T21:12:00Z",
+        "source": {
+          "commit": "f17c5e03d",
+          "tree": "b4e9c77eb",
+          "source_state": "static_clean",
+          "commit_pushed": false
+        },
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_BUILD_JOBS=1",
+            "CARGO_INCREMENTAL=0",
+            "CARGO_TARGET_DIR=/tmp/ft-5xwsu3-active-project",
+            "cargo",
+            "test",
+            "-p",
+            "frankenterm-core-replay-types",
+            "--",
+            "--nocapture"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_BUILD_JOBS",
+            "CARGO_INCREMENTAL",
+            "CARGO_TARGET_DIR",
+            "RCH_NO_SELF_HEALING",
+            "RCH_REQUIRE_REMOTE"
+          ],
+          "target_dir": "/tmp/ft-5xwsu3-active-project",
+          "material_remote_required": true
+        },
+        "proof": {
+          "expected_kind": "cargo_test",
+          "package": "frankenterm-core-replay-types",
+          "test_filter": null,
+          "feature_set": [],
+          "material_cargo_required": true,
+          "evidence_classification": "blocked_infra"
+        },
+        "paths": {
+          "owned_paths": [
+            "crates/frankenterm-core-replay-types/src/lib.rs"
+          ],
+          "dirty_paths_at_capture": [],
+          "artifact_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json",
+            "docs/robot-contracts/deferred-proof-receipt.md",
+            "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json",
+            "tests/e2e/test_deferred_proof_receipt_contract.sh"
+          ]
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "agent_mail_state": "unavailable",
+          "rch_admission_state": "active_project_exclusion",
+          "operator_cancelled": false,
+          "selected_worker": null,
+          "rch_job_id": null,
+          "remote_failure_phase": "admission",
+          "remote_failure_detail": "no_admissible_workers=active_project_exclusion=1"
+        },
+        "eligibility": {
+          "state": "eligible",
+          "reason_codes": [
+            "rch.active_project_exclusion",
+            "proof.remote_required"
+          ],
+          "freshness_deadline": "2026-05-25T21:12:00Z",
+          "replay_allowed": false
+        },
+        "forbidden_actions": [
+          "local_cargo_proof",
+          "local_heavy_cargo_fallback",
+          "rch_service_repair",
+          "rch_worker_mutation",
+          "agent_mail_repair",
+          "delete_files",
+          "destructive_git",
+          "build_cancellation",
+          "raw_pane_text_storage",
+          "secret_storage"
+        ]
+      }
+    },
+    {
+      "case_id": "insufficient-slots-eligible-bypass",
+      "expected_rejection": "insufficient_slots_not_eligible",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-zbnz4.12:insufficient-slots-eligible-bypass",
+        "bead_id": "ft-zbnz4.12",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_TARGET_DIR=/tmp/ft-zbnz4-12-insufficient",
+            "cargo",
+            "check",
+            "-p",
+            "frankenterm-core",
+            "--lib"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_TARGET_DIR",
+            "RCH_NO_SELF_HEALING",
+            "RCH_REQUIRE_REMOTE"
+          ],
+          "target_dir": "/tmp/ft-zbnz4-12-insufficient",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true
+        },
+        "paths": {
+          "owned_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json"
+          ],
+          "dirty_paths_at_capture": []
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false,
+          "rch_admission_state": "insufficient_slots"
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": false
+        }
+      }
+    },
+    {
+      "case_id": "telemetry-gap-eligible-bypass",
+      "expected_rejection": "telemetry_gap_not_eligible",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.deferred_proof_receipt.v1",
+        "receipt_id": "ft-zbnz4.12:telemetry-gap-eligible-bypass",
+        "bead_id": "ft-zbnz4.12",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": [
+            "rch",
+            "--no-self-healing",
+            "exec",
+            "--",
+            "env",
+            "CARGO_TARGET_DIR=/tmp/ft-zbnz4-12-telemetry",
+            "cargo",
+            "check",
+            "-p",
+            "frankenterm-core",
+            "--lib"
+          ],
+          "env": [
+            {
+              "name": "RCH_REQUIRE_REMOTE",
+              "value": "1"
+            },
+            {
+              "name": "RCH_NO_SELF_HEALING",
+              "value": "1"
+            }
+          ],
+          "env_allowlist": [
+            "CARGO_TARGET_DIR",
+            "RCH_NO_SELF_HEALING",
+            "RCH_REQUIRE_REMOTE"
+          ],
+          "target_dir": "/tmp/ft-zbnz4-12-telemetry",
+          "material_remote_required": true
+        },
+        "proof": {
+          "material_cargo_required": true
+        },
+        "paths": {
+          "owned_paths": [
+            "docs/json-schema/ft-deferred-proof-receipt.json"
+          ],
+          "dirty_paths_at_capture": []
+        },
+        "coordination": {
+          "prerequisite_beads": [],
+          "operator_cancelled": false,
+          "rch_admission_state": "telemetry_gap"
+        },
+        "eligibility": {
+          "state": "eligible",
+          "replay_allowed": false
+        }
+      }
     }
   ]
 }

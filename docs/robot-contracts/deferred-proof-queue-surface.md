@@ -33,7 +33,7 @@ completed proof:
 | Status | Meaning | Remediation |
 | --- | --- | --- |
 | `runnable` | RCH admitted; the receipt can replay now. | `none` |
-| `wait_rch` | RCH admission is under worker pressure, or a selected worker failed remote topology preflight before Cargo. | `wait_for_rch_admission` |
+| `wait_rch` | RCH admission is under worker pressure, insufficient slots, telemetry gap, active-project exclusion, or a selected worker failed remote topology preflight before Cargo. | `wait_for_rch_admission` |
 | `dirty_overlap` | Captured tree had dirty paths outside the owned set. | `resolve_dirty_overlap` |
 | `prerequisite_blocked` | A prerequisite bead has not landed its proof. | `complete_prerequisite_bead` |
 | `stale_command` | Command lacks the remote-only RCH flags or exec shape. | `refresh_command_shape` |
@@ -41,13 +41,18 @@ completed proof:
 | `completed` | Proof already replayed and passed. | `none` |
 
 `replay_allowed` is `true` only for `runnable` entries. RCH admission failure,
-worker pressure, and selected-worker topology preflight failure
+worker pressure, insufficient slots (`refused_insufficient_slots` /
+`rch.insufficient_slots`), telemetry gaps (`refused_telemetry_gap` /
+`rch.telemetry_gap`), active-project exclusion
+(`refused_active_project_exclusion` / `rch.active_project_exclusion`), and
+selected-worker topology preflight failure
 (`failed_topology_preflight` / `rch.topology_preflight_failed`) are *deferral*
 signals (the receipt stays queued under `wait_rch`), never an instruction to
-repair RCH or mutate workers. Because that outcome never reached Cargo, a
-`latest_replay.outcome` of `failed_topology_preflight` may only ride a
-`wait_rch` entry — never `completed` or `runnable` (the verifier rejects the
-mismatch as `topology_outcome_status_drift`).
+repair RCH, mutate workers, or cancel another proof lane. Because topology
+preflight never reached Cargo, a `latest_replay.outcome` of
+`failed_topology_preflight` may only ride a `wait_rch` entry — never
+`completed` or `runnable` (the verifier rejects the mismatch as
+`topology_outcome_status_drift`).
 
 ## Views
 

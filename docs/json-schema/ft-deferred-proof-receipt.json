@@ -301,7 +301,9 @@
             "admissible",
             "critical_pressure",
             "no_admissible_workers",
+            "insufficient_slots",
             "telemetry_gap",
+            "active_project_exclusion",
             "topology_preflight_failed",
             "not_required",
             "unknown"

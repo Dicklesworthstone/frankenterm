@@ -172,6 +172,21 @@
       "case_id": "topology-failed-marked-completed",
       "mutation": "complete_topology_failed_entry",
       "expected_violation": "topology_outcome_status_drift"
+    },
+    {
+      "case_id": "active-project-marked-completed",
+      "mutation": "complete_active_project_entry",
+      "expected_violation": "active_project_outcome_status_drift"
+    },
+    {
+      "case_id": "insufficient-slots-marked-completed",
+      "mutation": "complete_insufficient_slots_entry",
+      "expected_violation": "insufficient_slots_outcome_status_drift"
+    },
+    {
+      "case_id": "telemetry-gap-marked-completed",
+      "mutation": "complete_telemetry_gap_entry",
+      "expected_violation": "telemetry_gap_outcome_status_drift"
     }
   ]
 }

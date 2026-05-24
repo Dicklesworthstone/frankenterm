@@ -18,12 +18,12 @@
     ]
   },
   "summary": {
-    "total": 7,
-    "queued": 6,
+    "total": 10,
+    "queued": 9,
     "completed": 1,
     "by_status": {
       "runnable": 1,
-      "wait_rch": 1,
+      "wait_rch": 4,
       "dirty_overlap": 1,
       "prerequisite_blocked": 1,
       "stale_command": 1,
@@ -205,6 +205,78 @@
         "outcome": "failed_topology_preflight",
         "rch_admission_state": "blocked_worker_pressure"
       }
+    },
+    {
+      "bead_id": "ft-wt2",
+      "receipt_id": "ft-wt2:comment-7008",
+      "status": "wait_rch",
+      "reason_codes": [
+        "rch.active_project_exclusion"
+      ],
+      "target_dir": "/tmp/ft-wt2-replay-types",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "wait_for_rch_admission",
+      "source": {
+        "comment_id": 7008,
+        "author": "MagentaFern",
+        "created_at": "2026-05-24T21:12:00Z",
+        "source_text_sha256": "fcf9a8bc290e2956df55d3cb6747bab4edc71a9bfb877bcfb8ab5aa4c7e5325d",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": {
+        "attempted_at": "2026-05-24T21:12:30Z",
+        "outcome": "refused_active_project_exclusion",
+        "rch_admission_state": "blocked_worker_pressure"
+      }
+    },
+    {
+      "bead_id": "ft-wt3",
+      "receipt_id": "ft-wt3:comment-7009",
+      "status": "wait_rch",
+      "reason_codes": [
+        "rch.insufficient_slots"
+      ],
+      "target_dir": "/tmp/ft-wt3-insufficient",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "wait_for_rch_admission",
+      "source": {
+        "comment_id": 7009,
+        "author": "SwarmCOD4",
+        "created_at": "2026-05-24T22:20:00Z",
+        "source_text_sha256": "9855a9d4a26332ef9da2ef0f946272b064566ea6e4b503c4a06c812048824eca",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": {
+        "attempted_at": "2026-05-24T22:20:30Z",
+        "outcome": "refused_insufficient_slots",
+        "rch_admission_state": "blocked_worker_pressure"
+      }
+    },
+    {
+      "bead_id": "ft-wt4",
+      "receipt_id": "ft-wt4:comment-7010",
+      "status": "wait_rch",
+      "reason_codes": [
+        "rch.telemetry_gap"
+      ],
+      "target_dir": "/tmp/ft-wt4-telemetry",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "wait_for_rch_admission",
+      "source": {
+        "comment_id": 7010,
+        "author": "SwarmCOD4",
+        "created_at": "2026-05-24T22:21:00Z",
+        "source_text_sha256": "aaf2b9f1c9ac0c41c6643d309c09ae67f29935b8a21f32e347efe2ecb45d659f",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": {
+        "attempted_at": "2026-05-24T22:21:30Z",
+        "outcome": "refused_telemetry_gap",
+        "rch_admission_state": "blocked_worker_pressure"
+      }
     }
   ],
   "explain": [
@@ -252,6 +324,33 @@
         "rch.topology_preflight_failed"
       ],
       "remediation": "wait_for_rch_admission"
+    },
+    {
+      "bead_id": "ft-wt2",
+      "status": "wait_rch",
+      "why": "RCH reported active-project exclusion because another FrankenTerm proof lane occupied the project admission window; the receipt waits for the active lane to clear.",
+      "blocking_reason_codes": [
+        "rch.active_project_exclusion"
+      ],
+      "remediation": "wait_for_rch_admission"
+    },
+    {
+      "bead_id": "ft-wt3",
+      "status": "wait_rch",
+      "why": "RCH reported insufficient slots for a remote-required proof; the receipt waits for RCH admission capacity.",
+      "blocking_reason_codes": [
+        "rch.insufficient_slots"
+      ],
+      "remediation": "wait_for_rch_admission"
+    },
+    {
+      "bead_id": "ft-wt4",
+      "status": "wait_rch",
+      "why": "RCH reported a telemetry gap, so admission truth is incomplete and the receipt waits for RCH to recover telemetry.",
+      "blocking_reason_codes": [
+        "rch.telemetry_gap"
+      ],
+      "remediation": "wait_for_rch_admission"
     }
   ],
   "robot_dispatch": [
@@ -295,6 +394,24 @@
       "bead_id": "ft-wt1",
       "status": "wait_rch",
       "target_dir": "/tmp/ft-wt1-latency",
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-wt2",
+      "status": "wait_rch",
+      "target_dir": "/tmp/ft-wt2-replay-types",
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-wt3",
+      "status": "wait_rch",
+      "target_dir": "/tmp/ft-wt3-insufficient",
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-wt4",
+      "status": "wait_rch",
+      "target_dir": "/tmp/ft-wt4-telemetry",
       "replay_allowed": false
     }
   ]

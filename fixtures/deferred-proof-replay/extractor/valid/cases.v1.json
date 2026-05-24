@@ -52,6 +52,74 @@
       ]
     },
     {
+      "case_id": "selected-worker-topology-preflight-closeout",
+      "bead_id": "ft-bf4cg",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6212,
+        "author": "MagentaFern",
+        "created_at": "2026-05-24T21:42:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-24T21:42Z MagentaFern closeout footer:\nProof-State: static_clean\nCommit: f17c5e03d\nTree: b4e9c77eb\nStatic-Checks: bash tests/e2e/test_deferred_proof_receipt_contract.sh; git diff --check\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bf4cg-core-test cargo test -p frankenterm-core wait_for_pattern_output_redaction_masks_secret_tokens --lib -- --nocapture\nProof-Kind: cargo_test\nPackage: frankenterm-core\nTest-Filter: wait_for_pattern_output_redaction_masks_secret_tokens\nFeature-Set: default\nTarget-Dir: /tmp/ft-bf4cg-core-test\nOwned-Paths: crates/frankenterm/src/main.rs, crates/frankenterm-core/src/mcp_tools.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: topology_preflight_failed\nBlocker: rch_topology_preflight"
+      },
+      "expected_state": "receipt_emitted",
+      "expected_reason_codes": [
+        "receipt_emitted",
+        "static_clean_remote_pending"
+      ]
+    },
+    {
+      "case_id": "active-project-exclusion-closeout",
+      "bead_id": "ft-5xwsu.3",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6213,
+        "author": "MagentaFern",
+        "created_at": "2026-05-24T21:12:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-24T21:12Z MagentaFern active-project closeout footer:\nProof-State: static_clean\nCommit: f17c5e03d\nTree: b4e9c77eb\nStatic-Checks: bash tests/e2e/test_deferred_proof_receipt_contract.sh; git diff --check\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-5xwsu3-active-project cargo test -p frankenterm-core-replay-types -- --nocapture\nProof-Kind: cargo_test\nPackage: frankenterm-core-replay-types\nTest-Filter:\nFeature-Set: default\nTarget-Dir: /tmp/ft-5xwsu3-active-project\nOwned-Paths: crates/frankenterm-core-replay-types/src/lib.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: unavailable_after_retry\nRCH-Admission: active_project_exclusion=1\nBlocker: rch_admission"
+      },
+      "expected_state": "receipt_emitted",
+      "expected_reason_codes": [
+        "receipt_emitted",
+        "static_clean_remote_pending"
+      ]
+    },
+    {
+      "case_id": "insufficient-slots-closeout",
+      "bead_id": "ft-zbnz4.12",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6214,
+        "author": "SwarmCOD4",
+        "created_at": "2026-05-24T22:20:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-24T22:20Z SwarmCOD4 insufficient-slots closeout footer:\nProof-State: static_clean\nCommit: 2098ec937\nTree: 2098ec937\nStatic-Checks: jq empty fixtures/deferred-proof-replay/receipt/valid/cases.v1.json; git diff --check\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-zbnz4-12-insufficient cargo test -p frankenterm-core --test conformance_pattern_pack_format -- --nocapture\nProof-Kind: cargo_test\nPackage: frankenterm-core\nTest-Filter: conformance_pattern_pack_format\nFeature-Set: default\nTarget-Dir: /tmp/ft-zbnz4-12-insufficient\nOwned-Paths: docs/json-schema/ft-deferred-proof-receipt.json, fixtures/deferred-proof-replay/receipt/valid/cases.v1.json, tests/e2e/test_deferred_proof_receipt_contract.sh\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: unavailable_after_retry\nRCH-Admission: insufficient_slots\nBlocker: rch_admission"
+      },
+      "expected_state": "receipt_emitted",
+      "expected_reason_codes": [
+        "receipt_emitted",
+        "static_clean_remote_pending"
+      ]
+    },
+    {
+      "case_id": "telemetry-gap-closeout",
+      "bead_id": "ft-zbnz4.12",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6215,
+        "author": "SwarmCOD4",
+        "created_at": "2026-05-24T22:21:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-24T22:21Z SwarmCOD4 telemetry-gap closeout footer:\nProof-State: static_clean\nCommit: 2098ec937\nTree: 2098ec937\nStatic-Checks: jq empty fixtures/deferred-proof-replay/extractor/valid/cases.v1.json; git diff --check\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-zbnz4-12-telemetry cargo check -p frankenterm-core --lib\nProof-Kind: cargo_check\nPackage: frankenterm-core\nTest-Filter:\nFeature-Set: default\nTarget-Dir: /tmp/ft-zbnz4-12-telemetry\nOwned-Paths: docs/json-schema/ft-deferred-proof-comment-extraction.json, fixtures/deferred-proof-replay/extractor/valid/cases.v1.json, tests/e2e/test_deferred_proof_comment_extractor_contract.sh\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: unavailable_after_retry\nRCH-Admission: telemetry_gap\nBlocker: rch_admission"
+      },
+      "expected_state": "receipt_emitted",
+      "expected_reason_codes": [
+        "receipt_emitted",
+        "static_clean_remote_pending"
+      ]
+    },
+    {
       "case_id": "ambiguous-prose-ineligible",
       "bead_id": "ft-bad1",
       "source_comment": {

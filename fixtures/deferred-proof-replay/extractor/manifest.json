@@ -8,9 +8,9 @@
   "expected_jsonl": "fixtures/deferred-proof-replay/extractor/expected/records.v1.jsonl",
   "invalid_fragments": "fixtures/deferred-proof-replay/extractor/invalid/fragments.v1.json",
   "golden_summary": {
-    "source_case_count": 11,
-    "output_record_count": 11,
-    "receipt_emitted_count": 3,
+    "source_case_count": 15,
+    "output_record_count": 15,
+    "receipt_emitted_count": 7,
     "ineligible_count": 7,
     "duplicate_count": 1,
     "reason_codes": [

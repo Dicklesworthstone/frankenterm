@@ -50,6 +50,9 @@ CONTRACT_ID = "ft.deferred_proof_receipt.v1"
 REQUIRED_VALID = %w[
   remote-required-cargo-proof
   selected-worker-topology-preflight-block
+  active-project-exclusion-block
+  insufficient-slots-block
+  telemetry-gap-block
   static-only-proof
   dirty-overlap-block
   prerequisite-bead-block
@@ -72,6 +75,9 @@ REQUIRED_INVALID = %w[
   prerequisite-bypass
   duplicate-env-allowlist
   topology-preflight-eligible-bypass
+  active-project-exclusion-eligible-bypass
+  insufficient-slots-eligible-bypass
+  telemetry-gap-eligible-bypass
 ].freeze
 REQUIRED_FORBIDDEN = %w[
   local_cargo_proof
@@ -208,6 +214,9 @@ def rejection_reasons(receipt)
   reasons << "prerequisite_blocked" if coordination.fetch("prerequisite_beads", []).any? && eligibility["state"] == "eligible"
   reasons << "operator_cancelled" if coordination["operator_cancelled"] == true && eligibility["replay_allowed"] != false
   reasons << "topology_preflight_not_eligible" if coordination["rch_admission_state"] == "topology_preflight_failed" && eligibility["state"] == "eligible"
+  reasons << "active_project_exclusion_not_eligible" if coordination["rch_admission_state"] == "active_project_exclusion" && eligibility["state"] == "eligible"
+  reasons << "insufficient_slots_not_eligible" if coordination["rch_admission_state"] == "insufficient_slots" && eligibility["state"] == "eligible"
+  reasons << "telemetry_gap_not_eligible" if coordination["rch_admission_state"] == "telemetry_gap" && eligibility["state"] == "eligible"
   Array(paths.fetch("artifact_paths", [])).each do |path|
     reasons << "unsafe_artifact_path" unless artifact_path_safe?(path) && File.file?(path)
   end
@@ -229,6 +238,8 @@ fail!("schema forbidden enum drifted") unless schema.dig("$defs", "forbidden_act
 fail!("schema command shape enum drifted") unless schema.dig("$defs", "command_receipt", "properties", "command_shape_version", "enum").sort == [REMOTE_SHAPE, STATIC_SHAPE].sort
 fail!("schema artifact path pattern missing safe roots") unless SAFE_ARTIFACT_ROOTS.all? { |root| schema.dig("$defs", "artifact_path", "pattern").include?(root.delete_suffix("/")) }
 fail!("schema missing topology preflight admission state") unless schema.dig("$defs", "coordination_snapshot", "properties", "rch_admission_state", "enum").include?("topology_preflight_failed")
+fail!("schema missing active project admission state") unless schema.dig("$defs", "coordination_snapshot", "properties", "rch_admission_state", "enum").include?("active_project_exclusion")
+fail!("schema missing insufficient slots admission state") unless schema.dig("$defs", "coordination_snapshot", "properties", "rch_admission_state", "enum").include?("insufficient_slots")
 
 fail!("manifest contract drifted") unless manifest["contract_id"] == CONTRACT_ID
 fail!("manifest schema path drifted") unless manifest["schema_path"] == SCHEMA
@@ -255,6 +266,33 @@ valid_cases.each do |entry|
     fail!("#{receipt_id} material proof missing cargo argv") unless remote_command_payload(command_argv(receipt)).include?("cargo")
   else
     fail!("#{receipt_id} static proof should not require RCH target dir") unless receipt.dig("command", "target_dir").nil?
+  end
+  if case_id == "active-project-exclusion-block"
+    coordination = receipt.fetch("coordination")
+    reason_codes = receipt.fetch("eligibility").fetch("reason_codes")
+    fail!("#{receipt_id} must classify active project exclusion separately") unless coordination["rch_admission_state"] == "active_project_exclusion"
+    fail!("#{receipt_id} active project exclusion must wait on RCH") unless receipt.dig("eligibility", "state") == "wait_rch"
+    fail!("#{receipt_id} active project exclusion must not replay") if receipt.dig("eligibility", "replay_allowed")
+    fail!("#{receipt_id} active project exclusion must record reason") unless reason_codes.include?("rch.active_project_exclusion")
+    fail!("#{receipt_id} active project exclusion must record remote-required proof") unless reason_codes.include?("proof.remote_required")
+  end
+  if case_id == "insufficient-slots-block"
+    coordination = receipt.fetch("coordination")
+    reason_codes = receipt.fetch("eligibility").fetch("reason_codes")
+    fail!("#{receipt_id} must classify insufficient slots separately") unless coordination["rch_admission_state"] == "insufficient_slots"
+    fail!("#{receipt_id} insufficient slots must wait on RCH") unless receipt.dig("eligibility", "state") == "wait_rch"
+    fail!("#{receipt_id} insufficient slots must not replay") if receipt.dig("eligibility", "replay_allowed")
+    fail!("#{receipt_id} insufficient slots must record reason") unless reason_codes.include?("rch.insufficient_slots")
+    fail!("#{receipt_id} insufficient slots must record remote-required proof") unless reason_codes.include?("proof.remote_required")
+  end
+  if case_id == "telemetry-gap-block"
+    coordination = receipt.fetch("coordination")
+    reason_codes = receipt.fetch("eligibility").fetch("reason_codes")
+    fail!("#{receipt_id} must classify telemetry gap separately") unless coordination["rch_admission_state"] == "telemetry_gap"
+    fail!("#{receipt_id} telemetry gap must wait on RCH") unless receipt.dig("eligibility", "state") == "wait_rch"
+    fail!("#{receipt_id} telemetry gap must not replay") if receipt.dig("eligibility", "replay_allowed")
+    fail!("#{receipt_id} telemetry gap must record reason") unless reason_codes.include?("rch.telemetry_gap")
+    fail!("#{receipt_id} telemetry gap must record remote-required proof") unless reason_codes.include?("proof.remote_required")
   end
   next unless case_id == "selected-worker-topology-preflight-block"
 
@@ -290,6 +328,15 @@ end
   "operator_cancelled",
   "selected-worker-topology-preflight-block",
   "topology_preflight_failed",
+  "active-project-exclusion-block",
+  "active_project_exclusion",
+  "rch.active_project_exclusion",
+  "insufficient-slots-block",
+  "insufficient_slots",
+  "rch.insufficient_slots",
+  "telemetry-gap-block",
+  "telemetry_gap",
+  "rch.telemetry_gap",
   "selected_worker",
   "fixtures/deferred-proof-replay/receipt/"
 ].each do |term|
