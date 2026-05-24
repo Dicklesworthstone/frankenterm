@@ -1,10 +1,10 @@
 use crate::{Position, StableRowIndex, TerminalState};
 use anyhow::Context;
-use frankenterm_cell::image::{ImageCell, ImageDataType};
 use frankenterm_cell::Cell;
-use frankenterm_surface::change::ImageData;
+use frankenterm_cell::image::{ImageCell, ImageDataType};
 use frankenterm_surface::TextureCoordinate;
-use humansize::{SizeFormatter, DECIMAL};
+use frankenterm_surface::change::ImageData;
+use humansize::{DECIMAL, SizeFormatter};
 use num_traits::{One, Zero};
 use ordered_float::NotNan;
 use std::convert::TryFrom;
@@ -263,12 +263,20 @@ impl TerminalState {
         }
 
         // adjust cursor position if the drawn cells move beyond current cell
-        let x_padding_shift: i64 = one_or_zero(
-            draw_width as usize + cell_padding_left as usize > cell_pixel_width * width_in_cells,
-        );
-        let y_padding_shift: i64 = one_or_zero(
-            draw_height as usize + cell_padding_top as usize > cell_pixel_height * height_in_cells,
-        );
+        let x_padding_shift: i64 = one_or_zero(checked_padded_image_exceeds_cell_span(
+            IMAGE_CELL_SPAN_COLUMNS,
+            draw_width,
+            cell_padding_left,
+            cell_pixel_width,
+            width_in_cells,
+        )?);
+        let y_padding_shift: i64 = one_or_zero(checked_padded_image_exceeds_cell_span(
+            IMAGE_CELL_SPAN_ROWS,
+            draw_height,
+            cell_padding_top,
+            cell_pixel_height,
+            height_in_cells,
+        )?);
         if !params.do_not_move_cursor {
             // Sixel places the cursor under the left corner of the image,
             // unless sixel_scrolls_right is enabled.
@@ -351,11 +359,7 @@ pub(crate) fn dimensions(data: &[u8]) -> anyhow::Result<ImageInfo> {
 
 /// Returns `1` if `b` is true, else `0`,
 fn one_or_zero<T: Zero + One>(b: bool) -> T {
-    if b {
-        T::one()
-    } else {
-        T::zero()
-    }
+    if b { T::one() } else { T::zero() }
 }
 
 fn checked_explicit_cell_span_pixels(
@@ -407,6 +411,23 @@ fn checked_target_pixels(
         .checked_mul(cell_pixels)
         .and_then(|value| value.checked_add(remainder_pixels))
         .ok_or_else(|| anyhow::anyhow!("image placement {axis} target pixel span overflows"))
+}
+
+fn checked_padded_image_exceeds_cell_span(
+    axis: &str,
+    draw_pixels: u32,
+    padding_pixels: u16,
+    cell_pixels: usize,
+    cells: usize,
+) -> anyhow::Result<bool> {
+    let drawn_with_padding = usize::try_from(draw_pixels)
+        .with_context(|| format!("image placement {axis} draw pixels exceed usize"))?
+        .checked_add(padding_pixels as usize)
+        .ok_or_else(|| anyhow::anyhow!("image placement {axis} padded draw span overflows"))?;
+    let cell_span = cells.checked_mul(cell_pixels).ok_or_else(|| {
+        anyhow::anyhow!("image placement {axis} cell span overflows: {cells} * {cell_pixels}")
+    })?;
+    Ok(drawn_with_padding > cell_span)
 }
 
 #[cfg(test)]
@@ -594,6 +615,20 @@ mod tests {
             .expect("bounded placement should attach");
         assert_eq!(info.cols, 2);
         assert_eq!(info.rows, 2);
+    }
+
+    #[test]
+    fn padded_image_span_checks_boundary_without_overflow() {
+        assert!(
+            !checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 9, 1, 5, 2).unwrap()
+        );
+        assert!(
+            checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 9, 2, 5, 2).unwrap()
+        );
+        assert!(
+            checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 1, 0, usize::MAX, 2)
+                .is_err()
+        );
     }
 
     // ── check_image_dimensions ─────────────────────────────
