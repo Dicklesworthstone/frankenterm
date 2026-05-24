@@ -67,7 +67,11 @@
       "properties": {
         "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "tree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "branch": { "type": "string" }
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
       }
     },
     "artifacts": {

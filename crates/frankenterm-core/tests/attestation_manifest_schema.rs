@@ -350,6 +350,21 @@ fn bundle_schema_rejects_malformed_release_tags() {
 }
 
 #[test]
+fn bundle_schema_rejects_blank_git_branch() {
+    let validator = bundle_validator();
+    let mut bundle = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle tracked by ft-e87u6.2"
+    }));
+    bundle["git"]["branch"] = json!(" \t");
+    assert!(
+        !validate(&validator, &bundle).is_empty(),
+        "bundle git.branch must reject blank provenance text"
+    );
+}
+
+#[test]
 fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({
