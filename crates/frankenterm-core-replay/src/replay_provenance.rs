@@ -193,7 +193,7 @@ impl ReplayProvenanceEmitter {
     pub fn record(&self, params: ProvenanceRecordParams) -> u64 {
         let mut inner = self.lock_inner("record");
         let position = inner.next_position;
-        inner.next_position += 1;
+        inner.next_position = inner.next_position.saturating_add(1);
 
         let input_hash = compute_hash(&params.input_data);
 
@@ -532,7 +532,7 @@ impl ReplayAuditTrail {
     pub fn append(&self, params: AuditEntryParams) -> u64 {
         let mut inner = self.lock_inner("append");
         let ordinal = inner.next_ordinal;
-        inner.next_ordinal += 1;
+        inner.next_ordinal = inner.next_ordinal.saturating_add(1);
 
         let entry = ReplayAuditEntry {
             audit_version: REPLAY_AUDIT_VERSION.to_string(),
@@ -829,6 +829,21 @@ mod tests {
     }
 
     #[test]
+    fn emitter_position_saturates_at_u64_max() {
+        let emitter = ReplayProvenanceEmitter::with_defaults("run_sat".into());
+        {
+            let mut inner = emitter.lock_inner("test_saturating_position");
+            inner.next_position = u64::MAX;
+        }
+
+        let p0 = emitter.record(make_params("a", DecisionType::PatternMatch, "r"));
+        let p1 = emitter.record(make_params("b", DecisionType::PatternMatch, "r"));
+
+        assert_eq!(p0, u64::MAX);
+        assert_eq!(p1, u64::MAX);
+    }
+
+    #[test]
     fn emitter_minimal_omits_input() {
         let config = ProvenanceConfig {
             verbosity: ProvenanceVerbosity::Minimal,
@@ -1111,6 +1126,21 @@ mod tests {
         let entries = trail.entries();
         assert_eq!(entries[0].prev_entry_hash, REPLAY_AUDIT_GENESIS);
         assert_eq!(entries[1].prev_entry_hash, entries[0].hash());
+    }
+
+    #[test]
+    fn audit_trail_ordinal_saturates_at_u64_max() {
+        let trail = ReplayAuditTrail::new();
+        {
+            let mut inner = trail.lock_inner("test_saturating_ordinal");
+            inner.next_ordinal = u64::MAX;
+        }
+
+        let o0 = trail.append(make_audit_params("run_1"));
+        let o1 = trail.append(make_audit_params("run_2"));
+
+        assert_eq!(o0, u64::MAX);
+        assert_eq!(o1, u64::MAX);
     }
 
     #[test]
