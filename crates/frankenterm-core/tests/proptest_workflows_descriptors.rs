@@ -368,6 +368,34 @@ proptest! {
     }
 
     #[test]
+    fn empty_nested_step_id_fails_validation(
+        name in "[a-z_]{3,20}",
+    ) {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name,
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Loop {
+                id: "outer_loop".to_string(),
+                description: None,
+                count: 1,
+                body: vec![DescriptorStep::Log {
+                    id: "   ".to_string(),
+                    description: None,
+                    message: "empty nested id".to_string(),
+                }],
+            }],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "empty nested step ids must be rejected"
+        );
+    }
+
+    #[test]
     fn send_text_step_respects_configured_text_length_limit(
         max_text_len in 0usize..128,
     ) {
