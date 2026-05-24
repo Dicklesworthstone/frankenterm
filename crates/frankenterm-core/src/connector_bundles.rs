@@ -498,20 +498,20 @@ impl IngestionPipeline {
 
     /// Ingest a canonical connector event into the audit chain.
     pub fn ingest(&mut self, event: &CanonicalConnectorEvent, now_ms: u64) -> IngestionOutcome {
-        self.telemetry.events_received += 1;
+        self.telemetry.events_received = self.telemetry.events_received.saturating_add(1);
 
         // Direction filter.
         match event.direction {
             EventDirection::Inbound if !self.config.ingest_inbound => {
-                self.telemetry.events_filtered += 1;
+                self.telemetry.events_filtered = self.telemetry.events_filtered.saturating_add(1);
                 return IngestionOutcome::Filtered;
             }
             EventDirection::Outbound if !self.config.ingest_outbound => {
-                self.telemetry.events_filtered += 1;
+                self.telemetry.events_filtered = self.telemetry.events_filtered.saturating_add(1);
                 return IngestionOutcome::Filtered;
             }
             EventDirection::Lifecycle if !self.config.ingest_lifecycle => {
-                self.telemetry.events_filtered += 1;
+                self.telemetry.events_filtered = self.telemetry.events_filtered.saturating_add(1);
                 return IngestionOutcome::Filtered;
             }
             _ => {}
@@ -520,19 +520,19 @@ impl IngestionPipeline {
         // Severity gate.
         let event_severity = severity_to_level(event.severity);
         if event_severity < self.config.min_severity_level {
-            self.telemetry.events_filtered += 1;
+            self.telemetry.events_filtered = self.telemetry.events_filtered.saturating_add(1);
             return IngestionOutcome::Filtered;
         }
 
         // Validation.
         if event.connector_id.is_empty() {
-            self.telemetry.events_rejected += 1;
+            self.telemetry.events_rejected = self.telemetry.events_rejected.saturating_add(1);
             return IngestionOutcome::Rejected {
                 reason: "empty connector_id".to_string(),
             };
         }
         if event.event_id.is_empty() {
-            self.telemetry.events_rejected += 1;
+            self.telemetry.events_rejected = self.telemetry.events_rejected.saturating_add(1);
             return IngestionOutcome::Rejected {
                 reason: "empty event_id".to_string(),
             };
@@ -545,19 +545,25 @@ impl IngestionPipeline {
                 self.window_count = 0;
             }
             if self.window_count >= self.config.max_ingest_per_sec {
-                self.telemetry.events_rejected += 1;
+                self.telemetry.events_rejected = self.telemetry.events_rejected.saturating_add(1);
                 return IngestionOutcome::Rejected {
                     reason: "rate limit exceeded".to_string(),
                 };
             }
-            self.window_count += 1;
+            self.window_count = self.window_count.saturating_add(1);
         }
 
         // Record direction-specific counter.
         match event.direction {
-            EventDirection::Lifecycle => self.telemetry.lifecycle_events += 1,
-            EventDirection::Inbound => self.telemetry.inbound_events += 1,
-            EventDirection::Outbound => self.telemetry.outbound_events += 1,
+            EventDirection::Lifecycle => {
+                self.telemetry.lifecycle_events = self.telemetry.lifecycle_events.saturating_add(1);
+            }
+            EventDirection::Inbound => {
+                self.telemetry.inbound_events = self.telemetry.inbound_events.saturating_add(1);
+            }
+            EventDirection::Outbound => {
+                self.telemetry.outbound_events = self.telemetry.outbound_events.saturating_add(1);
+            }
         }
 
         // Build audit entry description.
@@ -576,7 +582,7 @@ impl IngestionPipeline {
         self.audit_chain
             .append(kind, &event.connector_id, &description, &entity_ref, now_ms);
 
-        self.telemetry.events_recorded += 1;
+        self.telemetry.events_recorded = self.telemetry.events_recorded.saturating_add(1);
         IngestionOutcome::Recorded
     }
 
@@ -766,9 +772,10 @@ impl BundleRegistry {
         }
 
         let validation = validate_bundle(&bundle);
-        self.telemetry.validations_run += 1;
+        self.telemetry.validations_run = self.telemetry.validations_run.saturating_add(1);
         if !validation.valid {
-            self.telemetry.validation_failures += 1;
+            self.telemetry.validation_failures =
+                self.telemetry.validation_failures.saturating_add(1);
             return Err(BundleRegistryError::ValidationFailed {
                 reason: validation.errors.join("; "),
             });
@@ -776,7 +783,7 @@ impl BundleRegistry {
 
         let bundle_id = bundle.bundle_id.clone();
         self.bundles.insert(bundle_id.clone(), bundle);
-        self.telemetry.bundles_registered += 1;
+        self.telemetry.bundles_registered = self.telemetry.bundles_registered.saturating_add(1);
         self.record_audit(BundleAuditAction::Registered, &bundle_id, actor, now_ms, "");
         Ok(())
     }
@@ -795,9 +802,10 @@ impl BundleRegistry {
         }
 
         let validation = validate_bundle(&bundle);
-        self.telemetry.validations_run += 1;
+        self.telemetry.validations_run = self.telemetry.validations_run.saturating_add(1);
         if !validation.valid {
-            self.telemetry.validation_failures += 1;
+            self.telemetry.validation_failures =
+                self.telemetry.validation_failures.saturating_add(1);
             return Err(BundleRegistryError::ValidationFailed {
                 reason: validation.errors.join("; "),
             });
@@ -805,7 +813,7 @@ impl BundleRegistry {
 
         let bundle_id = bundle.bundle_id.clone();
         self.bundles.insert(bundle_id.clone(), bundle);
-        self.telemetry.bundles_updated += 1;
+        self.telemetry.bundles_updated = self.telemetry.bundles_updated.saturating_add(1);
         self.record_audit(BundleAuditAction::Updated, &bundle_id, actor, now_ms, "");
         Ok(())
     }
@@ -823,7 +831,7 @@ impl BundleRegistry {
                 .ok_or_else(|| BundleRegistryError::NotFound {
                     bundle_id: bundle_id.to_string(),
                 })?;
-        self.telemetry.bundles_removed += 1;
+        self.telemetry.bundles_removed = self.telemetry.bundles_removed.saturating_add(1);
         self.record_audit(BundleAuditAction::Removed, bundle_id, actor, now_ms, "");
         Ok(bundle)
     }
@@ -1482,6 +1490,37 @@ mod tests {
     }
 
     #[test]
+    fn registry_telemetry_counters_saturate() {
+        let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
+        reg.telemetry = BundleRegistryTelemetry {
+            bundles_registered: u64::MAX,
+            bundles_removed: u64::MAX,
+            bundles_updated: u64::MAX,
+            validations_run: u64::MAX,
+            validation_failures: u64::MAX,
+        };
+
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
+        let mut updated = tier1_devtools_bundle(2000);
+        updated.version = "2.0.0".to_string();
+        reg.update(updated, "a", 2000).unwrap();
+        reg.remove("ft-bundle-devtools", "a", 3000).unwrap();
+        let invalid = ConnectorBundle::new("", "", BundleTier::Tier1, BundleCategory::General, 0);
+        assert!(matches!(
+            reg.register(invalid, "a", 4000),
+            Err(BundleRegistryError::ValidationFailed { .. })
+        ));
+
+        let t = reg.telemetry();
+        assert_eq!(t.bundles_registered, u64::MAX);
+        assert_eq!(t.bundles_removed, u64::MAX);
+        assert_eq!(t.bundles_updated, u64::MAX);
+        assert_eq!(t.validations_run, u64::MAX);
+        assert_eq!(t.validation_failures, u64::MAX);
+    }
+
+    #[test]
     fn registry_snapshot() {
         let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
         reg.register(tier1_devtools_bundle(1000), "a", 1000)
@@ -1523,6 +1562,73 @@ mod tests {
         assert_eq!(pipeline.telemetry().events_received, 1);
         assert_eq!(pipeline.telemetry().events_recorded, 1);
         assert_eq!(pipeline.telemetry().inbound_events, 1);
+    }
+
+    #[test]
+    fn ingestion_telemetry_counters_saturate() {
+        let config = IngestionPipelineConfig {
+            ingest_inbound: false,
+            max_ingest_per_sec: u64::MAX,
+            ..Default::default()
+        };
+        let mut pipeline = IngestionPipeline::new(config);
+        pipeline.telemetry = IngestionTelemetry {
+            events_received: u64::MAX,
+            events_recorded: u64::MAX,
+            events_filtered: u64::MAX,
+            events_rejected: u64::MAX,
+            lifecycle_events: u64::MAX,
+            inbound_events: u64::MAX,
+            outbound_events: u64::MAX,
+        };
+        pipeline.window_count = u64::MAX - 1;
+        pipeline.window_start_ms = 1000;
+
+        let inbound = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
+        assert_eq!(pipeline.ingest(&inbound, 1000), IngestionOutcome::Filtered);
+
+        pipeline.config.ingest_inbound = true;
+        let invalid = sample_event("", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        assert!(matches!(
+            pipeline.ingest(&invalid, 1001),
+            IngestionOutcome::Rejected { .. }
+        ));
+        assert_eq!(pipeline.ingest(&inbound, 1002), IngestionOutcome::Recorded);
+        assert_eq!(pipeline.window_count, u64::MAX);
+        pipeline.config.max_ingest_per_sec = 0;
+
+        let lifecycle = sample_event(
+            "conn-github",
+            "state",
+            EventDirection::Lifecycle,
+            CanonicalSeverity::Info,
+        );
+        assert_eq!(
+            pipeline.ingest(&lifecycle, 2000),
+            IngestionOutcome::Recorded
+        );
+
+        let outbound = sample_event(
+            "conn-github",
+            "send",
+            EventDirection::Outbound,
+            CanonicalSeverity::Info,
+        );
+        assert_eq!(pipeline.ingest(&outbound, 2001), IngestionOutcome::Recorded);
+
+        let t = pipeline.telemetry();
+        assert_eq!(t.events_received, u64::MAX);
+        assert_eq!(t.events_recorded, u64::MAX);
+        assert_eq!(t.events_filtered, u64::MAX);
+        assert_eq!(t.events_rejected, u64::MAX);
+        assert_eq!(t.lifecycle_events, u64::MAX);
+        assert_eq!(t.inbound_events, u64::MAX);
+        assert_eq!(t.outbound_events, u64::MAX);
     }
 
     #[test]
