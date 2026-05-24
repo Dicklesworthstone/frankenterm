@@ -578,6 +578,66 @@ proptest! {
     }
 
     #[test]
+    fn nested_steps_count_against_configured_step_limit(
+        max_steps in 2usize..16,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_steps,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit_body = (0..max_steps.saturating_sub(1))
+            .map(|idx| DescriptorStep::Log {
+                id: format!("at_child_{idx}"),
+                description: None,
+                message: "child".to_string(),
+            })
+            .collect();
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "nested_steps_at_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Loop {
+                id: "root_loop".to_string(),
+                description: None,
+                count: 1,
+                body: at_limit_body,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "nested descriptor with exactly max_steps total nodes should validate"
+        );
+
+        let over_limit_body = (0..max_steps)
+            .map(|idx| DescriptorStep::Log {
+                id: format!("over_child_{idx}"),
+                description: None,
+                message: "child".to_string(),
+            })
+            .collect();
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "nested_steps_over_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Loop {
+                id: "root_loop".to_string(),
+                description: None,
+                count: 1,
+                body: over_limit_body,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "nested descriptor with more than max_steps total nodes should fail validation"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();

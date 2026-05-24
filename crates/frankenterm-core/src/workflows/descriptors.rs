@@ -165,6 +165,15 @@ impl WorkflowDescriptor {
         for step in &self.steps {
             validate_step_tree(step, limits, &mut seen, 0)?;
         }
+        if seen.len() > limits.max_steps {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(format!(
+                    "Descriptor has too many total steps ({} > max {})",
+                    seen.len(),
+                    limits.max_steps
+                )),
+            ));
+        }
 
         Ok(())
     }
