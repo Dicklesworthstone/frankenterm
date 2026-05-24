@@ -8,7 +8,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::chaos_scale_harness::FailureClass;
 use frankenterm_core::runtime_telemetry::{
-    SwarmCapacityCertificateConfig, SwarmCapacityOutcome, SwarmCapacityRegressionBudget,
+    SwarmCapacityCertificateConfig, SwarmCapacityDriftDetector,
+    SwarmCapacityExpectedLossPolicyConfig, SwarmCapacityOutcome, SwarmCapacityRegressionBudget,
     SwarmCapacityRegressionGateStatus, SwarmCapacityStage, SwarmCapacityTelemetry,
     SwarmTailRiskMonitorConfig, SwarmTailRiskStatus,
 };
@@ -263,5 +264,35 @@ fn tail_risk_report_does_not_violate_certificate_against_itself() {
         report.status,
         SwarmTailRiskStatus::Violated,
         "a certificate must not show violated tail risk against its own baseline"
+    );
+}
+
+/// The change-point drift detector is deterministic and produces a
+/// well-formed per-mille change probability. Two fresh detectors observing
+/// identical evidence (certificate + tail-risk report + policy) emit
+/// identical drift events, and the change probability never exceeds 1000‰.
+#[test]
+fn drift_detector_observe_is_deterministic_and_probability_bounded() {
+    let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
+    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    let snapshot = telemetry.snapshot();
+    let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
+    let report = cert.tail_risk_report(&cert, SwarmTailRiskMonitorConfig::default());
+    let policy = SwarmCapacityExpectedLossPolicyConfig::default();
+
+    let mut detector_a = SwarmCapacityDriftDetector::default();
+    let mut detector_b = SwarmCapacityDriftDetector::default();
+    let event_a = detector_a.observe_certificate(&cert, &report, &policy);
+    let event_b = detector_b.observe_certificate(&cert, &report, &policy);
+
+    assert_eq!(
+        event_a, event_b,
+        "two fresh detectors observing identical evidence must emit identical drift events"
+    );
+    assert!(
+        event_a.change_probability_per_1000 <= 1000,
+        "change probability {} must be a per-mille value <= 1000",
+        event_a.change_probability_per_1000
     );
 }
