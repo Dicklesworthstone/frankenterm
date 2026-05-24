@@ -791,6 +791,21 @@ fn collect_pane_entries(node: &mux::tab::PaneNode, out: &mut Vec<PaneInfo>) {
 }
 
 #[cfg(all(feature = "vendored", unix))]
+fn mux_usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn mux_usize_to_i64_saturating(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn mux_stable_row_to_u32_saturating(value: isize) -> u32 {
+    u32::try_from(value).unwrap_or(if value < 0 { 0 } else { u32::MAX })
+}
+
+#[cfg(all(feature = "vendored", unix))]
 impl From<&mux::tab::PaneEntry> for PaneInfo {
     fn from(entry: &mux::tab::PaneEntry) -> Self {
         Self {
@@ -801,10 +816,10 @@ impl From<&mux::tab::PaneEntry> for PaneInfo {
             domain_name: None,
             workspace: Some(entry.workspace.clone()),
             size: Some(PaneSize {
-                rows: entry.size.rows as u32,
-                cols: entry.size.cols as u32,
-                pixel_width: Some(entry.size.pixel_width as u32),
-                pixel_height: Some(entry.size.pixel_height as u32),
+                rows: mux_usize_to_u32_saturating(entry.size.rows),
+                cols: mux_usize_to_u32_saturating(entry.size.cols),
+                pixel_width: Some(mux_usize_to_u32_saturating(entry.size.pixel_width)),
+                pixel_height: Some(mux_usize_to_u32_saturating(entry.size.pixel_height)),
                 dpi: Some(entry.size.dpi),
             }),
             rows: None,
@@ -812,11 +827,11 @@ impl From<&mux::tab::PaneEntry> for PaneInfo {
             title: Some(entry.title.clone()),
             cwd: entry.working_dir.as_ref().map(|u| u.url.to_string()),
             tty_name: entry.tty_name.clone(),
-            cursor_x: Some(entry.cursor_pos.x as u32),
-            cursor_y: Some(entry.cursor_pos.y as u32),
+            cursor_x: Some(mux_usize_to_u32_saturating(entry.cursor_pos.x)),
+            cursor_y: Some(mux_stable_row_to_u32_saturating(entry.cursor_pos.y)),
             cursor_visibility: None,
-            left_col: Some(entry.left_col as u32),
-            top_row: Some(entry.top_row as i64),
+            left_col: Some(mux_usize_to_u32_saturating(entry.left_col)),
+            top_row: Some(mux_usize_to_i64_saturating(entry.top_row)),
             is_active: entry.is_active_pane,
             is_zoomed: entry.is_zoomed_pane,
             extra: std::collections::HashMap::new(),
@@ -4297,6 +4312,79 @@ mod tests {
         let size = pane.size.as_ref().unwrap();
         assert_eq!(size.pixel_width, Some(960));
         assert_eq!(size.dpi, Some(96));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn pane_info_from_mux_entry_saturates_large_geometry() {
+        let entry = mux::tab::PaneEntry {
+            window_id: 1,
+            tab_id: 2,
+            pane_id: 3,
+            title: "large".to_string(),
+            size: frankenterm_term::TerminalSize {
+                rows: usize::MAX,
+                cols: (u32::MAX as usize).saturating_add(1),
+                pixel_width: usize::MAX,
+                pixel_height: (u32::MAX as usize).saturating_add(1),
+                dpi: 96,
+            },
+            working_dir: None,
+            alt_screen_active: false,
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: "default".to_string(),
+            cursor_pos: mux::renderable::StableCursorPosition {
+                x: usize::MAX,
+                y: isize::MAX,
+                ..Default::default()
+            },
+            physical_top: 0,
+            top_row: usize::MAX,
+            left_col: usize::MAX,
+            tty_name: None,
+        };
+
+        let pane = PaneInfo::from(&entry);
+        let size = pane.size.expect("mux pane info should include size");
+
+        assert_eq!(size.rows, u32::MAX);
+        assert_eq!(size.cols, u32::MAX);
+        assert_eq!(size.pixel_width, Some(u32::MAX));
+        assert_eq!(size.pixel_height, Some(u32::MAX));
+        assert_eq!(pane.cursor_x, Some(u32::MAX));
+        assert_eq!(pane.cursor_y, Some(u32::MAX));
+        assert_eq!(pane.left_col, Some(u32::MAX));
+        assert_eq!(pane.top_row, Some(i64::MAX));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn pane_info_from_mux_entry_clamps_negative_cursor_row_to_zero() {
+        let entry = mux::tab::PaneEntry {
+            window_id: 1,
+            tab_id: 2,
+            pane_id: 3,
+            title: "negative".to_string(),
+            size: frankenterm_term::TerminalSize::default(),
+            working_dir: None,
+            alt_screen_active: false,
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: "default".to_string(),
+            cursor_pos: mux::renderable::StableCursorPosition {
+                y: -1,
+                ..Default::default()
+            },
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        };
+
+        let pane = PaneInfo::from(&entry);
+
+        assert_eq!(pane.cursor_y, Some(0));
     }
 
     #[test]
