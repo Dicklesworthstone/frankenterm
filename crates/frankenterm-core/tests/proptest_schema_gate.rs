@@ -106,6 +106,20 @@ fn arb_widening_pair() -> impl Strategy<Value = (String, String)> {
     ]
 }
 
+/// Build a single-field snapshot carrying `field_type`.
+fn single_field_snapshot(field_type: &str, version: &str) -> SchemaSnapshot {
+    SchemaSnapshot {
+        fields: vec![SchemaField {
+            name: "x".to_string(),
+            field_type: field_type.to_string(),
+            required: !field_type.starts_with("Option<"),
+            indexed: true,
+        }],
+        version: version.to_string(),
+        captured_at_ms: 0,
+    }
+}
+
 // =============================================================================
 // SchemaField serde roundtrip
 // =============================================================================
@@ -449,6 +463,34 @@ proptest! {
         };
         let result = check_schema_preservation(&source, &target);
         prop_assert!(!result.safe);
+    }
+
+    /// Metamorphic relation: wrapping both sides of a type change in
+    /// Option<...> must not change the migration-safety verdict. Option<u32> →
+    /// Option<u64> is as safe as u32 → u64, and lossy inner changes stay lossy
+    /// when wrapped. Guards the schema-gate nested-Option recursion.
+    #[test]
+    fn option_wrapping_preserves_safety(
+        a in arb_type_name(),
+        b in arb_type_name(),
+    ) {
+        let bare = check_schema_preservation(
+            &single_field_snapshot(&a, "v1"),
+            &single_field_snapshot(&b, "v2"),
+        );
+        let wrapped = check_schema_preservation(
+            &single_field_snapshot(&format!("Option<{a}>"), "v1"),
+            &single_field_snapshot(&format!("Option<{b}>"), "v2"),
+        );
+        prop_assert_eq!(
+            bare.safe,
+            wrapped.safe,
+            "Option-wrapping changed safety for {} -> {}: bare={}, wrapped={}",
+            a,
+            b,
+            bare.safe,
+            wrapped.safe
+        );
     }
 
     /// Same type → same type has no type mismatches.
