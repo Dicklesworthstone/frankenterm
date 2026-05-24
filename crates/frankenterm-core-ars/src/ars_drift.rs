@@ -92,6 +92,14 @@ impl EValueConfig {
             0.0
         }
     }
+
+    fn effective_decay(&self) -> f64 {
+        if self.decay.is_finite() && (0.0..=1.0).contains(&self.decay) {
+            self.decay
+        } else {
+            1.0
+        }
+    }
 }
 
 // =============================================================================
@@ -266,7 +274,7 @@ impl EValueMonitor {
         let factor = factor.max(0.0);
 
         // Apply decay to prevent old evidence from dominating.
-        self.e_value = self.e_value * config.decay * factor;
+        self.e_value = self.e_value * config.effective_decay() * factor;
 
         // Clamp to avoid infinity.
         self.e_value = self.e_value.min(1e15);
@@ -667,6 +675,26 @@ mod tests {
 
         assert!(verdict.has_sufficient_data());
         assert!(monitor.e_value().is_finite());
+    }
+
+    #[test]
+    fn invalid_decay_does_not_poison_e_value() {
+        for decay in [f64::NAN, f64::INFINITY, -0.25, 1.25] {
+            let config = EValueConfig {
+                decay,
+                ..quick_config()
+            };
+            let mut monitor = EValueMonitor::new("c1");
+
+            for outcome in [1.0, 1.0, 1.0, 0.0, 0.0] {
+                monitor.observe(outcome, &config);
+            }
+            let verdict = monitor.observe(0.0, &config);
+
+            assert!(verdict.has_sufficient_data());
+            assert!(monitor.e_value().is_finite());
+            assert!(monitor.e_value() >= 0.0);
+        }
     }
 
     // ---- E-value behavior ----
