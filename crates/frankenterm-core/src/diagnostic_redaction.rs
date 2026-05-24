@@ -368,9 +368,19 @@ impl DiagnosticRedactor {
 
     /// Truncate a string value to the budget limit.
     fn truncate_value(&self, text: &str, stats: &mut RedactionStats) -> serde_json::Value {
-        if text.len() > self.budget.max_detail_value_len {
+        let limit = self.budget.max_detail_value_len;
+        if text.len() > limit {
             stats.details_truncated += 1;
-            let truncated = &text[..self.budget.max_detail_value_len];
+            let truncate_at = if text.is_char_boundary(limit) {
+                limit
+            } else {
+                text.char_indices()
+                    .map(|(idx, _)| idx)
+                    .take_while(|idx| *idx <= limit)
+                    .last()
+                    .unwrap_or(0)
+            };
+            let truncated = &text[..truncate_at];
             serde_json::Value::String(format!("{truncated}... [truncated]"))
         } else {
             serde_json::Value::String(text.to_string())
@@ -796,6 +806,24 @@ mod tests {
         assert!(val.len() < 100);
     }
 
+    #[test]
+    fn redact_event_truncates_on_utf8_boundary() {
+        let budget = DiagnosticPrivacyBudget {
+            max_detail_value_len: 3,
+            ..Default::default()
+        };
+        let redactor = DiagnosticRedactor::new(DiagnosticFieldPolicy::default(), budget);
+
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+            .detail_str("scope_tier", "ééé")
+            .reason("test")
+            .build();
+
+        let safe = redactor.redact_event(&event);
+        let val = safe.details.get("scope_tier").unwrap().as_str().unwrap();
+        assert_eq!(val, "é... [truncated]");
+    }
+
     // ── Events collection redaction ──
 
     #[test]
@@ -885,9 +913,9 @@ mod tests {
 
         let check = RuntimeHealthCheck::warn("test", "Test", "Issue")
             .with_remediation(RemediationHint::with_command(
-                "Fix auth",
-                "curl -H 'Authorization: Bearer sk-ant-secret123456789012345' https://api.example.com",
-            ));
+            "Fix auth",
+            "curl -H 'Authorization: Bearer sk-ant-secret123456789012345' https://api.example.com",
+        ));
 
         let safe = redactor.redact_health_check(&check);
         let cmd = safe.remediation[0].command.as_ref().unwrap();
@@ -994,11 +1022,9 @@ mod tests {
 
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.policy_name, "default");
-        assert!(
-            report
-                .always_redact_keys
-                .contains(&"error_message".to_string())
-        );
+        assert!(report
+            .always_redact_keys
+            .contains(&"error_message".to_string()));
         assert!(report.always_safe_keys.contains(&"queue_depth".to_string()));
     }
 
