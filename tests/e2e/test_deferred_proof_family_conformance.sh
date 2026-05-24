@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cross-contract conformance harness for the deferred-proof contract family
-# (ft-zbnz4.{1,2,3,5}). Locks the vocabulary the family must share so editing one
+# (ft-zbnz4.{1,2,3,5,8}). Locks the vocabulary the family must share so editing one
 # contract's enum and forgetting the others fails loudly. Static; no RCH needed.
 set -euo pipefail
 
@@ -50,9 +50,10 @@ CANONICAL_COMMAND_SHAPE = %w[rch-no-self-healing-v1 static-verifier-v1].freeze
 # The coarse, derived admission vocabulary the extractor projection and the queue
 # surface share. Intentionally distinct from the receipt's richer *captured*
 # vocabulary (admissible / critical_pressure / no_admissible_workers /
-# telemetry_gap), which records raw RCH signals before they are coarsened.
+# telemetry_gap / topology_preflight_failed), which records raw RCH signals
+# before they are coarsened.
 COARSE_ADMISSION = %w[admitted blocked_worker_pressure not_required unknown].freeze
-RICH_ADMISSION = %w[admissible critical_pressure no_admissible_workers telemetry_gap not_required unknown].freeze
+RICH_ADMISSION = %w[admissible critical_pressure no_admissible_workers telemetry_gap topology_preflight_failed not_required unknown].freeze
 BANNED_RAW_KEYS = %w[source_text pane_text raw_pane_text raw_pane_content].freeze
 
 def fail!(message)
@@ -92,6 +93,24 @@ def property_maps(node, acc = [])
   acc
 end
 
+# Every object-schema node (one that declares `properties`) and the trail to
+# it, when it does NOT pin additionalProperties:false. This is strictly
+# stronger than the named-raw-key ban below: additionalProperties:false
+# rejects ANY unknown field, so a future edit cannot smuggle an unvalidated
+# raw-content field under a name not yet on the ban list.
+def object_nodes_missing_ap_false(node, trail = "<root>", acc = [])
+  case node
+  when Hash
+    if node["properties"].is_a?(Hash) && node["additionalProperties"] != false
+      acc << trail
+    end
+    node.each { |key, value| object_nodes_missing_ap_false(value, "#{trail}/#{key}", acc) }
+  when Array
+    node.each_with_index { |item, idx| object_nodes_missing_ap_false(item, "#{trail}[#{idx}]", acc) }
+  end
+  acc
+end
+
 schemas = CONTRACTS.keys.to_h { |path| [path, read_json(path)] }
 provenance = File.read(PROVENANCE)
 
@@ -118,6 +137,11 @@ schemas.each do |path, schema|
       fail!("#{path} raw_pane_content_stored is not pinned false (#{const.inspect})") unless const == false
     end
   end
+
+  # Defense-in-depth: every object node must reject unknown fields outright,
+  # so no raw-content/secret field can be smuggled under an unbanned name.
+  offenders = object_nodes_missing_ap_false(schema)
+  fail!("#{path} object nodes missing additionalProperties:false: #{offenders.join(", ")}") unless offenders.empty?
 end
 
 # 3. Command-shape vocabulary: receipt and extractor must agree on the exact two
