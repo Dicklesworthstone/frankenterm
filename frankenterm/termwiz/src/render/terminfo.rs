@@ -196,6 +196,22 @@ pub struct TerminfoRenderer {
 }
 
 impl TerminfoRenderer {
+    fn term_count_from_usize(value: usize) -> u32 {
+        u32::try_from(value).unwrap_or(u32::MAX)
+    }
+
+    fn term_count_from_isize_magnitude(value: isize) -> u32 {
+        Self::term_count_from_usize(value.unsigned_abs())
+    }
+
+    fn term_count_from_end_relative(extent: usize, offset: usize) -> u32 {
+        Self::term_count_from_usize(extent.saturating_sub(offset.saturating_add(1)))
+    }
+
+    fn scroll_region_bottom(first_row: usize, region_size: usize) -> u32 {
+        Self::term_count_from_usize(first_row.saturating_add(region_size.saturating_sub(1)))
+    }
+
     fn checked_cell_area(cols: usize, rows: usize) -> Result<usize> {
         let Some(area) = cols.checked_mul(rows) else {
             crate::bail!("terminal cell area overflow for {cols}x{rows}");
@@ -444,9 +460,9 @@ impl TerminfoRenderer {
 
     fn cursor_y_relative<W: RenderTty + Write>(&mut self, y: isize, out: &mut W) -> Result<()> {
         if y > 0 {
-            self.cursor_down(y as u32, out)
+            self.cursor_down(Self::term_count_from_isize_magnitude(y), out)
         } else {
-            self.cursor_up(-y as u32, out)
+            self.cursor_up(Self::term_count_from_isize_magnitude(y), out)
         }
     }
 
@@ -474,9 +490,9 @@ impl TerminfoRenderer {
 
     fn cursor_x_relative<W: RenderTty + Write>(&mut self, x: isize, out: &mut W) -> Result<()> {
         if x > 0 {
-            self.cursor_right(x as u32, out)
+            self.cursor_right(Self::term_count_from_isize_magnitude(x), out)
         } else {
-            self.cursor_left(-x as u32, out)
+            self.cursor_left(Self::term_count_from_isize_magnitude(x), out)
         }
     }
 
@@ -662,7 +678,7 @@ impl TerminfoRenderer {
                             let (cols, _rows) = out.get_size_in_cells()?;
                             self.write_spaces(cols.saturating_sub(cursor_x), out)?;
                             out.by_ref().write_all(b"\r")?;
-                            self.cursor_right(cursor_x as u32, out)?;
+                            self.cursor_right(Self::term_count_from_usize(cursor_x), out)?;
                         } else if let Some(clr) = self.get_capability::<cap::ClrEol>() {
                             clr.expand().to(out.by_ref())?;
                         } else {
@@ -700,9 +716,9 @@ impl TerminfoRenderer {
                                 out.by_ref().write_all(b"\r\n")?;
                                 self.write_spaces(cols, out)?;
                             }
-                            self.cursor_up(rows_below as u32, out)?;
+                            self.cursor_up(Self::term_count_from_usize(rows_below), out)?;
                             out.by_ref().write_all(b"\r")?;
-                            self.cursor_right(cursor_x as u32, out)?;
+                            self.cursor_right(Self::term_count_from_usize(cursor_x), out)?;
                         } else if let Some(clr) = self.get_capability::<cap::ClrEos>() {
                             clr.expand().to(out.by_ref())?;
                         } else {
@@ -782,16 +798,13 @@ impl TerminfoRenderer {
                         (Position::Absolute(x), Position::Relative(y)) => {
                             self.cursor_y_relative(*y, out)?;
                             out.by_ref().write_all(b"\r")?;
-                            self.cursor_right(*x as u32, out)?;
+                            self.cursor_right(Self::term_count_from_usize(*x), out)?;
                         }
 
                         (Position::Relative(x), Position::EndRelative(y)) => {
                             let (_cols, rows) = out.get_size_in_cells()?;
-                            self.cursor_up(rows as u32, out)?;
-                            self.cursor_down(
-                                rows.saturating_sub((*y).saturating_add(1)) as u32,
-                                out,
-                            )?;
+                            self.cursor_up(Self::term_count_from_usize(rows), out)?;
+                            self.cursor_down(Self::term_count_from_end_relative(rows, *y), out)?;
                             self.cursor_x_relative(*x, out)?;
                         }
                         (Position::Relative(x), Position::Relative(y)) => {
@@ -802,44 +815,45 @@ impl TerminfoRenderer {
                             self.cursor_y_relative(*y, out)?;
                             let (cols, _rows) = out.get_size_in_cells()?;
                             out.by_ref().write_all(b"\r")?;
-                            self.cursor_right(
-                                cols.saturating_sub((*x).saturating_add(1)) as u32,
-                                out,
-                            )?;
+                            self.cursor_right(Self::term_count_from_end_relative(cols, *x), out)?;
                         }
 
                         (Position::Absolute(x), Position::Absolute(y)) => {
-                            self.move_cursor_absolute(*x as u32, *y as u32, out)?;
+                            self.move_cursor_absolute(
+                                Self::term_count_from_usize(*x),
+                                Self::term_count_from_usize(*y),
+                                out,
+                            )?;
                         }
                         (Position::Absolute(x), Position::EndRelative(y)) => {
                             let (_cols, rows) = out.get_size_in_cells()?;
                             self.move_cursor_absolute(
-                                *x as u32,
-                                rows.saturating_sub((*y).saturating_add(1)) as u32,
+                                Self::term_count_from_usize(*x),
+                                Self::term_count_from_end_relative(rows, *y),
                                 out,
                             )?;
                         }
                         (Position::EndRelative(x), Position::EndRelative(y)) => {
                             let (cols, rows) = out.get_size_in_cells()?;
                             self.move_cursor_absolute(
-                                cols.saturating_sub((*x).saturating_add(1)) as u32,
-                                rows.saturating_sub((*y).saturating_add(1)) as u32,
+                                Self::term_count_from_end_relative(cols, *x),
+                                Self::term_count_from_end_relative(rows, *y),
                                 out,
                             )?;
                         }
 
                         (Position::Relative(x), Position::Absolute(y)) => {
                             let (_cols, rows) = out.get_size_in_cells()?;
-                            self.cursor_up(rows as u32, out)?;
-                            self.cursor_down(*y as u32, out)?;
+                            self.cursor_up(Self::term_count_from_usize(rows), out)?;
+                            self.cursor_down(Self::term_count_from_usize(*y), out)?;
                             self.cursor_x_relative(*x, out)?;
                         }
 
                         (Position::EndRelative(x), Position::Absolute(y)) => {
                             let (cols, _rows) = out.get_size_in_cells()?;
                             self.move_cursor_absolute(
-                                cols.saturating_sub((*x).saturating_add(1)) as u32,
-                                *y as u32,
+                                Self::term_count_from_end_relative(cols, *x),
+                                Self::term_count_from_usize(*y),
                                 out,
                             )?;
                         }
@@ -927,10 +941,10 @@ impl TerminfoRenderer {
 
                             if y != image.height - 1 {
                                 writeln!(out)?;
-                                self.cursor_left(image.width as u32, out)?;
+                                self.cursor_left(Self::term_count_from_usize(image.width), out)?;
                             }
                         }
-                        self.cursor_up(image.height as u32, out)?;
+                        self.cursor_up(Self::term_count_from_usize(image.height), out)?;
                     }
                     self.cursor_position = None;
                 }
@@ -941,9 +955,9 @@ impl TerminfoRenderer {
                 } => {
                     if *region_size > 0 {
                         if let Some(csr) = self.get_capability::<cap::ChangeScrollRegion>() {
-                            let top = *first_row as u32;
-                            let bottom = (*first_row + *region_size - 1) as u32;
-                            let scroll_count = *scroll_count as u32;
+                            let top = Self::term_count_from_usize(*first_row);
+                            let bottom = Self::scroll_region_bottom(*first_row, *region_size);
+                            let scroll_count = Self::term_count_from_usize(*scroll_count);
                             csr.expand().top(top).bottom(bottom).to(out.by_ref())?;
                             if scroll_count > 0 {
                                 if let Some(scroll) = self.get_capability::<cap::ParmIndex>() {
@@ -972,9 +986,9 @@ impl TerminfoRenderer {
                 } => {
                     if *region_size > 0 {
                         if let Some(csr) = self.get_capability::<cap::ChangeScrollRegion>() {
-                            let top = *first_row as u32;
-                            let bottom = (*first_row + *region_size - 1) as u32;
-                            let scroll_count = *scroll_count as u32;
+                            let top = Self::term_count_from_usize(*first_row);
+                            let bottom = Self::scroll_region_bottom(*first_row, *region_size);
+                            let scroll_count = Self::term_count_from_usize(*scroll_count);
                             csr.expand().top(top).bottom(bottom).to(out.by_ref())?;
                             if scroll_count > 0 {
                                 if let Some(scroll) = self.get_capability::<cap::ParmRindex>() {
@@ -1481,6 +1495,64 @@ mod test {
     fn checked_cell_area_rejects_overflow() {
         assert_eq!(TerminfoRenderer::checked_cell_area(12, 3).unwrap(), 36);
         assert!(TerminfoRenderer::checked_cell_area(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn terminfo_u32_counts_saturate_instead_of_wrapping() {
+        assert_eq!(
+            TerminfoRenderer::term_count_from_usize((u32::MAX as usize).saturating_add(1)),
+            u32::MAX
+        );
+        assert_eq!(
+            TerminfoRenderer::term_count_from_isize_magnitude(isize::MIN),
+            u32::MAX
+        );
+        assert_eq!(
+            TerminfoRenderer::term_count_from_end_relative(usize::MAX, 0),
+            u32::MAX
+        );
+        assert_eq!(
+            TerminfoRenderer::scroll_region_bottom(usize::MAX, 2),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn render_relative_cursor_counts_saturate_instead_of_wrapping() {
+        let mut out = FakeTerm::new(no_terminfo_all_enabled());
+
+        out.render(&[Change::CursorPosition {
+            x: Position::Relative(isize::MIN),
+            y: Position::Relative(isize::MIN),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            out.parse(),
+            vec![
+                Action::CSI(CSI::Cursor(Cursor::Up(u32::MAX))),
+                Action::CSI(CSI::Cursor(Cursor::Left(u32::MAX))),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_absolute_cursor_counts_saturate_instead_of_wrapping() {
+        let mut out = FakeTerm::new(no_terminfo_all_enabled());
+
+        out.render(&[Change::CursorPosition {
+            x: Position::Absolute(usize::MAX),
+            y: Position::Relative(0),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            out.parse(),
+            vec![
+                Action::Control(ControlCode::CarriageReturn),
+                Action::CSI(CSI::Cursor(Cursor::Right(u32::MAX))),
+            ]
+        );
     }
 
     #[test]
