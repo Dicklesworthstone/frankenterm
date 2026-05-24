@@ -108,7 +108,7 @@ struct CompletionState {
 
 impl CompletionState {
     fn next(&mut self) {
-        self.index += 1;
+        self.index = self.index.saturating_add(1);
         if self.index >= self.candidates.len() {
             self.index = 0;
         }
@@ -1064,6 +1064,23 @@ mod tests {
             .expect("valid completion should apply");
 
         assert_eq!(editor.get_line_and_cursor(), ("hello x", 5));
+    }
+
+    #[test]
+    fn completion_state_next_saturates_corrupt_index() {
+        let mut state = CompletionState {
+            candidates: vec![CompletionCandidate {
+                range: 0..1,
+                text: "x".to_string(),
+            }],
+            index: usize::MAX,
+            original_line: "a".to_string(),
+            original_cursor: 1,
+        };
+
+        state.next();
+
+        assert_eq!(state.index, 0);
     }
 
     #[test]
