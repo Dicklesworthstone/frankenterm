@@ -93,4 +93,32 @@ proptest! {
         prop_assert!(!d.side_effects_executed, "planning must be side-effect free");
         prop_assert!(!plan.side_effects_executed);
     }
+
+    /// A herd-wave stagger is recommended exactly when the herd-wave signal
+    /// is at Yellow or worse; a Green herd-wave recommends no stagger.
+    /// (herd_wave is the only HerdWave-kind signal, so the result is
+    /// deterministic in its tier.)
+    #[test]
+    fn herd_wave_stagger_recommended_iff_pressure_at_least_yellow(
+        class in arb_class(),
+        pane_scale in 1u32..1000,
+        herd_tier in arb_tier(),
+    ) {
+        let mut input = SwarmCapacityWorkloadAdmissionInput::new("stagger.test", pane_scale, class);
+        // Keep the other signals benign (Measured/Green) so only herd_wave matters.
+        input.signals.herd_wave = SwarmCapacityWorkloadAdmissionSignal::new(
+            SwarmCapacityWorkloadSignalKind::HerdWave,
+            SwarmCapacityWorkloadEvidenceState::Measured,
+            herd_tier,
+        );
+        let plan = plan_swarm_capacity_workload_admission(1_700_000_000_000, "test", &[input]);
+        let d = &plan.decisions[0];
+
+        let expect_stagger = herd_tier >= HealthTier::Yellow;
+        prop_assert_eq!(
+            d.recommended_stagger_ms.is_some(),
+            expect_stagger,
+            "stagger recommendation must track herd-wave tier {:?}", herd_tier
+        );
+    }
 }
