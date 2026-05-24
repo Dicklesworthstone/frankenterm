@@ -722,7 +722,7 @@ impl FleetMemoryController {
         signals: &PressureSignals,
         tier_budget: Option<FleetMemoryTierBudgetSnapshot>,
     ) -> Vec<FleetMemoryAction> {
-        self.total_evaluations += 1;
+        self.total_evaluations = self.total_evaluations.saturating_add(1);
 
         // Map each subsystem to fleet tier
         let backpressure_tier = map_backpressure(signals.backpressure);
@@ -790,10 +790,10 @@ impl FleetMemoryController {
 
         if should_transition {
             self.compound_tier = target_tier;
-            self.total_transitions += 1;
+            self.total_transitions = self.total_transitions.saturating_add(1);
             self.consecutive_at_tier = 1;
         } else {
-            self.consecutive_at_tier += 1;
+            self.consecutive_at_tier = self.consecutive_at_tier.saturating_add(1);
         }
 
         // Determine actions for current compound tier.
@@ -1752,6 +1752,35 @@ mod tests {
 
         ctrl.evaluate(&green_signals()); // Elevated → Normal
         assert_eq!(ctrl.total_transitions(), 2);
+    }
+
+    #[test]
+    fn fleet_memory_controller_counters_saturate_at_u64_max() {
+        let mut ctrl = FleetMemoryController::new(FleetMemoryConfig {
+            escalation_threshold: 1,
+            deescalation_threshold: 1,
+            ..FleetMemoryConfig::default()
+        });
+
+        ctrl.total_evaluations = u64::MAX;
+        ctrl.consecutive_at_tier = u64::MAX;
+
+        ctrl.evaluate(&green_signals());
+        let snapshot = ctrl.snapshot();
+        assert_eq!(snapshot.total_evaluations, u64::MAX);
+        assert_eq!(snapshot.consecutive_at_tier, u64::MAX);
+        assert_eq!(ctrl.audit_trail().back().unwrap().sequence, u64::MAX);
+
+        ctrl.total_transitions = u64::MAX;
+        ctrl.consecutive_at_tier = u64::MAX;
+
+        ctrl.evaluate(&yellow_signals());
+        let snapshot = ctrl.snapshot();
+        assert_eq!(snapshot.compound_tier, FleetPressureTier::Elevated);
+        assert_eq!(snapshot.total_evaluations, u64::MAX);
+        assert_eq!(snapshot.total_transitions, u64::MAX);
+        assert_eq!(snapshot.consecutive_at_tier, 1);
+        assert_eq!(ctrl.audit_trail().back().unwrap().sequence, u64::MAX);
     }
 
     // ── Actions ──────────────────────────────────────────────────────
