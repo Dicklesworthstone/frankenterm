@@ -145,7 +145,7 @@ impl ReflexState {
 
     /// Record a successful execution and possibly promote.
     pub fn record_success(&mut self, config: &BlastRadiusConfig) {
-        self.successes += 1;
+        self.successes = self.successes.saturating_add(1);
         self.consecutive_failures = 0;
 
         // Check for tier promotion.
@@ -167,8 +167,8 @@ impl ReflexState {
 
     /// Record a failed execution and possibly demote.
     pub fn record_failure(&mut self, config: &BlastRadiusConfig) {
-        self.failures += 1;
-        self.consecutive_failures += 1;
+        self.failures = self.failures.saturating_add(1);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
 
         if self.consecutive_failures >= config.demotion_failure_count
             && self.tier != MaturityTier::Incubating
@@ -287,7 +287,7 @@ impl BlastRadiusController {
 
         // 1. Swarm-wide check.
         if !self.swarm_bucket.try_acquire(1, now_ms) {
-            self.total_denied += 1;
+            self.total_denied = self.total_denied.saturating_add(1);
             return BlastDecision::Deny {
                 reason: DenyReason::SwarmLimit,
                 tier,
@@ -307,7 +307,7 @@ impl BlastRadiusController {
         if !cluster_bucket.try_acquire(1, now_ms) {
             // Return the swarm token (compensate).
             // Note: exact return isn't possible with the existing API, so we accept slight drift.
-            self.total_denied += 1;
+            self.total_denied = self.total_denied.saturating_add(1);
             return BlastDecision::Deny {
                 reason: DenyReason::ClusterLimit { cluster_id },
                 tier,
@@ -321,14 +321,14 @@ impl BlastRadiusController {
             .entry(reflex_id)
             .or_insert_with(|| TokenBucket::new(burst, rate / 60.0));
         if !reflex_bucket.try_acquire(1, now_ms) {
-            self.total_denied += 1;
+            self.total_denied = self.total_denied.saturating_add(1);
             return BlastDecision::Deny {
                 reason: DenyReason::ReflexLimit { reflex_id },
                 tier,
             };
         }
 
-        self.total_allowed += 1;
+        self.total_allowed = self.total_allowed.saturating_add(1);
         BlastDecision::Allow { tier }
     }
 
@@ -531,6 +531,23 @@ mod tests {
         assert_eq!(state.total_executions(), 3);
     }
 
+    #[test]
+    fn reflex_state_counters_saturate() {
+        let config = BlastRadiusConfig::default();
+        let mut state = ReflexState::new("c1");
+        state.successes = u64::MAX;
+        state.failures = u64::MAX;
+        state.consecutive_failures = u64::MAX;
+
+        state.record_success(&config);
+        assert_eq!(state.successes, u64::MAX);
+        assert_eq!(state.consecutive_failures, 0);
+
+        state.record_failure(&config);
+        assert_eq!(state.failures, u64::MAX);
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
     // ---- Controller basic ----
 
     #[test]
@@ -726,6 +743,32 @@ mod tests {
         let stats = ctrl.stats();
         assert_eq!(stats.total_allowed, 1);
         assert_eq!(stats.total_denied, 1);
+    }
+
+    #[test]
+    fn controller_allow_deny_counters_saturate() {
+        let mut allowed = BlastRadiusController::new(BlastRadiusConfig {
+            swarm_rate_per_min: 6000.0,
+            swarm_burst: 100.0,
+            cluster_rate_per_min: 6000.0,
+            cluster_burst: 100.0,
+            incubating_rate_per_min: 6000.0,
+            incubating_burst: 100.0,
+            ..Default::default()
+        });
+        allowed.total_allowed = u64::MAX;
+        allowed.register_reflex(1, "c1");
+        assert!(allowed.check(1, 1000).is_allowed());
+        assert_eq!(allowed.stats().total_allowed, u64::MAX);
+
+        let mut denied = BlastRadiusController::new(BlastRadiusConfig {
+            swarm_burst: 0.0,
+            ..Default::default()
+        });
+        denied.total_denied = u64::MAX;
+        denied.register_reflex(1, "c1");
+        assert!(!denied.check(1, 1000).is_allowed());
+        assert_eq!(denied.stats().total_denied, u64::MAX);
     }
 
     #[test]
