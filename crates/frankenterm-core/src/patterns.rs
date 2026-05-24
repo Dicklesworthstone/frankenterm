@@ -3149,11 +3149,7 @@ impl PatternEngine {
         // We keep the last N chars
         let full_len = input_text.len();
         if full_len > DetectionContext::MAX_TAIL_SIZE {
-            // Take slice from end, respecting char boundaries
-            let mut start = full_len - DetectionContext::MAX_TAIL_SIZE;
-            while !input_text.is_char_boundary(start) && start > 0 {
-                start -= 1;
-            }
+            let start = Self::bounded_tail_start(&input_text, DetectionContext::MAX_TAIL_SIZE);
             context.tail_buffer = input_text[start..].to_string();
         } else {
             context.tail_buffer = input_text.to_string();
@@ -3306,10 +3302,7 @@ impl PatternEngine {
         // Update tail buffer for next time; keep last N chars.
         let full_len = input_text.len();
         if full_len > DetectionContext::MAX_TAIL_SIZE {
-            let mut start = full_len - DetectionContext::MAX_TAIL_SIZE;
-            while !input_text.is_char_boundary(start) && start > 0 {
-                start -= 1;
-            }
+            let start = Self::bounded_tail_start(&input_text, DetectionContext::MAX_TAIL_SIZE);
             context.tail_buffer = input_text[start..].to_string();
         } else {
             context.tail_buffer = input_text.to_string();
@@ -3928,6 +3921,18 @@ impl PatternEngine {
 
         // Otherwise, rule must match the expected agent
         rule_agent == expected_agent
+    }
+
+    fn bounded_tail_start(text: &str, max_tail_bytes: usize) -> usize {
+        if text.len() <= max_tail_bytes {
+            return 0;
+        }
+
+        let mut start = text.len() - max_tail_bytes;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        start
     }
 
     /// Quick reject check - returns false if text definitely has no matches
@@ -7625,6 +7630,39 @@ description = "Project lint warning"
         // The overlap region contains the old match, but dedup prevents re-emission
         let reemitted = d2.iter().any(|d| d.rule_id == "codex.tail");
         assert!(!reemitted, "should not re-emit from overlap/dedup");
+    }
+
+    #[test]
+    fn tail_buffer_utf8_trim_respects_byte_cap() {
+        let mut text = None;
+        for prefix in ["", "x", "xy", "xyz"] {
+            let candidate = format!(
+                "{}{}",
+                prefix,
+                "€".repeat((DetectionContext::MAX_TAIL_SIZE / 3) + 8)
+            );
+            let nominal_start = candidate.len() - DetectionContext::MAX_TAIL_SIZE;
+            if candidate.len() > DetectionContext::MAX_TAIL_SIZE
+                && !candidate.is_char_boundary(nominal_start)
+            {
+                text = Some(candidate);
+                break;
+            }
+        }
+        let text = text.expect("fixture should place nominal tail start inside a UTF-8 codepoint");
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.no_match", "NO_MATCH", None)]);
+
+        let mut ctx = DetectionContext::new();
+        let detections = engine.detect_with_context(&text, &mut ctx);
+        assert!(detections.is_empty());
+        assert!(ctx.tail_buffer.len() <= DetectionContext::MAX_TAIL_SIZE);
+
+        let mut traced_ctx = DetectionContext::new();
+        let (detections, traces) =
+            engine.detect_with_context_and_trace(&text, &mut traced_ctx, &TraceOptions::default());
+        assert!(detections.is_empty());
+        assert!(traces.is_empty());
+        assert!(traced_ctx.tail_buffer.len() <= DetectionContext::MAX_TAIL_SIZE);
     }
 
     // --- builtin_pack_by_name ---
