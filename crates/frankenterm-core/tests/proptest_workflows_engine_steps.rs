@@ -314,6 +314,62 @@ proptest! {
     }
 
     #[test]
+    fn wait_condition_pane_idle_constructors_preserve_threshold(
+        pane_id in 0u64..10_000,
+        idle_threshold_ms in 1u64..60_000,
+    ) {
+        let target_pane = WaitCondition::pane_idle(idle_threshold_ms);
+        prop_assert_eq!(target_pane.pane_id(), None);
+        match target_pane {
+            WaitCondition::PaneIdle {
+                pane_id,
+                idle_threshold_ms: actual_threshold_ms,
+            } => {
+                prop_assert_eq!(pane_id, None);
+                prop_assert_eq!(actual_threshold_ms, idle_threshold_ms);
+            }
+            other => prop_assert!(false, "Expected PaneIdle variant, got {other:?}"),
+        }
+
+        let explicit_pane = WaitCondition::pane_idle_on(pane_id, idle_threshold_ms);
+        prop_assert_eq!(explicit_pane.pane_id(), Some(pane_id));
+        match explicit_pane {
+            WaitCondition::PaneIdle {
+                pane_id: actual_pane_id,
+                idle_threshold_ms: actual_threshold_ms,
+            } => {
+                prop_assert_eq!(actual_pane_id, Some(pane_id));
+                prop_assert_eq!(actual_threshold_ms, idle_threshold_ms);
+            }
+            other => prop_assert!(false, "Expected PaneIdle variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_condition_sleep_and_external_have_no_pane_id(
+        duration_ms in 1u64..60_000,
+        key in "[a-z_]{3,15}",
+    ) {
+        let sleep = WaitCondition::sleep(duration_ms);
+        prop_assert_eq!(sleep.pane_id(), None);
+        match sleep {
+            WaitCondition::Sleep { duration_ms: actual_duration_ms } => {
+                prop_assert_eq!(actual_duration_ms, duration_ms);
+            }
+            other => prop_assert!(false, "Expected Sleep variant, got {other:?}"),
+        }
+
+        let external = WaitCondition::external(key.clone());
+        prop_assert_eq!(external.pane_id(), None);
+        match external {
+            WaitCondition::External { key: actual_key } => {
+                prop_assert_eq!(actual_key, key);
+            }
+            other => prop_assert!(false, "Expected External variant, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn policy_decision_allow_is_allowed(_dummy in 0u8..1) {
         prop_assert!(WorkflowStepPolicyDecision::Allow.is_allowed());
         prop_assert!(!WorkflowStepPolicyDecision::Deny.is_allowed());
