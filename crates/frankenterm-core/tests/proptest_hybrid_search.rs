@@ -1044,3 +1044,45 @@ proptest! {
         prop_assert_eq!(small.len(), large.len());
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// RRF score locality (metamorphic)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// RRF scores are rank-local: appending a new (disjoint) item to the tail of
+    /// the lexical lane leaves every pre-existing item's rank — and therefore its
+    /// fused score — unchanged, while the new item appears in the result. ids
+    /// from arb_ranked_list are in 1..=100, so the 1000.. new id is disjoint.
+    #[test]
+    fn rrf_fuse_tail_append_preserves_existing_scores(
+        lexical in arb_ranked_list(8),
+        semantic in arb_ranked_list(8),
+        new_id in 1000u64..=2000,
+        new_score in 0.1f32..10.0,
+        k in 1u32..=120,
+    ) {
+        let base = rrf_fuse(&lexical, &semantic, k);
+
+        let mut augmented_lex = lexical.clone();
+        augmented_lex.push((new_id, new_score));
+        let augmented = rrf_fuse(&augmented_lex, &semantic, k);
+
+        let aug_by_id: std::collections::HashMap<u64, f32> =
+            augmented.iter().map(|r| (r.id, r.score)).collect();
+
+        for item in &base {
+            let aug = aug_by_id.get(&item.id).copied();
+            prop_assert!(aug.is_some(), "existing id {} dropped after tail append", item.id);
+            prop_assert!(
+                (item.score - aug.unwrap()).abs() < 1e-6,
+                "score changed for id {} after tail append: base={}, aug={}",
+                item.id, item.score, aug.unwrap()
+            );
+        }
+        prop_assert!(aug_by_id.contains_key(&new_id), "appended id {} absent from result", new_id);
+        prop_assert_eq!(augmented.len(), base.len() + 1);
+    }
+}
