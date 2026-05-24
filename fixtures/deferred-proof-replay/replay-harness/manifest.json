@@ -1,0 +1,28 @@
+{
+  "schema_version": "ft.deferred_proof_replay_harness.fixtures.v1",
+  "contract_id": "ft.deferred_proof_replay_harness.decision.v1",
+  "schema_path": "docs/json-schema/ft-deferred-proof-replay-harness.json",
+  "contract_doc": "docs/robot-contracts/deferred-proof-replay-harness.md",
+  "static_verifier": "tests/e2e/test_deferred_proof_replay_harness_contract.sh",
+  "input_receipts": "fixtures/deferred-proof-replay/replay-harness/input-receipts.v1.json",
+  "tamper_cases": "fixtures/deferred-proof-replay/replay-harness/tamper-cases.v1.json",
+  "expected_jsonl": "fixtures/deferred-proof-replay/replay-harness/expected/decisions.v1.jsonl",
+  "golden_summary": {
+    "input_contract_id": "ft.deferred_proof_replay_harness.input.v1",
+    "tamper_contract_id": "ft.deferred_proof_replay_harness.tamper.v1",
+    "receipt_count": 9,
+    "tamper_case_count": 6,
+    "next_candidate": "ft-stat1",
+    "decision_counts": {
+      "run_static_now": 1,
+      "would_run_remote": 1,
+      "defer_remote_blocked": 2,
+      "defer_dirty_overlap": 1,
+      "defer_prerequisite": 1,
+      "cancelled": 1,
+      "reject_stale_command": 1,
+      "reject_non_remote_command": 0,
+      "request_triage": 1
+    }
+  }
+}

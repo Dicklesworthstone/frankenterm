@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.deferred_proof_replay_harness.tamper.v1",
+  "description": "Adversarial single-receipt inputs. The dry-run replay classifier MUST reject each one as specified and MUST NEVER emit a green/runnable decision for it. These lock the fail-closed invariants of ft-zbnz4.6: local cargo is never proof, stale shapes never run, and a selected-worker topology-preflight failure is a distinct blocker (not no-worker-admission, not code failure, never green).",
+  "cases": [
+    {
+      "case_id": "local-cargo-direct-never-runnable",
+      "note": "Bare local cargo with no rch wrapper. Even with admitted admission it must never be runnable.",
+      "expected_decision": "reject_non_remote_command",
+      "forbidden_decisions": ["would_run_remote", "run_static_now"],
+      "receipt": {
+        "bead_id": "ft-tamper-localcargo",
+        "receipt_id": "ft-tamper-localcargo:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["cargo", "test", "-p", "frankenterm-core", "policy"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-localcargo",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "blocked_infra"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "admitted", "operator_cancelled": false, "prerequisite_beads": []},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
+    },
+    {
+      "case_id": "missing-require-remote-env-never-runnable",
+      "note": "rch-wrapped but RCH_REQUIRE_REMOTE=1 absent: local fallback is reachable, so it is not a remote-only proof.",
+      "expected_decision": "reject_non_remote_command",
+      "forbidden_decisions": ["would_run_remote", "run_static_now"],
+      "receipt": {
+        "bead_id": "ft-tamper-noenv",
+        "receipt_id": "ft-tamper-noenv:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["rch", "--no-self-healing", "exec", "--", "cargo", "test", "-p", "frankenterm-core", "policy"],
+          "env": [{"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-noenv",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "blocked_infra"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "admitted", "operator_cancelled": false, "prerequisite_beads": []},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
+    },
+    {
+      "case_id": "topology-preflight-never-green",
+      "note": "Even when the receipt forges replay_allowed=true and a green evidence_classification, a topology-preflight failure must defer as a blocker, never run, never green.",
+      "expected_decision": "defer_remote_blocked",
+      "forbidden_decisions": ["would_run_remote", "run_static_now"],
+      "must_include_blocker": ["rch.topology_preflight_failed"],
+      "must_exclude_blocker": ["rch.no_admissible_workers", "rch.worker_pressure", "code.test_failed"],
+      "receipt": {
+        "bead_id": "ft-tamper-topo-green",
+        "receipt_id": "ft-tamper-topo-green:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-tamper-topo", "cargo", "test", "-p", "frankenterm-core", "redactor"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}, {"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-topo",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "green"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "topology_preflight_failed", "operator_cancelled": false, "prerequisite_beads": [], "selected_worker": "vmi1227854", "remote_failure_phase": "topology_preflight", "remote_failure_detail": "ln: Already exists"},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
+    },
+    {
+      "case_id": "topology-preflight-not-no-worker",
+      "note": "A selected-worker topology-preflight failure must not be coarsened into no-admissible-workers admission.",
+      "expected_decision": "defer_remote_blocked",
+      "forbidden_decisions": ["would_run_remote", "run_static_now"],
+      "must_include_blocker": ["rch.topology_preflight_failed"],
+      "must_exclude_blocker": ["rch.no_admissible_workers"],
+      "receipt": {
+        "bead_id": "ft-tamper-topo-noworker",
+        "receipt_id": "ft-tamper-topo-noworker:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-tamper-topo2", "cargo", "test", "-p", "frankenterm-core", "mcp"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}, {"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-topo2",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "blocked_infra"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "topology_preflight_failed", "operator_cancelled": false, "prerequisite_beads": [], "selected_worker": "vmi1227854", "remote_failure_phase": "topology_preflight", "remote_failure_detail": "ln: Already exists"},
+        "eligibility": {"state": "wait_rch", "replay_allowed": false}
+      }
+    },
+    {
+      "case_id": "stale-shape-never-runnable",
+      "note": "A non-canonical command_shape_version must never run even when admission is admitted and replay_allowed is forged true.",
+      "expected_decision": "reject_stale_command",
+      "forbidden_decisions": ["would_run_remote", "run_static_now"],
+      "receipt": {
+        "bead_id": "ft-tamper-stale",
+        "receipt_id": "ft-tamper-stale:1",
+        "command": {
+          "command_shape_version": "rch-legacy-v0",
+          "argv": ["rch", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-tamper-stale", "cargo", "test", "-p", "frankenterm-core", "policy"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}, {"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-stale",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "blocked_infra"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "admitted", "operator_cancelled": false, "prerequisite_beads": []},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
+    },
+    {
+      "case_id": "forged-green-without-remote-exit",
+      "note": "A material remote receipt claiming a green classification cannot become proof in dry-run: there is no recorded remote exit 0.",
+      "expected_decision": "would_run_remote",
+      "forbidden_decisions": ["run_static_now"],
+      "forbid_green_proof_state": true,
+      "receipt": {
+        "bead_id": "ft-tamper-forged-green",
+        "receipt_id": "ft-tamper-forged-green:1",
+        "command": {
+          "command_shape_version": "rch-no-self-healing-v1",
+          "argv": ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-tamper-fg", "cargo", "test", "-p", "frankenterm-core", "policy"],
+          "env": [{"name": "RCH_REQUIRE_REMOTE", "value": "1"}, {"name": "RCH_NO_SELF_HEALING", "value": "1"}],
+          "target_dir": "/tmp/ft-tamper-fg",
+          "material_remote_required": true
+        },
+        "proof": {"material_cargo_required": true, "evidence_classification": "green"},
+        "paths": {"dirty_paths_at_capture": []},
+        "coordination": {"rch_admission_state": "admitted", "operator_cancelled": false, "prerequisite_beads": []},
+        "eligibility": {"state": "eligible", "replay_allowed": true}
+      }
+    }
+  ]
+}
