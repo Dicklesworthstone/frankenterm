@@ -15,8 +15,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::events::{
-    CausalRelation, EventCausalitySnapshot, EventCausalityStamp, HybridLogicalStamp, LamportStamp,
-    VectorClock,
+    CausalRelation, EventCausalityClock, EventCausalitySnapshot, EventCausalityStamp,
+    HybridLogicalStamp, LamportStamp, VectorClock,
 };
 
 /// Vector clock over a small node alphabet so clocks overlap and the
@@ -168,5 +168,65 @@ proptest! {
         let snap_back: EventCausalitySnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         prop_assert_eq!(snapshot, snap_back);
+    }
+
+    /// The core HLC guarantee: successive local events produce strictly
+    /// increasing hybrid stamps even when the physical clock stalls or
+    /// regresses (the logical component absorbs it). Lamport increments by
+    /// exactly one per local event.
+    #[test]
+    fn clock_local_events_strictly_monotonic(
+        node in "[a-z]{1,6}",
+        walls in prop::collection::vec(0_u64..1000, 1..30),
+    ) {
+        let mut clock = EventCausalityClock::new(node);
+        let mut prev_hybrid: Option<HybridLogicalStamp> = None;
+        let mut prev_lamport = 0_u64;
+        for w in walls {
+            let stamp = clock.record_local_event(w);
+            prop_assert_eq!(stamp.lamport.counter, prev_lamport + 1,
+                "lamport must increment by exactly one per local event");
+            prev_lamport = stamp.lamport.counter;
+            if let Some(p) = &prev_hybrid {
+                prop_assert!(stamp.hybrid > *p,
+                    "HLC must strictly increase even on stalled/regressing wall time: {:?} !> {:?}",
+                    stamp.hybrid, p);
+            }
+            prev_hybrid = Some(stamp.hybrid.clone());
+        }
+    }
+
+    /// observe_remote establishes happens-after causality: after merging a
+    /// remote stamp, the local clock's vector strictly dominates the
+    /// remote's, and both the Lamport counter and the hybrid stamp exceed
+    /// the remote's. (Disjoint node alphabets guarantee the local node is
+    /// absent from the remote vector, so domination is strict.)
+    #[test]
+    fn clock_observe_remote_establishes_causality(
+        local_node in "[a-l]{1,4}",
+        remote_node in "[m-z]{1,4}",
+        local_walls in prop::collection::vec(0_u64..500, 0..10),
+        remote_walls in prop::collection::vec(0_u64..500, 1..10),
+        recv_wall in 0_u64..500,
+    ) {
+        let mut local = EventCausalityClock::new(local_node);
+        for w in local_walls {
+            local.record_local_event(w);
+        }
+        let mut remote = EventCausalityClock::new(remote_node);
+        let mut remote_stamp: Option<EventCausalityStamp> = None;
+        for w in remote_walls {
+            remote_stamp = Some(remote.record_local_event(w));
+        }
+        let remote_stamp = remote_stamp.expect("remote_walls is non-empty");
+
+        let result = local.observe_remote(&remote_stamp, recv_wall);
+
+        prop_assert_eq!(result.vector.relation_to(&remote_stamp.vector), CausalRelation::After,
+            "observing a remote stamp must make the local vector happen-after the remote");
+        prop_assert!(result.lamport.counter > remote_stamp.lamport.counter,
+            "lamport must exceed the observed remote counter");
+        prop_assert!(result.hybrid > remote_stamp.hybrid,
+            "hybrid stamp must exceed the observed remote stamp");
     }
 }
