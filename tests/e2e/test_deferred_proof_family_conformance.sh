@@ -43,7 +43,9 @@ CONTRACTS = {
   "docs/json-schema/ft-deferred-proof-queue-surface.json" =>
     ["ft.deferred_proof_queue_surface.v1", "tests/e2e/test_deferred_proof_queue_surface_contract.sh"],
   "docs/json-schema/ft-deferred-proof-ownership-gate.json" =>
-    ["ft.deferred_proof_ownership_gate.v1", "tests/e2e/test_deferred_proof_ownership_gate.sh"]
+    ["ft.deferred_proof_ownership_gate.v1", "tests/e2e/test_deferred_proof_ownership_gate.sh"],
+  "docs/json-schema/ft-deferred-proof-replay-harness.json" =>
+    ["ft.deferred_proof_replay_harness.decision.v1", "tests/e2e/test_deferred_proof_replay_harness_contract.sh"]
 }.freeze
 
 CANONICAL_COMMAND_SHAPE = %w[rch-no-self-healing-v1 static-verifier-v1].freeze

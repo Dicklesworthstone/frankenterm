@@ -265,6 +265,8 @@ jobs:
           bash tests/e2e/test_deferred_proof_ownership_gate.sh
           bash tests/e2e/test_deferred_proof_queue_surface_contract.sh
           bash tests/e2e/test_deferred_proof_replay_harness_contract.sh
+          bash tests/e2e/test_deferred_proof_family_conformance.sh
+          bash tests/e2e/test_deferred_proof_family_integrity.sh
 
       # ft-i2eni.3 — Cargo-deny ban on direct `tokio` dependencies in
       # first-party crates. The doctrine block in AGENTS.md states
