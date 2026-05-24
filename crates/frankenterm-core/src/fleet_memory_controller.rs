@@ -1035,24 +1035,29 @@ impl FleetScrollbackOrchestrator {
             return None;
         }
 
-        // Determine eviction aggressiveness based on tier
-        let (target_fraction, max_pane_fraction) = match tier {
-            // br-ft-4l0lk: structurally unreachable — the function's
-            // early-exit guard above (`if tier == FleetPressureTier::Normal
-            // { return None; }`) ensures Normal never reaches this match.
-            // The named message surfaces the invariant if a future refactor
-            // ever moves or removes the guard.
-            FleetPressureTier::Normal => unreachable!(
-                "FleetPressureTier::Normal handled by early-exit guard \
+        // Determine eviction aggressiveness based on tier using exact integer
+        // ratios; fleet totals may be large enough that f64 loses bytes/pages.
+        let (target_retained_numerator, target_retained_denominator, max_pane_numerator) =
+            match tier {
+                // br-ft-4l0lk: structurally unreachable — the function's
+                // early-exit guard above (`if tier == FleetPressureTier::Normal
+                // { return None; }`) ensures Normal never reaches this match.
+                // The named message surfaces the invariant if a future refactor
+                // ever moves or removes the guard.
+                FleetPressureTier::Normal => unreachable!(
+                    "FleetPressureTier::Normal handled by early-exit guard \
                  above; this match arm is structurally unreachable"
-            ),
-            FleetPressureTier::Elevated => (0.25, 0.5), // evict 25% of fleet warm, up to 50% per pane
-            FleetPressureTier::Critical => (0.75, 1.0), // evict 75% of fleet warm, full per pane
-            FleetPressureTier::Emergency => (1.0, 1.0), // evict everything
-        };
+                ),
+                FleetPressureTier::Elevated => (3, 4, 1), // retain 75%, up to 50% per pane
+                FleetPressureTier::Critical => (1, 4, 2), // retain 25%, full per pane
+                FleetPressureTier::Emergency => (0, 1, 2), // evict everything
+            };
 
-        let fleet_warm_bytes_target =
-            ((fleet_warm_bytes as f64) * (1.0 - target_fraction)) as usize;
+        let fleet_warm_bytes_target = floor_fraction_usize(
+            fleet_warm_bytes,
+            target_retained_numerator,
+            target_retained_denominator,
+        );
 
         // Score each pane for eviction priority.
         // Lower score = higher eviction priority (evict first).
@@ -1090,15 +1095,17 @@ impl FleetScrollbackOrchestrator {
                 continue;
             }
 
-            let target_frac = remaining_to_evict as f64 / *warm_bytes as f64;
-            let capped_frac = target_frac.min(max_pane_fraction).min(1.0);
-
-            let pages_to_evict = (capped_frac * *warm_pages as f64).ceil() as usize;
-            let pages_to_evict = pages_to_evict.min(*warm_pages).max(1);
+            let pages_by_remaining =
+                ceil_mul_div_usize(*warm_pages, remaining_to_evict, *warm_bytes);
+            let max_pages_for_pane = ceil_mul_div_usize(*warm_pages, max_pane_numerator, 2);
+            let pages_to_evict = pages_by_remaining
+                .min(max_pages_for_pane)
+                .min(*warm_pages)
+                .max(1);
 
             let bytes_evicted =
-                (*warm_bytes as f64 * (pages_to_evict as f64 / *warm_pages as f64)) as usize;
-            remaining_to_evict = remaining_to_evict.saturating_sub(bytes_evicted.min(*warm_bytes));
+                floor_mul_div_usize(*warm_bytes, pages_to_evict, *warm_pages).min(*warm_bytes);
+            remaining_to_evict = remaining_to_evict.saturating_sub(bytes_evicted);
 
             targets.push(EvictionTarget {
                 pane_id: *pane_id,
@@ -1130,6 +1137,38 @@ impl FleetScrollbackOrchestrator {
             self.last_activity.insert(p.pane_id, p.activity_counter);
         }
     }
+}
+
+fn floor_fraction_usize(value: usize, numerator: usize, denominator: usize) -> usize {
+    debug_assert!(numerator <= denominator);
+    debug_assert!(denominator > 0);
+
+    let quotient = value / denominator;
+    let remainder = value % denominator;
+    quotient
+        .saturating_mul(numerator)
+        .saturating_add(remainder.saturating_mul(numerator) / denominator)
+}
+
+fn ceil_mul_div_usize(multiplicand: usize, numerator: usize, denominator: usize) -> usize {
+    if numerator == 0 {
+        return 0;
+    }
+
+    let product = u128::from(multiplicand).saturating_mul(u128::from(numerator));
+    let denominator = u128::from(denominator);
+    debug_assert!(denominator > 0);
+
+    let rounded = product.div_ceil(denominator);
+    usize::try_from(rounded).unwrap_or(usize::MAX)
+}
+
+fn floor_mul_div_usize(multiplicand: usize, numerator: usize, denominator: usize) -> usize {
+    let product = u128::from(multiplicand).saturating_mul(u128::from(numerator));
+    let denominator = u128::from(denominator);
+    debug_assert!(denominator > 0);
+
+    usize::try_from(product / denominator).unwrap_or(usize::MAX)
 }
 
 impl Default for FleetScrollbackOrchestrator {
@@ -2125,6 +2164,57 @@ mod tests {
         assert_eq!(plan.fleet_warm_bytes_before, usize::MAX);
         assert_eq!(orch.total_plans(), u64::MAX);
         assert_eq!(orch.total_targets(), u64::MAX);
+    }
+
+    #[test]
+    fn orchestrator_large_fleet_targets_use_exact_integer_fractions() {
+        let elevated_expected =
+            (usize::MAX / 4).saturating_mul(3) + (usize::MAX % 4).saturating_mul(3) / 4;
+        let critical_expected = usize::MAX / 4;
+
+        let mut elevated_orch = FleetScrollbackOrchestrator::new();
+        let elevated = elevated_orch
+            .plan_eviction(
+                FleetPressureTier::Elevated,
+                &[make_pane_info(1, 100, usize::MAX, 4)],
+            )
+            .expect("large warm total should produce elevated eviction plan");
+        assert_eq!(elevated.fleet_warm_bytes_before, usize::MAX);
+        assert_eq!(elevated.fleet_warm_bytes_target, elevated_expected);
+
+        let mut critical_orch = FleetScrollbackOrchestrator::new();
+        let critical = critical_orch
+            .plan_eviction(
+                FleetPressureTier::Critical,
+                &[make_pane_info(1, 100, usize::MAX, 4)],
+            )
+            .expect("large warm total should produce critical eviction plan");
+        assert_eq!(critical.fleet_warm_bytes_before, usize::MAX);
+        assert_eq!(critical.fleet_warm_bytes_target, critical_expected);
+    }
+
+    #[test]
+    fn orchestrator_large_page_counts_use_exact_integer_eviction_math() {
+        let large_pages = if usize::BITS >= 64 {
+            (1usize << 54) + 3
+        } else {
+            (1usize << 20) + 3
+        };
+        let warm_bytes = large_pages
+            .checked_mul(4)
+            .expect("test page count should leave room for byte scaling");
+
+        let mut orch = FleetScrollbackOrchestrator::new();
+        let plan = orch
+            .plan_eviction(
+                FleetPressureTier::Elevated,
+                &[make_pane_info(1, 100, warm_bytes, large_pages)],
+            )
+            .expect("large page count should produce an eviction plan");
+
+        let expected_pages = large_pages.div_ceil(4);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].pages_to_evict, expected_pages);
     }
 
     #[test]
