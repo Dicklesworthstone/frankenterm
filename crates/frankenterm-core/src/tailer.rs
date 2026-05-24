@@ -335,9 +335,21 @@ impl PaneTailer {
         if had_changes {
             self.current_interval = config.min_interval;
         } else {
-            let new_interval = Duration::from_secs_f64(
-                self.current_interval.as_secs_f64() * config.backoff_multiplier,
-            );
+            // Fail closed: `Duration::from_secs_f64` panics on NaN, negative,
+            // or overflowing input. `TailerConfig` does not normalize
+            // `backoff_multiplier`, so a non-finite / negative value (hostile
+            // config, JSON-permitted NaN, or upstream arithmetic) would crash
+            // the poll scheduler here. Saturate to `max_interval` (the slowest
+            // poll, which we cap to anyway) instead of panicking. Mirrors the
+            // NaN-defence in disk_pressure (ft-761tz) and the histogram path
+            // (ft-b4l62). Behavior-preserving for valid finite multipliers.
+            let max_secs = config.max_interval.as_secs_f64();
+            let scaled = self.current_interval.as_secs_f64() * config.backoff_multiplier;
+            let new_interval = if scaled.is_finite() && scaled >= 0.0 {
+                Duration::from_secs_f64(scaled.min(max_secs))
+            } else {
+                config.max_interval
+            };
             self.current_interval = new_interval.min(config.max_interval);
         }
     }
@@ -2210,6 +2222,51 @@ mod tests {
 
         // Should cap at max_interval
         tailer.record_poll(false, &config);
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    /// Fail-closed: a NaN backoff_multiplier must not panic
+    /// `Duration::from_secs_f64`; the idle backoff saturates to max_interval.
+    #[test]
+    fn pane_tailer_nan_backoff_multiplier_saturates_to_max() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            backoff_multiplier: f64::NAN,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        tailer.record_poll(false, &config); // must not panic
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    /// Fail-closed: a negative backoff_multiplier (which would make
+    /// `from_secs_f64` panic on a negative value) saturates to max_interval.
+    #[test]
+    fn pane_tailer_negative_backoff_multiplier_saturates_to_max() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            backoff_multiplier: -2.0,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        tailer.record_poll(false, &config); // must not panic
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    /// Fail-closed: an infinite backoff_multiplier saturates to max_interval
+    /// rather than overflowing/panicking in `from_secs_f64`.
+    #[test]
+    fn pane_tailer_infinite_backoff_multiplier_saturates_to_max() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(100),
+            max_interval: Duration::from_millis(500),
+            backoff_multiplier: f64::INFINITY,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+        tailer.record_poll(false, &config); // must not panic
         assert_eq!(tailer.current_interval, config.max_interval);
     }
 
