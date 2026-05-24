@@ -8,7 +8,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::chaos_scale_harness::FailureClass;
 use frankenterm_core::runtime_telemetry::{
-    SwarmCapacityOutcome, SwarmCapacityStage, SwarmCapacityTelemetry,
+    SwarmCapacityCertificateConfig, SwarmCapacityOutcome, SwarmCapacityStage, SwarmCapacityTelemetry,
 };
 
 proptest! {
@@ -197,4 +197,24 @@ fn record_outcome_dispatches_to_correct_counter() {
         probe(SwarmCapacityOutcome::Error(FailureClass::Timeout)),
         (0, 0, 1, 1)
     );
+}
+
+/// capacity_certificate is a pure derivation of the snapshot + config, so
+/// it must be deterministic. Compared via serialized JSON (the certificate
+/// is an audit attestation without PartialEq), this complements the
+/// evidence-ledger hash determinism for the deferred-proof system.
+#[test]
+fn capacity_certificate_is_deterministic() {
+    let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+    // Populate with a couple of finite outcomes so derived fields are well
+    // defined (and finite, avoiding non-finite serialization).
+    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
+    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    let snapshot = telemetry.snapshot();
+
+    let c1 = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
+    let c2 = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
+    let j1 = serde_json::to_string(&c1).expect("certificate serializes");
+    let j2 = serde_json::to_string(&c2).expect("certificate serializes");
+    assert_eq!(j1, j2, "capacity_certificate must be deterministic for a fixed snapshot + config");
 }
