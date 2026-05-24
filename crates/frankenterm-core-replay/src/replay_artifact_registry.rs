@@ -708,7 +708,7 @@ impl ArtifactRegistry {
                 }
             }
             pruned_paths.push(path.clone());
-            bytes_freed += size;
+            bytes_freed = bytes_freed.saturating_add(*size);
         }
 
         if !opts.dry_run {
@@ -1551,6 +1551,31 @@ mod tests {
             now_ms: 1000 + 24 * 60 * 60 * 1000,
         });
         assert_eq!(result.bytes_freed, 8);
+    }
+
+    #[test]
+    fn prune_bytes_freed_saturates() {
+        let mut max_entry = make_entry("max.ftreplay", "max", b"max");
+        max_entry.status = ArtifactStatus::Retired;
+        max_entry.retired_at_ms = Some(1000);
+        max_entry.size_bytes = u64::MAX;
+
+        let mut one_entry = make_entry("one.ftreplay", "one", b"one");
+        one_entry.status = ArtifactStatus::Retired;
+        one_entry.retired_at_ms = Some(1000);
+        one_entry.size_bytes = 1;
+
+        let fs = MockFs::new();
+        let mut reg = setup_registry(vec![max_entry, one_entry], fs);
+
+        let result = reg.prune(&PruneOptions {
+            dry_run: false,
+            max_age_days: 0,
+            now_ms: 1000 + 24 * 60 * 60 * 1000,
+        });
+
+        assert_eq!(result.pruned_count, 2);
+        assert_eq!(result.bytes_freed, u64::MAX);
     }
 
     #[test]
