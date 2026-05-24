@@ -473,7 +473,7 @@ impl FederationEngine {
                     repo_path: export.repo_path(),
                     timestamp_ms: now_ms,
                 });
-                self.total_exports += 1;
+                self.total_exports = self.total_exports.saturating_add(1);
 
                 // Emit webhook event.
                 self.emit_event(FederationEvent {
@@ -529,7 +529,7 @@ impl FederationEngine {
             version: export.version,
             timestamp_ms: now_ms,
         });
-        self.total_imports += 1;
+        self.total_imports = self.total_imports.saturating_add(1);
 
         // Emit import event.
         self.emit_event(FederationEvent {
@@ -569,7 +569,7 @@ impl FederationEngine {
                 status: DeliveryStatus::Pending,
                 timestamp_ms: event.timestamp_ms,
             });
-            self.total_webhooks += 1;
+            self.total_webhooks = self.total_webhooks.saturating_add(1);
         }
     }
 
@@ -834,6 +834,17 @@ mod tests {
     }
 
     #[test]
+    fn export_stats_saturate() {
+        let store = make_store_with_records();
+        let mut engine = FederationEngine::with_defaults();
+        engine.total_exports = u64::MAX;
+
+        engine.export(&store, 5000);
+
+        assert_eq!(engine.stats().total_exports, u64::MAX);
+    }
+
+    #[test]
     fn export_creates_log_entries() {
         let store = make_store_with_records();
         let mut engine = FederationEngine::with_defaults();
@@ -903,6 +914,18 @@ mod tests {
         assert_eq!(engine.import_log().len(), 1);
     }
 
+    #[test]
+    fn import_stats_saturate() {
+        let record = make_record(1, "net", MaturityTier::Graduated);
+        let export = ReflexExport::from_record(&record, "other", 3000);
+        let mut engine = FederationEngine::with_defaults();
+        engine.total_imports = u64::MAX;
+
+        engine.import(&export, 5000);
+
+        assert_eq!(engine.stats().total_imports, u64::MAX);
+    }
+
     // ---- Webhooks ----
 
     #[test]
@@ -915,6 +938,28 @@ mod tests {
         let mut engine = FederationEngine::new(config);
         engine.export(&store, 5000);
         assert!(engine.pending_deliveries() > 0);
+    }
+
+    #[test]
+    fn webhook_stats_saturate() {
+        let config = FederationConfig {
+            webhooks: vec![make_webhook_config()],
+            ..Default::default()
+        };
+        let mut engine = FederationEngine::new(config);
+        engine.total_webhooks = u64::MAX;
+
+        engine.emit_event(FederationEvent {
+            kind: FederationEventKind::ReflexExported,
+            swarm_id: "other".to_string(),
+            reflex_id: 1,
+            cluster_id: "net".to_string(),
+            summary: "export".to_string(),
+            timestamp_ms: 5000,
+            metadata: HashMap::new(),
+        });
+
+        assert_eq!(engine.stats().total_webhooks, u64::MAX);
     }
 
     #[test]
