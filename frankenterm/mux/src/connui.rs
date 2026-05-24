@@ -34,7 +34,7 @@ impl LineEditorHost for PasswordPromptHost {
         }
         (
             output,
-            unicode_column_width(placeholder, None) * cursor_position,
+            unicode_column_width(placeholder, None).saturating_mul(cursor_position),
         )
     }
 }
@@ -569,6 +569,13 @@ mod tests {
         let (_output, cursor_2) = host.highlight_line("abc", 2);
         assert_eq!(cursor_0, 0);
         assert!(cursor_2 > cursor_0, "cursor at pos 2 should be after pos 0");
+    }
+
+    #[test]
+    fn password_prompt_host_cursor_position_saturates() {
+        let host = PasswordPromptHost::default();
+        let (_output, cursor) = host.highlight_line("abc", usize::MAX);
+        assert_eq!(cursor, usize::MAX);
     }
 
     #[test]
