@@ -8,14 +8,17 @@
   "expected_jsonl": "fixtures/deferred-proof-replay/extractor/expected/records.v1.jsonl",
   "invalid_fragments": "fixtures/deferred-proof-replay/extractor/invalid/fragments.v1.json",
   "golden_summary": {
-    "source_case_count": 6,
-    "output_record_count": 6,
+    "source_case_count": 9,
+    "output_record_count": 9,
     "receipt_emitted_count": 3,
-    "ineligible_count": 2,
+    "ineligible_count": 5,
     "duplicate_count": 1,
     "reason_codes": [
       "ambiguous_comment",
+      "code_test_failure",
+      "dirty_overlap",
       "duplicate_comment",
+      "operator_cancelled",
       "receipt_emitted",
       "stale_command_shape",
       "static_clean_remote_pending"

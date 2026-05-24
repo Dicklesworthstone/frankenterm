@@ -98,6 +98,54 @@
       "expected_reason_codes": [
         "duplicate_comment"
       ]
+    },
+    {
+      "case_id": "operator-cancelled-ineligible",
+      "bead_id": "ft-op1",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6207,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T02:00:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T02:00Z SilverTrout closeout footer:\nProof-State: source_landed\nCommit: aa11bb22cc\nTree: 0011223344556677889900112233445566778899\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-op1-policy cargo test -p frankenterm-core policy_gate_denial -- --nocapture\nProof-Kind: cargo_test\nPackage: frankenterm-core\nTest-Filter: policy_gate_denial\nFeature-Set: default\nTarget-Dir: /tmp/ft-op1-policy\nOwned-Paths: crates/frankenterm-core/src/policy.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: no_admissible_workers=critical_pressure=5\nBlocker: operator_cancelled"
+      },
+      "expected_state": "ineligible",
+      "expected_reason_codes": [
+        "operator_cancelled"
+      ]
+    },
+    {
+      "case_id": "dirty-overlap-ineligible",
+      "bead_id": "ft-dirt1",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6208,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T02:06:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T02:06Z SilverTrout closeout footer:\nProof-State: source_landed\nCommit: bb22cc33dd\nTree: 11223344556677889900112233445566778899aa\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-dirt1-redactor cargo check -p frankenterm-core --lib\nProof-Kind: cargo_check\nPackage: frankenterm-core\nTest-Filter:\nFeature-Set: default\nTarget-Dir: /tmp/ft-dirt1-redactor\nOwned-Paths: crates/frankenterm-core/src/redactor.rs\nDirty-Paths: crates/frankenterm-core/src/redactor.rs, crates/frankenterm-core/src/unrelated_feature.rs\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: no_admissible_workers=critical_pressure=5\nBlocker: dirty_overlap"
+      },
+      "expected_state": "ineligible",
+      "expected_reason_codes": [
+        "dirty_overlap"
+      ]
+    },
+    {
+      "case_id": "code-failure-ineligible",
+      "bead_id": "ft-codf1",
+      "source_comment": {
+        "kind": "closeout_footer",
+        "comment_id": 6209,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T02:12:00Z",
+        "raw_pane_content_stored": false,
+        "source_text": "2026-05-19T02:12Z SilverTrout closeout footer:\nProof-State: failing\nCommit: cc33dd44ee\nTree: 223344556677889900112233445566778899aabb\nCommand: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-codf1-mcp cargo test -p frankenterm-core mcp_tool_contract -- --nocapture\nProof-Kind: cargo_test\nPackage: frankenterm-core\nTest-Filter: mcp_tool_contract\nFeature-Set: default\nTarget-Dir: /tmp/ft-codf1-mcp\nOwned-Paths: crates/frankenterm-core/src/mcp.rs\nDirty-Paths:\nPrerequisite-Beads:\nAgent-Mail: available\nRCH-Admission: admitted\nBlocker: test_failure"
+      },
+      "expected_state": "ineligible",
+      "expected_reason_codes": [
+        "code_test_failure"
+      ]
     }
   ]
 }

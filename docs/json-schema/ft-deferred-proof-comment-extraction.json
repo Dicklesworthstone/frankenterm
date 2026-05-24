@@ -140,12 +140,15 @@
             "type": "string",
             "enum": [
               "ambiguous_comment",
+              "code_test_failure",
+              "dirty_overlap",
               "duplicate_comment",
               "env_not_allowlisted",
               "local_fallback_evidence",
               "malformed_footer",
               "missing_command",
               "missing_owned_paths",
+              "operator_cancelled",
               "receipt_emitted",
               "stale_command_shape",
               "static_clean_remote_pending"

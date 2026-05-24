@@ -64,6 +64,9 @@ REQUIRED_CASES = %w[
   ambiguous-prose-ineligible
   stale-command-ineligible
   duplicate-comment-ineligible
+  operator-cancelled-ineligible
+  dirty-overlap-ineligible
+  code-failure-ineligible
 ].freeze
 REQUIRED_STATES = %w[
   duplicate
@@ -72,7 +75,10 @@ REQUIRED_STATES = %w[
 ].freeze
 REQUIRED_REASONS = %w[
   ambiguous_comment
+  code_test_failure
+  dirty_overlap
   duplicate_comment
+  operator_cancelled
   receipt_emitted
   stale_command_shape
   static_clean_remote_pending
@@ -278,10 +284,25 @@ def extraction_record(case_entry, seen)
   fields = footer_fields(source.fetch("source_text"))
   command_text = fields.fetch("command", "")
   env, argv = command_parts(command_text)
+  owned_paths = split_list(fields.fetch("owned_paths", ""))
+  dirty_paths = split_list(fields.fetch("dirty_paths", ""))
+  blocker = fields.fetch("blocker", "").downcase
+  proof_state = fields.fetch("proof_state", "").downcase
   reasons = []
   reasons << "ambiguous_comment" if command_text.empty?
+  # Operator explicitly cancelled this replay: never auto-queue it, even when
+  # RCH is otherwise blocked. Distinct from infra deferral.
+  reasons << "operator_cancelled" if blocker == "operator_cancelled"
+  # Genuine code/test failure (a remote worker reached Cargo and the proof went
+  # red) is NOT a deferred-replayable receipt — it is a real failing result.
+  # Kept distinct from RCH admission / worker-pressure infra blocks.
+  reasons << "code_test_failure" if %w[code_failure test_failure].include?(blocker) ||
+                                     %w[failing red failed].include?(proof_state)
+  # Dirty-tree overlap: the captured tree carried dirty paths outside the owned
+  # set, so replaying would bundle unrelated work. Resolve before queueing.
+  reasons << "dirty_overlap" if dirty_paths.any? { |path| !owned_paths.include?(path) }
   reasons << "stale_command_shape" if stale_command?(fields, env, argv)
-  reasons << "missing_owned_paths" if command_text != "" && split_list(fields.fetch("owned_paths", "")).empty?
+  reasons << "missing_owned_paths" if command_text != "" && owned_paths.empty?
   reasons << "local_fallback_evidence" if source.fetch("source_text").match?(/\[RCH\] local|running locally|local fallback/i)
 
   if reasons.any?

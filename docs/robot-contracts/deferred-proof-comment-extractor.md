@@ -27,6 +27,26 @@ retained fixture corpus lives under `fixtures/deferred-proof-replay/extractor/`.
 - Mixed static/RCH closeouts may preserve static-clean evidence but must still
   emit `wait_rch` when material remote proof remains blocked.
 
+## Ineligibility Failure Classes
+
+The extractor distinguishes deferred-but-replayable proof from sources that must
+never be auto-queued. Each maps to a distinct reason code so an operator or
+robot can act without re-reading prose:
+
+| Reason code | Trigger | Why it is not a deferred receipt |
+| --- | --- | --- |
+| `ambiguous_comment` | No structured command in the footer. | Prose is not proof. |
+| `stale_command_shape` | Material Cargo command missing `RCH_REQUIRE_REMOTE=1`, `RCH_NO_SELF_HEALING=1`, or the `rch --no-self-healing exec --` shape. | Replaying a stale shape risks a non-conforming or local run. |
+| `operator_cancelled` | Footer `Blocker: operator_cancelled`. | The operator deliberately stopped this replay; honor it even when RCH is otherwise blocked. |
+| `code_test_failure` | Footer `Blocker: code_failure`/`test_failure` or `Proof-State: failing`/`red`/`failed`. | A remote worker reached Cargo and the proof went red — a real failing result, not infra deferral. |
+| `dirty_overlap` | Captured `Dirty-Paths` includes a path outside `Owned-Paths`. | Replaying would bundle unrelated dirty work; resolve the tree first. |
+| `duplicate_comment` | Same `(bead_id, source_text_sha256)` seen earlier. | The receipt already exists. |
+
+RCH admission failure and worker pressure remain *deferral* signals (the receipt
+is emitted with `wait_rch`/`blocked_worker_pressure`), and Agent Mail outage is
+recorded in the receipt's `coordination.agent_mail_state` rather than blocking
+extraction. Only the table above renders a source ineligible.
+
 ## Extraction States
 
 | State | Meaning |
@@ -45,6 +65,9 @@ The static verifier freezes source comments and expected JSONL records for:
 - `ambiguous-prose-ineligible`
 - `stale-command-ineligible`
 - `duplicate-comment-ineligible`
+- `operator-cancelled-ineligible`
+- `dirty-overlap-ineligible`
+- `code-failure-ineligible`
 
 It also rejects malformed fixture fragments for missing source text, raw pane
 text storage, and unknown expected states.
