@@ -1082,14 +1082,10 @@ impl ConnectorDataClassifier {
                 let hash = simple_hash(&self.config.hash_salt, value);
                 Some(format!("hash:{hash:016x}"))
             }
-            RedactionStrategy::Truncate { max_len } => {
-                if value.len() <= *max_len {
-                    Some(value.to_string())
-                } else {
-                    let truncated = &value[..value.len().min(*max_len)];
-                    Some(format!("{truncated}[...]"))
-                }
-            }
+            RedactionStrategy::Truncate { max_len } => match value.char_indices().nth(*max_len) {
+                Some((boundary, _)) => Some(format!("{}[...]", &value[..boundary])),
+                None => Some(value.to_string()),
+            },
             RedactionStrategy::Remove => None,
             RedactionStrategy::Tokenize { token_prefix } => {
                 let id = self.next_token_id;
@@ -1826,6 +1822,14 @@ mod tests {
         let result =
             classifier.apply_strategy(&RedactionStrategy::Truncate { max_len: 100 }, "short");
         assert_eq!(result, Some("short".to_string()));
+    }
+
+    #[test]
+    fn apply_truncate_strategy_preserves_utf8_boundaries() {
+        let mut classifier = test_classifier();
+        let result =
+            classifier.apply_strategy(&RedactionStrategy::Truncate { max_len: 1 }, "éclair");
+        assert_eq!(result, Some("é[...]".to_string()));
     }
 
     #[test]
