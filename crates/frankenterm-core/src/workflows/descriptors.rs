@@ -235,8 +235,50 @@ impl WorkflowDescriptor {
                 )),
             ));
         }
+        let expanded_steps = expanded_step_count(&self.steps).ok_or_else(|| {
+            crate::Error::Config(crate::error::ConfigError::ValidationError(
+                "Descriptor expands to too many executable steps".to_string(),
+            ))
+        })?;
+        if expanded_steps > limits.max_steps {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(format!(
+                    "Descriptor expands to too many executable steps ({expanded_steps} > max {})",
+                    limits.max_steps
+                )),
+            ));
+        }
 
         Ok(())
+    }
+}
+
+fn expanded_step_count(steps: &[DescriptorStep]) -> Option<usize> {
+    steps.iter().try_fold(0usize, |total, step| {
+        total.checked_add(expanded_step_count_for_step(step)?)
+    })
+}
+
+fn expanded_step_count_for_step(step: &DescriptorStep) -> Option<usize> {
+    match step {
+        DescriptorStep::Conditional {
+            then_steps,
+            else_steps,
+            ..
+        } => 2usize
+            .checked_add(expanded_step_count(then_steps)?)?
+            .checked_add(expanded_step_count(else_steps)?),
+        DescriptorStep::Loop { count, body, .. } => {
+            let body_steps = expanded_step_count(body)?;
+            body_steps.checked_mul(usize::try_from(*count).ok()?)
+        }
+        DescriptorStep::WaitFor { .. }
+        | DescriptorStep::Sleep { .. }
+        | DescriptorStep::SendText { .. }
+        | DescriptorStep::SendCtrl { .. }
+        | DescriptorStep::Notify { .. }
+        | DescriptorStep::Log { .. }
+        | DescriptorStep::Abort { .. } => Some(1),
     }
 }
 
@@ -2511,7 +2553,29 @@ steps:
         id: inner
         message: "x"
 "#;
-        assert!(DescriptorWorkflow::from_yaml_str(yaml).is_ok());
+        let descriptor: WorkflowDescriptor = serde_yaml::from_str(yaml).unwrap();
+        let mut limits = DescriptorLimits::default();
+        limits.max_steps = 1000;
+        assert!(descriptor.validate(&limits).is_ok());
+    }
+
+    #[test]
+    fn validate_loop_expansion_over_max_steps_fails() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: loop_expands_too_far
+steps:
+  - type: loop
+    id: loop1
+    count: 33
+    body:
+      - type: notify
+        id: inner
+        message: "x"
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("too many executable steps"), "got: {msg}");
     }
 
     #[test]
