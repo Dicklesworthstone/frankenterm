@@ -1,7 +1,8 @@
 //! Property-based tests for `workflows::lock` public lock-manager behavior.
 
 use frankenterm_core::workflows::{
-    ConcurrencyLimitInfo, LockAcquisitionResult, LockManagerHealth, PaneWorkflowLockManager,
+    ConcurrencyLimitInfo, LockAcquisitionResult, LockManagerHealth, OwnedLockAcquisitionResult,
+    PaneWorkflowLockManager,
 };
 use proptest::prelude::*;
 use std::collections::BTreeSet;
@@ -235,5 +236,84 @@ proptest! {
         prop_assert_eq!(health.acquisitions_total, 1);
         prop_assert_eq!(health.releases_total, 1);
         prop_assert_eq!(health.active_locks, 0);
+    }
+
+    #[test]
+    fn proptest_workflow_lock_owned_full_preserves_conflict_details_before_limit_errors(
+        pane_ids in prop::collection::btree_set(1u64..10_000, 2..8),
+        requested_limit in 1usize..8,
+        workflow_prefix in arb_label(),
+        execution_prefix in arb_label(),
+    ) {
+        prop_assume!(requested_limit < pane_ids.len());
+
+        let manager = Arc::new(PaneWorkflowLockManager::new());
+        let ordered_ids: Vec<u64> = pane_ids.iter().copied().collect();
+        let mut guards = Vec::new();
+
+        for (idx, pane_id) in ordered_ids.iter().take(requested_limit).enumerate() {
+            let workflow = format!("{workflow_prefix}-{idx}");
+            let execution = format!("{execution_prefix}-{idx}");
+            let acquired = manager
+                .try_acquire_with_limit_owned_full(*pane_id, &workflow, &execution, requested_limit)
+                .expect("initial owned full acquire should not hit the limit");
+            prop_assert!(
+                acquired.is_acquired(),
+                "fresh pane should not report an existing lock"
+            );
+            if let OwnedLockAcquisitionResult::Acquired(guard) = acquired {
+                guards.push(guard);
+            }
+        }
+
+        prop_assert_eq!(manager.active_count(), requested_limit);
+
+        let first_pane = ordered_ids[0];
+        let same_pane_conflict = manager
+            .try_acquire_with_limit_owned_full(
+                first_pane,
+                "conflicting-workflow",
+                "conflicting-execution",
+                requested_limit,
+            )
+            .expect("same-pane conflict should be reported before the global limit");
+
+        prop_assert!(
+            same_pane_conflict.is_already_locked(),
+            "same pane should preserve already-locked details"
+        );
+        if let OwnedLockAcquisitionResult::AlreadyLocked {
+            held_by_workflow,
+            held_by_execution,
+            locked_since_ms,
+        } = same_pane_conflict
+        {
+            prop_assert_eq!(held_by_workflow, format!("{workflow_prefix}-0"));
+            prop_assert_eq!(held_by_execution, format!("{execution_prefix}-0"));
+            prop_assert!(locked_since_ms > 0);
+        }
+
+        let overflow_pane = ordered_ids[requested_limit];
+        let overflow = manager.try_acquire_with_limit_owned_full(
+            overflow_pane,
+            "overflow-workflow",
+            "overflow-execution",
+            requested_limit,
+        );
+
+        prop_assert_eq!(
+            overflow.expect_err("different pane should hit the global limit"),
+            ConcurrencyLimitInfo {
+                active: requested_limit,
+                limit: requested_limit,
+            }
+        );
+        prop_assert_eq!(manager.active_count(), requested_limit);
+
+        drop(guards);
+        let health = manager.health();
+        prop_assert_eq!(health.releases_total, u64::try_from(requested_limit).unwrap());
+        prop_assert_eq!(health.active_locks, 0);
+        prop_assert!(manager.active_locks().is_empty());
     }
 }
