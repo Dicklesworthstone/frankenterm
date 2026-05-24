@@ -316,6 +316,47 @@ fn synthetic_robot_error_envelope_without_hint_validates() {
         .unwrap_or_else(|errors| panic_validation_errors("robot error envelope", errors));
 }
 
+#[test]
+fn synthetic_robot_error_envelope_with_blank_error_must_fail() {
+    let schema = load_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "   ",
+        "error_code": "robot.storage_error",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot ok=false envelopes with blank `error` text"
+    );
+}
+
+#[test]
+fn synthetic_robot_error_envelope_with_blank_hint_must_fail() {
+    let schema = load_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "Storage unavailable",
+        "error_code": "robot.storage_error",
+        "hint": "\t\n",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot ok=false envelopes with blank `hint` text"
+    );
+}
+
 /// Negative case: ok=true but no `data` field. The schema's
 /// conditional clause (if ok==true then data is required) must fire.
 #[test]
@@ -532,6 +573,49 @@ fn synthetic_mcp_error_envelope_without_hint_validates_against_schema() {
     schema
         .validate(&envelope)
         .unwrap_or_else(|errors| panic_validation_errors("MCP error envelope", errors));
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_with_blank_error_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "   ",
+        "error_code": "FT-MCP-0005",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP ok=false envelopes with blank `error` text"
+    );
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_with_blank_hint_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "Storage unavailable",
+        "error_code": "FT-MCP-0005",
+        "hint": "\t\n",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP ok=false envelopes with blank `hint` text"
+    );
 }
 
 #[test]

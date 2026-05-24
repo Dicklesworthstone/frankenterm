@@ -16,6 +16,7 @@
     },
     "error": {
       "type": "string",
+      "pattern": "\\S",
       "description": "Human-readable error message. Present when ok=false."
     },
     "error_code": {
@@ -25,6 +26,7 @@
     },
     "hint": {
       "type": "string",
+      "pattern": "\\S",
       "description": "Actionable suggestion for resolving the error. Present when ok=false and a remediation is known."
     },
     "elapsed_ms": {
