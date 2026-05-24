@@ -34,6 +34,14 @@ fn arb_descriptor_trigger() -> impl Strategy<Value = DescriptorTrigger> {
             agent_types,
             rule_ids,
         })
+        .prop_filter(
+            "descriptor trigger must constrain at least one dimension",
+            |trigger| {
+                !trigger.event_types.is_empty()
+                    || !trigger.agent_types.is_empty()
+                    || !trigger.rule_ids.is_empty()
+            },
+        )
 }
 
 fn arb_descriptor_failure_handler() -> impl Strategy<Value = DescriptorFailureHandler> {
@@ -470,6 +478,21 @@ proptest! {
         prop_assert!(
             val.validate(&limits).is_err(),
             "descriptor validation must reject empty trigger values"
+        );
+    }
+
+    #[test]
+    fn all_empty_trigger_fails_validation(mut val in arb_workflow_descriptor()) {
+        val.triggers = vec![DescriptorTrigger {
+            event_types: Vec::new(),
+            agent_types: Vec::new(),
+            rule_ids: Vec::new(),
+        }];
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+
+        prop_assert!(
+            val.validate(&limits).is_err(),
+            "descriptor validation must reject match-all trigger entries"
         );
     }
 

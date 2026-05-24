@@ -182,6 +182,17 @@ impl WorkflowDescriptor {
         }
 
         for trigger in &self.triggers {
+            if trigger.event_types.is_empty()
+                && trigger.agent_types.is_empty()
+                && trigger.rule_ids.is_empty()
+            {
+                return Err(crate::Error::Config(
+                    crate::error::ConfigError::ValidationError(
+                        "Descriptor trigger must constrain at least one of event_types, agent_types, or rule_ids"
+                            .to_string(),
+                    ),
+                ));
+            }
             validate_trigger_values("event_types", &trigger.event_types, limits.max_text_len)?;
             validate_trigger_values("agent_types", &trigger.agent_types, limits.max_text_len)?;
             validate_trigger_values("rule_ids", &trigger.rule_ids, limits.max_text_len)?;
