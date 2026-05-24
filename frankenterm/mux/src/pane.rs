@@ -1,9 +1,9 @@
+use crate::ExitBehavior;
 use crate::domain::DomainId;
 use crate::renderable::*;
-use crate::ExitBehavior;
 use async_trait::async_trait;
 use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
@@ -161,15 +161,34 @@ pub struct LogicalLine {
     pub first_row: StableRowIndex,
 }
 
+fn stable_row_offset(row: StableRowIndex, offset: usize) -> Option<StableRowIndex> {
+    let offset = StableRowIndex::try_from(offset).ok()?;
+    row.checked_add(offset)
+}
+
+fn stable_row_span(row: StableRowIndex, len: usize) -> Option<Range<StableRowIndex>> {
+    let end = stable_row_offset(row, len)?;
+    Some(row..end)
+}
+
 impl LogicalLine {
     pub fn contains_y(&self, y: StableRowIndex) -> bool {
-        y >= self.first_row && y < self.first_row + self.physical_lines.len() as StableRowIndex
+        if y < self.first_row {
+            return false;
+        }
+
+        match stable_row_offset(self.first_row, self.physical_lines.len()) {
+            Some(end) => y < end,
+            None => true,
+        }
     }
 
     pub fn xy_to_logical_x(&self, x: usize, y: StableRowIndex) -> usize {
         let mut offset = 0;
         for (idx, line) in self.physical_lines.iter().enumerate() {
-            let phys_y = self.first_row + idx as StableRowIndex;
+            let Some(phys_y) = stable_row_offset(self.first_row, idx) else {
+                break;
+            };
             if y < phys_y {
                 // Eg: trying to drag off the top of the viewport.
                 // Their y coordinate precedes our first line, so
@@ -198,7 +217,10 @@ impl LogicalLine {
             if x_off < line_len {
                 return (y, x_off);
             }
-            y += 1;
+            let Some(next_y) = y.checked_add(1) else {
+                return (y, x - idx + line_len);
+            };
+            y = next_y;
             idx += line_len;
         }
         (y - 1, x - idx + last_physical_line.len())
@@ -469,13 +491,14 @@ pub fn impl_for_each_logical_line_via_get_logical_lines<P: Pane + ?Sized>(
     let mut logical = pane.get_logical_lines(lines);
 
     for line in &mut logical {
-        let num_lines = line.physical_lines.len() as StableRowIndex;
         let mut line_refs = vec![];
         for phys in line.physical_lines.iter_mut() {
             line_refs.push(phys);
         }
-        let should_continue = for_line
-            .with_logical_line_mut(line.first_row..line.first_row + num_lines, &mut line_refs);
+        let Some(range) = stable_row_span(line.first_row, line.physical_lines.len()) else {
+            break;
+        };
+        let should_continue = for_line.with_logical_line_mut(range, &mut line_refs);
         if !should_continue {
             break;
         }
@@ -528,8 +551,13 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
             break;
         }
 
-        let next_row = first + phys.len() as StableRowIndex;
-        let (last_row, mut ahead) = pane.get_lines(next_row..next_row + 1);
+        let Some(next_row) = stable_row_offset(first, phys.len()) else {
+            break;
+        };
+        let Some(next_row_end) = next_row.checked_add(1) else {
+            break;
+        };
+        let (last_row, mut ahead) = pane.get_lines(next_row..next_row_end);
         if last_row != next_row {
             break;
         }
@@ -542,13 +570,16 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
     // Now process this stuff into logical lines
     let mut lines = vec![];
     for (idx, line) in phys.into_iter().enumerate() {
+        let Some(first_row) = stable_row_offset(first, idx) else {
+            break;
+        };
         match lines.last_mut() {
             None => {
                 let logical = line.clone();
                 lines.push(LogicalLine {
                     physical_lines: vec![line],
                     logical,
-                    first_row: first + idx as StableRowIndex,
+                    first_row,
                 });
             }
             Some(prior)
@@ -565,7 +596,7 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
                 lines.push(LogicalLine {
                     physical_lines: vec![line],
                     logical,
-                    first_row: first + idx as StableRowIndex,
+                    first_row,
                 });
             }
         }
@@ -614,6 +645,7 @@ mod test {
         lines: Mutex<Vec<Line>>,
         size: Mutex<TerminalSize>,
         writes: Mutex<Vec<u8>>,
+        base_row: StableRowIndex,
         empty_one_line_rows: Vec<StableRowIndex>,
     }
 
@@ -626,12 +658,37 @@ mod test {
             lines: Vec<Line>,
             empty_one_line_rows: Vec<StableRowIndex>,
         ) -> Self {
+            Self::new_with_base_row_and_empty_one_line_rows(lines, 0, empty_one_line_rows)
+        }
+
+        fn new_with_base_row(lines: Vec<Line>, base_row: StableRowIndex) -> Self {
+            Self::new_with_base_row_and_empty_one_line_rows(lines, base_row, Vec::new())
+        }
+
+        fn new_with_base_row_and_empty_one_line_rows(
+            lines: Vec<Line>,
+            base_row: StableRowIndex,
+            empty_one_line_rows: Vec<StableRowIndex>,
+        ) -> Self {
             Self {
                 lines: Mutex::new(lines),
                 size: Mutex::new(TerminalSize::default()),
                 writes: Mutex::new(Vec::new()),
+                base_row,
                 empty_one_line_rows,
             }
+        }
+
+        fn range_slice(&self, stable_range: Range<StableRowIndex>) -> Option<(usize, usize)> {
+            let start_offset = stable_range.start.checked_sub(self.base_row)?;
+            let end_offset = stable_range.end.checked_sub(self.base_row)?;
+            if start_offset < 0 || end_offset < start_offset {
+                return None;
+            }
+
+            let start = usize::try_from(start_offset).ok()?;
+            let len = usize::try_from(end_offset - start_offset).ok()?;
+            Some((start, len))
         }
     }
 
@@ -662,12 +719,10 @@ mod test {
         ) {
             let mut line_refs = vec![];
             let mut lines = self.lines.lock();
-            for line in lines
-                .iter_mut()
-                .skip(stable_range.start as usize)
-                .take((stable_range.end - stable_range.start) as usize)
-            {
-                line_refs.push(line);
+            if let Some((start, len)) = self.range_slice(stable_range.clone()) {
+                for line in lines.iter_mut().skip(start).take(len) {
+                    line_refs.push(line);
+                }
             }
             with_lines.with_lines_mut(stable_range.start, &mut line_refs);
         }
@@ -691,13 +746,16 @@ mod test {
             {
                 return (first, Vec::new());
             }
+            let Some((start, len)) = self.range_slice(lines) else {
+                return (first, Vec::new());
+            };
             (
                 first,
                 self.lines
                     .lock()
                     .iter()
-                    .skip(lines.start as usize)
-                    .take((lines.end - lines.start) as usize)
+                    .skip(start)
+                    .take(len)
                     .cloned()
                     .collect(),
             )
@@ -811,9 +869,10 @@ mod test {
         assert!(pane.get_changed_since(0..10, SEQ_ZERO).is_empty());
         assert_eq!(pane.get_title(), "fake-pane");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(pane
-            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-            .is_ok());
+        assert!(
+            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+                .is_ok()
+        );
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());
@@ -1230,6 +1289,19 @@ mod test {
         assert_eq!(
             summarize_logical_lines(&lines),
             vec![(0, Cow::Borrowed("wrapped"))]
+        );
+    }
+
+    #[test]
+    fn get_logical_lines_stops_forward_scan_at_stable_row_limit() {
+        let start = StableRowIndex::MAX - 1;
+        let pane = FakePane::new_with_base_row(vec![line("boundary", true)], start);
+
+        let lines = pane.get_logical_lines(start..StableRowIndex::MAX);
+
+        assert_eq!(
+            summarize_logical_lines(&lines),
+            vec![(start, Cow::Borrowed("boundary"))]
         );
     }
 
