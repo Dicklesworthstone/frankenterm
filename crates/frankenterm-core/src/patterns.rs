@@ -860,14 +860,7 @@ impl PatternPack {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.name.trim().is_empty() {
-            return Err(PatternError::InvalidRule("pack name cannot be empty".to_string()).into());
-        }
-        if self.version.trim().is_empty() {
-            return Err(
-                PatternError::InvalidRule("pack version cannot be empty".to_string()).into(),
-            );
-        }
+        validate_pack_identity(&self.name, &self.version)?;
 
         let mut seen = HashSet::new();
         for rule in &self.rules {
@@ -885,14 +878,7 @@ impl PatternPack {
     }
 
     fn validate_as_user_pack(&self) -> Result<()> {
-        if self.name.trim().is_empty() {
-            return Err(PatternError::InvalidRule("pack name cannot be empty".to_string()).into());
-        }
-        if self.version.trim().is_empty() {
-            return Err(
-                PatternError::InvalidRule("pack version cannot be empty".to_string()).into(),
-            );
-        }
+        validate_pack_identity(&self.name, &self.version)?;
 
         let mut seen = HashSet::new();
         for rule in &self.rules {
@@ -908,6 +894,26 @@ impl PatternPack {
 
         Ok(())
     }
+}
+
+fn validate_pack_identity(name: &str, version: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(PatternError::InvalidRule("pack name cannot be empty".to_string()).into());
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Err(
+            PatternError::InvalidRule("pack name cannot contain whitespace".to_string()).into(),
+        );
+    }
+    if version.trim().is_empty() {
+        return Err(PatternError::InvalidRule("pack version cannot be empty".to_string()).into());
+    }
+    if version.chars().any(char::is_whitespace) {
+        return Err(
+            PatternError::InvalidRule("pack version cannot contain whitespace".to_string()).into(),
+        );
+    }
+    Ok(())
 }
 
 #[must_use]

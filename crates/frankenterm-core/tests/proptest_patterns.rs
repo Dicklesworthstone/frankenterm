@@ -1131,9 +1131,25 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_pack_name_whitespace(rule_suffix in "[a-z]{3,10}") {
+        let rule = make_anchor_only_rule(&rule_suffix, "PACK_NAME_WHITESPACE");
+        let pack = PatternPack::new("builtin:bad pack", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_empty_pack_version(rule_suffix in "[a-z]{3,10}") {
         let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_VERSION");
         let pack = PatternPack::new("builtin:empty-version-test", " \t ", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn prop_library_rejects_pack_version_whitespace(rule_suffix in "[a-z]{3,10}") {
+        let rule = make_anchor_only_rule(&rule_suffix, "PACK_VERSION_WHITESPACE");
+        let pack = PatternPack::new("builtin:version-whitespace-test", "1.0 beta", vec![rule]);
 
         prop_assert!(PatternLibrary::new(vec![pack]).is_err());
     }
