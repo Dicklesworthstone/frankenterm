@@ -687,6 +687,7 @@
     "signature": {
       "type": "object",
       "required": ["method", "canonical_sha256"],
+      "additionalProperties": false,
       "properties": {
         "method": {
           "enum": ["sigstore-cosign-keyless", "ed25519", "unsigned"]
@@ -695,6 +696,30 @@
           "description": "SHA-256 of the canonical signing payload: the bundle JSON with the .signature field deleted, then `jq --sort-keys --compact-output` canonicalized.",
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "sigstore_bundle": { "$ref": "#/$defs/sigstoreBundle" },
+        "certificate_identity": {
+          "description": "Expected SAN/identity (typically the GitHub Actions workflow ref).",
+          "type": "string"
+        },
+        "certificate_oidc_issuer": {
+          "description": "Expected OIDC issuer (https://token.actions.githubusercontent.com for GitHub).",
+          "type": "string",
+          "format": "uri"
+        },
+        "signature_path": {
+          "description": "Repo-relative path to the raw 64-byte ed25519 signature, hex-encoded.",
+          "type": "string"
+        },
+        "public_key": {
+          "description": "32-byte ed25519 public key, hex-encoded.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reason": {
+          "description": "Why this bundle is unsigned. Must include a bead ID tracking the gap.",
+          "type": "string",
+          "minLength": 1
         }
       },
       "oneOf": [

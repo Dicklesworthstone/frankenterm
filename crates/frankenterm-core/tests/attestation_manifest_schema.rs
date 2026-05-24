@@ -301,6 +301,23 @@ fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
         !validate(&validator, &legacy_bundle_path_only).is_empty(),
         "sigstore signature without signature.sigstore_bundle must fail validation"
     );
+
+    let legacy_bundle_path_with_hashes = base_bundle(json!({
+        "method": "sigstore-cosign-keyless",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "sigstore_bundle": {
+            "path": "docs/attestations/0.2.0.sigstore",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "size_bytes": 4096
+        },
+        "bundle_path": "docs/attestations/0.2.0.sigstore",
+        "certificate_identity": "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+        "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+    }));
+    assert!(
+        !validate(&validator, &legacy_bundle_path_with_hashes).is_empty(),
+        "sigstore signature must reject legacy signature.bundle_path even when hashed metadata is present"
+    );
 }
 
 #[test]
