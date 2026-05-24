@@ -303,7 +303,7 @@ struct Recency {
 impl Recency {
     fn tag(&mut self, idx: usize) {
         self.by_idx.insert(idx, self.count);
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
     }
 
     fn score(&self, idx: usize) -> usize {
@@ -4394,6 +4394,19 @@ mod test {
             .create_stack(TabStackId(1), vec![99])
             .expect("create single-tab stack");
         assert_eq!(single.cycle_visible(TabStackId(1), isize::MIN), Some(99));
+    }
+
+    #[test]
+    fn recency_counter_saturates_at_usize_max() {
+        let mut recency = Recency {
+            count: usize::MAX,
+            by_idx: HashMap::new(),
+        };
+
+        recency.tag(7);
+
+        assert_eq!(recency.count, usize::MAX);
+        assert_eq!(recency.score(7), usize::MAX);
     }
 
     #[test]
