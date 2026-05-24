@@ -170,6 +170,17 @@ fn compute_cursor_after_printing_x_columns(
     (x, cursor_y.saturating_add(row_delta))
 }
 
+fn relative_offset_to_editor_start(cursor_y: isize) -> isize {
+    cursor_y.saturating_neg()
+}
+
+fn relative_offset_to_editor_end(render_height: usize, cursor_y: isize) -> isize {
+    let render_height = isize::try_from(render_height).unwrap_or(isize::MAX);
+    1isize
+        .saturating_add(render_height)
+        .saturating_sub(cursor_y)
+}
+
 impl<'term> LineEditor<'term> {
     /// Create a new line editor.
     /// In most cases, you'll want to use the `line_editor` function,
@@ -302,12 +313,15 @@ impl<'term> LineEditor<'term> {
 
         self.move_to_editor_start.replace(Change::CursorPosition {
             x: Position::Absolute(0),
-            y: Position::Relative(-1 * cursor_position.1),
+            y: Position::Relative(relative_offset_to_editor_start(cursor_position.1)),
         });
 
         self.move_to_editor_end.replace(Change::CursorPosition {
             x: Position::Absolute(0),
-            y: Position::Relative(1 + render_height as isize - cursor_position.1),
+            y: Position::Relative(relative_offset_to_editor_end(
+                render_height,
+                cursor_position.1,
+            )),
         });
 
         Ok(())
@@ -1088,5 +1102,16 @@ mod tests {
     fn cursor_position_math_saturates_large_offsets() {
         let (_x, y) = compute_cursor_after_printing_x_columns(usize::MAX, isize::MAX - 1, 10, 80);
         assert_eq!(y, isize::MAX);
+    }
+
+    #[test]
+    fn editor_relative_offsets_saturate_extreme_cursor_rows() {
+        assert_eq!(relative_offset_to_editor_start(3), -3);
+        assert_eq!(relative_offset_to_editor_start(isize::MIN), isize::MAX);
+        assert_eq!(relative_offset_to_editor_end(2, 1), 2);
+        assert_eq!(
+            relative_offset_to_editor_end(usize::MAX, isize::MIN),
+            isize::MAX
+        );
     }
 }
