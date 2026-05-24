@@ -7149,19 +7149,24 @@ pub fn lint_fts_query(query: &str) -> Vec<SearchLint> {
                 suggestion: Some("Use a term with prefix wildcard, e.g. \"err*\".".to_string()),
             });
         } else if token_trim.contains('*') {
-            if !token_trim.ends_with('*') {
-                lints.push(SearchLint {
-                    code: "wildcard_position".to_string(),
-                    severity: SearchLintSeverity::Warning,
-                    message: format!("Wildcard in '{token_trim}' is not in suffix position."),
-                    suggestion: Some("Use prefix search syntax like \"term*\".".to_string()),
-                });
-            } else if token_trim.starts_with('*') {
+            // Check the leading-wildcard case first: a token like "*foo" is a
+            // leading wildcard (unsupported by FTS5), not merely a non-suffix
+            // wildcard. The previous `!ends_with('*')`-first ordering routed
+            // "*foo" to wildcard_position and left wildcard_prefix reachable
+            // only for the "*foo*" double-wildcard form.
+            if token_trim.starts_with('*') {
                 lints.push(SearchLint {
                     code: "wildcard_prefix".to_string(),
                     severity: SearchLintSeverity::Warning,
                     message: format!("Leading wildcard in '{token_trim}' is not supported."),
                     suggestion: Some("Use a suffix wildcard like \"term*\".".to_string()),
+                });
+            } else if !token_trim.ends_with('*') {
+                lints.push(SearchLint {
+                    code: "wildcard_position".to_string(),
+                    severity: SearchLintSeverity::Warning,
+                    message: format!("Wildcard in '{token_trim}' is not in suffix position."),
+                    suggestion: Some("Use prefix search syntax like \"term*\".".to_string()),
                 });
             }
         }
