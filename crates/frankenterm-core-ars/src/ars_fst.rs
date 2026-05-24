@@ -119,6 +119,8 @@ pub enum FstError {
     EmptyKey,
     /// No entries to compile.
     EmptyInput,
+    /// MinHash key length was not a whole number of u64 words.
+    InvalidMinHashKeyLength { len: usize },
     /// Trigger builder exhausted the reflex ID space.
     ReflexIdExhausted,
 }
@@ -132,6 +134,9 @@ impl std::fmt::Display for FstError {
             }
             Self::EmptyKey => write!(f, "empty key"),
             Self::EmptyInput => write!(f, "no entries to compile"),
+            Self::InvalidMinHashKeyLength { len } => {
+                write!(f, "invalid MinHash key length: {len} is not divisible by 8")
+            }
             Self::ReflexIdExhausted => write!(f, "reflex ID space exhausted"),
         }
     }
@@ -472,14 +477,19 @@ pub fn minhash_to_key(signature: &[u64]) -> Vec<u8> {
 }
 
 /// Deserialize a byte key back into MinHash values.
-pub fn key_to_minhash(key: &[u8]) -> Vec<u64> {
-    key.chunks_exact(8)
+pub fn key_to_minhash(key: &[u8]) -> Result<Vec<u64>, FstError> {
+    if key.len() % 8 != 0 {
+        return Err(FstError::InvalidMinHashKeyLength { len: key.len() });
+    }
+
+    Ok(key
+        .chunks_exact(8)
         .map(|chunk| {
             let mut arr = [0u8; 8];
             arr.copy_from_slice(chunk);
             u64::from_be_bytes(arr)
         })
-        .collect()
+        .collect())
 }
 
 // =============================================================================
@@ -913,8 +923,14 @@ mod tests {
     fn minhash_roundtrip() {
         let sig = vec![12345u64, 67890, u64::MAX, 0];
         let key = minhash_to_key(&sig);
-        let recovered = key_to_minhash(&key);
+        let recovered = key_to_minhash(&key).unwrap();
         assert_eq!(recovered, sig);
+    }
+
+    #[test]
+    fn minhash_rejects_trailing_bytes() {
+        let err = key_to_minhash(&[0; 9]).unwrap_err();
+        assert_eq!(err, FstError::InvalidMinHashKeyLength { len: 9 });
     }
 
     #[test]
@@ -1108,6 +1124,11 @@ mod tests {
             FstError::TooManyEntries { count: 10, max: 5 }
                 .to_string()
                 .contains("too many entries")
+        );
+        assert!(
+            FstError::InvalidMinHashKeyLength { len: 9 }
+                .to_string()
+                .contains("not divisible by 8")
         );
         assert!(
             FstError::ReflexIdExhausted

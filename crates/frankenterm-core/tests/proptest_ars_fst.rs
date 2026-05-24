@@ -208,7 +208,7 @@ proptest! {
     #[test]
     fn minhash_roundtrip(sig in arb_minhash()) {
         let key = minhash_to_key(&sig);
-        let recovered = key_to_minhash(&key);
+        let recovered = key_to_minhash(&key).unwrap();
         prop_assert_eq!(recovered, sig);
     }
 
@@ -228,6 +228,18 @@ proptest! {
             let k2 = minhash_to_key(&sig2);
             prop_assert_ne!(k1, k2);
         }
+    }
+
+    #[test]
+    fn malformed_minhash_key_lengths_are_rejected(
+        mut key in prop::collection::vec(any::<u8>(), 0..128),
+        suffix_len in 1usize..8,
+    ) {
+        key.truncate((key.len() / 8) * 8);
+        key.extend(std::iter::repeat(0u8).take(suffix_len));
+
+        let err = key_to_minhash(&key).unwrap_err();
+        prop_assert_eq!(err, FstError::InvalidMinHashKeyLength { len: key.len() });
     }
 }
 
