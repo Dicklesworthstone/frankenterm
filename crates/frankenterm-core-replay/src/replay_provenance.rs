@@ -663,8 +663,13 @@ pub fn verify_chain(entries: &[ReplayAuditEntry]) -> AuditChainVerification {
 
     // Check ordinal gaps.
     for i in 1..entries.len() {
-        let expected = entries[i - 1].ordinal + 1;
+        let previous = entries[i - 1].ordinal;
+        let expected = previous.saturating_add(1);
         let actual = entries[i].ordinal;
+        if actual <= previous && chain_intact {
+            chain_intact = false;
+            first_break_at = Some(actual);
+        }
         if actual > expected {
             for gap in expected..actual {
                 missing_ordinals.push(gap);
@@ -1151,6 +1156,43 @@ mod tests {
         });
         let v = verify_chain(&entries);
         assert_eq!(v.missing_ordinals, vec![1, 2]);
+    }
+
+    #[test]
+    fn audit_trail_rejects_duplicate_ordinals_with_valid_hash_link() {
+        let mut entries = vec![];
+        entries.push(ReplayAuditEntry {
+            audit_version: REPLAY_AUDIT_VERSION.into(),
+            ordinal: 0,
+            replay_run_id: "r0".into(),
+            actor: "a".into(),
+            started_at_ms: 100,
+            completed_at_ms: 200,
+            artifact_ref: "art".into(),
+            override_ref: None,
+            decision_count: 10,
+            anomaly_count: 0,
+            prev_entry_hash: REPLAY_AUDIT_GENESIS.into(),
+        });
+        let h0 = entries[0].hash();
+        entries.push(ReplayAuditEntry {
+            audit_version: REPLAY_AUDIT_VERSION.into(),
+            ordinal: 0,
+            replay_run_id: "duplicate".into(),
+            actor: "a".into(),
+            started_at_ms: 300,
+            completed_at_ms: 400,
+            artifact_ref: "art".into(),
+            override_ref: None,
+            decision_count: 10,
+            anomaly_count: 0,
+            prev_entry_hash: h0,
+        });
+
+        let v = verify_chain(&entries);
+        assert!(!v.chain_intact);
+        assert_eq!(v.first_break_at, Some(0));
+        assert!(v.missing_ordinals.is_empty());
     }
 
     #[test]
