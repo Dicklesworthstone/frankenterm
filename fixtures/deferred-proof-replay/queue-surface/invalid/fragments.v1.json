@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "contract_id": "ft.deferred_proof_queue_surface.v1",
-  "description": "Negative corpus. Each case names a minimal mutation applied to the golden surface and the single violation code the verifier must report. Mutations are applied programmatically so the corpus stays small and precise.",
+  "description": "Negative corpus. Each case names a mutation applied to the golden surface and the violation code the verifier must report. Most mutations are minimal/single-code; a few structural mutations (duplicate bead/explain, unknown status, runnable demotion) legitimately cascade, so the verifier requires only that the named code is present in the violation set. Mutations are applied programmatically so the corpus stays precise.",
   "cases": [
     {
       "case_id": "guardrail-disabled",
@@ -147,6 +147,26 @@
       "case_id": "next-candidate-target-drift",
       "mutation": "drift_next_candidate_target",
       "expected_violation": "next_candidate_target_drift"
+    },
+    {
+      "case_id": "duplicate-bead-id",
+      "mutation": "duplicate_bead_id",
+      "expected_violation": "bead_dup"
+    },
+    {
+      "case_id": "unknown-status",
+      "mutation": "inject_unknown_status",
+      "expected_violation": "unknown_status"
+    },
+    {
+      "case_id": "duplicate-explain-entry",
+      "mutation": "duplicate_explain_entry",
+      "expected_violation": "explain_dup"
+    },
+    {
+      "case_id": "runnable-demoted-candidate-kept",
+      "mutation": "demote_runnable_keep_candidate",
+      "expected_violation": "next_candidate_should_be_null"
     }
   ]
 }

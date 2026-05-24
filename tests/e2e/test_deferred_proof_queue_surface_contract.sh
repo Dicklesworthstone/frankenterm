@@ -293,6 +293,14 @@ def apply_mutation(surface, op)
     cmd = s["next_candidate"]["command_preview"]
     idx = cmd.index { |t| t.start_with?("CARGO_TARGET_DIR=") }
     cmd[idx] = "CARGO_TARGET_DIR=/tmp/ft-rdy1-WRONG" if idx
+  when "duplicate_bead_id"
+    s["queue"][1]["bead_id"] = s["queue"][0]["bead_id"]
+  when "inject_unknown_status"
+    s["queue"].first["status"] = "totally_unknown_status"
+  when "duplicate_explain_entry"
+    s["explain"] = [deep_dup(s["explain"].first)] + s["explain"]
+  when "demote_runnable_keep_candidate"
+    s["queue"].find { |e| e["status"] == "runnable" }["replay_allowed"] = false
   else
     fail!("unknown invalid-fragment mutation: #{op}")
   end
