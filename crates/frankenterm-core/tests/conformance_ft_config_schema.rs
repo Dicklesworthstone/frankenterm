@@ -319,6 +319,44 @@ fn schema_rejects_empty_pane_filter_rule_id() {
     );
 }
 
+/// 4f) Falsification: pane filters and priority overrides must carry
+/// at least one matcher field, not just an ID.
+#[test]
+fn schema_rejects_matcherless_pane_rules() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "ingest.panes.include",
+            serde_json::json!({
+                "ingest": {
+                    "panes": {
+                        "include": [
+                            { "id": "missing_matcher" }
+                        ]
+                    }
+                }
+            }),
+        ),
+        (
+            "ingest.priorities.rules",
+            serde_json::json!({
+                "ingest": {
+                    "priorities": {
+                        "rules": [
+                            { "id": "missing_matcher", "priority": 10 }
+                        ]
+                    }
+                }
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject matcher-less {surface} entries"
+        );
+    }
+}
+
 /// Pin the documented-but-unreachable list. If the README↔code
 /// reconciliation lands and the unreachable section starts round-
 /// tripping, this test fails and the maintainer must move the entry

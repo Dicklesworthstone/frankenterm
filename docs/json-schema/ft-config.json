@@ -10,6 +10,11 @@
       "type": "object",
       "additionalProperties": true,
       "required": ["id"],
+      "anyOf": [
+        { "required": ["domain"] },
+        { "required": ["title"] },
+        { "required": ["cwd"] }
+      ],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "domain": { "type": "string" },
@@ -73,8 +78,13 @@
                 "type": "object",
                 "additionalProperties": true,
                 "required": ["id", "priority"],
+                "anyOf": [
+                  { "required": ["domain"] },
+                  { "required": ["title"] },
+                  { "required": ["cwd"] }
+                ],
                 "properties": {
-                  "id": { "type": "string" },
+                  "id": { "type": "string", "minLength": 1 },
                   "priority": { "type": "integer", "minimum": 0 },
                   "title": { "type": "string" },
                   "domain": { "type": "string" }
