@@ -88,6 +88,13 @@ impl KittyImageState {
     }
 }
 
+fn next_kitty_frame_number(frame_count: usize) -> anyhow::Result<u32> {
+    let frame_count = u32::try_from(frame_count).context("kitty animation has too many frames")?;
+    frame_count
+        .checked_add(1)
+        .context("kitty animation frame space exhausted")
+}
+
 /// Maximum number of accumulated multi-chunk Kitty image fragments.
 /// Prevents unbounded growth from malformed escape sequences that start
 /// a multi-chunk transfer but never send the final chunk.
@@ -885,8 +892,9 @@ impl TerminalState {
                 durations,
                 hashes,
             } => {
-                let frame_no = frame.frame_number.unwrap_or(frames.len() as u32 + 1);
-                if frame_no == frames.len() as u32 + 1 {
+                let append_frame_no = next_kitty_frame_number(frames.len())?;
+                let frame_no = frame.frame_number.unwrap_or(append_frame_no);
+                if frame_no == append_frame_no {
                     // Append a new frame
 
                     let mut new_frame = match frame.base_frame {
@@ -923,7 +931,7 @@ impl TerminalState {
                     durations.push(frame_gap);
                 } else {
                     anyhow::ensure!(
-                        frame_no > 0 && frame_no <= frames.len() as u32,
+                        frame_no > 0 && frame_no < append_frame_no,
                         "attempted to edit frame {} which is outside range 1-{}",
                         frame_no,
                         frames.len()
@@ -1385,6 +1393,16 @@ mod tests {
 
         assert!(err.to_string().contains("image id space exhausted"));
         assert!(!terminal.kitty_img.number_to_id.contains_key(&9));
+    }
+
+    #[test]
+    fn next_kitty_frame_number_checks_protocol_boundary() {
+        assert_eq!(next_kitty_frame_number(0).unwrap(), 1);
+        assert_eq!(
+            next_kitty_frame_number((u32::MAX as usize).saturating_sub(1)).unwrap(),
+            u32::MAX
+        );
+        assert!(next_kitty_frame_number(u32::MAX as usize).is_err());
     }
 
     #[test]
