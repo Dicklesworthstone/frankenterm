@@ -462,6 +462,44 @@ fn synthetic_robot_envelope_with_malformed_version_must_fail() {
 }
 
 #[test]
+fn synthetic_robot_envelope_with_negative_elapsed_ms_must_fail() {
+    let schema = load_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "pane_id": 7 },
+        "elapsed_ms": -1,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot envelopes with negative `elapsed_ms`"
+    );
+}
+
+#[test]
+fn synthetic_robot_envelope_with_negative_now_must_fail() {
+    let schema = load_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "pane_id": 7 },
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": -1,
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot envelopes with negative `now` timestamps"
+    );
+}
+
+#[test]
 fn synthetic_robot_envelope_with_unknown_top_level_field_must_fail() {
     let schema = load_envelope_schema();
 
@@ -801,6 +839,46 @@ fn synthetic_mcp_envelope_with_malformed_version_must_fail() {
     assert!(
         result.is_err(),
         "validator MUST reject MCP envelopes whose `version` is not semver-shaped"
+    );
+}
+
+#[test]
+fn synthetic_mcp_envelope_with_negative_elapsed_ms_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "tool": "wa.search", "matches": [] },
+        "elapsed_ms": -1,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP envelopes with negative `elapsed_ms`"
+    );
+}
+
+#[test]
+fn synthetic_mcp_envelope_with_negative_now_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "tool": "wa.search", "matches": [] },
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": -1,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP envelopes with negative `now` timestamps"
     );
 }
 
