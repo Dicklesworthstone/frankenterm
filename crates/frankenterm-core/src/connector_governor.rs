@@ -821,11 +821,11 @@ impl QueueBackpressure {
 
     /// Record an enqueue.
     pub fn record_enqueue(&mut self) {
-        self.current_depth += 1;
+        self.current_depth = self.current_depth.saturating_add(1);
         if self.current_depth > self.peak_depth {
             self.peak_depth = self.current_depth;
         }
-        self.total_enqueued += 1;
+        self.total_enqueued = self.total_enqueued.saturating_add(1);
     }
 
     /// Record a dequeue.
@@ -835,7 +835,7 @@ impl QueueBackpressure {
 
     /// Record a rejection.
     pub fn record_rejection(&mut self) {
-        self.total_rejected += 1;
+        self.total_rejected = self.total_rejected.saturating_add(1);
     }
 
     /// Current depth fraction (0.0–1.0).
@@ -1833,6 +1833,24 @@ mod tests {
         qb.record_dequeue();
         assert_eq!(qb.current_depth(), 1);
         assert_eq!(qb.peak_depth(), 2); // peak unchanged
+    }
+
+    #[test]
+    fn queue_backpressure_counters_saturate() {
+        let mut qb = QueueBackpressure::new(QueueBackpressureConfig::default());
+        qb.current_depth = usize::MAX;
+        qb.peak_depth = usize::MAX;
+        qb.total_enqueued = u64::MAX;
+        qb.total_rejected = u64::MAX;
+
+        qb.record_enqueue();
+        qb.record_rejection();
+
+        let snapshot = qb.snapshot();
+        assert_eq!(snapshot.current_depth, usize::MAX);
+        assert_eq!(snapshot.peak_depth, usize::MAX);
+        assert_eq!(snapshot.total_enqueued, u64::MAX);
+        assert_eq!(snapshot.total_rejected, u64::MAX);
     }
 
     #[test]
