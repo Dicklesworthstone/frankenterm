@@ -369,6 +369,21 @@ fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
 }
 
 #[test]
+fn bundle_schema_rejects_blank_generator_version() {
+    let validator = bundle_validator();
+    let mut bundle = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle tracked by ft-e87u6.2"
+    }));
+    bundle["generator"]["version"] = json!(" \t");
+    assert!(
+        !validate(&validator, &bundle).is_empty(),
+        "bundle generator.version must reject blank provenance text"
+    );
+}
+
+#[test]
 fn bundle_schema_rejects_unsafe_signature_paths() {
     let validator = bundle_validator();
 
