@@ -988,6 +988,27 @@ fn synthetic_mcp_envelope_with_negative_now_must_fail() {
     );
 }
 
+#[test]
+fn synthetic_mcp_envelope_with_unknown_top_level_field_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "tool": "wa.search", "matches": [] },
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+        "unexpected_top_level": "this is not part of the MCP envelope contract",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP envelopes with unknown top-level fields"
+    );
+}
+
 /// Coverage assertion: prints the fixture inventory so a CI reviewer
 /// can audit what's covered without re-deriving from the test output.
 #[test]
