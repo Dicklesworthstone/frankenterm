@@ -456,6 +456,94 @@ proptest! {
     }
 
     #[test]
+    fn workflow_description_respects_configured_text_length_limit(
+        max_text_len in 0usize..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "description_limit".to_string(),
+            description: Some("x".repeat(max_text_len)),
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "workflow description at max_text_len should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "description_limit".to_string(),
+            description: Some("x".repeat(max_text_len.saturating_add(1))),
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "workflow description longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
+    fn step_description_respects_configured_text_length_limit(
+        max_text_len in 0usize..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_text_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "step_description_limit".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: Some("x".repeat(max_text_len)),
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "step description at max_text_len should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "step_description_limit".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "step".to_string(),
+                description: Some("x".repeat(max_text_len.saturating_add(1))),
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "step description longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
     fn duplicate_top_level_step_ids_fail_validation(
         name in "[a-z_]{3,20}",
         duplicate_id in "[a-z_]{3,15}",

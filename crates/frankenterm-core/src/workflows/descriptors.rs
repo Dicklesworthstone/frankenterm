@@ -151,6 +151,12 @@ impl WorkflowDescriptor {
             ));
         }
 
+        validate_optional_text_len(
+            "Descriptor description",
+            self.description.as_deref(),
+            limits.max_text_len,
+        )?;
+
         if self.steps.is_empty() {
             return Err(crate::Error::Config(
                 crate::error::ConfigError::ValidationError(
@@ -208,6 +214,25 @@ fn validate_trigger_values(field: &str, values: &[String]) -> crate::Result<()> 
     Ok(())
 }
 
+fn validate_optional_text_len(
+    label: &str,
+    value: Option<&str>,
+    max_len: usize,
+) -> crate::Result<()> {
+    if let Some(value) = value {
+        if value.len() > max_len {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(format!(
+                    "{label} too long ({} > max {})",
+                    value.len(),
+                    max_len
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_failure_handler(
     handler: &DescriptorFailureHandler,
     limits: &DescriptorLimits,
@@ -257,6 +282,7 @@ fn validate_step_tree(
         ));
     }
 
+    validate_step_description(step, limits)?;
     step.validate(limits)?;
 
     match step {
@@ -287,6 +313,24 @@ fn validate_step_tree(
     }
 
     Ok(())
+}
+
+fn validate_step_description(
+    step: &DescriptorStep,
+    limits: &DescriptorLimits,
+) -> crate::Result<()> {
+    let description = match step {
+        DescriptorStep::WaitFor { description, .. }
+        | DescriptorStep::Sleep { description, .. }
+        | DescriptorStep::SendText { description, .. }
+        | DescriptorStep::SendCtrl { description, .. }
+        | DescriptorStep::Notify { description, .. }
+        | DescriptorStep::Log { description, .. }
+        | DescriptorStep::Abort { description, .. }
+        | DescriptorStep::Conditional { description, .. }
+        | DescriptorStep::Loop { description, .. } => description.as_deref(),
+    };
+    validate_optional_text_len("Descriptor step description", description, limits.max_text_len)
 }
 
 /// Matchers in descriptors (substring or regex).
