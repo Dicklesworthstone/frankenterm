@@ -390,6 +390,33 @@ fail!("next candidate drifted: got #{next_candidate["bead_id"]}, manifest says #
 fail!("next candidate must be runnable now (static, RCH down)") unless next_candidate["decision"] == "run_static_now"
 fail!("next candidate must be replay_allowed_now") unless next_candidate["replay_allowed_now"]
 
+# Metamorphic checks on the selection branches the honest corpus cannot exercise
+# (it carries exactly one run_static_now and no static ties):
+#  - tier fallback: with no static receipt, the next candidate must fall through
+#    to a would_run_remote one (not to a deferred/rejected receipt, and not null
+#    while a remote-runnable one exists);
+#  - deterministic tie-break: among same-tier candidates the smallest bead_id
+#    wins regardless of input order;
+#  - empty/all-blocked input yields no candidate.
+without_static = actual.reject { |rec| rec["decision"] == "run_static_now" }
+fallback = select_next_candidate(without_static)
+remote_runnable = without_static.select { |rec| rec["decision"] == "would_run_remote" }
+if remote_runnable.empty?
+  fail!("fallback should be nil when nothing is runnable") unless fallback.nil?
+else
+  fail!("fallback must pick a would_run_remote receipt") unless fallback && fallback["decision"] == "would_run_remote"
+  fail!("fallback must be the smallest-bead_id remote receipt") unless fallback["bead_id"] == remote_runnable.map { |r| r["bead_id"] }.min
+end
+
+tie_a = { "bead_id" => "ft-zzz", "decision" => "run_static_now" }
+tie_b = { "bead_id" => "ft-aaa", "decision" => "run_static_now" }
+fail!("tie-break must be order-independent (forward)") unless select_next_candidate([tie_a, tie_b])["bead_id"] == "ft-aaa"
+fail!("tie-break must be order-independent (reversed)") unless select_next_candidate([tie_b, tie_a])["bead_id"] == "ft-aaa"
+
+only_blocked = actual.reject { |rec| %w[run_static_now would_run_remote].include?(rec["decision"]) }
+fail!("all-blocked input must yield no candidate") unless select_next_candidate(only_blocked).nil?
+fail!("empty input must yield no candidate") unless select_next_candidate([]).nil?
+
 # Manifest decision histogram reconciles with the classifier output.
 counts = Hash.new(0)
 actual.each { |rec| counts[rec["decision"]] += 1 }
