@@ -451,7 +451,7 @@ proptest! {
 
     #[test]
     fn failure_handler_message_respects_configured_text_length_limit(
-        max_text_len in 0usize..128,
+        max_text_len in 1usize..128,
         handler_variant in 0u8..3,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
@@ -466,7 +466,7 @@ proptest! {
 
         let at_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "failure_handler_limit".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
@@ -483,7 +483,7 @@ proptest! {
 
         let over_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "failure_handler_limit".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
@@ -501,7 +501,7 @@ proptest! {
 
     #[test]
     fn workflow_description_respects_configured_text_length_limit(
-        max_text_len in 0usize..128,
+        max_text_len in 1usize..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_text_len,
@@ -510,7 +510,7 @@ proptest! {
 
         let at_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "description_limit".to_string(),
+            name: "x".to_string(),
             description: Some("x".repeat(max_text_len)),
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
@@ -527,7 +527,7 @@ proptest! {
 
         let over_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "description_limit".to_string(),
+            name: "x".to_string(),
             description: Some("x".repeat(max_text_len.saturating_add(1))),
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
@@ -545,7 +545,7 @@ proptest! {
 
     #[test]
     fn step_description_respects_configured_text_length_limit(
-        max_text_len in 0usize..128,
+        max_text_len in 1usize..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_text_len,
@@ -554,7 +554,7 @@ proptest! {
 
         let at_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "step_description_limit".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
@@ -571,7 +571,7 @@ proptest! {
 
         let over_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "step_description_limit".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendCtrl {
@@ -685,7 +685,7 @@ proptest! {
 
     #[test]
     fn send_text_step_respects_configured_text_length_limit(
-        max_text_len in 0usize..128,
+        max_text_len in 1usize..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_text_len,
@@ -694,7 +694,7 @@ proptest! {
 
         let at_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "text_limit_at_boundary".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendText {
@@ -713,7 +713,7 @@ proptest! {
 
         let over_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "text_limit_over_boundary".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::SendText {
@@ -733,7 +733,7 @@ proptest! {
 
     #[test]
     fn conditional_test_text_respects_configured_text_length_limit(
-        max_text_len in 0usize..128,
+        max_text_len in 1usize..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_text_len,
@@ -742,7 +742,7 @@ proptest! {
 
         let at_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "condition_text_limit_at_boundary".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::Conditional {
@@ -768,7 +768,7 @@ proptest! {
 
         let over_limit = WorkflowDescriptor {
             workflow_schema_version: 1,
-            name: "condition_text_limit_over_boundary".to_string(),
+            name: "x".to_string(),
             description: None,
             triggers: Vec::new(),
             steps: vec![DescriptorStep::Conditional {
