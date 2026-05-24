@@ -638,6 +638,100 @@ proptest! {
     }
 
     #[test]
+    fn wait_for_timeout_respects_configured_limit(
+        max_wait_timeout_ms in 0u64..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_wait_timeout_ms,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "wait_timeout_at_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::WaitFor {
+                id: "wait".to_string(),
+                description: None,
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                },
+                timeout_ms: Some(max_wait_timeout_ms),
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "wait_for timeout at max_wait_timeout_ms should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "wait_timeout_over_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::WaitFor {
+                id: "wait".to_string(),
+                description: None,
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                },
+                timeout_ms: Some(max_wait_timeout_ms.saturating_add(1)),
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "wait_for timeout longer than max_wait_timeout_ms should fail validation"
+        );
+    }
+
+    #[test]
+    fn sleep_duration_respects_configured_limit(
+        max_sleep_ms in 0u64..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_sleep_ms,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "sleep_at_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Sleep {
+                id: "sleep".to_string(),
+                description: None,
+                duration_ms: max_sleep_ms,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "sleep duration at max_sleep_ms should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "sleep_over_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Sleep {
+                id: "sleep".to_string(),
+                description: None,
+                duration_ms: max_sleep_ms.saturating_add(1),
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "sleep duration longer than max_sleep_ms should fail validation"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();
