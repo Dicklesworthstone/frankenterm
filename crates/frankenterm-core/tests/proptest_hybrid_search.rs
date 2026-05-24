@@ -935,3 +935,72 @@ proptest! {
         prop_assert!(!tau.is_nan(), "kendall_tau returned NaN after fuse");
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Weighted RRF score behavior (metamorphic)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Increasing a lane's weight (other lane fixed) must not decrease — and for
+    /// a lane-exclusive item strictly increases — that item's fused score. A
+    /// lexical-only item scores lexical_weight/(k+rank+1) under both fusion
+    /// backends, so doubling lexical_weight strictly raises it. Existing tests
+    /// cover weight clamping/defaults but not the weighted-score effect.
+    #[test]
+    fn rrf_weight_monotonic_for_lexical_only_item(
+        id in any::<u64>(),
+        base_score in 0.1f32..100.0,
+    ) {
+        let lexical = vec![(id, base_score)];
+        let semantic: Vec<(u64, f32)> = Vec::new();
+
+        let low = HybridSearchService::new()
+            .with_rrf_weights(1.0, 1.0)
+            .fuse(&lexical, &semantic, 10);
+        let high = HybridSearchService::new()
+            .with_rrf_weights(2.0, 1.0)
+            .fuse(&lexical, &semantic, 10);
+
+        let low_score = low.iter().find(|r| r.id == id).map(|r| r.score);
+        let high_score = high.iter().find(|r| r.id == id).map(|r| r.score);
+
+        prop_assert!(low_score.is_some(), "lexical-only item absent under weight 1.0");
+        prop_assert!(high_score.is_some(), "lexical-only item absent under weight 2.0");
+        let low_s = low_score.unwrap();
+        let high_s = high_score.unwrap();
+        prop_assert!(low_s > 0.0, "lexical-only score should be positive, got {}", low_s);
+        prop_assert!(
+            high_s > low_s,
+            "doubling lexical_weight must raise the lexical-only score: low={}, high={}",
+            low_s, high_s
+        );
+    }
+
+    /// Symmetric relation for the semantic lane: a semantic-only item's score
+    /// strictly increases when semantic_weight is raised, lexical_weight fixed.
+    #[test]
+    fn rrf_weight_monotonic_for_semantic_only_item(
+        id in any::<u64>(),
+        base_score in 0.1f32..1.0,
+    ) {
+        let lexical: Vec<(u64, f32)> = Vec::new();
+        let semantic = vec![(id, base_score)];
+
+        let low = HybridSearchService::new()
+            .with_rrf_weights(1.0, 1.0)
+            .fuse(&lexical, &semantic, 10);
+        let high = HybridSearchService::new()
+            .with_rrf_weights(1.0, 2.0)
+            .fuse(&lexical, &semantic, 10);
+
+        let low_s = low.iter().find(|r| r.id == id).map(|r| r.score);
+        let high_s = high.iter().find(|r| r.id == id).map(|r| r.score);
+        prop_assert!(low_s.is_some() && high_s.is_some(), "semantic-only item missing");
+        prop_assert!(
+            high_s.unwrap() > low_s.unwrap(),
+            "raising semantic_weight must raise the semantic-only score"
+        );
+    }
+}
