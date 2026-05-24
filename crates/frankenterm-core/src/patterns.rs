@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
@@ -99,11 +99,19 @@ impl PatternTelemetry {
         }
     }
 
+    fn top_rule_hits_guard(&self) -> MutexGuard<'_, SpaceSavingTopK<String>> {
+        match self.top_rule_hits.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.top_rule_hits.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
     #[cfg(test)]
     fn record_rule_hit(&self, rule_id: &str) {
-        let Ok(mut top_rule_hits) = self.top_rule_hits.lock() else {
-            return;
-        };
+        let mut top_rule_hits = self.top_rule_hits_guard();
         top_rule_hits.insert(rule_id.to_string());
     }
 
@@ -112,9 +120,7 @@ impl PatternTelemetry {
             return;
         }
 
-        let Ok(mut top_rule_hits) = self.top_rule_hits.lock() else {
-            return;
-        };
+        let mut top_rule_hits = self.top_rule_hits_guard();
         for detection in detections {
             top_rule_hits.insert(detection.rule_id.clone());
         }
@@ -124,10 +130,8 @@ impl PatternTelemetry {
     #[must_use]
     pub fn snapshot(&self) -> PatternTelemetrySnapshot {
         let top_rule_hits = self
-            .top_rule_hits
-            .lock()
-            .map(|top_rule_hits| top_rule_hits.snapshot(PATTERN_RULE_HOTSPOT_SNAPSHOT_LEN))
-            .unwrap_or_default();
+            .top_rule_hits_guard()
+            .snapshot(PATTERN_RULE_HOTSPOT_SNAPSHOT_LEN);
 
         PatternTelemetrySnapshot {
             scans_total: self.scans_total.load(Ordering::Relaxed),
@@ -151,11 +155,7 @@ impl std::fmt::Debug for PatternTelemetry {
             .field("quick_rejects", &self.quick_rejects.load(Ordering::Relaxed))
             .field(
                 "top_rule_hits_monitored",
-                &self
-                    .top_rule_hits
-                    .lock()
-                    .map(|top_rule_hits| top_rule_hits.monitored_count())
-                    .unwrap_or(0),
+                &self.top_rule_hits_guard().monitored_count(),
             )
             .finish()
     }
@@ -8685,6 +8685,24 @@ rules:
             "estimated count {} outside [30, 50]",
             frequent.count
         );
+    }
+
+    #[test]
+    fn telemetry_rule_hit_sketch_recovers_from_poison() {
+        let telemetry = PatternTelemetry::with_rule_hit_capacity(3);
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = telemetry.top_rule_hits.lock().unwrap();
+            panic!("poison telemetry sketch");
+        }));
+        assert!(poison.is_err());
+
+        telemetry.record_rule_hit("codex.recovered");
+
+        let snap = telemetry.snapshot().top_rule_hits;
+        assert_eq!(snap.capacity, 3);
+        assert_eq!(snap.total_inserts, 1);
+        assert_eq!(snap.top_items.len(), 1);
+        assert_eq!(snap.top_items[0].key, "codex.recovered");
     }
 
     #[test]
