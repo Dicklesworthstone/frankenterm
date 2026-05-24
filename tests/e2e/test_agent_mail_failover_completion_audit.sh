@@ -82,7 +82,22 @@ fail!("fallback snapshot mode drifted") unless audit.dig("latest_fallback_snapsh
 fail!("dep cycle evidence drifted") unless audit.dig("graph_evidence", "dep_cycles_count") == 0
 fail!("robot blocked-by evidence drifted") unless audit.dig("graph_evidence", "robot_selected_blocked_by") == "ft-5xwsu.3"
 
-bad_side_effects = audit.fetch("side_effect_policy").select { |_key, value| value != false }
+expected_side_effect_flags = %w[
+  agent_mail_repair_allowed
+  agent_mail_restart_allowed
+  agent_mail_reconstruct_allowed
+  process_kill_allowed
+  destructive_git_allowed
+  file_deletion_allowed
+  worker_mutation_allowed
+  build_cancellation_allowed
+  local_cargo_proof_allowed
+].freeze
+side_effect_policy = audit.fetch("side_effect_policy")
+# Pin the flag set so an empty or trimmed policy cannot vacuously pass the
+# all-false gate below (a missing flag is an undeclared, ungated side-effect).
+fail!("side-effect policy flag set drifted: #{side_effect_policy.keys.sort.inspect}") unless side_effect_policy.keys.sort == expected_side_effect_flags.sort
+bad_side_effects = side_effect_policy.select { |_key, value| value != false }
 fail!("side-effect policy has non-false flags: #{bad_side_effects.keys.inspect}") unless bad_side_effects.empty?
 
 required_commands = audit.fetch("required_closeout_commands")
