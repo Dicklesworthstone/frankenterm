@@ -467,6 +467,52 @@ fn synthetic_pack_unknown_rule_property_must_fail() {
 }
 
 #[test]
+fn synthetic_pack_unknown_supply_chain_property_must_fail() {
+    let validator = load_schema();
+    let bad = serde_json::json!({
+        "name": "synthetic",
+        "version": "1.0.0",
+        "rules": [{
+            "id": "codex.synthetic.unknown_supply_chain_field",
+            "agent_type": "codex",
+            "event_type": "synthetic_unknown_supply_chain_field",
+            "severity": "warning",
+            "anchors": ["synthetic"],
+            "description": "Synthetic rule in a pack with an unknown supply-chain field."
+        }],
+        "supply_chain": {
+            "provenance": {
+                "author": "ft-test",
+                "source": "synthetic",
+                "revision": "rev-1"
+            },
+            "lint": {
+                "passed": true
+            },
+            "regex_backtrack_budget": 10000000,
+            "redaction_review": {
+                "reviewer": "security",
+                "reviewed_at": "2026-05-03T00:00:00Z",
+                "approved": true
+            },
+            "compatibility_target": "frankenterm-patterns.v1",
+            "rollout": {
+                "stage": "test",
+                "dry_run_match_telemetry": true,
+                "observe_only_until_verified": true
+            },
+            "unexpected_supply_chain_field": "this is not allowed"
+        }
+    });
+    let result = validator.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema validator did not reject a supply_chain object with an unknown \
+         property (SupplyChain.additionalProperties: false should kick)"
+    );
+}
+
+#[test]
 fn synthetic_pack_empty_required_strings_must_fail() {
     let validator = load_schema();
     for (field, bad) in [

@@ -1,0 +1,47 @@
+{
+  "name": "example.com:supply-chain",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "id": "supply.chain.signed",
+      "agent_type": "codex",
+      "event_type": "supply_chain_signed",
+      "severity": "warning",
+      "anchors": ["supply-chain signed"],
+      "description": "Supply-chain backed pattern pack fixture."
+    }
+  ],
+  "supply_chain": {
+    "provenance": {
+      "author": "ft-test",
+      "source": "tests/fixtures/pattern_packs/valid/supply_chain_pack.json",
+      "revision": "rev-1"
+    },
+    "fixture_hashes": {
+      "tests/corpus/codex/sample.txt": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "lint": {
+      "passed": true,
+      "errors": [],
+      "warnings": ["fixture warning retained for schema coverage"]
+    },
+    "regex_backtrack_budget": 10000000,
+    "redaction_review": {
+      "reviewer": "security",
+      "reviewed_at": "2026-05-03T00:00:00Z",
+      "approved": true
+    },
+    "compatibility_target": "frankenterm-patterns.v1",
+    "rollout": {
+      "stage": "test",
+      "dry_run_match_telemetry": true,
+      "observe_only_until_verified": true
+    },
+    "signature": {
+      "algorithm": "frankenterm.sha256-attestation.v1",
+      "signer": "local-test-signer",
+      "payload_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "value": "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+    }
+  }
+}

@@ -23,6 +23,13 @@
       "type": "array",
       "description": "Rules in this pack. Every rule's `id` MUST be unique within the array.",
       "items": { "$ref": "#/$defs/Rule" }
+    },
+    "supply_chain": {
+      "oneOf": [
+        { "$ref": "#/$defs/SupplyChain" },
+        { "type": "null" }
+      ],
+      "description": "Optional supply-chain verification manifest for user or extension pattern packs."
     }
   },
   "$defs": {
@@ -103,6 +110,156 @@
           "description": "URL for additional documentation about this rule."
         }
       }
+    },
+    "SupplyChain": {
+      "type": "object",
+      "required": [
+        "provenance",
+        "lint",
+        "regex_backtrack_budget",
+        "redaction_review",
+        "compatibility_target",
+        "rollout"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "provenance": { "$ref": "#/$defs/SupplyChainProvenance" },
+        "fixture_hashes": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        },
+        "lint": { "$ref": "#/$defs/SupplyChainLint" },
+        "regex_backtrack_budget": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "redaction_review": { "$ref": "#/$defs/SupplyChainRedactionReview" },
+        "compatibility_target": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "rollout": { "$ref": "#/$defs/SupplyChainRollout" },
+        "signature": {
+          "oneOf": [
+            { "$ref": "#/$defs/SupplyChainSignature" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "SupplyChainProvenance": {
+      "type": "object",
+      "required": ["author", "source", "revision"],
+      "additionalProperties": false,
+      "properties": {
+        "author": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "SupplyChainLint": {
+      "type": "object",
+      "required": ["passed"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": { "type": "boolean" },
+        "errors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/NonBlankString" }
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/NonBlankString" }
+        }
+      }
+    },
+    "SupplyChainRedactionReview": {
+      "type": "object",
+      "required": ["reviewer", "reviewed_at", "approved"],
+      "additionalProperties": false,
+      "properties": {
+        "reviewer": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "reviewed_at": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "approved": { "type": "boolean" }
+      }
+    },
+    "SupplyChainRollout": {
+      "type": "object",
+      "required": [
+        "stage",
+        "dry_run_match_telemetry",
+        "observe_only_until_verified"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "stage": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "dry_run_match_telemetry": { "type": "boolean" },
+        "observe_only_until_verified": { "type": "boolean" }
+      }
+    },
+    "SupplyChainSignature": {
+      "type": "object",
+      "required": ["algorithm", "signer", "payload_sha256", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "signer": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "value": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "NonBlankString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "AgentType": {
       "type": "string",

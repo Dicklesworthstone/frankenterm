@@ -10,7 +10,8 @@
 
 ## At a glance
 
-A pattern pack is a single document with three top-level fields:
+A pattern pack is a single document with three required top-level
+fields and one optional supply-chain manifest:
 
 ```yaml
 name: builtin:core
@@ -48,6 +49,7 @@ shape is the same across all three.
 | `name` | string | **MUST** | Pack identifier. Built-in packs use a `builtin:` prefix (`builtin:core`); user packs use a plain or namespaced name (`example.com:custom-rules`). MUST be non-empty after trimming. |
 | `version` | string | **MUST** | Pack version. Convention is semver-like (`"1.0.0"`) but the loader treats it as opaque; MUST be non-empty after trimming. |
 | `rules` | array of [Rule](#rule-fields) | **MUST** | The rule list. MAY be empty for an intentionally-stubbed pack, but every rule's `id` MUST be unique within the pack. |
+| `supply_chain` | object | MAY | Supply-chain verification manifest for user or extension packs. See [Supply-chain fields](#supply-chain-fields). |
 
 Unknown top-level fields are tolerated by the parser (default serde
 behavior) but are not part of the spec — authors SHOULD NOT rely on
@@ -78,6 +80,30 @@ the conformance gate enforces the JSON Schema `additionalProperties`
 contract: pack files MUST NOT carry unknown rule fields. CI treats
 unknown rule fields as a build failure even though the lower-level
 serde parser can still deserialize them.
+
+## Supply-chain fields
+
+`supply_chain` mirrors the Rust `PatternPackSupplyChain` structure and
+is optional. When present, it has the following fields.
+
+| Field | Type | Presence | Description |
+|-------|------|:--------:|-------------|
+| `provenance.author` | string | **MUST** | Pack author or producing system. MUST be non-empty after trimming. |
+| `provenance.source` | string | **MUST** | Source repository, fixture path, or generator identifier. MUST be non-empty after trimming. |
+| `provenance.revision` | string | **MUST** | Source revision, release id, or reviewed snapshot id. MUST be non-empty after trimming. |
+| `fixture_hashes` | object | MAY | Map of fixture path to expected hash. Keys and values MUST be non-empty after trimming. Defaults to an empty map when omitted. |
+| `lint.passed` | boolean | **MUST** | Whether the pattern-pack lint gate passed. |
+| `lint.errors` | array of string | MAY | Lint errors retained with the manifest. Each item MUST be non-empty after trimming. Defaults to an empty list when omitted. |
+| `lint.warnings` | array of string | MAY | Lint warnings retained with the manifest. Each item MUST be non-empty after trimming. Defaults to an empty list when omitted. |
+| `regex_backtrack_budget` | integer | **MUST** | Backtracking budget declared for regex validation. |
+| `redaction_review.reviewer` | string | **MUST** | Reviewer or review system. MUST be non-empty after trimming. |
+| `redaction_review.reviewed_at` | string | **MUST** | Review timestamp or retained review id. MUST be non-empty after trimming. |
+| `redaction_review.approved` | boolean | **MUST** | Whether redaction review approved the pack. |
+| `compatibility_target` | string | **MUST** | Compatibility target, currently `frankenterm-patterns.v1`. MUST be non-empty after trimming. |
+| `rollout.stage` | string | **MUST** | Rollout stage name. MUST be non-empty after trimming. |
+| `rollout.dry_run_match_telemetry` | boolean | **MUST** | Whether dry-run match telemetry was collected. |
+| `rollout.observe_only_until_verified` | boolean | **MUST** | Whether actions must stay observe-only until verification passes. |
+| `signature` | object | MAY | Optional signature object with `algorithm`, `signer`, `payload_sha256`, and `value`. |
 
 ## Validation
 
@@ -141,6 +167,8 @@ fixture corpus mirroring this spec:
 - `valid/full_pack.yaml` — every documented field exercised at least
   once.
 - `valid/multi_rule_pack.json` — multiple rules in JSON form.
+- `valid/supply_chain_pack.json` — optional supply-chain manifest in
+  JSON form.
 - `valid/toml_pack.toml` — TOML round-trip example.
 - `invalid/duplicate_rule_id.yaml` — two rules with the same `id`.
 - `invalid/missing_severity.yaml` — rule with no `severity`.
