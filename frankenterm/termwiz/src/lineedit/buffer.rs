@@ -107,25 +107,28 @@ impl LineEditBuffer {
                 if char_indices.is_empty() {
                     return self.cursor;
                 }
-                let mut char_position = char_indices
-                    .iter()
-                    .position(|(idx, _)| *idx == self.cursor)
-                    .unwrap_or(char_indices.len() - 1);
+                let mut char_position =
+                    match char_indices.binary_search_by_key(&self.cursor, |(idx, _)| *idx) {
+                        Ok(0) | Err(0) => return 0,
+                        Ok(pos) | Err(pos) => pos.saturating_sub(1),
+                    };
 
-                for _ in 0..rep {
+                for step in 0..rep {
+                    while char_position > 0 && char_indices[char_position].1.is_whitespace() {
+                        char_position -= 1;
+                    }
+
+                    while char_position > 0 && !char_indices[char_position - 1].1.is_whitespace() {
+                        char_position -= 1;
+                    }
+
                     if char_position == 0 {
                         break;
                     }
 
-                    let mut found = None;
-                    for prev in (0..char_position - 1).rev() {
-                        if char_indices[prev].1.is_whitespace() {
-                            found = Some(prev + 1);
-                            break;
-                        }
+                    if step + 1 < rep {
+                        char_position -= 1;
                     }
-
-                    char_position = found.unwrap_or(0);
                 }
                 char_indices[char_position].0
             }
@@ -382,6 +385,20 @@ mod tests {
         let mut buf = LineEditBuffer::new("hello world", 6);
         buf.exec_movement(Movement::BackwardWord(1));
         assert_eq!(buf.get_cursor(), 0); // start of "hello"
+    }
+
+    #[test]
+    fn backward_word_from_end_stops_at_current_word_start() {
+        let mut buf = LineEditBuffer::new("a b", 3);
+        buf.exec_movement(Movement::BackwardWord(1));
+        assert_eq!(buf.get_cursor(), 2);
+    }
+
+    #[test]
+    fn backward_word_repeats_across_words() {
+        let mut buf = LineEditBuffer::new("one two three", 13);
+        buf.exec_movement(Movement::BackwardWord(2));
+        assert_eq!(buf.get_cursor(), 4);
     }
 
     #[test]
