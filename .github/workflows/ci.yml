@@ -214,6 +214,19 @@ jobs:
       - name: Codec version release-note guard (ft-8smkj)
         run: scripts/check_codec_version_release_notes.sh
 
+      # ft-b1p6x — redactor streaming anchor-coverage + registration guard.
+      # Fences the recurring streaming-leak bug class (ft-b1p6x azureopenai /
+      # devicecode / usercode, DATADOG long-form, uppercase-anchor): every
+      # keyed-secret regex key-name with an `[_-]?` collapsible separator must,
+      # fully collapsed, contain a STREAMING_SECRET_ANCHORS entry, and every
+      # `static …: LazyLock<Regex>` must be wired into SECRET_PATTERNS. Both
+      # invariants are derived from redactor.rs, so the guard cannot drift from
+      # the catalog. Static; no compilation required.
+      - name: Redactor streaming anchor-coverage guard (ft-b1p6x)
+        run: |
+          bash tests/e2e/test_redactor_streaming_anchor_coverage.sh
+          bash tests/e2e/test_redactor_streaming_anchor_coverage.sh --self-test
+
       # ft-i2eni.3 — Cargo-deny ban on direct `tokio` dependencies in
       # first-party crates. The doctrine block in AGENTS.md states
       # that the canonical async runtime is asupersync via
