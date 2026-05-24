@@ -104,15 +104,19 @@ pub struct DurationStats {
 impl DurationStats {
     /// Compute statistics from a slice of durations (in milliseconds).
     ///
-    /// Returns None if the slice is empty or contains non-positive values.
+    /// Returns None if the slice is empty or contains no positive finite values.
     #[must_use]
     pub fn from_durations(durations: &[f64]) -> Option<Self> {
         if durations.is_empty() {
             return None;
         }
 
-        // Filter out non-positive durations for log-normal.
-        let positive: Vec<f64> = durations.iter().copied().filter(|d| *d > 0.0).collect();
+        // Filter out non-positive or non-finite durations for log-normal.
+        let positive: Vec<f64> = durations
+            .iter()
+            .copied()
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .collect();
         if positive.is_empty() {
             return None;
         }
@@ -453,7 +457,7 @@ impl TimeoutTracker {
     ///
     /// br-ft-ykrsq: O(1) FIFO eviction via VecDeque::pop_front.
     pub fn record(&mut self, duration_ms: f64) {
-        if duration_ms > 0.0 {
+        if duration_ms.is_finite() && duration_ms > 0.0 {
             if self.observations.len() >= self.max_observations {
                 self.observations.pop_front();
             }
@@ -727,6 +731,15 @@ mod tests {
     }
 
     #[test]
+    fn stats_filters_non_finite() {
+        let stats =
+            DurationStats::from_durations(&[f64::NAN, f64::INFINITY, 100.0, 200.0]).unwrap();
+        assert_eq!(stats.count, 2);
+        assert!(stats.mean_ms.is_finite());
+        assert!((stats.mean_ms - 150.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn stats_all_non_positive_is_none() {
         assert!(DurationStats::from_durations(&[-1.0, 0.0, -5.0]).is_none());
     }
@@ -979,6 +992,16 @@ mod tests {
         tracker.record(0.0);
         tracker.record(-5.0);
         assert_eq!(tracker.observation_count(), 0);
+    }
+
+    #[test]
+    fn tracker_ignores_non_finite() {
+        let mut tracker = TimeoutTracker::with_defaults();
+        tracker.record(f64::NAN);
+        tracker.record(f64::INFINITY);
+        tracker.record(100.0);
+        assert_eq!(tracker.observation_count(), 1);
+        assert_eq!(tracker.total_observations(), 1);
     }
 
     #[test]
