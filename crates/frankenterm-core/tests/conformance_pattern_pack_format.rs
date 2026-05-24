@@ -187,6 +187,15 @@ fn every_valid_fixture_parses_into_pattern_pack() {
     }
 }
 
+#[test]
+fn every_valid_fixture_is_accepted_by_pattern_library() {
+    for path in discover_fixtures("valid") {
+        let pack = parse_to_pack(&path);
+        frankenterm_core::patterns::PatternLibrary::new(vec![pack])
+            .unwrap_or_else(|err| panic!("fixture {} failed validation: {err}", path.display()));
+    }
+}
+
 // ── Layer 3: invalid-fixture rejection ──────────────────────────────────────
 
 #[test]
