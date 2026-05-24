@@ -27,14 +27,24 @@ Options:
 EOF
 }
 
+require_arg() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "error: $flag requires a value" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --beads) BEADS_PATH="${2:?--beads requires a path}"; shift 2 ;;
-    --taxonomy) TAXONOMY_PATH="${2:?--taxonomy requires a path}"; shift 2 ;;
-    --epic-id) EPIC_ID="${2:?--epic-id requires an id}"; shift 2 ;;
-    --strict-created-after) STRICT_CREATED_AFTER="${2:?--strict-created-after requires a timestamp}"; shift 2 ;;
+    --beads) require_arg "$1" "${2-}"; BEADS_PATH="$2"; shift 2 ;;
+    --taxonomy) require_arg "$1" "${2-}"; TAXONOMY_PATH="$2"; shift 2 ;;
+    --epic-id) require_arg "$1" "${2-}"; EPIC_ID="$2"; shift 2 ;;
+    --strict-created-after) require_arg "$1" "${2-}"; STRICT_CREATED_AFTER="$2"; shift 2 ;;
     --strict-all) STRICT_ALL=1; shift ;;
-    --write-report) REPORT_PATH="${2:?--write-report requires a path}"; shift 2 ;;
+    --write-report) require_arg "$1" "${2-}"; REPORT_PATH="$2"; shift 2 ;;
     --json) JSON_OUTPUT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;

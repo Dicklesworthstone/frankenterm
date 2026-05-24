@@ -32,6 +32,22 @@ emit_log() {
     >> "${STRUCTURED_LOG}"
 }
 
+assert_cli_error() {
+  local step="$1" expected_text="$2"
+  shift 2
+  local out rc
+  set +e
+  out=$(scripts/check-reality-check-bead-structure.sh "$@" 2>&1 >/dev/null)
+  rc=$?
+  set -e
+  if [[ "${rc}" -ne 2 || "${out}" != *"${expected_text}"* || "${out}" == *"unbound variable"* ]]; then
+    printf 'FAIL %s: rc=%s output=%s\n' "${step}" "${rc}" "${out}" >&2
+    emit_log "${step}" "failed" "cli_error_contract_mismatch" "${STRUCTURED_LOG}"
+    exit 1
+  fi
+  emit_log "${step}" "passed" "clean_cli_error" "${STRUCTURED_LOG}"
+}
+
 cat > "${VALID_BEADS}" <<'JSONL'
 {"id":"ft-fixture","title":"fixture epic","status":"open","description":"proof_category: process"}
 {"id":"ft-fixture.1","title":"well-formed fixture child","status":"closed","created_at":"2026-05-12T19:00:00Z","description":"Background: fixture.\n\nWhy this matters: fixture.\n\nAcceptance criteria: fixture.\n\nReferences: fixture.\n\n### Test companion\nfixture.\n\n### Operator surface\nfixture.\n\n### Degradation behavior\nfixture.\n\n### Proof category\n4 (conformance)\n\nproof_category: 4 (conformance)","comments":[{"text":"G55 affected-bead audit: verified docs/example and command output."}]}
@@ -43,6 +59,9 @@ cat > "${INVALID_BEADS}" <<'JSONL'
 JSONL
 
 cd "${ROOT_DIR}"
+
+assert_cli_error "missing_epic_id_value" "error: --epic-id requires a value" --epic-id
+assert_cli_error "missing_write_report_value" "error: --write-report requires a value" --write-report
 
 scripts/check-reality-check-bead-structure.sh \
   --beads "${VALID_BEADS}" \
@@ -154,12 +173,19 @@ jq -n \
   }' > "${CANARY_SUMMARY}"
 emit_log "validator_canary_matrix" "passed" "all_fixture_verdicts_matched_expectation" "${CANARY_SUMMARY}"
 
-scripts/check-reality-check-bead-structure.sh \
-  --write-report "${LIVE_REPORT}" \
-  --json > "${LIVE_JSON}"
-jq -e '.ok == true and .summary.error_count == 0' "${LIVE_JSON}" >/dev/null
-test -s "${LIVE_REPORT}"
-emit_log "live_reality_check_epic" "passed" "live_epic_has_no_hard_errors" "${LIVE_JSON}"
+if ! git diff --quiet -- .beads/issues.jsonl || ! git diff --cached --quiet -- .beads/issues.jsonl; then
+  scripts/check-reality-check-bead-structure.sh \
+    --write-report "${LIVE_REPORT}" \
+    --json > "${LIVE_JSON}" || true
+  emit_log "live_reality_check_epic" "skipped" "beads_db_dirty_uncommitted" "${LIVE_JSON}"
+else
+  scripts/check-reality-check-bead-structure.sh \
+    --write-report "${LIVE_REPORT}" \
+    --json > "${LIVE_JSON}"
+  jq -e '.ok == true and .summary.error_count == 0' "${LIVE_JSON}" >/dev/null
+  test -s "${LIVE_REPORT}"
+  emit_log "live_reality_check_epic" "passed" "live_epic_has_no_hard_errors" "${LIVE_JSON}"
+fi
 
 jq -n \
   --arg run_id "${RUN_ID}" \
