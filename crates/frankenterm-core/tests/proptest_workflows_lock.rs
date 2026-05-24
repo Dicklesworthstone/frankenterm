@@ -75,6 +75,47 @@ proptest! {
     }
 
     #[test]
+    fn already_locked_attempt_preserves_holder_and_updates_conflict_counter(
+        pane_id in 1u64..10_000,
+        workflow_name in arb_label(),
+        execution_id in arb_label(),
+        conflicting_workflow in arb_label(),
+        conflicting_execution in arb_label(),
+    ) {
+        prop_assume!(workflow_name != conflicting_workflow);
+        prop_assume!(execution_id != conflicting_execution);
+
+        let manager = PaneWorkflowLockManager::new();
+        prop_assert_eq!(
+            manager.try_acquire(pane_id, &workflow_name, &execution_id),
+            LockAcquisitionResult::Acquired
+        );
+
+        let conflict = manager.try_acquire(pane_id, &conflicting_workflow, &conflicting_execution);
+
+        if let LockAcquisitionResult::AlreadyLocked {
+            held_by_workflow,
+            held_by_execution,
+            locked_since_ms,
+        } = conflict
+        {
+            prop_assert_eq!(held_by_workflow, workflow_name);
+            prop_assert_eq!(held_by_execution, execution_id);
+            prop_assert!(locked_since_ms > 0);
+        } else {
+            prop_assert!(false, "second acquisition should report the existing holder");
+        }
+
+        let lock = manager.is_locked(pane_id).expect("original lock should remain held");
+        let health = manager.health();
+        prop_assert_eq!(lock.workflow_name, workflow_name);
+        prop_assert_eq!(lock.execution_id, execution_id);
+        prop_assert_eq!(health.acquisitions_total, 1);
+        prop_assert_eq!(health.pane_already_locked_total, 1);
+        prop_assert_eq!(health.active_locks, 1);
+    }
+
+    #[test]
     fn guard_drop_and_force_release_restore_unlocked_state(
         pane_id in 1u64..10_000,
         workflow_name in arb_label(),
