@@ -134,12 +134,23 @@ impl PaneStack {
 
     /// Cycle to the next pane in the stack.  Wraps around.
     pub fn cycle_next(&mut self) {
-        self.active_index = (self.active_index + 1) % self.panes.len();
+        if self.panes.is_empty() {
+            self.active_index = 0;
+            return;
+        }
+
+        let active_index = self.active_index.min(self.panes.len() - 1);
+        self.active_index = (active_index + 1) % self.panes.len();
     }
 
     /// Cycle to the previous pane in the stack.  Wraps around.
     pub fn cycle_prev(&mut self) {
-        if self.active_index == 0 {
+        if self.panes.is_empty() {
+            self.active_index = 0;
+            return;
+        }
+
+        if self.active_index == 0 || self.active_index >= self.panes.len() {
             self.active_index = self.panes.len() - 1;
         } else {
             self.active_index -= 1;
@@ -722,6 +733,21 @@ mod tests {
         // but we test with the stack API.
         let arrangement = stacked();
         assert_eq!(arrangement.arrangement.slot_count(), 1);
+    }
+
+    #[test]
+    fn pane_stack_cycle_empty_stack_is_noop() {
+        let mut stack = PaneStack {
+            panes: Vec::new(),
+            active_index: usize::MAX,
+        };
+
+        stack.cycle_next();
+        assert_eq!(stack.active_index(), 0);
+
+        stack.active_index = usize::MAX;
+        stack.cycle_prev();
+        assert_eq!(stack.active_index(), 0);
     }
 
     #[test]
