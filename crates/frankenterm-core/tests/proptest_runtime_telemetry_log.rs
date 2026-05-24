@@ -59,6 +59,35 @@ proptest! {
         }
     }
 
+    /// filter_by_kind returns exactly the retained events of that kind:
+    /// every result matches the requested kind, the per-kind counts equal
+    /// the emissions (capacity 100 >> total, so no eviction), and the two
+    /// kind-partitions sum to the full retained set.
+    #[test]
+    fn telemetry_log_filter_by_kind_partitions_events(a in 0usize..20, b in 0usize..20) {
+        let mut log = log_with_capacity(100); // > a + b, so nothing is evicted
+        for _ in 0..a {
+            log.emit(RuntimeTelemetryEventBuilder::new("c", RuntimeTelemetryKind::ScopeCreated));
+        }
+        for _ in 0..b {
+            log.emit(RuntimeTelemetryEventBuilder::new("c", RuntimeTelemetryKind::ScopeStarted));
+        }
+        let created = log.filter_by_kind(RuntimeTelemetryKind::ScopeCreated);
+        let started = log.filter_by_kind(RuntimeTelemetryKind::ScopeStarted);
+        prop_assert!(
+            created.iter().all(|e| e.event_kind == RuntimeTelemetryKind::ScopeCreated),
+            "filter_by_kind(ScopeCreated) must only return ScopeCreated events"
+        );
+        prop_assert!(
+            started.iter().all(|e| e.event_kind == RuntimeTelemetryKind::ScopeStarted),
+            "filter_by_kind(ScopeStarted) must only return ScopeStarted events"
+        );
+        prop_assert_eq!(created.len(), a);
+        prop_assert_eq!(started.len(), b);
+        prop_assert_eq!(created.len() + started.len(), log.len(),
+            "the two kind-partitions must cover every retained event");
+    }
+
     /// drain() returns the retained events and leaves the log empty.
     #[test]
     fn telemetry_log_drain_empties(cap in 1usize..20, n in 0usize..40) {
