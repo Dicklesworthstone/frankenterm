@@ -122,7 +122,9 @@ impl PipelineResult {
     #[must_use]
     pub fn from_steps(incident_id: String, steps: Vec<StepResult>) -> Self {
         let success = steps.iter().all(|s| s.success);
-        let total_duration_ms = steps.iter().map(|s| s.duration_ms).sum();
+        let total_duration_ms = steps
+            .iter()
+            .fold(0u64, |total, step| total.saturating_add(step.duration_ms));
         let artifact_path = steps.iter().rev().find_map(|s| s.artifact_path.clone());
         let bead_id = steps.iter().rev().find_map(|s| s.bead_id.clone());
         let error = if success {
@@ -498,6 +500,34 @@ mod tests {
         let result = execute_pipeline(&input);
         let sum: u64 = result.steps.iter().map(|s| s.duration_ms).sum();
         assert_eq!(result.total_duration_ms, sum);
+    }
+
+    #[test]
+    fn pipeline_total_duration_saturates() {
+        let result = PipelineResult::from_steps(
+            "INC-SAT".to_string(),
+            vec![
+                StepResult {
+                    step: PipelineStep::HarvestArtifact,
+                    success: true,
+                    message: "first".to_string(),
+                    artifact_path: None,
+                    bead_id: None,
+                    duration_ms: u64::MAX,
+                },
+                StepResult {
+                    step: PipelineStep::ValidateArtifact,
+                    success: true,
+                    message: "second".to_string(),
+                    artifact_path: None,
+                    bead_id: None,
+                    duration_ms: 1,
+                },
+            ],
+        );
+
+        assert_eq!(result.total_duration_ms, u64::MAX);
+        assert!(result.success);
     }
 
     #[test]

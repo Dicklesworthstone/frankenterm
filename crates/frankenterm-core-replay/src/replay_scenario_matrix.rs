@@ -162,7 +162,9 @@ impl MatrixResult {
             .filter(|s| s.is_ok() && s.has_divergence())
             .count();
         let error_count = scenarios.iter().filter(|s| !s.is_ok()).count();
-        let total_duration_ms = scenarios.iter().map(|s| s.duration_ms).sum();
+        let total_duration_ms = scenarios.iter().fold(0u64, |total, scenario| {
+            total.saturating_add(scenario.duration_ms)
+        });
 
         Self {
             scenarios,
@@ -2646,6 +2648,35 @@ label = "b"
         let json = result.to_json();
         let restored: MatrixResult = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.total_scenarios, result.total_scenarios);
+    }
+
+    #[test]
+    fn matrix_result_total_duration_saturates() {
+        let scenarios = vec![
+            ScenarioResult {
+                artifact_label: "a".into(),
+                override_label: String::new(),
+                baseline_decisions: vec!["d1".into()],
+                candidate_decisions: vec!["d1".into()],
+                diff: DiffSummary::default(),
+                error: None,
+                duration_ms: u64::MAX,
+            },
+            ScenarioResult {
+                artifact_label: "b".into(),
+                override_label: String::new(),
+                baseline_decisions: vec!["d1".into()],
+                candidate_decisions: vec!["d1".into()],
+                diff: DiffSummary::default(),
+                error: None,
+                duration_ms: 1,
+            },
+        ];
+
+        let result = MatrixResult::from_results(scenarios);
+
+        assert_eq!(result.total_duration_ms, u64::MAX);
+        assert_eq!(result.pass_count, 2);
     }
 
     // ── ScenarioMatrixRunner ────────────────────────────────────────────
