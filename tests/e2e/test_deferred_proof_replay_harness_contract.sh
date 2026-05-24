@@ -254,8 +254,25 @@ def decision_record(receipt)
   }
 end
 
+# Every emitted record must conform to the PUBLISHED schema, so the verifier and
+# the schema cannot silently drift apart. Required keys, the decision enum, and
+# the blocker enum are all read from the schema file itself (not re-hardcoded).
+def assert_schema_conformant!(record, schema, where)
+  required = schema.fetch("required")
+  fail!("#{where}: record keys #{record.keys.sort.inspect} != schema required #{required.sort.inspect}") unless record.keys.sort == required.sort
+  decision_enum = schema.dig("properties", "decision", "enum")
+  fail!("#{where}: decision #{record["decision"]} not in schema enum") unless decision_enum.include?(record["decision"])
+  blocker_enum = schema.dig("properties", "blockers", "items", "enum")
+  record.fetch("blockers").each do |blocker|
+    fail!("#{where}: blocker #{blocker} not in schema enum") unless blocker_enum.include?(blocker)
+  end
+  fail!("#{where}: contract_id drift") unless record["contract_id"] == schema.dig("properties", "contract_id", "const")
+  fail!("#{where}: schema_version drift") unless record["schema_version"] == schema.dig("properties", "schema_version", "const")
+end
+
 # Cross-cutting fail-closed invariants every emitted record must satisfy.
-def assert_fail_closed!(record, where)
+def assert_fail_closed!(record, schema, where)
+  assert_schema_conformant!(record, schema, where)
   fail!("#{where}: unknown decision #{record["decision"]}") unless DECISIONS.include?(record["decision"])
   fail!("#{where}: dry_run must be true") unless record["dry_run"] == true
   fail!("#{where}: remote_exit_status must be null") unless record["remote_exit_status"].nil?
@@ -312,7 +329,7 @@ receipt_ids = receipts.map { |r| r.fetch("receipt_id") }
 fail!("input receipt ids are not unique") unless receipt_ids.uniq.length == receipt_ids.length
 
 actual = receipts.map { |r| decision_record(r) }
-actual.each { |rec| assert_fail_closed!(rec, "input #{rec["receipt_id"]}") }
+actual.each { |rec| assert_fail_closed!(rec, schema, "input #{rec["receipt_id"]}") }
 
 actual_lines = actual.map { |rec| JSON.generate(rec) }
 expected_lines = expected.map { |rec| JSON.generate(rec) }
@@ -402,7 +419,7 @@ fail!("tamper coverage drifted: #{tamper_ids.sort.inspect}") unless tamper_ids.s
 cases.each do |kase|
   receipt = kase.fetch("receipt")
   record = decision_record(receipt)
-  assert_fail_closed!(record, "tamper #{kase["case_id"]}")
+  assert_fail_closed!(record, schema, "tamper #{kase["case_id"]}")
   decision = record["decision"]
   expected_decision = kase.fetch("expected_decision")
   fail!("tamper #{kase["case_id"]} expected #{expected_decision} but got #{decision}") unless decision == expected_decision
