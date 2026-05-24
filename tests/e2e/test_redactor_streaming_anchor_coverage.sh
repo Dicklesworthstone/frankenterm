@@ -157,5 +157,35 @@ end
 dangling = registered - defined
 fail!("SECRET_PATTERNS references undefined regex(es): #{dangling.join(", ")}") unless dangling.empty?
 
-puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored, #{registered.length} regexes all registered)"
+# --- 6. Pattern name hygiene. -------------------------------------------------
+# Each SecretPattern.name is load-bearing in three places: detect() attributes
+# every match by name (`detections.push((pattern.name, ..))`), secret_pattern_names()
+# exposes the list as public API, and with_debug_markers() emits `[REDACTED:{name}]`.
+# A duplicate name silently merges two secret classes in attribution and the name
+# list; an empty name or one carrying whitespace / `:` / `]` corrupts the debug
+# marker so it can no longer be parsed back to a single pattern. Names follow the
+# established snake_case convention (`api_key`, `aws_secret_key`, ...), so the
+# exact invariant is: every name matches /[a-z0-9_]+/, all names are unique, and
+# there is exactly one name per registered regex.
+names = pattern_block.scan(/name:\s*"((?:\\.|[^"\\])*)"/).map { |m| m[0] }
+fail!("no SecretPattern names parsed from SECRET_PATTERNS") if names.empty?
+unless names.length == registered.length
+  fail!("SECRET_PATTERNS entry drift: #{names.length} name field(s) vs #{registered.length} regex field(s) — every entry must carry exactly one of each")
+end
+malformed = names.reject { |n| n =~ /\A[a-z0-9_]+\z/ }
+unless malformed.empty?
+  fail!(<<~MSG.chomp)
+    #{malformed.length} SecretPattern name(s) are not snake_case /[a-z0-9_]+/: #{malformed.inspect}
+    A name with whitespace, `:`, or `]` corrupts the `[REDACTED:{name}]` debug marker and the secret_pattern_names() list.
+  MSG
+end
+dupe_names = names.group_by(&:itself).select { |_, g| g.length > 1 }.keys.sort
+unless dupe_names.empty?
+  fail!(<<~MSG.chomp)
+    duplicate SecretPattern name(s) in SECRET_PATTERNS: #{dupe_names.inspect}
+    Detection attribution (detect() -> (name, start, end)) and secret_pattern_names() silently merge the colliding classes.
+  MSG
+end
+
+puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored, #{registered.length} regexes all registered, #{names.length} pattern names unique + well-formed)"
 RUBY
