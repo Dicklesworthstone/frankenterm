@@ -500,6 +500,38 @@ fn synthetic_robot_envelope_with_negative_elapsed_ms_must_fail() {
 }
 
 #[test]
+fn synthetic_robot_envelope_with_non_integer_timing_must_fail() {
+    let schema = load_envelope_schema();
+    for (surface, broken) in [
+        (
+            "elapsed_ms",
+            serde_json::json!({
+                "ok": true,
+                "data": { "pane_id": 7 },
+                "elapsed_ms": 5.5,
+                "version": "0.1.0",
+                "now": 1_700_000_000_000_u64,
+            }),
+        ),
+        (
+            "now",
+            serde_json::json!({
+                "ok": true,
+                "data": { "pane_id": 7 },
+                "elapsed_ms": 5,
+                "version": "0.1.0",
+                "now": "1700000000000",
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&broken).is_err(),
+            "validator MUST reject robot envelopes with non-integer {surface}"
+        );
+    }
+}
+
+#[test]
 fn synthetic_robot_envelope_with_negative_now_must_fail() {
     let schema = load_envelope_schema();
 
@@ -900,6 +932,40 @@ fn synthetic_mcp_envelope_with_negative_elapsed_ms_must_fail() {
         result.is_err(),
         "validator MUST reject MCP envelopes with negative `elapsed_ms`"
     );
+}
+
+#[test]
+fn synthetic_mcp_envelope_with_non_integer_timing_must_fail() {
+    let schema = load_mcp_envelope_schema();
+    for (surface, broken) in [
+        (
+            "elapsed_ms",
+            serde_json::json!({
+                "ok": true,
+                "data": { "tool": "wa.search", "matches": [] },
+                "elapsed_ms": 5.5,
+                "version": "0.1.0",
+                "now": 1_700_000_000_000_u64,
+                "mcp_version": "v1",
+            }),
+        ),
+        (
+            "now",
+            serde_json::json!({
+                "ok": true,
+                "data": { "tool": "wa.search", "matches": [] },
+                "elapsed_ms": 5,
+                "version": "0.1.0",
+                "now": "1700000000000",
+                "mcp_version": "v1",
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&broken).is_err(),
+            "validator MUST reject MCP envelopes with non-integer {surface}"
+        );
+    }
 }
 
 #[test]
