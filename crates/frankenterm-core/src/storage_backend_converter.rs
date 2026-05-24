@@ -184,6 +184,21 @@ pub fn convert_db(
 /// is byte-identical between the two backends. Returns the
 /// first divergence as `BackendError::Query` carrying the
 /// table name + row index + column index.
+///
+/// # Limitations
+///
+/// Comparison runs over the *string* row pipeline
+/// (`query_map_strings`), which is lossy for two value classes, so
+/// equivalence here is necessary but not fully sufficient for those:
+/// - **BLOBs** stringify to a `<blob:N bytes>` size placeholder, so two
+///   blobs of the *same length but different bytes* compare equal. Do not
+///   rely on this for blob-bearing tables; verify those over the
+///   `SqlCell` pipeline (`query_map_cells`) which carries raw bytes.
+/// - **NULL vs empty TEXT** both render as the empty string, so a SQL NULL
+///   and a real `""` compare equal.
+///
+/// Ordering also assumes a rowid table (`ORDER BY rowid`); `WITHOUT ROWID`
+/// tables are out of scope for this verifier.
 pub fn verify_equivalence(
     a: &dyn StorageBackend,
     b: &dyn StorageBackend,
