@@ -1777,11 +1777,15 @@ fn load_pack_from_id(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> 
 pub(crate) const MAX_PACK_BYTES: u64 = 16 * 1024 * 1024;
 
 fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
-    let raw_path = PathBuf::from(path);
+    load_pack_from_path(Path::new(path), root)
+}
+
+fn load_pack_from_path(raw_path: &Path, root: Option<&Path>) -> Result<PatternPack> {
     let candidate = if raw_path.is_absolute() {
-        raw_path
+        raw_path.to_path_buf()
     } else {
-        root.map(|r| r.join(&raw_path)).unwrap_or(raw_path)
+        root.map(|r| r.join(raw_path))
+            .unwrap_or_else(|| raw_path.to_path_buf())
     };
 
     // Sandbox enforcement: when a `root` is supplied by the caller, every
@@ -2020,7 +2024,7 @@ fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
         // Use non-following metadata for directory discovery so symlinked pack
         // files are skipped instead of followed by metadata/read paths.
         if file_type.is_file() && is_pack_file(&path) {
-            match load_pack_from_file(path.to_str().unwrap_or_default(), Some(dir)) {
+            match load_pack_from_path(&path, Some(dir)) {
                 Ok(pack) => packs.push(pack),
                 Err(e) => {
                     tracing::warn!("Skipping invalid user pack {}: {e}", path.display());
@@ -2031,7 +2035,7 @@ fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
                 if !is_regular_file_no_symlink(&rules_file) {
                     continue;
                 }
-                match load_pack_from_file(rules_file.to_str().unwrap_or_default(), Some(dir)) {
+                match load_pack_from_path(&rules_file, Some(dir)) {
                     Ok(pack) => packs.push(pack),
                     Err(e) => {
                         tracing::warn!("Skipping invalid user pack {}: {e}", rules_file.display());
@@ -8073,6 +8077,22 @@ rules:
 
         let packs = discover_packs_from_dir(root.path()).unwrap();
         assert!(packs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_packs_from_dir_loads_non_utf8_pack_files() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let filename = OsString::from_vec(b"non-utf8-\xFF.yaml".to_vec());
+        let pack_path = root.path().join(filename);
+        fs::write(&pack_path, minimal_yaml_pack()).unwrap();
+
+        let packs = discover_packs_from_dir(root.path()).unwrap();
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].name, "sandbox_test");
     }
 
     #[test]
