@@ -93,6 +93,14 @@ fn buffered_write_needs_flush(current_len: usize, incoming_len: usize, capacity:
         .map_or(true, |total| total > capacity)
 }
 
+fn visible_span(start: i16, end: i16) -> i16 {
+    end.saturating_sub(start).saturating_add(1).max(1)
+}
+
+fn rect_end(start: i16, extent: i16) -> i16 {
+    start.saturating_add(extent.saturating_sub(1))
+}
+
 enum Renderer {
     Terminfo(TerminfoRenderer),
     Windows(WindowsConsoleRenderer),
@@ -269,14 +277,14 @@ impl OutputHandle {
 }
 
 fn dimensions_from_buffer_info(info: CONSOLE_SCREEN_BUFFER_INFO) -> (usize, usize) {
-    let cols = 1 + (info.srWindow.Right - info.srWindow.Left);
-    let rows = 1 + (info.srWindow.Bottom - info.srWindow.Top);
+    let cols = visible_span(info.srWindow.Left, info.srWindow.Right);
+    let rows = visible_span(info.srWindow.Top, info.srWindow.Bottom);
     (cols as usize, rows as usize)
 }
 
 fn alternate_screen_buffer_geometry(info: CONSOLE_SCREEN_BUFFER_INFO) -> (COORD, SMALL_RECT) {
-    let visible_cols = 1 + (info.srWindow.Right - info.srWindow.Left);
-    let visible_rows = 1 + (info.srWindow.Bottom - info.srWindow.Top);
+    let visible_cols = visible_span(info.srWindow.Left, info.srWindow.Right);
+    let visible_rows = visible_span(info.srWindow.Top, info.srWindow.Bottom);
     let cols = max(info.dwSize.X, visible_cols).max(1);
     let rows = max(info.dwSize.Y, visible_rows).max(1);
     (
@@ -298,8 +306,8 @@ struct ScreenResizePlan {
 
 fn visible_window_dimensions(info: CONSOLE_SCREEN_BUFFER_INFO) -> COORD {
     COORD {
-        X: (1 + info.srWindow.Right - info.srWindow.Left).max(1),
-        Y: (1 + info.srWindow.Bottom - info.srWindow.Top).max(1),
+        X: visible_span(info.srWindow.Left, info.srWindow.Right),
+        Y: visible_span(info.srWindow.Top, info.srWindow.Bottom),
     }
 }
 
@@ -309,8 +317,8 @@ fn viewport_for_buffer_size(size: COORD) -> SMALL_RECT {
     SMALL_RECT {
         Left: 0,
         Top: 0,
-        Right: size.X - 1,
-        Bottom: size.Y - 1,
+        Right: size.X.saturating_sub(1),
+        Bottom: size.Y.saturating_sub(1),
     }
 }
 
@@ -325,16 +333,16 @@ fn pre_buffer_resize_viewport(
 
     let cols = min(visible.X, target.X).max(1);
     let rows = min(visible.Y, target.Y).max(1);
-    let max_left = target.X - cols;
-    let max_top = target.Y - rows;
+    let max_left = target.X.saturating_sub(cols);
+    let max_top = target.Y.saturating_sub(rows);
     let left = min(max(info.srWindow.Left, 0), max_left);
     let top = min(max(info.srWindow.Top, 0), max_top);
 
     Some(SMALL_RECT {
         Left: left,
         Top: top,
-        Right: left + cols - 1,
-        Bottom: top + rows - 1,
+        Right: rect_end(left, cols),
+        Bottom: rect_end(top, rows),
     })
 }
 
@@ -1181,6 +1189,21 @@ mod tests {
         assert!(!buffered_write_needs_flush(4, 4, 8));
         assert!(buffered_write_needs_flush(5, 4, 8));
         assert!(buffered_write_needs_flush(usize::MAX, 1, usize::MAX));
+    }
+
+    #[test]
+    fn visible_span_clamps_invalid_ranges() {
+        assert_eq!(visible_span(10, 19), 10);
+        assert_eq!(visible_span(20, 10), 1);
+        assert_eq!(visible_span(i16::MIN, i16::MAX), i16::MAX);
+    }
+
+    #[test]
+    fn viewport_rect_construction_saturates_edges() {
+        let viewport = viewport_for_buffer_size(COORD { X: 1, Y: i16::MAX });
+
+        assert_eq!(rect_tuple(viewport), (0, 0, 0, i16::MAX - 1));
+        assert_eq!(rect_end(i16::MAX - 1, 10), i16::MAX);
     }
 
     #[test]
