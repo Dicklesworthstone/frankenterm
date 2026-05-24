@@ -120,5 +120,26 @@ unless uncovered.empty?
   MSG
 end
 
-puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored)"
+# --- 5. Registration coverage: no regex may be defined but left unwired. -------
+# A `static FOO: LazyLock<Regex>` that is never referenced in SECRET_PATTERNS is
+# a dead pattern — its entire secret class flows through redact()/StreamingRedactor
+# unscrubbed with zero compile error. Every regex in this file is a secret
+# pattern, so the invariant is exact: defined set == SECRET_PATTERNS set.
+defined = src.scan(/static\s+([A-Z][A-Z0-9_]*)\s*:\s*LazyLock<Regex>/).map { |m| m[0] }.uniq.sort
+pattern_block = src[/static\s+SECRET_PATTERNS[^=]*=\s*&\[(.*?)\];/m, 1]
+fail!("could not locate SECRET_PATTERNS array") if pattern_block.nil?
+registered = pattern_block.scan(/regex:\s*&([A-Z][A-Z0-9_]*)/).map { |m| m[0] }.uniq.sort
+fail!("SECRET_PATTERNS parsed empty") if registered.empty?
+
+orphaned = defined - registered
+unless orphaned.empty?
+  fail!(<<~MSG.chomp)
+    #{orphaned.length} regex(es) defined but NOT registered in SECRET_PATTERNS: #{orphaned.join(", ")}
+    A defined-but-unwired pattern silently leaks its entire secret class. Add a SecretPattern entry, or — if intentionally not a secret pattern — this guard's exact-equality invariant must be revisited.
+  MSG
+end
+dangling = registered - defined
+fail!("SECRET_PATTERNS references undefined regex(es): #{dangling.join(", ")}") unless dangling.empty?
+
+puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored, #{registered.length} regexes all registered)"
 RUBY
