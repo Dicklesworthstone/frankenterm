@@ -195,6 +195,7 @@ impl WorkflowDescriptor {
             }
             validate_trigger_values("event_types", &trigger.event_types, limits.max_text_len)?;
             validate_trigger_values("agent_types", &trigger.agent_types, limits.max_text_len)?;
+            validate_trigger_agent_types(&trigger.agent_types)?;
             validate_trigger_values("rule_ids", &trigger.rule_ids, limits.max_text_len)?;
         }
 
@@ -264,6 +265,24 @@ fn validate_trigger_values(field: &str, values: &[String], max_len: usize) -> cr
         return Err(crate::Error::Config(
             crate::error::ConfigError::ValidationError(format!(
                 "Descriptor trigger {field} value cannot contain empty dot-separated segments"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+const DESCRIPTOR_TRIGGER_AGENT_TYPES: [&str; 5] =
+    ["codex", "claude_code", "gemini", "wezterm", "unknown"];
+
+fn validate_trigger_agent_types(values: &[String]) -> crate::Result<()> {
+    if let Some(value) = values
+        .iter()
+        .find(|value| !DESCRIPTOR_TRIGGER_AGENT_TYPES.contains(&value.as_str()))
+    {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!(
+                "Descriptor trigger agent_types value '{value}' is not one of: {}",
+                DESCRIPTOR_TRIGGER_AGENT_TYPES.join(", ")
             )),
         ));
     }

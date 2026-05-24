@@ -572,9 +572,33 @@ proptest! {
     }
 
     #[test]
+    fn unknown_trigger_agent_type_fails_validation(
+        mut val in arb_workflow_descriptor(),
+        unknown_agent in "[a-z]{4,10}",
+    ) {
+        prop_assume!(
+            !matches!(
+                unknown_agent.as_str(),
+                "codex" | "claude_code" | "gemini" | "wezterm" | "unknown"
+            )
+        );
+        val.triggers = vec![DescriptorTrigger {
+            event_types: vec!["session.compaction".to_string()],
+            agent_types: vec![unknown_agent],
+            rule_ids: Vec::new(),
+        }];
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+
+        prop_assert!(
+            val.validate(&limits).is_err(),
+            "descriptor validation must reject unsupported trigger agent_types values"
+        );
+    }
+
+    #[test]
     fn trigger_values_respect_configured_text_length_limit(
         max_text_len in 1usize..128,
-        trigger_field in 0u8..3,
+        trigger_field in prop_oneof![Just(0u8), Just(2u8)],
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_text_len,
@@ -583,7 +607,7 @@ proptest! {
         let build_trigger = |value: String| {
             let mut trigger = DescriptorTrigger {
                 event_types: vec!["e".to_string()],
-                agent_types: vec!["a".to_string()],
+                agent_types: vec!["codex".to_string()],
                 rule_ids: vec!["r".to_string()],
             };
             match trigger_field {
