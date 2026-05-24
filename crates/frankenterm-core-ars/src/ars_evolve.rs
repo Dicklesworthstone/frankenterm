@@ -217,8 +217,7 @@ impl EvolutionEngine {
         commands: Vec<String>,
         timestamp_ms: u64,
     ) -> ReflexId {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.allocate_reflex_id();
 
         let version = ReflexVersion {
             reflex_id: id,
@@ -272,8 +271,7 @@ impl EvolutionEngine {
         }
 
         // Create new version.
-        let new_id = self.next_id;
-        self.next_id += 1;
+        let new_id = self.allocate_reflex_id();
         let new_version_num = parent.version + 1;
 
         let initial_status = if self.config.incubate_evolutions {
@@ -324,6 +322,17 @@ impl EvolutionEngine {
             new_reflex_id: new_id,
             new_version: new_version_num,
             deprecated_reflex_id: request.parent_reflex_id,
+        }
+    }
+
+    fn allocate_reflex_id(&mut self) -> ReflexId {
+        let mut candidate = self.next_id.max(1);
+        loop {
+            if !self.versions.contains_key(&candidate) {
+                self.next_id = candidate.checked_add(1).unwrap_or(1).max(1);
+                return candidate;
+            }
+            candidate = candidate.checked_add(1).unwrap_or(1).max(1);
         }
     }
 
@@ -544,6 +553,21 @@ mod tests {
         let id1 = engine.register_original("c1", vec![1], vec!["a".into()], 1000);
         let id2 = engine.register_original("c1", vec![2], vec!["b".into()], 1000);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn register_original_wraparound_skips_active_ids() {
+        let mut engine = make_engine();
+        let existing = engine.register_original("c1", vec![1], vec!["a".into()], 1000);
+        engine.next_id = u64::MAX;
+
+        let max_id = engine.register_original("c1", vec![2], vec!["b".into()], 2000);
+        let wrapped_id = engine.register_original("c1", vec![3], vec!["c".into()], 3000);
+
+        assert_eq!(existing, 1);
+        assert_eq!(max_id, u64::MAX);
+        assert_eq!(wrapped_id, 2);
+        assert!(engine.get_version(0).is_none());
     }
 
     // ---- Evolution ----
