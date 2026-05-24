@@ -712,6 +712,8 @@ pub struct QueueBackpressureConfig {
 pub enum QueueBackpressureConfigError {
     /// Throttle or reject threshold is NaN or infinite.
     NonFiniteThreshold,
+    /// Throttle or reject threshold is outside the 0.0..=1.0 fraction range.
+    ThresholdOutOfRange,
     /// Throttle threshold is above reject threshold.
     MisorderedThresholds,
 }
@@ -735,11 +737,17 @@ impl QueueBackpressureConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when either threshold is not finite or the throttle
-    /// threshold is greater than the reject threshold.
+    /// Returns an error when either threshold is not finite, outside the
+    /// 0.0..=1.0 fraction range, or the throttle threshold is greater than the
+    /// reject threshold.
     pub fn validate(&self) -> Result<(), QueueBackpressureConfigError> {
         if !self.throttle_threshold.is_finite() || !self.reject_threshold.is_finite() {
             return Err(QueueBackpressureConfigError::NonFiniteThreshold);
+        }
+        if !(0.0..=1.0).contains(&self.throttle_threshold)
+            || !(0.0..=1.0).contains(&self.reject_threshold)
+        {
+            return Err(QueueBackpressureConfigError::ThresholdOutOfRange);
         }
         if self.throttle_threshold > self.reject_threshold {
             return Err(QueueBackpressureConfigError::MisorderedThresholds);
@@ -782,8 +790,7 @@ impl QueueBackpressure {
     ///
     /// # Errors
     ///
-    /// Returns an error when `config` contains non-finite thresholds or a
-    /// throttle threshold above the reject threshold.
+    /// Returns an error when `config` contains invalid thresholds.
     pub fn try_new(config: QueueBackpressureConfig) -> Result<Self, QueueBackpressureConfigError> {
         config.validate()?;
         Ok(Self::new_unchecked(config))
@@ -1779,6 +1786,23 @@ mod tests {
         qb.update_depth(90);
         assert!(qb.should_throttle());
         assert!(qb.should_reject());
+    }
+
+    #[test]
+    fn queue_backpressure_rejects_out_of_range_thresholds() {
+        let disables_rejection = QueueBackpressureConfig {
+            max_queue_depth: 100,
+            throttle_threshold: 1.2,
+            reject_threshold: 1.5,
+        };
+        assert!(matches!(
+            QueueBackpressure::try_new(disables_rejection.clone()),
+            Err(QueueBackpressureConfigError::ThresholdOutOfRange)
+        ));
+
+        let fail_closed = QueueBackpressure::new(disables_rejection);
+        assert!(fail_closed.should_throttle());
+        assert!(fail_closed.should_reject());
     }
 
     #[test]
