@@ -1,7 +1,7 @@
-use crate::terminalstate::image::*;
 use crate::TerminalState;
-use ::image::imageops::FilterType;
+use crate::terminalstate::image::*;
 use ::image::ImageFormat;
+use ::image::imageops::FilterType;
 use frankenterm_cell::image::ImageDataType;
 use frankenterm_escape_parser::osc::ITermFileData;
 use log::error;
@@ -48,8 +48,8 @@ impl TerminalState {
         }
 
         // Figure out the dimensions.
-        let physical_cols = self.screen().physical_cols;
-        let physical_rows = self.screen().physical_rows;
+        let physical_cols = self.screen().physical_cols.max(1);
+        let physical_rows = self.screen().physical_rows.max(1);
         let cell_pixel_width = self.pixel_width / physical_cols;
         let cell_pixel_height = self.pixel_height / physical_rows;
 
@@ -83,7 +83,7 @@ impl TerminalState {
                         candidates.push(((width * y_scale) as usize, self.pixel_height));
                     }
 
-                    candidates.sort_by_key(|a| a.0 * a.1);
+                    candidates.sort_by_key(|a| a.0.saturating_mul(a.1));
 
                     candidates
                         .pop()
@@ -107,6 +107,11 @@ impl TerminalState {
             (Some(w), Some(h)) => (w, h),
         };
 
+        let Some((image_width, image_height)) = checked_u32_image_dimensions(width, height) else {
+            log::error!("iTerm image dimensions exceed u32 bounds: {width}x{height}");
+            return;
+        };
+
         let downscaled = (width < info.width as usize) || (height < info.height as usize);
         let data = match (downscaled, info.format) {
             (true, ImageFormat::Gif)
@@ -119,9 +124,9 @@ impl TerminalState {
             }
             (true, _) => match ::image::load_from_memory(&image.data) {
                 Ok(im) => {
-                    let im = im.resize_exact(width as u32, height as u32, FilterType::CatmullRom);
+                    let im = im.resize_exact(image_width, image_height, FilterType::CatmullRom);
                     let data = im.into_rgba8().into_vec();
-                    ImageDataType::new_single_frame(width as u32, height as u32, data)
+                    ImageDataType::new_single_frame(image_width, image_height, data)
                 }
                 Err(_) => ImageDataType::EncodedFile(image.data),
             },
@@ -136,8 +141,8 @@ impl TerminalState {
         };
 
         if let Err(err) = self.assign_image_to_cells(ImageAttachParams {
-            image_width: width as u32,
-            image_height: height as u32,
+            image_width,
+            image_height,
             source_width: None,
             source_height: None,
             source_origin_x: 0,
@@ -154,6 +159,25 @@ impl TerminalState {
             do_not_move_cursor: image.do_not_move_cursor,
         }) {
             log::error!("set iterm2 image: {:#}", err);
+        }
+    }
+}
+
+fn checked_u32_image_dimensions(width: usize, height: usize) -> Option<(u32, u32)> {
+    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_u32_image_dimensions_rejects_overflow() {
+        assert_eq!(checked_u32_image_dimensions(1, 1), Some((1, 1)));
+
+        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(checked_u32_image_dimensions(too_large, 1), None);
+            assert_eq!(checked_u32_image_dimensions(1, too_large), None);
         }
     }
 }
