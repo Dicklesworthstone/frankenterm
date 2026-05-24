@@ -288,6 +288,54 @@ fn production_loader_rejects_unknown_enum_values() {
     }
 }
 
+#[test]
+fn serde_loader_is_not_the_unknown_field_gate() {
+    let validator = load_schema();
+    for (field_scope, value) in [
+        (
+            "top-level",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.unknown_top_level",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_unknown_top_level",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule in a pack with an unknown top-level field."
+                }],
+                "extra_top_level": "serde accepts this but the schema must not"
+            }),
+        ),
+        (
+            "rule",
+            serde_json::json!({
+                "name": "synthetic",
+                "version": "1.0.0",
+                "rules": [{
+                    "id": "codex.synthetic.unknown_rule_field",
+                    "agent_type": "codex",
+                    "event_type": "synthetic_unknown_rule_field",
+                    "severity": "warning",
+                    "anchors": ["synthetic"],
+                    "description": "Synthetic rule carrying an unknown rule field.",
+                    "unexpected_rule_field": "serde accepts this but the schema must not"
+                }]
+            }),
+        ),
+    ] {
+        assert!(
+            serde_json::from_value::<PatternPack>(value.clone()).is_ok(),
+            "serde loader should tolerate unknown {field_scope} fields"
+        );
+        assert!(
+            validator.validate(&value).is_err(),
+            "schema validator accepted unknown {field_scope} fields"
+        );
+    }
+}
+
 // ── Coverage meta-test ──────────────────────────────────────────────────────
 
 #[test]
