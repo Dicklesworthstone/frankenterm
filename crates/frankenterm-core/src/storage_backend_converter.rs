@@ -89,6 +89,22 @@ impl ConvertOutcome {
 /// Quoting policy: identifiers (table names) are double-quoted
 /// per SQLite conventions. Values are routed through `?N`
 /// positional parameter binding to avoid string-injection.
+///
+/// # Data-integrity warning — NOT blob/NULL safe
+///
+/// This copy round-trips every value through the *string* row pipeline
+/// (`query_map_strings` → `query_row_strings`), which is lossy for two value
+/// classes, so it must not be used on tables that carry them:
+/// - **BLOB columns are corrupted.** A blob reads back as the TEXT placeholder
+///   `<blob:N bytes>` and is re-inserted as that literal string, destroying the
+///   bytes. `verify_equivalence` cannot detect this (it stringifies both sides
+///   identically), so the corruption is silent.
+/// - **SQL NULL becomes empty TEXT** (`""`) on the destination.
+///
+/// Restrict callers to text/integer/real, non-NULL-significant tables until a
+/// `SqlCell`/`ToSqlValue`-binding copy path that preserves blob bytes and NULL
+/// is wired (the default trait param binding currently stringifies via
+/// `to_canonical_string`, so it does not help here).
 pub fn copy_table(
     source: &dyn StorageBackend,
     dest: &dyn StorageBackend,
