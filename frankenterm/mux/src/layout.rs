@@ -236,7 +236,11 @@ impl LayoutCycle {
 
     /// Advance to the next layout and return it.
     pub fn advance(&mut self) -> &SwapLayout {
-        self.current = (self.current + 1) % self.layouts.len();
+        self.current = if self.current >= self.layouts.len().saturating_sub(1) {
+            0
+        } else {
+            self.current + 1
+        };
         &self.layouts[self.current]
     }
 
@@ -852,6 +856,15 @@ mod tests {
         let mut cycle = single;
         assert_eq!(cycle.advance().name, "stacked");
         assert_eq!(cycle.prev().name, "stacked");
+    }
+
+    #[test]
+    fn layout_cycle_advance_recovers_from_out_of_range_index() {
+        let mut cycle = default_cycle();
+        cycle.current = usize::MAX;
+
+        assert_eq!(cycle.advance().name, "grid-4");
+        assert_eq!(cycle.current_index(), 0);
     }
 
     // --- Built-in preset tests ---
