@@ -7533,6 +7533,27 @@ description = "Project lint warning"
         assert!(trunc);
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn proptest_bound_utf8_preserves_valid_prefix_and_limit(
+            input in ".*",
+            max_bytes in 0usize..256,
+        ) {
+            let (bounded, truncated) = PatternEngine::bound_utf8(&input, max_bytes);
+
+            prop_assert!(bounded.len() <= max_bytes);
+            prop_assert!(input.starts_with(&bounded));
+            prop_assert!(input.is_char_boundary(bounded.len()));
+            prop_assert_eq!(truncated, bounded.len() < input.len());
+
+            if !truncated {
+                prop_assert_eq!(bounded, input);
+            }
+        }
+    }
+
     // --- slice_bytes ---
 
     #[test]
