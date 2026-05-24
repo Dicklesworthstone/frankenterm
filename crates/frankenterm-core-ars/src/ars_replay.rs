@@ -266,7 +266,7 @@ impl ReplayHarness {
         incidents: &[HistoricalIncident],
         timestamp_ms: u64,
     ) -> ReplaySession {
-        self.total_sessions += 1;
+        self.total_sessions = self.total_sessions.saturating_add(1);
 
         // Check minimum incidents.
         if incidents.len() < self.config.min_incidents {
@@ -300,7 +300,7 @@ impl ReplayHarness {
         };
 
         let assessment = if pass_rate >= self.config.min_pass_rate {
-            self.total_validated += 1;
+            self.total_validated = self.total_validated.saturating_add(1);
             debug!(
                 reflex_id,
                 pass_rate,
@@ -312,7 +312,7 @@ impl ReplayHarness {
                 incidents: replay_count,
             }
         } else {
-            self.total_rejected += 1;
+            self.total_rejected = self.total_rejected.saturating_add(1);
             warn!(
                 reflex_id,
                 pass_rate,
@@ -467,16 +467,16 @@ impl ReplayHarness {
         for v in verdicts {
             match v {
                 ReplayVerdict::Pass { .. } => {
-                    passes += 1;
-                    total += 1;
+                    passes = passes.saturating_add(1);
+                    total = total.saturating_add(1);
                 }
                 ReplayVerdict::Fail { .. } => {
-                    total += 1;
+                    total = total.saturating_add(1);
                 }
                 ReplayVerdict::Inconclusive { .. } => {
                     if self.config.count_inconclusive_as_pass {
-                        passes += 1;
-                        total += 1;
+                        passes = passes.saturating_add(1);
+                        total = total.saturating_add(1);
                     }
                     // Otherwise excluded from total.
                 }
@@ -751,6 +751,23 @@ mod tests {
 
         let stats = harness.stats();
         assert_eq!(stats.total_sessions, 2);
+    }
+
+    #[test]
+    fn stats_counters_saturate() {
+        let mut harness = ReplayHarness::with_defaults();
+        harness.total_sessions = u64::MAX;
+        harness.total_validated = u64::MAX;
+        harness.total_rejected = u64::MAX;
+        let incidents = make_incidents(5);
+
+        harness.validate(1, &["systemctl restart app".into()], &incidents, 1000);
+        harness.validate(2, &["bad cmd".into()], &incidents, 2000);
+
+        let stats = harness.stats();
+        assert_eq!(stats.total_sessions, u64::MAX);
+        assert_eq!(stats.total_validated, u64::MAX);
+        assert_eq!(stats.total_rejected, u64::MAX);
     }
 
     #[test]
