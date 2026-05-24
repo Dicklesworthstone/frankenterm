@@ -404,7 +404,7 @@ impl QuotaTracker {
             return false;
         }
         self.window_actions.push(now_ms);
-        self.total_actions += 1;
+        self.total_actions = self.total_actions.saturating_add(1);
         true
     }
 
@@ -547,7 +547,7 @@ impl CostBudget {
         self.gc(now_ms);
         let cost = self.estimate_cost(action_kind);
         self.window_records.push((now_ms, cost));
-        self.total_cost_cents += cost;
+        self.total_cost_cents = self.total_cost_cents.saturating_add(cost);
         cost
     }
 
@@ -555,7 +555,9 @@ impl CostBudget {
     #[must_use]
     pub fn window_cost(&mut self, now_ms: u64) -> u64 {
         self.gc(now_ms);
-        self.window_records.iter().map(|&(_, c)| c).sum()
+        self.window_records
+            .iter()
+            .fold(0u64, |total, &(_, cost)| total.saturating_add(cost))
     }
 
     /// Remaining budget (cents).
@@ -1616,6 +1618,21 @@ mod tests {
     }
 
     #[test]
+    fn quota_total_actions_saturates() {
+        let config = QuotaConfig {
+            max_actions: 2,
+            window_ms: 10_000,
+            warning_threshold: 0.8,
+        };
+        let mut qt = QuotaTracker::new(config);
+        qt.total_actions = u64::MAX;
+
+        assert!(qt.record(1000));
+
+        assert_eq!(qt.total_actions(), u64::MAX);
+    }
+
+    #[test]
     fn quota_warning_threshold() {
         let config = QuotaConfig {
             max_actions: 10,
@@ -1688,6 +1705,21 @@ mod tests {
         // t=7000: action at t=1000 expired (cutoff = 7000-5000 = 2000)
         assert_eq!(cb.window_cost(7000), 10); // only t=2000 remains
         assert!(!cb.is_exhausted(7000));
+    }
+
+    #[test]
+    fn cost_budget_totals_saturate() {
+        let mut config = CostBudgetConfig::default();
+        config.max_cost_cents = u64::MAX;
+        config.action_costs.insert("notify".into(), u64::MAX);
+        let mut cb = CostBudget::new(config);
+
+        assert_eq!(cb.record(&ConnectorActionKind::Notify, 1000), u64::MAX);
+        assert_eq!(cb.record(&ConnectorActionKind::Notify, 1001), u64::MAX);
+
+        let snapshot = cb.snapshot(1001);
+        assert_eq!(snapshot.window_cost_cents, u64::MAX);
+        assert_eq!(snapshot.total_lifetime_cents, u64::MAX);
     }
 
     #[test]
