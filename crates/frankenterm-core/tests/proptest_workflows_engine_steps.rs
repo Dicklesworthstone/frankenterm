@@ -212,6 +212,30 @@ proptest! {
     }
 
     #[test]
+    fn step_result_send_text_and_wait_preserves_wait_payload(
+        text in "[a-z ]{3,30}",
+        cond in arb_wait_condition(),
+        timeout_ms in 1u64..60_000,
+    ) {
+        let r = StepResult::send_text_and_wait(text.clone(), cond.clone(), timeout_ms);
+        prop_assert!(r.is_send_text());
+        prop_assert!(!r.is_continue());
+        prop_assert!(!r.is_terminal());
+        match r {
+            StepResult::SendText {
+                text: actual_text,
+                wait_for,
+                wait_timeout_ms,
+            } => {
+                prop_assert_eq!(actual_text, text);
+                prop_assert_eq!(wait_for, Some(cond));
+                prop_assert_eq!(wait_timeout_ms, Some(timeout_ms));
+            }
+            other => prop_assert!(false, "expected SendText, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn step_result_retry_not_terminal(delay_ms in 100u64..30_000) {
         let r = StepResult::retry(delay_ms);
         prop_assert!(!r.is_terminal());
