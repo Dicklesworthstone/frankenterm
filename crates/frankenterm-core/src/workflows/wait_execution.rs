@@ -365,6 +365,12 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 })
             }
             WaitCondition::External { key } => {
+                if key.trim().is_empty() {
+                    return Ok(WaitConditionResult::Unsupported {
+                        reason: "External signal key cannot be empty".to_string(),
+                    });
+                }
+
                 let Some(registry) = self.external_signals else {
                     return Ok(WaitConditionResult::Unsupported {
                         reason: format!(
@@ -1391,6 +1397,32 @@ mod tests {
                         && reason.contains("external signal registry")
             ),
             "expected Unsupported mentioning key and registry, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn execute_external_returns_unsupported_for_empty_key() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let registry = ExternalSignalRegistry::new();
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_external_signals(&registry);
+
+        let condition = WaitCondition::External {
+            key: " \n ".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(
+            matches!(
+                &result,
+                WaitConditionResult::Unsupported { reason }
+                    if reason.contains("external signal key cannot be empty")
+            ),
+            "expected Unsupported for empty key, got {result:?}"
         );
     }
 

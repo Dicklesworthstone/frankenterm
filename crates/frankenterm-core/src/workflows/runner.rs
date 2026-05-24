@@ -167,6 +167,13 @@ async fn wait_condition_pause_maybe_cx(
             wait_duration_maybe_cx(cx, timeout, label).await
         }
         WaitCondition::External { key } => {
+            if key.trim().is_empty() {
+                return Err(crate::Error::Workflow(
+                    crate::error::WorkflowError::Aborted(format!(
+                        "{label}: external signal key cannot be empty"
+                    )),
+                ));
+            }
             let Some(registry) = external_signals else {
                 return Err(crate::Error::Workflow(
                     crate::error::WorkflowError::Aborted(format!(
@@ -4238,6 +4245,32 @@ mod tests {
                         assert!(
                             reason.contains("with_external_signals"),
                             "abort reason must point at the wiring API: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
+            });
+        }
+
+        #[test]
+        fn external_wait_rejects_empty_signal_key() {
+            run_async_test(async {
+                let registry = ExternalSignalRegistry::new();
+                let cond = WaitCondition::external(" \t ");
+                let err = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(60),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("blank external signal key must abort");
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("external signal key cannot be empty"),
+                            "unexpected abort reason: {reason}"
                         );
                     }
                     other => panic!("expected Workflow(Aborted), got: {other:?}"),
