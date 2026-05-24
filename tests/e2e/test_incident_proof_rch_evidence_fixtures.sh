@@ -198,5 +198,42 @@ jq -e '
   )
 ' "${FIXTURE}" >/dev/null || fail "missing-artifact case drifted"
 
+# Anti-fraud guard: a "passed" verdict is only legitimate when every evidence
+# pillar holds (material command + remote cargo + remote test binary reached, a
+# retained artifact, and no chatter-only / local-fallback / new-proof shortcut).
+# Every real case must satisfy the invariant, AND a fabricated pass with any one
+# pillar removed must fail it — proving the guard actually bites rather than
+# trivially passing because no fixture exercises the violation.
+jq -e '
+  def passed_has_evidence($c):
+    ($c.proof.verdict != "passed")
+    or (
+      $c.proof.material_command_reached == true
+      and $c.proof.remote_cargo_reached == true
+      and $c.proof.remote_test_binary_reached == true
+      and $c.proof.artifact_posture == "retained"
+      and ($c.proof.artifact_paths | length) >= 1
+      and $c.proof.sync_chatter_only == false
+      and $c.proof.queue_chatter_only == false
+      and $c.proof.setup_chatter_only == false
+      and $c.proof.local_fallback_detected == false
+      and $c.proof.local_cargo_detected == false
+      and $c.proof.launches_new_proof == false
+    );
+  (all(.cases[]; passed_has_evidence(.)))
+  and (
+    ([.cases[] | select(.case_id == "passed-remote-proof")][0]) as $p
+    | (passed_has_evidence($p | .proof.remote_cargo_reached = false) | not)
+    and (passed_has_evidence($p | .proof.material_command_reached = false) | not)
+    and (passed_has_evidence($p | .proof.remote_test_binary_reached = false) | not)
+    and (passed_has_evidence($p | .proof.artifact_posture = "missing_required_artifact" | .proof.artifact_paths = []) | not)
+    and (passed_has_evidence($p | .proof.sync_chatter_only = true) | not)
+    and (passed_has_evidence($p | .proof.queue_chatter_only = true) | not)
+    and (passed_has_evidence($p | .proof.setup_chatter_only = true) | not)
+    and (passed_has_evidence($p | .proof.local_fallback_detected = true) | not)
+    and (passed_has_evidence($p | .proof.launches_new_proof = true) | not)
+  )
+' "${FIXTURE}" >/dev/null || fail "passed-verdict evidence guard does not bite"
+
 case_count="$(jq -r '.cases | length' "${FIXTURE}")"
 printf 'incident proof_rch_evidence fixture corpus: static verifier passed (%s cases)\n' "${case_count}"
