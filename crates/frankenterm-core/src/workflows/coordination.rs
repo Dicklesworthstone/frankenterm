@@ -1059,10 +1059,28 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
 
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    path = %dir.display(),
+                    error = %e,
+                    "cannot read unstick scan directory"
+                );
+                continue;
+            }
         };
 
-        for entry in entries.flatten() {
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "failed to read unstick scan directory entry"
+                    );
+                    continue;
+                }
+            };
             if all_findings.len() >= config.max_total_findings {
                 truncated = true;
                 break;
@@ -1070,8 +1088,19 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
 
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to inspect unstick scan entry file type"
+                    );
+                    continue;
+                }
+            };
 
-            if path.is_dir() {
+            if file_type.is_dir() {
                 // Skip hidden dirs, target, node_modules, vendor
                 if !name.starts_with('.')
                     && name != "target"
@@ -1083,7 +1112,7 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
                 continue;
             }
 
-            if !path.is_file() {
+            if !file_type.is_file() {
                 continue;
             }
 
@@ -1749,6 +1778,37 @@ mod tests {
         assert_eq!(todo_count, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_unstick_scan_text_skips_symlinked_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked_file_target = outside.path().join("linked_file.rs");
+        std::fs::write(&linked_file_target, "// TODO should stay outside scan\n").unwrap();
+        std::os::unix::fs::symlink(&linked_file_target, root.path().join("linked_file.rs"))
+            .unwrap();
+
+        let linked_dir_target = outside.path().join("linked_dir");
+        std::fs::create_dir_all(&linked_dir_target).unwrap();
+        std::fs::write(
+            linked_dir_target.join("inside.rs"),
+            "fn panic_path() { panic!(\"outside scan\"); }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&linked_dir_target, root.path().join("linked_dir")).unwrap();
+
+        let report = run_unstick_scan_text(&UnstickConfig {
+            root: root.path().to_path_buf(),
+            max_findings_per_kind: 10,
+            max_total_findings: 25,
+            extensions: vec!["rs".to_string()],
+        });
+
+        assert_eq!(report.files_scanned, 0);
+        assert!(report.findings.is_empty());
+        assert!(report.counts.is_empty());
     }
 
     // ========================================================================
