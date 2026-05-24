@@ -82,6 +82,10 @@ fn add_u32_to_i64_saturating(value: i64, delta: u32) -> i64 {
     value.saturating_add(i64::from(delta))
 }
 
+fn next_sequence_no(seqno: SequenceNo) -> SequenceNo {
+    seqno.saturating_add(1)
+}
+
 impl TabStop {
     fn new(screen_width: usize, tab_width: usize) -> Self {
         let mut tabs = Vec::with_capacity(screen_width);
@@ -654,7 +658,7 @@ impl TerminalState {
     }
 
     pub fn increment_seqno(&mut self) {
-        self.seqno += 1;
+        self.seqno = next_sequence_no(self.seqno);
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
@@ -3068,6 +3072,12 @@ mod tests {
         let checksum = terminal.checksum_rectangle(0, 0, 79, 23);
 
         assert_eq!(checksum, ((u32::from(b'A') * 80 * 24) & 0xffff) as u16);
+    }
+
+    #[test]
+    fn next_sequence_no_saturates_at_usize_max() {
+        assert_eq!(next_sequence_no(0), 1);
+        assert_eq!(next_sequence_no(usize::MAX), usize::MAX);
     }
 
     /// Per ft-mv27v (cont of ft-d1pv3): TerminalConfiguration test
