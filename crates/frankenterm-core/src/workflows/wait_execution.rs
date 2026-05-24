@@ -48,20 +48,29 @@ impl ExternalSignalRegistry {
     /// Record that the named external signal has been raised.
     pub fn signal(&self, key: impl Into<String>) {
         let key = key.into();
-        if key.trim().is_empty() {
+        let key = key.trim();
+        if key.is_empty() {
             return;
         }
-        self.fired_guard().insert(key);
+        self.fired_guard().insert(key.to_string());
     }
 
     /// Returns true once the named signal has been raised.
     #[must_use]
     pub fn is_signaled(&self, key: &str) -> bool {
+        let key = key.trim();
+        if key.is_empty() {
+            return false;
+        }
         self.fired_guard().contains(key)
     }
 
     /// Clear a previously raised signal.
     pub fn clear(&self, key: &str) {
+        let key = key.trim();
+        if key.is_empty() {
+            return;
+        }
         self.fired_guard().remove(key);
     }
 
@@ -1444,6 +1453,14 @@ mod tests {
         assert_eq!(registry.len(), 1);
 
         registry.signal("workflow.approved");
+        assert_eq!(registry.len(), 2);
+
+        registry.signal(" deploy.ready ");
+        assert_eq!(registry.len(), 3);
+        assert!(registry.is_signaled("deploy.ready"));
+        assert!(registry.is_signaled(" deploy.ready "));
+        registry.clear(" deploy.ready ");
+        assert!(!registry.is_signaled("deploy.ready"));
         assert_eq!(registry.len(), 2);
 
         registry.signal(" \t ");
