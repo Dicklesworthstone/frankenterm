@@ -196,6 +196,27 @@ proptest! {
     }
 
     #[test]
+    fn step_result_done_preserves_result_payload(
+        status in "[a-z_]{3,20}",
+        count in 0u64..10_000,
+        ok in any::<bool>(),
+    ) {
+        let payload = serde_json::json!({
+            "status": status,
+            "count": count,
+            "ok": ok,
+        });
+        let r = StepResult::done(payload.clone());
+
+        prop_assert!(r.is_done());
+        prop_assert!(r.is_terminal());
+        match r {
+            StepResult::Done { result } => prop_assert_eq!(result, payload),
+            other => prop_assert!(false, "expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn step_result_abort_is_terminal(reason in "[a-z ]{5,30}") {
         let r = StepResult::abort(reason);
         prop_assert!(r.is_terminal());
