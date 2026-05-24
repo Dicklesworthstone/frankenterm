@@ -77,14 +77,11 @@ const REPLICATE_TOKEN: &str = "r8_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345"; // r8_ + 31
 const ANYSCALE_KEY: &str = "esecret_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345"; // esecret_ + 31
 const PERPLEXITY_KEY: &str = "pplx-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH"; // pplx- + 44
 const TWILIO_ACCOUNT_SID: &str = "AC0123456789abcdef0123456789abcdef"; // AC + 32 hex
-const SENDGRID_KEY: &str =
-    "SG.aBcDeFgHiJkLmNoPqRsTuV.aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCD"; // SG.<22>.<40>
-const JWT_TOKEN: &str =
-    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXN1YmplY3QifQ.abc123_test-XYZ";
+const SENDGRID_KEY: &str = "SG.aBcDeFgHiJkLmNoPqRsTuV.aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCD"; // SG.<22>.<40>
+const JWT_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXN1YmplY3QifQ.abc123_test-XYZ";
 // Keyed patterns: the secret only redacts with its surrounding key name,
 // so the sample embeds that name (the match span covers name + value).
-const AWS_SECRET_KEY: &str =
-    "aws_secret_access_key=aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd"; // value = exactly 40
+const AWS_SECRET_KEY: &str = "aws_secret_access_key=aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd"; // value = exactly 40
 const BEARER_TOKEN: &str = "Bearer aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"; // bearer + 36 body
 const DATADOG_API_KEY: &str = "DATADOG_API_KEY=0123456789abcdef0123456789abcdef"; // 32 hex
 // Keyed / generic / URL patterns. The match span covers the secret
