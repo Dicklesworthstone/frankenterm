@@ -372,6 +372,31 @@ fn bundle_schema_rejects_unsafe_signature_paths() {
 }
 
 #[test]
+fn bundle_schema_rejects_unsafe_reference_paths() {
+    let validator = bundle_validator();
+    let valid = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle tracked by ft-e87u6.2"
+    }));
+
+    let mut unsafe_taxonomy_path = valid.clone();
+    unsafe_taxonomy_path["taxonomy_coverage"]["taxonomy_path"] = json!("../proof-taxonomy.json");
+    assert!(
+        !validate(&validator, &unsafe_taxonomy_path).is_empty(),
+        "taxonomy_path must reject parent-directory traversal"
+    );
+
+    let mut unsafe_source_path = valid;
+    unsafe_source_path["confidence_summary"]["records"][0]["source_artifact_path"] =
+        json!("../schema.json");
+    assert!(
+        !validate(&validator, &unsafe_source_path).is_empty(),
+        "confidence source_artifact_path must reject parent-directory traversal"
+    );
+}
+
+#[test]
 fn bundle_schema_requires_canonical_confidence_summary() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({

@@ -234,7 +234,8 @@
         "source_artifact_path": {
           "description": "Optional repo-relative source artifact path for operator navigation.",
           "type": "string",
-          "pattern": "^[^/].*$"
+          "pattern": "^[^/].*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         }
       }
     },
@@ -404,7 +405,8 @@
         },
         "retraction_path": {
           "type": "string",
-          "pattern": "^[^/].*$"
+          "pattern": "^[^/].*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "retraction_sha256": {
           "type": "string",
@@ -496,7 +498,8 @@
         "taxonomy_path": {
           "description": "Repo-relative path to the proof taxonomy registry used by the builder.",
           "type": "string",
-          "pattern": "^[^/].*$"
+          "pattern": "^[^/].*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "category_counts": {
           "type": "array",
