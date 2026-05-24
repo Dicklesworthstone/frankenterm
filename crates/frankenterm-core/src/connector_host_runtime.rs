@@ -248,13 +248,9 @@ impl ConnectorCapabilityEnvelope {
                     .any(|prefix| path_is_within_prefix(path, prefix))
             }),
             ConnectorCapability::NetworkEgress => target.is_some_and(|host| {
-                self.network_allow_hosts.iter().any(|allowed| {
-                    if allowed.starts_with("*.") {
-                        host.ends_with(&allowed[1..])
-                    } else {
-                        host == allowed
-                    }
-                })
+                self.network_allow_hosts
+                    .iter()
+                    .any(|allowed| network_host_matches(allowed, host))
             }),
             ConnectorCapability::ProcessExec => target.is_some_and(|command| {
                 self.allowed_exec_commands
@@ -266,6 +262,18 @@ impl ConnectorCapabilityEnvelope {
             | ConnectorCapability::StreamEvents
             | ConnectorCapability::SecretBroker => true,
         }
+    }
+}
+
+fn network_host_matches(allowed: &str, host: &str) -> bool {
+    let allowed = allowed.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+
+    if let Some(suffix) = allowed.strip_prefix("*.") {
+        let suffix = format!(".{suffix}");
+        host.len() > suffix.len() && host.ends_with(&suffix)
+    } else {
+        host == allowed
     }
 }
 
@@ -1367,6 +1375,31 @@ mod tests {
             decisions.iter().filter(|decision| decision.allowed).count(),
             1
         );
+    }
+
+    #[test]
+    fn connector_network_allowlist_matches_dns_hosts_case_insensitively() {
+        let envelope = ConnectorCapabilityEnvelope {
+            allowed_capabilities: vec![ConnectorCapability::NetworkEgress],
+            filesystem_read_prefixes: Vec::new(),
+            filesystem_write_prefixes: Vec::new(),
+            network_allow_hosts: vec![
+                "API.FRANKENTERM.DEV".to_string(),
+                "*.Example.COM".to_string(),
+            ],
+            allowed_exec_commands: Vec::new(),
+        };
+
+        assert!(envelope.allows_target(
+            ConnectorCapability::NetworkEgress,
+            Some("api.frankenterm.dev")
+        ));
+        assert!(envelope.allows_target(
+            ConnectorCapability::NetworkEgress,
+            Some("worker.example.com")
+        ));
+        assert!(!envelope.allows_target(ConnectorCapability::NetworkEgress, Some("example.com")));
+        assert!(!envelope.allows_target(ConnectorCapability::NetworkEgress, Some(".example.com")));
     }
 
     #[test]
