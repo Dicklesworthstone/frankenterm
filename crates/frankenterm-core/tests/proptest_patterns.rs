@@ -1317,6 +1317,51 @@ fn verification_report_action_mode_controls_pack_action_surfaces() {
     );
 }
 
+#[test]
+fn verification_report_mismatch_or_unverified_action_forces_observe_only() {
+    let mut rule = make_anchor_only_rule("verification_report_guard", "VERIFY_GUARD");
+    rule.workflow = Some("usage_limit_response".to_string());
+    rule.preview_command = Some("ft workflow preview usage-limit".to_string());
+    rule.manual_fix = Some("Recover pane {pane}".to_string());
+
+    let mismatched_report = PatternPackVerificationReport {
+        pack_name: "different-pack".to_string(),
+        verified: true,
+        action_mode: PatternPackActionMode::ActionTriggering,
+        signature_checked: true,
+        fixture_hashes_checked: 0,
+        regex_budget_checked: true,
+        issues: Vec::new(),
+    };
+    let mismatched_pack =
+        PatternPack::new("verification-guard", "1.0.0", vec![rule.clone()])
+            .enforce_verification_report(&mismatched_report);
+    assert_eq!(mismatched_pack.rules[0].workflow, None);
+    assert_eq!(mismatched_pack.rules[0].preview_command, None);
+    assert_eq!(
+        mismatched_pack.rules[0].get_manual_fix(5, None).as_deref(),
+        Some("Recover pane 5")
+    );
+
+    let unverified_report = PatternPackVerificationReport {
+        pack_name: "verification-guard".to_string(),
+        verified: false,
+        issues: vec![PatternPackVerificationIssue {
+            category: "signature".to_string(),
+            message: "signature missing".to_string(),
+        }],
+        ..mismatched_report
+    };
+    let unverified_pack = PatternPack::new("verification-guard", "1.0.0", vec![rule])
+        .enforce_verification_report(&unverified_report);
+    assert_eq!(unverified_pack.rules[0].workflow, None);
+    assert_eq!(unverified_pack.rules[0].preview_command, None);
+    assert_eq!(
+        unverified_pack.rules[0].get_manual_fix(5, None).as_deref(),
+        Some("Recover pane 5")
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 

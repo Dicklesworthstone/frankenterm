@@ -833,7 +833,10 @@ impl PatternPack {
 
     #[must_use]
     pub fn enforce_verification_report(self, report: &PatternPackVerificationReport) -> Self {
-        if report.action_mode.allows_action_triggers() {
+        if report.pack_name == self.name
+            && report.verified
+            && report.action_mode.allows_action_triggers()
+        {
             self
         } else {
             self.into_observe_only()
