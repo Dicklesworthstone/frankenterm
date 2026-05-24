@@ -1,11 +1,11 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, PaneId};
+use crate::pane::{PaneId, alloc_pane_id};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{CSI, Cursor};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 
@@ -728,6 +728,14 @@ impl TmuxDomainState {
 }
 
 fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
+    let Some(prefix) = text.chars().next() else {
+        anyhow::bail!("missing tmux id sigil");
+    };
+    anyhow::ensure!(
+        matches!(prefix, '$' | '%' | '@'),
+        "unsupported tmux id sigil {prefix:?}"
+    );
+
     let num = text
         .get(1..)
         .ok_or_else(|| anyhow!("wrong prefixed id"))?
@@ -1472,6 +1480,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_sigil_number_rejects_unknown_prefix() {
+        assert!(parse_sigil_number("x42").is_err());
+    }
+
+    #[test]
     fn send_keys_get_command_formats_hex_bytes() {
         let cmd = SendKeys {
             keys: vec![0x48, 0x69],
@@ -1593,11 +1606,13 @@ mod tests {
 
         cmd.process_result(domain_id, &result)?;
 
-        assert!(tmux_domain
-            .inner
-            .support_commands
-            .lock()
-            .contains_key("list-windows"));
+        assert!(
+            tmux_domain
+                .inner
+                .support_commands
+                .lock()
+                .contains_key("list-windows")
+        );
 
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert_eq!(queue.len(), 1);
