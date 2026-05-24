@@ -17,9 +17,9 @@
       ],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
-        "domain": { "type": "string" },
-        "title": { "type": "string" },
-        "cwd": { "type": "string" }
+        "domain": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "cwd": { "type": "string", "minLength": 1 }
       }
     }
   },
@@ -86,8 +86,9 @@
                 "properties": {
                   "id": { "type": "string", "minLength": 1 },
                   "priority": { "type": "integer", "minimum": 0 },
-                  "title": { "type": "string" },
-                  "domain": { "type": "string" }
+                  "title": { "type": "string", "minLength": 1 },
+                  "domain": { "type": "string", "minLength": 1 },
+                  "cwd": { "type": "string", "minLength": 1 }
                 }
               }
             }

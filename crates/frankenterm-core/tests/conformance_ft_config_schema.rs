@@ -357,6 +357,44 @@ fn schema_rejects_matcherless_pane_rules() {
     }
 }
 
+/// 4g) Falsification: matcher strings must be non-empty, because an
+/// empty title substring would otherwise match every pane.
+#[test]
+fn schema_rejects_empty_pane_matcher_values() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "ingest.panes.include.title",
+            serde_json::json!({
+                "ingest": {
+                    "panes": {
+                        "include": [
+                            { "id": "empty_title", "title": "" }
+                        ]
+                    }
+                }
+            }),
+        ),
+        (
+            "ingest.priorities.rules.cwd",
+            serde_json::json!({
+                "ingest": {
+                    "priorities": {
+                        "rules": [
+                            { "id": "empty_cwd", "priority": 10, "cwd": "" }
+                        ]
+                    }
+                }
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject empty matcher string at {surface}"
+        );
+    }
+}
+
 /// Pin the documented-but-unreachable list. If the README↔code
 /// reconciliation lands and the unreachable section starts round-
 /// tripping, this test fails and the maintainer must move the entry
