@@ -29,7 +29,7 @@ require "static_attestation_helpers"
 Primary entry points:
 
 - `StaticAttestation.repo_relative_path!` rejects empty, absolute, NUL-bearing,
-  and parent-traversal paths.
+  empty-segment, dot-segment, and parent-traversal paths.
 - `StaticAttestation.require_file!`, `read_text!`, and `read_json!` validate and
   read repo-relative files.
 - `StaticAttestation.expected_strings` preserves each expected string as a whole
@@ -83,7 +83,8 @@ use `StaticAttestation` without duplicating helper bootstrapping.
 These checks are static proof only:
 
 - JSON parseability and schema/manifest field consistency.
-- Repo-relative path and parent-traversal rejection.
+- Repo-relative path plus empty-segment, dot-segment, and parent-traversal
+  rejection.
 - Source document existence.
 - Seed corpus file name and byte-size consistency.
 - Direct-exec, shebang, and strict-mode script shape.
