@@ -1086,3 +1086,32 @@ proptest! {
         prop_assert_eq!(augmented.len(), base.len() + 1);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// kendall_tau reversal-negation (metamorphic)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Reversing one ranking flips every pairwise order over the common items,
+    /// so tau(a, reverse(b)) == -tau(a, b). Generalizes the existing
+    /// tau(r, reverse(r)) == -1 case to arbitrary ranking pairs. Exact in f32:
+    /// only the sign of the (concordant - discordant) numerator changes; the
+    /// pair total is unchanged (arb_ranking ids are unique, so no tied ranks).
+    #[test]
+    fn kendall_tau_reverse_negates(
+        a in arb_ranking(15),
+        b in arb_ranking(15),
+    ) {
+        let mut rev_b = b.clone();
+        rev_b.reverse();
+        let tau = kendall_tau(&a, &b);
+        let tau_rev = kendall_tau(&a, &rev_b);
+        prop_assert!(
+            (tau_rev + tau).abs() < 1e-6,
+            "tau(a, reverse b) should equal -tau(a, b): tau={}, tau_rev={}",
+            tau, tau_rev
+        );
+    }
+}
