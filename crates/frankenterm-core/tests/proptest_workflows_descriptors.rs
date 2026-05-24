@@ -38,15 +38,15 @@ fn arb_descriptor_trigger() -> impl Strategy<Value = DescriptorTrigger> {
 
 fn arb_descriptor_failure_handler() -> impl Strategy<Value = DescriptorFailureHandler> {
     prop_oneof![
-        "[a-z ${}_]{5,30}".prop_map(|message| DescriptorFailureHandler::Notify { message }),
-        "[a-z ${}_]{5,30}".prop_map(|message| DescriptorFailureHandler::Log { message }),
-        "[a-z ${}_]{5,30}".prop_map(|message| DescriptorFailureHandler::Abort { message }),
+        "[a-z][a-z ${}_]{4,29}".prop_map(|message| DescriptorFailureHandler::Notify { message }),
+        "[a-z][a-z ${}_]{4,29}".prop_map(|message| DescriptorFailureHandler::Log { message }),
+        "[a-z][a-z ${}_]{4,29}".prop_map(|message| DescriptorFailureHandler::Abort { message }),
     ]
 }
 
 fn arb_descriptor_matcher() -> impl Strategy<Value = DescriptorMatcher> {
     prop_oneof![
-        "[a-z ]{3,20}".prop_map(|value| DescriptorMatcher::Substring { value }),
+        "[a-z][a-z ]{2,19}".prop_map(|value| DescriptorMatcher::Substring { value }),
         // Use safe regex patterns only (no nested quantifiers)
         "[a-z]+".prop_map(|pattern| DescriptorMatcher::Regex { pattern }),
     ]
@@ -92,7 +92,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
         (
             "[a-z_]{3,10}",
             prop::option::of("[a-z ]{5,20}"),
-            "[a-z ]{3,50}",
+            "[a-z][a-z ]{2,49}",
             prop::option::of(arb_descriptor_matcher()),
             prop::option::of(1000u64..120_000),
         )
@@ -118,7 +118,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
         (
             "[a-z_]{3,10}",
             prop::option::of("[a-z ]{5,20}"),
-            "[a-z ]{5,50}"
+            "[a-z][a-z ]{4,49}"
         )
             .prop_map(|(id, description, message)| DescriptorStep::Notify {
                 id,
@@ -128,7 +128,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
         (
             "[a-z_]{3,10}",
             prop::option::of("[a-z ]{5,20}"),
-            "[a-z ]{5,50}"
+            "[a-z][a-z ]{4,49}"
         )
             .prop_map(|(id, description, message)| DescriptorStep::Log {
                 id,
@@ -138,7 +138,7 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
         (
             "[a-z_]{3,10}",
             prop::option::of("[a-z ]{5,20}"),
-            "[a-z ]{5,50}"
+            "[a-z][a-z ]{4,49}"
         )
             .prop_map(|(id, description, reason)| DescriptorStep::Abort {
                 id,
@@ -964,6 +964,30 @@ proptest! {
         prop_assert!(
             over_limit.validate(&limits).is_err(),
             "send_text longer than max_text_len should fail validation"
+        );
+    }
+
+    #[test]
+    fn empty_send_text_step_fails_validation() {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "send_text_blank".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendText {
+                id: "s".to_string(),
+                description: None,
+                text: " \t ".to_string(),
+                wait_for: None,
+                wait_timeout_ms: None,
+            }],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "send_text steps must inject non-empty text"
         );
     }
 

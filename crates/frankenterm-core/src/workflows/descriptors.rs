@@ -625,6 +625,13 @@ impl DescriptorStep {
                 wait_timeout_ms,
                 ..
             } => {
+                if text.trim().is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "send_text cannot be empty".to_string(),
+                        ),
+                    ));
+                }
                 if text.len() > limits.max_text_len {
                     return Err(crate::Error::Config(
                         crate::error::ConfigError::ValidationError(format!(
