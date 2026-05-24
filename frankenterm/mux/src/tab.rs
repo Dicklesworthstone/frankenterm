@@ -73,6 +73,10 @@ fn offset_by_resize_delta(value: usize, delta: isize) -> usize {
     }
 }
 
+fn pixel_span(cell_pixels: usize, cells: usize) -> usize {
+    cell_pixels.saturating_mul(cells)
+}
+
 fn positive_resize_budget(value: usize) -> isize {
     value.min(isize::MAX as usize) as isize
 }
@@ -510,8 +514,8 @@ impl SplitDirectionAndSize {
         TerminalSize {
             rows,
             cols,
-            pixel_height: cell_height * rows,
-            pixel_width: cell_width * cols,
+            pixel_height: pixel_span(cell_height, rows),
+            pixel_width: pixel_span(cell_width, cols),
             dpi: self.first.dpi,
         }
     }
@@ -3054,11 +3058,11 @@ impl TabInner {
                     return;
                 }
             }
-            node.first.pixel_width = node.first.cols * cell_width;
-            node.first.pixel_height = node.first.rows * cell_height;
+            node.first.pixel_width = pixel_span(cell_width, node.first.cols);
+            node.first.pixel_height = pixel_span(cell_height, node.first.rows);
 
-            node.second.pixel_width = node.second.cols * cell_width;
-            node.second.pixel_height = node.second.rows * cell_height;
+            node.second.pixel_width = pixel_span(cell_width, node.second.cols);
+            node.second.pixel_height = pixel_span(cell_height, node.second.rows);
         }
     }
 
@@ -3567,8 +3571,14 @@ impl TabInner {
                                     TerminalSize {
                                         rows: parent.height(),
                                         cols: parent.width(),
-                                        pixel_width: cell_dims.pixel_width * parent.width(),
-                                        pixel_height: cell_dims.pixel_height * parent.height(),
+                                        pixel_width: pixel_span(
+                                            cell_dims.pixel_width,
+                                            parent.width(),
+                                        ),
+                                        pixel_height: pixel_span(
+                                            cell_dims.pixel_height,
+                                            parent.height(),
+                                        ),
                                         dpi: cell_dims.dpi,
                                     }
                                 } else {
@@ -3892,15 +3902,15 @@ impl TabInner {
                 first: TerminalSize {
                     rows: height1 as _,
                     cols: width1 as _,
-                    pixel_height: cell_dims.pixel_height * height1,
-                    pixel_width: cell_dims.pixel_width * width1,
+                    pixel_height: pixel_span(cell_dims.pixel_height, height1),
+                    pixel_width: pixel_span(cell_dims.pixel_width, width1),
                     dpi: cell_dims.dpi,
                 },
                 second: TerminalSize {
                     rows: height2 as _,
                     cols: width2 as _,
-                    pixel_height: cell_dims.pixel_height * height2,
-                    pixel_width: cell_dims.pixel_width * width2,
+                    pixel_height: pixel_span(cell_dims.pixel_height, height2),
+                    pixel_width: pixel_span(cell_dims.pixel_width, width2),
                     dpi: cell_dims.dpi,
                 },
             });
@@ -3969,15 +3979,15 @@ impl TabInner {
                 first: TerminalSize {
                     rows: height1 as _,
                     cols: width1 as _,
-                    pixel_height: cell_dims.pixel_height * height1,
-                    pixel_width: cell_dims.pixel_width * width1,
+                    pixel_height: pixel_span(cell_dims.pixel_height, height1),
+                    pixel_width: pixel_span(cell_dims.pixel_width, width1),
                     dpi: cell_dims.dpi,
                 },
                 second: TerminalSize {
                     rows: height2 as _,
                     cols: width2 as _,
-                    pixel_height: cell_dims.pixel_height * height2,
-                    pixel_width: cell_dims.pixel_width * width2,
+                    pixel_height: pixel_span(cell_dims.pixel_height, height2),
+                    pixel_width: pixel_span(cell_dims.pixel_width, width2),
                     dpi: cell_dims.dpi,
                 },
             })
@@ -4368,6 +4378,8 @@ mod test {
         assert_eq!(offset_by_resize_delta(5, -3), 2);
         assert_eq!(offset_by_resize_delta(5, 3), 8);
         assert_eq!(offset_by_resize_delta(5, isize::MIN), 0);
+        assert_eq!(pixel_span(8, 10), 80);
+        assert_eq!(pixel_span(usize::MAX, 2), usize::MAX);
         assert_eq!(usize_to_isize_saturating(42), 42);
         assert_eq!(usize_to_isize_saturating(usize::MAX), isize::MAX);
         assert_eq!(positive_resize_budget(usize::MAX), isize::MAX);
