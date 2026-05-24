@@ -2192,7 +2192,12 @@ impl Screen {
     /// of the scrollback, we'll return the top n rows, but if it goes off
     /// the bottom we'll return the bottom n rows.
     pub fn stable_range(&self, range: &Range<StableRowIndex>) -> Range<PhysRowIndex> {
-        let range_len = (range.end - range.start) as usize;
+        if range.start >= range.end {
+            return 0..0;
+        }
+
+        let range_len =
+            usize::try_from(range.end.saturating_sub(range.start)).unwrap_or(usize::MAX);
 
         let first = match self.stable_row_to_phys(range.start) {
             Some(first) => first,
@@ -2205,11 +2210,12 @@ impl Screen {
             Some(last) => last,
             None => {
                 let last = self.lines.len().saturating_sub(1);
-                return last.saturating_sub(range_len)..last + 1;
+                return last.saturating_sub(range_len)
+                    ..last.saturating_add(1).min(self.lines.len());
             }
         };
 
-        first..last + 1
+        first..last.saturating_add(1).min(self.lines.len())
     }
 
     /// Translate a range of VisibleRowIndex to a range of PhysRowIndex.
@@ -3078,6 +3084,14 @@ mod tests {
 
     fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
         test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
+    }
+
+    #[test]
+    fn stable_range_rejects_empty_and_reversed_ranges() {
+        let screen = test_screen(3, 8, 96);
+
+        assert_eq!(screen.stable_range(&(2..2)), 0..0);
+        assert_eq!(screen.stable_range(&(2..1)), 0..0);
     }
 
     #[derive(Debug, Default)]
