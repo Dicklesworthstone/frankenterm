@@ -233,6 +233,26 @@ fn manifest_schema_rejects_blank_deferred_reasons() {
 }
 
 #[test]
+fn manifest_schema_rejects_malformed_bead_ids() {
+    let validator = manifest_validator();
+
+    let mut bad_producer = base_slot(json!("docs/perf/headline-claims.json"));
+    bad_producer["produced_by_bead"] = json!("ft-.");
+    assert!(
+        !validate(&validator, &base_manifest(bad_producer)).is_empty(),
+        "manifest slot produced_by_bead must reject malformed dotted IDs"
+    );
+
+    let mut bad_deferred = base_slot(Value::Null);
+    bad_deferred["deferred_to_bead"] = json!("ft-e87u6.");
+    bad_deferred["deferred_reason"] = json!("synthetic malformed bead ID");
+    assert!(
+        !validate(&validator, &base_manifest(bad_deferred)).is_empty(),
+        "manifest slot deferred_to_bead must reject trailing-dot IDs"
+    );
+}
+
+#[test]
 fn checked_in_manifest_validates_against_deferred_slot_schema() {
     let validator = manifest_validator();
     let path = workspace_root()

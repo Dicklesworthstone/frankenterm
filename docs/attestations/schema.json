@@ -317,7 +317,7 @@
         "produced_by_bead": {
           "description": "Bead ID of the work item whose acceptance criteria gate this artifact.",
           "type": "string",
-          "pattern": "^(ft|wa|br)-[a-z0-9.]+$"
+          "pattern": "^(ft|wa|br)-[a-z0-9]+(?:\\.[a-z0-9]+)*$"
         },
         "proof_categories": {
           "description": "Proof taxonomy category IDs from docs/proof-taxonomy.json that this artifact contributes to.",
@@ -346,11 +346,11 @@
         },
         "produced_by_bead": {
           "type": "string",
-          "pattern": "^(ft|wa|br)-[a-z0-9.]+$"
+          "pattern": "^(ft|wa|br)-[a-z0-9]+(?:\\.[a-z0-9]+)*$"
         },
         "deferred_to_bead": {
           "type": "string",
-          "pattern": "^ft-[a-z0-9.]+$"
+          "pattern": "^ft-[a-z0-9]+(?:\\.[a-z0-9]+)*$"
         },
         "deferred_reason": {
           "type": "string",
@@ -624,11 +624,11 @@
         },
         "produced_by_bead": {
           "type": "string",
-          "pattern": "^(ft|wa|br)-[a-z0-9.]+$"
+          "pattern": "^(ft|wa|br)-[a-z0-9]+(?:\\.[a-z0-9]+)*$"
         },
         "deferred_to_bead": {
           "type": "string",
-          "pattern": "^ft-[a-z0-9.]+$",
+          "pattern": "^ft-[a-z0-9]+(?:\\.[a-z0-9]+)*$",
           "description": "When path is null, names the bead whose closure will populate this slot."
         },
         "deferred_reason": {
