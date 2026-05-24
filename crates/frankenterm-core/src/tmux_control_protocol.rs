@@ -840,6 +840,18 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_bad_escape_reports_byte_offset_after_utf8() {
+        let err = parse_command("send-keys \"é\\x\"").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::BadEscape {
+                at: 13,
+                observed: 'x',
+            }
+        );
+    }
+
+    #[test]
     fn response_encode_success_uses_end_trailer() {
         let resp = TmuxResponse {
             timestamp_secs: 1_700_000_000,

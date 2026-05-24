@@ -42,7 +42,7 @@ against the speaker we actually ship, not the spec we wish we shipped.
 
 | Tool | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
-| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (28/28 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
+| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (29/29 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
 | neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | substrate-pass | parse_send_keys_with_target_and_payload + parse_list_windows_with_session_target | Pane navigator emits `send-keys -t <pane> <keystroke>` — covered by send-keys parse path. End-to-end blocked on ft-l4cef. |
 | vscode tmux extension (`vscode-tmux`) | substrate-pass | parse_attach_session_with_target + response_encode_success_uses_end_trailer | Extension speaks attach-session + capture-pane. Both wire-syntax shapes covered. End-to-end blocked on ft-l4cef. |
 
@@ -79,7 +79,7 @@ rationale per row.
 
 ## Substrate verification — wire-syntax golden vectors
 
-The 28 unit tests in `tmux_control_protocol.rs::tests` are the golden
+The 29 unit tests in `tmux_control_protocol.rs::tests` are the golden
 vectors. Each one asserts a single literal tmux wire-syntax string
 parses to the expected `TmuxCommand` variant, plus the response
 encoder produces a `%begin`/`%end` block frame that matches the tmux
@@ -117,6 +117,7 @@ Wire-syntax edge cases:
 | Unterminated single quote → diagnostic | `tokenize_unterminated_single_quote_errors` |
 | Unterminated double quote → diagnostic | `tokenize_unterminated_double_quote_errors` |
 | Bad escape inside double quote → diagnostic | `tokenize_bad_escape_errors` |
+| Bad escape after UTF-8 reports the byte offset | `tokenize_bad_escape_reports_byte_offset_after_utf8` |
 
 ## Promotion path
 
