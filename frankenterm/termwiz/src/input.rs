@@ -1470,6 +1470,9 @@ impl InputParser {
         // the first 4 bytes.  We pick 4 bytes because the docs for str::len_utf8()
         // state that the maximum expansion for a `char` is 4 bytes.
         let bytes = &bytes[..bytes.len().min(4)];
+        if bytes.is_empty() {
+            return None;
+        }
         match std::str::from_utf8(bytes) {
             Ok(s) => {
                 let (c, len) = Self::first_char_and_len(s);
@@ -2968,6 +2971,11 @@ mod test {
         let mut p = InputParser::new();
         let inputs = p.parse_as_vec(b"", NO_MORE);
         assert!(inputs.is_empty());
+    }
+
+    #[test]
+    fn decode_one_char_empty_input() {
+        assert_eq!(InputParser::decode_one_char(b""), None);
     }
 
     #[test]
