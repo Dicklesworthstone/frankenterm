@@ -7168,6 +7168,22 @@ pub enum MockEvent {
     SetTitle(String),
 }
 
+fn mark_mock_id_seen(counter: &AtomicU64, id: u64) {
+    let _ = counter.fetch_max(id.saturating_add(1), Ordering::SeqCst);
+}
+
+fn allocate_mock_id(counter: &AtomicU64, label: &str) -> crate::Result<u64> {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|current| {
+            crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                "mock {label} id space exhausted at {current}"
+            )))
+        })
+}
+
 impl MockWezterm {
     /// Create a new MockWezterm with no panes.
     #[must_use]
@@ -7190,15 +7206,9 @@ impl MockWezterm {
         let tab_id = pane.tab_id;
         panes.insert(id, pane);
         // Ensure next_pane_id stays above any manually inserted pane
-        let _ = self
-            .next_pane_id
-            .fetch_max(id + 1, std::sync::atomic::Ordering::SeqCst);
-        let _ = self
-            .next_window_id
-            .fetch_max(window_id + 1, std::sync::atomic::Ordering::SeqCst);
-        let _ = self
-            .next_tab_id
-            .fetch_max(tab_id + 1, std::sync::atomic::Ordering::SeqCst);
+        mark_mock_id_seen(&self.next_pane_id, id);
+        mark_mock_id_seen(&self.next_window_id, window_id);
+        mark_mock_id_seen(&self.next_tab_id, tab_id);
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::add_pane`]
@@ -7214,15 +7224,9 @@ impl MockWezterm {
         let window_id = pane.window_id;
         let tab_id = pane.tab_id;
         panes.insert(id, pane);
-        let _ = self
-            .next_pane_id
-            .fetch_max(id + 1, std::sync::atomic::Ordering::SeqCst);
-        let _ = self
-            .next_window_id
-            .fetch_max(window_id + 1, std::sync::atomic::Ordering::SeqCst);
-        let _ = self
-            .next_tab_id
-            .fetch_max(tab_id + 1, std::sync::atomic::Ordering::SeqCst);
+        mark_mock_id_seen(&self.next_pane_id, id);
+        mark_mock_id_seen(&self.next_window_id, window_id);
+        mark_mock_id_seen(&self.next_tab_id, tab_id);
     }
 
     /// Create a simple mock pane with defaults.
@@ -7470,22 +7474,15 @@ impl WeztermInterface for MockWezterm {
         let cwd = cwd.unwrap_or("/home/user").to_string();
         let domain = domain_name.unwrap_or("local").to_string();
         Box::pin(async move {
-            let pane_id = self
-                .next_pane_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pane_id = allocate_mock_id(&self.next_pane_id, "pane")?;
             let window_id = if target.new_window {
-                self.next_window_id
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                allocate_mock_id(&self.next_window_id, "window")?
             } else {
                 let existing_window_id = target.window_id.unwrap_or(0);
-                let _ = self
-                    .next_window_id
-                    .fetch_max(existing_window_id + 1, std::sync::atomic::Ordering::SeqCst);
+                mark_mock_id_seen(&self.next_window_id, existing_window_id);
                 existing_window_id
             };
-            let tab_id = self
-                .next_tab_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let tab_id = allocate_mock_id(&self.next_tab_id, "tab")?;
             let pane = MockPane {
                 pane_id,
                 window_id,
@@ -7521,9 +7518,7 @@ impl WeztermInterface for MockWezterm {
                     .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?
             };
 
-            let new_pane_id = self
-                .next_pane_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let new_pane_id = allocate_mock_id(&self.next_pane_id, "pane")?;
             let pane = MockPane {
                 pane_id: new_pane_id,
                 window_id: parent.window_id,
@@ -7929,6 +7924,80 @@ mod mock_tests {
                 .unwrap();
             assert_eq!(mock.pane_count().await, 2);
             assert_ne!(new_id, 0);
+        });
+    }
+
+    #[test]
+    fn mock_manual_max_pane_id_exhausts_future_pane_allocations() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_pane(MockPane {
+                pane_id: u64::MAX,
+                window_id: 0,
+                tab_id: 0,
+                title: "max".to_string(),
+                domain: "local".to_string(),
+                cwd: "/home/user".to_string(),
+                is_active: false,
+                is_zoomed: false,
+                cols: 80,
+                rows: 24,
+                content: String::new(),
+            })
+            .await;
+
+            assert_eq!(
+                mock.next_pane_id.load(std::sync::atomic::Ordering::SeqCst),
+                u64::MAX
+            );
+            let err = mock.spawn(None, None).await.unwrap_err().to_string();
+            assert!(
+                err.contains("mock pane id space exhausted"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn mock_existing_max_window_id_exhausts_future_window_allocations() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+
+            let pane_id = mock
+                .spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: Some(u64::MAX),
+                        new_window: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let pane = mock.pane_state(pane_id).await.unwrap();
+            assert_eq!(pane.window_id, u64::MAX);
+            assert_eq!(
+                mock.next_window_id
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                u64::MAX
+            );
+
+            let err = mock
+                .spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("mock window id space exhausted"),
+                "unexpected error: {err}"
+            );
         });
     }
 
