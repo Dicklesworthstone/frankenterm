@@ -1,11 +1,11 @@
 //! A Renderer for windows consoles
 
+use crate::Result;
 use crate::caps::{Capabilities, ColorLevel};
 use crate::cell::{AttributeChange, CellAttributes, Underline};
 use crate::color::{AnsiColor, ColorAttribute};
 use crate::surface::{Change, Position};
 use crate::terminal::windows::ConsoleOutputHandle;
-use crate::Result;
 use num_traits::FromPrimitive;
 use std::io::Write;
 use winapi::shared::minwindef::WORD;
@@ -18,6 +18,26 @@ use winapi::um::wincon::{
 pub struct WindowsConsoleRenderer {
     pending_attr: CellAttributes,
     capabilities: Capabilities,
+}
+
+fn relative_coordinate(current: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        current.saturating_add(delta as usize)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn end_relative_coordinate(extent: usize, offset: usize) -> usize {
+    extent.saturating_sub(offset.saturating_add(1))
+}
+
+fn negative_scroll_count(value: usize) -> isize {
+    if value > isize::MAX as usize {
+        isize::MIN
+    } else {
+        -(value as isize)
+    }
 }
 
 impl WindowsConsoleRenderer {
@@ -130,9 +150,13 @@ struct ScreenBuffer {
 
 impl ScreenBuffer {
     fn cursor_idx(&self) -> usize {
-        let idx = (self.cursor_y * self.cols) + self.cursor_x;
+        let idx = self
+            .cursor_y
+            .checked_mul(self.cols)
+            .and_then(|base| base.checked_add(self.cursor_x))
+            .expect("cursor cell index overflow");
         assert!(
-            idx < self.rows * self.cols,
+            idx < self.rows.saturating_mul(self.cols),
             "idx={}, cursor:({},{}) rows={}, cols={}.",
             idx,
             self.cursor_x,
@@ -144,10 +168,13 @@ impl ScreenBuffer {
     }
 
     fn fill(&mut self, c: char, attr: WORD, x: usize, y: usize, num_elements: usize) -> usize {
-        let idx = (y * self.cols) + x;
-        let max = self.rows * self.cols;
+        let idx = y
+            .saturating_mul(self.cols)
+            .saturating_add(x)
+            .min(self.buf.len());
+        let max = self.rows.saturating_mul(self.cols).min(self.buf.len());
 
-        let end = (idx + num_elements).min(max);
+        let end = idx.saturating_add(num_elements).min(max);
         let c = c as u16;
         for cell in &mut self.buf[idx..end] {
             cell.Attributes = attr;
@@ -163,7 +190,7 @@ impl ScreenBuffer {
         if self.cursor_y >= self.rows {
             self.dirty = true;
             let lines_to_scroll = self.cursor_y.saturating_sub(self.rows) + 1;
-            self.scroll(0, self.rows, -1 * lines_to_scroll as isize, out)?;
+            self.scroll(0, self.rows, negative_scroll_count(lines_to_scroll), out)?;
             self.dirty = true;
             self.cursor_y -= lines_to_scroll;
             assert!(self.cursor_y < self.rows);
@@ -299,6 +326,26 @@ impl ScreenBuffer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinate_helpers_handle_extreme_relative_offsets() {
+        assert_eq!(relative_coordinate(5, 3), 8);
+        assert_eq!(relative_coordinate(5, -3), 2);
+        assert_eq!(relative_coordinate(5, isize::MIN), 0);
+        assert_eq!(end_relative_coordinate(10, 0), 9);
+        assert_eq!(end_relative_coordinate(10, usize::MAX), 0);
+    }
+
+    #[test]
+    fn negative_scroll_count_saturates_extreme_values() {
+        assert_eq!(negative_scroll_count(3), -3);
+        assert_eq!(negative_scroll_count(isize::MAX as usize + 1), isize::MIN);
+    }
+}
+
 impl WindowsConsoleRenderer {
     pub fn render_to<B: ConsoleOutputHandle + Write>(
         &mut self,
@@ -373,20 +420,16 @@ impl WindowsConsoleRenderer {
                 Change::CursorPosition { x, y } => {
                     let x = match x {
                         Position::Absolute(x) => *x as usize,
-                        Position::Relative(delta) => {
-                            (buffer.cursor_x as isize).saturating_sub(-*delta) as usize
-                        }
-                        Position::EndRelative(delta) => cols.saturating_sub(*delta),
+                        Position::Relative(delta) => relative_coordinate(buffer.cursor_x, *delta),
+                        Position::EndRelative(delta) => end_relative_coordinate(cols, *delta),
                     };
 
                     // For vertical cursor movement, we constrain the movement to
                     // the viewport.
                     let y = match y {
                         Position::Absolute(y) => *y as usize,
-                        Position::Relative(delta) => {
-                            (buffer.cursor_y as isize).saturating_sub(-*delta) as usize
-                        }
-                        Position::EndRelative(delta) => rows.saturating_sub(*delta),
+                        Position::Relative(delta) => relative_coordinate(buffer.cursor_y, *delta),
+                        Position::EndRelative(delta) => end_relative_coordinate(rows, *delta),
                     };
 
                     buffer.set_cursor(x, y, out)?;
@@ -448,7 +491,12 @@ impl WindowsConsoleRenderer {
                     region_size,
                     scroll_count,
                 } => {
-                    buffer.scroll(*first_row, *region_size, -1 * *scroll_count as isize, out)?;
+                    buffer.scroll(
+                        *first_row,
+                        *region_size,
+                        negative_scroll_count(*scroll_count),
+                        out,
+                    )?;
                 }
                 Change::ScrollRegionDown {
                     first_row,
