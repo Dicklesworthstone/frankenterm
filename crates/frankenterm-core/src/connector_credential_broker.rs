@@ -368,6 +368,14 @@ impl CredentialAccessRule {
 const MAX_AUDIT_EVENTS: usize = 1024;
 const MAX_LEASES_PER_CONNECTOR_DEFAULT: usize = 10;
 
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 /// The credential broker: manages providers, credentials, leases, and access policy.
 #[derive(Debug)]
 pub struct ConnectorCredentialBroker {
@@ -866,11 +874,11 @@ impl ConnectorCredentialBroker {
         }
 
         if let Some(provider) = self.providers.get_mut(&provider_id) {
-            let revoked_count = revoked_leases.len() as u32;
+            let revoked_count = usize_to_u32_saturating(revoked_leases.len());
             provider.active_leases = provider.active_leases.saturating_sub(revoked_count);
             provider.total_revoked = provider
                 .total_revoked
-                .saturating_add(u64::from(revoked_count));
+                .saturating_add(usize_to_u64_saturating(revoked_leases.len()));
         }
 
         self.emit_audit(CredentialAuditEvent {
@@ -914,21 +922,24 @@ impl ConnectorCredentialBroker {
         CredentialBrokerTelemetrySnapshot {
             captured_at_ms: now_ms,
             counters: self.telemetry.clone(),
-            active_leases: self
-                .leases
-                .values()
-                .filter(|l| l.state == LeaseState::Active)
-                .count() as u32,
-            active_credentials: self
-                .credentials
-                .values()
-                .filter(|c| c.state == CredentialState::Active)
-                .count() as u32,
-            active_providers: self
-                .providers
-                .values()
-                .filter(|p| p.status == ProviderStatus::Available)
-                .count() as u32,
+            active_leases: usize_to_u32_saturating(
+                self.leases
+                    .values()
+                    .filter(|l| l.state == LeaseState::Active)
+                    .count(),
+            ),
+            active_credentials: usize_to_u32_saturating(
+                self.credentials
+                    .values()
+                    .filter(|c| c.state == CredentialState::Active)
+                    .count(),
+            ),
+            active_providers: usize_to_u32_saturating(
+                self.providers
+                    .values()
+                    .filter(|p| p.status == ProviderStatus::Available)
+                    .count(),
+            ),
         }
     }
 
@@ -1689,6 +1700,12 @@ mod tests {
         assert_eq!(snap.active_credentials, 1);
         assert_eq!(snap.active_providers, 1);
         assert_eq!(snap.counters.leases_issued, 1);
+    }
+
+    #[test]
+    fn telemetry_count_conversions_saturate() {
+        assert_eq!(usize_to_u32_saturating(usize::MAX), u32::MAX);
+        assert_eq!(usize_to_u64_saturating(42), 42);
     }
 
     #[test]
