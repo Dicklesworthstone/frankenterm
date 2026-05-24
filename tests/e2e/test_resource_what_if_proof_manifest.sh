@@ -250,6 +250,33 @@ end
 fail!("expected two live-hardware cases") unless live_hardware_cases == 2
 fail!("expected seven replay-backed skipped cases") unless replay_blocked_cases == 7
 fail!("expected three failure-oriented cases") unless failure_oriented_cases == 3
+
+# Cross-cutting anti-overclaim invariant, independent of the case->class map:
+# a high-scale capability claim is legitimate ONLY behind a PASSED live-hardware
+# predicate. The per-case branches above enforce this via the proof_class label;
+# this guard asserts it directly on the golden fields, so it still bites if
+# EXPECTED_PROOF_CLASSES is later mis-edited to relabel a replay case as live.
+high_scale_ok = lambda do |golden|
+  golden["high_scale_claim_allowed"] != true ||
+    (golden["proof_status"] == "PASSED" &&
+      golden["proof_evidence_source"] == "live_hardware" &&
+      golden["hardware_predicate"] == "proven_predicate_met")
+end
+cases.each do |case_entry|
+  golden = case_entry["golden_report"]
+  unless high_scale_ok.call(golden)
+    fail!("#{case_entry["case_id"]} claims high-scale without a passed live-hardware predicate")
+  end
+end
+# Prove the guard actually bites: a replay-backed golden that flips the claim to
+# true (without live evidence) must be rejected.
+replay_case = cases.find { |entry| REPLAY_PROOF_CLASSES.include?(entry["proof_classification"]) }
+fail!("no replay-backed case available to tamper") unless replay_case
+tampered_golden = Marshal.load(Marshal.dump(replay_case["golden_report"]))
+tampered_golden["high_scale_claim_allowed"] = true
+if high_scale_ok.call(tampered_golden)
+  fail!("high-scale anti-overclaim guard failed to bite on a tampered replay golden")
+end
 RUBY
 
 printf 'resource what-if proof manifest: static verifier passed (%s cases, %s traces, %s override packages)\n' \
