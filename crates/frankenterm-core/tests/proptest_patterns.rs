@@ -1008,6 +1008,57 @@ fn observe_only_pack_preserves_manual_fix_but_removes_action_surfaces() {
     assert_eq!(detections[0].rule_id, "codex.observe_only");
 }
 
+#[test]
+fn verification_report_action_mode_controls_pack_action_surfaces() {
+    let mut rule = make_anchor_only_rule("verification_mode", "VERIFY_ME");
+    rule.workflow = Some("usage_limit_response".to_string());
+    rule.preview_command = Some("ft workflow preview usage-limit".to_string());
+    rule.manual_fix = Some("Recover pane {pane}".to_string());
+
+    let action_report = PatternPackVerificationReport {
+        pack_name: "verification-mode".to_string(),
+        verified: true,
+        action_mode: PatternPackActionMode::ActionTriggering,
+        signature_checked: true,
+        fixture_hashes_checked: 0,
+        regex_budget_checked: true,
+        issues: Vec::new(),
+    };
+    let action_pack =
+        PatternPack::new("verification-mode", "1.0.0", vec![rule.clone()])
+            .enforce_verification_report(&action_report);
+    assert_eq!(
+        action_pack.rules[0].workflow.as_deref(),
+        Some("usage_limit_response")
+    );
+    assert_eq!(
+        action_pack.rules[0].preview_command.as_deref(),
+        Some("ft workflow preview usage-limit")
+    );
+    assert_eq!(
+        action_pack.rules[0].get_manual_fix(9, None).as_deref(),
+        Some("Recover pane 9")
+    );
+
+    let observe_report = PatternPackVerificationReport {
+        action_mode: PatternPackActionMode::ObserveOnly,
+        verified: false,
+        issues: vec![PatternPackVerificationIssue {
+            category: "signature".to_string(),
+            message: "signature missing".to_string(),
+        }],
+        ..action_report
+    };
+    let observe_pack = PatternPack::new("verification-mode", "1.0.0", vec![rule])
+        .enforce_verification_report(&observe_report);
+    assert_eq!(observe_pack.rules[0].workflow, None);
+    assert_eq!(observe_pack.rules[0].preview_command, None);
+    assert_eq!(
+        observe_pack.rules[0].get_manual_fix(9, None).as_deref(),
+        Some("Recover pane 9")
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
