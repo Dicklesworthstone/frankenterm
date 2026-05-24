@@ -909,6 +909,7 @@ proptest! {
         // Should use the later pack's version
         prop_assert_eq!(lib.rules()[0].severity, Severity::Critical);
         prop_assert_eq!(&lib.rules()[0].description, "New version");
+        prop_assert_eq!(lib.pack_for_rule("codex.override_test"), Some("builtin:codex"));
     }
 }
 
