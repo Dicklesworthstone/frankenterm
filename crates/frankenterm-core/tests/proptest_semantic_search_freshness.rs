@@ -399,3 +399,25 @@ proptest! {
         prop_assert_eq!(report, back);
     }
 }
+
+proptest! {
+    /// Freshness is monotone in the window: enlarging freshness_window_ms never
+    /// turns a Fresh classification Stale (all other inputs fixed). The window
+    /// only affects the final age<=window.max(0) branch; the higher-precedence
+    /// Stale/Unknown/FutureDated outcomes are window-independent.
+    #[test]
+    fn freshness_monotone_in_window(
+        indexed in arb_indexed(),
+        captured in arb_captured(),
+        observed in any::<i64>(),
+        w1 in any::<i64>(),
+        w2 in any::<i64>(),
+    ) {
+        let (small, large) = if w1 <= w2 { (w1, w2) } else { (w2, w1) };
+        let s_small = classify_semantic_search_freshness(indexed, captured, observed, small);
+        let s_large = classify_semantic_search_freshness(indexed, captured, observed, large);
+        if s_small == SemanticSearchFreshnessStatus::Fresh {
+            prop_assert_eq!(s_large, SemanticSearchFreshnessStatus::Fresh);
+        }
+    }
+}
