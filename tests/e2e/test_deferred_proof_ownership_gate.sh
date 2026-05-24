@@ -287,6 +287,22 @@ stale_owner.fetch("coordination").fetch("in_progress_owners") <<
 fail!("stale_owner_overlap missed a stale overlapping owner") unless stale_owner_overlap(stale_owner)
 fail!("active_owner_overlap false-positived on a stale-only owner") if active_owner_overlap(stale_owner)
 
+# 6. A fresh (<2h) in-progress owner overlapping owned paths registers as an
+#    ACTIVE overlap (the predicate must actually be reachable as true, not a
+#    dead guard), and not as a stale one.
+active_owner = dup_gate.call(base)
+active_owner.fetch("coordination").fetch("in_progress_owners") <<
+  { "agent" => "LiveOwner", "stale_over_2h" => false, "owned_paths" => [active_owner.fetch("receipt").fetch("owned_paths").first] }
+fail!("active_owner_overlap missed a fresh overlapping owner") unless active_owner_overlap(active_owner)
+fail!("stale_owner_overlap false-positived on a fresh owner") if stale_owner_overlap(active_owner)
+
+# 7. A queued receipt owner overlapping owned paths registers as a queued
+#    receipt overlap (owner-handoff territory).
+queued = dup_gate.call(base)
+queued.fetch("coordination").fetch("queued_receipt_owners") <<
+  { "receipt_id" => "ft-queued1:comment-1", "owned_paths" => [queued.fetch("receipt").fetch("owned_paths").first] }
+fail!("queued_receipt_overlap missed an overlapping queued receipt") unless queued_receipt_overlap(queued)
+
 EXPECTED_STATES.each do |state|
   fail!("doc missing state #{state}") unless doc.include?(state)
 end
