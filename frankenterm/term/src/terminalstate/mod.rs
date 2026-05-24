@@ -66,6 +66,14 @@ fn usize_to_i64_saturating(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn i64_to_u32_saturating(value: i64) -> u32 {
+    u32::try_from(value).unwrap_or(if value < 0 { 0 } else { u32::MAX })
+}
+
 fn add_u32_to_usize_saturating(value: usize, delta: u32) -> usize {
     value.saturating_add(delta as usize)
 }
@@ -2097,10 +2105,10 @@ impl TerminalState {
 
     fn checksum_rectangle(&mut self, left: u32, top: u32, right: u32, bottom: u32) -> u16 {
         let y_origin = if self.dec_origin_mode {
-            self.top_and_bottom_margins.start
+            i64_to_u32_saturating(self.top_and_bottom_margins.start)
         } else {
             0
-        } as u32;
+        };
         let x_origin = if self.dec_origin_mode {
             self.left_and_right_margins.start
         } else {
@@ -2119,10 +2127,12 @@ impl TerminalState {
         */
 
         for y in top..=bottom {
-            let line_idx = screen.phys_row(VisibleRowIndex::from(y_origin + y));
+            let line_idx = screen.phys_row(VisibleRowIndex::from(y_origin.saturating_add(y)));
             let line = screen.line_mut(line_idx);
-            for cell in line.visible_cells().skip(x_origin + left as usize) {
-                if cell.cell_index() > x_origin + right as usize {
+            let left = x_origin.saturating_add(left as usize);
+            let right = x_origin.saturating_add(right as usize);
+            for cell in line.visible_cells().skip(left) {
+                if cell.cell_index() > right {
                     break;
                 }
 
@@ -2443,9 +2453,9 @@ impl TerminalState {
         // The terminal only recognizes this control function if vertical split
         // screen mode (DECLRMM) is set.
         if self.left_and_right_margin_mode {
-            let cols = self.screen().physical_cols as u32;
-            let left = left.as_zero_based().min(cols - 1).max(0) as usize;
-            let right = right.as_zero_based().min(cols - 1).max(0) as usize;
+            let cols = usize_to_u32_saturating(self.screen().physical_cols);
+            let left = left.as_zero_based().min(cols.saturating_sub(1)) as usize;
+            let right = right.as_zero_based().min(cols.saturating_sub(1)) as usize;
 
             // The value of the left margin (Pl) must be less than the right margin (Pr).
             if left >= right {
@@ -2677,24 +2687,23 @@ impl TerminalState {
                 // we don't need to process it as a terminal command
             }
             Cursor::RequestActivePositionReport => {
-                let line = OneBased::from_zero_based(
-                    (self.cursor.y.saturating_sub(if self.dec_origin_mode {
+                let line = OneBased::from_zero_based(i64_to_u32_saturating(
+                    self.cursor.y.saturating_sub(if self.dec_origin_mode {
                         self.top_and_bottom_margins.start
                     } else {
                         0
-                    })) as u32,
-                );
-                let col = OneBased::from_zero_based(
-                    (self
-                        .cursor
+                    }),
+                ));
+                let col = OneBased::from_zero_based(usize_to_u32_saturating(
+                    self.cursor
                         .x
-                        .min(self.screen().physical_cols - 1)
+                        .min(self.screen().physical_cols.saturating_sub(1))
                         .saturating_sub(if self.dec_origin_mode {
                             self.left_and_right_margins.start
                         } else {
                             0
-                        })) as u32,
-                );
+                        }),
+                ));
                 let report = CSI::Cursor(Cursor::ActivePositionReport { line, col });
                 write!(self.writer, "{}", report).ok();
                 self.writer.flush().ok();
@@ -2708,7 +2717,9 @@ impl TerminalState {
                     // https://vt100.net/docs/vt510-rm/DECSLRM.html
                     self.set_left_and_right_margins(
                         OneBased::new(1),
-                        OneBased::new(self.screen().physical_cols as u32 + 1),
+                        OneBased::new(
+                            usize_to_u32_saturating(self.screen().physical_cols).saturating_add(1),
+                        ),
                     );
                 } else {
                     self.dec_save_cursor();
@@ -3587,6 +3598,11 @@ mod tests {
     fn usize_to_i64_conversion_saturates_extreme_values() {
         assert_eq!(usize_to_i64_saturating(42), 42);
         assert_eq!(usize_to_i64_saturating(usize::MAX), i64::MAX);
+        assert_eq!(usize_to_u32_saturating(42), 42);
+        assert_eq!(usize_to_u32_saturating(usize::MAX), u32::MAX);
+        assert_eq!(i64_to_u32_saturating(-1), 0);
+        assert_eq!(i64_to_u32_saturating(42), 42);
+        assert_eq!(i64_to_u32_saturating(i64::MAX), u32::MAX);
     }
 
     #[test]
