@@ -424,6 +424,32 @@ proptest! {
         }
     }
 
+    /// Dedup invariant (br-ft-hkif4): detect() drops lower-priority
+    /// overlapping spans, so no two returned spans may overlap. With
+    /// the spans sorted by start, that reduces to `prev.end <=
+    /// next.start` for every adjacent pair (half-open intervals, so a
+    /// touching boundary is allowed). A regression that stopped
+    /// skipping overlaps would inflate `RedactionResult.evidence.matches`
+    /// past the number of markers `redact()` actually emits.
+    #[test]
+    fn detect_spans_never_overlap(text in mixed_text()) {
+        let r = Redactor::new();
+        let detections = r.detect(&text);
+        for window in detections.windows(2) {
+            let (_, _, prev_end) = window[0];
+            let (name, next_start, _) = window[1];
+            prop_assert!(
+                prev_end <= next_start,
+                "detect returned overlapping spans (ft-hkif4 dedup broken): \
+                 prev_end={} > next_start={} (`{}`), detections={:?}",
+                prev_end,
+                next_start,
+                name,
+                detections
+            );
+        }
+    }
+
     /// Invariant #6: plain-text passthrough. Text built only from
     /// short alphanumeric words (no catalog samples mixed in)
     /// must round-trip unchanged. This catches over-eager generic
