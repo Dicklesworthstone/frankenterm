@@ -508,7 +508,19 @@ fn synthetic_pack_invalid_rule_enums_must_fail() {
 #[test]
 fn synthetic_pack_empty_anchor_must_fail() {
     let validator = load_schema();
-    let bad = serde_json::json!({
+    let empty_array = serde_json::json!({
+        "name": "synthetic",
+        "version": "1.0.0",
+        "rules": [{
+            "id": "codex.synthetic.empty_anchors_array",
+            "agent_type": "codex",
+            "event_type": "synthetic_empty_anchors_array",
+            "severity": "warning",
+            "anchors": [],
+            "description": "Synthetic rule carrying no anchors."
+        }]
+    });
+    let empty_string = serde_json::json!({
         "name": "synthetic",
         "version": "1.0.0",
         "rules": [{
@@ -520,9 +532,12 @@ fn synthetic_pack_empty_anchor_must_fail() {
             "description": "Synthetic rule carrying an empty anchor."
         }]
     });
-    let result = validator.validate(&bad);
     assert!(
-        result.is_err(),
-        "schema validator accepted a rule with an empty anchor"
+        validator.validate(&empty_array).is_err(),
+        "schema validator accepted a rule with no anchors"
+    );
+    assert!(
+        validator.validate(&empty_string).is_err(),
+        "schema validator accepted a rule with an empty anchor string"
     );
 }

@@ -64,7 +64,7 @@ A rule (Rust: `RuleDef`) has the following fields. `MUST` /
 | `agent_type` | enum | **MUST** | One of `codex`, `claude_code`, `gemini`, `wezterm`, `unknown`. Serde rename is `snake_case`. |
 | `event_type` | string | **MUST** | The event-type label emitted on match (e.g. `usage_limit`, `compaction_required`). |
 | `severity` | enum | **MUST** | One of `info`, `warning`, `critical`. Serde rename is `snake_case`. |
-| `anchors` | array of string | **MUST** | Literal substrings used by the Aho-Corasick quick-reject pass. SHOULD include at least one anchor; otherwise the regex runs on every input chunk. |
+| `anchors` | array of string | **MUST** | Literal substrings used by the Aho-Corasick quick-reject pass. MUST include at least one non-empty anchor. |
 | `regex` | string | MAY | Optional extraction regex. Named captures (`(?P<name>...)`) are preferred; unnamed groups MAY be used but are not surfaced as `extracted` fields. |
 | `description` | string | **MUST** | Human-readable description shown in `ft why <rule_id>` and the doctor pack listing. |
 | `remediation` | string | MAY | Suggested remediation text. Surfaced in the rendered event template. |
