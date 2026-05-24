@@ -394,6 +394,29 @@ fn bundle_schema_rejects_unsafe_reference_paths() {
         !validate(&validator, &unsafe_source_path).is_empty(),
         "confidence source_artifact_path must reject parent-directory traversal"
     );
+
+    let mut unsafe_retraction_path = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle tracked by ft-e87u6.2"
+    }));
+    unsafe_retraction_path["retractions"] = json!([
+        {
+            "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "affected_slot": "perf/headline-claims",
+            "retracted_at": "2026-05-12T00:00:00Z",
+            "retracted_by_release": "0.2.1",
+            "retraction_rationale": "synthetic unsafe path regression",
+            "retraction_path": "../retractions/unsafe.json",
+            "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "size_bytes": 1,
+            "corrected_claim_value": null
+        }
+    ]);
+    assert!(
+        !validate(&validator, &unsafe_retraction_path).is_empty(),
+        "retraction_path must reject parent-directory traversal"
+    );
 }
 
 #[test]
