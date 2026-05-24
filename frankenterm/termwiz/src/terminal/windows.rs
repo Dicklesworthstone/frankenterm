@@ -87,6 +87,12 @@ fn checked_cell_count(cols: usize, rows: usize) -> Result<usize> {
         .ok_or_else(|| format_err!("console cell count overflow: cols={cols} rows={rows}"))
 }
 
+fn buffered_write_needs_flush(current_len: usize, incoming_len: usize, capacity: usize) -> bool {
+    current_len
+        .checked_add(incoming_len)
+        .map_or(true, |total| total > capacity)
+}
+
 enum Renderer {
     Terminfo(TerminfoRenderer),
     Windows(WindowsConsoleRenderer),
@@ -380,7 +386,11 @@ unsafe impl Sync for EventHandle {}
 
 impl Write for OutputHandle {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        if self.write_buffer.len() + buf.len() > self.write_buffer.capacity() {
+        if buffered_write_needs_flush(
+            self.write_buffer.len(),
+            buf.len(),
+            self.write_buffer.capacity(),
+        ) {
             self.flush()?;
         }
         if buf.len() >= self.write_buffer.capacity() {
@@ -1164,6 +1174,13 @@ mod tests {
     fn checked_cell_count_rejects_overflow() {
         assert_eq!(checked_cell_count(80, 24).unwrap(), 1_920);
         assert!(checked_cell_count(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn buffered_write_flush_check_handles_overflow() {
+        assert!(!buffered_write_needs_flush(4, 4, 8));
+        assert!(buffered_write_needs_flush(5, 4, 8));
+        assert!(buffered_write_needs_flush(usize::MAX, 1, usize::MAX));
     }
 
     #[test]

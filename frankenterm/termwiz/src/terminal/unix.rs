@@ -1,31 +1,37 @@
 use crate::render::RenderTty;
 use crate::terminal::ProbeCapabilities;
-use crate::{bail, Context, Result};
-use filedescriptor::{poll, pollfd, FileDescriptor, POLLIN};
+use crate::{Context, Result, bail};
+use filedescriptor::{FileDescriptor, POLLIN, poll, pollfd};
 use libc::{self, winsize};
 use signal_hook::{self, SigId};
 use std::collections::VecDeque;
 use std::error::Error as _;
 use std::fs::OpenOptions;
-use std::io::{stdin, stdout, Error as IoError, ErrorKind, Read, Write};
+use std::io::{Error as IoError, ErrorKind, Read, Write, stdin, stdout};
 use std::mem;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use termios::{
-    cfmakeraw, tcdrain, tcflush, tcsetattr, Termios, TCIFLUSH, TCIOFLUSH, TCOFLUSH, TCSADRAIN,
-    TCSAFLUSH, TCSANOW,
+    TCIFLUSH, TCIOFLUSH, TCOFLUSH, TCSADRAIN, TCSAFLUSH, TCSANOW, Termios, cfmakeraw, tcdrain,
+    tcflush, tcsetattr,
 };
 
 use crate::caps::Capabilities;
-use crate::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, XtermKeyModifierResource, CSI};
+use crate::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode, XtermKeyModifierResource};
 use crate::input::{InputEvent, InputParser};
 use crate::render::terminfo::TerminfoRenderer;
 use crate::surface::Change;
-use crate::terminal::{cast, Blocking, ScreenSize, Terminal};
+use crate::terminal::{Blocking, ScreenSize, Terminal, cast};
 
 const BUF_SIZE: usize = 4096;
+
+fn buffered_write_needs_flush(current_len: usize, incoming_len: usize, capacity: usize) -> bool {
+    current_len
+        .checked_add(incoming_len)
+        .map_or(true, |total| total > capacity)
+}
 
 pub enum Purge {
     InputQueue,
@@ -115,7 +121,11 @@ impl TtyWriteHandle {
 
 impl Write for TtyWriteHandle {
     fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, IoError> {
-        if self.write_buffer.len() + buf.len() > self.write_buffer.capacity() {
+        if buffered_write_needs_flush(
+            self.write_buffer.len(),
+            buf.len(),
+            self.write_buffer.capacity(),
+        ) {
             self.flush()?;
         }
         if buf.len() >= self.write_buffer.capacity() {
@@ -130,6 +140,18 @@ impl Write for TtyWriteHandle {
         self.drain()
             .map_err(|e| IoError::new(ErrorKind::Other, format!("{}", e)))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffered_write_flush_check_handles_overflow() {
+        assert!(!buffered_write_needs_flush(4, 4, 8));
+        assert!(buffered_write_needs_flush(5, 4, 8));
+        assert!(buffered_write_needs_flush(usize::MAX, 1, usize::MAX));
     }
 }
 
