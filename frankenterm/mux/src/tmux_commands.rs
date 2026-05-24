@@ -34,6 +34,10 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+fn next_split_pane_index(inserted_index: usize) -> usize {
+    inserted_index.saturating_add(1)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaneItem {
     session_id: TmuxSessionId,
@@ -531,7 +535,7 @@ impl TmuxDomainState {
                             continue;
                         }
 
-                        split_pane_index = tab.split_and_insert(
+                        split_pane_index = next_split_pane_index(tab.split_and_insert(
                             split_pane_index,
                             SplitRequest {
                                 direction: split_direction,
@@ -546,7 +550,7 @@ impl TmuxDomainState {
                                 ),
                             },
                             local_pane.clone(),
-                        )? + 1;
+                        )?);
                     } else {
                         let pane_map = self.remote_panes.lock();
                         let local_pane_id = match pane_map.get(&p.pane_id) {
@@ -1797,5 +1801,11 @@ mod tests {
         if usize::BITS > u32::BITS {
             assert_eq!(usize_to_u32_saturating(usize::MAX), u32::MAX);
         }
+    }
+
+    #[test]
+    fn next_split_pane_index_saturates_at_usize_max() {
+        assert_eq!(next_split_pane_index(0), 1);
+        assert_eq!(next_split_pane_index(usize::MAX), usize::MAX);
     }
 }
