@@ -269,7 +269,7 @@ impl DeadLetterQueue {
         // Evict oldest if at capacity
         while self.entries.len() >= self.config.max_entries {
             self.entries.pop_front();
-            self.telemetry.evictions += 1;
+            self.telemetry.evictions = self.telemetry.evictions.saturating_add(1);
         }
 
         let id = self.allocate_id();
@@ -280,7 +280,7 @@ impl DeadLetterQueue {
             error_kind,
             timestamp_ms,
         ));
-        self.telemetry.total_enqueued += 1;
+        self.telemetry.total_enqueued = self.telemetry.total_enqueued.saturating_add(1);
         id
     }
 
@@ -325,7 +325,7 @@ impl DeadLetterQueue {
     pub fn discard(&mut self, id: u64) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             entry.discarded = true;
-            self.telemetry.discarded += 1;
+            self.telemetry.discarded = self.telemetry.discarded.saturating_add(1);
             true
         } else {
             false
@@ -342,7 +342,7 @@ impl DeadLetterQueue {
     ) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             entry.record_retry_failure(error, error_kind, timestamp_ms);
-            self.telemetry.retry_attempts += 1;
+            self.telemetry.retry_attempts = self.telemetry.retry_attempts.saturating_add(1);
             true
         } else {
             false
@@ -353,7 +353,7 @@ impl DeadLetterQueue {
     pub fn remove(&mut self, id: u64) -> Option<DeadLetterEntry> {
         if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
             let entry = self.entries.remove(pos);
-            self.telemetry.replayed_ok += 1;
+            self.telemetry.replayed_ok = self.telemetry.replayed_ok.saturating_add(1);
             entry
         } else {
             None
@@ -370,7 +370,7 @@ impl DeadLetterQueue {
             .retain(|e| !(e.age_ms(now_ms) > max_age || e.exceeded_max_retries(max_retries)));
 
         let purged = before - self.entries.len();
-        self.telemetry.purged += purged as u64;
+        self.telemetry.purged = self.telemetry.purged.saturating_add(purged as u64);
         purged
     }
 
@@ -683,16 +683,16 @@ impl ConnectorReliabilityController {
     pub fn allow_operation(&mut self) -> bool {
         let allowed = self.circuit.allow();
         if !allowed {
-            self.telemetry.circuit_rejections += 1;
+            self.telemetry.circuit_rejections = self.telemetry.circuit_rejections.saturating_add(1);
         }
-        self.telemetry.operations_attempted += 1;
+        self.telemetry.operations_attempted = self.telemetry.operations_attempted.saturating_add(1);
         allowed
     }
 
     /// Record a successful operation.
     pub fn record_success(&mut self) {
         self.circuit.record_success();
-        self.telemetry.operations_succeeded += 1;
+        self.telemetry.operations_succeeded = self.telemetry.operations_succeeded.saturating_add(1);
     }
 
     /// Record a failed operation, optionally enqueuing to DLQ.
@@ -711,7 +711,7 @@ impl ConnectorReliabilityController {
         if error_kind.trips_breaker() {
             self.circuit.record_failure();
         }
-        self.telemetry.operations_failed += 1;
+        self.telemetry.operations_failed = self.telemetry.operations_failed.saturating_add(1);
 
         // Auto-enqueue to DLQ if configured
         if self.config.auto_dlq && error_kind.is_retryable() {
@@ -1031,6 +1031,44 @@ mod tests {
     }
 
     #[test]
+    fn connector_reliability_dlq_telemetry_counters_saturate() {
+        let config = DeadLetterQueueConfig {
+            max_entries: 1,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+        dlq.telemetry.total_enqueued = u64::MAX;
+        dlq.telemetry.evictions = u64::MAX;
+        dlq.telemetry.discarded = u64::MAX;
+        dlq.telemetry.retry_attempts = u64::MAX;
+        dlq.telemetry.replayed_ok = u64::MAX;
+        let first = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "first",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+        let second = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "second",
+            ConnectorErrorKind::Transient,
+            1001,
+        );
+
+        assert_ne!(first, second);
+        assert!(dlq.discard(second));
+        assert!(dlq.record_retry(second, "retry", ConnectorErrorKind::Timeout, 2000));
+        assert!(dlq.remove(second).is_some());
+
+        let snap = dlq.telemetry_snapshot();
+        assert_eq!(snap.total_enqueued, u64::MAX);
+        assert_eq!(snap.evictions, u64::MAX);
+        assert_eq!(snap.discarded, u64::MAX);
+        assert_eq!(snap.retry_attempts, u64::MAX);
+        assert_eq!(snap.replayed_ok, u64::MAX);
+    }
+
+    #[test]
     fn connector_reliability_dlq_zero_capacity_does_not_spin() {
         let config = DeadLetterQueueConfig {
             max_entries: 0,
@@ -1153,6 +1191,26 @@ mod tests {
         assert_eq!(dlq.entries.len(), 1);
     }
 
+    #[test]
+    fn connector_reliability_dlq_purged_counter_saturates() {
+        let config = DeadLetterQueueConfig {
+            max_age_ms: 5000,
+            max_retries: 100,
+            ..Default::default()
+        };
+        let mut dlq = DeadLetterQueue::new(config);
+        dlq.telemetry.purged = u64::MAX;
+        dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "old",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+
+        assert_eq!(dlq.purge_expired(7000), 1);
+        assert_eq!(dlq.telemetry_snapshot().purged, u64::MAX);
+    }
+
     // ---- Controller ----
 
     #[test]
@@ -1167,6 +1225,35 @@ mod tests {
         assert_eq!(snap.operations_attempted, 1);
         assert_eq!(snap.operations_succeeded, 1);
         assert_eq!(snap.connector_id, "slack");
+    }
+
+    #[test]
+    fn connector_reliability_controller_telemetry_saturates() {
+        let config = ConnectorReliabilityConfig {
+            circuit: ConnectorCircuitConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        let mut ctrl = ConnectorReliabilityController::new("slack", config);
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+        ctrl.record_failure(&action, "timeout", ConnectorErrorKind::Timeout, 1000);
+        ctrl.telemetry.operations_attempted = u64::MAX;
+        ctrl.telemetry.operations_succeeded = u64::MAX;
+        ctrl.telemetry.operations_failed = u64::MAX;
+        ctrl.telemetry.circuit_rejections = u64::MAX;
+
+        assert!(!ctrl.allow_operation());
+        ctrl.record_success();
+        ctrl.record_failure(&action, "rate limit", ConnectorErrorKind::RateLimited, 2000);
+
+        let snap = ctrl.telemetry_snapshot();
+        assert_eq!(snap.operations_attempted, u64::MAX);
+        assert_eq!(snap.operations_succeeded, u64::MAX);
+        assert_eq!(snap.operations_failed, u64::MAX);
+        assert_eq!(snap.circuit_rejections, u64::MAX);
     }
 
     #[test]
