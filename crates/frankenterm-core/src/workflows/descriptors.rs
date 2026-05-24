@@ -615,6 +615,13 @@ impl DescriptorStep {
             } => {
                 matcher.validate(limits)?;
                 if let Some(timeout_ms) = timeout_ms {
+                    if *timeout_ms == 0 {
+                        return Err(crate::Error::Config(
+                            crate::error::ConfigError::ValidationError(
+                                "wait_for timeout_ms must be greater than zero".to_string(),
+                            ),
+                        ));
+                    }
                     if *timeout_ms > limits.max_wait_timeout_ms {
                         return Err(crate::Error::Config(
                             crate::error::ConfigError::ValidationError(format!(
@@ -626,6 +633,13 @@ impl DescriptorStep {
                 }
             }
             Self::Sleep { duration_ms, .. } => {
+                if *duration_ms == 0 {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "sleep duration_ms must be greater than zero".to_string(),
+                        ),
+                    ));
+                }
                 if *duration_ms > limits.max_sleep_ms {
                     return Err(crate::Error::Config(
                         crate::error::ConfigError::ValidationError(format!(
@@ -661,6 +675,13 @@ impl DescriptorStep {
                     wait_for.validate(limits)?;
                 }
                 if let Some(wait_timeout_ms) = wait_timeout_ms {
+                    if *wait_timeout_ms == 0 {
+                        return Err(crate::Error::Config(
+                            crate::error::ConfigError::ValidationError(
+                                "send_text wait_timeout_ms must be greater than zero".to_string(),
+                            ),
+                        ));
+                    }
                     if *wait_timeout_ms > limits.max_wait_timeout_ms {
                         return Err(crate::Error::Config(
                             crate::error::ConfigError::ValidationError(format!(

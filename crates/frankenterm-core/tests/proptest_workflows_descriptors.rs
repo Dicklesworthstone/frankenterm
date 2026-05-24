@@ -1190,7 +1190,7 @@ proptest! {
 
     #[test]
     fn wait_for_timeout_respects_configured_limit(
-        max_wait_timeout_ms in 0u64..128,
+        max_wait_timeout_ms in 1u64..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_wait_timeout_ms,
@@ -1240,7 +1240,7 @@ proptest! {
 
     #[test]
     fn sleep_duration_respects_configured_limit(
-        max_sleep_ms in 0u64..128,
+        max_sleep_ms in 1u64..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_sleep_ms,
@@ -1284,7 +1284,7 @@ proptest! {
 
     #[test]
     fn send_text_wait_timeout_respects_configured_limit(
-        max_wait_timeout_ms in 0u64..128,
+        max_wait_timeout_ms in 1u64..128,
     ) {
         let limits = frankenterm_core::workflows::DescriptorLimits {
             max_wait_timeout_ms,
@@ -1331,6 +1331,48 @@ proptest! {
         prop_assert!(
             over_limit.validate(&limits).is_err(),
             "send_text wait_timeout_ms longer than max_wait_timeout_ms should fail validation"
+        );
+    }
+
+    #[test]
+    fn zero_timing_values_fail_validation(step_variant in 0u8..3) {
+        let step = match step_variant {
+            0 => DescriptorStep::WaitFor {
+                id: "wait".to_string(),
+                description: None,
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                },
+                timeout_ms: Some(0),
+            },
+            1 => DescriptorStep::Sleep {
+                id: "sleep".to_string(),
+                description: None,
+                duration_ms: 0,
+            },
+            _ => DescriptorStep::SendText {
+                id: "send".to_string(),
+                description: None,
+                text: "x".to_string(),
+                wait_for: Some(DescriptorMatcher::Substring {
+                    value: "x".to_string(),
+                }),
+                wait_timeout_ms: Some(0),
+            },
+        };
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "zero_timing".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![step],
+            on_failure: None,
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "workflow timing fields must be positive when explicitly configured"
         );
     }
 
