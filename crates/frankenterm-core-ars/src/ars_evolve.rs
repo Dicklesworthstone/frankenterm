@@ -388,7 +388,7 @@ impl EvolutionEngine {
 
     /// Get lineage depth (0 for originals).
     pub fn lineage_depth(&self, reflex_id: ReflexId) -> u32 {
-        self.lineage(reflex_id).len() as u32
+        usize_to_u32_saturating(self.lineage(reflex_id).len())
     }
 
     /// Find the latest (most recent) version in a lineage.
@@ -471,6 +471,10 @@ impl EvolutionEngine {
     pub fn reflex_count(&self) -> usize {
         self.versions.len()
     }
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Evolution statistics.
@@ -791,6 +795,11 @@ mod tests {
         assert_eq!(stats.total_evolutions, 1);
         assert_eq!(stats.total_deprecations, 1);
         assert_eq!(stats.max_lineage_depth, 1);
+    }
+
+    #[test]
+    fn lineage_depth_projection_saturates() {
+        assert_eq!(usize_to_u32_saturating(usize::MAX), u32::MAX);
     }
 
     #[test]
