@@ -280,7 +280,7 @@ impl PaneWorkflowLockManager {
             });
         }
 
-        if let Some(limit) = max_active.filter(|limit| *limit > 0) {
+        if let Some(limit) = max_active {
             let active = locks.len();
             if active >= limit {
                 self.telemetry
@@ -883,6 +883,21 @@ mod tests {
             .expect_err("second pane should be blocked by global limit");
         assert_eq!(err.active, 1);
         assert_eq!(err.limit, 1);
+    }
+
+    #[test]
+    fn try_acquire_with_zero_limit_blocks_all_acquisitions() {
+        let mgr = PaneWorkflowLockManager::new();
+        let err = mgr
+            .try_acquire_with_limit(1, "wf_a", "exec-1", 0)
+            .expect_err("zero active-lock limit should block acquisition");
+        assert_eq!(err.active, 0);
+        assert_eq!(err.limit, 0);
+        assert!(mgr.is_locked(1).is_none());
+
+        let h = mgr.health();
+        assert_eq!(h.concurrency_limit_blocks_total, 1);
+        assert_eq!(h.acquisitions_total, 0);
     }
 
     #[test]
