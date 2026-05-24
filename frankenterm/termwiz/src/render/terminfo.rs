@@ -767,7 +767,10 @@ impl TerminfoRenderer {
                         (Position::Relative(x), Position::EndRelative(y)) => {
                             let (_cols, rows) = out.get_size_in_cells()?;
                             self.cursor_up(rows as u32, out)?;
-                            self.cursor_down(rows.saturating_sub(y + 1) as u32, out)?;
+                            self.cursor_down(
+                                rows.saturating_sub((*y).saturating_add(1)) as u32,
+                                out,
+                            )?;
                             self.cursor_x_relative(*x, out)?;
                         }
                         (Position::Relative(x), Position::Relative(y)) => {
@@ -778,7 +781,10 @@ impl TerminfoRenderer {
                             self.cursor_y_relative(*y, out)?;
                             let (cols, _rows) = out.get_size_in_cells()?;
                             out.by_ref().write_all(b"\r")?;
-                            self.cursor_right(cols.saturating_sub(x + 1) as u32, out)?;
+                            self.cursor_right(
+                                cols.saturating_sub((*x).saturating_add(1)) as u32,
+                                out,
+                            )?;
                         }
 
                         (Position::Absolute(x), Position::Absolute(y)) => {
@@ -788,15 +794,15 @@ impl TerminfoRenderer {
                             let (_cols, rows) = out.get_size_in_cells()?;
                             self.move_cursor_absolute(
                                 *x as u32,
-                                rows.saturating_sub(y + 1) as u32,
+                                rows.saturating_sub((*y).saturating_add(1)) as u32,
                                 out,
                             )?;
                         }
                         (Position::EndRelative(x), Position::EndRelative(y)) => {
                             let (cols, rows) = out.get_size_in_cells()?;
                             self.move_cursor_absolute(
-                                cols.saturating_sub(x + 1) as u32,
-                                rows.saturating_sub(y + 1) as u32,
+                                cols.saturating_sub((*x).saturating_add(1)) as u32,
+                                rows.saturating_sub((*y).saturating_add(1)) as u32,
                                 out,
                             )?;
                         }
@@ -811,7 +817,7 @@ impl TerminfoRenderer {
                         (Position::EndRelative(x), Position::Absolute(y)) => {
                             let (cols, _rows) = out.get_size_in_cells()?;
                             self.move_cursor_absolute(
-                                cols.saturating_sub(x + 1) as u32,
+                                cols.saturating_sub((*x).saturating_add(1)) as u32,
                                 *y as u32,
                                 out,
                             )?;
@@ -1681,6 +1687,19 @@ mod test {
         );
 
         assert_eq!(renderer.cursor_position, Some((0, 0)));
+    }
+
+    #[test]
+    fn render_cursor_position_saturates_oversized_end_relative_offsets() {
+        let mut out = FakeTerm::new_with_size(xterm_terminfo(), 4, 3);
+
+        out.render(&[Change::CursorPosition {
+            x: Position::EndRelative(usize::MAX),
+            y: Position::EndRelative(usize::MAX),
+        }])
+        .unwrap();
+
+        assert_eq!(out.renderer.cursor_position, Some((0, 0)));
     }
 
     #[test]
