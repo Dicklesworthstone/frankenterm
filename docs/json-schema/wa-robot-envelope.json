@@ -40,6 +40,11 @@
       "type": "integer",
       "minimum": 0,
       "description": "Unix timestamp in milliseconds when the response was generated."
+    },
+    "mcp_version": {
+      "type": "string",
+      "description": "Optional MCP-compatible envelope version emitted by robot fixtures that are also consumed through MCP surfaces.",
+      "const": "v1"
     }
   },
   "if": {
