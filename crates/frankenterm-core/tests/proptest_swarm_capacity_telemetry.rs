@@ -296,3 +296,28 @@ fn drift_detector_observe_is_deterministic_and_probability_bounded() {
         event_a.change_probability_per_1000
     );
 }
+
+/// Drift false-positive guard via the public API: observing a STABLE
+/// evidence stream (the same real certificate + report repeatedly) must
+/// never flag a change point — no change means no detection, regardless of
+/// the absolute capacity state. (The in-file unit test pins this with
+/// synthetic Safe certificates; this uses a real snapshot-derived one.)
+#[test]
+fn drift_detector_no_false_positive_on_stable_real_certificate() {
+    let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
+    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    let snapshot = telemetry.snapshot();
+    let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
+    let report = cert.tail_risk_report(&cert, SwarmTailRiskMonitorConfig::default());
+    let policy = SwarmCapacityExpectedLossPolicyConfig::default();
+
+    let mut detector = SwarmCapacityDriftDetector::default();
+    for tick in 0..20 {
+        let event = detector.observe_certificate(&cert, &report, &policy);
+        assert!(
+            !event.detected,
+            "stable evidence must not trigger drift detection (tick {tick})"
+        );
+    }
+}
