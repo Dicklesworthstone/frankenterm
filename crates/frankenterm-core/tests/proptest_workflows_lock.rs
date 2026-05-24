@@ -176,6 +176,44 @@ proptest! {
     }
 
     #[test]
+    fn proptest_workflow_lock_repeated_wrong_releases_are_observable_but_non_destructive(
+        pane_id in 1u64..10_000,
+        workflow_name in arb_label(),
+        execution_id in arb_label(),
+        wrong_execution_ids in prop::collection::vec(arb_label(), 1..8),
+    ) {
+        prop_assume!(wrong_execution_ids.iter().all(|wrong| wrong != &execution_id));
+
+        let manager = PaneWorkflowLockManager::new();
+        prop_assert_eq!(
+            manager.try_acquire(pane_id, &workflow_name, &execution_id),
+            LockAcquisitionResult::Acquired
+        );
+
+        for wrong_execution_id in &wrong_execution_ids {
+            prop_assert!(!manager.release(pane_id, wrong_execution_id));
+            let lock = manager.is_locked(pane_id).expect("lock should remain held");
+            prop_assert_eq!(lock.workflow_name, workflow_name);
+            prop_assert_eq!(lock.execution_id, execution_id);
+            prop_assert_eq!(manager.active_count(), 1);
+        }
+
+        let health = manager.health();
+        prop_assert_eq!(
+            health.release_mismatched_total,
+            u64::try_from(wrong_execution_ids.len()).expect("wrong execution count fits u64")
+        );
+        prop_assert_eq!(health.releases_total, 0);
+        prop_assert_eq!(health.active_locks, 1);
+
+        prop_assert!(manager.release(pane_id, &execution_id));
+        let health_after_release = manager.health();
+        prop_assert_eq!(health_after_release.releases_total, 1);
+        prop_assert_eq!(health_after_release.active_locks, 0);
+        prop_assert!(manager.is_locked(pane_id).is_none());
+    }
+
+    #[test]
     fn proptest_workflow_lock_owned_guard_drop_restores_unlocked_state(
         pane_id in 1u64..10_000,
         workflow_name in arb_label(),
