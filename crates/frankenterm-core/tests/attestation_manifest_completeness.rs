@@ -63,6 +63,12 @@ enum ManifestError {
         category: String,
         bead_id: String,
     },
+    ProducerBeadNotClosed {
+        slot_index: usize,
+        category: String,
+        bead_id: String,
+        status: String,
+    },
     DeferredBeadMissing {
         slot_index: usize,
         category: String,
@@ -101,6 +107,7 @@ impl ManifestError {
             ManifestError::UnfilledSlot { .. } => "unfilled_slot",
             ManifestError::MissingDeferredReason { .. } => "deferred_reason_missing",
             ManifestError::ProducerBeadMissing { .. } => "producer_bead_missing",
+            ManifestError::ProducerBeadNotClosed { .. } => "producer_bead_not_closed",
             ManifestError::DeferredBeadMissing { .. } => "deferred_bead_missing",
             ManifestError::DeferredBeadInactive { .. } => "deferred_bead_not_active",
             ManifestError::DeferredBeadOrphan { .. } => "orphan_deferred_bead",
@@ -164,6 +171,16 @@ impl ManifestError {
             } => {
                 format!(
                     "slot[{slot_index}] {category}: produced_by_bead={bead_id:?} was not found in .beads/issues.jsonl"
+                )
+            }
+            ManifestError::ProducerBeadNotClosed {
+                slot_index,
+                category,
+                bead_id,
+                status,
+            } => {
+                format!(
+                    "slot[{slot_index}] {category}: resolved path has produced_by_bead={bead_id:?} but producer status is {status:?}, not \"closed\""
                 )
             }
             ManifestError::DeferredBeadMissing {
@@ -371,12 +388,25 @@ fn validate_manifest_text(
             });
         }
         if let Some(bead_id) = producer {
-            if !beads.is_empty() && !beads.contains_key(bead_id) {
-                errors.push(ManifestError::ProducerBeadMissing {
-                    slot_index,
-                    category: category.to_string(),
-                    bead_id: bead_id.to_string(),
-                });
+            if !beads.is_empty() {
+                match beads.get(bead_id) {
+                    Some(record) if path.is_some() && record.status != "closed" => {
+                        errors.push(ManifestError::ProducerBeadNotClosed {
+                            slot_index,
+                            category: category.to_string(),
+                            bead_id: bead_id.to_string(),
+                            status: record.status.clone(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        errors.push(ManifestError::ProducerBeadMissing {
+                            slot_index,
+                            category: category.to_string(),
+                            bead_id: bead_id.to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -591,6 +621,24 @@ fn mutation_missing_producer_bead_is_rejected() {
     )
     .expect_err("missing produced_by_bead mutation must fail");
     assert_error_contains(&errors, "producer_bead_missing", "ft-syqcz.3");
+}
+
+#[test]
+fn mutation_resolved_slot_with_open_producer_bead_is_rejected() {
+    let issues = json!({
+        "id": "ft-syqcz.3",
+        "title": "unfinished producer",
+        "status": "open",
+        "dependencies": []
+    })
+    .to_string();
+    let errors = validate_manifest_text(
+        &manifest_with_slot(valid_manifest_slot()),
+        &issues,
+        &workspace_root(),
+    )
+    .expect_err("resolved slot with open produced_by_bead must fail");
+    assert_error_contains(&errors, "producer_bead_not_closed", "not \"closed\"");
 }
 
 #[test]
