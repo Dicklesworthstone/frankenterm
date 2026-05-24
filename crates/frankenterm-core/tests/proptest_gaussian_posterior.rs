@@ -17,7 +17,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::aegis_backpressure::GaussianPosterior;
+use frankenterm_core::aegis_backpressure::{GaussianPosterior, PaneSnapshot};
 
 fn arb_mean() -> impl Strategy<Value = f64> {
     -1_000.0_f64..1_000.0
@@ -106,5 +106,39 @@ proptest! {
         let sd = p.std_dev();
         prop_assert!((sd * sd - p.variance).abs() <= 1e-9 * p.variance.max(1.0),
             "std_dev^2 {} must equal variance {}", sd * sd, p.variance);
+    }
+
+    /// PaneSnapshot (per-pane PAC-Bayes telemetry DTO) serde round-trips.
+    /// All-finite fields keep the JSON round-trip exact.
+    #[test]
+    fn pane_snapshot_serde_roundtrip(
+        pane_id in any::<u64>(),
+        observations in any::<usize>(),
+        frame_drops in any::<usize>(),
+        drop_rate in 0.0_f64..1.0,
+        smoothed_ratio in 0.0_f64..1.0,
+        threshold_mean in -1e6_f64..1e6,
+        threshold_variance in 0.0_f64..1e6,
+        throttled in any::<bool>(),
+    ) {
+        let snap = PaneSnapshot {
+            pane_id,
+            observations,
+            frame_drops,
+            drop_rate,
+            smoothed_ratio,
+            threshold_mean,
+            threshold_variance,
+            throttled,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PaneSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.pane_id, back.pane_id);
+        prop_assert_eq!(snap.observations, back.observations);
+        prop_assert_eq!(snap.frame_drops, back.frame_drops);
+        prop_assert_eq!(snap.throttled, back.throttled);
+        prop_assert!((snap.drop_rate - back.drop_rate).abs() < 1e-12);
+        prop_assert!((snap.threshold_mean - back.threshold_mean).abs() < 1e-9);
+        prop_assert!((snap.threshold_variance - back.threshold_variance).abs() < 1e-9);
     }
 }
