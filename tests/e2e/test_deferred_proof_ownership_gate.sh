@@ -156,6 +156,11 @@ fail!("dirty path categories missing owned overlap") unless schema.dig("$defs", 
 # Free-text explanation must be bounded so it cannot become a raw-content sink.
 EXPLANATION_MAX_LEN = 512
 fail!("explanation must pin maxLength #{EXPLANATION_MAX_LEN}") unless schema.dig("$defs", "gate_decision", "properties", "explanation", "maxLength") == EXPLANATION_MAX_LEN
+# Worker/agent identity fields must use the safe identity charset (matching the
+# receipt schema) so an unbounded free string cannot ride in as an identity.
+IDENTITY_PATTERN = "^[A-Za-z0-9._-]+$"
+fail!("selected_worker must pin the identity pattern") unless schema.dig("$defs", "rch_admission_snapshot", "properties", "selected_worker", "pattern") == IDENTITY_PATTERN
+fail!("assignee must pin the identity pattern") unless schema.dig("$defs", "in_progress_owner", "properties", "assignee", "pattern") == IDENTITY_PATTERN
 fail!("coordination schema missing queued receipt owners") unless schema.dig("$defs", "coordination_snapshot", "required").include?("queued_receipt_owners")
 
 fail!("manifest contract drifted") unless manifest["contract_id"] == "ft.deferred_proof_ownership_gate.fixture_manifest.v1"
@@ -237,6 +242,20 @@ fixture_cases.each do |entry|
   when "wait"
     wait_reasons = decision.fetch("reason_codes")
     fail!("#{case_id} wait lacks waiting reason") unless wait_reasons.any? { |reason| reason.start_with?("rch.") || reason == "git.shared_tracker_dirty" }
+  end
+end
+
+# Golden identity hygiene: every selected_worker (when present) and every
+# in-progress owner assignee must match the safe identity charset.
+identity_re = Regexp.new(IDENTITY_PATTERN)
+fixture_cases.each do |entry|
+  gate = entry.fetch("gate")
+  case_id = entry.fetch("case_id")
+  worker = gate.dig("rch_admission", "selected_worker")
+  fail!("#{case_id} selected_worker is not a safe identity: #{worker.inspect}") unless worker.nil? || worker.match?(identity_re)
+  gate.fetch("coordination").fetch("in_progress_owners").each do |owner|
+    name = owner.fetch("assignee")
+    fail!("#{case_id} owner assignee is not a safe identity: #{name.inspect}") unless name.match?(identity_re)
   end
 end
 
