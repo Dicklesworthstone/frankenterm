@@ -303,20 +303,21 @@ fn schema_rejects_unknown_sharding_strategy() {
 #[test]
 fn schema_rejects_empty_pane_filter_rule_id() {
     let schema = compile_config_schema();
-    let bad = serde_json::json!({
-        "ingest": {
-            "panes": {
-                "include": [
-                    { "id": "", "title": "codex" }
-                ]
+    for (label, id) in [("empty", ""), ("blank", " \t")] {
+        let bad = serde_json::json!({
+            "ingest": {
+                "panes": {
+                    "include": [
+                        { "id": id, "title": "codex" }
+                    ]
+                }
             }
-        }
-    });
-    let result = schema.validate(&bad);
-    assert!(
-        result.is_err(),
-        "schema MUST reject ingest.panes.include entries with empty IDs"
-    );
+        });
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject ingest.panes.include entries with {label} IDs"
+        );
+    }
 }
 
 /// 4f) Falsification: pane filters and priority overrides must carry

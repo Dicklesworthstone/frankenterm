@@ -1099,7 +1099,7 @@ impl PaneFilterRule {
 
     /// Validate that this rule has at least one matcher and all patterns are valid
     pub fn validate(&self) -> Result<(), String> {
-        if self.id.is_empty() {
+        if self.id.trim().is_empty() {
             return Err("Rule ID cannot be empty".to_string());
         }
 
@@ -5948,6 +5948,11 @@ max_sender_id_len = 0
         let mut empty_id = PaneFilterRule::new("test").with_domain("local");
         empty_id.id = String::new();
         assert!(empty_id.validate().is_err());
+
+        // Blank ID
+        let mut blank_id = PaneFilterRule::new("test").with_domain("local");
+        blank_id.id = " \t".to_string();
+        assert!(blank_id.validate().is_err());
 
         // No matchers
         let no_matchers = PaneFilterRule::new("test");
