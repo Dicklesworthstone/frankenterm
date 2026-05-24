@@ -68,6 +68,16 @@ need() {
   command -v "$1" >/dev/null || { echo "error: $1 required (install or PATH-fix)" >&2; exit 3; }
 }
 
+require_arg() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "error: $flag requires a value" >&2
+    usage
+    exit 2
+  fi
+}
+
 emit_human() {
   if [[ "$JSON_MODE" -eq 0 ]]; then
     printf '%s\n' "$1" >&2
@@ -238,11 +248,23 @@ shift || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) JSON_MODE=1; shift ;;
-    --epic) EPIC_ID="$2"; shift 2 ;;
+    --epic) require_arg "$1" "${2-}"; EPIC_ID="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
+    --*) echo "unknown option: $1" >&2; usage; exit 2 ;;
     *) break ;;
   esac
 done
+
+if [[ "$SUBCMD" != "epic" && $# -gt 0 ]]; then
+  echo "unexpected argument for $SUBCMD: $1" >&2
+  usage
+  exit 2
+fi
+if [[ "$SUBCMD" == "epic" && $# -gt 1 ]]; then
+  echo "unexpected extra argument for epic: $2" >&2
+  usage
+  exit 2
+fi
 
 case "$SUBCMD" in
   status)              cmd_status ;;

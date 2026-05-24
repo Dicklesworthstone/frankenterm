@@ -43,6 +43,29 @@ assert_has_key() {
   fi
 }
 
+assert_clean_cli_error() {
+  local label="$1" expected_rc="$2" expected_text="$3"
+  shift 3
+  local out
+  set +e
+  out=$("$SUT" "$@" 2>&1 >/dev/null)
+  local rc=$?
+  set -e
+  if [[ $rc -ne $expected_rc ]]; then
+    fail "$label" "expected rc=$expected_rc, got rc=$rc; output=$out"
+    return
+  fi
+  if [[ "$out" != *"$expected_text"* ]]; then
+    fail "$label" "expected error text ${expected_text}; output=$out"
+    return
+  fi
+  if [[ "$out" == *"unbound variable"* ]]; then
+    fail "$label" "leaked raw shell error: $out"
+    return
+  fi
+  pass "$label"
+}
+
 # ---------------------------------------------------------------------------
 # 1: --help exits 0
 # ---------------------------------------------------------------------------
@@ -74,6 +97,22 @@ t_unknown_subcommand_exits_two() {
   local rc=$?
   set -e
   if [[ $rc -eq 2 ]]; then pass "unknown subcommand exits 2"; else fail "unknown subcommand exits 2" "got rc=$rc"; fi
+}
+
+t_missing_epic_value_exits_two_cleanly() {
+  assert_clean_cli_error "missing --epic value exits 2 cleanly" 2 "error: --epic requires a value" status --epic
+}
+
+t_unknown_option_exits_two_cleanly() {
+  assert_clean_cli_error "unknown option exits 2 cleanly" 2 "unknown option: --not-real" status --not-real
+}
+
+t_unexpected_subcommand_argument_exits_two() {
+  assert_clean_cli_error "unexpected status argument exits 2 cleanly" 2 "unexpected argument for status: extra" status extra
+}
+
+t_epic_extra_argument_exits_two() {
+  assert_clean_cli_error "unexpected epic extra argument exits 2 cleanly" 2 "unexpected extra argument for epic: beta" epic alpha beta
 }
 
 # ---------------------------------------------------------------------------
@@ -167,6 +206,10 @@ t_env_var_override() {
 t_help_exits_zero
 t_no_subcommand_exits_two
 t_unknown_subcommand_exits_two
+t_missing_epic_value_exits_two_cleanly
+t_unknown_option_exits_two_cleanly
+t_unexpected_subcommand_argument_exits_two
+t_epic_extra_argument_exits_two
 t_status_json_shape
 t_next_json_shape
 t_epic_json_default
