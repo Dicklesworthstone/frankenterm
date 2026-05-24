@@ -265,6 +265,12 @@ proptest! {
         let r = StepResult::retry(delay_ms);
         prop_assert!(!r.is_terminal());
         prop_assert!(!r.is_continue());
+        match r {
+            StepResult::Retry { delay_ms: actual_delay_ms } => {
+                prop_assert_eq!(actual_delay_ms, delay_ms);
+            }
+            other => prop_assert!(false, "expected Retry, got {other:?}"),
+        }
     }
 
     #[test]
