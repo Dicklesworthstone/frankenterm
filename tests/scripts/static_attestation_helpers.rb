@@ -109,7 +109,14 @@ module StaticAttestation
     if path.include?("\0")
       fail!("#{field} must not contain NUL bytes", check: check, input_path: path, expected: "no NUL", actual: "contains NUL")
     end
-    if path.split("/").any? { |part| part == ".." }
+    path_parts = path.split("/", -1)
+    if path_parts.any?(&:empty?)
+      fail!("#{field} must not contain empty path segments: #{path}", check: check, input_path: path, expected: "no empty path segment", actual: path)
+    end
+    if path_parts.any? { |part| part == "." }
+      fail!("#{field} must not contain dot path segments: #{path}", check: check, input_path: path, expected: "no . component", actual: path)
+    end
+    if path_parts.any? { |part| part == ".." }
       fail!("#{field} must not contain parent traversal: #{path}", check: check, input_path: path, expected: "no .. component", actual: path)
     end
 

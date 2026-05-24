@@ -30,7 +30,7 @@ run_shell_helper = lambda do |body|
   Open3.capture3({ "FRANKENTERM_REPO_ROOT" => root }, "bash", "-c", script, chdir: root)
 end
 
-check("repo-relative path guard rejects absolute, parent traversal, empty, and NUL paths") do
+check("repo-relative path guard rejects absolute, parent traversal, empty, dot, duplicate slash, and NUL paths") do
   StaticAttestation.repo_relative_path!("docs/security/passive-watch-attestation.json")
   StaticAttestation.expect_failure!("absolute path guard", check: "test.negative.absolute_path") do
     StaticAttestation.repo_relative_path!("/tmp/nope")
@@ -40,6 +40,12 @@ check("repo-relative path guard rejects absolute, parent traversal, empty, and N
   end
   StaticAttestation.expect_failure!("empty path guard", check: "test.negative.empty_path") do
     StaticAttestation.repo_relative_path!("")
+  end
+  StaticAttestation.expect_failure!("dot segment path guard", check: "test.negative.dot_segment_path") do
+    StaticAttestation.repo_relative_path!("./docs/security/passive-watch-attestation.json")
+  end
+  StaticAttestation.expect_failure!("empty segment path guard", check: "test.negative.empty_segment_path") do
+    StaticAttestation.repo_relative_path!("docs//security/passive-watch-attestation.json")
   end
   StaticAttestation.expect_failure!("NUL path guard", check: "test.negative.nul_path") do
     StaticAttestation.repo_relative_path!("docs/security/passive-watch-attestation.json\0suffix")
@@ -171,6 +177,8 @@ check("shell helper path guards fail cleanly under strict mode") do
     ["static_attestation_require_repo_relative_path", "", "path is empty"],
     ["static_attestation_require_repo_relative_path", "/tmp/nope", "absolute path is forbidden"],
     ["static_attestation_require_repo_relative_path", "docs/../secret", "parent traversal is forbidden"],
+    ["static_attestation_require_repo_relative_path", "./docs/security/passive-watch-attestation.json", "dot path segment is forbidden"],
+    ["static_attestation_require_repo_relative_path", "docs//security/passive-watch-attestation.json", "empty path segment is forbidden"],
     ["static_attestation_require_file", "", "path is empty"],
     ["static_attestation_require_executable_script", "", "path is empty"],
   ].each do |function_name, argument, expected_error|

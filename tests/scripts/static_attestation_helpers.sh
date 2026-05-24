@@ -31,10 +31,12 @@ static_attestation_require_repo_relative_path() {
 
   [[ -n "${path}" ]] || static_attestation_fail "path is empty"
   [[ "${path}" != /* ]] || static_attestation_fail "absolute path is forbidden: ${path}"
+  [[ "${path}" != *"//"* && "${path}" != */ ]] || static_attestation_fail "empty path segment is forbidden: ${path}"
 
   local part
   IFS='/' read -r -a _static_attestation_path_parts <<<"${path}"
   for part in "${_static_attestation_path_parts[@]}"; do
+    [[ "${part}" != "." ]] || static_attestation_fail "dot path segment is forbidden: ${path}"
     [[ "${part}" != ".." ]] || static_attestation_fail "parent traversal is forbidden: ${path}"
   done
 }
