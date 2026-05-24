@@ -370,6 +370,70 @@ proptest! {
     }
 
     #[test]
+    fn wait_condition_stable_tail_constructors_preserve_duration(
+        pane_id in 0u64..10_000,
+        stable_for_ms in 1u64..60_000,
+    ) {
+        let target_pane = WaitCondition::stable_tail(stable_for_ms);
+        prop_assert_eq!(target_pane.pane_id(), None);
+        match target_pane {
+            WaitCondition::StableTail {
+                pane_id,
+                stable_for_ms: actual_stable_for_ms,
+            } => {
+                prop_assert_eq!(pane_id, None);
+                prop_assert_eq!(actual_stable_for_ms, stable_for_ms);
+            }
+            other => prop_assert!(false, "Expected StableTail variant, got {other:?}"),
+        }
+
+        let explicit_pane = WaitCondition::stable_tail_on(pane_id, stable_for_ms);
+        prop_assert_eq!(explicit_pane.pane_id(), Some(pane_id));
+        match explicit_pane {
+            WaitCondition::StableTail {
+                pane_id: actual_pane_id,
+                stable_for_ms: actual_stable_for_ms,
+            } => {
+                prop_assert_eq!(actual_pane_id, Some(pane_id));
+                prop_assert_eq!(actual_stable_for_ms, stable_for_ms);
+            }
+            other => prop_assert!(false, "Expected StableTail variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_condition_text_match_constructors_preserve_matcher_and_pane(
+        pane_id in 0u64..10_000,
+        matcher in arb_text_match(),
+    ) {
+        let target_pane = WaitCondition::text_match(matcher.clone());
+        prop_assert_eq!(target_pane.pane_id(), None);
+        match target_pane {
+            WaitCondition::TextMatch {
+                pane_id,
+                matcher: actual_matcher,
+            } => {
+                prop_assert_eq!(pane_id, None);
+                prop_assert_eq!(actual_matcher, matcher);
+            }
+            other => prop_assert!(false, "Expected TextMatch variant, got {other:?}"),
+        }
+
+        let explicit_pane = WaitCondition::text_match_on_pane(pane_id, matcher.clone());
+        prop_assert_eq!(explicit_pane.pane_id(), Some(pane_id));
+        match explicit_pane {
+            WaitCondition::TextMatch {
+                pane_id: actual_pane_id,
+                matcher: actual_matcher,
+            } => {
+                prop_assert_eq!(actual_pane_id, Some(pane_id));
+                prop_assert_eq!(actual_matcher, matcher);
+            }
+            other => prop_assert!(false, "Expected TextMatch variant, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn policy_decision_allow_is_allowed(_dummy in 0u8..1) {
         prop_assert!(WorkflowStepPolicyDecision::Allow.is_allowed());
         prop_assert!(!WorkflowStepPolicyDecision::Deny.is_allowed());
