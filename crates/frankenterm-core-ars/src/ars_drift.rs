@@ -74,7 +74,23 @@ impl Default for EValueConfig {
 impl EValueConfig {
     /// The rejection threshold: 1/α.
     pub fn threshold(&self) -> f64 {
-        1.0 / self.alpha
+        1.0 / self.effective_alpha()
+    }
+
+    fn effective_alpha(&self) -> f64 {
+        if self.alpha.is_finite() && self.alpha > 0.0 {
+            self.alpha.min(1.0)
+        } else {
+            1.0
+        }
+    }
+
+    fn effective_max_lambda(&self) -> f64 {
+        if self.max_lambda.is_finite() && self.max_lambda >= 0.0 {
+            self.max_lambda
+        } else {
+            0.0
+        }
     }
 }
 
@@ -298,9 +314,10 @@ impl EValueMonitor {
         }
 
         let lambda = diff / variance;
+        let max_lambda = config.effective_max_lambda();
         // Clamp to safe range.
-        lambda.clamp(-config.max_lambda, config.max_lambda)
-            .clamp(-config.max_lambda, config.max_lambda)
+        lambda.clamp(-max_lambda, max_lambda)
+            .clamp(-max_lambda, max_lambda)
             // Ensure |λ| ≥ min_lambda only if there's a real signal.
             * if diff.abs() > 0.01 { 1.0 } else { 0.0 }
     }
@@ -564,6 +581,17 @@ mod tests {
         assert!(diff < 1e-10);
     }
 
+    #[test]
+    fn invalid_alpha_threshold_fails_closed_to_one() {
+        for alpha in [0.0, -0.1, f64::NAN, f64::INFINITY, 2.0] {
+            let config = EValueConfig {
+                alpha,
+                ..Default::default()
+            };
+            assert_eq!(config.threshold(), 1.0);
+        }
+    }
+
     // ---- EValueMonitor calibration ----
 
     #[test]
@@ -622,6 +650,23 @@ mod tests {
             monitor2.observe(0.0, &config);
         }
         assert!(monitor2.null_rate() >= 0.01);
+    }
+
+    #[test]
+    fn invalid_max_lambda_does_not_panic_or_poison_e_value() {
+        let config = EValueConfig {
+            max_lambda: f64::NAN,
+            ..quick_config()
+        };
+        let mut monitor = EValueMonitor::new("c1");
+
+        for outcome in [1.0, 1.0, 1.0, 0.0, 0.0] {
+            monitor.observe(outcome, &config);
+        }
+        let verdict = monitor.observe(0.0, &config);
+
+        assert!(verdict.has_sufficient_data());
+        assert!(monitor.e_value().is_finite());
     }
 
     // ---- E-value behavior ----
