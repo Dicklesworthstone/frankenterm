@@ -177,6 +177,12 @@ fn resolve_kitty_alt_text(transmit: &KittyImageTransmit) -> Option<String> {
     kitty_data_filename(&transmit.data).and_then(|filename| sanitize_kitty_alt_text(&filename))
 }
 
+fn placement_stable_rows(info: PlacementInfo) -> Option<std::ops::Range<StableRowIndex>> {
+    let rows = StableRowIndex::try_from(info.rows).ok()?;
+    let end = info.first_row.checked_add(rows)?;
+    Some(info.first_row..end)
+}
+
 impl KittyImageState {
     /// Push a chunk to the accumulator, discarding all accumulated data
     /// if the cap is exceeded (prevents unbounded growth from malformed
@@ -487,8 +493,10 @@ impl TerminalState {
     ) {
         let seqno = self.seqno;
         let screen = self.screen_mut();
-        let range =
-            screen.stable_range(&(info.first_row..info.first_row + info.rows as StableRowIndex));
+        let Some(stable_rows) = placement_stable_rows(info) else {
+            return;
+        };
+        let range = screen.stable_range(&stable_rows);
         for idx in range {
             let line = screen.line_mut(idx);
             for c in line.cells_mut() {
@@ -1265,6 +1273,34 @@ mod tests {
             alerts: Arc::clone(&alerts),
         }));
         (terminal, alerts)
+    }
+
+    #[test]
+    fn placement_stable_rows_rejects_unrepresentable_end() {
+        assert_eq!(
+            placement_stable_rows(PlacementInfo {
+                first_row: StableRowIndex::MAX - 1,
+                rows: 1,
+                cols: 1,
+            }),
+            Some((StableRowIndex::MAX - 1)..StableRowIndex::MAX)
+        );
+        assert_eq!(
+            placement_stable_rows(PlacementInfo {
+                first_row: StableRowIndex::MAX,
+                rows: 1,
+                cols: 1,
+            }),
+            None
+        );
+        assert_eq!(
+            placement_stable_rows(PlacementInfo {
+                first_row: StableRowIndex::MAX - 1,
+                rows: 2,
+                cols: 1,
+            }),
+            None
+        );
     }
 
     #[test]
