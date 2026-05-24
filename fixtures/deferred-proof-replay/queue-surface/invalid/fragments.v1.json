@@ -57,6 +57,66 @@
       "case_id": "explain-coverage-gap",
       "mutation": "drop_explain_entry",
       "expected_violation": "explain_coverage"
+    },
+    {
+      "case_id": "contract-id-drift",
+      "mutation": "corrupt_contract_id",
+      "expected_violation": "contract_drift"
+    },
+    {
+      "case_id": "receipt-id-not-derived",
+      "mutation": "corrupt_receipt_id",
+      "expected_violation": "receipt_id_drift"
+    },
+    {
+      "case_id": "empty-reason-codes",
+      "mutation": "empty_reason_codes_on_completed",
+      "expected_violation": "empty_reason_codes"
+    },
+    {
+      "case_id": "remediation-not-status-derived",
+      "mutation": "corrupt_remediation_on_completed",
+      "expected_violation": "remediation_mismatch"
+    },
+    {
+      "case_id": "summary-completed-miscount",
+      "mutation": "break_summary_completed",
+      "expected_violation": "summary_completed"
+    },
+    {
+      "case_id": "summary-queued-miscount",
+      "mutation": "break_summary_queued",
+      "expected_violation": "summary_queued"
+    },
+    {
+      "case_id": "by-status-miscount",
+      "mutation": "break_by_status_runnable",
+      "expected_violation": "by_status_drift"
+    },
+    {
+      "case_id": "explain-status-drift",
+      "mutation": "drift_explain_status",
+      "expected_violation": "explain_status_drift"
+    },
+    {
+      "case_id": "explain-remediation-drift",
+      "mutation": "drift_explain_remediation",
+      "expected_violation": "explain_remediation_drift"
+    },
+    {
+      "case_id": "explain-reason-drift",
+      "mutation": "empty_explain_reason_codes",
+      "expected_violation": "explain_reason_drift"
+    },
+    {
+      "case_id": "dispatch-unsorted",
+      "mutation": "unsort_dispatch",
+      "expected_violation": "dispatch_unsorted"
+    },
+    {
+      "case_id": "dispatch-coverage-gap",
+      "mutation": "drop_dispatch_entry",
+      "expected_violation": "dispatch_coverage"
     }
   ]
 }

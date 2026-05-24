@@ -254,6 +254,30 @@ def apply_mutation(surface, op)
     s["robot_dispatch"].first["status"] = "runnable"
   when "drop_explain_entry"
     s["explain"] = s["explain"][1..]
+  when "corrupt_contract_id"
+    s["contract_id"] = "ft.deferred_proof_queue_surface.v0"
+  when "corrupt_receipt_id"
+    s["queue"].first["receipt_id"] = "ft-am1:comment-9999"
+  when "empty_reason_codes_on_completed"
+    s["queue"].find { |e| e["status"] == "completed" }["reason_codes"] = []
+  when "corrupt_remediation_on_completed"
+    s["queue"].find { |e| e["status"] == "completed" }["remediation"] = "request_human_triage"
+  when "break_summary_completed"
+    s["summary"]["completed"] = 0
+  when "break_summary_queued"
+    s["summary"]["queued"] = s["summary"]["queued"] - 1
+  when "break_by_status_runnable"
+    s["summary"]["by_status"]["runnable"] = 0
+  when "drift_explain_status"
+    s["explain"].first["status"] = "wait_rch"
+  when "drift_explain_remediation"
+    s["explain"].first["remediation"] = "none"
+  when "empty_explain_reason_codes"
+    s["explain"].first["blocking_reason_codes"] = []
+  when "unsort_dispatch"
+    s["robot_dispatch"] = s["robot_dispatch"].reverse
+  when "drop_dispatch_entry"
+    s["robot_dispatch"] = s["robot_dispatch"][1..]
   else
     fail!("unknown invalid-fragment mutation: #{op}")
   end
