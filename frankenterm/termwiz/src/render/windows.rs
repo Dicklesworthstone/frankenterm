@@ -40,6 +40,10 @@ fn negative_scroll_count(value: usize) -> isize {
     }
 }
 
+fn screen_cell_count(cols: usize, rows: usize) -> usize {
+    cols.saturating_mul(rows)
+}
+
 impl WindowsConsoleRenderer {
     pub fn new(capabilities: Capabilities) -> Self {
         Self {
@@ -187,12 +191,16 @@ impl ScreenBuffer {
     }
 
     fn do_cursor_y_scroll<B: ConsoleOutputHandle + Write>(&mut self, out: &mut B) -> Result<()> {
+        if self.rows == 0 {
+            self.cursor_y = 0;
+            return Ok(());
+        }
         if self.cursor_y >= self.rows {
             self.dirty = true;
-            let lines_to_scroll = self.cursor_y.saturating_sub(self.rows) + 1;
+            let lines_to_scroll = self.cursor_y.saturating_sub(self.rows).saturating_add(1);
             self.scroll(0, self.rows, negative_scroll_count(lines_to_scroll), out)?;
             self.dirty = true;
-            self.cursor_y -= lines_to_scroll;
+            self.cursor_y = self.cursor_y.saturating_sub(lines_to_scroll);
             assert!(self.cursor_y < self.rows);
         }
         Ok(())
@@ -228,12 +236,12 @@ impl ScreenBuffer {
                     self.cursor_x = 0;
                 }
                 '\n' => {
-                    self.cursor_y += 1;
+                    self.cursor_y = self.cursor_y.saturating_add(1);
                     self.do_cursor_y_scroll(out)?;
                 }
                 c => {
                     if self.cursor_x == self.cols {
-                        self.cursor_y += 1;
+                        self.cursor_y = self.cursor_y.saturating_add(1);
                         self.cursor_x = 0;
                     }
                     self.do_cursor_y_scroll(out)?;
@@ -245,7 +253,7 @@ impl ScreenBuffer {
                     unsafe {
                         *cell.Char.UnicodeChar_mut() = c as u16;
                     }
-                    self.cursor_x += 1;
+                    self.cursor_x = self.cursor_x.saturating_add(1);
                     self.dirty = true;
                 }
             }
@@ -294,7 +302,7 @@ impl ScreenBuffer {
 
             // Scroll the full width of the window, always.
             let left = 0;
-            let right = info.dwSize.X - 1;
+            let right = info.dwSize.X.saturating_sub(1);
 
             // We're only doing vertical scrolling
             let dx = 0;
@@ -305,9 +313,9 @@ impl ScreenBuffer {
                 // up into the scrollback
                 out.set_viewport(
                     info.srWindow.Left,
-                    info.srWindow.Top - dy,
+                    info.srWindow.Top.saturating_sub(dy),
                     info.srWindow.Right,
-                    info.srWindow.Bottom - dy,
+                    info.srWindow.Bottom.saturating_sub(dy),
                 )?;
             } else {
                 // We're just scrolling a region within the window
@@ -343,6 +351,12 @@ mod tests {
     fn negative_scroll_count_saturates_extreme_values() {
         assert_eq!(negative_scroll_count(3), -3);
         assert_eq!(negative_scroll_count(isize::MAX as usize + 1), isize::MIN);
+    }
+
+    #[test]
+    fn screen_cell_count_saturates_extreme_dimensions() {
+        assert_eq!(screen_cell_count(80, 24), 1_920);
+        assert_eq!(screen_cell_count(usize::MAX, 2), usize::MAX);
     }
 }
 
@@ -380,7 +394,7 @@ impl WindowsConsoleRenderer {
                         to_attr_word(&self.capabilities, &attr),
                         0,
                         0,
-                        cols * rows,
+                        screen_cell_count(cols, rows),
                     );
                     buffer.set_cursor(0, 0, out)?;
                 }
@@ -407,7 +421,7 @@ impl WindowsConsoleRenderer {
                         to_attr_word(&self.capabilities, &attr),
                         buffer.cursor_x,
                         buffer.cursor_y,
-                        cols * rows,
+                        screen_cell_count(cols, rows),
                     );
                 }
                 Change::Text(text) => {
@@ -480,11 +494,15 @@ impl WindowsConsoleRenderer {
                             ' ',
                             0,
                             buffer.cursor_x,
-                            y + buffer.cursor_y,
+                            y.saturating_add(buffer.cursor_y),
                             image.width as usize,
                         );
                     }
-                    buffer.set_cursor(buffer.cursor_x + image.width, buffer.cursor_y, out)?;
+                    buffer.set_cursor(
+                        buffer.cursor_x.saturating_add(image.width),
+                        buffer.cursor_y,
+                        out,
+                    )?;
                 }
                 Change::ScrollRegionUp {
                     first_row,
