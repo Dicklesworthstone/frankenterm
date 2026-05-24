@@ -1004,3 +1004,43 @@ proptest! {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// RRF k-monotonicity (metamorphic)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// A larger RRF k dampens every item's fused score: each reciprocal-rank
+    /// term 1/(k+rank+1) is non-increasing in k, so for identical inputs no
+    /// item scores higher under the bigger k. Round-to-nearest preserves the
+    /// ordering of the per-term and summed values, so the relation holds in f32.
+    /// Existing tests vary k per run but never compare scores across k values.
+    #[test]
+    fn rrf_fuse_score_non_increasing_in_k(
+        lexical in arb_ranked_list(10),
+        semantic in arb_ranked_list(10),
+        k_small in 1u32..=100,
+        k_delta in 1u32..=100,
+    ) {
+        let k_large = k_small + k_delta;
+        let small = rrf_fuse(&lexical, &semantic, k_small);
+        let large = rrf_fuse(&lexical, &semantic, k_large);
+
+        let large_by_id: std::collections::HashMap<u64, f32> =
+            large.iter().map(|r| (r.id, r.score)).collect();
+
+        for item in &small {
+            let big = large_by_id.get(&item.id).copied();
+            prop_assert!(big.is_some(), "id {} present under small k but missing under large k", item.id);
+            prop_assert!(
+                item.score >= big.unwrap(),
+                "score rose with larger k for id {}: k={} -> {}, k={} -> {}",
+                item.id, k_small, item.score, k_large, big.unwrap()
+            );
+        }
+        // Same input set yields the same id set regardless of k.
+        prop_assert_eq!(small.len(), large.len());
+    }
+}
