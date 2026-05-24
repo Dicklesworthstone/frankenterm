@@ -449,6 +449,66 @@ fn bundle_schema_rejects_unsafe_reference_paths() {
 }
 
 #[test]
+fn bundle_schema_rejects_blank_retraction_summary_metadata() {
+    let validator = bundle_validator();
+    for (surface, bundle) in [
+        (
+            "retracted_by_release",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["retractions"] = json!([
+                    {
+                        "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                        "affected_slot": "perf/headline-claims",
+                        "retracted_at": "2026-05-12T00:00:00Z",
+                        "retracted_by_release": " \t",
+                        "retraction_rationale": "synthetic blank release regression",
+                        "retraction_path": "docs/attestations/retractions/synthetic.json",
+                        "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                        "size_bytes": 1,
+                        "corrected_claim_value": null
+                    }
+                ]);
+                bundle
+            },
+        ),
+        (
+            "retraction_rationale",
+            {
+                let mut bundle = base_bundle(json!({
+                    "method": "unsigned",
+                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "reason": "dev bundle tracked by ft-e87u6.2"
+                }));
+                bundle["retractions"] = json!([
+                    {
+                        "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                        "affected_slot": "perf/headline-claims",
+                        "retracted_at": "2026-05-12T00:00:00Z",
+                        "retracted_by_release": "0.2.1",
+                        "retraction_rationale": "\n",
+                        "retraction_path": "docs/attestations/retractions/synthetic.json",
+                        "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                        "size_bytes": 1,
+                        "corrected_claim_value": null
+                    }
+                ]);
+                bundle
+            },
+        ),
+    ] {
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "bundle retraction summary must reject blank {surface}"
+        );
+    }
+}
+
+#[test]
 fn bundle_schema_requires_canonical_confidence_summary() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({
@@ -517,4 +577,35 @@ fn attestation_retraction_schema_rejects_unsigned_signatures() {
         !validate(&validator, &unsigned).is_empty(),
         "retraction_signature must reject unsigned signatures"
     );
+}
+
+#[test]
+fn attestation_retraction_schema_rejects_blank_metadata() {
+    let validator = retraction_validator();
+    for (surface, mut retraction) in [
+        (
+            "retracted_by_release",
+            base_retraction(json!({
+                "method": "ed25519",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "signature_path": "docs/attestations/retractions/0.2.1.sig",
+                "public_key": "3333333333333333333333333333333333333333333333333333333333333333"
+            })),
+        ),
+        (
+            "retraction_rationale",
+            base_retraction(json!({
+                "method": "ed25519",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "signature_path": "docs/attestations/retractions/0.2.1.sig",
+                "public_key": "3333333333333333333333333333333333333333333333333333333333333333"
+            })),
+        ),
+    ] {
+        retraction[surface] = json!(" \t\n");
+        assert!(
+            !validate(&validator, &retraction).is_empty(),
+            "standalone attestation retraction must reject blank {surface}"
+        );
+    }
 }

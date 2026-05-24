@@ -396,11 +396,13 @@
         "retracted_by_release": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "maxLength": 120
         },
         "retraction_rationale": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "maxLength": 2000
         },
         "retraction_path": {
@@ -465,11 +467,13 @@
         "retracted_by_release": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "maxLength": 120
         },
         "retraction_rationale": {
           "type": "string",
           "minLength": 1,
+          "pattern": "\\S",
           "maxLength": 2000
         },
         "affected_slot": { "$ref": "#/$defs/category" },
