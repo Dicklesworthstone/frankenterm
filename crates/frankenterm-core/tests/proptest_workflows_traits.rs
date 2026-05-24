@@ -15,6 +15,7 @@ fn arb_step() -> impl Strategy<Value = WorkflowStep> {
 
 struct StaticWorkflow {
     steps: Vec<WorkflowStep>,
+    enabled: bool,
     requires_pane: bool,
     requires_approval: bool,
     can_abort: bool,
@@ -74,6 +75,10 @@ impl Workflow for StaticWorkflow {
         self.destructive
     }
 
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     fn dependencies(&self) -> &'static [&'static str] {
         &["handle_auth_required", "handle_usage_limits"]
     }
@@ -94,6 +99,7 @@ proptest! {
     #[test]
     fn workflow_info_from_workflow_reflects_trait_metadata(
         steps in prop::collection::vec(arb_step(), 1..5),
+        enabled in any::<bool>(),
         requires_pane in any::<bool>(),
         requires_approval in any::<bool>(),
         can_abort in any::<bool>(),
@@ -101,6 +107,7 @@ proptest! {
     ) {
         let workflow = StaticWorkflow {
             steps: steps.clone(),
+            enabled,
             requires_pane,
             requires_approval,
             can_abort,
@@ -111,7 +118,7 @@ proptest! {
 
         prop_assert_eq!(info.name, "static_workflow");
         prop_assert_eq!(info.description, "Synthetic workflow for property tests");
-        prop_assert_eq!(info.enabled, true);
+        prop_assert_eq!(info.enabled, enabled);
         prop_assert_eq!(info.step_count, steps.len());
         prop_assert_eq!(info.requires_pane, requires_pane);
         prop_assert_eq!(info.requires_approval, requires_approval);
@@ -130,6 +137,7 @@ proptest! {
     ) {
         let workflow = StaticWorkflow {
             steps: steps.clone(),
+            enabled: true,
             requires_pane: true,
             requires_approval: false,
             can_abort: true,
@@ -177,6 +185,7 @@ proptest! {
 fn static_workflow_handle_predicate_is_codex_only() {
     let workflow = StaticWorkflow {
         steps: vec![WorkflowStep::new("step", "desc")],
+        enabled: true,
         requires_pane: true,
         requires_approval: false,
         can_abort: true,
