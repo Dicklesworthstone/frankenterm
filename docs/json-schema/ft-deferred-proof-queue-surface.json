@@ -1,0 +1,443 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-deferred-proof-queue-surface.json",
+  "title": "FrankenTerm Deferred Proof Queue Surface",
+  "description": "Static contract for the human/Robot/MCP surfaces that expose the deferred RCH proof replay queue without DB or comment archaeology. Read-only: no surface may suggest local Cargo, worker mutation, service repair, deletion, reset, or broad formatting as an automatic action.",
+  "type": "object",
+  "required": [
+    "contract_id",
+    "generated_at",
+    "guardrails",
+    "summary",
+    "next_candidate",
+    "queue",
+    "explain",
+    "robot_dispatch"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_id": {
+      "type": "string",
+      "const": "ft.deferred_proof_queue_surface.v1"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "guardrails": {
+      "$ref": "#/$defs/guardrails"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "next_candidate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/next_candidate"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "queue": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/queue_entry"
+      }
+    },
+    "explain": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/explain_entry"
+      }
+    },
+    "robot_dispatch": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/dispatch_entry"
+      }
+    }
+  },
+  "$defs": {
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*$"
+    },
+    "receipt_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*:[a-z0-9][a-z0-9._-]*$"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "runnable",
+        "wait_rch",
+        "dirty_overlap",
+        "prerequisite_blocked",
+        "stale_command",
+        "ambiguous",
+        "completed"
+      ]
+    },
+    "target_dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^/tmp/[A-Za-z0-9._-]+$"
+    },
+    "guardrails": {
+      "type": "object",
+      "description": "Machine-checkable assertions that the surface never proposes an unsafe automatic action.",
+      "required": [
+        "forbids_local_cargo",
+        "forbids_worker_mutation",
+        "forbids_service_repair",
+        "forbids_deletion",
+        "forbids_reset",
+        "forbids_broad_formatting",
+        "remediation_allowlist"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "forbids_local_cargo": {
+          "type": "boolean",
+          "const": true
+        },
+        "forbids_worker_mutation": {
+          "type": "boolean",
+          "const": true
+        },
+        "forbids_service_repair": {
+          "type": "boolean",
+          "const": true
+        },
+        "forbids_deletion": {
+          "type": "boolean",
+          "const": true
+        },
+        "forbids_reset": {
+          "type": "boolean",
+          "const": true
+        },
+        "forbids_broad_formatting": {
+          "type": "boolean",
+          "const": true
+        },
+        "remediation_allowlist": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/remediation"
+          }
+        }
+      }
+    },
+    "remediation": {
+      "type": "string",
+      "enum": [
+        "wait_for_rch_admission",
+        "resolve_dirty_overlap",
+        "complete_prerequisite_bead",
+        "refresh_command_shape",
+        "request_human_triage",
+        "none"
+      ]
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "total",
+        "queued",
+        "completed",
+        "by_status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queued": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Receipts not yet proven (every status except completed)."
+        },
+        "completed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "by_status": {
+          "type": "object",
+          "required": [
+            "runnable",
+            "wait_rch",
+            "dirty_overlap",
+            "prerequisite_blocked",
+            "stale_command",
+            "ambiguous",
+            "completed"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "runnable": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "wait_rch": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "dirty_overlap": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "prerequisite_blocked": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stale_command": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "ambiguous": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "completed": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "comment_id",
+        "author",
+        "created_at",
+        "source_text_sha256",
+        "raw_pane_content_stored"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "comment_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "author": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_text_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "raw_pane_content_stored": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "latest_replay": {
+      "type": "object",
+      "required": [
+        "attempted_at",
+        "outcome",
+        "rch_admission_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "attempted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed",
+            "refused_no_worker",
+            "refused_local_fallback",
+            "never_attempted"
+          ]
+        },
+        "rch_admission_state": {
+          "type": "string",
+          "enum": [
+            "admitted",
+            "blocked_worker_pressure",
+            "not_required",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "queue_entry": {
+      "type": "object",
+      "required": [
+        "bead_id",
+        "receipt_id",
+        "status",
+        "reason_codes",
+        "target_dir",
+        "material_remote_required",
+        "replay_allowed",
+        "remediation",
+        "source",
+        "latest_replay"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "receipt_id": {
+          "$ref": "#/$defs/receipt_id"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "reason_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "target_dir": {
+          "$ref": "#/$defs/target_dir"
+        },
+        "material_remote_required": {
+          "type": "boolean"
+        },
+        "replay_allowed": {
+          "type": "boolean"
+        },
+        "remediation": {
+          "$ref": "#/$defs/remediation"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "latest_replay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/latest_replay"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "next_candidate": {
+      "type": "object",
+      "required": [
+        "bead_id",
+        "receipt_id",
+        "reason_codes",
+        "target_dir",
+        "command_preview",
+        "material_remote_required"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "receipt_id": {
+          "$ref": "#/$defs/receipt_id"
+        },
+        "reason_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "target_dir": {
+          "$ref": "#/$defs/target_dir"
+        },
+        "command_preview": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "material_remote_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "explain_entry": {
+      "type": "object",
+      "required": [
+        "bead_id",
+        "status",
+        "why",
+        "blocking_reason_codes",
+        "remediation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "why": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blocking_reason_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "remediation": {
+          "$ref": "#/$defs/remediation"
+        }
+      }
+    },
+    "dispatch_entry": {
+      "type": "object",
+      "description": "Compact TOON-serializable row for AI-to-AI dispatch: one object per queue entry, minimal keys.",
+      "required": [
+        "bead_id",
+        "status",
+        "target_dir",
+        "replay_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "target_dir": {
+          "$ref": "#/$defs/target_dir"
+        },
+        "replay_allowed": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

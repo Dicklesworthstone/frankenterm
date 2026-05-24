@@ -1,0 +1,301 @@
+{
+  "contract_id": "ft.deferred_proof_queue_surface.v1",
+  "generated_at": "2026-05-19T03:00:00Z",
+  "guardrails": {
+    "forbids_local_cargo": true,
+    "forbids_worker_mutation": true,
+    "forbids_service_repair": true,
+    "forbids_deletion": true,
+    "forbids_reset": true,
+    "forbids_broad_formatting": true,
+    "remediation_allowlist": [
+      "wait_for_rch_admission",
+      "resolve_dirty_overlap",
+      "complete_prerequisite_bead",
+      "refresh_command_shape",
+      "request_human_triage",
+      "none"
+    ]
+  },
+  "summary": {
+    "total": 7,
+    "queued": 6,
+    "completed": 1,
+    "by_status": {
+      "runnable": 1,
+      "wait_rch": 1,
+      "dirty_overlap": 1,
+      "prerequisite_blocked": 1,
+      "stale_command": 1,
+      "ambiguous": 1,
+      "completed": 1
+    }
+  },
+  "next_candidate": {
+    "bead_id": "ft-rdy1",
+    "receipt_id": "ft-rdy1:comment-7001",
+    "reason_codes": [
+      "rch.admitted"
+    ],
+    "target_dir": "/tmp/ft-rdy1-recorder",
+    "command_preview": [
+      "rch",
+      "--no-self-healing",
+      "exec",
+      "--",
+      "env",
+      "CARGO_TARGET_DIR=/tmp/ft-rdy1-recorder",
+      "cargo",
+      "test",
+      "-p",
+      "frankenterm-core",
+      "recorder_storage_cas"
+    ],
+    "material_remote_required": true
+  },
+  "queue": [
+    {
+      "bead_id": "ft-am1",
+      "receipt_id": "ft-am1:comment-7006",
+      "status": "ambiguous",
+      "reason_codes": [
+        "ambiguous_comment"
+      ],
+      "target_dir": null,
+      "material_remote_required": false,
+      "replay_allowed": false,
+      "remediation": "request_human_triage",
+      "source": {
+        "comment_id": 7006,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:30:00Z",
+        "source_text_sha256": "ff70b3c9d6836513cc4606064f832aca4b64ffa4024983a075c41c45019f1ae8",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": null
+    },
+    {
+      "bead_id": "ft-cp1",
+      "receipt_id": "ft-cp1:comment-7007",
+      "status": "completed",
+      "reason_codes": [
+        "receipt_emitted"
+      ],
+      "target_dir": "/tmp/ft-cp1-policy",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "none",
+      "source": {
+        "comment_id": 7007,
+        "author": "SilverTrout",
+        "created_at": "2026-05-18T22:05:00Z",
+        "source_text_sha256": "b33385e27c84ff3f6ff6867e105b75630f1558f74bca9d02111154998d57e3ea",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": {
+        "attempted_at": "2026-05-23T18:40:00Z",
+        "outcome": "passed",
+        "rch_admission_state": "admitted"
+      }
+    },
+    {
+      "bead_id": "ft-do1",
+      "receipt_id": "ft-do1:comment-7003",
+      "status": "dirty_overlap",
+      "reason_codes": [
+        "dirty_overlap"
+      ],
+      "target_dir": "/tmp/ft-do1-redactor",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "resolve_dirty_overlap",
+      "source": {
+        "comment_id": 7003,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T02:06:00Z",
+        "source_text_sha256": "6ba0d46e56ef29d92b7a54d92381346451732119a8907fd086054cb7d8c16150",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": null
+    },
+    {
+      "bead_id": "ft-pq1",
+      "receipt_id": "ft-pq1:comment-7004",
+      "status": "prerequisite_blocked",
+      "reason_codes": [
+        "prerequisite_blocked"
+      ],
+      "target_dir": "/tmp/ft-pq1-mcp",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "complete_prerequisite_bead",
+      "source": {
+        "comment_id": 7004,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T02:18:00Z",
+        "source_text_sha256": "6e60213827d5c51e9df0a092ddd74473915eb1c34998a69f9bee4e9a76baeba5",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": null
+    },
+    {
+      "bead_id": "ft-rdy1",
+      "receipt_id": "ft-rdy1:comment-7001",
+      "status": "runnable",
+      "reason_codes": [
+        "rch.admitted"
+      ],
+      "target_dir": "/tmp/ft-rdy1-recorder",
+      "material_remote_required": true,
+      "replay_allowed": true,
+      "remediation": "none",
+      "source": {
+        "comment_id": 7001,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:12:00Z",
+        "source_text_sha256": "e40c06ecf5be7a018f3d3ad281ff7296714338fa879671eab174832ad6a89ca1",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": {
+        "attempted_at": "2026-05-19T01:12:30Z",
+        "outcome": "refused_no_worker",
+        "rch_admission_state": "blocked_worker_pressure"
+      }
+    },
+    {
+      "bead_id": "ft-st1",
+      "receipt_id": "ft-st1:comment-7005",
+      "status": "stale_command",
+      "reason_codes": [
+        "stale_command_shape"
+      ],
+      "target_dir": "/tmp/ft-st1-policy",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "refresh_command_shape",
+      "source": {
+        "comment_id": 7005,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:36:00Z",
+        "source_text_sha256": "e0c5fcbd111f50b5f1eb6440b7311274bbd706d9ca38f4a52656ba9cedcd0a36",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": null
+    },
+    {
+      "bead_id": "ft-wt1",
+      "receipt_id": "ft-wt1:comment-7002",
+      "status": "wait_rch",
+      "reason_codes": [
+        "rch.worker_pressure"
+      ],
+      "target_dir": "/tmp/ft-wt1-latency",
+      "material_remote_required": true,
+      "replay_allowed": false,
+      "remediation": "wait_for_rch_admission",
+      "source": {
+        "comment_id": 7002,
+        "author": "SilverTrout",
+        "created_at": "2026-05-19T01:24:00Z",
+        "source_text_sha256": "92fc3f9d8e7b35fe604571e41b45c5a186ebc452da9a7229621e692125df6f13",
+        "raw_pane_content_stored": false
+      },
+      "latest_replay": {
+        "attempted_at": "2026-05-24T20:20:42Z",
+        "outcome": "refused_local_fallback",
+        "rch_admission_state": "blocked_worker_pressure"
+      }
+    }
+  ],
+  "explain": [
+    {
+      "bead_id": "ft-am1",
+      "status": "ambiguous",
+      "why": "Footer carried no structured command, only prose, so no replayable proof can be derived.",
+      "blocking_reason_codes": [
+        "ambiguous_comment"
+      ],
+      "remediation": "request_human_triage"
+    },
+    {
+      "bead_id": "ft-do1",
+      "status": "dirty_overlap",
+      "why": "Captured tree had dirty paths outside the owned set; replaying would bundle unrelated work.",
+      "blocking_reason_codes": [
+        "dirty_overlap"
+      ],
+      "remediation": "resolve_dirty_overlap"
+    },
+    {
+      "bead_id": "ft-pq1",
+      "status": "prerequisite_blocked",
+      "why": "A prerequisite bead is still open; its proof must land before this receipt can replay.",
+      "blocking_reason_codes": [
+        "prerequisite_blocked"
+      ],
+      "remediation": "complete_prerequisite_bead"
+    },
+    {
+      "bead_id": "ft-st1",
+      "status": "stale_command",
+      "why": "Material command is missing the required remote-only RCH flags or exec shape.",
+      "blocking_reason_codes": [
+        "stale_command_shape"
+      ],
+      "remediation": "refresh_command_shape"
+    },
+    {
+      "bead_id": "ft-wt1",
+      "status": "wait_rch",
+      "why": "RCH admission is under worker pressure; the receipt waits for a remote worker to admit.",
+      "blocking_reason_codes": [
+        "rch.worker_pressure"
+      ],
+      "remediation": "wait_for_rch_admission"
+    }
+  ],
+  "robot_dispatch": [
+    {
+      "bead_id": "ft-am1",
+      "status": "ambiguous",
+      "target_dir": null,
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-cp1",
+      "status": "completed",
+      "target_dir": "/tmp/ft-cp1-policy",
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-do1",
+      "status": "dirty_overlap",
+      "target_dir": "/tmp/ft-do1-redactor",
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-pq1",
+      "status": "prerequisite_blocked",
+      "target_dir": "/tmp/ft-pq1-mcp",
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-rdy1",
+      "status": "runnable",
+      "target_dir": "/tmp/ft-rdy1-recorder",
+      "replay_allowed": true
+    },
+    {
+      "bead_id": "ft-st1",
+      "status": "stale_command",
+      "target_dir": "/tmp/ft-st1-policy",
+      "replay_allowed": false
+    },
+    {
+      "bead_id": "ft-wt1",
+      "status": "wait_rch",
+      "target_dir": "/tmp/ft-wt1-latency",
+      "replay_allowed": false
+    }
+  ]
+}

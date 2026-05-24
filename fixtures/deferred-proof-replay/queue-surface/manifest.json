@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.deferred_proof_queue_surface.v1",
+  "bead": "ft-zbnz4.5",
+  "schema": "docs/json-schema/ft-deferred-proof-queue-surface.json",
+  "contract": "docs/robot-contracts/deferred-proof-queue-surface.md",
+  "cases": "fixtures/deferred-proof-replay/queue-surface/cases.v1.json",
+  "golden_summary": {
+    "queue_entry_count": 7,
+    "queued_count": 6,
+    "completed_count": 1,
+    "explain_count": 5,
+    "statuses": [
+      "ambiguous",
+      "completed",
+      "dirty_overlap",
+      "prerequisite_blocked",
+      "runnable",
+      "stale_command",
+      "wait_rch"
+    ],
+    "remediations": [
+      "complete_prerequisite_bead",
+      "none",
+      "refresh_command_shape",
+      "request_human_triage",
+      "resolve_dirty_overlap",
+      "wait_for_rch_admission"
+    ]
+  },
+  "verification": [
+    "jq empty docs/json-schema/ft-deferred-proof-queue-surface.json fixtures/deferred-proof-replay/queue-surface/manifest.json fixtures/deferred-proof-replay/queue-surface/cases.v1.json",
+    "bash tests/e2e/test_deferred_proof_queue_surface_contract.sh"
+  ]
+}
