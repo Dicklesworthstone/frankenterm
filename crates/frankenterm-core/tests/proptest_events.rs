@@ -961,6 +961,39 @@ proptest! {
             "filter with include should not be permissive");
     }
 
+    /// Property 40b: Exclude is anti-monotone — adding an exclude pattern
+    /// can only remove matches, never add them. Excludes are checked first
+    /// and short-circuit to `false`, so `f_with_extra.matches(d)` implies
+    /// `f.matches(d)` for the same include/severity/agent configuration.
+    #[test]
+    fn prop_filter_exclude_is_antimonotone(
+        detection in arb_detection(),
+        include in proptest::collection::vec(arb_dedup_key(), 0..3),
+        exclude in proptest::collection::vec(arb_dedup_key(), 0..3),
+        extra in arb_dedup_key(),
+    ) {
+        let f = EventFilter::from_config(&include, &exclude, None, &[]);
+        let mut exclude2 = exclude.clone();
+        exclude2.push(extra);
+        let f2 = EventFilter::from_config(&include, &exclude2, None, &[]);
+        if f2.matches(&detection) {
+            prop_assert!(f.matches(&detection),
+                "adding an exclude turned a non-match into a match");
+        }
+    }
+
+    /// Property 40c: A catch-all `"*"` exclude blocks every detection,
+    /// regardless of include rules — exclude precedence is absolute.
+    #[test]
+    fn prop_filter_catchall_exclude_blocks_everything(
+        detection in arb_detection(),
+        include in proptest::collection::vec(arb_dedup_key(), 0..3),
+    ) {
+        let f = EventFilter::from_config(&include, &["*".to_string()], None, &[]);
+        prop_assert!(!f.matches(&detection),
+            "a '*' exclude must block every detection (exclude wins)");
+    }
+
     // ========================================================================
     // Property Tests: event_identity_key
     // ========================================================================
