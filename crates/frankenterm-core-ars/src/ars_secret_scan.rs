@@ -475,19 +475,21 @@ impl ScanStats {
 
     /// Record a scan verdict.
     pub fn record(&mut self, verdict: &ScanVerdict) {
-        self.total_scans += 1;
+        self.total_scans = self.total_scans.saturating_add(1);
         match verdict {
-            ScanVerdict::Clean => self.clean_count += 1,
+            ScanVerdict::Clean => self.clean_count = self.clean_count.saturating_add(1),
             ScanVerdict::Contaminated(contamination) => {
-                self.contaminated_count += 1;
+                self.contaminated_count = self.contaminated_count.saturating_add(1);
                 for finding in &contamination.findings {
-                    self.total_findings += 1;
-                    *self
+                    self.total_findings = self.total_findings.saturating_add(1);
+                    let pattern_count = self
                         .findings_by_pattern
                         .entry(finding.pattern_name.clone())
-                        .or_insert(0) += 1;
+                        .or_insert(0);
+                    *pattern_count = pattern_count.saturating_add(1);
                     let method = format!("{:?}", finding.detection_method);
-                    *self.findings_by_method.entry(method).or_insert(0) += 1;
+                    let method_count = self.findings_by_method.entry(method).or_insert(0);
+                    *method_count = method_count.saturating_add(1);
                 }
             }
         }
@@ -1170,6 +1172,44 @@ mod tests {
         assert_eq!(stats.clean_count, 2);
         assert_eq!(stats.contaminated_count, 1);
         assert_eq!(stats.total_findings, 2);
+    }
+
+    #[test]
+    fn stats_record_saturates_counters() {
+        let mut stats = ScanStats::new();
+        stats.total_scans = u64::MAX;
+        stats.contaminated_count = u64::MAX;
+        stats.total_findings = u64::MAX;
+        stats
+            .findings_by_pattern
+            .insert("openai_key".to_string(), u64::MAX);
+        stats
+            .findings_by_method
+            .insert("PatternMatch".to_string(), u64::MAX);
+        let contaminated = ScanVerdict::Contaminated(ScanContamination {
+            findings: vec![ScanFinding {
+                pattern_name: "openai_key".to_string(),
+                block_index: 0,
+                source: "command".to_string(),
+                byte_offset: 0,
+                match_len: 3,
+                context_redacted: "...".to_string(),
+                detection_method: DetectionMethod::PatternMatch,
+                entropy: None,
+            }],
+            abort_reason: "test".to_string(),
+        });
+
+        stats.record(&contaminated);
+
+        assert_eq!(stats.total_scans, u64::MAX);
+        assert_eq!(stats.contaminated_count, u64::MAX);
+        assert_eq!(stats.total_findings, u64::MAX);
+        assert_eq!(stats.findings_by_pattern.get("openai_key"), Some(&u64::MAX));
+        assert_eq!(
+            stats.findings_by_method.get("PatternMatch"),
+            Some(&u64::MAX)
+        );
     }
 
     // -------------------------------------------------------------------------
