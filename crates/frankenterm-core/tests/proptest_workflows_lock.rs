@@ -215,6 +215,22 @@ proptest! {
     }
 
     #[test]
+    fn proptest_workflow_lock_force_release_missing_lock_updates_only_force_counter(
+        pane_id in 1u64..10_000,
+    ) {
+        let manager = PaneWorkflowLockManager::new();
+
+        prop_assert!(manager.force_release(pane_id).is_none());
+
+        let health = manager.health();
+        prop_assert_eq!(health.force_releases_total, 1);
+        prop_assert_eq!(health.releases_total, 0);
+        prop_assert_eq!(health.active_locks, 0);
+        prop_assert!(!health.is_safe());
+        prop_assert!(manager.is_locked(pane_id).is_none());
+    }
+
+    #[test]
     fn proptest_workflow_lock_force_release_updates_health(
         pane_id in 1u64..10_000,
         workflow_name in arb_label(),
