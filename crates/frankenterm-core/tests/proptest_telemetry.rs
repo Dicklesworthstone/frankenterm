@@ -89,6 +89,32 @@ proptest! {
         }
         prop_assert_eq!(h.count(), values.len() as u64);
     }
+
+    /// Non-finite samples (NaN, ±Inf) are ignored entirely (ft-b4l62 /
+    /// ft-trot7): a finite sequence polluted with non-finite values
+    /// produces the same count and the same quantiles as the finite-only
+    /// sequence. Uses a large capacity (> sequence length) so eviction
+    /// never confounds the comparison.
+    #[test]
+    fn histogram_ignores_non_finite_samples(
+        values in proptest::collection::vec(arb_value(), 1..50),
+    ) {
+        let mut clean = Histogram::new("clean", 1000);
+        let mut dirty = Histogram::new("dirty", 1000);
+        let pollutants = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for (i, &v) in values.iter().enumerate() {
+            clean.record(v);
+            dirty.record(v);
+            // Interleave a non-finite value that must be dropped.
+            dirty.record(pollutants[i % pollutants.len()]);
+        }
+        prop_assert_eq!(clean.count(), dirty.count(),
+            "non-finite samples must not change the recorded count");
+        for q in [0.0_f64, 0.25, 0.5, 0.75, 0.95, 1.0] {
+            prop_assert_eq!(clean.quantile(q), dirty.quantile(q),
+                "non-finite samples must not change quantile at q={}", q);
+        }
+    }
 }
 
 // =============================================================================
