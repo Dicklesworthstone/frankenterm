@@ -255,6 +255,27 @@ proptest! {
     }
 
     #[test]
+    fn step_result_wait_for_with_timeout_preserves_condition_and_timeout(
+        cond in arb_wait_condition(),
+        timeout_ms in 1u64..60_000,
+    ) {
+        let r = StepResult::wait_for_with_timeout(cond.clone(), timeout_ms);
+        prop_assert!(!r.is_continue());
+        prop_assert!(!r.is_terminal());
+        prop_assert!(!r.is_send_text());
+        match r {
+            StepResult::WaitFor {
+                condition,
+                timeout_ms: actual_timeout_ms,
+            } => {
+                prop_assert_eq!(condition, cond);
+                prop_assert_eq!(actual_timeout_ms, Some(timeout_ms));
+            }
+            other => prop_assert!(false, "expected WaitFor, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn text_match_substring_constructor(value in "[a-z ]{3,20}") {
         let m = TextMatch::substring(value.clone());
         let check = matches!(m, TextMatch::Substring { .. });
