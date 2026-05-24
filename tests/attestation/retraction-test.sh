@@ -100,6 +100,28 @@ if [[ ! -f "$REPO_ROOT/$RETRACTION_SIG_REL" ]]; then
   echo "FAIL: retraction signature path is not verifier-resolvable: $RETRACTION_SIG_REL"
   exit 1
 fi
+
+echo
+echo "=== external retraction root is rejected for signed output ==="
+EXTERNAL_RETRACTIONS_ROOT="${TMPDIR:-/tmp}/ft-attestation-external-retractions-${RUN_ID}"
+mkdir -p "$EXTERNAL_RETRACTIONS_ROOT"
+set +e
+ED25519_PRIVATE_KEY_PATH="$KEY" \
+FT_ATTESTATION_RETRACTIONS_ROOT="$EXTERNAL_RETRACTIONS_ROOT" \
+  bash scripts/retract-bundle-slot.sh \
+    --bundle "$BUNDLE" \
+    --slot doctrine/agents-md-counts \
+    --rationale-file "$RATIONALE" \
+    --retracted-by-release 0.0.1-external-root \
+    --sign ed25519 > "$RUN_ROOT/retract-external.out" 2>&1
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] || ! grep -q "signed retraction output must be inside the repository" "$RUN_ROOT/retract-external.out"; then
+  echo "FAIL: external signed retraction root was not rejected with the expected error"
+  cat "$RUN_ROOT/retract-external.out"
+  exit 1
+fi
+
 cp "$RETRACTION_PATH" \
   "$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts-duplicate.json"
 

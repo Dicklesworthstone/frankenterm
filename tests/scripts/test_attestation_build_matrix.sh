@@ -455,6 +455,47 @@ run_sigstore_cases() {
   echo "PASS ${verify_name}"
 }
 
+run_external_signed_output_case() {
+  local fake_bin="${ARTIFACT_ROOT}/fake-cosign-external-bin"
+  install_fake_cosign "${fake_bin}"
+
+  local name="signed_output_outside_repo_fails"
+  local case_dir="${ARTIFACT_ROOT}/${name}"
+  local manifest="${case_dir}/manifest.json"
+  local external_out_dir="${TMPDIR:-/tmp}/ft-e87u6-2-external-signed-output-${RUN_ID}"
+  local version="0.0.0-external-signed-output"
+  local rc=0
+  mkdir -p "${case_dir}" "${external_out_dir}"
+  write_manifest "${manifest}" "$(json_slot '"docs/attestations/schema.json"' "" "")"
+
+  set +e
+  PATH="${fake_bin}:$PATH" \
+  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
+  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  FT_ATTESTATION_MANIFEST="${manifest}" \
+  FT_ATTESTATION_OUT_DIR="${external_out_dir}" \
+  FT_BEAD_ID="ft-e87u6.2" \
+  FT_SCENARIO_ID="attestation_external_signed_output_guard" \
+    bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version "${version}" \
+      --channel stable \
+      --sign cosign >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
+  rc=$?
+  set -e
+
+  total=$((total + 1))
+  if [[ "${rc}" == "0" ]] || ! grep -q "signed attestation output must be inside the repository" "${case_dir}/stderr.txt"; then
+    fail=$((fail + 1))
+    record_result "${name}" "nonzero_external_output_rejection" "${rc}" "failed" "${case_dir}"
+    echo "FAIL ${name}: external signed output was not rejected" >&2
+    return 0
+  fi
+
+  pass=$((pass + 1))
+  record_result "${name}" "nonzero_external_output_rejection" "${rc}" "passed" "${case_dir}"
+  echo "PASS ${name}"
+}
+
 require_cmd bash
 require_cmd jq
 require_cmd git
@@ -527,6 +568,7 @@ run_case \
   --allow-partial
 
 run_sigstore_cases
+run_external_signed_output_case
 
 jq -n \
   --arg bead_id "ft-e87u6.2" \
