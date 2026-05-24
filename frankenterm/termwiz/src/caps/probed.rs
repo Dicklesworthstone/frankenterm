@@ -1,8 +1,8 @@
 use crate::escape::csi::{Device, Window};
 use crate::escape::parser::Parser;
-use crate::escape::{Action, DeviceControlMode, Esc, EscCode, CSI};
+use crate::escape::{Action, CSI, DeviceControlMode, Esc, EscCode};
 use crate::terminal::ScreenSize;
-use crate::{bail, Result};
+use crate::{Result, bail};
 use std::io::{Read, Write};
 
 const TMUX_BEGIN: &str = "\u{1b}Ptmux;\u{1b}";

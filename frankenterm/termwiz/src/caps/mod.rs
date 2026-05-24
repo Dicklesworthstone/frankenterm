@@ -54,7 +54,7 @@
 //! implements some heuristics (a fancy word for guessing) to compute
 //! the terminal capabilities, but also offers a `ProbeHints`
 //! that can be used by the embedding application to override those choices.
-use crate::{builder, Result};
+use crate::{Result, builder};
 use std::env::var;
 use terminfo::{self, capability as cap};
 
@@ -379,10 +379,10 @@ impl Capabilities {
 /// Returns true if the version string `a` is >= `b`
 fn version_ge(a: &str, b: &str) -> bool {
     let mut a = a.split('.');
-    let mut b = b.split('.');
+    let mut b_components = b.split('.');
 
     loop {
-        match (a.next(), b.next()) {
+        match (a.next(), b_components.next()) {
             (Some(a), Some(b)) => match (a.parse::<u64>(), b.parse::<u64>()) {
                 (Ok(a), Ok(b)) => {
                     if a > b {
@@ -405,9 +405,10 @@ fn version_ge(a: &str, b: &str) -> bool {
                 // A is greater
                 return true;
             }
-            (None, Some(_)) => {
-                // A is smaller
-                return false;
+            (None, Some(b)) => {
+                // Missing trailing zero components are equivalent.
+                return b.parse::<u64>() == Ok(0)
+                    && b_components.all(|component| component.parse::<u64>() == Ok(0));
             }
             (None, None) => {
                 // Equal
@@ -566,6 +567,8 @@ mod test {
     #[test]
     fn version_ge_equal_versions() {
         assert!(version_ge("1.0.0", "1.0.0"));
+        assert!(version_ge("1.0", "1.0.0"));
+        assert!(version_ge("1", "1.0.0"));
         assert!(version_ge("0", "0"));
     }
 
