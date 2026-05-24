@@ -1179,12 +1179,11 @@ impl TmuxCommand for ListCommands {
 
         let mut support_commands = tmux_domain.inner.support_commands.lock();
 
-        for line in result.output.split('\n') {
-            if line.is_empty() {
+        for line in result.output.lines() {
+            let Some(command_name) = line.split_whitespace().next() else {
                 continue;
-            }
-            let v: Vec<&str> = line.split(' ').collect();
-            support_commands.insert(v[0].to_string(), line.to_string());
+            };
+            support_commands.insert(command_name.to_string(), line.to_string());
         }
 
         let mut cmd_queue = tmux_domain.inner.cmd_queue.as_ref().lock();
@@ -1601,18 +1600,15 @@ mod tests {
             timestamp: 0,
             number: 0,
             flags: 0,
-            output: "list-windows list-windows".to_string(),
+            output: "\n  list-windows   list-windows\n\n".to_string(),
         };
 
         cmd.process_result(domain_id, &result)?;
 
-        assert!(
-            tmux_domain
-                .inner
-                .support_commands
-                .lock()
-                .contains_key("list-windows")
-        );
+        let support_commands = tmux_domain.inner.support_commands.lock();
+        assert!(support_commands.contains_key("list-windows"));
+        assert!(!support_commands.contains_key(""));
+        drop(support_commands);
 
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert_eq!(queue.len(), 1);
