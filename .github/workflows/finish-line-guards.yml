@@ -267,7 +267,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: ft-e87u6-2-attestation-build-matrix
-          path: ${{ runner.temp }}/ft-e87u6-2-attestation-build-matrix/
+          path: target/test-artifacts/ft-e87u6-2-attestation-build-matrix-ci/
           if-no-files-found: error
           retention-days: 30
 
