@@ -275,6 +275,13 @@ fn validate_failure_handler(
         | DescriptorFailureHandler::Log { message }
         | DescriptorFailureHandler::Abort { message } => message,
     };
+    if message.trim().is_empty() {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(
+                "Failure handler message cannot be empty".to_string(),
+            ),
+        ));
+    }
     if message.len() > limits.max_text_len {
         return Err(crate::Error::Config(
             crate::error::ConfigError::ValidationError(format!(

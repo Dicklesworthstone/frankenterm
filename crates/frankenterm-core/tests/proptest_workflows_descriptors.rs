@@ -668,6 +668,39 @@ proptest! {
     }
 
     #[test]
+    fn empty_failure_handler_message_fails_validation(handler_variant in 0u8..3) {
+        let handler = match handler_variant {
+            0 => DescriptorFailureHandler::Notify {
+                message: " \t ".to_string(),
+            },
+            1 => DescriptorFailureHandler::Log {
+                message: " \t ".to_string(),
+            },
+            _ => DescriptorFailureHandler::Abort {
+                message: " \t ".to_string(),
+            },
+        };
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "failure_handler_blank".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "s".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: Some(handler),
+        };
+
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "failure handler messages must be non-empty when on_failure is configured"
+        );
+    }
+
+    #[test]
     fn workflow_description_respects_configured_text_length_limit(
         max_text_len in 1usize..128,
     ) {
