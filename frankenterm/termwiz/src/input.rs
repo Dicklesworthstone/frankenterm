@@ -806,6 +806,14 @@ fn is_ascii(c: char) -> bool {
     (c as u32) < 0x80
 }
 
+fn signed_coord_to_u16_saturating(value: i16) -> u16 {
+    u16::try_from(value).unwrap_or(if value < 0 { 0 } else { u16::MAX })
+}
+
+fn signed_coord_to_usize_saturating(value: i16) -> usize {
+    usize::try_from(i32::from(value).max(0)).unwrap_or(0)
+}
+
 fn csi_u_encode(
     buf: &mut String,
     c: char,
@@ -1048,8 +1056,8 @@ mod windows {
             }
 
             let mouse = InputEvent::Mouse(MouseEvent {
-                x: event.dwMousePosition.X as u16,
-                y: event.dwMousePosition.Y as u16,
+                x: signed_coord_to_u16_saturating(event.dwMousePosition.X),
+                y: signed_coord_to_u16_saturating(event.dwMousePosition.Y),
                 mouse_buttons: buttons,
                 modifiers,
             });
@@ -1066,8 +1074,8 @@ mod windows {
             callback: &mut F,
         ) {
             callback(InputEvent::Resized {
-                rows: event.dwSize.Y as usize,
-                cols: event.dwSize.X as usize,
+                rows: signed_coord_to_usize_saturating(event.dwSize.Y),
+                cols: signed_coord_to_usize_saturating(event.dwSize.X),
             });
         }
 
@@ -1703,6 +1711,14 @@ mod test {
 
     const NO_MORE: bool = false;
     const MAYBE_MORE: bool = true;
+
+    #[test]
+    fn signed_coordinate_conversions_do_not_wrap_negative_values() {
+        assert_eq!(signed_coord_to_u16_saturating(42), 42);
+        assert_eq!(signed_coord_to_u16_saturating(-1), 0);
+        assert_eq!(signed_coord_to_usize_saturating(42), 42);
+        assert_eq!(signed_coord_to_usize_saturating(-1), 0);
+    }
 
     #[test]
     fn simple() {
