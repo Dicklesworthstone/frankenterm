@@ -1027,7 +1027,9 @@ impl FleetScrollbackOrchestrator {
             return None;
         }
 
-        let fleet_warm_bytes: usize = panes.iter().map(|p| p.warm_bytes).sum();
+        let fleet_warm_bytes = panes
+            .iter()
+            .fold(0usize, |total, pane| total.saturating_add(pane.warm_bytes));
         if fleet_warm_bytes == 0 {
             self.update_activity(panes);
             return None;
@@ -1105,8 +1107,10 @@ impl FleetScrollbackOrchestrator {
         }
 
         self.update_activity(panes);
-        self.total_plans += 1;
-        self.total_targets += targets.len() as u64;
+        self.total_plans = self.total_plans.saturating_add(1);
+        self.total_targets = self
+            .total_targets
+            .saturating_add(u64::try_from(targets.len()).unwrap_or(u64::MAX));
 
         if targets.is_empty() {
             None
@@ -2020,7 +2024,7 @@ mod tests {
             activity_counter: activity,
             warm_bytes,
             warm_pages,
-            estimated_memory_bytes: warm_bytes + 10_000,
+            estimated_memory_bytes: warm_bytes.saturating_add(10_000),
         }
     }
 
@@ -2102,6 +2106,25 @@ mod tests {
         orch.plan_eviction(FleetPressureTier::Critical, &panes);
         assert_eq!(orch.total_plans(), 1);
         assert!(orch.total_targets() >= 1);
+    }
+
+    #[test]
+    fn orchestrator_totals_and_warm_sum_saturate() {
+        let mut orch = FleetScrollbackOrchestrator::new();
+        orch.total_plans = u64::MAX;
+        orch.total_targets = u64::MAX - 1;
+        let panes = vec![
+            make_pane_info(1, 100, usize::MAX, 1),
+            make_pane_info(2, 200, usize::MAX, 1),
+        ];
+
+        let plan = orch.plan_eviction(FleetPressureTier::Critical, &panes);
+
+        assert!(plan.is_some());
+        let plan = plan.unwrap();
+        assert_eq!(plan.fleet_warm_bytes_before, usize::MAX);
+        assert_eq!(orch.total_plans(), u64::MAX);
+        assert_eq!(orch.total_targets(), u64::MAX);
     }
 
     #[test]
