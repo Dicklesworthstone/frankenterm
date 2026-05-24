@@ -971,6 +971,10 @@ pub fn scan_file_text(
     max_per_kind: usize,
     kind_counts: &mut std::collections::HashMap<UnstickFindingKind, usize>,
 ) -> Vec<UnstickFinding> {
+    if max_per_kind == 0 {
+        return Vec::new();
+    }
+
     if unstick_scan_file_exceeds_size_limit(path) {
         return Vec::new();
     }
@@ -1818,6 +1822,21 @@ mod tests {
         assert_eq!(todo_count, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_file_text_zero_max_per_kind_leaves_counts_empty() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let file = root.join("src/workflows/coordination.rs");
+        let source = std::fs::read_to_string(&file).unwrap();
+        assert!(TEXT_SCAN_TODO.is_match(&source));
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = HashMap::new();
+        let findings = scan_file_text(&file, &root, &patterns, 0, &mut kind_counts);
+
+        assert!(findings.is_empty());
+        assert!(kind_counts.is_empty());
     }
 
     #[test]
