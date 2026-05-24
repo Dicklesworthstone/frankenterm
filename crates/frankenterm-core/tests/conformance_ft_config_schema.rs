@@ -276,6 +276,19 @@ fn schema_rejects_invalid_log_level() {
     );
 }
 
+#[test]
+fn schema_rejects_invalid_log_format() {
+    let schema = compile_config_schema();
+    let bad = serde_json::json!({
+        "general": { "log_format": "xml" },
+    });
+    let result = schema.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema MUST reject general.log_format outside the documented enum"
+    );
+}
+
 /// 4c) Falsification: a negative `retention_days` MUST be rejected
 /// (the schema declares `minimum: 0`).
 #[test]
