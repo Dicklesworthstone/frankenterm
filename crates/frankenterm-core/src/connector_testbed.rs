@@ -137,7 +137,7 @@ impl MockProvider {
         at_ms: u64,
         seed: u64,
     ) -> MockProviderOutcome {
-        self.requests_received += 1;
+        self.requests_received = self.requests_received.saturating_add(1);
 
         let current_second = at_ms / 1000;
         let requests_this_second = self
@@ -157,7 +157,7 @@ impl MockProvider {
 
         let success = matches!(outcome, MockProviderOutcome::Success);
         if !success {
-            self.requests_failed += 1;
+            self.requests_failed = self.requests_failed.saturating_add(1);
         }
 
         let request = MockRequest {
@@ -172,7 +172,10 @@ impl MockProvider {
             },
         };
 
-        if self.request_log.len() >= self.max_log_entries {
+        if self.max_log_entries == 0 {
+            return outcome;
+        }
+        while self.request_log.len() >= self.max_log_entries {
             self.request_log.pop_front();
         }
         self.request_log.push_back(request);
@@ -183,7 +186,7 @@ impl MockProvider {
     /// Number of successful requests.
     #[must_use]
     pub fn successful_requests(&self) -> u64 {
-        self.requests_received - self.requests_failed
+        self.requests_received.saturating_sub(self.requests_failed)
     }
 
     /// Failure ratio (0.0..=1.0).
@@ -532,11 +535,11 @@ impl ConnectorTestbed {
         seed: u64,
     ) -> TestbedRequestResult {
         // Evaluate governor first.
-        self.telemetry.governor_evaluations += 1;
+        self.telemetry.governor_evaluations = self.telemetry.governor_evaluations.saturating_add(1);
         let decision = self.governor.evaluate(action, now_ms);
 
         if decision.verdict == GovernorVerdict::Reject {
-            self.telemetry.governor_rejects += 1;
+            self.telemetry.governor_rejects = self.telemetry.governor_rejects.saturating_add(1);
             return TestbedRequestResult {
                 governor_verdict: decision.verdict,
                 provider_outcome: None,
@@ -545,7 +548,7 @@ impl ConnectorTestbed {
         }
 
         // Send to provider.
-        self.telemetry.provider_requests += 1;
+        self.telemetry.provider_requests = self.telemetry.provider_requests.saturating_add(1);
         let provider_outcome = if let Some(provider) = self.providers.get_mut(provider_id) {
             let outcome = provider.receive_request(
                 connector_id,
@@ -554,14 +557,15 @@ impl ConnectorTestbed {
                 seed,
             );
             if !matches!(outcome, MockProviderOutcome::Success) {
-                self.telemetry.provider_failures += 1;
+                self.telemetry.provider_failures =
+                    self.telemetry.provider_failures.saturating_add(1);
                 self.governor.record_outcome(connector_id, false, now_ms);
             } else {
                 self.governor.record_outcome(connector_id, true, now_ms);
             }
             Some(outcome)
         } else {
-            self.telemetry.provider_failures += 1;
+            self.telemetry.provider_failures = self.telemetry.provider_failures.saturating_add(1);
             self.governor.record_outcome(connector_id, false, now_ms);
             Some(MockProviderOutcome::MissingProvider)
         };
@@ -598,7 +602,7 @@ impl ConnectorTestbed {
             metadata: BTreeMap::new(),
         };
 
-        self.telemetry.events_ingested += 1;
+        self.telemetry.events_ingested = self.telemetry.events_ingested.saturating_add(1);
         let ingestion_outcome = Some(self.ingestion.ingest(&event, now_ms));
 
         TestbedRequestResult {
@@ -614,20 +618,24 @@ impl ConnectorTestbed {
         let mut all_passed = true;
 
         for attempt in attempts {
-            self.telemetry.escape_attempts += 1;
+            self.telemetry.escape_attempts = self.telemetry.escape_attempts.saturating_add(1);
             let result = attempt.evaluate(&self.sandbox_envelope);
 
             if result.was_blocked {
-                self.telemetry.escapes_blocked += 1;
+                self.telemetry.escapes_blocked = self.telemetry.escapes_blocked.saturating_add(1);
             } else {
-                self.telemetry.escapes_allowed += 1;
+                self.telemetry.escapes_allowed = self.telemetry.escapes_allowed.saturating_add(1);
             }
 
             if !result.passed {
                 all_passed = false;
             }
 
-            if self.escape_results.len() >= self.config.max_escape_results {
+            if self.config.max_escape_results == 0 {
+                results.push(result);
+                continue;
+            }
+            while self.escape_results.len() >= self.config.max_escape_results {
                 self.escape_results.pop_front();
             }
             self.escape_results.push_back(result.clone());
@@ -653,12 +661,14 @@ impl ConnectorTestbed {
         let mut rejected = 0u64;
 
         for i in 0..event_count {
+            let offset_ms = (i as u64).saturating_mul(10);
+            let timestamp_ms = start_ms.saturating_add(offset_ms);
             let event = CanonicalConnectorEvent {
                 schema_version: SchemaVersion::current(),
                 direction: EventDirection::Inbound,
                 event_id: format!("flood-{i}"),
                 correlation_id: format!("flood-corr-{i}"),
-                timestamp_ms: start_ms + (i as u64) * 10,
+                timestamp_ms,
                 connector_id: connector_id.to_string(),
                 connector_name: Some(connector_id.to_string()),
                 event_type: "flood_event".to_string(),
@@ -677,11 +687,11 @@ impl ConnectorTestbed {
                 metadata: BTreeMap::new(),
             };
 
-            let now = start_ms + (i as u64) * 10;
+            let now = timestamp_ms;
             match self.ingestion.ingest(&event, now) {
-                IngestionOutcome::Recorded => recorded += 1,
-                IngestionOutcome::Filtered => filtered += 1,
-                IngestionOutcome::Rejected { .. } => rejected += 1,
+                IngestionOutcome::Recorded => recorded = recorded.saturating_add(1),
+                IngestionOutcome::Filtered => filtered = filtered.saturating_add(1),
+                IngestionOutcome::Rejected { .. } => rejected = rejected.saturating_add(1),
             }
         }
 
@@ -905,6 +915,32 @@ mod tests {
         // Bounded to 2 entries.
         assert_eq!(p.request_log.len(), 2);
         assert_eq!(p.request_log[0].connector_id, "b");
+    }
+
+    #[test]
+    fn mock_provider_counters_saturate_and_zero_log_capacity() {
+        let mut p = MockProvider::new("github");
+        p.go_offline();
+        p.requests_received = u64::MAX;
+        p.requests_failed = u64::MAX;
+        p.max_log_entries = 0;
+
+        let outcome = p.receive_request("conn-1", "invoke", 1000, 50);
+
+        assert_eq!(outcome, MockProviderOutcome::Offline);
+        assert_eq!(p.requests_received, u64::MAX);
+        assert_eq!(p.requests_failed, u64::MAX);
+        assert!(p.request_log.is_empty());
+        assert_eq!(p.successful_requests(), 0);
+    }
+
+    #[test]
+    fn mock_provider_successful_requests_saturates_when_failed_exceeds_received() {
+        let mut p = MockProvider::new("github");
+        p.requests_received = 1;
+        p.requests_failed = 2;
+
+        assert_eq!(p.successful_requests(), 0);
     }
 
     #[test]
@@ -1143,6 +1179,57 @@ mod tests {
         assert_eq!(t.governor_evaluations, 2);
         assert_eq!(t.provider_requests, 2);
         assert_eq!(t.events_ingested, 2);
+    }
+
+    #[test]
+    fn testbed_request_telemetry_saturates() {
+        let mut tb = ConnectorTestbed::new(TestbedConfig::default());
+        let mut provider = MockProvider::new("github");
+        provider.go_offline();
+        tb.register_provider(provider);
+        tb.telemetry.governor_evaluations = u64::MAX;
+        tb.telemetry.provider_requests = u64::MAX;
+        tb.telemetry.provider_failures = u64::MAX;
+        tb.telemetry.events_ingested = u64::MAX;
+
+        let action = sample_action("conn-1", ConnectorActionKind::Notify);
+        let result = tb.send_request("github", "conn-1", &action, 1000, 50);
+
+        assert_eq!(result.provider_outcome, Some(MockProviderOutcome::Offline));
+        assert_eq!(tb.telemetry().governor_evaluations, u64::MAX);
+        assert_eq!(tb.telemetry().provider_requests, u64::MAX);
+        assert_eq!(tb.telemetry().provider_failures, u64::MAX);
+        assert_eq!(tb.telemetry().events_ingested, u64::MAX);
+    }
+
+    #[test]
+    fn testbed_sandbox_telemetry_saturates_and_zero_result_capacity() {
+        let config = TestbedConfig {
+            max_escape_results: 0,
+            ..Default::default()
+        };
+        let mut tb = ConnectorTestbed::new(config);
+        tb.telemetry.escape_attempts = u64::MAX;
+        tb.telemetry.escapes_blocked = u64::MAX;
+        let attempts = [SandboxEscapeAttempt::filesystem_read("/etc/passwd")];
+
+        let report = tb.run_sandbox_probe(&attempts);
+
+        assert!(report.all_passed);
+        assert_eq!(report.total_attempts, 1);
+        assert_eq!(tb.telemetry().escape_attempts, u64::MAX);
+        assert_eq!(tb.telemetry().escapes_blocked, u64::MAX);
+        assert!(tb.escape_results().is_empty());
+    }
+
+    #[test]
+    fn testbed_ingestion_flood_saturates_timestamp_offsets() {
+        let mut tb = ConnectorTestbed::new(TestbedConfig::default());
+
+        let report = tb.run_ingestion_flood("conn-1", 2, u64::MAX - 5);
+
+        assert_eq!(report.total_events, 2);
+        assert!(report.chain_integrity_valid);
     }
 
     // -------------------------------------------------------------------------
