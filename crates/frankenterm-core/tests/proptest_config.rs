@@ -530,6 +530,39 @@ proptest! {
         let expected = inc_count > 0 || exc_count > 0;
         prop_assert_eq!(config.has_rules(), expected);
     }
+
+    #[test]
+    fn filter_config_validate_accepts_unique_valid_rules(
+        inc_count in 0usize..3,
+        exc_count in 0usize..3,
+    ) {
+        let include: Vec<PaneFilterRule> = (0..inc_count)
+            .map(|i| PaneFilterRule::new(format!("inc_{}", i)).with_domain("local"))
+            .collect();
+        let exclude: Vec<PaneFilterRule> = (0..exc_count)
+            .map(|i| PaneFilterRule::new(format!("exc_{}", i)).with_title("vim"))
+            .collect();
+        let config = PaneFilterConfig { include, exclude };
+        prop_assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn filter_config_validate_rejects_duplicate_ids(id in arb_id()) {
+        let config = PaneFilterConfig {
+            include: vec![PaneFilterRule::new(id.clone()).with_domain("local")],
+            exclude: vec![PaneFilterRule::new(id).with_title("vim")],
+        };
+        prop_assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn filter_config_validate_rejects_invalid_nested_rule(id in arb_id()) {
+        let config = PaneFilterConfig {
+            include: vec![PaneFilterRule::new(id).with_title(" \t")],
+            exclude: vec![],
+        };
+        prop_assert!(config.validate().is_err());
+    }
 }
 
 // =============================================================================
