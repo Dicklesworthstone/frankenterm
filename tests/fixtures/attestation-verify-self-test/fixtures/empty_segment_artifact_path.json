@@ -4,7 +4,7 @@
       "category": "perf/headline-claims",
       "description": "Headline-claim manifest + 5 must-prove benches (G3).",
       "media_type": "application/json",
-      "path": "docs/perf/headline-claims.json",
+      "path": "docs//attestations/schema.json",
       "produced_by_bead": "ft-syqcz.3",
       "proof_categories": [
         5
@@ -214,6 +214,18 @@
       ],
       "sha256": "c6cb5180cb3219df614ce52dc00f0058c7880fe2106261c9752776bd72fba824",
       "size_bytes": 2734
+    },
+    {
+      "category": "doctrine/agents-md-counts",
+      "description": "Auto-stamped README/AGENTS module/crate/test counts (G6).",
+      "media_type": "application/json",
+      "path": "docs/attestations/doctrine/agents-md-counts.json",
+      "produced_by_bead": "ft-tf6g3.2",
+      "proof_categories": [
+        5
+      ],
+      "sha256": "751592804fc42dd458347b775be7d67a4e91a45f41578cd360384c9f63428ae9",
+      "size_bytes": 11245
     },
     {
       "category": "doctrine/vendored-provenance",
@@ -801,7 +813,7 @@
   "retractions": [],
   "schema_version": "1.0.0",
   "signature": {
-    "canonical_sha256": "90ac3004df2e83b68b536c1c580922ac184299c74f91a8af36ccedb689b4c59f",
+    "canonical_sha256": "4859562831a94e733ed4eaab35a2c2f571c84f909276c38a77e469c29c02476d",
     "method": "unsigned",
     "reason": "dev channel bundle — production releases must use --sign cosign or --sign ed25519"
   },

@@ -26,6 +26,8 @@
 #       - extra_unknown_slot
 #       - absolute_artifact_path
 #       - parent_artifact_path
+#       - dot_segment_artifact_path
+#       - empty_segment_artifact_path
 #       - wrong_schema_version
 #       - missing_release_block
 #       - inflated_taxonomy_coverage
@@ -114,6 +116,8 @@ expect_verdict "missing_required_slot.json"            "false" "missing|required
 expect_verdict "extra_unknown_slot.json"               "false" "unknown|forbidden|fake"
 expect_verdict "absolute_artifact_path.json"           "false" "repo-relative|parent traversal|artifact path"
 expect_verdict "parent_artifact_path.json"             "false" "repo-relative|parent traversal|artifact path"
+expect_verdict "dot_segment_artifact_path.json"        "false" "repo-relative|parent traversal|artifact path"
+expect_verdict "empty_segment_artifact_path.json"      "false" "repo-relative|parent traversal|artifact path"
 expect_verdict "wrong_schema_version.json"             "false" "schema|version|9\\.9\\.9"
 expect_verdict "missing_release_block.json"            "false" "release|version|tag"
 expect_verdict "inflated_taxonomy_coverage.json"       "false" "taxonomy|coverage"

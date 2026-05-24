@@ -87,6 +87,12 @@ refresh_unsigned_canonical_sha "$FIX/absolute_artifact_path.json"
 jq '.artifacts[0].path = "../docs/attestations/schema.json"' \
   "$POSITIVE" > "$FIX/parent_artifact_path.json"
 refresh_unsigned_canonical_sha "$FIX/parent_artifact_path.json"
+jq '.artifacts[0].path = "./docs/attestations/schema.json"' \
+  "$POSITIVE" > "$FIX/dot_segment_artifact_path.json"
+refresh_unsigned_canonical_sha "$FIX/dot_segment_artifact_path.json"
+jq '.artifacts[0].path = "docs//attestations/schema.json"' \
+  "$POSITIVE" > "$FIX/empty_segment_artifact_path.json"
+refresh_unsigned_canonical_sha "$FIX/empty_segment_artifact_path.json"
 jq '.schema_version = "9.9.9"' "$POSITIVE" > "$FIX/wrong_schema_version.json"
 refresh_unsigned_canonical_sha "$FIX/wrong_schema_version.json"
 jq 'del(.release)' "$POSITIVE" > "$FIX/missing_release_block.json"
