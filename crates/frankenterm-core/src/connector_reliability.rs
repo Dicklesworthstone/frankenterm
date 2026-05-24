@@ -181,7 +181,7 @@ impl DeadLetterEntry {
         error_kind: ConnectorErrorKind,
         timestamp_ms: u64,
     ) {
-        self.attempt_count += 1;
+        self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_error = error.into();
         self.error_kind = error_kind;
         self.last_failed_at_ms = timestamp_ms;
@@ -1382,6 +1382,19 @@ mod tests {
         assert!(entry.exceeded_max_retries(3));
         assert_eq!(entry.attempt_count, 3);
         assert_eq!(entry.last_failed_at_ms, 3000);
+    }
+
+    #[test]
+    fn connector_reliability_entry_retry_count_saturates() {
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let mut entry = DeadLetterEntry::new(1, action, "err", ConnectorErrorKind::Transient, 1000);
+        entry.attempt_count = u32::MAX;
+
+        entry.record_retry_failure("err2", ConnectorErrorKind::Timeout, 2000);
+
+        assert_eq!(entry.attempt_count, u32::MAX);
+        assert_eq!(entry.error_kind, ConnectorErrorKind::Timeout);
+        assert_eq!(entry.last_failed_at_ms, 2000);
     }
 
     // ---- Shedding ----
