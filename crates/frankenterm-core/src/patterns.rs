@@ -605,9 +605,25 @@ impl RuleDef {
             .into());
         }
 
+        if self.event_type.trim().is_empty() {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must include a non-empty event_type",
+                self.id
+            ))
+            .into());
+        }
+
         if self.anchors.is_empty() || self.anchors.iter().any(|a| a.trim().is_empty()) {
             return Err(PatternError::InvalidRule(format!(
                 "rule id '{}' must include at least one non-empty anchor",
+                self.id
+            ))
+            .into());
+        }
+
+        if self.description.trim().is_empty() {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must include a non-empty description",
                 self.id
             ))
             .into());
@@ -4973,6 +4989,14 @@ rules:
     }
 
     #[test]
+    fn empty_event_type_is_rejected() {
+        let mut rule = sample_rule("codex.test");
+        rule.event_type = " \t".to_string();
+        let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn empty_anchor_is_rejected() {
         let mut rule = sample_rule("codex.test");
         rule.anchors = vec![String::new()];
@@ -4984,6 +5008,14 @@ rules:
     fn empty_anchors_list_is_rejected() {
         let mut rule = sample_rule("codex.test");
         rule.anchors = Vec::new();
+        let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
+        assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn empty_description_is_rejected() {
+        let mut rule = sample_rule("codex.test");
+        rule.description = " \n".to_string();
         let pack = PatternPack::new("pack", "0.1.0", vec![rule]);
         assert!(PatternLibrary::new(vec![pack]).is_err());
     }
