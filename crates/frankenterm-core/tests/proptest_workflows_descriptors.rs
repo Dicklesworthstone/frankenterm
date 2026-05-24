@@ -834,6 +834,56 @@ proptest! {
     }
 
     #[test]
+    fn regex_matcher_respects_configured_match_length_limit(
+        max_match_len in 0usize..128,
+    ) {
+        let limits = frankenterm_core::workflows::DescriptorLimits {
+            max_match_len,
+            ..frankenterm_core::workflows::DescriptorLimits::default()
+        };
+
+        let at_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "regex_match_at_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::WaitFor {
+                id: "wait".to_string(),
+                description: None,
+                matcher: DescriptorMatcher::Regex {
+                    pattern: "x".repeat(max_match_len),
+                },
+                timeout_ms: None,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            at_limit.validate(&limits).is_ok(),
+            "regex matcher at max_match_len should validate"
+        );
+
+        let over_limit = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "regex_match_over_boundary".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::WaitFor {
+                id: "wait".to_string(),
+                description: None,
+                matcher: DescriptorMatcher::Regex {
+                    pattern: "x".repeat(max_match_len.saturating_add(1)),
+                },
+                timeout_ms: None,
+            }],
+            on_failure: None,
+        };
+        prop_assert!(
+            over_limit.validate(&limits).is_err(),
+            "regex matcher longer than max_match_len should fail validation"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();
