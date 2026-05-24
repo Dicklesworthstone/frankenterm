@@ -1,9 +1,9 @@
 //! This module provides some automatic layout functionality for widgets.
 //! The parameters are similar to those that you may have encountered
 //! in HTML, but do not fully recreate the layout model.
-use crate::{format_err, Error, Result};
-use cassowary::strength::{REQUIRED, STRONG, WEAK};
+use crate::{Error, Result, format_err};
 use cassowary::WeightedRelation::*;
+use cassowary::strength::{REQUIRED, STRONG, WEAK};
 use cassowary::{AddConstraintError, Expression, Solver, SuggestValueError, Variable};
 use std::collections::HashMap;
 
@@ -194,6 +194,10 @@ fn adderr(e: AddConstraintError) -> Error {
     format_err!("{:?}", e)
 }
 
+fn parent_relative_coordinate(child: usize, parent: usize) -> usize {
+    child.saturating_sub(parent)
+}
+
 impl Default for LayoutState {
     fn default() -> Self {
         Self::new()
@@ -292,8 +296,8 @@ impl LayoutState {
         results.push(LaidOutWidget {
             widget,
             rect: Rect {
-                x: left - parent_left,
-                y: top - parent_top,
+                x: parent_relative_coordinate(left, parent_left),
+                y: parent_relative_coordinate(top, parent_top),
                 width,
                 height,
             },
@@ -534,6 +538,12 @@ impl LayoutState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn parent_relative_coordinate_saturates_underflow() {
+        assert_eq!(parent_relative_coordinate(7, 3), 4);
+        assert_eq!(parent_relative_coordinate(3, 7), 0);
+    }
 
     #[test]
     fn single_widget_unspec() {
