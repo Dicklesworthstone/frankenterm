@@ -363,7 +363,7 @@ impl ArsSecretScanner {
                         pattern_name: "high_entropy".to_string(),
                         block_index,
                         source: source.to_string(),
-                        byte_offset: 0, // Approximate; not byte-exact for tokens.
+                        byte_offset: token_start,
                         match_len: len,
                         context_redacted: format!(
                             "[HIGH_ENTROPY len={} entropy={:.2}]",
@@ -990,6 +990,22 @@ mod tests {
                 .any(|f| f.detection_method == DetectionMethod::EntropyThreshold);
             assert!(has_entropy, "should have entropy-based detection");
         }
+    }
+
+    #[test]
+    fn entropy_finding_reports_token_byte_offset() {
+        let scanner = default_scanner();
+        let secret = "Zx9kQ3mW7bRt5Yp8Cn2FvJ6dLs4A";
+        let text = format!("prefix {secret} suffix");
+
+        let findings = scanner.scan_text_standalone(&text);
+        let entropy = findings
+            .iter()
+            .find(|finding| finding.detection_method == DetectionMethod::EntropyThreshold)
+            .expect("high-entropy token should be detected");
+
+        assert_eq!(entropy.byte_offset, "prefix ".len());
+        assert_eq!(entropy.match_len, secret.len());
     }
 
     #[test]
