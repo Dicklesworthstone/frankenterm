@@ -947,6 +947,27 @@ impl PaneFilterConfig {
     pub fn has_rules(&self) -> bool {
         !self.include.is_empty() || !self.exclude.is_empty()
     }
+
+    /// Validate include/exclude rules and ensure rule IDs are unique
+    /// across both lists.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for (surface, rules) in [
+            ("ingest.panes.include", &self.include),
+            ("ingest.panes.exclude", &self.exclude),
+        ] {
+            for rule in rules {
+                rule.validate()?;
+                if !seen.insert(rule.id.clone()) {
+                    return Err(format!(
+                        "Duplicate pane filter rule id in {surface}: {}",
+                        rule.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A single pane filter rule with optional matchers for domain, title, and cwd
@@ -4559,6 +4580,11 @@ impl Config {
         }
 
         self.ingest
+            .panes
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        self.ingest
             .priorities
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
@@ -6084,6 +6110,47 @@ max_bytes_per_sec = 1048576
         let err = config.validate().expect_err("Expected validation failure");
         assert!(
             err.to_string().contains("Duplicate pane priority rule id"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pane_filter_validation_rejects_invalid_rules() {
+        let mut config = Config::default();
+        config
+            .ingest
+            .panes
+            .include
+            .push(PaneFilterRule::new("blank_title").with_title(" \t"));
+
+        let err = config
+            .validate()
+            .expect_err("Expected pane filter validation failure");
+        assert!(
+            err.to_string().contains("empty title matcher"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pane_filter_validation_rejects_duplicate_ids() {
+        let mut config = Config::default();
+        config
+            .ingest
+            .panes
+            .include
+            .push(PaneFilterRule::new("dup").with_title("codex"));
+        config
+            .ingest
+            .panes
+            .exclude
+            .push(PaneFilterRule::new("dup").with_title("vim"));
+
+        let err = config
+            .validate()
+            .expect_err("Expected duplicate pane filter rule validation failure");
+        assert!(
+            err.to_string().contains("Duplicate pane filter rule id"),
             "Unexpected error: {err}"
         );
     }
