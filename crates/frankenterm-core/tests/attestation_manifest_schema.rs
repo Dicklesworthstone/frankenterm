@@ -340,6 +340,38 @@ fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
 }
 
 #[test]
+fn bundle_schema_rejects_unsafe_signature_paths() {
+    let validator = bundle_validator();
+
+    let unsafe_sigstore_path = base_bundle(json!({
+        "method": "sigstore-cosign-keyless",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "sigstore_bundle": {
+            "path": "../0.2.0.sigstore",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "size_bytes": 4096
+        },
+        "certificate_identity": "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+        "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+    }));
+    assert!(
+        !validate(&validator, &unsafe_sigstore_path).is_empty(),
+        "sigstore bundle path must reject parent-directory traversal"
+    );
+
+    let unsafe_ed25519_path = base_bundle(json!({
+        "method": "ed25519",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signature_path": "../0.2.0.sig",
+        "public_key": "3333333333333333333333333333333333333333333333333333333333333333"
+    }));
+    assert!(
+        !validate(&validator, &unsafe_ed25519_path).is_empty(),
+        "ed25519 signature_path must reject parent-directory traversal"
+    );
+}
+
+#[test]
 fn bundle_schema_requires_canonical_confidence_summary() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({

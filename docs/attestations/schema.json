@@ -583,7 +583,8 @@
         "path": {
           "description": "Repo-relative path to the cosign sigstore bundle emitted beside the release attestation JSON.",
           "type": "string",
-          "pattern": "^[^/].*$"
+          "pattern": "^[^/].*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "sha256": {
           "description": "Lowercase hex SHA-256 of the sigstore bundle bytes. This binds the external .sigstore file to the signed JSON bundle.",
@@ -709,7 +710,9 @@
         },
         "signature_path": {
           "description": "Repo-relative path to the raw 64-byte ed25519 signature, hex-encoded.",
-          "type": "string"
+          "type": "string",
+          "pattern": "^[^/].*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "public_key": {
           "description": "32-byte ed25519 public key, hex-encoded.",
@@ -745,7 +748,9 @@
             "method": { "const": "ed25519" },
             "signature_path": {
               "description": "Repo-relative path to the raw 64-byte ed25519 signature, hex-encoded.",
-              "type": "string"
+              "type": "string",
+              "pattern": "^[^/].*$",
+              "not": { "pattern": "(^|/)\\.\\.(/|$)" }
             },
             "public_key": {
               "description": "32-byte ed25519 public key, hex-encoded.",
