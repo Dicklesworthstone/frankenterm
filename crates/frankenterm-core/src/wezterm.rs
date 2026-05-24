@@ -6452,12 +6452,13 @@ pub fn evaluate_backend_selection(inputs: &BackendSelectionInputs) -> BackendSel
 /// Discover the WezTerm mux socket path using all available sources.
 ///
 /// Resolution order:
-/// 1. Explicit config path (if set, non-empty, and exists on disk)
-/// 2. `WEZTERM_UNIX_SOCKET` environment variable (if set and exists)
+/// 1. Explicit config path (if set, non-empty, and usable)
+/// 2. `WEZTERM_UNIX_SOCKET` environment variable (if set and usable)
 /// 3. *(vendored feature, unix)* Canonical WezTerm unix-domain defaults
 ///    (e.g. `$XDG_RUNTIME_DIR/wezterm/sock`)
 ///
-/// Returns the first socket path that exists on disk, or `None`.
+/// Returns the first usable socket path, or `None`. On Unix, regular
+/// files are rejected; the path must be a socket.
 #[must_use]
 pub fn discover_mux_socket(config_socket_path: Option<&str>) -> Option<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
@@ -6465,14 +6466,14 @@ pub fn discover_mux_socket(config_socket_path: Option<&str>) -> Option<std::path
     // 1. Explicit config path.
     if let Some(path) = config_socket_path {
         let trimmed = path.trim();
-        if !trimmed.is_empty() && Path::new(trimmed).exists() {
+        if !trimmed.is_empty() && mux_socket_path_is_usable(Path::new(trimmed)) {
             return Some(PathBuf::from(trimmed));
         }
     }
 
     // 2. WEZTERM_UNIX_SOCKET env var.
     if let Ok(path) = std::env::var("WEZTERM_UNIX_SOCKET") {
-        if !path.trim().is_empty() && Path::new(path.trim()).exists() {
+        if !path.trim().is_empty() && mux_socket_path_is_usable(Path::new(path.trim())) {
             return Some(PathBuf::from(path.trim()));
         }
     }
@@ -6486,6 +6487,22 @@ pub fn discover_mux_socket(config_socket_path: Option<&str>) -> Option<std::path
     }
 
     None
+}
+
+fn mux_socket_path_is_usable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        std::fs::metadata(path)
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
 }
 
 /// Build a `UnifiedClient` by probing the runtime environment.
@@ -7927,6 +7944,22 @@ mod unified_tests {
         let sel = evaluate_backend_selection(&inp);
         assert_eq!(sel.kind, BackendKind::Cli);
         assert!(sel.reason.contains("socket not discovered"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mux_socket_path_rejects_regular_files() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        assert!(!mux_socket_path_is_usable(file.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mux_socket_path_accepts_unix_socket() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket_path = dir.path().join("mux.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("unix socket");
+        assert!(mux_socket_path_is_usable(&socket_path));
     }
 
     #[test]
