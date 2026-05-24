@@ -236,6 +236,57 @@ fixture_cases.each do |entry|
   end
 end
 
+# Negative corpus: prove the safety predicates actually fire on a violated
+# gate. Start from the clean "allow" golden and apply one targeted corruption
+# per predicate, asserting the predicate trips (and does not false-positive on
+# the safe shape). This guards against a predicate being silently weakened — a
+# weakened guard would still pass every positive golden case above.
+dup_gate = ->(g) { Marshal.load(Marshal.dump(g)) }
+clean = fixture_cases.find { |entry| entry.fetch("case_id") == "allow-clean-static" }
+fail!("negative corpus needs the allow-clean-static golden") unless clean
+base = clean.fetch("gate")
+fail!("negative-corpus base is not a clean allow") unless base.fetch("decision").fetch("state") == "allow"
+
+# 1. path_safe? must reject absolute, traversal, .git, and empty-segment paths.
+["/etc/passwd", "../escape", ".git/config", "foo//bar", "foo/./bar", ""].each do |bad|
+  fail!("path_safe? accepted unsafe path #{bad.inspect}") if path_safe?(bad)
+end
+fail!("path_safe? rejected a known-good repo path") unless path_safe?("tests/e2e/test_deferred_proof_ownership_gate.sh")
+
+# 2. A dirty path overlapping an owned path must register as current overlap
+#    (the condition that forbids an allow decision).
+overlap_gate = dup_gate.call(base)
+owned_first = overlap_gate.fetch("receipt").fetch("owned_paths").first
+overlap_gate.fetch("current_checkout").fetch("dirty_paths") <<
+  { "path" => owned_first, "status" => " M", "category" => "owned_overlap" }
+fail!("current_dirty_overlap missed an injected owned-path overlap") if current_dirty_overlap(overlap_gate).empty?
+
+# 3. An open prerequisite bead must register as blocked; a closed one must not.
+open_prereq = dup_gate.call(base)
+open_prereq.fetch("coordination").fetch("prerequisite_beads") << { "bead_id" => "ft-open1", "status" => "open" }
+fail!("blocked_prerequisite? missed an open prerequisite") unless blocked_prerequisite?(open_prereq)
+closed_prereq = dup_gate.call(base)
+closed_prereq.fetch("coordination").fetch("prerequisite_beads") << { "bead_id" => "ft-done1", "status" => "closed" }
+fail!("blocked_prerequisite? false-positived on a closed prerequisite") if blocked_prerequisite?(closed_prereq)
+
+# 4. Unknown mail without a fallback snapshot must be flagged; with one, not.
+mail_unknown = dup_gate.call(base)
+mail_unknown.fetch("coordination")["agent_mail_state"] = "unknown"
+mail_unknown.fetch("coordination")["agent_mail_fallback_snapshot"] = false
+fail!("unknown_mail_without_fallback? missed unknown mail with no fallback") unless unknown_mail_without_fallback?(mail_unknown)
+mail_fallback = dup_gate.call(base)
+mail_fallback.fetch("coordination")["agent_mail_state"] = "unknown"
+mail_fallback.fetch("coordination")["agent_mail_fallback_snapshot"] = true
+fail!("unknown_mail_without_fallback? ignored a present fallback snapshot") if unknown_mail_without_fallback?(mail_fallback)
+
+# 5. A stale (>2h) in-progress owner overlapping owned paths registers as a
+#    stale overlap, not an active one.
+stale_owner = dup_gate.call(base)
+stale_owner.fetch("coordination").fetch("in_progress_owners") <<
+  { "agent" => "GhostOwner", "stale_over_2h" => true, "owned_paths" => [stale_owner.fetch("receipt").fetch("owned_paths").first] }
+fail!("stale_owner_overlap missed a stale overlapping owner") unless stale_owner_overlap(stale_owner)
+fail!("active_owner_overlap false-positived on a stale-only owner") if active_owner_overlap(stale_owner)
+
 EXPECTED_STATES.each do |state|
   fail!("doc missing state #{state}") unless doc.include?(state)
 end
@@ -246,5 +297,5 @@ fail!("doc missing fixture path") unless doc.include?("fixtures/deferred-proof-r
 fail!("provenance missing ownership gate row") unless provenance.include?("`ft-deferred-proof-ownership-gate.json`")
 fail!("provenance missing ownership gate verifier") unless provenance.include?("bash tests/e2e/test_deferred_proof_ownership_gate.sh")
 
-puts "deferred proof ownership gate: static verifier passed (#{ids.length} cases, #{EXPECTED_STATES.length} decision states)"
+puts "deferred proof ownership gate: static verifier passed (#{ids.length} cases, #{EXPECTED_STATES.length} decision states, predicate negative corpus green)"
 RUBY
