@@ -81,6 +81,29 @@ check("negative expectation helper records expected failures") do
   raise "missing failure reason" unless record["failure_reason"].to_s.include?("gamma delta")
 end
 
+check("structured failure logs redact sensitive reason text") do
+  log_io = StringIO.new
+  StaticAttestation.configure(log_io: log_io, log_enabled: true)
+  StaticAttestation.expect_failure!("secret failure reason", check: "test.secret_reason") do
+    StaticAttestation.fail!(
+      "api key leaked in synthetic fixture",
+      check: "test.secret_reason.inner",
+      input_path: "inline-secret-fixture",
+      expected: "no secret",
+      actual: "sk-ant-secret123456789012345",
+      reason: "token sk-ant-secret123456789012345 must not reach logs",
+    )
+  end
+
+  records = log_io.string.lines.map { |line| JSON.parse(line) }
+  inner_record = records.find { |record| record["check"] == "test.secret_reason.inner" }
+  raise "missing inner failure record" unless inner_record
+  serialized = JSON.generate(inner_record)
+  raise "secret leaked into structured log" if serialized.include?("sk-ant-secret")
+  reason = inner_record.fetch("failure_reason")
+  raise "failure reason was not redacted" unless reason.fetch("redacted").start_with?("sha256:")
+end
+
 check("passive-watch source documents and multi-word audit phrases are preserved") do
   attestation = StaticAttestation.read_json!("docs/security/passive-watch-attestation.json")
   StaticAttestation.require_source_documents!(attestation.fetch("source_documents"))

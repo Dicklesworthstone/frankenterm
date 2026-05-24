@@ -93,7 +93,7 @@ module StaticAttestation
           "expected" => safe_value(expected),
           "actual" => safe_value(actual),
           "status" => status,
-          "failure_reason" => reason,
+          "failure_reason" => safe_value(reason),
         }.compact,
       ),
     )
@@ -344,7 +344,7 @@ module StaticAttestation
   def safe_literal?(value)
     value.bytesize <= 120 &&
       !value.match?(/[[:cntrl:]]/) &&
-      value.match?(/\A[-A-Za-z0-9_.,:\/@+=\[\]{}()#! ]*\z/) &&
+      value.match?(/\A[-A-Za-z0-9_.,:\/@+=\[\]{}()#!" ]*\z/) &&
       !value.match?(/(secret|token|password|api[_-]?key|pane content)/i)
   end
 end
