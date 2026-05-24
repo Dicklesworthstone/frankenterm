@@ -159,6 +159,13 @@ impl WorkflowDescriptor {
                 )),
             ));
         }
+        if self.name.chars().any(char::is_whitespace) {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(
+                    "Descriptor name cannot contain whitespace".to_string(),
+                ),
+            ));
+        }
 
         validate_optional_text_len(
             "Descriptor description",

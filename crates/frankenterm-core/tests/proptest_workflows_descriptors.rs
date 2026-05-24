@@ -426,6 +426,30 @@ proptest! {
     }
 
     #[test]
+    fn workflow_name_with_whitespace_fails_validation(
+        prefix in "[a-z]{1,8}",
+        suffix in "[a-z]{1,8}",
+    ) {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: format!("{prefix} {suffix}"),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendCtrl {
+                id: "s".to_string(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            }],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "descriptor validation must reject workflow names containing whitespace"
+        );
+    }
+
+    #[test]
     fn empty_trigger_values_fail_validation(
         mut val in arb_workflow_descriptor(),
         trigger_field in 0u8..3,
