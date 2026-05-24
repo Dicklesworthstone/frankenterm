@@ -951,9 +951,9 @@ fn is_basic_semver(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
     parts.len() >= 2
         && parts.len() <= 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts.iter().all(|p| {
+            !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && p.parse::<u64>().is_ok()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2866,6 +2866,7 @@ mod tests {
         assert!(!is_basic_semver("latest"));
         assert!(!is_basic_semver("1.0.0.0"));
         assert!(!is_basic_semver("v1.0"));
+        assert!(!is_basic_semver("18446744073709551616.0.0"));
     }
 
     // ---- Serde roundtrip tests ----
