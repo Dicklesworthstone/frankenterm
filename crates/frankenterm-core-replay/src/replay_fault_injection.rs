@@ -450,6 +450,7 @@ impl FaultInjector {
     /// Create from a fault spec.
     #[must_use]
     pub fn new(spec: FaultSpec) -> Self {
+        spec.validate().expect("invalid replay fault spec");
         let rng = SplitMix64::new(spec.seed);
         Self {
             spec,
@@ -876,6 +877,22 @@ time_range_end_ms = 100
     }
 
     // ── FaultInjector ───────────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "invalid replay fault spec")]
+    fn injector_new_rejects_invalid_direct_spec() {
+        let spec = FaultSpec {
+            name: "bad-direct".into(),
+            description: String::new(),
+            seed: 1,
+            faults: vec![FaultType::Drop {
+                filter: EventFilter::match_all(),
+                probability: 2.0,
+            }],
+        };
+
+        let _ = FaultInjector::new(spec);
+    }
 
     #[test]
     fn delay_injects_duration() {
