@@ -86,6 +86,31 @@ def safe_repo_relative_path?(path)
   true
 end
 
+# Executable safety predicate over a whole policy document. Returns stable
+# violation codes; the valid policy must yield none. Unlike the field-shape
+# assertions on the invalid_fragments below, this runs the policy itself
+# through a single guard so a silently weakened positive check (e.g. dropping
+# the simulation_only requirement) is caught by the tamper corpus.
+def policy_violations(policy)
+  v = []
+  v << "live_simulation_breach" unless policy["simulation_only"] == true
+  v << "live_mutation_granted" unless policy["live_mutation_authority"] == false
+  v << "raw_pane_retained" unless policy["raw_pane_content_stored"] == false
+  EXPECTED_FORBIDDEN.each do |action|
+    v << "forbidden_action_missing" unless Array(policy["forbidden_actions"]).include?(action)
+  end
+  (policy["failure_behaviors"] || {}).each_value do |behavior|
+    v << "failure_not_fail_closed" unless behavior["fail_closed"] == true
+  end
+  (policy["output_requirements"] || {}).each_value do |value|
+    v << "output_requirement_off" unless value == true
+  end
+  (policy["retention_policy"] || {}).each_value do |rule|
+    v << "retention_allows_raw" unless rule["max_contains_raw_content"] == false
+  end
+  v.uniq
+end
+
 schema = read_json(SCHEMA)
 policy = read_json(POLICY)
 invalid = read_json(INVALID)
@@ -168,5 +193,33 @@ unsafe_paths.each do |path|
   fail!("unsafe path accepted by predicate: #{path}") if safe_repo_relative_path?(path)
 end
 
-puts "mission twin safety policy: static verifier passed (#{EXPECTED_FORBIDDEN.length} forbidden actions, #{EXPECTED_FAILURES.length} invalid cases)"
+# The valid policy must satisfy every safety predicate.
+golden_policy_violations = policy_violations(policy)
+fail!("valid policy reports safety violations: #{golden_policy_violations.inspect}") unless golden_policy_violations.empty?
+
+# Tamper corpus: deep-dup the valid policy, weaken one safety property per case,
+# and prove policy_violations fires. This guards against the verifier's positive
+# checks being silently removed without any negative case noticing.
+require "json" unless defined?(JSON)
+deep_dup_policy = ->(p) { JSON.parse(JSON.generate(p)) }
+POLICY_TAMPERS = [
+  ["go-live", "live_simulation_breach", ->(p) { p["simulation_only"] = false }],
+  ["grant-mutation", "live_mutation_granted", ->(p) { p["live_mutation_authority"] = true }],
+  ["retain-raw-pane", "raw_pane_retained", ->(p) { p["raw_pane_content_stored"] = true }],
+  ["drop-forbidden", "forbidden_action_missing", ->(p) { p["forbidden_actions"] = p["forbidden_actions"][1..] }],
+  ["fail-open", "failure_not_fail_closed", ->(p) { p["failure_behaviors"].values.first["fail_closed"] = false }],
+  ["requirement-off", "output_requirement_off", ->(p) { p["output_requirements"][p["output_requirements"].keys.first] = false }],
+  ["retention-raw", "retention_allows_raw", ->(p) { p["retention_policy"].values.first["max_contains_raw_content"] = true }]
+].freeze
+seen_policy_codes = []
+POLICY_TAMPERS.each do |case_id, expected, mutate|
+  tampered = deep_dup_policy.call(policy)
+  mutate.call(tampered)
+  found = policy_violations(tampered)
+  fail!("policy tamper #{case_id} did not raise #{expected} (got #{found.inspect})") unless found.include?(expected)
+  seen_policy_codes << expected
+end
+fail!("policy tampers degenerate") unless seen_policy_codes.uniq.length == POLICY_TAMPERS.length
+
+puts "mission twin safety policy: static verifier passed (#{EXPECTED_FORBIDDEN.length} forbidden actions, #{EXPECTED_FAILURES.length} invalid cases, #{POLICY_TAMPERS.length} policy tampers)"
 RUBY
