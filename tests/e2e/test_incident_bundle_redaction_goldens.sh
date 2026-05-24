@@ -114,6 +114,23 @@ REQUIRED_GOLDENS.each do |golden|
     fail!("#{golden}: redaction_report count for #{entry["file"]} must be >= 1") unless entry.fetch("count") >= 1
   end
 
+  # --- Warnings reconcile across warnings.jsonl and the manifest ---------
+  # Editing one without the other would let an operator-facing warning (e.g. the
+  # agent-mail "no repair or restart was attempted" note) silently drift out of
+  # the machine-readable bundle.
+  warnings_path = File.join(base, "warnings.jsonl")
+  jsonl_warnings = File.readlines(warnings_path, chomp: true).reject(&:empty?).map do |line|
+    begin
+      JSON.parse(line)
+    rescue JSON::ParserError => error
+      fail!("#{golden}: warnings.jsonl line does not parse: #{error.message}")
+    end
+  end
+  manifest_warnings = swarm["warnings"] || []
+  unless jsonl_warnings.map { |w| JSON.generate(w) } == manifest_warnings.map { |w| JSON.generate(w) }
+    fail!("#{golden}: warnings.jsonl does not reconcile with manifest swarm.warnings")
+  end
+
   # --- Privacy: no raw pane/source-text key in any source payload --------
   source_files = files.select { |rel| rel.start_with?("sources/") && rel.end_with?(".json") }
   source_payloads = source_files.to_h do |rel|
