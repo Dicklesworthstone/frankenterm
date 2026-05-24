@@ -24,7 +24,8 @@ use std::collections::HashMap;
 
 use frankenterm_core::telemetry::{
     CircularMetricBuffer, Histogram, HistogramSummary, HourlyAggregate, MetricPoint,
-    MetricRegistry, ResourceSnapshot, TelemetryConfig, TelemetrySnapshot, TelemetryStore,
+    MetricRegistry, ResourceSnapshot, TDigestHistogram, TelemetryConfig, TelemetrySnapshot,
+    TelemetryStore,
 };
 
 // =============================================================================
@@ -1124,5 +1125,77 @@ proptest! {
         if let Some(cpu) = agg.mean_cpu_percent {
             prop_assert!((0.0..=100.0).contains(&cpu));
         }
+    }
+}
+
+// =============================================================================
+// Property: TDigestHistogram wrapper exact-aggregate contract
+//
+// The underlying TDigest sketch is covered by proptest_quantile_sketch.rs.
+// These pin the WRAPPER's contract that TDigest alone does not provide:
+// non-finite rejection (ft-b4l62 / ft-trot7 mirror), an EXACT running
+// count/mean (not the approximate centroid mean), exact min/max, and
+// count-additive merge_from.
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Non-finite samples are dropped; count is exact and equals the number
+    /// of finite inserts; mean is the exact running mean; min/max are exact.
+    #[test]
+    fn tdigest_histogram_exact_aggregates_ignore_non_finite(
+        values in proptest::collection::vec(arb_value(), 1..50),
+    ) {
+        let mut h = TDigestHistogram::new("t");
+        let pollutants = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for (i, &v) in values.iter().enumerate() {
+            h.record(v);
+            h.record(pollutants[i % pollutants.len()]); // dropped
+        }
+        prop_assert_eq!(h.count(), values.len() as u64,
+            "count must equal finite inserts, ignoring non-finite");
+
+        let exact_mean = values.iter().sum::<f64>() / values.len() as f64;
+        let m = h.mean().unwrap();
+        let tol = 1e-6 * exact_mean.abs().max(1.0);
+        prop_assert!((m - exact_mean).abs() <= tol,
+            "wrapper mean {} must match exact mean {} within {}", m, exact_mean, tol);
+
+        let exact_min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let exact_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (mn, mx) = h.min_max().unwrap();
+        prop_assert_eq!(mn, exact_min, "wrapper min must be exact");
+        prop_assert_eq!(mx, exact_max, "wrapper max must be exact");
+    }
+
+    /// merge_from is count-additive and preserves the exact mean and the
+    /// exact combined min/max (TDigest tracks true extremes).
+    #[test]
+    fn tdigest_histogram_merge_from_count_additive(
+        values_a in proptest::collection::vec(arb_value(), 1..40),
+        values_b in proptest::collection::vec(arb_value(), 1..40),
+    ) {
+        let mut a = TDigestHistogram::new("a");
+        for &v in &values_a { a.record(v); }
+        let mut b = TDigestHistogram::new("b");
+        for &v in &values_b { b.record(v); }
+        a.merge_from(&b);
+
+        prop_assert_eq!(a.count(), (values_a.len() + values_b.len()) as u64,
+            "merged count must be additive");
+
+        let all: Vec<f64> = values_a.iter().chain(values_b.iter()).copied().collect();
+        let exact_mean = all.iter().sum::<f64>() / all.len() as f64;
+        let m = a.mean().unwrap();
+        let tol = 1e-6 * exact_mean.abs().max(1.0);
+        prop_assert!((m - exact_mean).abs() <= tol,
+            "merged mean {} must match combined exact mean {} within {}", m, exact_mean, tol);
+
+        let exact_min = all.iter().copied().fold(f64::INFINITY, f64::min);
+        let exact_max = all.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (mn, mx) = a.min_max().unwrap();
+        prop_assert_eq!(mn, exact_min, "merged min must be exact");
+        prop_assert_eq!(mx, exact_max, "merged max must be exact");
     }
 }
