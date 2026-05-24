@@ -305,6 +305,37 @@ fn allocate_pdu_buffer(
     Ok(data)
 }
 
+fn decoded_payload_len(
+    label: &str,
+    len: u64,
+    serial: u64,
+    serial_len: usize,
+    ident: u64,
+    ident_len: usize,
+) -> anyhow::Result<usize> {
+    let header_len = serial_len
+        .checked_add(ident_len)
+        .with_context(|| format!("{label}: serial + ident header length overflow"))?;
+    let frame_len = match usize::try_from(len) {
+        Ok(frame_len) => frame_len,
+        Err(_) => {
+            return Err(CorruptResponse(format!(
+                "{label}: PDU length {len} does not fit in usize"
+            ))
+            .into());
+        }
+    };
+
+    match frame_len.checked_sub(header_len) {
+        Some(data_len) => Ok(data_len),
+        None => Err(CorruptResponse(format!(
+            "{label}: sizes don't make sense: \
+             len:{len} serial:{serial} (enc={serial_len}) ident:{ident} (enc={ident_len})",
+        ))
+        .into()),
+    }
+}
+
 /// Decode a frame.
 /// See encode_raw() for the frame format.
 async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
@@ -334,19 +365,14 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     let (ident, ident_len) = read_u64_async_with_len(r)
         .await
         .context("decode_raw_async failed to read PDU ident")?;
-    let header_len = serial_len
-        .checked_add(ident_len)
-        .context("decode_raw_async: serial + ident header length overflow")?;
-    let data_len = match (len as usize).overflowing_sub(header_len) {
-        (_, true) => {
-            return Err(CorruptResponse(format!(
-                "decode_raw_async: sizes don't make sense: \
-                    len:{len} serial:{serial} (enc={serial_len}) ident:{ident} (enc={ident_len})",
-            ))
-            .into());
-        }
-        (data_len, false) => data_len,
-    };
+    let data_len = decoded_payload_len(
+        "decode_raw_async",
+        len,
+        serial,
+        serial_len,
+        ident,
+        ident_len,
+    )?;
 
     if data_len > MAX_PDU_SIZE {
         anyhow::bail!(
@@ -392,22 +418,7 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
     };
     let (serial, serial_len) = read_u64_with_len(&mut r).context("reading PDU serial")?;
     let (ident, ident_len) = read_u64_with_len(&mut r).context("reading PDU ident")?;
-    let header_len = serial_len
-        .checked_add(ident_len)
-        .context("serial + ident header length overflow")?;
-    let data_len = match (len as usize).overflowing_sub(header_len) {
-        (_, true) => {
-            anyhow::bail!(
-                "sizes don't make sense: len:{} serial:{} (enc={}) ident:{} (enc={})",
-                len,
-                serial,
-                serial_len,
-                ident,
-                ident_len
-            );
-        }
-        (data_len, false) => data_len,
-    };
+    let data_len = decoded_payload_len("decode_raw", len, serial, serial_len, ident, ident_len)?;
 
     if data_len > MAX_PDU_SIZE {
         anyhow::bail!(
@@ -2635,6 +2646,20 @@ mod test {
             message.contains("sizes don't make sense"),
             "unexpected error message: {}",
             message
+        );
+    }
+
+    #[test]
+    fn decoded_payload_len_rejects_lengths_too_wide_for_usize() {
+        let Some(wide_len) = (usize::MAX as u64).checked_add(1) else {
+            return;
+        };
+
+        let err = decoded_payload_len("test", wide_len, 1, 1, 1, 1)
+            .expect_err("wire length wider than usize must fail before truncating");
+        assert!(
+            err.to_string().contains("does not fit in usize"),
+            "unexpected error message: {err}"
         );
     }
 
