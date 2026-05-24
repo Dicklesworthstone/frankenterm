@@ -87,6 +87,18 @@ const AWS_SECRET_KEY: &str =
     "aws_secret_access_key=aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd"; // value = exactly 40
 const BEARER_TOKEN: &str = "Bearer aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"; // bearer + 36 body
 const DATADOG_API_KEY: &str = "DATADOG_API_KEY=0123456789abcdef0123456789abcdef"; // 32 hex
+// Keyed / generic / URL patterns. The match span covers the secret
+// value (database_url redacts the password segment up to `@`); each
+// sample is verified to redact and leave no residue under all three
+// smoke envelopes.
+const AI_PROVIDER_KEYED_VALUE: &str = "cohere_api_key=aBcDeFgHiJkLmNoPq1234";
+const GENERIC_API_KEY: &str = "api_key=aBcDeFgHiJkLmNoPq1234";
+const GENERIC_TOKEN: &str = "token=aBcDeFgHiJkLmNoPq1234";
+const GENERIC_PASSWORD: &str = "password=sekretPw99";
+const GENERIC_SECRET: &str = "secret=aBcDeFgH12";
+const DEVICE_CODE: &str = "device_code=ABC123XYZ";
+const OAUTH_URL: &str = "https://example.com/cb?access_token=aBcDeFg123XYZ";
+const DATABASE_URL: &str = "postgres://user:sekretPw123@db.example.com:5432/app";
 
 /// br-ft-2xkrc: SSH/PEM private-key blocks. The conformance
 /// harness drives `redact()` over envelopes containing each of
@@ -149,6 +161,14 @@ const ALL_KNOWN_FORMATS: &[(&str, &str)] = &[
     ("datadog_api_key", DATADOG_API_KEY),
     ("bearer_token", BEARER_TOKEN),
     ("jwt_token", JWT_TOKEN),
+    ("ai_provider_keyed_value", AI_PROVIDER_KEYED_VALUE),
+    ("generic_api_key", GENERIC_API_KEY),
+    ("generic_token", GENERIC_TOKEN),
+    ("generic_password", GENERIC_PASSWORD),
+    ("generic_secret", GENERIC_SECRET),
+    ("device_code", DEVICE_CODE),
+    ("oauth_url", OAUTH_URL),
+    ("database_url", DATABASE_URL),
     ("ssh_private_key_rsa", SSH_PRIVATE_KEY_RSA),
     ("ssh_private_key_openssh", SSH_PRIVATE_KEY_OPENSSH),
     ("ssh_private_key_ed25519", SSH_PRIVATE_KEY_ED25519),
@@ -211,6 +231,32 @@ fn each_known_format_detect_reports_a_span() {
             "ft-etpfu: catalog format `{name}` produced no detect() span: input={envelope:?}"
         );
     }
+}
+
+#[test]
+fn every_catalog_pattern_has_smoke_coverage() {
+    // Drift guard: every live pattern in `secret_pattern_names()`
+    // (the catalog source of truth) must be exercised by the smoke
+    // suite. A new pattern added to redactor.rs without a sample
+    // here fails this test instead of silently going untested.
+    use std::collections::BTreeSet;
+
+    // Patterns covered through shape variants whose tuple label
+    // differs from the catalog name (multiple envelopes per name).
+    let multi_variant = ["ssh_private_key", "pgp_block", "stripe_key"];
+    let covered: BTreeSet<&str> = multi_variant
+        .into_iter()
+        .chain(ALL_KNOWN_FORMATS.iter().map(|(name, _)| *name))
+        .collect();
+
+    let catalog: BTreeSet<&str> = frankenterm_core::redactor::secret_pattern_names().collect();
+    let missing: Vec<&str> = catalog.difference(&covered).copied().collect();
+
+    assert!(
+        missing.is_empty(),
+        "ft-etpfu: catalog patterns lack conformance smoke coverage: {missing:?} \
+         — add a shape-conformant sample to ALL_KNOWN_FORMATS"
+    );
 }
 
 // ---------------------------------------------------------------------------
