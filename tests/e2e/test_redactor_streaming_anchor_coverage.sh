@@ -75,44 +75,60 @@ src.scan(/Regex::new\(\s*"((?:\\.|[^"\\])*)"/m) { |m| bodies << m[0] }
 fail!("no Regex::new literals found — extractor drifted") if bodies.empty?
 
 # --- 3. Derive collapsed key-name fragments from `[_-]?` optional separators. --
-# A fragment is `word([_-]?word)+`, e.g. `azure[_-]?openai`, `device[_-]?code`,
+# A fragment is `word(SEP word)+`, e.g. `azure[_-]?openai`, `device[_-]?code`,
 # `nvidia[_-]?api`, `api[_-]?key`. Its collapsed form elides the separators:
 # `azureopenai`, `devicecode`, `nvidiaapi`, `apikey`. That collapsed form is the
 # literal key-name a config/env line can present (`azureopenai_key=`), and it is
 # what the streaming anchor scan must be able to retain a tail for.
-FRAGMENT = /[A-Za-z][A-Za-z0-9]*(?:\[_-\]\?[A-Za-z][A-Za-z0-9]*)+/
+#
+# SEP must recognize *every* spelling of the optional separator class an author
+# might write. The catalog uses `[_-]?` today, but `[-_]?` (hyphen-first),
+# `[_\- ]?` (escaped hyphen + space), and similar reorderings are equally
+# natural Rust regex. A separator spelling the extractor fails to match is a
+# silent false negative: the key-name fragment goes unseen, coverage is never
+# checked, and a value split across a chunk boundary for that key-name leaks
+# unredacted (ft-b1p6x class) with this guard reporting green. We discriminate a
+# separator from a value char class (`[A-Za-z0-9_-]{32}`) two ways: the trailing
+# `?` (value classes carry `+`/`*`/`{n,}`, never `?`) and a class body composed
+# *only* of separator chars (`_`, `-`, space, with optional backslash escapes).
+SEP = /\[(?:\\?[-_ ]){1,4}\]\?/
+FRAGMENT = /[A-Za-z][A-Za-z0-9]*(?:#{SEP}[A-Za-z][A-Za-z0-9]*)+/
 fragments = bodies.flat_map { |body| body.scan(FRAGMENT) }.uniq
 
 if self_test
   # Tamper corpus: a fragment whose collapsed form contains NO anchor must be
-  # rejected. Proves the checker actually enforces the invariant rather than
-  # vacuously passing. `zzqnewprovider[_-]?vault` -> `zzqnewprovidervault`.
+  # rejected. Proves the checker enforces the invariant rather than vacuously
+  # passing. The two synthetic forms also prove the separator extractor is
+  # spelling-agnostic — `[_-]?` (canonical) and `[-_]?` (reversed) are both
+  # collapsed and checked, so a future catalog edit using either spelling cannot
+  # smuggle an unanchored key-name past the guard.
   fragments << "zzqnewprovider[_-]?vault"
+  fragments << "zzqotherprovider[-_]?keyring"
 end
 
 # A fragment that contains no optional separator at all is a parser bug.
 fragments.each do |frag|
-  fail!("fragment #{frag.inspect} has no [_-]? separator (extractor drift)") unless frag.include?("[_-]?")
+  fail!("fragment #{frag.inspect} has no optional separator class (extractor drift)") unless frag.match?(SEP)
 end
 
 # --- 4. Enforce coverage: each collapsed fragment must contain an anchor. ------
 uncovered = fragments.reject do |frag|
-  collapsed = frag.gsub("[_-]?", "").downcase
+  collapsed = frag.gsub(SEP, "").downcase
   anchors_lower.any? { |a| collapsed.include?(a) }
 end
 
 if self_test
-  expected = "zzqnewprovidervault"
-  got = uncovered.map { |f| f.gsub("[_-]?", "").downcase }
-  unless got == [expected]
-    fail!("self-test FAILED: expected exactly [#{expected.inspect}] uncovered, got #{got.inspect}")
+  expected = ["zzqnewprovidervault", "zzqotherproviderkeyring"].sort
+  got = uncovered.map { |f| f.gsub(SEP, "").downcase }.sort
+  unless got == expected
+    fail!("self-test FAILED: expected exactly #{expected.inspect} uncovered, got #{got.inspect}")
   end
-  puts "redactor anchor coverage: self-test passed (synthetic unanchored fragment correctly rejected; #{fragments.length - 1} live fragments all covered)"
+  puts "redactor anchor coverage: self-test passed (synthetic unanchored [_-]? and [-_]? fragments both rejected; #{fragments.length - 2} live fragments all covered)"
   exit 0
 end
 
 unless uncovered.empty?
-  detail = uncovered.map { |f| "#{f} -> #{f.gsub('[_-]?', '').downcase}" }.join(", ")
+  detail = uncovered.map { |f| "#{f} -> #{f.gsub(SEP, '').downcase}" }.join(", ")
   fail!(<<~MSG.chomp)
     #{uncovered.length} keyed-secret key-name fragment(s) have NO STREAMING_SECRET_ANCHORS coverage: #{detail}
     A value split across a chunk boundary for these key-names leaks unredacted on the streaming path (ft-b1p6x class).
