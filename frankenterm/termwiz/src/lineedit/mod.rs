@@ -155,6 +155,21 @@ fn completion_cursor_after_replacement(
     }
 }
 
+fn compute_cursor_after_printing_x_columns(
+    cursor_x: usize,
+    cursor_y: isize,
+    delta: usize,
+    screen_cols: usize,
+) -> (usize, isize) {
+    let screen_cols = screen_cols.max(1);
+    let total_cols = cursor_x.saturating_add(delta);
+    let y = total_cols / screen_cols;
+    let x = total_cols % screen_cols;
+    let row_delta = isize::try_from(y).unwrap_or(isize::MAX);
+
+    (x, cursor_y.saturating_add(row_delta))
+}
+
 impl<'term> LineEditor<'term> {
     /// Create a new line editor.
     /// In most cases, you'll want to use the `line_editor` function,
@@ -215,23 +230,6 @@ impl<'term> LineEditor<'term> {
 
         let (elements, cursor_x_pos) = host.highlight_line(line_to_display, cursor);
 
-        // Calculate what the cursor position would be after printing X columns
-        // of text from the specified location.
-        // Returns (x, y) of the resultant cursor position.
-        fn compute_cursor_after_printing_x_columns(
-            cursor_x: usize,
-            cursor_y: isize,
-            delta: usize,
-            screen_cols: usize,
-        ) -> (usize, isize) {
-            let y = (cursor_x + delta) / screen_cols;
-            let x = (cursor_x + delta) % screen_cols;
-
-            let row = cursor_y + y as isize;
-            let col = x;
-
-            (col, row)
-        }
         let cursor_position = compute_cursor_after_printing_x_columns(
             cursor_position_after_printing_prompt.0,
             cursor_position_after_printing_prompt.1,
@@ -1050,5 +1048,16 @@ mod tests {
             .expect("valid completion should apply");
 
         assert_eq!(editor.get_line_and_cursor(), ("hello x", 5));
+    }
+
+    #[test]
+    fn cursor_position_math_treats_zero_width_as_one_column() {
+        assert_eq!(compute_cursor_after_printing_x_columns(0, 0, 3, 0), (0, 3));
+    }
+
+    #[test]
+    fn cursor_position_math_saturates_large_offsets() {
+        let (_x, y) = compute_cursor_after_printing_x_columns(usize::MAX, isize::MAX - 1, 10, 80);
+        assert_eq!(y, isize::MAX);
     }
 }
