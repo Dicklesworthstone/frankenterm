@@ -101,10 +101,13 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
             "[a-z_]{3,10}",
             prop::option::of("[a-z][a-z ]{4,19}"),
             "[a-z][a-z ]{2,49}",
-            prop::option::of(arb_descriptor_matcher()),
-            prop::option::of(1000u64..120_000),
+            prop_oneof![
+                Just((None, None)),
+                (arb_descriptor_matcher(), prop::option::of(1000u64..120_000))
+                    .prop_map(|(matcher, timeout_ms)| (Some(matcher), timeout_ms)),
+            ],
         )
-            .prop_map(|(id, description, text, wait_for, wait_timeout_ms)| {
+            .prop_map(|(id, description, text, (wait_for, wait_timeout_ms))| {
                 DescriptorStep::SendText {
                     id,
                     description,
@@ -1446,6 +1449,30 @@ proptest! {
         prop_assert!(
             over_limit.validate(&limits).is_err(),
             "send_text wait_timeout_ms longer than max_wait_timeout_ms should fail validation"
+        );
+    }
+
+    #[test]
+    fn send_text_wait_timeout_without_wait_for_fails_validation(timeout_ms in 1u64..120_000) {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "send_wait_timeout_without_wait_for".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::SendText {
+                id: "send".to_string(),
+                description: None,
+                text: "x".to_string(),
+                wait_for: None,
+                wait_timeout_ms: Some(timeout_ms),
+            }],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "send_text wait_timeout_ms must be paired with a wait_for matcher"
         );
     }
 

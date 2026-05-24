@@ -714,6 +714,13 @@ impl DescriptorStep {
                 if let Some(wait_for) = wait_for {
                     wait_for.validate(limits)?;
                 }
+                if wait_for.is_none() && wait_timeout_ms.is_some() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "send_text wait_timeout_ms requires wait_for".to_string(),
+                        ),
+                    ));
+                }
                 if let Some(wait_timeout_ms) = wait_timeout_ms {
                     if *wait_timeout_ms == 0 {
                         return Err(crate::Error::Config(
