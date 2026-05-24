@@ -19,7 +19,7 @@
 #      scripts/attestation-build.sh --version all_sections_present_valid
 #      --channel dev --sign unsigned --allow-partial, writing directly into
 #      the fixture directory.
-#   2. Apply the 8 documented jq mutations to derive the tampered variants.
+#   2. Apply the documented jq mutations to derive the tampered variants.
 #   3. Refresh the unsigned canonical hash for every tamper whose expected
 #      failure is not itself a signature/canonical-hash failure.
 
@@ -69,7 +69,7 @@ FT_ATTESTATION_OUT_DIR="${FIX}" \
 
 [[ -f "$POSITIVE" ]] || { echo "build did not produce $POSITIVE" >&2; exit 1; }
 
-echo "2/3: Applying 8 jq mutations to derive tampered variants..." >&2
+echo "2/3: Applying jq mutations to derive tampered variants..." >&2
 jq '.artifacts[0].sha256 = "tampered000000000000000000000000000000000000000000000000000000"' \
   "$POSITIVE" > "$FIX/tampered_artifact_hash.json"
 refresh_unsigned_canonical_sha "$FIX/tampered_artifact_hash.json"
@@ -81,6 +81,12 @@ refresh_unsigned_canonical_sha "$FIX/missing_required_slot.json"
 jq '.artifacts += [{"category":"unknown/forbidden","description":"injected","path":"fake","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":0,"proof_categories":[]}]' \
   "$POSITIVE" > "$FIX/extra_unknown_slot.json"
 refresh_unsigned_canonical_sha "$FIX/extra_unknown_slot.json"
+jq '.artifacts[0].path = "/tmp/ft-attestation-outside.json"' \
+  "$POSITIVE" > "$FIX/absolute_artifact_path.json"
+refresh_unsigned_canonical_sha "$FIX/absolute_artifact_path.json"
+jq '.artifacts[0].path = "../docs/attestations/schema.json"' \
+  "$POSITIVE" > "$FIX/parent_artifact_path.json"
+refresh_unsigned_canonical_sha "$FIX/parent_artifact_path.json"
 jq '.schema_version = "9.9.9"' "$POSITIVE" > "$FIX/wrong_schema_version.json"
 refresh_unsigned_canonical_sha "$FIX/wrong_schema_version.json"
 jq 'del(.release)' "$POSITIVE" > "$FIX/missing_release_block.json"

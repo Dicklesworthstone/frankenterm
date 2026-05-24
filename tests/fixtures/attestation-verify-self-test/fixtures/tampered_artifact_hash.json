@@ -780,15 +780,15 @@
     "schema_version": "1.0.0"
   },
   "deferred_slots": [],
-  "generated_at": "2026-05-24T22:55:41Z",
+  "generated_at": "2026-05-24T23:16:01Z",
   "generator": {
     "name": "scripts/attestation-build.sh",
     "version": "1.5.0"
   },
   "git": {
     "branch": "main",
-    "commit": "9c9a10a74d9df6734433e122b61b60295348dbd2",
-    "tree": "b7a295a4af371ad7828b2aa0ec62ab527dfe3e8c"
+    "commit": "84bafc27dca649b7e623c38745360b138128fedc",
+    "tree": "f023001d8b6f922d824945728c8d35d6f092401c"
   },
   "release": {
     "channel": "dev",
@@ -813,7 +813,7 @@
   "retractions": [],
   "schema_version": "1.0.0",
   "signature": {
-    "canonical_sha256": "7747f0be368caa1a6e0f60ec6b514f6684d9bd4abdb991b31129c16b4132eea6",
+    "canonical_sha256": "f411879d3cf5bbde13dc9623f7779646f7f3bade5374b138ef44da52958a21d6",
     "method": "unsigned",
     "reason": "dev channel bundle — production releases must use --sign cosign or --sign ed25519"
   },

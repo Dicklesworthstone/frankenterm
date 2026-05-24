@@ -4,7 +4,7 @@
       "category": "perf/headline-claims",
       "description": "Headline-claim manifest + 5 must-prove benches (G3).",
       "media_type": "application/json",
-      "path": "docs/perf/headline-claims.json",
+      "path": "/tmp/ft-attestation-outside.json",
       "produced_by_bead": "ft-syqcz.3",
       "proof_categories": [
         5
@@ -813,13 +813,186 @@
   "retractions": [],
   "schema_version": "1.0.0",
   "signature": {
-    "canonical_sha256": "73bc19d5564646eed9754c7a645058fd773cc552e2f9bc1fc858ba7daa43d9c4",
+    "canonical_sha256": "c4573bdeaf18241c4e7031a8ca4fdf32d51ed7bbaf90cb1655179cfce6f6af13",
     "method": "unsigned",
     "reason": "dev channel bundle — production releases must use --sign cosign or --sign ed25519"
   },
   "taxonomy_coverage": {
-    "1": 99,
-    "7": 99,
-    "12": 99
+    "below_threshold_count": 0,
+    "category_counts": [
+      {
+        "artifact_count": 3,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 1,
+        "name": "Type-Level Proof",
+        "slug": "type-level"
+      },
+      {
+        "artifact_count": 3,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 2,
+        "name": "Property Test",
+        "slug": "property"
+      },
+      {
+        "artifact_count": 2,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 3,
+        "name": "Loom Concurrency Proof",
+        "slug": "loom"
+      },
+      {
+        "artifact_count": 6,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 4,
+        "name": "Conformance Artifact",
+        "slug": "conformance"
+      },
+      {
+        "artifact_count": 7,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 5,
+        "name": "Quantitative Attestation",
+        "slug": "quantitative-attestation"
+      },
+      {
+        "artifact_count": 2,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 6,
+        "name": "Formal Method",
+        "slug": "formal-method"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 7,
+        "name": "Information-Theoretic Bound",
+        "slug": "information-theoretic"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 8,
+        "name": "Network Calculus Bound",
+        "slug": "network-calculus"
+      },
+      {
+        "artifact_count": 6,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 9,
+        "name": "Differential Comparison",
+        "slug": "differential"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 10,
+        "name": "Cryptographic Attestation",
+        "slug": "cryptographic"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": false,
+        "deferred_slot_count": 0,
+        "id": 11,
+        "name": "Topological Invariant",
+        "slug": "topological-invariant"
+      }
+    ],
+    "delta_from_prior_release": {
+      "category_deltas": [
+        {
+          "artifact_delta": 3,
+          "deferred_slot_delta": 0,
+          "id": 1,
+          "slug": "type-level"
+        },
+        {
+          "artifact_delta": 3,
+          "deferred_slot_delta": 0,
+          "id": 2,
+          "slug": "property"
+        },
+        {
+          "artifact_delta": 2,
+          "deferred_slot_delta": 0,
+          "id": 3,
+          "slug": "loom"
+        },
+        {
+          "artifact_delta": 6,
+          "deferred_slot_delta": 0,
+          "id": 4,
+          "slug": "conformance"
+        },
+        {
+          "artifact_delta": 7,
+          "deferred_slot_delta": 0,
+          "id": 5,
+          "slug": "quantitative-attestation"
+        },
+        {
+          "artifact_delta": 2,
+          "deferred_slot_delta": 0,
+          "id": 6,
+          "slug": "formal-method"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 7,
+          "slug": "information-theoretic"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 8,
+          "slug": "network-calculus"
+        },
+        {
+          "artifact_delta": 6,
+          "deferred_slot_delta": 0,
+          "id": 9,
+          "slug": "differential"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 10,
+          "slug": "cryptographic"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 11,
+          "slug": "topological-invariant"
+        }
+      ],
+      "status": "no_prior_bundle"
+    },
+    "schema_version": "1.0.0",
+    "taxonomy_path": "docs/proof-taxonomy.json",
+    "uncategorized_artifact_count": 0
   }
 }

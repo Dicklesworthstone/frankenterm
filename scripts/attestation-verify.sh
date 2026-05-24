@@ -77,6 +77,15 @@ is_hex_len() {
   local value="$1" expected_len="$2"
   [[ ${#value} -eq "$expected_len" && ! "$value" =~ [^0-9A-Fa-f] ]]
 }
+is_repo_relative_path() {
+  local path="$1"
+  [[ -n "$path" && "$path" != /* ]] || return 1
+  IFS='/' read -r -a parts <<< "$path"
+  local part
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != "." && "$part" != ".." ]] || return 1
+  done
+}
 
 declare -a checks=()
 declare -a errors=()
@@ -127,8 +136,8 @@ verify_retraction_signature() {
       sigstore_expected_size="$(jq -r '.retraction_signature.sigstore_bundle.size_bytes // ""' <<<"$retraction_json")"
       cert_identity="$(jq -r '.retraction_signature.certificate_identity // ""' <<<"$retraction_json")"
       cert_issuer="$(jq -r '.retraction_signature.certificate_oidc_issuer // ""' <<<"$retraction_json")"
-      if [[ -z "$sigstore_path" || "$sigstore_path" == /* ]]; then
-        record_check "retraction_signature:$affected_slot" false "sigstore_bundle.path must be repo-relative in $retraction_path"
+      if ! is_repo_relative_path "$sigstore_path"; then
+        record_check "retraction_signature:$affected_slot" false "sigstore_bundle.path must be repo-relative without parent traversal in $retraction_path"
         return 1
       elif ! is_hex_len "$sigstore_expected_hash" 64; then
         record_check "retraction_signature:$affected_slot" false "sigstore_bundle.sha256 must be a 32-byte hex SHA-256 in $retraction_path"
@@ -186,8 +195,8 @@ verify_retraction_signature() {
       elif ! command -v xxd >/dev/null 2>&1; then
         record_check "retraction_signature:$affected_slot" false "xxd not installed; cannot decode ed25519 retraction"
         return 1
-      elif [[ -z "$signature_path" || "$signature_path" == /* ]]; then
-        record_check "retraction_signature:$affected_slot" false "ed25519 signature_path must be repo-relative in $retraction_path"
+      elif ! is_repo_relative_path "$signature_path"; then
+        record_check "retraction_signature:$affected_slot" false "ed25519 signature_path must be repo-relative without parent traversal in $retraction_path"
         return 1
       elif ! is_hex_len "$public_key" 64; then
         record_check "retraction_signature:$affected_slot" false "ed25519 public_key must be 32 bytes hex-encoded in $retraction_path"
@@ -495,6 +504,10 @@ for ((i=0; i<artifact_count; i++)); do
   path="$(jq -r '.path' <<<"$art")"
   expected="$(jq -r '.sha256' <<<"$art")"
   expected_size="$(jq -r '.size_bytes' <<<"$art")"
+  if ! is_repo_relative_path "$path"; then
+    record_check "artifact:$path" false "artifact path must be repo-relative without parent traversal"
+    continue
+  fi
   abs="$REPO_ROOT/$path"
   if [[ ! -f "$abs" ]]; then
     record_check "artifact:$path" false "file missing on disk"
@@ -534,6 +547,8 @@ if [[ -z "$cx_artifact_path" ]]; then
   if jq -e '.required_categories | index("doctrine/cx-propagation")' <<<"$bundle_json" >/dev/null 2>&1; then
     record_check "doctrine/cx-propagation" false "bundle committed to category but no artifact found"
   fi
+elif ! is_repo_relative_path "$cx_artifact_path"; then
+  record_check "doctrine/cx-propagation" false "snapshot path must be repo-relative without parent traversal: $cx_artifact_path"
 else
   cx_abs="$REPO_ROOT/$cx_artifact_path"
   if [[ ! -f "$cx_abs" ]]; then
@@ -562,8 +577,8 @@ case "$sig_method" in
     sigstore_expected_hash="$(jq -r '.signature.sigstore_bundle.sha256 // ""' <<<"$bundle_json")"
     sigstore_expected_size="$(jq -r '.signature.sigstore_bundle.size_bytes // ""' <<<"$bundle_json")"
     sigstore_ok=0
-    if [[ -z "$sigstore_path" || "$sigstore_path" == /* ]]; then
-      record_check "sigstore_bundle" false "signature.sigstore_bundle.path must be repo-relative"
+    if ! is_repo_relative_path "$sigstore_path"; then
+      record_check "sigstore_bundle" false "signature.sigstore_bundle.path must be repo-relative without parent traversal"
     elif ! is_hex_len "$sigstore_expected_hash" 64; then
       record_check "sigstore_bundle" false "signature.sigstore_bundle.sha256 must be a 32-byte hex SHA-256"
     elif [[ ! "$sigstore_expected_size" =~ ^[0-9]+$ || "$sigstore_expected_size" -lt 1 ]]; then
@@ -618,8 +633,8 @@ case "$sig_method" in
     else
       signature_path="$(jq -r '.signature.signature_path // ""' <<<"$bundle_json")"
       public_key="$(jq -r '.signature.public_key // ""' <<<"$bundle_json")"
-      if [[ -z "$signature_path" || "$signature_path" == /* ]]; then
-        record_check "signature" false "ed25519 signature_path must be a repo-relative path"
+      if ! is_repo_relative_path "$signature_path"; then
+        record_check "signature" false "ed25519 signature_path must be repo-relative without parent traversal"
       elif ! is_hex_len "$public_key" 64; then
         record_check "signature" false "ed25519 public_key must be 32 bytes hex-encoded"
       else
