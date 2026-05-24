@@ -793,6 +793,8 @@ enum ManifestMutation {
     WrongIssueEdgeDeferred,
     DuplicateSlot,
     MissingRequiredCategory,
+    MissingProducerBead,
+    OpenProducerBead,
 }
 
 impl ManifestMutation {
@@ -825,6 +827,8 @@ fn mutation_strategy() -> impl Strategy<Value = ManifestMutation> {
         Just(ManifestMutation::WrongIssueEdgeDeferred),
         Just(ManifestMutation::DuplicateSlot),
         Just(ManifestMutation::MissingRequiredCategory),
+        Just(ManifestMutation::MissingProducerBead),
+        Just(ManifestMutation::OpenProducerBead),
     ]
 }
 
@@ -919,6 +923,22 @@ fn apply_mutation(mutation: &ManifestMutation) -> (String, String) {
                 .to_string(),
                 issues,
             );
+        }
+        ManifestMutation::MissingProducerBead => {
+            issues = json!({
+                "id": "ft-unrelated.1",
+                "status": "closed",
+                "dependencies": []
+            })
+            .to_string();
+        }
+        ManifestMutation::OpenProducerBead => {
+            issues = json!({
+                "id": "ft-syqcz.3",
+                "status": "open",
+                "dependencies": []
+            })
+            .to_string();
         }
     }
     (manifest_with_slot(slot), issues)
