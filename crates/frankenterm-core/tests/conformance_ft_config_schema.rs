@@ -308,6 +308,44 @@ fn schema_rejects_out_of_range_vacuum_threshold() {
     }
 }
 
+/// 4c.2) Falsification: documented counters and millisecond knobs
+/// with `minimum: 0` must reject negative values across sections.
+#[test]
+fn schema_rejects_negative_documented_nonnegative_fields() {
+    let schema = compile_config_schema();
+    for (surface, bad) in [
+        (
+            "ingest.poll_interval_ms",
+            serde_json::json!({
+                "ingest": { "poll_interval_ms": -1 },
+            }),
+        ),
+        (
+            "gc.interval_seconds",
+            serde_json::json!({
+                "gc": { "interval_seconds": -1 },
+            }),
+        ),
+        (
+            "safety.rate_limit_global",
+            serde_json::json!({
+                "safety": { "rate_limit_global": -1 },
+            }),
+        ),
+        (
+            "agent_detection.idle_silence_ms",
+            serde_json::json!({
+                "agent_detection": { "idle_silence_ms": -1 },
+            }),
+        ),
+    ] {
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject negative documented nonnegative field {surface}"
+        );
+    }
+}
+
 /// 4d) Falsification: `vendored.sharding.assignment.strategy` is an
 /// enum; an unknown strategy MUST be rejected.
 #[test]
