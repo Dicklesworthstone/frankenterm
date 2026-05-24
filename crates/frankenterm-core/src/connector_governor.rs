@@ -306,7 +306,7 @@ impl TokenBucket {
         if self.tokens > 0 {
             return 0;
         }
-        if self.config.refill_rate == 0 {
+        if self.config.refill_rate == 0 || self.config.refill_interval_ms == 0 {
             return u64::MAX; // never refills
         }
         // Time until next refill interval
@@ -1503,6 +1503,19 @@ mod tests {
         assert_eq!(bucket.time_until_available(0), 1000);
         assert_eq!(bucket.time_until_available(500), 500);
         assert_eq!(bucket.time_until_available(1000), 0); // refill happened
+    }
+
+    #[test]
+    fn token_bucket_zero_refill_interval_never_reports_empty_bucket_ready() {
+        let config = TokenBucketConfig {
+            capacity: 10,
+            refill_rate: 1,
+            refill_interval_ms: 0,
+        };
+        let mut bucket = TokenBucket::with_initial(config, 0, 0);
+        assert_eq!(bucket.available(1000), 0);
+        assert_eq!(bucket.time_until_available(1000), u64::MAX);
+        assert!(!bucket.try_consume(1000));
     }
 
     #[test]
