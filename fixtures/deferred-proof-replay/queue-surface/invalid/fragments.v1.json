@@ -117,6 +117,36 @@
       "case_id": "dispatch-coverage-gap",
       "mutation": "drop_dispatch_entry",
       "expected_violation": "dispatch_coverage"
+    },
+    {
+      "case_id": "next-candidate-receipt-drift",
+      "mutation": "drift_next_candidate_receipt",
+      "expected_violation": "next_candidate_receipt_drift"
+    },
+    {
+      "case_id": "next-candidate-material-drift",
+      "mutation": "drift_next_candidate_material",
+      "expected_violation": "next_candidate_material_drift"
+    },
+    {
+      "case_id": "next-candidate-not-runnable",
+      "mutation": "point_next_candidate_at_blocked",
+      "expected_violation": "next_candidate_not_runnable"
+    },
+    {
+      "case_id": "next-candidate-missing",
+      "mutation": "null_next_candidate",
+      "expected_violation": "next_candidate_missing"
+    },
+    {
+      "case_id": "next-candidate-target-unpinned",
+      "mutation": "unpin_next_candidate_target",
+      "expected_violation": "next_candidate_target_unpinned"
+    },
+    {
+      "case_id": "next-candidate-target-drift",
+      "mutation": "drift_next_candidate_target",
+      "expected_violation": "next_candidate_target_drift"
     }
   ]
 }

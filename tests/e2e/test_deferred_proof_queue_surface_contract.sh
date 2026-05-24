@@ -278,6 +278,21 @@ def apply_mutation(surface, op)
     s["robot_dispatch"] = s["robot_dispatch"].reverse
   when "drop_dispatch_entry"
     s["robot_dispatch"] = s["robot_dispatch"][1..]
+  when "drift_next_candidate_receipt"
+    s["next_candidate"]["receipt_id"] = "ft-rdy1:comment-0000"
+  when "drift_next_candidate_material"
+    s["next_candidate"]["material_remote_required"] = false
+  when "point_next_candidate_at_blocked"
+    s["next_candidate"]["bead_id"] = "ft-wt1"
+  when "null_next_candidate"
+    s["next_candidate"] = nil
+  when "unpin_next_candidate_target"
+    s["next_candidate"]["command_preview"] = s["next_candidate"]["command_preview"].reject { |t| t.start_with?("CARGO_TARGET_DIR=") }
+  when "drift_next_candidate_target"
+    s["next_candidate"]["target_dir"] = "/tmp/ft-rdy1-WRONG"
+    cmd = s["next_candidate"]["command_preview"]
+    idx = cmd.index { |t| t.start_with?("CARGO_TARGET_DIR=") }
+    cmd[idx] = "CARGO_TARGET_DIR=/tmp/ft-rdy1-WRONG" if idx
   else
     fail!("unknown invalid-fragment mutation: #{op}")
   end

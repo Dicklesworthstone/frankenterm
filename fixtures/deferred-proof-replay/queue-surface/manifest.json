@@ -11,7 +11,7 @@
     "queued_count": 6,
     "completed_count": 1,
     "explain_count": 5,
-    "invalid_fragment_count": 23,
+    "invalid_fragment_count": 29,
     "statuses": [
       "ambiguous",
       "completed",
