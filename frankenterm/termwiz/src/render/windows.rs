@@ -44,6 +44,24 @@ fn screen_cell_count(cols: usize, rows: usize) -> usize {
     cols.saturating_mul(rows)
 }
 
+fn coord_extent_to_usize(value: i16) -> usize {
+    usize::try_from(i32::from(value).max(0)).unwrap_or(0)
+}
+
+fn visible_window_rows(top: i16, bottom: i16) -> usize {
+    let top = i32::from(top);
+    let bottom = i32::from(bottom);
+    if bottom < top {
+        0
+    } else {
+        usize::try_from(bottom - top + 1).unwrap_or(usize::MAX)
+    }
+}
+
+fn relative_window_coord(position: i16, origin: i16) -> usize {
+    usize::try_from(i32::from(position).saturating_sub(i32::from(origin))).unwrap_or(0)
+}
+
 impl WindowsConsoleRenderer {
     pub fn new(capabilities: Capabilities) -> Self {
         Self {
@@ -358,6 +376,16 @@ mod tests {
         assert_eq!(screen_cell_count(80, 24), 1_920);
         assert_eq!(screen_cell_count(usize::MAX, 2), usize::MAX);
     }
+
+    #[test]
+    fn windows_coord_helpers_do_not_wrap_negative_values() {
+        assert_eq!(coord_extent_to_usize(120), 120);
+        assert_eq!(coord_extent_to_usize(-1), 0);
+        assert_eq!(visible_window_rows(3, 5), 3);
+        assert_eq!(visible_window_rows(5, 3), 0);
+        assert_eq!(relative_window_coord(10, 3), 7);
+        assert_eq!(relative_window_coord(-1, 3), 0);
+    }
 }
 
 impl WindowsConsoleRenderer {
@@ -369,13 +397,13 @@ impl WindowsConsoleRenderer {
         out.flush()?;
         let info = out.get_buffer_info()?;
 
-        let cols = info.dwSize.X as usize;
-        let rows = 1 + info.srWindow.Bottom as usize - info.srWindow.Top as usize;
+        let cols = coord_extent_to_usize(info.dwSize.X);
+        let rows = visible_window_rows(info.srWindow.Top, info.srWindow.Bottom);
 
         let mut buffer = ScreenBuffer {
             buf: out.get_buffer_contents()?,
-            cursor_x: info.dwCursorPosition.X as usize,
-            cursor_y: (info.dwCursorPosition.Y as usize).saturating_sub(info.srWindow.Top as usize),
+            cursor_x: coord_extent_to_usize(info.dwCursorPosition.X),
+            cursor_y: relative_window_coord(info.dwCursorPosition.Y, info.srWindow.Top),
             dirty: false,
             rows,
             cols,
