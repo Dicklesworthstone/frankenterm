@@ -362,7 +362,16 @@ impl SearchFacade {
         let mut failure_reason = None;
         let mut passed = true;
 
-        if tau < self.config.shadow_tau_threshold && !legacy_ids.is_empty() && !orch_ids.is_empty()
+        // An exact ranking match is conclusive agreement and must never be
+        // flagged on tau alone: kendall_tau is degenerate (0.0) for fewer than
+        // two common items, so identical 0/1-result rankings would otherwise
+        // trip the (default 0.95) threshold and report a false shadow failure.
+        // This mirrors run_regression_suite's `tau_ok = ranking_match || ...`
+        // escape (search/regression_diff.rs).
+        if !ranking_match
+            && tau < self.config.shadow_tau_threshold
+            && !legacy_ids.is_empty()
+            && !orch_ids.is_empty()
         {
             passed = false;
             failure_reason = Some(format!(
@@ -623,6 +632,36 @@ mod tests {
         assert!(
             cmp.passed,
             "comparison should pass with generous thresholds"
+        );
+    }
+
+    #[test]
+    fn shadow_single_result_match_passes_under_default_threshold() {
+        // Regression: an exact ranking match must not be reported as a shadow
+        // failure merely because kendall_tau is degenerate (0.0) for a single
+        // result under the DEFAULT tau threshold (0.95). Before the
+        // ranking_match escape this returned passed == false.
+        let config = FacadeConfig {
+            routing: FacadeRouting::Shadow,
+            ..FacadeConfig::default()
+        };
+        let facade = SearchFacade::with_config(config);
+        let lexical = [(1u64, 5.0f32)];
+        let semantic: [(u64, f32); 0] = [];
+        let result = facade.fuse_with_metrics(&lexical, &semantic, 10);
+        let cmp = result
+            .shadow_comparison
+            .expect("shadow mode produces a comparison");
+        assert!(cmp.ranking_match, "single identical result should match");
+        assert!(
+            cmp.kendall_tau.abs() < 1e-6,
+            "kendall_tau is degenerate (0.0) for a single result, got {}",
+            cmp.kendall_tau
+        );
+        assert!(
+            cmp.passed,
+            "exact ranking match must pass despite degenerate tau: {:?}",
+            cmp.failure_reason
         );
     }
 
