@@ -9,7 +9,7 @@ use crate::{Domain, Mux, MuxNotification};
 use anyhow::Error;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
+use config::{ExitBehavior, ExitBehaviorMessaging, configuration};
 use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
@@ -26,11 +26,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
-use termwiz::escape::csi::{Sgr, CSI};
+use termwiz::escape::csi::{CSI, Sgr};
 use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
@@ -314,7 +314,7 @@ where
                     return Err((err, stats));
                 }
                 let backoff = retry_backoff_for_attempt(policy, attempt);
-                stats.backoff_elapsed += backoff;
+                stats.backoff_elapsed = stats.backoff_elapsed.saturating_add(backoff);
                 std::thread::sleep(backoff);
                 attempt += 1;
             }
@@ -2126,6 +2126,21 @@ mod tests {
         assert_eq!(d2, Duration::from_millis(4));
         assert_eq!(d3, Duration::from_millis(5));
         assert_eq!(d4, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn retry_backoff_accounting_saturates_duration_overflow() {
+        let policy = ResizeRetryPolicy {
+            max_attempts: 3,
+            base_backoff: Duration::MAX,
+            max_backoff: Duration::MAX,
+        };
+
+        let result: Result<(), ((), ResizeRetryStats)> = retry_with_backoff(policy, |_| Err(()));
+        let (_err, stats) = result.expect_err("retry should exhaust attempts");
+
+        assert_eq!(stats.attempts, 3);
+        assert_eq!(stats.backoff_elapsed, Duration::MAX);
     }
 
     #[test]
