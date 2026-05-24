@@ -925,6 +925,7 @@ impl PatternPack {
         if report.pack_name == self.name
             && report.verified
             && report.issues.is_empty()
+            && report.regex_budget_checked
             && report.action_mode.allows_action_triggers()
         {
             self

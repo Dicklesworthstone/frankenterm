@@ -1564,6 +1564,33 @@ fn verification_report_with_issues_forces_observe_only() {
     );
 }
 
+#[test]
+fn verification_report_without_regex_budget_check_forces_observe_only() {
+    let mut rule = make_anchor_only_rule("verification_regex_budget", "VERIFY_REGEX_BUDGET");
+    rule.workflow = Some("usage_limit_response".to_string());
+    rule.preview_command = Some("ft workflow preview usage-limit".to_string());
+    rule.manual_fix = Some("Recover pane {pane}".to_string());
+
+    let report = PatternPackVerificationReport {
+        pack_name: "verification-regex-budget".to_string(),
+        verified: true,
+        action_mode: PatternPackActionMode::ActionTriggering,
+        signature_checked: true,
+        fixture_hashes_checked: 0,
+        regex_budget_checked: false,
+        issues: Vec::new(),
+    };
+    let pack = PatternPack::new("verification-regex-budget", "1.0.0", vec![rule])
+        .enforce_verification_report(&report);
+
+    assert_eq!(pack.rules[0].workflow, None);
+    assert_eq!(pack.rules[0].preview_command, None);
+    assert_eq!(
+        pack.rules[0].get_manual_fix(5, None).as_deref(),
+        Some("Recover pane 5")
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
