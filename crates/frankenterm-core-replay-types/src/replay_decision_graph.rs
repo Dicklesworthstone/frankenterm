@@ -7,7 +7,7 @@
 //! - Graph operations: `roots`, `causal_chain`, `effects`, `nodes_by_type`.
 //! - Canonicalization for deterministic comparison.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -145,7 +145,7 @@ pub struct DecisionEvent {
     #[serde(default)]
     pub parent_event_id: Option<String>,
     /// Confidence score (0.0–1.0).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_confidence")]
     pub confidence: Option<f64>,
     /// Optional: node that triggered this decision.
     #[serde(default)]
@@ -211,7 +211,7 @@ impl DecisionEvent {
             timestamp_ms,
             pane_id,
             parent_event_id,
-            confidence,
+            confidence: normalize_confidence(confidence),
             triggered_by: None,
             overrides: None,
             wall_clock_ms: timestamp_ms,
@@ -228,6 +228,17 @@ fn stable_decision_hash(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+fn normalize_confidence(confidence: Option<f64>) -> Option<f64> {
+    confidence.filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+}
+
+fn deserialize_confidence<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer).map(normalize_confidence)
 }
 
 fn canonical_json_string(value: &serde_json::Value) -> String {
@@ -1087,6 +1098,59 @@ mod tests {
         assert_eq!(restored.triggered_by, Some(0));
         assert_eq!(restored.parent_event_id.as_deref(), Some("event_0"));
         assert_eq!(restored.confidence, Some(0.75));
+    }
+
+    #[test]
+    fn decision_event_rejects_invalid_confidence_values() {
+        for confidence in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.001, 1.001] {
+            let event = DecisionEvent::new(
+                DecisionType::PatternMatch,
+                1,
+                "rule",
+                "definition",
+                "input",
+                serde_json::json!({"ok": true}),
+                None,
+                Some(confidence),
+                100,
+            );
+            assert_eq!(event.confidence, None);
+        }
+
+        for confidence in [0.0, 0.5, 1.0] {
+            let event = DecisionEvent::new(
+                DecisionType::PatternMatch,
+                1,
+                "rule",
+                "definition",
+                "input",
+                serde_json::json!({"ok": true}),
+                None,
+                Some(confidence),
+                100,
+            );
+            assert_eq!(event.confidence, Some(confidence));
+        }
+    }
+
+    #[test]
+    fn decision_event_deserialize_rejects_out_of_range_confidence() {
+        let mut event = DecisionEvent::new(
+            DecisionType::PatternMatch,
+            1,
+            "rule",
+            "definition",
+            "input",
+            serde_json::json!({"ok": true}),
+            None,
+            Some(0.75),
+            100,
+        );
+        event.confidence = Some(1.25);
+
+        let json = serde_json::to_string(&event).unwrap();
+        let restored: DecisionEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.confidence, None);
     }
 
     #[test]
