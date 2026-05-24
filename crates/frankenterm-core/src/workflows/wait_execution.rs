@@ -341,10 +341,21 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
             WaitCondition::Sleep { duration_ms } => {
                 let dur = Duration::from_millis(*duration_ms);
-                let capped = dur.min(timeout);
-                wait_sleep_maybe_cx(cx, capped, "sleep wait condition").await?;
+                if dur > timeout {
+                    wait_sleep_maybe_cx(cx, timeout, "sleep wait condition").await?;
+                    return Ok(WaitConditionResult::TimedOut {
+                        elapsed_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                        polls: 0,
+                        last_observed: Some(format!(
+                            "sleep duration {duration_ms}ms exceeded timeout {}ms",
+                            timeout.as_millis()
+                        )),
+                    });
+                }
+
+                wait_sleep_maybe_cx(cx, dur, "sleep wait condition").await?;
                 Ok(WaitConditionResult::Satisfied {
-                    elapsed_ms: capped.as_millis() as u64,
+                    elapsed_ms: *duration_ms,
                     polls: 0,
                     context: Some("sleep completed".to_string()),
                 })
@@ -1269,20 +1280,38 @@ mod tests {
     }
 
     #[test]
-    fn execute_sleep_capped_by_timeout() {
+    fn execute_sleep_times_out_when_duration_exceeds_timeout() {
         let rt = test_runtime();
         let source = MockPaneSource::new(vec![]);
         let engine = PatternEngine::new();
         let executor = WaitConditionExecutor::new(&source, &engine);
 
-        // Sleep 10 seconds but timeout is 50ms — should cap to 50ms
+        // Sleep 10 seconds but timeout is 50ms: the condition was not
+        // satisfied just because the executor stopped waiting.
         let condition = WaitCondition::Sleep { duration_ms: 10000 };
         let start = Instant::now();
         let result = rt
             .block_on(executor.execute(&condition, 1, Duration::from_millis(50)))
             .unwrap();
 
-        assert!(result.is_satisfied());
+        assert!(result.is_timed_out());
+        if let WaitConditionResult::TimedOut {
+            elapsed_ms,
+            polls,
+            last_observed,
+        } = result
+        {
+            assert_eq!(elapsed_ms, 50);
+            assert_eq!(polls, 0);
+            assert!(
+                last_observed
+                    .as_deref()
+                    .is_some_and(|s| s.contains("exceeded timeout")),
+                "unexpected last_observed: {last_observed:?}"
+            );
+        } else {
+            panic!("expected TimedOut");
+        }
         // Should complete near 50ms, not 10 seconds
         assert!(start.elapsed() < Duration::from_secs(1));
     }
