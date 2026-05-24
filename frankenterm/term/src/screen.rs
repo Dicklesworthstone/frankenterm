@@ -2,17 +2,24 @@
 use super::*;
 use crate::config::BidiMode;
 use crossbeam::thread;
+use frankenterm_surface::SequenceNo;
 use frankenterm_surface::line::{
     LineWrapScorecard as MonospaceLineWrapScorecard, MonospaceKpCostModel, MonospaceWrapMode,
 };
-use frankenterm_surface::SequenceNo;
 use log::{debug, warn};
-use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
+
+fn logical_len_exceeds_limit(current: usize, additional: usize, limit: usize) -> bool {
+    match current.checked_add(additional) {
+        Some(total) => total > limit,
+        None => true,
+    }
+}
 
 /// Holds the model of a screen.  This can either be the primary screen
 /// which includes lines of scrollback text, or the alternate screen
@@ -2812,10 +2819,10 @@ impl Screen {
             if !prior.last_cell_was_wrapped() {
                 break;
             }
-            if prior.len() + back_len > MAX_LOGICAL_LINE_LEN {
+            if logical_len_exceeds_limit(back_len, prior.len(), MAX_LOGICAL_LINE_LEN) {
                 break;
             }
-            back_len += prior.len();
+            back_len = back_len.saturating_add(prior.len());
             phys_range.start -= 1
         }
 
@@ -2828,11 +2835,13 @@ impl Screen {
             // First pass to measure number of lines
             for idx in phys_row.. {
                 if let Some(line) = self.lines.get(idx) {
-                    if total_len > 0 && total_len + line.len() > MAX_LOGICAL_LINE_LEN {
+                    if total_len > 0
+                        && logical_len_exceeds_limit(total_len, line.len(), MAX_LOGICAL_LINE_LEN)
+                    {
                         break;
                     }
                     end_inclusive = idx;
-                    total_len += line.len();
+                    total_len = total_len.saturating_add(line.len());
                     if !line.last_cell_was_wrapped() {
                         break;
                     }
@@ -2891,10 +2900,10 @@ impl Screen {
             if !prior.last_cell_was_wrapped() {
                 break;
             }
-            if prior.len() + back_len > MAX_LOGICAL_LINE_LEN {
+            if logical_len_exceeds_limit(back_len, prior.len(), MAX_LOGICAL_LINE_LEN) {
                 break;
             }
-            back_len += prior.len();
+            back_len = back_len.saturating_add(prior.len());
             phys_range.start -= 1
         }
 
@@ -2908,11 +2917,13 @@ impl Screen {
 
             for idx in phys_row.. {
                 if let Some(line) = self.lines.get(idx) {
-                    if total_len > 0 && total_len + line.len() > MAX_LOGICAL_LINE_LEN {
+                    if total_len > 0
+                        && logical_len_exceeds_limit(total_len, line.len(), MAX_LOGICAL_LINE_LEN)
+                    {
                         break;
                     }
                     end_inclusive = idx;
-                    total_len += line.len();
+                    total_len = total_len.saturating_add(line.len());
                     line_vec.push(line);
                     if !line.last_cell_was_wrapped() {
                         break;
@@ -2949,11 +2960,7 @@ impl Screen {
 fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Range<PhysRowIndex> {
     let start = r1.start.max(r2.start);
     let end = r1.end.min(r2.end);
-    if end > start {
-        start..end
-    } else {
-        0..0
-    }
+    if end > start { start..end } else { 0..0 }
 }
 
 #[cfg(test)]
@@ -2967,6 +2974,13 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn logical_len_limit_check_treats_overflow_as_exceeded() {
+        assert!(!logical_len_exceeds_limit(10, 5, 20));
+        assert!(logical_len_exceeds_limit(10, 11, 20));
+        assert!(logical_len_exceeds_limit(usize::MAX, 1, usize::MAX));
+    }
 
     #[derive(Debug, Clone)]
     struct TestTermConfig {
@@ -3496,10 +3510,11 @@ mod tests {
         );
 
         assert!(plan.covers_each_logical_line_once(logical_count));
-        assert!(plan
-            .batches
-            .iter()
-            .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES));
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
+        );
         assert_eq!(
             plan.batches
                 .first()
@@ -3747,8 +3762,10 @@ mod tests {
     #[test]
     fn last_good_frame_rollback_tracks_missing_snapshot_failures() {
         let mut screen = test_screen(2, 2, 96);
-        assert!(!screen
-            .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation));
+        assert!(
+            !screen
+                .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation)
+        );
         assert_eq!(screen.last_good_frame_lifecycle.rollback_count, 0);
         assert_eq!(
             screen
