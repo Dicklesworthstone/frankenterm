@@ -669,7 +669,12 @@ impl AdaptiveBackoff {
             return 0;
         }
         let exponent = (self.consecutive_failures - 1).min(20); // cap exponent
-        let delay = self.base_delay_ms as f64 * self.multiplier.powi(exponent as i32);
+        let multiplier = if self.multiplier.is_finite() && self.multiplier >= 1.0 {
+            self.multiplier
+        } else {
+            1.0
+        };
+        let delay = self.base_delay_ms as f64 * multiplier.powi(exponent as i32);
         (delay as u64).min(self.max_delay_ms)
     }
 
@@ -1750,6 +1755,18 @@ mod tests {
         }
         // Should be capped at 5000ms
         assert!(b.remaining_ms(90000) <= 5000);
+    }
+
+    #[test]
+    fn backoff_invalid_multiplier_does_not_disable_delay() {
+        let mut nan_multiplier = AdaptiveBackoff::new(1000, 60_000, f64::NAN);
+        nan_multiplier.record_failure(0);
+        assert_eq!(nan_multiplier.remaining_ms(0), 1000);
+
+        let mut negative_multiplier = AdaptiveBackoff::new(1000, 60_000, -2.0);
+        negative_multiplier.record_failure(0);
+        negative_multiplier.record_failure(1000);
+        assert_eq!(negative_multiplier.remaining_ms(1000), 1000);
     }
 
     #[test]
