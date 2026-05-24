@@ -1094,11 +1094,16 @@ fn phase_label(index: u32) -> String {
 // Utility
 // =============================================================================
 
+fn duration_ms_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    duration_ms_saturating(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
 
 /// Dispatch bootstrap commands for a slot through the command router.
@@ -1145,10 +1150,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        duration_ms_saturating(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    fn fleet_launcher_duration_millis_saturates() {
+        assert_eq!(duration_ms_saturating(std::time::Duration::MAX), u64::MAX);
     }
 
     // -------------------------------------------------------------------------
