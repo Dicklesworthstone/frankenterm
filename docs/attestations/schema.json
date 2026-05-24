@@ -293,7 +293,8 @@
         "path": {
           "description": "Repo-relative POSIX path to the artifact at the bundle's git commit.",
           "type": "string",
-          "pattern": "^[^/].*$"
+          "pattern": "^[^/].*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
         },
         "media_type": {
           "enum": [
@@ -603,7 +604,11 @@
         "path": {
           "description": "Repo-relative POSIX path to the artifact, or null only when deferred_to_bead and deferred_reason explain the live follow-up.",
           "oneOf": [
-            { "type": "string", "pattern": "^[^/].*$" },
+            {
+              "type": "string",
+              "pattern": "^[^/].*$",
+              "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+            },
             { "type": "null" }
           ]
         },
@@ -643,7 +648,11 @@
       "oneOf": [
         {
           "properties": {
-            "path": { "type": "string", "pattern": "^[^/].*$" }
+            "path": {
+              "type": "string",
+              "pattern": "^[^/].*$",
+              "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+            }
           },
           "not": { "required": ["deferred_to_bead"] }
         },

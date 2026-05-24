@@ -206,6 +206,19 @@ fn manifest_schema_rejects_ambiguous_or_unfilled_slots() {
 }
 
 #[test]
+fn manifest_schema_rejects_parent_directory_paths() {
+    let validator = manifest_validator();
+
+    let mut traversal_slot = base_slot(json!("../perf/headline-claims.json"));
+    traversal_slot["description"] = json!("synthetic path traversal");
+    let errors = validate(&validator, &base_manifest(traversal_slot));
+    assert!(
+        !errors.is_empty(),
+        "manifest slot paths must reject parent-directory traversal"
+    );
+}
+
+#[test]
 fn checked_in_manifest_validates_against_deferred_slot_schema() {
     let validator = manifest_validator();
     let path = workspace_root()
