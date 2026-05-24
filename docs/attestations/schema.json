@@ -269,11 +269,13 @@
         },
         "records": {
           "type": "array",
+          "minItems": 1,
           "items": { "$ref": "#/$defs/confidenceRecord" }
         },
         "best_confidence_by_category": {
           "description": "One canonical best-available confidence record per proof taxonomy category represented by delivered artifacts in the release bundle.",
           "type": "array",
+          "minItems": 1,
           "items": { "$ref": "#/$defs/confidenceRecord" }
         }
       }
@@ -531,6 +533,7 @@
         },
         "category_counts": {
           "type": "array",
+          "minItems": 1,
           "items": { "$ref": "#/$defs/taxonomyCategoryCoverage" }
         },
         "below_threshold_count": {

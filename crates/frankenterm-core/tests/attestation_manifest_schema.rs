@@ -815,6 +815,39 @@ fn bundle_schema_requires_canonical_confidence_summary() {
 }
 
 #[test]
+fn bundle_schema_rejects_empty_required_summary_arrays() {
+    let validator = bundle_validator();
+    let valid = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle tracked by ft-e87u6.2"
+    }));
+
+    for (surface, mut bundle) in [
+        ("confidence_summary.records", valid.clone()),
+        ("confidence_summary.best_confidence_by_category", valid.clone()),
+        ("taxonomy_coverage.category_counts", valid),
+    ] {
+        match surface {
+            "confidence_summary.records" => {
+                bundle["confidence_summary"]["records"] = json!([]);
+            }
+            "confidence_summary.best_confidence_by_category" => {
+                bundle["confidence_summary"]["best_confidence_by_category"] = json!([]);
+            }
+            "taxonomy_coverage.category_counts" => {
+                bundle["taxonomy_coverage"]["category_counts"] = json!([]);
+            }
+            _ => unreachable!("test case is exhaustive"),
+        }
+        assert!(
+            !validate(&validator, &bundle).is_empty(),
+            "bundle schema must reject empty {surface}"
+        );
+    }
+}
+
+#[test]
 fn bundle_schema_rejects_blank_confidence_summary_text() {
     let validator = bundle_validator();
     let valid = base_bundle(json!({
