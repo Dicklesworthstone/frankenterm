@@ -1369,6 +1369,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn streaming_redactor_never_leaks_any_corpus_positive_across_splits() {
+        // Class guard (ft-b1p6x). The per-sample streaming-split tests above each
+        // pin one secret. STREAMING_SECRET_ANCHORS is a hand-maintained list, so a
+        // newly added keyed pattern can silently miss an anchor and leak a value
+        // split across a chunk boundary — exactly the failure ft-b1p6x fixed for
+        // azureopenai/devicecode/usercode and br-ft-zbnz4 fixed for the DATADOG
+        // long form. Rather than enumerate samples by hand, drive EVERY positive
+        // vector from the coverage corpus through the streaming redactor at every
+        // split offset and assert the secret bytes never survive. Any future
+        // pattern that forgets its anchor fails here instead of in production.
+        //
+        // Every corpus input is far under the 64 KiB default tail window
+        // (DEFAULT_STREAMING_REDACTOR_TAIL_BYTES), so the streaming redactor holds
+        // each secret in full and its output must equal batch redaction byte for
+        // byte — the same invariant the per-sample tests assert.
+        use crate::redactor_coverage_matrix::synthesized_corpus;
+
+        let batch = Redactor::new();
+        for vector in synthesized_corpus() {
+            if vector.expected_matches.is_empty() {
+                continue; // negatives carry no secret to leak
+            }
+            assert!(
+                vector.input.len() < DEFAULT_STREAMING_REDACTOR_TAIL_BYTES,
+                "corpus vector {} exceeds the default tail window; the \
+                 byte-identical streaming invariant below would not hold",
+                vector.name
+            );
+
+            let expected_str = batch.redact(&vector.input);
+            let expected = expected_str.clone().into_bytes();
+            // The corpus is only meaningful here if batch actually scrubs the
+            // secret; otherwise a streaming "match" would be a false comfort.
+            for em in &vector.expected_matches {
+                let secret = &vector.input[em.start as usize..em.end as usize];
+                assert!(
+                    !expected_str.contains(secret),
+                    "batch redaction left secret {secret:?} for vector {}",
+                    vector.name
+                );
+            }
+
+            let input = vector.input.as_bytes();
+            for split in 1..input.len() {
+                let mut streaming = StreamingRedactor::new();
+                let mut out = Vec::new();
+                out.extend(streaming.redact_chunk(&input[..split]).bytes);
+                out.extend(streaming.redact_chunk(&input[split..]).bytes);
+                out.extend(streaming.finish().bytes);
+
+                assert_eq!(
+                    out, expected,
+                    "vector {} split={split}: streaming output diverged from batch",
+                    vector.name
+                );
+
+                let rendered = String::from_utf8(out).unwrap_or_else(|_| {
+                    panic!("vector {} split={split}: non-UTF8 stream output", vector.name)
+                });
+                for em in &vector.expected_matches {
+                    let secret = &vector.input[em.start as usize..em.end as usize];
+                    assert!(
+                        !rendered.contains(secret),
+                        "vector {} split={split} leaked secret {secret:?} in {rendered:?}",
+                        vector.name
+                    );
+                }
+            }
+        }
+    }
+
     proptest! {
         #[test]
         fn streaming_redactor_detects_hyphenated_keyed_prefixes(
