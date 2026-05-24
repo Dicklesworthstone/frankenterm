@@ -64,6 +64,31 @@ pub(crate) struct PerPane {
     pub(crate) notifications: Vec<Alert>,
 }
 
+fn stable_row_offset(row: StableRowIndex, offset: usize) -> Option<StableRowIndex> {
+    let offset = StableRowIndex::try_from(offset).ok()?;
+    row.checked_add(offset)
+}
+
+fn stable_row_range_from_len(
+    start: StableRowIndex,
+    len: usize,
+) -> Option<std::ops::Range<StableRowIndex>> {
+    let end = stable_row_offset(start, len)?;
+    Some(start..end)
+}
+
+fn stable_row_range_from_signed_len(
+    start: StableRowIndex,
+    len: StableRowIndex,
+) -> Option<std::ops::Range<StableRowIndex>> {
+    if len < 0 {
+        return None;
+    }
+
+    let len = usize::try_from(len).ok()?;
+    stable_row_range_from_len(start, len)
+}
+
 impl PerPane {
     fn compute_changes(
         &mut self,
@@ -106,10 +131,9 @@ impl PerPane {
 
         let old_seqno = self.seqno;
         self.seqno = pane.get_current_seqno();
-        let mut all_dirty_lines = pane.get_changed_since(
-            0..dims.physical_top + dims.viewport_rows as StableRowIndex,
-            old_seqno,
-        );
+        let viewport_range = stable_row_range_from_len(dims.physical_top, dims.viewport_rows)
+            .unwrap_or(dims.physical_top..dims.physical_top);
+        let mut all_dirty_lines = pane.get_changed_since(viewport_range.clone(), old_seqno);
         if !all_dirty_lines.is_empty() {
             changed = true;
         }
@@ -119,15 +143,12 @@ impl PerPane {
         }
 
         // Figure out what we're going to send as dirty lines vs bonus lines
-        let viewport_range =
-            dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
-
         let (first_line, lines) = pane.get_lines(viewport_range);
         let mut bonus_lines = lines
             .into_iter()
             .enumerate()
             .filter_map(|(idx, mut line)| {
-                let stable_row = first_line + idx as StableRowIndex;
+                let stable_row = stable_row_offset(first_line, idx)?;
                 if all_dirty_lines.contains(stable_row) {
                     all_dirty_lines.remove(stable_row);
                     line.compress_for_scrollback();
@@ -1035,7 +1056,9 @@ impl SessionHandler {
                             for range in lines {
                                 let (first_row, lines) = pane.get_lines(range);
                                 for (idx, mut line) in lines.into_iter().enumerate() {
-                                    let stable_row = first_row + idx as StableRowIndex;
+                                    let Some(stable_row) = stable_row_offset(first_row, idx) else {
+                                        break;
+                                    };
                                     line.compress_for_scrollback();
                                     lines_and_indices.push((stable_row, line));
                                 }
@@ -1067,7 +1090,10 @@ impl SessionHandler {
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
 
-                            let (_, lines) = pane.get_lines(line_idx..line_idx + 1);
+                            let lines = match stable_row_range_from_len(line_idx, 1) {
+                                Some(line_range) => pane.get_lines(line_range).1,
+                                None => Vec::new(),
+                            };
                             'found_data: for line in lines {
                                 if let Some(cell) = line.get_cell(cell_idx) {
                                     if let Some(images) = cell.attrs().images() {
@@ -1974,6 +2000,20 @@ mod tests {
     }
 
     #[test]
+    fn stable_row_range_helpers_reject_unrepresentable_spans() {
+        assert_eq!(
+            stable_row_range_from_len(StableRowIndex::MAX - 1, 1),
+            Some((StableRowIndex::MAX - 1)..StableRowIndex::MAX)
+        );
+        assert_eq!(stable_row_range_from_len(StableRowIndex::MAX, 1), None);
+        assert_eq!(
+            stable_row_range_from_signed_len(StableRowIndex::MAX - 1, 2),
+            None
+        );
+        assert_eq!(stable_row_range_from_signed_len(10, -1), None);
+    }
+
+    #[test]
     fn session_handler_new_has_empty_state() {
         let (sender, _captured) = capturing_sender();
         let handler = SessionHandler::new(sender);
@@ -2650,10 +2690,14 @@ mod tests {
                     pane_id,
                     start,
                     len,
-                } => Pdu::GetLines(GetLines {
-                    pane_id,
-                    lines: std::iter::once(start..start + len).collect(),
-                }),
+                } => {
+                    let range =
+                        stable_row_range_from_signed_len(start, len).unwrap_or(start..start);
+                    Pdu::GetLines(GetLines {
+                        pane_id,
+                        lines: std::iter::once(range).collect(),
+                    })
+                }
                 Self::GetImageCell {
                     pane_id,
                     line_idx,
@@ -2743,6 +2787,12 @@ mod tests {
 
     fn arb_missing_mux_session_error_op() -> impl Strategy<Value = MissingMuxSessionErrorOp> {
         let label = "[a-zA-Z0-9 _./-]{0,48}";
+        let line_start = prop_oneof![
+            0isize..128,
+            Just(StableRowIndex::MAX - 1),
+            Just(StableRowIndex::MAX),
+        ];
+        let line_len = prop_oneof![1isize..8, Just(-1), Just(2)];
         prop_oneof![
             (0usize..128, label).prop_map(|(window_id, workspace)| {
                 MissingMuxSessionErrorOp::SetWindowWorkspace {
@@ -2782,14 +2832,14 @@ mod tests {
             (0usize..4096).prop_map(|pane_id| {
                 MissingMuxSessionErrorOp::GetPaneRenderableDimensions { pane_id }
             }),
-            (0usize..4096, 0isize..128, 1isize..8).prop_map(|(pane_id, start, len)| {
+            (0usize..4096, line_start.clone(), line_len).prop_map(|(pane_id, start, len)| {
                 MissingMuxSessionErrorOp::GetLines {
                     pane_id,
                     start,
                     len,
                 }
             }),
-            (0usize..4096, 0isize..128, 0usize..128, any::<[u8; 32]>()).prop_map(
+            (0usize..4096, line_start, 0usize..128, any::<[u8; 32]>()).prop_map(
                 |(pane_id, line_idx, cell_idx, data_hash)| MissingMuxSessionErrorOp::GetImageCell {
                     pane_id,
                     line_idx,
