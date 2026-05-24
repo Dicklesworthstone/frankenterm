@@ -1104,6 +1104,25 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_rule_id_whitespace(
+        suffix in "[a-z]{3,10}",
+    ) {
+        let mut builtin_rule = make_anchor_only_rule("whitespace_builtin", "WS_BUILTIN");
+        builtin_rule.id = format!("codex.{suffix} rule");
+        let builtin_pack =
+            PatternPack::new("builtin:whitespace-rule", "1.0.0", vec![builtin_rule]);
+        prop_assert!(PatternLibrary::new(vec![builtin_pack]).is_err());
+
+        let pack_name = format!("user:{suffix}");
+        let mut user_rule = make_anchor_only_rule("whitespace_user", "WS_USER");
+        user_rule.id = format!("custom.{suffix}\trule");
+        let user_pack = PatternPack::new(&pack_name, "1.0.0", vec![user_rule]);
+        let user_packs: std::collections::HashSet<String> =
+            std::iter::once(pack_name).collect();
+        prop_assert!(PatternLibrary::new_with_user_packs(vec![user_pack], &user_packs).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_empty_pack_name(rule_suffix in "[a-z]{3,10}") {
         let rule = make_anchor_only_rule(&rule_suffix, "EMPTY_PACK_NAME");
         let pack = PatternPack::new(" \t ", "1.0.0", vec![rule]);

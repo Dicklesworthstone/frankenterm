@@ -591,6 +591,14 @@ impl RuleDef {
             .into());
         }
 
+        if self.id.chars().any(char::is_whitespace) {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must not contain whitespace",
+                self.id
+            ))
+            .into());
+        }
+
         if !allow_custom_prefix
             && !ALLOWED_RULE_PREFIXES
                 .iter()
