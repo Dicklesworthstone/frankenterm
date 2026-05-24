@@ -250,6 +250,22 @@ jobs:
           bash tests/e2e/test_redactor_coverage_report_integrity.sh
           bash tests/e2e/test_redactor_coverage_report_integrity.sh --self-test
 
+      # ft-zbnz4 — deferred RCH proof replay queue static contract family.
+      # These verifiers prove the receipt/extractor/ownership/queue/replay
+      # semantics WITHOUT live RCH (jq + ruby only), so they stay green even
+      # while the remote proof lane (ft-4tp7g) is down. They are the only thing
+      # that exercises these contracts; nothing else in CI compiles them. Each
+      # locks fail-closed invariants: local cargo is never proof, stale command
+      # shapes never run, and a selected-worker topology-preflight failure stays
+      # a distinct blocker (never coarsened, never green). Static; no compilation.
+      - name: Deferred-proof replay contract family (ft-zbnz4)
+        run: |
+          bash tests/e2e/test_deferred_proof_receipt_contract.sh
+          bash tests/e2e/test_deferred_proof_comment_extractor_contract.sh
+          bash tests/e2e/test_deferred_proof_ownership_gate.sh
+          bash tests/e2e/test_deferred_proof_queue_surface_contract.sh
+          bash tests/e2e/test_deferred_proof_replay_harness_contract.sh
+
       # ft-i2eni.3 — Cargo-deny ban on direct `tokio` dependencies in
       # first-party crates. The doctrine block in AGENTS.md states
       # that the canonical async runtime is asupersync via
