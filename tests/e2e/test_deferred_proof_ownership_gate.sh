@@ -284,6 +284,16 @@ overlap_gate.fetch("current_checkout").fetch("dirty_paths") <<
   { "path" => owned_first, "status" => " M", "category" => "owned_overlap" }
 fail!("current_dirty_overlap missed an injected owned-path overlap") if current_dirty_overlap(overlap_gate).empty?
 
+# 2b. An owned path present in dirty_paths_at_capture must register as a
+#     captured overlap. The allow decision forbids captured overlap too, but no
+#     positive golden exercises it, so without this the captured predicate could
+#     be silently weakened to always-empty and still pass every case above.
+captured_gate = dup_gate.call(base)
+fail!("negative-corpus base already has captured overlap") unless captured_dirty_overlap(captured_gate).empty?
+captured_gate.fetch("receipt").fetch("dirty_paths_at_capture") <<
+  captured_gate.fetch("receipt").fetch("owned_paths").first
+fail!("captured_dirty_overlap missed an injected captured owned-path overlap") if captured_dirty_overlap(captured_gate).empty?
+
 # 3. An open prerequisite bead must register as blocked; a closed one must not.
 open_prereq = dup_gate.call(base)
 open_prereq.fetch("coordination").fetch("prerequisite_beads") << { "bead_id" => "ft-open1", "status" => "open" }
