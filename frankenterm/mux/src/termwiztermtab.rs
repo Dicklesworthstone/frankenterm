@@ -3,19 +3,19 @@
 //! input from the user as part of eg: setting up an ssh
 //! session.
 
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
+use crate::Mux;
+use crate::domain::{Domain, DomainId, DomainState, alloc_domain_id};
 use crate::pane::{
-    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
-    WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, WithPaneLines,
+    alloc_pane_id,
 };
 use crate::renderable::*;
 use crate::tab::Tab;
 use crate::window::WindowId;
-use crate::Mux;
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use crossbeam::channel::{unbounded as channel, Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender, unbounded as channel};
 use filedescriptor::{FileDescriptor, Pipe};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
@@ -46,6 +46,14 @@ fn termwiz_terminal_domain() -> Arc<dyn Domain> {
         let domain_id = alloc_domain_id();
         Arc::new(TermWizTerminalDomain { domain_id })
     }))
+}
+
+fn usize_to_u16_saturating(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn row_to_u16_saturating(value: i64) -> u16 {
+    u16::try_from(value.max(0)).unwrap_or(u16::MAX)
 }
 
 #[async_trait(?Send)]
@@ -258,8 +266,8 @@ impl Pane for TermWizTerminalPane {
         };
 
         let event = InputEvent::Mouse(TermWizMouseEvent {
-            x: event.x as u16,
-            y: event.y as u16,
+            x: usize_to_u16_saturating(event.x),
+            y: row_to_u16_saturating(event.y),
             mouse_buttons,
             modifiers: event.modifiers,
         });
@@ -381,7 +389,7 @@ impl TermWizTerminal {
 
 impl termwiz::terminal::Terminal for TermWizTerminal {
     fn set_raw_mode(&mut self) -> termwiz::Result<()> {
-        use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
+        use termwiz::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode};
 
         macro_rules! decset {
             ($variant:ident) => {
@@ -634,8 +642,8 @@ pub async fn run<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::LocalDomain;
     use crate::Mux;
+    use crate::domain::LocalDomain;
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,
@@ -673,8 +681,18 @@ mod tests {
     }
 
     #[test]
+    fn mouse_coordinate_conversions_saturate() {
+        assert_eq!(usize_to_u16_saturating(7), 7);
+        assert_eq!(usize_to_u16_saturating((u16::MAX as usize) + 1), u16::MAX);
+        assert_eq!(row_to_u16_saturating(-1), 0);
+        assert_eq!(row_to_u16_saturating(i64::from(u16::MAX) + 1), u16::MAX);
+    }
+
+    #[test]
     fn allocate_registers_overlay_pane_with_termwiz_domain() {
-        let _guard = crate::MUX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let default_domain: Arc<dyn Domain> =
             Arc::new(LocalDomain::new("termwiz-overlay-default").unwrap());
         let mux = Arc::new(Mux::new(Some(default_domain)));
