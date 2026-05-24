@@ -189,10 +189,11 @@ impl CanonicalConnectorEvent {
         event_type: impl Into<String>,
         payload: serde_json::Value,
     ) -> Self {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = duration_ms_saturating(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
         let event_id = generate_event_id(now_ms);
         Self {
             schema_version: SchemaVersion::current(),
@@ -343,6 +344,10 @@ impl CanonicalConnectorEvent {
 fn generate_event_id(timestamp_ms: u64) -> String {
     let seq = EVENT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("evt-{timestamp_ms}-{seq:016x}")
+}
+
+fn duration_ms_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 // =============================================================================
@@ -906,6 +911,11 @@ mod tests {
     #[test]
     fn connector_event_model_schema_version_display() {
         assert_eq!(format!("{}", SchemaVersion::new(1, 2)), "1.2");
+    }
+
+    #[test]
+    fn connector_event_model_duration_millis_saturates() {
+        assert_eq!(duration_ms_saturating(std::time::Duration::MAX), u64::MAX);
     }
 
     // ---- Event direction ----
