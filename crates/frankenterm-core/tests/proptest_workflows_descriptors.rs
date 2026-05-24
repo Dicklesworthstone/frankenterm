@@ -300,6 +300,37 @@ proptest! {
     }
 
     #[test]
+    fn duplicate_top_level_step_ids_fail_validation(
+        name in "[a-z_]{3,20}",
+        duplicate_id in "[a-z_]{3,15}",
+    ) {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name,
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![
+                DescriptorStep::Log {
+                    id: duplicate_id.clone(),
+                    description: None,
+                    message: "first duplicate".to_string(),
+                },
+                DescriptorStep::Notify {
+                    id: duplicate_id,
+                    description: None,
+                    message: "second duplicate".to_string(),
+                },
+            ],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "duplicate top-level step ids must be rejected"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();
