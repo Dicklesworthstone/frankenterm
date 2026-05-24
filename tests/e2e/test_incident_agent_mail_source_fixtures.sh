@@ -199,6 +199,25 @@ jq -e '
   )
 ' "${FIXTURE}" >/dev/null || fail "fallback-only case drifted"
 
+# Redaction anti-leak guard (ft-1nqye class): every case must keep message
+# bodies / attachments / raw mailbox paths out of the bundle and prove secrets
+# are redacted. Assert all cases satisfy it AND that flipping any privacy field
+# to a leak state is rejected, so the guard provably bites rather than passing
+# only because no fixture exercises a leak.
+jq -e '
+  def privacy_clean($c):
+    $c.agent_mail.privacy.message_bodies_included == false
+    and $c.agent_mail.privacy.attachments_included == false
+    and $c.agent_mail.privacy.secrets_redacted == true
+    and $c.agent_mail.privacy.raw_mailbox_paths_included == false;
+  (all(.cases[]; privacy_clean(.)))
+  and (.cases[0] as $p
+    | (privacy_clean($p | .agent_mail.privacy.message_bodies_included = true) | not)
+    and (privacy_clean($p | .agent_mail.privacy.attachments_included = true) | not)
+    and (privacy_clean($p | .agent_mail.privacy.secrets_redacted = false) | not)
+    and (privacy_clean($p | .agent_mail.privacy.raw_mailbox_paths_included = true) | not))
+' "${FIXTURE}" >/dev/null || fail "privacy redaction guard does not bite"
+
 live_e2e="$(git ls-files tests/e2e | awk '/\.sh$/ { count++ } END { print count + 0 }')"
 grep -q "<!--count:e2e_scripts-->${live_e2e}<!--/count-->" README.md \
   || fail "README stamped E2E count stale; expected ${live_e2e}"
