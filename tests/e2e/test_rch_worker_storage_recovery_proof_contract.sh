@@ -97,6 +97,32 @@ def assert_sha!(value, message)
   fail!(message) unless SHA256.match?(value)
 end
 
+# Cross-cutting safety invariants protecting the one property the whole
+# contract exists to enforce: ft-4tp7g may only close on completed
+# remote-smoke evidence. Returns stable violation codes; every real fixture
+# must yield none, and each tamper case must yield exactly its expected code.
+def guard_violations(payload)
+  v = []
+  recovered = payload["admission_recovered"] == true
+  closeout = payload["ft4tp7g_closeout_allowed"] == true
+  is_pass = payload["gate_result"] == "passed_remote_smoke"
+  smoke_completed = payload.dig("remote_required_smoke", "remote_execution_state") == "completed"
+
+  v << "recovered_without_pass" if recovered && !is_pass
+  v << "pass_without_recovery" if is_pass && !recovered
+  v << "closeout_without_recovery" if closeout && !recovered
+  v << "closeout_without_pass" if closeout && !is_pass
+  v << "closeout_without_completed_smoke" if closeout && !smoke_completed
+  v << "pass_without_completed_smoke" if is_pass && !smoke_completed
+
+  side_effects = payload["agent_side_effect_policy"] || {}
+  side_effects.each do |flag, value|
+    expected = flag == "read_only_evidence_collection"
+    v << "agent_side_effect" if value != expected
+  end
+  v.uniq
+end
+
 schema = read_json(SCHEMA)
 manifest = read_json(MANIFEST)
 doc = File.read(DOC)
@@ -191,6 +217,36 @@ payloads.each do |fixture_id, payload|
   fail!("#{fixture_id} br dep cycles not zero") unless cycles["count"] == 0
 end
 
+# Every real fixture must satisfy the cross-cutting closeout-evidence guards.
+payloads.each do |fixture_id, payload|
+  found = guard_violations(payload)
+  fail!("#{fixture_id} violates closeout-evidence guards: #{found.inspect}") unless found.empty?
+end
+
+# Negative corpus: tamper the only fixture that legitimately closes ft-4tp7g
+# and prove each guard fires. Each tamper must surface exactly its expected
+# code so a future regression cannot silently re-open the closeout path.
+require "json" unless defined?(JSON)
+def deep_dup(obj)
+  JSON.parse(JSON.generate(obj))
+end
+GUARD_TAMPERS = [
+  ["recovered-without-pass", "recovered_without_pass", ->(p) { p["gate_result"] = "blocked_topology_preflight" }],
+  ["pass-without-recovery", "pass_without_recovery", ->(p) { p["admission_recovered"] = false }],
+  ["closeout-without-completed-smoke", "closeout_without_completed_smoke", ->(p) { p["remote_required_smoke"]["remote_execution_state"] = "failed" }],
+  ["agent-mutated-worker", "agent_side_effect", ->(p) { p["agent_side_effect_policy"]["worker_mutated_by_agent"] = true }],
+  ["local-cargo-as-proof", "agent_side_effect", ->(p) { p["agent_side_effect_policy"]["local_cargo_counted_as_proof"] = true }]
+].freeze
+seen_guard_codes = []
+GUARD_TAMPERS.each do |case_id, expected, mutate|
+  tampered = deep_dup(payloads.fetch("passed-remote-smoke"))
+  mutate.call(tampered)
+  found = guard_violations(tampered)
+  fail!("guard tamper #{case_id} did not raise #{expected} (got #{found.inspect})") unless found.include?(expected)
+  seen_guard_codes << expected
+end
+fail!("guard tampers degenerate: only #{seen_guard_codes.uniq.inspect} exercised") unless seen_guard_codes.uniq.length >= 3
+
 passed = payloads.fetch("passed-remote-smoke")
 fail!("passed fixture missing operator recovery reference") unless passed["operator_recovery_reference"]
 fail!("passed fixture must recover admission") unless passed["admission_recovered"] == true
@@ -264,5 +320,5 @@ fail!("doc missing missing-approval gate result") unless doc.include?("invalid_m
 fail!("doc missing topology-preflight fixture") unless doc.include?("blocked-topology-preflight")
 fail!("doc missing topology-preflight gate result") unless doc.include?("blocked_topology_preflight")
 
-puts "rch worker storage recovery proof contract: static verifier passed (#{fixture_paths.length} fixtures, #{EXPECTED_FORBIDDEN.length} forbidden actions)"
+puts "rch worker storage recovery proof contract: static verifier passed (#{fixture_paths.length} fixtures, #{EXPECTED_FORBIDDEN.length} forbidden actions, #{GUARD_TAMPERS.length} closeout-guard tampers)"
 RUBY

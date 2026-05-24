@@ -41,7 +41,12 @@ Every proof artifact records:
 - `br dep cycles --json` evidence.
 
 `ft-4tp7g` must not be closed from inventories alone. Closeout is allowed only
-when the gate result is `passed_remote_smoke`.
+when the gate result is `passed_remote_smoke`. The verifier enforces this as
+cross-cutting guards: `admission_recovered` may be `true` only for
+`passed_remote_smoke` (and vice versa), and `ft4tp7g_closeout_allowed` requires
+both a recovered admission and a `completed` remote-smoke execution. A negative
+tamper corpus mutates the passing fixture to prove each guard fires, so no
+future fixture can silently re-open the closeout path without remote evidence.
 
 ## Required Fields
 
