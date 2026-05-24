@@ -227,9 +227,10 @@ impl FaultSpec {
                         return Err(format!("fault {index} reorder window_size must be > 0"));
                     }
                 }
-                FaultType::Delay { .. }
-                | FaultType::Corrupt { .. }
-                | FaultType::Duplicate { .. } => {}
+                FaultType::Corrupt {
+                    field, mutation, ..
+                } => validate_corrupt(index, field, mutation)?,
+                FaultType::Delay { .. } | FaultType::Duplicate { .. } => {}
             }
         }
 
@@ -257,6 +258,31 @@ fn validate_filter(index: usize, filter: &EventFilter) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_corrupt(index: usize, field: &str, mutation: &str) -> Result<(), String> {
+    match field {
+        "timestamp_ms" => {
+            let delta = mutation
+                .strip_prefix('-')
+                .or_else(|| mutation.strip_prefix('+'))
+                .ok_or_else(|| {
+                    format!(
+                        "fault {index} timestamp_ms corrupt mutation must start with '+' or '-'"
+                    )
+                })?;
+            if delta.is_empty() || delta.parse::<u64>().is_err() {
+                return Err(format!(
+                    "fault {index} timestamp_ms corrupt mutation delta must be an unsigned integer"
+                ));
+            }
+            Ok(())
+        }
+        "payload" => Ok(()),
+        _ => Err(format!(
+            "fault {index} corrupt field must be one of: timestamp_ms, payload"
+        )),
+    }
 }
 
 // ============================================================================
@@ -876,6 +902,38 @@ time_range_end_ms = 100
 "#;
         let err = FaultSpec::from_toml(toml).unwrap_err();
         assert!(err.contains("time range"));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_corrupt_field() {
+        let toml = r#"
+name = "bad-corrupt-field"
+seed = 1
+
+[[faults]]
+type = "corrupt"
+field = "sequence"
+mutation = "+1"
+[faults.filter]
+"#;
+        let err = FaultSpec::from_toml(toml).unwrap_err();
+        assert!(err.contains("corrupt field"));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_timestamp_corrupt_mutation() {
+        let toml = r#"
+name = "bad-corrupt-mutation"
+seed = 1
+
+[[faults]]
+type = "corrupt"
+field = "timestamp_ms"
+mutation = "later"
+[faults.filter]
+"#;
+        let err = FaultSpec::from_toml(toml).unwrap_err();
+        assert!(err.contains("timestamp_ms corrupt mutation"));
     }
 
     // ── FaultInjector ───────────────────────────────────────────────────
