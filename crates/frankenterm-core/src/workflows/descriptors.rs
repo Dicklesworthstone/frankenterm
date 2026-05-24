@@ -163,25 +163,62 @@ impl WorkflowDescriptor {
 
         let mut seen = std::collections::HashSet::new();
         for step in &self.steps {
-            let id = step.id();
-            if id.trim().is_empty() {
-                return Err(crate::Error::Config(
-                    crate::error::ConfigError::ValidationError(
-                        "Descriptor step id cannot be empty".to_string(),
-                    ),
-                ));
-            }
-            if !seen.insert(id.to_string()) {
-                return Err(crate::Error::Config(
-                    crate::error::ConfigError::ValidationError(format!("Duplicate step id: {id}")),
-                ));
-            }
-
-            step.validate(limits)?;
+            validate_step_tree(step, limits, &mut seen)?;
         }
 
         Ok(())
     }
+}
+
+fn validate_step_tree(
+    step: &DescriptorStep,
+    limits: &DescriptorLimits,
+    seen: &mut std::collections::HashSet<String>,
+) -> crate::Result<()> {
+    let id = step.id();
+    if id.trim().is_empty() {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(
+                "Descriptor step id cannot be empty".to_string(),
+            ),
+        ));
+    }
+    if !seen.insert(id.to_string()) {
+        return Err(crate::Error::Config(
+            crate::error::ConfigError::ValidationError(format!("Duplicate step id: {id}")),
+        ));
+    }
+
+    step.validate(limits)?;
+
+    match step {
+        DescriptorStep::Conditional {
+            then_steps,
+            else_steps,
+            ..
+        } => {
+            for child in then_steps {
+                validate_step_tree(child, limits, seen)?;
+            }
+            for child in else_steps {
+                validate_step_tree(child, limits, seen)?;
+            }
+        }
+        DescriptorStep::Loop { body, .. } => {
+            for child in body {
+                validate_step_tree(child, limits, seen)?;
+            }
+        }
+        DescriptorStep::WaitFor { .. }
+        | DescriptorStep::Sleep { .. }
+        | DescriptorStep::SendText { .. }
+        | DescriptorStep::SendCtrl { .. }
+        | DescriptorStep::Notify { .. }
+        | DescriptorStep::Log { .. }
+        | DescriptorStep::Abort { .. } => {}
+    }
+
+    Ok(())
 }
 
 /// Matchers in descriptors (substring or regex).

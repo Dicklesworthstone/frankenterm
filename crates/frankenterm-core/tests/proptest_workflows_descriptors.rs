@@ -331,6 +331,43 @@ proptest! {
     }
 
     #[test]
+    fn duplicate_nested_step_ids_fail_validation(
+        name in "[a-z_]{3,20}",
+        duplicate_id in "[a-z_]{3,15}",
+    ) {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name,
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::Conditional {
+                id: "branch".to_string(),
+                description: None,
+                test_text: "matched".to_string(),
+                matcher: DescriptorMatcher::Substring {
+                    value: "matched".to_string(),
+                },
+                then_steps: vec![DescriptorStep::Log {
+                    id: duplicate_id.clone(),
+                    description: None,
+                    message: "then duplicate".to_string(),
+                }],
+                else_steps: vec![DescriptorStep::Notify {
+                    id: duplicate_id,
+                    description: None,
+                    message: "else duplicate".to_string(),
+                }],
+            }],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "duplicate nested step ids must be rejected"
+        );
+    }
+
+    #[test]
     fn send_text_step_respects_configured_text_length_limit(
         max_text_len in 0usize..128,
     ) {
