@@ -642,6 +642,8 @@ impl ConnectorCredentialBroker {
                 reason: "provider marked unavailable".to_string(),
             });
         }
+        let credential_provider_id = credential.provider_id.clone();
+        let credential_version = credential.version;
 
         // Determine lease TTL
         let lease_ttl = self
@@ -653,8 +655,7 @@ impl ConnectorCredentialBroker {
             .unwrap_or(provider.config.default_lease_ttl_ms);
 
         // Issue the lease
-        self.lease_counter += 1;
-        let lease_id = format!("lease-{}", self.lease_counter);
+        let lease_id = self.allocate_lease_id();
         let lease = CredentialLease {
             lease_id: lease_id.clone(),
             credential_id: credential_id.to_string(),
@@ -663,17 +664,14 @@ impl ConnectorCredentialBroker {
             state: LeaseState::Active,
             issued_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(lease_ttl),
-            credential_version: credential.version,
+            credential_version,
         };
 
         // Update counters
         if let Some(cred) = self.credentials.get_mut(credential_id) {
             cred.active_lease_count += 1;
         }
-        if let Some(prov) = self
-            .providers
-            .get_mut(&self.credentials[credential_id].provider_id)
-        {
+        if let Some(prov) = self.providers.get_mut(&credential_provider_id) {
             prov.active_leases += 1;
             prov.total_issued += 1;
         }
@@ -695,6 +693,18 @@ impl ConnectorCredentialBroker {
         });
 
         Ok(result)
+    }
+
+    fn allocate_lease_id(&mut self) -> String {
+        let mut candidate = self.lease_counter.checked_add(1).unwrap_or(1).max(1);
+        loop {
+            let lease_id = format!("lease-{candidate}");
+            if !self.leases.contains_key(&lease_id) {
+                self.lease_counter = candidate;
+                return lease_id;
+            }
+            candidate = candidate.checked_add(1).unwrap_or(1).max(1);
+        }
     }
 
     /// Revoke a specific lease.
@@ -1222,6 +1232,24 @@ mod tests {
         assert_eq!(lease.state, LeaseState::Active);
         assert!(lease.expires_at_ms > 2000);
         assert_eq!(broker.telemetry.leases_issued, 1);
+    }
+
+    #[test]
+    fn lease_id_wraparound_skips_active_ids() {
+        let mut broker = setup_broker();
+        let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
+        let first = broker
+            .request_lease("conn-1", "cred-1", scope.clone(), 2000)
+            .unwrap();
+        broker.lease_counter = u64::MAX;
+
+        let second = broker
+            .request_lease("conn-1", "cred-1", scope, 2001)
+            .unwrap();
+
+        assert_eq!(first.lease_id, "lease-1");
+        assert_eq!(second.lease_id, "lease-2");
+        assert_ne!(second.lease_id, "lease-0");
     }
 
     #[test]
