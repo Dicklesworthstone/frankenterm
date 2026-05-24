@@ -68,6 +68,25 @@ fn scroll_destination(left: i16, top: i16, dx: i16, dy: i16) -> COORD {
     }
 }
 
+fn visible_window_size(info: &CONSOLE_SCREEN_BUFFER_INFO) -> Result<(usize, usize)> {
+    let cols = cast(info.dwSize.X)?;
+    let top = i32::from(info.srWindow.Top);
+    let bottom = i32::from(info.srWindow.Bottom);
+    ensure!(
+        bottom >= top,
+        "console window bottom {} is above top {}",
+        bottom,
+        top
+    );
+    let rows = cast(bottom - top + 1)?;
+    Ok((cols, rows))
+}
+
+fn checked_cell_count(cols: usize, rows: usize) -> Result<usize> {
+    cols.checked_mul(rows)
+        .ok_or_else(|| format_err!("console cell count overflow: cols={cols} rows={rows}"))
+}
+
 enum Renderer {
     Terminfo(TerminfoRenderer),
     Windows(WindowsConsoleRenderer),
@@ -477,15 +496,15 @@ impl ConsoleOutputHandle for OutputHandle {
     fn get_buffer_contents(&mut self) -> Result<Vec<CHAR_INFO>> {
         let info = self.get_buffer_info()?;
 
-        let cols = info.dwSize.X as usize;
-        let rows = 1 + info.srWindow.Bottom as usize - info.srWindow.Top as usize;
+        let (cols, rows) = visible_window_size(&info)?;
+        let cell_count = checked_cell_count(cols, rows)?;
 
         let mut res = vec![
             CHAR_INFO {
                 Attributes: 0,
                 Char: unsafe { mem::zeroed() }
             };
-            cols * rows
+            cell_count
         ];
         let mut read_region = SMALL_RECT {
             Left: 0,
@@ -514,10 +533,10 @@ impl ConsoleOutputHandle for OutputHandle {
     fn set_buffer_contents(&mut self, buffer: &[CHAR_INFO]) -> Result<()> {
         let info = self.get_buffer_info()?;
 
-        let cols = info.dwSize.X as usize;
-        let rows = 1 + info.srWindow.Bottom as usize - info.srWindow.Top as usize;
+        let (cols, rows) = visible_window_size(&info)?;
+        let cell_count = checked_cell_count(cols, rows)?;
         ensure!(
-            rows * cols == buffer.len(),
+            cell_count == buffer.len(),
             "buffer size doesn't match screen size"
         );
 
@@ -1130,6 +1149,21 @@ mod tests {
 
         assert_eq!(rect_tuple(rect), (2_768, -20_000, 30_000, -12_767));
         assert_eq!((destination.X, destination.Y), (-30_000, 12_767));
+    }
+
+    #[test]
+    fn visible_window_size_rejects_invalid_geometry() {
+        let negative_cols = buffer_info(-1, 24, 0, 0, 79, 23);
+        assert!(visible_window_size(&negative_cols).is_err());
+
+        let inverted_window = buffer_info(80, 24, 0, 10, 79, 5);
+        assert!(visible_window_size(&inverted_window).is_err());
+    }
+
+    #[test]
+    fn checked_cell_count_rejects_overflow() {
+        assert_eq!(checked_cell_count(80, 24).unwrap(), 1_920);
+        assert!(checked_cell_count(usize::MAX, 2).is_err());
     }
 
     #[test]
