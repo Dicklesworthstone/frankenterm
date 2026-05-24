@@ -282,6 +282,46 @@ fn descriptor_validation_rejects_over_recursion_limit_before_compile_truncation(
     );
 }
 
+#[test]
+fn descriptor_validation_accepts_nested_unique_step_ids_within_limit() {
+    let descriptor = WorkflowDescriptor {
+        workflow_schema_version: 1,
+        name: "nested_unique".to_string(),
+        description: None,
+        triggers: Vec::new(),
+        steps: vec![DescriptorStep::Conditional {
+            id: "branch".to_string(),
+            description: None,
+            test_text: "yes".to_string(),
+            matcher: DescriptorMatcher::Substring {
+                value: "yes".to_string(),
+            },
+            then_steps: vec![DescriptorStep::Loop {
+                id: "then_loop".to_string(),
+                description: None,
+                count: 2,
+                body: vec![DescriptorStep::Log {
+                    id: "then_log".to_string(),
+                    description: None,
+                    message: "then".to_string(),
+                }],
+            }],
+            else_steps: vec![DescriptorStep::Notify {
+                id: "else_notify".to_string(),
+                description: None,
+                message: "else".to_string(),
+            }],
+        }],
+        on_failure: None,
+    };
+
+    let limits = frankenterm_core::workflows::DescriptorLimits::default();
+    assert!(
+        descriptor.validate(&limits).is_ok(),
+        "nested descriptors with unique ids and valid limits should validate"
+    );
+}
+
 // =============================================================================
 // Structural invariant tests
 // =============================================================================
