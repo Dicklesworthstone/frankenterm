@@ -415,7 +415,7 @@ impl ConnectorLifecycleManager {
         intent: LifecycleIntent,
         now_ms: u64,
     ) -> Result<LifecycleResult, ConnectorLifecycleError> {
-        self.op_counter += 1;
+        self.op_counter = self.op_counter.saturating_add(1);
         match intent {
             LifecycleIntent::Install { manifest } => self.do_install(manifest, now_ms),
             LifecycleIntent::Update {
@@ -754,7 +754,7 @@ impl ConnectorLifecycleManager {
             }
         }
 
-        mc.restart_count += 1;
+        mc.restart_count = mc.restart_count.saturating_add(1);
         if mc.restart_count > self.config.restart_policy.max_restarts {
             return Err(ConnectorLifecycleError::RestartLimitExceeded {
                 connector_id: connector_id.to_string(),
@@ -1015,22 +1015,22 @@ impl ConnectorLifecycleManager {
 
         for mc in self.connectors.values() {
             match mc.admin_state {
-                AdminState::Enabled => enabled += 1,
-                AdminState::Disabled => disabled += 1,
+                AdminState::Enabled => enabled = enabled.saturating_add(1),
+                AdminState::Disabled => disabled = disabled.saturating_add(1),
                 AdminState::Upgrading => {}
                 AdminState::Uninstalling => {}
             }
             match mc.runtime_phase {
-                ConnectorLifecyclePhase::Running => running += 1,
-                ConnectorLifecyclePhase::Stopped => stopped += 1,
-                ConnectorLifecyclePhase::Degraded => degraded += 1,
-                ConnectorLifecyclePhase::Failed => failed += 1,
+                ConnectorLifecyclePhase::Running => running = running.saturating_add(1),
+                ConnectorLifecyclePhase::Stopped => stopped = stopped.saturating_add(1),
+                ConnectorLifecyclePhase::Degraded => degraded = degraded.saturating_add(1),
+                ConnectorLifecyclePhase::Failed => failed = failed.saturating_add(1),
                 ConnectorLifecyclePhase::Starting => {}
             }
         }
 
         LifecycleManagerSummary {
-            total: self.connectors.len() as u32,
+            total: u32::try_from(self.connectors.len()).unwrap_or(u32::MAX),
             enabled,
             disabled,
             running,
@@ -2059,6 +2059,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mgr.op_counter(), 2);
+    }
+
+    #[test]
+    fn op_counter_saturates_at_u64_max() {
+        let mut mgr = test_manager();
+        mgr.op_counter = u64::MAX;
+
+        mgr.execute(
+            LifecycleIntent::Install {
+                manifest: test_manifest("c", "1.0.0"),
+            },
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(mgr.op_counter(), u64::MAX);
+    }
+
+    #[test]
+    fn restart_count_saturates_at_u32_max() {
+        let mut config = LifecycleManagerConfig::default();
+        config.restart_policy.max_restarts = u32::MAX;
+        config.restart_policy.cooldown_ms = 0;
+        config
+            .trust_policy
+            .trusted_publishers
+            .push("test-publisher".to_string());
+        let mut mgr = ConnectorLifecycleManager::new(config);
+        mgr.execute(
+            LifecycleIntent::Install {
+                manifest: test_manifest("c", "1.0.0"),
+            },
+            1000,
+        )
+        .unwrap();
+        mgr.connectors.get_mut("c").unwrap().restart_count = u32::MAX;
+
+        let result = mgr
+            .execute(
+                LifecycleIntent::Restart {
+                    connector_id: "c".to_string(),
+                },
+                2000,
+            )
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(mgr.get("c").unwrap().restart_count, u32::MAX);
     }
 
     // -- Serde roundtrip tests --
