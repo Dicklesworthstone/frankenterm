@@ -311,6 +311,44 @@ proptest! {
             "Different extracted values should produce different dedup keys");
     }
 
+    /// Detections with equivalent extracted objects have the same key regardless of field order.
+    #[test]
+    fn prop_detection_dedup_key_ignores_extracted_field_order(
+        rule_id in "[a-z_.]{5,20}",
+        first in "[a-z0-9]{1,12}",
+        second in "[a-z0-9]{1,12}",
+    ) {
+        let mut extracted_a = serde_json::Map::new();
+        extracted_a.insert("first".to_string(), json!(first.clone()));
+        extracted_a.insert("second".to_string(), json!(second.clone()));
+
+        let mut extracted_b = serde_json::Map::new();
+        extracted_b.insert("second".to_string(), json!(second));
+        extracted_b.insert("first".to_string(), json!(first));
+
+        let d1 = Detection {
+            rule_id: rule_id.clone(),
+            agent_type: AgentType::Codex,
+            event_type: "error".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.9,
+            extracted: serde_json::Value::Object(extracted_a),
+            matched_text: "test".to_string(),
+            span: (0, 4),
+        };
+        let d2 = Detection {
+            rule_id,
+            agent_type: AgentType::Codex,
+            event_type: "error".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.9,
+            extracted: serde_json::Value::Object(extracted_b),
+            matched_text: "test".to_string(),
+            span: (0, 4),
+        };
+        prop_assert_eq!(d1.dedup_key(), d2.dedup_key());
+    }
+
     /// Detections with empty extracted object have same key for same rule_id.
     #[test]
     fn prop_detection_dedup_key_empty_extracted_same(
