@@ -19,13 +19,19 @@ end
 
 StaticAttestation.configure(log_io: StringIO.new, log_enabled: true)
 
-check("repo-relative path guard rejects absolute and parent traversal") do
+check("repo-relative path guard rejects absolute, parent traversal, empty, and NUL paths") do
   StaticAttestation.repo_relative_path!("docs/security/passive-watch-attestation.json")
   StaticAttestation.expect_failure!("absolute path guard", check: "test.negative.absolute_path") do
     StaticAttestation.repo_relative_path!("/tmp/nope")
   end
   StaticAttestation.expect_failure!("parent traversal guard", check: "test.negative.parent_traversal") do
     StaticAttestation.repo_relative_path!("docs/../secret")
+  end
+  StaticAttestation.expect_failure!("empty path guard", check: "test.negative.empty_path") do
+    StaticAttestation.repo_relative_path!("")
+  end
+  StaticAttestation.expect_failure!("NUL path guard", check: "test.negative.nul_path") do
+    StaticAttestation.repo_relative_path!("docs/security/passive-watch-attestation.json\0suffix")
   end
 end
 
