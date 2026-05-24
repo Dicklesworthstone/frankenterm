@@ -494,7 +494,7 @@ pub(super) fn compute_next_step(step_logs: &[crate::storage::WorkflowStepLogReco
 
     match last_log {
         Some(log) => match log.result_type.as_str() {
-            "continue" | "done" => log.step_index + 1,
+            "continue" | "done" => log.step_index.saturating_add(1),
             "jump_to" => {
                 if let Some(data) = &log.result_data {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
@@ -1716,6 +1716,12 @@ mod tests {
     fn compute_next_step_done_is_terminal() {
         let logs = vec![make_step_log(0, "continue"), make_step_log(1, "done")];
         assert_eq!(compute_next_step(&logs), 2);
+    }
+
+    #[test]
+    fn compute_next_step_saturates_corrupt_terminal_index() {
+        let logs = vec![make_step_log(usize::MAX, "continue")];
+        assert_eq!(compute_next_step(&logs), usize::MAX);
     }
 
     #[test]
