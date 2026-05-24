@@ -4192,7 +4192,7 @@ pub(crate) fn tail_text(text: &str, tail_lines: usize) -> String {
     // If text ends with \n, that trailing newline is part of the last line,
     // not a separator. We need to skip one extra newline to get the right count.
     let count = if bytes.last() == Some(&b'\n') {
-        tail_lines + 1
+        tail_lines.saturating_add(1)
     } else {
         tail_lines
     };
@@ -5341,6 +5341,12 @@ mod tests {
     fn tail_text_more_than_available_returns_all() {
         let text = "one\ntwo\n";
         assert_eq!(tail_text(text, 100), "one\ntwo\n");
+    }
+
+    #[test]
+    fn tail_text_max_lines_with_trailing_newline_does_not_overflow() {
+        let text = "one\ntwo\n";
+        assert_eq!(tail_text(text, usize::MAX), text);
     }
 
     #[test]
