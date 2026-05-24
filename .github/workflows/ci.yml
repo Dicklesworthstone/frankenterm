@@ -236,6 +236,20 @@ jobs:
           bash tests/e2e/test_redactor_streaming_anchor_coverage.sh
           bash tests/e2e/test_redactor_streaming_anchor_coverage.sh --self-test
 
+      # Recall-coverage report integrity. docs/security/redactor-coverage.json is
+      # a security-assurance artifact stating the redactor's measured
+      # recall/precision and the per-class sample-size derivation. This guard
+      # recomputes its headline metrics from its own primitives (tp == sum of
+      # per-class positives; recall == tp/(tp+fn); precision == tp/(tp+fp);
+      # positives <= total; per-class floors uniform; under-sampled classes keep
+      # an under-sampled status) so a stale or fabricated hand-edit that CLAIMS
+      # coverage it does not have fails loudly. Class-set sync to the live catalog
+      # is covered by the anchor-coverage guard above. Static; no compilation.
+      - name: Redactor recall-coverage report integrity guard
+        run: |
+          bash tests/e2e/test_redactor_coverage_report_integrity.sh
+          bash tests/e2e/test_redactor_coverage_report_integrity.sh --self-test
+
       # ft-i2eni.3 — Cargo-deny ban on direct `tokio` dependencies in
       # first-party crates. The doctrine block in AGENTS.md states
       # that the canonical async runtime is asupersync via
