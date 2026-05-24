@@ -21,17 +21,18 @@ use super::*;
 pub struct HandleSessionEnd;
 
 fn parse_i64_field(value: &serde_json::Value) -> Option<i64> {
-    match value {
+    let parsed = match value {
         serde_json::Value::String(raw) => parse_number(raw.trim()),
         serde_json::Value::Number(number) => number
             .as_i64()
             .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok())),
         _ => None,
-    }
+    };
+    parsed.filter(|value| *value >= 0)
 }
 
 fn parse_cost_usd_field(value: &serde_json::Value) -> Option<f64> {
-    match value {
+    let parsed = match value {
         serde_json::Value::String(raw) => {
             let normalized = raw.trim().replace(',', "");
             if normalized.is_empty() {
@@ -42,7 +43,8 @@ fn parse_cost_usd_field(value: &serde_json::Value) -> Option<f64> {
         }
         serde_json::Value::Number(number) => number.as_f64(),
         _ => None,
-    }
+    };
+    parsed.filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn cooldown_query_since_ms(now_ms: i64, cooldown_ms: i64) -> i64 {
@@ -5900,6 +5902,37 @@ mod tests {
         assert_eq!(record.total_tokens, Some(1000));
         assert!(record.input_tokens.is_none());
         assert!(record.estimated_cost_usd.is_none()); // "not_a_number" fails parse
+    }
+
+    #[test]
+    fn record_from_detection_rejects_negative_usage_and_cost() {
+        let detection = serde_json::json!({
+            "agent_type": "codex",
+            "event_type": "session.summary",
+            "extracted": {
+                "total": -1,
+                "input": "-2",
+                "output": -3,
+                "cached": "-4",
+                "reasoning": -5,
+                "cost": "-0.01"
+            }
+        });
+
+        let record = HandleSessionEnd::record_from_detection(5, &detection);
+        assert!(record.total_tokens.is_none());
+        assert!(record.input_tokens.is_none());
+        assert!(record.output_tokens.is_none());
+        assert!(record.cached_tokens.is_none());
+        assert!(record.reasoning_tokens.is_none());
+        assert!(record.estimated_cost_usd.is_none());
+    }
+
+    #[test]
+    fn parse_cost_usd_field_rejects_non_finite_strings() {
+        assert!(parse_cost_usd_field(&serde_json::json!("NaN")).is_none());
+        assert!(parse_cost_usd_field(&serde_json::json!("inf")).is_none());
+        assert!(parse_cost_usd_field(&serde_json::json!("-inf")).is_none());
     }
 
     #[test]
