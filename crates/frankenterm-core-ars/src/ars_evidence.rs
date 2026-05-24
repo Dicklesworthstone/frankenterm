@@ -173,6 +173,21 @@ impl From<bool> for EvidenceValue {
     }
 }
 
+impl EvidenceValue {
+    /// Whether this value can be represented as canonical JSON in the ledger.
+    #[must_use]
+    pub fn is_json_compatible(&self) -> bool {
+        match self {
+            Self::String(_) | Self::Bool(_) | Self::StringList(_) => true,
+            Self::Number(n) => n.is_finite(),
+        }
+    }
+}
+
+fn payload_is_json_compatible(payload: &BTreeMap<String, EvidenceValue>) -> bool {
+    payload.values().all(EvidenceValue::is_json_compatible)
+}
+
 // =============================================================================
 // Ledger digest
 // =============================================================================
@@ -243,7 +258,8 @@ impl EvidenceLedger {
 
     /// Append an evidence entry to the ledger.
     ///
-    /// Returns false if the ledger is at max capacity.
+    /// Returns false if the ledger is at max capacity or if the
+    /// payload cannot be represented as canonical JSON.
     pub fn append(
         &mut self,
         category: EvidenceCategory,
@@ -253,6 +269,10 @@ impl EvidenceLedger {
         verdict: EvidenceVerdict,
     ) -> bool {
         if self.entries.len() >= self.config.max_entries {
+            return false;
+        }
+
+        if !payload_is_json_compatible(&payload) {
             return false;
         }
 
@@ -331,6 +351,14 @@ impl EvidenceLedger {
 
             // Check entry hash is non-empty.
             if entry.entry_hash.is_empty() {
+                return ChainVerification {
+                    is_valid: false,
+                    entries_checked: i + 1,
+                    first_invalid_seq: Some(entry.seq),
+                };
+            }
+
+            if !payload_is_json_compatible(&entry.payload) {
                 return ChainVerification {
                     is_valid: false,
                     entries_checked: i + 1,
@@ -776,7 +804,8 @@ fn compute_entry_hash(
     // determinism across serde roundtrips (avoids f64 precision
     // issues with raw bytes). BTreeMap ordering already gives us
     // a canonical key sequence.
-    let payload_json = serde_json::to_string(payload).unwrap_or_default();
+    let payload_json = serde_json::to_string(payload)
+        .expect("validated evidence payload must serialize to canonical JSON");
     mix_field(&mut hasher, payload_json.as_bytes());
 
     mix_field(&mut hasher, prev_hash.as_bytes());
@@ -877,6 +906,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn evidence_value_non_finite_numbers_are_not_json_compatible() {
+        for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                !EvidenceValue::Number(n).is_json_compatible(),
+                "non-finite number {n} must not enter canonical evidence JSON"
+            );
+        }
+        assert!(EvidenceValue::Number(42.0).is_json_compatible());
+    }
+
     // =========================================================================
     // EvidenceLedger tests
     // =========================================================================
@@ -929,6 +969,27 @@ mod tests {
             EvidenceVerdict::Support,
         ));
         assert_eq!(ledger.len(), 2);
+    }
+
+    #[test]
+    fn ledger_append_rejects_non_finite_payload_numbers() {
+        for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut ledger = EvidenceLedger::with_defaults();
+            let mut payload = BTreeMap::new();
+            payload.insert("score".to_string(), EvidenceValue::Number(n));
+
+            assert!(
+                !ledger.append(
+                    EvidenceCategory::ChangeDetection,
+                    now_us(),
+                    format!("invalid numeric evidence payload {n}"),
+                    payload,
+                    EvidenceVerdict::Support,
+                ),
+                "non-finite payload number {n} must be rejected"
+            );
+            assert!(ledger.is_empty());
+        }
     }
 
     #[test]
@@ -996,6 +1057,29 @@ mod tests {
 
         let verification = ledger.verify_chain();
         assert!(!verification.is_valid);
+    }
+
+    #[test]
+    fn ledger_verification_rejects_non_finite_payload_numbers() {
+        let mut ledger = EvidenceLedger::with_defaults();
+        let mut payload = BTreeMap::new();
+        payload.insert("score".to_string(), EvidenceValue::Number(1.0));
+        assert!(ledger.append(
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "finite score".to_string(),
+            payload,
+            EvidenceVerdict::Support,
+        ));
+
+        ledger.entries[0]
+            .payload
+            .insert("score".to_string(), EvidenceValue::Number(f64::INFINITY));
+
+        let verification = ledger.verify_chain();
+        assert!(!verification.is_valid);
+        assert_eq!(verification.entries_checked, 1);
+        assert_eq!(verification.first_invalid_seq, Some(0));
     }
 
     #[test]
