@@ -1017,6 +1017,38 @@ proptest! {
         prop_assert_eq!(&lib.rules()[0].description, "New version");
         prop_assert_eq!(lib.pack_for_rule("codex.override_test"), Some("builtin:codex"));
     }
+
+    #[test]
+    fn prop_library_rejects_duplicate_rule_ids_within_builtin_pack(
+        rule_suffix in "[a-z]{3,10}",
+    ) {
+        let rule_id = format!("codex.{rule_suffix}");
+        let mut first = make_anchor_only_rule(&rule_suffix, "DUP_A");
+        first.id = rule_id.clone();
+        let mut second = make_anchor_only_rule(&rule_suffix, "DUP_B");
+        second.id = rule_id;
+
+        let pack = PatternPack::new("builtin:duplicate-test", "1.0.0", vec![first, second]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
+    fn prop_library_rejects_duplicate_rule_ids_within_user_pack(
+        namespace in "[a-z]{3,10}",
+    ) {
+        let pack_name = format!("user:{namespace}");
+        let rule_id = format!("custom.{namespace}.duplicate");
+        let mut first = make_anchor_only_rule("user_duplicate_a", "USER_DUP_A");
+        first.id = rule_id.clone();
+        let mut second = make_anchor_only_rule("user_duplicate_b", "USER_DUP_B");
+        second.id = rule_id;
+        let pack = PatternPack::new(&pack_name, "1.0.0", vec![first, second]);
+        let user_packs: std::collections::HashSet<String> =
+            std::iter::once(pack_name).collect();
+
+        prop_assert!(PatternLibrary::new_with_user_packs(vec![pack], &user_packs).is_err());
+    }
 }
 
 // ============================================================================
