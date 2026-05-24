@@ -394,6 +394,19 @@ pub fn evaluate_pilot(log: &FeedbackLog, criteria: &SuccessCriteria) -> PilotEva
         ));
     }
 
+    match time_to_first_success_secs(log) {
+        Some(seconds) if seconds > criteria.max_time_to_first_success_secs => {
+            violations.push(format!(
+                "Time to first success {seconds}s exceeds max {}s",
+                criteria.max_time_to_first_success_secs
+            ));
+        }
+        None if metrics.total_scenarios > 0 => {
+            violations.push("No successful scenario completed".to_string());
+        }
+        Some(_) | None => {}
+    }
+
     // Extract top improvements from most common friction categories
     let mut top_improvements: Vec<String> = metrics
         .friction_by_category
@@ -428,6 +441,20 @@ pub fn evaluate_pilot(log: &FeedbackLog, criteria: &SuccessCriteria) -> PilotEva
         violations,
         top_improvements,
     }
+}
+
+fn time_to_first_success_secs(log: &FeedbackLog) -> Option<u64> {
+    let mut elapsed_secs = 0u64;
+    for result in &log.results {
+        elapsed_secs = elapsed_secs.saturating_add(result.duration_secs);
+        if matches!(
+            result.outcome,
+            ScenarioOutcome::Success | ScenarioOutcome::SuccessWithFriction
+        ) {
+            return Some(elapsed_secs);
+        }
+    }
+    None
 }
 
 // ── Pilot Summary Report ────────────────────────────────────────────────────
@@ -917,6 +944,44 @@ mod tests {
         let eval = evaluate_pilot(&log, &criteria);
         assert!(!eval.passed);
         assert!(eval.violations.iter().any(|v| v.contains("Confusion rate")));
+    }
+
+    #[test]
+    fn evaluation_fails_slow_time_to_first_success() {
+        let mut log = FeedbackLog::new("P1", "now");
+        log.add_result(ScenarioResult {
+            scenario: PilotScenario::CaptureSession,
+            participant_id: "OP-001".into(),
+            outcome: ScenarioOutcome::Failed,
+            duration_secs: 250,
+            errors: vec!["capture failed".into()],
+            friction_points: vec![],
+            notes: None,
+        });
+        log.add_result(ScenarioResult {
+            scenario: PilotScenario::ReplayTrace,
+            participant_id: "OP-001".into(),
+            outcome: ScenarioOutcome::Success,
+            duration_secs: 75,
+            errors: vec![],
+            friction_points: vec![],
+            notes: None,
+        });
+        let criteria = SuccessCriteria {
+            max_error_rate: 1.0,
+            min_success_rate: 0.0,
+            max_time_to_first_success_secs: 300,
+            ..SuccessCriteria::default()
+        };
+
+        let eval = evaluate_pilot(&log, &criteria);
+
+        assert!(!eval.passed);
+        assert!(
+            eval.violations
+                .iter()
+                .any(|violation| violation.contains("Time to first success 325s"))
+        );
     }
 
     #[test]
