@@ -228,6 +228,9 @@ jobs:
       #     detect() attribution, secret_pattern_names(), and `[REDACTED:{name}]`).
       #   - golden pin: the pattern-name set matches an inline 32-entry golden, so
       #     deleting a whole pattern (silent security regression) fails loudly.
+      #   - recall-coverage sync: docs/security/redactor-coverage.json's
+      #     by_pattern_class keys (and sample_size_floor.secret_pattern_classes
+      #     count) match the catalog, so no secret class goes unmeasured.
       - name: Redactor streaming anchor-coverage guard (ft-b1p6x)
         run: |
           bash tests/e2e/test_redactor_streaming_anchor_coverage.sh

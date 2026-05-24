@@ -215,5 +215,32 @@ unless current_names == GOLDEN_NAMES
   MSG
 end
 
-puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored, #{registered.length} regexes all registered, #{names.length} pattern names unique + well-formed, catalog matches #{GOLDEN_NAMES.length}-entry golden)"
+# --- 8. Recall-coverage doc sync: every catalog class must be measured. --------
+# docs/security/redactor-coverage.json drives the recall-coverage methodology
+# (recall_floor, per-class sample-size derivation). Its `by_pattern_class` keys
+# must be exactly the SECRET_PATTERNS name set: adding a secret pattern without a
+# coverage entry means that class's recall is never measured — an unmeasured
+# secret class is a security-assurance gap — and removing a pattern leaves the
+# doc claiming coverage for a dead class. The sample-size derivation's
+# `secret_pattern_classes` count must likewise track the catalog size, or the
+# zero-miss vector requirement it derives is computed against a stale class count.
+require "json"
+coverage_path = "docs/security/redactor-coverage.json"
+fail!("missing #{coverage_path} — redactor recall-coverage methodology doc absent") unless File.exist?(coverage_path)
+coverage = JSON.parse(File.read(coverage_path))
+doc_classes = (coverage["by_pattern_class"] || {}).keys.sort
+unless doc_classes == current_names
+  unmeasured = current_names - doc_classes
+  stale = doc_classes - current_names
+  fail!(<<~MSG.chomp)
+    #{coverage_path} by_pattern_class is out of sync with SECRET_PATTERNS: unmeasured=#{unmeasured.inspect} stale=#{stale.inspect}
+    An unmeasured class has no recall guarantee; a stale class measures a pattern that no longer exists. Update by_pattern_class to match the live catalog.
+  MSG
+end
+declared_classes = coverage.dig("sample_size_floor", "secret_pattern_classes")
+if declared_classes && declared_classes != current_names.length
+  fail!("#{coverage_path} sample_size_floor.secret_pattern_classes=#{declared_classes} but the catalog has #{current_names.length} patterns — the recall sample-size derivation is stale.")
+end
+
+puts "redactor anchor coverage: passed (#{anchors.length} anchors, #{fragments.length} collapsible key-name fragments all anchored, #{registered.length} regexes all registered, #{names.length} pattern names unique + well-formed, catalog matches #{GOLDEN_NAMES.length}-entry golden + recall-coverage doc)"
 RUBY
