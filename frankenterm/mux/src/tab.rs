@@ -1,5 +1,5 @@
 use crate::domain::DomainId;
-use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
+use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{Mux, MuxNotification, WindowId};
@@ -75,6 +75,18 @@ fn offset_by_resize_delta(value: usize, delta: isize) -> usize {
 
 fn pixel_span(cell_pixels: usize, cells: usize) -> usize {
     cell_pixels.saturating_mul(cells)
+}
+
+fn split_separator_offset(value: usize) -> usize {
+    value.saturating_add(1)
+}
+
+fn split_separator_sum(first: usize, second: usize) -> usize {
+    first.saturating_add(second).saturating_add(1)
+}
+
+fn checked_split_separator_sum(first: usize, second: usize) -> Option<usize> {
+    first.checked_add(second)?.checked_add(1)
 }
 
 fn positive_resize_budget(value: usize) -> isize {
@@ -469,20 +481,20 @@ impl SplitDirectionAndSize {
     fn top_of_second(&self) -> usize {
         match self.direction {
             SplitDirection::Horizontal => 0,
-            SplitDirection::Vertical => self.first.rows as usize + 1,
+            SplitDirection::Vertical => split_separator_offset(self.first.rows),
         }
     }
 
     fn left_of_second(&self) -> usize {
         match self.direction {
-            SplitDirection::Horizontal => self.first.cols as usize + 1,
+            SplitDirection::Horizontal => split_separator_offset(self.first.cols),
             SplitDirection::Vertical => 0,
         }
     }
 
     pub fn width(&self) -> usize {
         if self.direction == SplitDirection::Horizontal {
-            self.first.cols + self.second.cols + 1
+            split_separator_sum(self.first.cols, self.second.cols)
         } else {
             self.first.cols
         }
@@ -490,7 +502,7 @@ impl SplitDirectionAndSize {
 
     pub fn height(&self) -> usize {
         if self.direction == SplitDirection::Vertical {
-            self.first.rows + self.second.rows + 1
+            split_separator_sum(self.first.rows, self.second.rows)
         } else {
             self.first.rows
         }
@@ -670,8 +682,12 @@ fn compute_min_size(tree: &Tree, overrides: &HashMap<PaneId, PaneConstraints>) -
             let (left_x, left_y) = compute_min_size(&*left, overrides);
             let (right_x, right_y) = compute_min_size(&*right, overrides);
             match data.direction {
-                SplitDirection::Vertical => (left_x.max(right_x), left_y + right_y + 1),
-                SplitDirection::Horizontal => (left_x + right_x + 1, left_y.max(right_y)),
+                SplitDirection::Vertical => {
+                    (left_x.max(right_x), split_separator_sum(left_y, right_y))
+                }
+                SplitDirection::Horizontal => {
+                    (split_separator_sum(left_x, right_x), left_y.max(right_y))
+                }
             }
         }
         Tree::Leaf(pane) => {
@@ -1019,7 +1035,7 @@ fn compute_min_size_with_collapsed(
                     } else if rw == 0 {
                         lw
                     } else {
-                        lw + 1 + rw
+                        split_separator_sum(lw, rw)
                     };
                     (w, lh.max(rh))
                 }
@@ -1031,7 +1047,7 @@ fn compute_min_size_with_collapsed(
                     } else if rh == 0 {
                         lh
                     } else {
-                        lh + 1 + rh
+                        split_separator_sum(lh, rh)
                     };
                     (lw.max(rw), h)
                 }
@@ -3374,45 +3390,45 @@ impl TabInner {
             current_size: usize,
         ) -> bool {
             intersects_range(
-                &(active_start..active_start + active_size),
-                &(current_start..current_start + current_size),
+                &(active_start..active_start.saturating_add(active_size)),
+                &(current_start..current_start.saturating_add(current_size)),
             )
         }
 
         for pane in &panes {
             let score = match direction {
                 PaneDirection::Right => {
-                    if pane.left == active.left + active.width + 1
+                    if checked_split_separator_sum(active.left, active.width) == Some(pane.left)
                         && edge_intersects(active.top, active.height, pane.top, pane.height)
                     {
-                        1 + recency.score(pane.index)
+                        recency.score(pane.index).saturating_add(1)
                     } else {
                         0
                     }
                 }
                 PaneDirection::Left => {
-                    if pane.left + pane.width + 1 == active.left
+                    if checked_split_separator_sum(pane.left, pane.width) == Some(active.left)
                         && edge_intersects(active.top, active.height, pane.top, pane.height)
                     {
-                        1 + recency.score(pane.index)
+                        recency.score(pane.index).saturating_add(1)
                     } else {
                         0
                     }
                 }
                 PaneDirection::Up => {
-                    if pane.top + pane.height + 1 == active.top
+                    if checked_split_separator_sum(pane.top, pane.height) == Some(active.top)
                         && edge_intersects(active.left, active.width, pane.left, pane.width)
                     {
-                        1 + recency.score(pane.index)
+                        recency.score(pane.index).saturating_add(1)
                     } else {
                         0
                     }
                 }
                 PaneDirection::Down => {
-                    if active.top + active.height + 1 == pane.top
+                    if checked_split_separator_sum(active.top, active.height) == Some(pane.top)
                         && edge_intersects(active.left, active.width, pane.left, pane.width)
                     {
-                        1 + recency.score(pane.index)
+                        recency.score(pane.index).saturating_add(1)
                     } else {
                         0
                     }
@@ -4329,13 +4345,15 @@ mod test {
     use rangeset::RangeSet;
     use std::convert::TryFrom;
     use std::ops::Range;
-    use termwiz::surface::{SequenceNo, SEQ_ZERO};
+    use termwiz::surface::{SEQ_ZERO, SequenceNo};
     use url::Url;
 
     /// Ensure the global Mux singleton is initialized for tests that trigger
     /// focus-change notifications (e.g. floating pane and top-level split tests).
     fn ensure_mux_initialized() {
-        let _guard = crate::MUX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if Mux::try_get().is_none() {
             let mux = Arc::new(Mux::new(None));
             Mux::set_mux(&mux);
@@ -4380,6 +4398,17 @@ mod test {
         assert_eq!(offset_by_resize_delta(5, isize::MIN), 0);
         assert_eq!(pixel_span(8, 10), 80);
         assert_eq!(pixel_span(usize::MAX, 2), usize::MAX);
+        assert_eq!(split_separator_offset(4), 5);
+        assert_eq!(split_separator_offset(usize::MAX), usize::MAX);
+        assert_eq!(split_separator_sum(2, 3), 6);
+        assert_eq!(split_separator_sum(usize::MAX, 3), usize::MAX);
+        assert_eq!(split_separator_sum(usize::MAX - 1, 1), usize::MAX);
+        assert_eq!(checked_split_separator_sum(2, 3), Some(6));
+        assert_eq!(
+            checked_split_separator_sum(usize::MAX - 1, 0),
+            Some(usize::MAX)
+        );
+        assert_eq!(checked_split_separator_sum(usize::MAX, 0), None);
         assert_eq!(usize_to_isize_saturating(42), 42);
         assert_eq!(usize_to_isize_saturating(usize::MAX), isize::MAX);
         assert_eq!(positive_resize_budget(usize::MAX), isize::MAX);
@@ -4676,9 +4705,10 @@ mod test {
         assert!(pane.get_logical_lines(0..10).is_empty());
         assert_eq!(pane.get_title(), "fake-pane-42");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(pane
-            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-            .is_ok());
+        assert!(
+            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+                .is_ok()
+        );
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());
@@ -4728,15 +4758,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
