@@ -272,8 +272,7 @@ impl DeadLetterQueue {
             self.telemetry.evictions += 1;
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.allocate_id();
         self.entries.push_back(DeadLetterEntry::new(
             id,
             action,
@@ -283,6 +282,17 @@ impl DeadLetterQueue {
         ));
         self.telemetry.total_enqueued += 1;
         id
+    }
+
+    fn allocate_id(&mut self) -> u64 {
+        let mut candidate = self.next_id.max(1);
+        loop {
+            if !self.entries.iter().any(|entry| entry.id == candidate) {
+                self.next_id = candidate.checked_add(1).unwrap_or(1);
+                return candidate;
+            }
+            candidate = candidate.checked_add(1).unwrap_or(1);
+        }
     }
 
     /// Get the current queue depth (non-discarded entries).
@@ -1046,6 +1056,30 @@ mod tests {
         assert_eq!(dlq.depth(), 1);
         assert_eq!(dlq.pending_entries()[0].id, second);
         assert_eq!(dlq.telemetry_snapshot().evictions, 1);
+    }
+
+    #[test]
+    fn connector_reliability_dlq_id_allocation_wraps_without_collision() {
+        let mut dlq = DeadLetterQueue::new(DeadLetterQueueConfig::default());
+        dlq.next_id = u64::MAX;
+
+        let first = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "first",
+            ConnectorErrorKind::Transient,
+            1000,
+        );
+        let second = dlq.enqueue(
+            sample_action("test", ConnectorActionKind::Notify),
+            "second",
+            ConnectorErrorKind::Transient,
+            2000,
+        );
+
+        assert_eq!(first, u64::MAX);
+        assert_eq!(second, 1);
+        assert_eq!(dlq.pending_entries()[0].id, u64::MAX);
+        assert_eq!(dlq.pending_entries()[1].id, 1);
     }
 
     #[test]
