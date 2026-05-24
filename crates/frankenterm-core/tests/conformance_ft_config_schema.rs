@@ -292,6 +292,22 @@ fn schema_rejects_negative_retention_days() {
     );
 }
 
+/// 4c.1) Falsification: `gc.vacuum_threshold` is a ratio and must
+/// stay inside the documented [0, 1] range.
+#[test]
+fn schema_rejects_out_of_range_vacuum_threshold() {
+    let schema = compile_config_schema();
+    for (label, threshold) in [("negative", -0.01), ("above_one", 1.01)] {
+        let bad = serde_json::json!({
+            "gc": { "vacuum_threshold": threshold },
+        });
+        assert!(
+            schema.validate(&bad).is_err(),
+            "schema MUST reject {label} gc.vacuum_threshold values"
+        );
+    }
+}
+
 /// 4d) Falsification: `vendored.sharding.assignment.strategy` is an
 /// enum; an unknown strategy MUST be rejected.
 #[test]
