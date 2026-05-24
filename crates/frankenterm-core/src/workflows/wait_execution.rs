@@ -47,7 +47,11 @@ impl ExternalSignalRegistry {
 
     /// Record that the named external signal has been raised.
     pub fn signal(&self, key: impl Into<String>) {
-        self.fired_guard().insert(key.into());
+        let key = key.into();
+        if key.trim().is_empty() {
+            return;
+        }
+        self.fired_guard().insert(key);
     }
 
     /// Returns true once the named signal has been raised.
@@ -1441,6 +1445,10 @@ mod tests {
 
         registry.signal("workflow.approved");
         assert_eq!(registry.len(), 2);
+
+        registry.signal(" \t ");
+        assert_eq!(registry.len(), 2);
+        assert!(!registry.is_signaled(" \t "));
 
         registry.clear("build.ready");
         assert!(!registry.is_signaled("build.ready"));
