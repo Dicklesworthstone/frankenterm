@@ -1466,6 +1466,31 @@ proptest! {
     }
 
     #[test]
+    fn regex_matchers_that_match_empty_input_fail_validation() {
+        let descriptor = WorkflowDescriptor {
+            workflow_schema_version: 1,
+            name: "empty_regex_matcher".to_string(),
+            description: None,
+            triggers: Vec::new(),
+            steps: vec![DescriptorStep::WaitFor {
+                id: "wait".to_string(),
+                description: None,
+                matcher: DescriptorMatcher::Regex {
+                    pattern: ".*".to_string(),
+                },
+                timeout_ms: None,
+            }],
+            on_failure: None,
+        };
+        let limits = frankenterm_core::workflows::DescriptorLimits::default();
+
+        prop_assert!(
+            descriptor.validate(&limits).is_err(),
+            "descriptor validation must reject regex matchers that match empty input"
+        );
+    }
+
+    #[test]
     fn descriptor_matcher_substring_serde_contains_kind(value in "[a-z ]{3,20}") {
         let matcher = DescriptorMatcher::Substring { value };
         let json = serde_json::to_string(&matcher).unwrap();

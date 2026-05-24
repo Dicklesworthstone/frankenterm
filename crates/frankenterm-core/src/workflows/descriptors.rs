@@ -447,11 +447,22 @@ impl DescriptorMatcher {
                         )),
                     ));
                 }
-                fancy_regex::Regex::new(pattern).map_err(|e| {
+                let regex = fancy_regex::Regex::new(pattern).map_err(|e| {
                     crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
                         "Invalid regex pattern: {e}"
                     )))
                 })?;
+                if regex.is_match("").map_err(|e| {
+                    crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
+                        "Invalid regex pattern: {e}"
+                    )))
+                })? {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "Regex matcher cannot match empty input".to_string(),
+                        ),
+                    ));
+                }
             }
         }
         Ok(())
