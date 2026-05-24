@@ -34,7 +34,9 @@
 //! policies SIT ATOP this redactor; the policy harness covered the
 //! upper layer but left the regex-catalog invariants untested).
 
-use frankenterm_core::redactor::{Redactor, StreamingRedactor};
+use frankenterm_core::redactor::{
+    MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES, Redactor, StreamingRedactor,
+};
 use proptest::prelude::*;
 
 const REDACTED_MARKER: &str = "[REDACTED]";
@@ -190,6 +192,33 @@ fn each_known_format_detect_reports_a_span() {
 /// secret runs straight into the prefix of the next without a
 /// separator — see `redact_adjacency_known_limitation` below for
 /// the explicit pin and limitation note.
+/// Arbitrary Unicode scalar biased toward multibyte forms so the
+/// streaming overflow path is exercised against 1-, 2-, 3-, and
+/// 4-byte scalars (and a bare combining mark). The inline unit
+/// tests in `redactor.rs` pin specific scalars; this strategy lets
+/// the overflow property sweep the whole boundary-flooring surface.
+fn arb_overflow_scalar() -> impl Strategy<Value = char> {
+    prop_oneof![
+        Just('a'),
+        Just('Z'),
+        Just('9'),
+        Just('_'),
+        Just(' '),
+        Just('\n'),
+        Just('é'),        // 2-byte
+        Just('Ω'),        // 2-byte
+        Just('日'),       // 3-byte
+        Just('語'),       // 3-byte
+        Just('🦀'),       // 4-byte
+        Just('🎉'),       // 4-byte
+        Just('\u{0301}'), // combining acute accent
+    ]
+}
+
+fn arb_overflow_text() -> impl Strategy<Value = String> {
+    prop::collection::vec(arb_overflow_scalar(), 1..48).prop_map(|cs| cs.into_iter().collect())
+}
+
 fn mixed_text() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop_oneof![
@@ -360,6 +389,69 @@ proptest! {
         out.extend(streaming.finish().bytes);
 
         prop_assert_eq!(out, expected);
+    }
+
+    /// Overflow-path UTF-8 safety + forced progress (br-ft-wjjkp.1,
+    /// br-ft-r4nwe, br-ft-4socw), generalized to arbitrary multibyte
+    /// input under degenerate pending caps.
+    ///
+    /// The inline unit tests in `redactor.rs` pin a fixed 4-byte
+    /// prefix against caps {0,1,2}. This sweeps arbitrary Unicode
+    /// scalar sequences against small caps and tail windows, pinning
+    /// two invariants the cold-tier evidence renderer relies on:
+    ///
+    /// 1. **UTF-8 safety**: the forced-emission cut in
+    ///    `overflow_emit_boundary` always lands on a char boundary,
+    ///    so the full concatenated stream is valid UTF-8 — never a
+    ///    torn multibyte scalar (which would panic `emit_prefix`'s
+    ///    `split_off` or the downstream renderer).
+    /// 2. **Forced progress**: when a single chunk exceeds the
+    ///    clamped cap the overflow path must drain at least one
+    ///    scalar rather than count a zero-byte drain and stall.
+    #[test]
+    fn streaming_overflow_path_is_utf8_safe_and_progresses(
+        text in arb_overflow_text(),
+        cap in 0usize..=8,
+        tail in 0usize..=8,
+    ) {
+        // with_max_pending_bytes clamps up to the minimum floor, so
+        // the effective cap the overflow loop compares against is
+        // never below MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES.
+        let clamped_cap = cap.max(MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES);
+
+        let mut streaming = StreamingRedactor::new()
+            .with_tail_bytes(tail)
+            .with_max_pending_bytes(cap);
+
+        let chunk = streaming.redact_chunk(text.as_bytes());
+        let chunk_emitted = chunk.bytes.len();
+
+        let mut out = chunk.bytes;
+        out.extend(streaming.finish().bytes);
+
+        // Invariant 1: never tear a multibyte scalar.
+        prop_assert!(
+            String::from_utf8(out.clone()).is_ok(),
+            "overflow path produced invalid UTF-8: input={:?} cap={} tail={} out={:?}",
+            text,
+            cap,
+            tail,
+            out
+        );
+
+        // Invariant 2: a chunk longer than the clamped cap forces the
+        // overflow loop to fire and drain at least one scalar.
+        if text.len() > clamped_cap {
+            prop_assert!(
+                chunk_emitted > 0,
+                "overflow path stalled on a zero-byte drain: \
+                 input={:?} cap={} clamped_cap={} tail={}",
+                text,
+                cap,
+                clamped_cap,
+                tail
+            );
+        }
     }
 }
 
