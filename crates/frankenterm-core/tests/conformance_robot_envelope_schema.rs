@@ -229,6 +229,25 @@ fn synthetic_envelope_missing_required_field_must_fail() {
     );
 }
 
+#[test]
+fn synthetic_robot_envelope_with_non_boolean_ok_must_fail() {
+    let schema = load_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": "true",
+        "data": { "answer": 42 },
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot envelopes whose `ok` field is not boolean"
+    );
+}
+
 /// Negative case: malformed `error_code` (must match the namespaced `robot.*`
 /// wire-code grammar).
 #[test]
@@ -551,6 +570,27 @@ fn synthetic_mcp_success_envelope_validates_against_schema() {
     schema
         .validate(&envelope)
         .unwrap_or_else(|errors| panic_validation_errors("MCP success envelope", errors));
+}
+
+#[test]
+fn synthetic_mcp_envelope_with_non_boolean_ok_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": "false",
+        "error": "invalid arguments",
+        "error_code": "FT-MCP-0001",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP envelopes whose `ok` field is not boolean"
+    );
 }
 
 #[test]
