@@ -44,7 +44,10 @@ completed proof:
 worker pressure, and selected-worker topology preflight failure
 (`failed_topology_preflight` / `rch.topology_preflight_failed`) are *deferral*
 signals (the receipt stays queued under `wait_rch`), never an instruction to
-repair RCH or mutate workers.
+repair RCH or mutate workers. Because that outcome never reached Cargo, a
+`latest_replay.outcome` of `failed_topology_preflight` may only ride a
+`wait_rch` entry — never `completed` or `runnable` (the verifier rejects the
+mismatch as `topology_outcome_status_drift`).
 
 ## Views
 

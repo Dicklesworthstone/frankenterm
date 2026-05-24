@@ -162,6 +162,10 @@ def violations(surface)
     v << "empty_reason_codes" if (entry["reason_codes"] || []).empty?
     v << "remediation_mismatch" unless entry["remediation"] == REMEDIATION_BY_STATUS[status]
     v << "replay_allowed_mismatch" unless entry["replay_allowed"] == (status == "runnable")
+    # A topology-preflight failure never reached Cargo, so it is a block, not a
+    # completion: that outcome may only ride a wait_rch entry.
+    outcome = entry.dig("latest_replay", "outcome")
+    v << "topology_outcome_status_drift" if outcome == "failed_topology_preflight" && status != "wait_rch"
   end
 
   # Summary reconciles with the queue and keeps queued distinct from completed.
@@ -304,6 +308,8 @@ def apply_mutation(surface, op)
     s["explain"] = [deep_dup(s["explain"].first)] + s["explain"]
   when "demote_runnable_keep_candidate"
     s["queue"].find { |e| e["status"] == "runnable" }["replay_allowed"] = false
+  when "complete_topology_failed_entry"
+    s["queue"].find { |e| e["status"] == "completed" }["latest_replay"]["outcome"] = "failed_topology_preflight"
   else
     fail!("unknown invalid-fragment mutation: #{op}")
   end

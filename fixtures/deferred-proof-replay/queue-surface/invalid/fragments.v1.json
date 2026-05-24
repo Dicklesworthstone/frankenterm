@@ -167,6 +167,11 @@
       "case_id": "runnable-demoted-candidate-kept",
       "mutation": "demote_runnable_keep_candidate",
       "expected_violation": "next_candidate_should_be_null"
+    },
+    {
+      "case_id": "topology-failed-marked-completed",
+      "mutation": "complete_topology_failed_entry",
+      "expected_violation": "topology_outcome_status_drift"
     }
   ]
 }
