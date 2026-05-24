@@ -282,7 +282,8 @@ impl FleetAlertManager {
             }
             // Dedup check
             if let Some(&last) = self.last_fired.get(&policy.class_id) {
-                if now_ms.saturating_sub(last) < policy.dedup_window_secs * 1000 {
+                let dedup_window_ms = policy.dedup_window_secs.saturating_mul(1000);
+                if now_ms.saturating_sub(last) < dedup_window_ms {
                     continue;
                 }
             }
@@ -792,6 +793,26 @@ mod tests {
         // Second evaluation within dedup window should not fire
         let second = manager.evaluate(&snap);
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn manager_dedup_window_conversion_saturates() {
+        let mut manager = FleetAlertManager::new(vec![FleetAlertPolicy {
+            class_id: "test.degraded".into(),
+            description: "test".into(),
+            severity: FleetAlertSeverity::Warning,
+            routes: vec![AlertRoute::Log],
+            condition: AlertCondition::FleetHealthBelow {
+                threshold: HealthStatus::Degraded,
+            },
+            runbook: None,
+            dedup_window_secs: u64::MAX,
+            enabled: true,
+        }]);
+
+        let snap = degraded_snapshot();
+        assert_eq!(manager.evaluate(&snap).len(), 1);
+        assert!(manager.evaluate(&snap).is_empty());
     }
 
     #[test]
