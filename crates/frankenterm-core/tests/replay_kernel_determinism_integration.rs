@@ -579,7 +579,7 @@ fn i16_merge_stats_consistency() {
     );
     resolver.add_pane_stream(2, vec![make_merge_event(1500, 2, 0, "ingress_text")]);
 
-    // pane_count is tracked before merge (merge drains pane_streams)
+    // Counts are stable before and after merge even though merge drains pane_streams.
     assert_eq!(resolver.pane_count(), 2);
     assert_eq!(resolver.total_events(), 3);
 
@@ -587,6 +587,9 @@ fn i16_merge_stats_consistency() {
     assert_eq!(merged.len(), 3);
     let stats = resolver.stats();
     assert_eq!(stats.total_events, 3);
+    assert_eq!(stats.pane_count, 2);
+    assert_eq!(resolver.pane_count(), 2);
+    assert_eq!(resolver.total_events(), 3);
 }
 
 // ── I-17: Provenance verbosity filtering ─────────────────────────────────

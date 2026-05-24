@@ -101,6 +101,8 @@ pub struct PaneMergeResolver {
     config: MergeConfig,
     pane_streams: HashMap<u64, Vec<MergeEvent>>,
     merged: Vec<MergeEvent>,
+    merged_pane_count: usize,
+    merged_source_event_count: usize,
     merge_complete: bool,
 }
 
@@ -112,6 +114,8 @@ impl PaneMergeResolver {
             config,
             pane_streams: HashMap::new(),
             merged: Vec::new(),
+            merged_pane_count: 0,
+            merged_source_event_count: 0,
             merge_complete: false,
         }
     }
@@ -132,13 +136,21 @@ impl PaneMergeResolver {
     /// Number of pane streams added.
     #[must_use]
     pub fn pane_count(&self) -> usize {
-        self.pane_streams.len()
+        if self.merge_complete {
+            self.merged_pane_count
+        } else {
+            self.pane_streams.len()
+        }
     }
 
     /// Total events across all pane streams.
     #[must_use]
     pub fn total_events(&self) -> usize {
-        self.pane_streams.values().map(|v| v.len()).sum()
+        if self.merge_complete {
+            self.merged_source_event_count
+        } else {
+            self.pending_event_count()
+        }
     }
 
     /// Execute the k-way merge and return the globally sorted result.
@@ -149,6 +161,9 @@ impl PaneMergeResolver {
         if self.merge_complete {
             return &self.merged;
         }
+
+        self.merged_pane_count = self.pane_streams.len();
+        self.merged_source_event_count = self.pending_event_count();
 
         let mut tracker = ClockAnomalyTracker::new(self.config.future_skew_threshold_ms);
 
@@ -232,10 +247,16 @@ impl PaneMergeResolver {
         let gap_count = self.merged.iter().filter(|e| e.is_gap_marker).count();
         MergeStats {
             total_events: self.merged.len(),
-            pane_count: 0, // Already drained
+            pane_count: self.pane_count(),
             anomaly_count,
             gap_marker_count: gap_count,
         }
+    }
+
+    fn pending_event_count(&self) -> usize {
+        self.pane_streams
+            .values()
+            .fold(0usize, |total, events| total.saturating_add(events.len()))
     }
 }
 
@@ -663,6 +684,22 @@ mod tests {
         assert_eq!(stats.total_events, 3);
         assert_eq!(stats.gap_marker_count, 1);
         assert_eq!(stats.anomaly_count, 1); // 200 → 5000 is >100ms threshold
+    }
+
+    #[test]
+    fn stats_preserve_pane_count_after_merge_drains_streams() {
+        let mut resolver = PaneMergeResolver::with_defaults();
+        resolver.add_pane_stream(1, vec![ev(100, 1, 0)]);
+        resolver.add_pane_stream(2, Vec::new());
+        assert_eq!(resolver.pane_count(), 2);
+        assert_eq!(resolver.total_events(), 1);
+
+        resolver.merge();
+        let stats = resolver.stats();
+
+        assert_eq!(stats.pane_count, 2);
+        assert_eq!(resolver.pane_count(), 2);
+        assert_eq!(resolver.total_events(), 1);
     }
 
     // ── Caching Tests ───────────────────────────────────────────────────
