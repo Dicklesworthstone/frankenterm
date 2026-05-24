@@ -143,6 +143,12 @@ const STREAMING_SECRET_ANCHORS: &[&str] = &[
     "SG.",
     "AC",
     "DD_API_KEY",
+    // br-ft-zbnz4: `datadog_api_key` matches `(?:DD|DATADOG)_API_KEY`, so the
+    // long key-name form must also anchor streaming retention. Without it a
+    // `DATADOG_API_KEY=<32 hex>` assignment split across a chunk boundary
+    // produced no anchor hit, the prefix was emitted early, and the split hex
+    // value leaked unredacted. Short `DD_API_KEY` form was already covered.
+    "DATADOG_API_KEY",
 ];
 
 /// Pattern definition for secret detection.
@@ -1235,6 +1241,34 @@ mod tests {
             assert_eq!(out, expected, "split={split}");
             let rendered = String::from_utf8(out).unwrap();
             assert!(!rendered.contains("sk-ant-api03-"), "split={split}");
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_catches_datadog_long_form_split_at_every_offset() {
+        // br-ft-zbnz4 regression: the long `DATADOG_API_KEY=` key-name form was
+        // absent from STREAMING_SECRET_ANCHORS, so a value split across a chunk
+        // boundary produced no anchor hit and the 32-hex value leaked. The short
+        // `DD_API_KEY=` form was already anchored; this guards the long form.
+        let value = "deadbeef0123456789abcdef01234567";
+        let input = format!("before DATADOG_API_KEY={value} after");
+        let expected = Redactor::new().redact(&input).into_bytes();
+        assert_ne!(expected, input.as_bytes(), "fixture must actually redact");
+
+        for split in 1..input.len() {
+            let mut streaming = StreamingRedactor::new();
+            let mut out = Vec::new();
+
+            out.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
+            out.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+            out.extend(streaming.finish().bytes);
+
+            assert_eq!(out, expected, "split={split}");
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(
+                !rendered.contains(value),
+                "split={split} leaked {rendered:?}"
+            );
         }
     }
 
