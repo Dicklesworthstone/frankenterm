@@ -1,0 +1,5 @@
+max_critical = 0
+max_high = 0
+max_medium = 3
+skip_budget_percent = 5.5
+time_budget_ms = 60000

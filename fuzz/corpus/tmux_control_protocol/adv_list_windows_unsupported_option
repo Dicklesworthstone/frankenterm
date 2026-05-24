@@ -1,0 +1,1 @@
+list-windows -F "#{window_id}"

@@ -1,0 +1,13 @@
+schema_version = "replay.manifest.v1"
+last_updated_ms = 42
+
+[[artifacts]]
+path = "../escape.ftreplay"
+label = "escape"
+sha256 = "not-a-sha"
+event_count = 1
+decision_count = 1
+created_at_ms = 42
+sensitivity_tier = "t2"
+status = "active"
+size_bytes = 1

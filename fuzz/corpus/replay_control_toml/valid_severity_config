@@ -1,0 +1,3 @@
+[[rules]]
+rule_id_pattern = "rate_limit_*"
+severity = "Critical"

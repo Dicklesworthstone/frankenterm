@@ -1,0 +1,1 @@
+send -t %2 "hello world" Enter

@@ -1983,6 +1983,10 @@ fn nested_pack_manifest_candidates(dir: &Path) -> impl Iterator<Item = PathBuf> 
         .map(|name| dir.join(name))
 }
 
+fn is_regular_file_no_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -1993,27 +1997,38 @@ fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| PatternError::InvalidRule(format!("cannot read {}: {e}", dir.display())))?;
 
-    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    let mut sorted = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => sorted.push(entry),
+            Err(e) => {
+                tracing::warn!(
+                    "Skipping unreadable user pack directory entry in {}: {e}",
+                    dir.display()
+                );
+            }
+        }
+    }
     sorted.sort_by_key(|e| e.file_name());
 
     for entry in sorted {
         let path = entry.path();
-        // [ft-05hfm follow-up] Pin the sandbox root to `dir` so a symlink
-        // inside `.ft/patterns/` pointing out of tree (e.g.
-        // `config.yaml -> ~/.ssh/id_rsa`) is rejected by `sandbox_resolve`
-        // before `read_to_string` follows it. Without this root, a hostile
-        // repo could smuggle outside-of-tree file contents into the pack
-        // parser and leak excerpts through the `tracing::warn!` below.
-        if path.is_file() && is_pack_file(&path) {
+        let Ok(file_type) = entry.file_type() else {
+            tracing::warn!("Skipping user pack with unreadable file type: {}", path.display());
+            continue;
+        };
+        // Use non-following metadata for directory discovery so symlinked pack
+        // files are skipped instead of followed by metadata/read paths.
+        if file_type.is_file() && is_pack_file(&path) {
             match load_pack_from_file(path.to_str().unwrap_or_default(), Some(dir)) {
                 Ok(pack) => packs.push(pack),
                 Err(e) => {
                     tracing::warn!("Skipping invalid user pack {}: {e}", path.display());
                 }
             }
-        } else if path.is_dir() {
+        } else if file_type.is_dir() {
             for rules_file in nested_pack_manifest_candidates(&path) {
-                if !rules_file.is_file() {
+                if !is_regular_file_no_symlink(&rules_file) {
                     continue;
                 }
                 match load_pack_from_file(rules_file.to_str().unwrap_or_default(), Some(dir)) {
@@ -8006,6 +8021,19 @@ rules:
             msg.contains("outside sandbox root") || msg.contains("sandbox"),
             "unexpected rejection message: {msg}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_packs_from_dir_skips_symlinked_pack_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("linked.yaml");
+        fs::write(&target, minimal_yaml_pack()).unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("linked.yaml")).unwrap();
+
+        let packs = discover_packs_from_dir(root.path()).unwrap();
+        assert!(packs.is_empty());
     }
 
     #[test]

@@ -1,0 +1,13 @@
+schema_version = "replay.manifest.v1"
+last_updated_ms = 42
+
+[[artifacts]]
+path = "captures/incident-a.ftreplay"
+label = "incident-a"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+event_count = 10
+decision_count = 3
+created_at_ms = 42
+sensitivity_tier = "t1"
+status = "active"
+size_bytes = 512
