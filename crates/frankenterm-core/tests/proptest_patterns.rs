@@ -1132,6 +1132,15 @@ proptest! {
     }
 
     #[test]
+    fn prop_library_rejects_event_type_empty_segments(rule_suffix in "[a-z]{3,10}") {
+        let mut rule = make_anchor_only_rule(&rule_suffix, "EVENT_TYPE_EMPTY_SEGMENT");
+        rule.event_type = "usage..reached".to_string();
+        let pack = PatternPack::new("builtin:event-type-empty-segment", "1.0.0", vec![rule]);
+
+        prop_assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    #[test]
     fn prop_library_rejects_blank_optional_rule_text(
         rule_suffix in "[a-z]{3,10}",
         field_index in 0u8..5,
