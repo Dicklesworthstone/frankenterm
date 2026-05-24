@@ -58,6 +58,11 @@ enum ManifestError {
         category: String,
         bead_id: String,
     },
+    ProducerBeadMissing {
+        slot_index: usize,
+        category: String,
+        bead_id: String,
+    },
     DeferredBeadMissing {
         slot_index: usize,
         category: String,
@@ -95,6 +100,7 @@ impl ManifestError {
             ManifestError::UnsafePath { .. } => "unsafe_repo_relative_path",
             ManifestError::UnfilledSlot { .. } => "unfilled_slot",
             ManifestError::MissingDeferredReason { .. } => "deferred_reason_missing",
+            ManifestError::ProducerBeadMissing { .. } => "producer_bead_missing",
             ManifestError::DeferredBeadMissing { .. } => "deferred_bead_missing",
             ManifestError::DeferredBeadInactive { .. } => "deferred_bead_not_active",
             ManifestError::DeferredBeadOrphan { .. } => "orphan_deferred_bead",
@@ -149,6 +155,15 @@ impl ManifestError {
             } => {
                 format!(
                     "slot[{slot_index}] {category}: deferred_to_bead={bead_id:?} is missing deferred_reason"
+                )
+            }
+            ManifestError::ProducerBeadMissing {
+                slot_index,
+                category,
+                bead_id,
+            } => {
+                format!(
+                    "slot[{slot_index}] {category}: produced_by_bead={bead_id:?} was not found in .beads/issues.jsonl"
                 )
             }
             ManifestError::DeferredBeadMissing {
@@ -208,7 +223,7 @@ fn read_workspace_file(rel_path: &str) -> String {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
 }
 
-fn read_live_issues_if_manifest_defers(manifest_text: &str) -> String {
+fn read_live_issues_if_manifest_references_beads(manifest_text: &str) -> String {
     let Ok(manifest) = serde_json::from_str::<Value>(manifest_text) else {
         return String::new();
     };
@@ -221,6 +236,10 @@ fn read_live_issues_if_manifest_defers(manifest_text: &str) -> String {
             slot.get("deferred_to_bead")
                 .and_then(Value::as_str)
                 .is_some()
+                || slot
+                    .get("produced_by_bead")
+                    .and_then(Value::as_str)
+                    .is_some()
         });
     if manifest_needs_beads {
         read_workspace_file(ISSUES_REL_PATH)
@@ -342,6 +361,7 @@ fn validate_manifest_text(
         seen_categories.insert(category.to_string());
         let path = slot.get("path").and_then(Value::as_str);
         let deferred = slot.get("deferred_to_bead").and_then(Value::as_str);
+        let producer = slot.get("produced_by_bead").and_then(Value::as_str);
         let fingerprint = slot_fingerprint(slot, category);
         if !seen_slot_fingerprints.insert(fingerprint.clone()) {
             errors.push(ManifestError::DuplicateSlotFingerprint {
@@ -349,6 +369,15 @@ fn validate_manifest_text(
                 category: category.to_string(),
                 fingerprint,
             });
+        }
+        if let Some(bead_id) = producer {
+            if !beads.is_empty() && !beads.contains_key(bead_id) {
+                errors.push(ManifestError::ProducerBeadMissing {
+                    slot_index,
+                    category: category.to_string(),
+                    bead_id: bead_id.to_string(),
+                });
+            }
         }
 
         match (path, deferred) {
@@ -457,21 +486,31 @@ fn manifest_with_slot(slot: Value) -> String {
 }
 
 fn synthetic_issues(status: &str, edge_type: &str) -> String {
-    json!({
-        "id": "ft-e87u6.99",
-        "title": "synthetic deferred producer",
-        "status": status,
-        "dependencies": [
-            {
-                "issue_id": "ft-e87u6.99",
-                "depends_on_id": ROOT_BEAD_ID,
-                "type": edge_type,
-                "created_at": "2026-05-13T00:00:00Z",
-                "created_by": "test"
-            }
-        ]
-    })
-    .to_string()
+    [
+        json!({
+            "id": "ft-syqcz.3",
+            "title": "synthetic resolved slot producer",
+            "status": "closed",
+            "dependencies": []
+        })
+        .to_string(),
+        json!({
+            "id": "ft-e87u6.99",
+            "title": "synthetic deferred producer",
+            "status": status,
+            "dependencies": [
+                {
+                    "issue_id": "ft-e87u6.99",
+                    "depends_on_id": ROOT_BEAD_ID,
+                    "type": edge_type,
+                    "created_at": "2026-05-13T00:00:00Z",
+                    "created_by": "test"
+                }
+            ]
+        })
+        .to_string(),
+    ]
+    .join("\n")
 }
 
 fn assert_error_contains(errors: &[ManifestError], code: &str, text: &str) {
@@ -491,7 +530,7 @@ fn assert_error_contains(errors: &[ManifestError], code: &str, text: &str) {
 #[test]
 fn every_slot_is_resolved_or_explicitly_deferred() {
     let manifest_text = read_workspace_file(MANIFEST_REL_PATH);
-    let issues_text = read_live_issues_if_manifest_defers(&manifest_text);
+    let issues_text = read_live_issues_if_manifest_references_beads(&manifest_text);
     if let Err(errors) = validate_manifest_text(&manifest_text, &issues_text, &workspace_root()) {
         panic!(
             "attestation manifest is incoherent:\n  - {}",
@@ -534,6 +573,24 @@ fn mutation_both_null_is_rejected() {
     let errors = validate_manifest_text(&manifest_with_slot(slot), "", &workspace_root())
         .expect_err("both-null mutation must fail");
     assert_error_contains(&errors, "unfilled_slot", "exact ft-e87u6 NO_BEAD gap");
+}
+
+#[test]
+fn mutation_missing_producer_bead_is_rejected() {
+    let issues = json!({
+        "id": "ft-unrelated.1",
+        "title": "unrelated bead",
+        "status": "closed",
+        "dependencies": []
+    })
+    .to_string();
+    let errors = validate_manifest_text(
+        &manifest_with_slot(valid_manifest_slot()),
+        &issues,
+        &workspace_root(),
+    )
+    .expect_err("missing produced_by_bead mutation must fail");
+    assert_error_contains(&errors, "producer_bead_missing", "ft-syqcz.3");
 }
 
 #[test]
