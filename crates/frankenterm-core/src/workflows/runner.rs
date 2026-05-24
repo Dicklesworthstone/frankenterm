@@ -106,7 +106,12 @@ async fn wait_external_signal_maybe_cx(
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Ok(());
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "{label}: external signal '{key}' timed out after {}ms",
+                    timeout.as_millis()
+                )),
+            ));
         }
         let chunk = interval.min(remaining);
         if let Some(cx) = cx {
@@ -4204,14 +4209,15 @@ mod tests {
             });
         }
 
-        /// Timeout still bounds the wait when no signal fires.
+        /// Timeout still bounds the wait when no signal fires, and must fail
+        /// closed so the workflow cannot advance without the external event.
         #[test]
-        fn external_wait_returns_at_timeout_when_signal_never_fires() {
+        fn external_wait_aborts_at_timeout_when_signal_never_fires() {
             run_async_test(async {
                 let registry = ExternalSignalRegistry::new();
                 let cond = WaitCondition::external("never");
                 let start = std::time::Instant::now();
-                wait_condition_pause_maybe_cx(
+                let err = wait_condition_pause_maybe_cx(
                     None,
                     &cond,
                     Duration::from_millis(120),
@@ -4219,8 +4225,17 @@ mod tests {
                     "workflow wait condition",
                 )
                 .await
-                .expect("timeout path returns Ok (caller maps to TimedOut)");
+                .expect_err("timeout path must abort instead of advancing");
                 let elapsed = start.elapsed();
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("external signal 'never' timed out"),
+                            "abort reason must name the missing signal: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
                 assert!(
                     elapsed >= Duration::from_millis(100),
                     "wait returned before timeout: {elapsed:?}"
