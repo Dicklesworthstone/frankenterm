@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
   "bead_id": "ft-tf6g3.2",
-  "generated_at": "2026-05-24T22:46:18Z",
+  "generated_at": "2026-05-24T22:49:11Z",
   "generator": "scripts/stamp-readme-counts.sh --json --source=head",
   "source": {
     "script": "scripts/stamp-readme-counts.sh",
@@ -183,15 +183,15 @@
     {
       "name": "core_loc",
       "command": "git ls-tree -r --name-only HEAD crates/frankenterm-core/src | awk '/\\.rs$/ { print }' | while IFS= read -r file_path; do git show \"HEAD:${file_path}\"; done | wc -l",
-      "live_value": 1024891,
+      "live_value": 1025065,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 1024891,
-          "live_value": 1024891,
+          "documented_value": 1025065,
+          "live_value": 1025065,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -199,8 +199,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 1024891,
-          "live_value": 1024891,
+          "documented_value": 1025065,
+          "live_value": 1025065,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -217,15 +217,15 @@
     {
       "name": "test_count",
       "command": "git grep -E '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' HEAD -- crates | wc -l",
-      "live_value": 56341,
+      "live_value": 56347,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
           "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 56341,
-          "live_value": 56341,
+          "documented_value": 56347,
+          "live_value": 56347,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -233,8 +233,8 @@
           "path": "README.md",
           "occurrence": 2,
           "placeholder_present": true,
-          "documented_value": 56341,
-          "live_value": 56341,
+          "documented_value": 56347,
+          "live_value": 56347,
           "drift_pct": 0,
           "status": "matches"
         },
@@ -242,8 +242,8 @@
           "path": "README.md",
           "occurrence": 3,
           "placeholder_present": true,
-          "documented_value": 56341,
-          "live_value": 56341,
+          "documented_value": 56347,
+          "live_value": 56347,
           "drift_pct": 0,
           "status": "matches"
         },
