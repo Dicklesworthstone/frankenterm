@@ -223,21 +223,21 @@ fn tokenize(line: &str) -> Result<Vec<String>, ParseError> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
-    let bytes = line.as_bytes();
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    while i < chars.len() {
+        let (offset, c) = chars[i];
         if !in_token && c.is_whitespace() {
             i += 1;
             continue;
         }
         match c {
             '\'' => {
-                let opened_at = i;
+                let opened_at = offset;
                 i += 1;
                 let mut found = false;
-                while i < bytes.len() {
-                    let cc = bytes[i] as char;
+                while i < chars.len() {
+                    let (_, cc) = chars[i];
                     if cc == '\'' {
                         i += 1;
                         found = true;
@@ -255,18 +255,18 @@ fn tokenize(line: &str) -> Result<Vec<String>, ParseError> {
                 in_token = true;
             }
             '"' => {
-                let opened_at = i;
+                let opened_at = offset;
                 i += 1;
                 let mut found = false;
-                while i < bytes.len() {
-                    let cc = bytes[i] as char;
+                while i < chars.len() {
+                    let (cc_offset, cc) = chars[i];
                     if cc == '"' {
                         i += 1;
                         found = true;
                         break;
                     }
-                    if cc == '\\' && i + 1 < bytes.len() {
-                        let next = bytes[i + 1] as char;
+                    if cc == '\\' && i + 1 < chars.len() {
+                        let (_, next) = chars[i + 1];
                         match next {
                             '\\' => current.push('\\'),
                             '"' => current.push('"'),
@@ -274,7 +274,7 @@ fn tokenize(line: &str) -> Result<Vec<String>, ParseError> {
                             't' => current.push('\t'),
                             other => {
                                 return Err(ParseError::BadEscape {
-                                    at: i,
+                                    at: cc_offset,
                                     observed: other,
                                 });
                             }
@@ -656,6 +656,32 @@ mod tests {
         } else {
             panic!("expected SendKeys");
         }
+    }
+
+    #[test]
+    fn tokenize_preserves_utf8_bare_arguments() {
+        let cmd = parse_command("send-keys café λ Enter").unwrap();
+        if let TmuxCommand::SendKeys { keys, .. } = cmd {
+            assert_eq!(
+                keys,
+                vec!["café".to_string(), "λ".to_string(), "Enter".to_string()]
+            );
+        } else {
+            panic!("expected SendKeys");
+        }
+    }
+
+    #[test]
+    fn tokenize_preserves_utf8_inside_quotes() {
+        let cmd = parse_command("pipe-pane -t %1 \"grep café\"").unwrap();
+        assert_eq!(
+            cmd,
+            TmuxCommand::PipePane {
+                target: Some("%1".to_string()),
+                only_if_not_piped: false,
+                command: vec!["grep café".to_string()],
+            }
+        );
     }
 
     #[test]
