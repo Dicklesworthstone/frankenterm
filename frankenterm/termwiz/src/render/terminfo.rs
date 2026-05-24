@@ -26,6 +26,9 @@ use image::{
 use std::io::Write;
 use terminfo::{Capability as TermInfoCapability, capability as cap};
 
+const SPACE_CHUNK_SIZE: usize = 4096;
+const SPACE_CHUNK: [u8; SPACE_CHUNK_SIZE] = [b' '; SPACE_CHUNK_SIZE];
+
 #[cfg(feature = "use_image")]
 fn is_full_image_region(top_left: TextureCoordinate, bottom_right: TextureCoordinate) -> bool {
     top_left == TextureCoordinate::new_f32(0.0, 0.0)
@@ -193,6 +196,13 @@ pub struct TerminfoRenderer {
 }
 
 impl TerminfoRenderer {
+    fn checked_cell_area(cols: usize, rows: usize) -> Result<usize> {
+        let Some(area) = cols.checked_mul(rows) else {
+            crate::bail!("terminal cell area overflow for {cols}x{rows}");
+        };
+        Ok(area)
+    }
+
     pub fn new(caps: Capabilities) -> Self {
         Self {
             caps,
@@ -504,13 +514,12 @@ impl TerminfoRenderer {
         Ok(())
     }
 
-    fn write_spaces<W: Write>(&self, count: usize, out: &mut W) -> Result<()> {
-        if count == 0 {
-            return Ok(());
+    fn write_spaces<W: Write>(&self, mut count: usize, out: &mut W) -> Result<()> {
+        while count > 0 {
+            let chunk_len = count.min(SPACE_CHUNK_SIZE);
+            out.write_all(&SPACE_CHUNK[..chunk_len])?;
+            count -= chunk_len;
         }
-        let mut buf = Vec::with_capacity(count);
-        buf.resize(count, b' ');
-        out.write_all(buf.as_slice())?;
         Ok(())
     }
 
@@ -633,7 +642,7 @@ impl TerminfoRenderer {
                         self.move_cursor_absolute(0, 0, out)?;
 
                         let (cols, rows) = out.get_size_in_cells()?;
-                        let num_spaces = cols * rows;
+                        let num_spaces = Self::checked_cell_area(cols, rows)?;
                         self.write_spaces(num_spaces, out)?;
                         self.move_cursor_absolute(0, 0, out)?;
                     }
@@ -1453,6 +1462,25 @@ mod test {
         out.render(&[Change::Text("foo".into())]).unwrap();
         assert_eq!("foo", String::from_utf8(out.write.buf).unwrap());
         assert_eq!(out.renderer.current_attr, CellAttributes::default());
+    }
+
+    #[test]
+    fn write_spaces_streams_large_counts_in_chunks() {
+        let renderer = TerminfoRenderer::new(xterm_terminfo());
+        let mut out = Vec::new();
+
+        renderer
+            .write_spaces(SPACE_CHUNK_SIZE + 3, &mut out)
+            .unwrap();
+
+        assert_eq!(out.len(), SPACE_CHUNK_SIZE + 3);
+        assert!(out.iter().all(|byte| *byte == b' '));
+    }
+
+    #[test]
+    fn checked_cell_area_rejects_overflow() {
+        assert_eq!(TerminfoRenderer::checked_cell_area(12, 3).unwrap(), 36);
+        assert!(TerminfoRenderer::checked_cell_area(usize::MAX, 2).is_err());
     }
 
     #[test]
