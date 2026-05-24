@@ -185,14 +185,14 @@ impl FleetScrollbackCoordinator {
         pane_infos: &[PaneScrollbackInfo],
         panes: &mut dyn PaneScrollbackAccess,
     ) -> EvaluationResult {
-        self.telemetry.ticks += 1;
+        self.telemetry.ticks = self.telemetry.ticks.saturating_add(1);
 
         // Step 1: Evaluate fleet pressure.
         let actions = self.controller.evaluate(signals);
         let tier = self.controller.compound_tier();
 
         if tier != FleetPressureTier::Normal {
-            self.telemetry.elevated_ticks += 1;
+            self.telemetry.elevated_ticks = self.telemetry.elevated_ticks.saturating_add(1);
         }
 
         // Step 2: Determine if eviction is needed.
@@ -211,9 +211,12 @@ impl FleetScrollbackCoordinator {
         }
 
         // Step 3: Check minimum threshold.
-        let fleet_warm_bytes: usize = pane_infos.iter().map(|p| p.warm_bytes).sum();
+        let fleet_warm_bytes = pane_infos
+            .iter()
+            .fold(0usize, |total, pane| total.saturating_add(pane.warm_bytes));
         if fleet_warm_bytes < self.config.min_fleet_warm_bytes_for_eviction {
-            self.telemetry.skipped_below_threshold += 1;
+            self.telemetry.skipped_below_threshold =
+                self.telemetry.skipped_below_threshold.saturating_add(1);
             return EvaluationResult {
                 compound_tier: tier,
                 actions,
@@ -229,7 +232,7 @@ impl FleetScrollbackCoordinator {
 
         if is_emergency && self.config.emergency_evict_all {
             // Emergency path: evict all warm pages on every pane.
-            self.telemetry.emergency_cleanups += 1;
+            self.telemetry.emergency_cleanups = self.telemetry.emergency_cleanups.saturating_add(1);
             let (evicted_pages, freed_bytes, applied) =
                 self.apply_emergency_eviction(pane_infos, panes);
             return EvaluationResult {
@@ -256,7 +259,7 @@ impl FleetScrollbackCoordinator {
             };
         };
 
-        self.telemetry.plans_produced += 1;
+        self.telemetry.plans_produced = self.telemetry.plans_produced.saturating_add(1);
 
         // Step 6: Apply the eviction plan (bounded by max_targets_per_cycle).
         let (evicted_pages, freed_bytes, applied) = self.apply_plan(&plan, panes);
@@ -284,7 +287,9 @@ impl FleetScrollbackCoordinator {
                     activity_counter: snapshot.activity_counter,
                     warm_bytes: snapshot.warm_bytes,
                     warm_pages: snapshot.warm_pages,
-                    estimated_memory_bytes: snapshot.warm_bytes + (snapshot.hot_lines * 200), // rough estimate: 200 bytes/line
+                    estimated_memory_bytes: snapshot
+                        .warm_bytes
+                        .saturating_add(snapshot.hot_lines.saturating_mul(200)), // rough estimate: 200 bytes/line
                 });
             }
         }
@@ -309,7 +314,7 @@ impl FleetScrollbackCoordinator {
                 .set_tracked_bytes(info.pane_id, info.estimated_memory_bytes)
                 .is_some()
             {
-                updated += 1;
+                updated = updated.saturating_add(1);
             }
         }
         updated
@@ -402,16 +407,19 @@ impl FleetScrollbackCoordinator {
                 _ => 0,
             };
 
-            total_pages += evicted as u64;
-            total_bytes += bytes_freed;
+            total_pages = total_pages.saturating_add(evicted as u64);
+            total_bytes = total_bytes.saturating_add(bytes_freed);
             if evicted > 0 || bytes_freed > 0 {
-                applied += 1;
+                applied = applied.saturating_add(1);
             }
         }
 
-        self.telemetry.targets_applied += applied as u64;
-        self.telemetry.pages_evicted += total_pages;
-        self.telemetry.bytes_reclaimed += total_bytes;
+        self.telemetry.targets_applied = self
+            .telemetry
+            .targets_applied
+            .saturating_add(applied as u64);
+        self.telemetry.pages_evicted = self.telemetry.pages_evicted.saturating_add(total_pages);
+        self.telemetry.bytes_reclaimed = self.telemetry.bytes_reclaimed.saturating_add(total_bytes);
 
         (total_pages, total_bytes, applied)
     }
@@ -442,16 +450,19 @@ impl FleetScrollbackCoordinator {
                 _ => (0, 0),
             };
 
-            total_pages += pages_evicted;
-            total_bytes += bytes_freed;
+            total_pages = total_pages.saturating_add(pages_evicted);
+            total_bytes = total_bytes.saturating_add(bytes_freed);
             if pages_evicted > 0 || bytes_freed > 0 {
-                targets += 1;
+                targets = targets.saturating_add(1);
             }
         }
 
-        self.telemetry.targets_applied += targets as u64;
-        self.telemetry.pages_evicted += total_pages;
-        self.telemetry.bytes_reclaimed += total_bytes;
+        self.telemetry.targets_applied = self
+            .telemetry
+            .targets_applied
+            .saturating_add(targets as u64);
+        self.telemetry.pages_evicted = self.telemetry.pages_evicted.saturating_add(total_pages);
+        self.telemetry.bytes_reclaimed = self.telemetry.bytes_reclaimed.saturating_add(total_bytes);
 
         (total_pages, total_bytes, targets)
     }
@@ -892,6 +903,31 @@ mod tests {
     }
 
     #[test]
+    fn collect_pane_infos_saturates_memory_estimate() {
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            1,
+            ScrollbackTierSnapshot {
+                hot_lines: usize::MAX,
+                warm_pages: 1,
+                warm_bytes: usize::MAX,
+                warm_lines: 1,
+                cold_lines: 0,
+                cold_pages: 0,
+                total_lines_added: u64::MAX,
+                activity_counter: 9,
+                cold_uncompressed_bytes: 0,
+            },
+        );
+
+        let access = SnapshotPaneScrollbackAccess::new(snapshots);
+        let infos = FleetScrollbackCoordinator::collect_pane_infos(&access);
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].estimated_memory_bytes, usize::MAX);
+    }
+
+    #[test]
     fn telemetry_accumulates_across_ticks() {
         let mut coord = FleetScrollbackCoordinator::default();
         let mut panes = make_panes(5, 50);
@@ -920,6 +956,144 @@ mod tests {
 
         assert_eq!(snap1.ticks, 1);
         assert_eq!(snap2.ticks, 2);
+    }
+
+    #[test]
+    fn coordinator_telemetry_skip_counters_saturate_at_u64_max() {
+        let mut coord = FleetScrollbackCoordinator::new(
+            CoordinatorConfig {
+                min_fleet_warm_bytes_for_eviction: 1,
+                ..CoordinatorConfig::default()
+            },
+            FleetMemoryConfig {
+                escalation_threshold: 1,
+                deescalation_threshold: 1,
+                ..FleetMemoryConfig::default()
+            },
+        );
+        coord.telemetry.ticks = u64::MAX;
+        coord.telemetry.elevated_ticks = u64::MAX;
+        coord.telemetry.skipped_below_threshold = u64::MAX;
+
+        let signals = PressureSignals {
+            backpressure: BackpressureTier::Red,
+            memory_pressure: MemoryPressureTier::Orange,
+            worst_budget: BudgetLevel::Normal,
+            pane_count: 1,
+            paused_pane_count: 0,
+        };
+        let mut null_panes = NullPaneScrollbackAccess;
+
+        let result = coord.evaluate(&signals, &[], &mut null_panes);
+
+        assert_eq!(result.compound_tier, FleetPressureTier::Critical);
+        assert_eq!(coord.telemetry().ticks, u64::MAX);
+        assert_eq!(coord.telemetry().elevated_ticks, u64::MAX);
+        assert_eq!(coord.telemetry().skipped_below_threshold, u64::MAX);
+    }
+
+    #[test]
+    fn coordinator_fleet_warm_sum_and_emergency_counter_saturate() {
+        let mut coord = FleetScrollbackCoordinator::new(
+            CoordinatorConfig {
+                emergency_evict_all: true,
+                min_fleet_warm_bytes_for_eviction: usize::MAX,
+                ..CoordinatorConfig::default()
+            },
+            FleetMemoryConfig {
+                escalation_threshold: 1,
+                deescalation_threshold: 1,
+                ..FleetMemoryConfig::default()
+            },
+        );
+        coord.telemetry.emergency_cleanups = u64::MAX;
+        let infos = vec![
+            PaneScrollbackInfo {
+                pane_id: 1,
+                activity_counter: 0,
+                warm_bytes: usize::MAX,
+                warm_pages: 1,
+                estimated_memory_bytes: usize::MAX,
+            },
+            PaneScrollbackInfo {
+                pane_id: 2,
+                activity_counter: 0,
+                warm_bytes: usize::MAX,
+                warm_pages: 1,
+                estimated_memory_bytes: usize::MAX,
+            },
+        ];
+        let signals = PressureSignals {
+            backpressure: BackpressureTier::Black,
+            memory_pressure: MemoryPressureTier::Red,
+            worst_budget: BudgetLevel::OverBudget,
+            pane_count: infos.len(),
+            paused_pane_count: 0,
+        };
+        let mut null_panes = NullPaneScrollbackAccess;
+
+        let result = coord.evaluate(&signals, &infos, &mut null_panes);
+
+        assert_eq!(result.compound_tier, FleetPressureTier::Emergency);
+        assert_eq!(coord.telemetry().emergency_cleanups, u64::MAX);
+    }
+
+    #[test]
+    fn coordinator_apply_plan_telemetry_saturates() {
+        let mut coord = FleetScrollbackCoordinator::new(
+            CoordinatorConfig {
+                max_targets_per_cycle: 2,
+                min_fleet_warm_bytes_for_eviction: 0,
+                ..CoordinatorConfig::default()
+            },
+            FleetMemoryConfig::default(),
+        );
+        coord.telemetry.targets_applied = u64::MAX - 1;
+        coord.telemetry.pages_evicted = u64::MAX - 1;
+        coord.telemetry.bytes_reclaimed = u64::MAX - 1;
+
+        let mut snapshots = HashMap::new();
+        for pane_id in 1..=2 {
+            snapshots.insert(
+                pane_id,
+                ScrollbackTierSnapshot {
+                    hot_lines: 0,
+                    warm_pages: 1,
+                    warm_bytes: usize::MAX,
+                    warm_lines: 1,
+                    cold_lines: 0,
+                    cold_pages: 0,
+                    total_lines_added: 1,
+                    activity_counter: 0,
+                    cold_uncompressed_bytes: 0,
+                },
+            );
+        }
+        let mut access = SnapshotPaneScrollbackAccess::new(snapshots);
+        let plan = EvictionPlan {
+            targets: vec![
+                crate::fleet_memory_controller::EvictionTarget {
+                    pane_id: 1,
+                    pages_to_evict: 1,
+                },
+                crate::fleet_memory_controller::EvictionTarget {
+                    pane_id: 2,
+                    pages_to_evict: 1,
+                },
+            ],
+            trigger_tier: FleetPressureTier::Critical,
+            fleet_warm_bytes_before: usize::MAX,
+            fleet_warm_bytes_target: 0,
+        };
+
+        let (pages, bytes, targets) = coord.apply_plan(&plan, &mut access);
+
+        assert_eq!(pages, 2);
+        assert_eq!(bytes, u64::MAX);
+        assert_eq!(targets, 2);
+        assert_eq!(coord.telemetry().targets_applied, u64::MAX);
+        assert_eq!(coord.telemetry().pages_evicted, u64::MAX);
+        assert_eq!(coord.telemetry().bytes_reclaimed, u64::MAX);
     }
 
     #[test]
