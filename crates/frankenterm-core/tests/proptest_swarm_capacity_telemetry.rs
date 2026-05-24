@@ -8,7 +8,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::chaos_scale_harness::FailureClass;
 use frankenterm_core::runtime_telemetry::{
-    SwarmCapacityCertificateConfig, SwarmCapacityOutcome, SwarmCapacityStage, SwarmCapacityTelemetry,
+    SwarmCapacityCertificateConfig, SwarmCapacityOutcome, SwarmCapacityRegressionBudget,
+    SwarmCapacityRegressionGateStatus, SwarmCapacityStage, SwarmCapacityTelemetry,
 };
 
 proptest! {
@@ -217,4 +218,29 @@ fn capacity_certificate_is_deterministic() {
     let j1 = serde_json::to_string(&c1).expect("certificate serializes");
     let j2 = serde_json::to_string(&c2).expect("certificate serializes");
     assert_eq!(j1, j2, "capacity_certificate must be deterministic for a fixed snapshot + config");
+}
+
+/// The regression gate must not false-positive: a capacity certificate
+/// compared against its own identical baseline produces matching baseline
+/// and live hashes and never reports a regression (Fail). With the default
+/// budget (baseline-update Disabled) this exercises the normal gate path.
+#[test]
+fn regression_gate_does_not_flag_certificate_against_itself() {
+    let mut telemetry = SwarmCapacityTelemetry::with_defaults();
+    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
+    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    let snapshot = telemetry.snapshot();
+    let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
+
+    let report = cert.regression_budget_report(&cert, SwarmCapacityRegressionBudget::default());
+
+    assert_eq!(
+        report.baseline_hash, report.live_hash,
+        "identical baseline and live certificates must hash identically"
+    );
+    assert_ne!(
+        report.status,
+        SwarmCapacityRegressionGateStatus::Fail,
+        "a certificate must never regress against its own identical baseline"
+    );
 }
