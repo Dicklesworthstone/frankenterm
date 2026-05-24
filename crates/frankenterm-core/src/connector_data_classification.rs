@@ -398,7 +398,8 @@ impl ClassifiedEvent {
     pub fn sensitivity_histogram(&self) -> BTreeMap<DataSensitivity, usize> {
         let mut hist = BTreeMap::new();
         for fc in &self.field_classifications {
-            *hist.entry(fc.sensitivity).or_insert(0) += 1;
+            let count = hist.entry(fc.sensitivity).or_insert(0usize);
+            *count = count.saturating_add(1);
         }
         hist
     }
@@ -452,19 +453,25 @@ impl RedactedEvent {
     /// Count of fields that were redacted but retained in sanitized form.
     #[must_use]
     pub fn fields_redacted(&self) -> u32 {
-        self.redaction_actions
-            .iter()
-            .filter(|action| !matches!(action.strategy, RedactionStrategy::Remove))
-            .count() as u32
+        u32::try_from(
+            self.redaction_actions
+                .iter()
+                .filter(|action| !matches!(action.strategy, RedactionStrategy::Remove))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     }
 
     /// Count of fields that were removed entirely.
     #[must_use]
     pub fn fields_removed(&self) -> u32 {
-        self.redaction_actions
-            .iter()
-            .filter(|action| matches!(action.strategy, RedactionStrategy::Remove))
-            .count() as u32
+        u32::try_from(
+            self.redaction_actions
+                .iter()
+                .filter(|action| matches!(action.strategy, RedactionStrategy::Remove))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     }
 }
 
@@ -700,7 +707,7 @@ impl ConnectorDataClassifier {
         &mut self,
         event: &CanonicalConnectorEvent,
     ) -> Result<ClassifiedEvent, ClassificationError> {
-        self.telemetry.policy_lookups += 1;
+        self.telemetry.policy_lookups = self.telemetry.policy_lookups.saturating_add(1);
 
         let policy = self
             .policies
@@ -708,7 +715,7 @@ impl ConnectorDataClassifier {
             .find(|p| p.matches_connector(&event.connector_id))
             .cloned()
             .ok_or_else(|| {
-                self.telemetry.policy_misses += 1;
+                self.telemetry.policy_misses = self.telemetry.policy_misses.saturating_add(1);
                 ClassificationError::NoPolicyFound {
                     connector_id: event.connector_id.clone(),
                 }
@@ -717,7 +724,8 @@ impl ConnectorDataClassifier {
         // Check payload size
         let payload_str = event.payload.to_string();
         if payload_str.len() > policy.max_payload_bytes {
-            self.telemetry.payload_truncations += 1;
+            self.telemetry.payload_truncations =
+                self.telemetry.payload_truncations.saturating_add(1);
             // We still classify, but note the truncation
         }
 
@@ -738,7 +746,7 @@ impl ConnectorDataClassifier {
             if fc.sensitivity > overall_sensitivity {
                 overall_sensitivity = fc.sensitivity;
             }
-            self.telemetry.fields_classified += 1;
+            self.telemetry.fields_classified = self.telemetry.fields_classified.saturating_add(1);
             field_classifications.push(fc);
         }
 
@@ -749,7 +757,7 @@ impl ConnectorDataClassifier {
             if fc.sensitivity > overall_sensitivity {
                 overall_sensitivity = fc.sensitivity;
             }
-            self.telemetry.fields_classified += 1;
+            self.telemetry.fields_classified = self.telemetry.fields_classified.saturating_add(1);
             field_classifications.push(fc);
         }
 
@@ -785,16 +793,13 @@ impl ConnectorDataClassifier {
                 }
             }
             if secrets_detected {
-                self.telemetry.secrets_detected += 1;
+                self.telemetry.secrets_detected = self.telemetry.secrets_detected.saturating_add(1);
             }
         }
 
-        self.telemetry.events_classified += 1;
+        self.telemetry.events_classified = self.telemetry.events_classified.saturating_add(1);
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = now_unix_millis_saturating();
 
         Ok(ClassifiedEvent {
             event_id: event.event_id.clone(),
@@ -869,7 +874,8 @@ impl ConnectorDataClassifier {
                                 if fc.sensitivity > *overall {
                                     *overall = fc.sensitivity;
                                 }
-                                self.telemetry.fields_classified += 1;
+                                self.telemetry.fields_classified =
+                                    self.telemetry.fields_classified.saturating_add(1);
                                 classifications.push(fc);
                             }
                         }
@@ -879,7 +885,8 @@ impl ConnectorDataClassifier {
                             if fc.sensitivity > *overall {
                                 *overall = fc.sensitivity;
                             }
-                            self.telemetry.fields_classified += 1;
+                            self.telemetry.fields_classified =
+                                self.telemetry.fields_classified.saturating_add(1);
                             classifications.push(fc);
                         }
                     }
@@ -890,7 +897,8 @@ impl ConnectorDataClassifier {
                 if fc.sensitivity > *overall {
                     *overall = fc.sensitivity;
                 }
-                self.telemetry.fields_classified += 1;
+                self.telemetry.fields_classified =
+                    self.telemetry.fields_classified.saturating_add(1);
                 classifications.push(fc);
             }
             _ => {
@@ -901,7 +909,8 @@ impl ConnectorDataClassifier {
                     matched_rule: "scalar".to_string(),
                     strategy: RedactionStrategy::Passthrough,
                 });
-                self.telemetry.fields_classified += 1;
+                self.telemetry.fields_classified =
+                    self.telemetry.fields_classified.saturating_add(1);
             }
         }
     }
@@ -985,10 +994,12 @@ impl ConnectorDataClassifier {
                     let new_val = self.apply_strategy(&fc.strategy, original);
                     if let Some(new_val) = new_val {
                         redacted_event.metadata.insert(rest.to_string(), new_val);
-                        self.telemetry.fields_redacted += 1;
+                        self.telemetry.fields_redacted =
+                            self.telemetry.fields_redacted.saturating_add(1);
                     } else {
                         redacted_event.metadata.remove(rest);
-                        self.telemetry.fields_removed += 1;
+                        self.telemetry.fields_removed =
+                            self.telemetry.fields_removed.saturating_add(1);
                     }
                     actions.push(RedactionAction {
                         field_path: fc.field_path.clone(),
@@ -1013,9 +1024,11 @@ impl ConnectorDataClassifier {
                     let new_val = self.apply_strategy(&fc.strategy, &original_str);
                     set_json_path(&mut payload, rest, new_val);
                     if fc.strategy == RedactionStrategy::Remove {
-                        self.telemetry.fields_removed += 1;
+                        self.telemetry.fields_removed =
+                            self.telemetry.fields_removed.saturating_add(1);
                     } else {
-                        self.telemetry.fields_redacted += 1;
+                        self.telemetry.fields_redacted =
+                            self.telemetry.fields_redacted.saturating_add(1);
                     }
                     actions.push(RedactionAction {
                         field_path: fc.field_path.clone(),
@@ -1029,19 +1042,22 @@ impl ConnectorDataClassifier {
         redacted_event.payload = payload;
 
         // Record audit entry
-        let fields_redacted = actions
-            .iter()
-            .filter(|a| !matches!(a.strategy, RedactionStrategy::Remove))
-            .count() as u32;
-        let fields_removed = actions
-            .iter()
-            .filter(|a| matches!(a.strategy, RedactionStrategy::Remove))
-            .count() as u32;
+        let fields_redacted = u32::try_from(
+            actions
+                .iter()
+                .filter(|a| !matches!(a.strategy, RedactionStrategy::Remove))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let fields_removed = u32::try_from(
+            actions
+                .iter()
+                .filter(|a| matches!(a.strategy, RedactionStrategy::Remove))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = now_unix_millis_saturating();
 
         let audit = ClassificationAuditEntry {
             event_id: classified.event_id.clone(),
@@ -1058,16 +1074,18 @@ impl ConnectorDataClassifier {
 
         match decision {
             IngestionDecision::Accept => {
-                self.telemetry.events_accepted += 1;
+                self.telemetry.events_accepted = self.telemetry.events_accepted.saturating_add(1);
             }
             IngestionDecision::AcceptRedacted => {
-                self.telemetry.events_accepted_redacted += 1;
+                self.telemetry.events_accepted_redacted =
+                    self.telemetry.events_accepted_redacted.saturating_add(1);
             }
             IngestionDecision::Reject { .. } => {
-                self.telemetry.events_rejected += 1;
+                self.telemetry.events_rejected = self.telemetry.events_rejected.saturating_add(1);
             }
             IngestionDecision::Quarantine { .. } => {
-                self.telemetry.events_quarantined += 1;
+                self.telemetry.events_quarantined =
+                    self.telemetry.events_quarantined.saturating_add(1);
             }
         }
 
@@ -1093,7 +1111,7 @@ impl ConnectorDataClassifier {
             RedactionStrategy::Remove => None,
             RedactionStrategy::Tokenize { token_prefix } => {
                 let id = self.next_token_id;
-                self.next_token_id += 1;
+                self.next_token_id = self.next_token_id.saturating_add(1);
                 Some(format!("{token_prefix}{id}"))
             }
             RedactionStrategy::Passthrough => Some(value.to_string()),
@@ -1102,7 +1120,10 @@ impl ConnectorDataClassifier {
 
     /// Push an audit entry, evicting old ones if at capacity.
     fn push_audit(&mut self, entry: ClassificationAuditEntry) {
-        if self.audit_log.len() >= self.config.max_audit_entries {
+        if self.config.max_audit_entries == 0 {
+            return;
+        }
+        while self.audit_log.len() >= self.config.max_audit_entries {
             self.audit_log.pop_front();
         }
         self.audit_log.push_back(entry);
@@ -1185,6 +1206,14 @@ fn set_json_path(value: &mut serde_json::Value, path: &str, new_value: Option<St
         }
         _ => {}
     }
+}
+
+fn now_unix_millis_saturating() -> u64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 /// Simple non-cryptographic hash for deterministic tokenization.
@@ -1863,6 +1892,29 @@ mod tests {
     }
 
     #[test]
+    fn apply_tokenize_strategy_saturates_at_u64_max() {
+        let mut classifier = test_classifier();
+        classifier.next_token_id = u64::MAX;
+
+        let first = classifier.apply_strategy(
+            &RedactionStrategy::Tokenize {
+                token_prefix: "tok-".into(),
+            },
+            "value1",
+        );
+        let second = classifier.apply_strategy(
+            &RedactionStrategy::Tokenize {
+                token_prefix: "tok-".into(),
+            },
+            "value2",
+        );
+
+        assert_eq!(first, Some(format!("tok-{}", u64::MAX)));
+        assert_eq!(second, Some(format!("tok-{}", u64::MAX)));
+        assert_eq!(classifier.next_token_id, u64::MAX);
+    }
+
+    #[test]
     fn apply_passthrough_strategy() {
         let mut classifier = test_classifier();
         let result = classifier.apply_strategy(&RedactionStrategy::Passthrough, "hello");
@@ -1902,6 +1954,22 @@ mod tests {
         assert_eq!(classifier.audit_log().len(), 3);
         // Oldest should have been evicted
         assert_eq!(classifier.audit_log().front().unwrap().event_id, "evt-2");
+    }
+
+    #[test]
+    fn audit_log_zero_capacity_retains_no_entries() {
+        let config = ClassifierConfig {
+            max_audit_entries: 0,
+            ..Default::default()
+        };
+        let mut classifier = ConnectorDataClassifier::new(config);
+        classifier.register_policy(ClassificationPolicy::default());
+
+        let event = test_event("test-connector");
+        let classified = classifier.classify_event(&event).unwrap();
+        classifier.redact_event(&event, &classified);
+
+        assert!(classifier.audit_log().is_empty());
     }
 
     #[test]
@@ -1981,6 +2049,88 @@ mod tests {
         let t = classifier.telemetry();
         assert_eq!(t.events_classified, 1);
         assert!(t.fields_classified > 0);
+    }
+
+    #[test]
+    fn classify_missing_policy_telemetry_saturates() {
+        let mut classifier = ConnectorDataClassifier::new(ClassifierConfig::default());
+        classifier.telemetry.policy_lookups = u64::MAX;
+        classifier.telemetry.policy_misses = u64::MAX;
+
+        let event = test_event("test-connector");
+        let result = classifier.classify_event(&event);
+
+        assert!(result.is_err());
+        assert_eq!(classifier.telemetry().policy_lookups, u64::MAX);
+        assert_eq!(classifier.telemetry().policy_misses, u64::MAX);
+    }
+
+    #[test]
+    fn classify_event_telemetry_counters_saturate() {
+        let mut classifier = test_classifier();
+        classifier.policies[0].max_payload_bytes = 1;
+        classifier.telemetry.policy_lookups = u64::MAX;
+        classifier.telemetry.payload_truncations = u64::MAX;
+        classifier.telemetry.fields_classified = u64::MAX;
+        classifier.telemetry.events_classified = u64::MAX;
+
+        let event = test_event("test-connector");
+        let _classified = classifier.classify_event(&event).unwrap();
+
+        assert_eq!(classifier.telemetry().policy_lookups, u64::MAX);
+        assert_eq!(classifier.telemetry().payload_truncations, u64::MAX);
+        assert_eq!(classifier.telemetry().fields_classified, u64::MAX);
+        assert_eq!(classifier.telemetry().events_classified, u64::MAX);
+    }
+
+    #[test]
+    fn redact_event_telemetry_counters_saturate() {
+        let mut classifier = test_classifier();
+        let mut event = test_event("test-connector");
+        event
+            .metadata
+            .insert("auth_token".to_string(), "bearer-secret".to_string());
+        event.payload = serde_json::json!({
+            "password": "super-secret",
+            "status": "ok"
+        });
+        let classified = classifier.classify_event(&event).unwrap();
+
+        classifier.telemetry.fields_redacted = u64::MAX;
+        classifier.telemetry.fields_removed = u64::MAX;
+        classifier.telemetry.events_accepted = u64::MAX;
+        classifier.telemetry.events_accepted_redacted = u64::MAX;
+        classifier.telemetry.events_rejected = u64::MAX;
+        classifier.telemetry.events_quarantined = u64::MAX;
+
+        let _ = classifier.redact_event_with_decision(
+            &event,
+            &classified,
+            IngestionDecision::AcceptRedacted,
+        );
+        let _ =
+            classifier.redact_event_with_decision(&event, &classified, IngestionDecision::Accept);
+        let _ = classifier.redact_event_with_decision(
+            &event,
+            &classified,
+            IngestionDecision::Reject {
+                reason: "blocked".to_string(),
+            },
+        );
+        let _ = classifier.redact_event_with_decision(
+            &event,
+            &classified,
+            IngestionDecision::Quarantine {
+                reason: "review".to_string(),
+            },
+        );
+
+        assert_eq!(classifier.telemetry().fields_redacted, u64::MAX);
+        assert_eq!(classifier.telemetry().fields_removed, u64::MAX);
+        assert_eq!(classifier.telemetry().events_accepted, u64::MAX);
+        assert_eq!(classifier.telemetry().events_accepted_redacted, u64::MAX);
+        assert_eq!(classifier.telemetry().events_rejected, u64::MAX);
+        assert_eq!(classifier.telemetry().events_quarantined, u64::MAX);
     }
 
     #[test]
