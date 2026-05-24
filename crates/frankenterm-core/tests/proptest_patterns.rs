@@ -956,6 +956,35 @@ fn make_test_engine(rules: Vec<RuleDef>) -> PatternEngine {
     PatternEngine::with_packs(vec![pack]).expect("valid test engine")
 }
 
+fn minimal_supply_chain() -> PatternPackSupplyChain {
+    PatternPackSupplyChain {
+        provenance: PatternPackProvenance {
+            author: "test".to_string(),
+            source: "fixture".to_string(),
+            revision: "rev-1".to_string(),
+        },
+        fixture_hashes: std::collections::BTreeMap::new(),
+        lint: PatternPackLintAttestation {
+            passed: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        },
+        regex_backtrack_budget: 10,
+        redaction_review: PatternPackRedactionReview {
+            reviewer: "test".to_string(),
+            reviewed_at: "2026-05-24T00:00:00Z".to_string(),
+            approved: true,
+        },
+        compatibility_target: PATTERN_PACK_COMPATIBILITY_TARGET.to_string(),
+        rollout: PatternPackRollout {
+            stage: "test".to_string(),
+            dry_run_match_telemetry: true,
+            observe_only_until_verified: false,
+        },
+        signature: None,
+    }
+}
+
 #[test]
 fn pattern_library_later_pack_override_drives_detection_and_pack_mapping() {
     let mut base_rule = make_anchor_only_rule("override_me", "OLDANCHOR");
@@ -1006,6 +1035,25 @@ fn observe_only_pack_preserves_manual_fix_but_removes_action_surfaces() {
     let detections = engine.detect("OBSERVE_ME");
     assert_eq!(detections.len(), 1);
     assert_eq!(detections[0].rule_id, "codex.observe_only");
+}
+
+#[test]
+fn observe_only_pack_marks_supply_chain_rollout_observe_only() {
+    let mut rule = make_anchor_only_rule("supply_chain_observe_only", "SUPPLY_OBSERVE");
+    rule.workflow = Some("usage_limit_response".to_string());
+    rule.preview_command = Some("ft workflow preview usage-limit".to_string());
+
+    let pack = PatternPack::new("observe-only-supply-chain", "1.0.0", vec![rule])
+        .with_supply_chain(minimal_supply_chain())
+        .into_observe_only();
+
+    let supply_chain = pack
+        .supply_chain
+        .as_ref()
+        .expect("observe-only pack should retain supply-chain metadata");
+    assert!(supply_chain.rollout.observe_only_until_verified);
+    assert_eq!(pack.rules[0].workflow, None);
+    assert_eq!(pack.rules[0].preview_command, None);
 }
 
 #[test]
