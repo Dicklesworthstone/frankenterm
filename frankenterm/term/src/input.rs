@@ -86,7 +86,7 @@ impl LastMouseClick {
             && position.row == self.position.row
             && now.duration_since(self.time) <= Duration::from_millis(click_interval_ms)
         {
-            self.streak + 1
+            self.streak.saturating_add(1)
         } else {
             1
         };
@@ -238,6 +238,19 @@ mod tests {
         assert_eq!(click2.streak, 2);
         let click3 = click2.add(MouseButton::Left, pos(5, 3), 500);
         assert_eq!(click3.streak, 3);
+    }
+
+    #[test]
+    fn click_streak_saturates_at_usize_max() {
+        let click = LastMouseClick {
+            button: MouseButton::Left,
+            position: pos(5, 3),
+            time: Instant::now(),
+            streak: usize::MAX,
+        };
+
+        let next = click.add(MouseButton::Left, pos(5, 3), 500);
+        assert_eq!(next.streak, usize::MAX);
     }
 
     #[test]
