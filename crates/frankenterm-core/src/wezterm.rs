@@ -2695,7 +2695,7 @@ impl WeztermClient {
     {
         let mut attempt = 0;
         loop {
-            attempt += 1;
+            attempt = next_retry_attempt(attempt);
             match runner().await {
                 Ok(output) => return Ok(output),
                 Err(err) => {
@@ -2731,7 +2731,7 @@ impl WeztermClient {
                     "retry_with cancelled: {err}"
                 )))
             })?;
-            attempt += 1;
+            attempt = next_retry_attempt(attempt);
             match runner().await {
                 Ok(output) => return Ok(output),
                 Err(err) => {
@@ -4175,6 +4175,10 @@ pub(crate) fn next_poll_count(polls: usize) -> usize {
     polls.saturating_add(1)
 }
 
+pub(crate) fn next_retry_attempt(attempt: usize) -> usize {
+    attempt.saturating_add(1)
+}
+
 pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
     for byte in bytes {
@@ -5385,6 +5389,12 @@ mod tests {
     fn next_poll_count_saturates_at_usize_max() {
         assert_eq!(next_poll_count(0), 1);
         assert_eq!(next_poll_count(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn next_retry_attempt_saturates_at_usize_max() {
+        assert_eq!(next_retry_attempt(0), 1);
+        assert_eq!(next_retry_attempt(usize::MAX), usize::MAX);
     }
 
     // =====================================================================
