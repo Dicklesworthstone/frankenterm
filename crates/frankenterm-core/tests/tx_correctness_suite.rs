@@ -15,15 +15,26 @@ use frankenterm_core::plan::{
     MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
     TxCommitOutcome, TxCommitStepInput, TxCompensation, TxCompensationOutcome,
     TxCompensationStepInput, TxExecutionRecord, TxId, TxIdempotencyVerdict, TxIntent, TxOutcome,
-    TxPhase, TxPlan, TxPlanId, TxReceipt, TxResumeState, TxStep, TxStepExecutionRecord, TxStepId,
-    execute_commit_phase, execute_compensation_phase, reconstruct_tx_resume_state,
-    validate_tx_idempotency,
+    TxPhase, TxPlan, TxPlanId, TxPrepareGateInput, TxPrepareOutcome, TxReceipt, TxResumeState,
+    TxStep, TxStepExecutionRecord, TxStepId, evaluate_prepare_phase, execute_commit_phase,
+    execute_compensation_phase, reconstruct_tx_resume_state, validate_tx_idempotency,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn receipt_seq(v: &serde_json::Value) -> u64 {
     v["seq"].as_u64().unwrap()
+}
+
+fn assert_receipts_monotonic(receipts: &[serde_json::Value], scenario: &str) {
+    for window in receipts.windows(2) {
+        let current = receipt_seq(&window[0]);
+        let next = receipt_seq(&window[1]);
+        assert!(
+            next > current,
+            "[{scenario}] receipts not monotonic: seq {current} -> {next}",
+        );
+    }
 }
 
 fn build_contract(num_steps: usize, state: MissionTxState) -> MissionTxContract {
@@ -71,6 +82,24 @@ fn build_contract(num_steps: usize, state: MissionTxState) -> MissionTxContract 
         outcome: TxOutcome::Pending,
         receipts: vec![],
     }
+}
+
+fn all_gates_pass(num_steps: usize) -> Vec<TxPrepareGateInput> {
+    (1..=num_steps)
+        .map(|i| TxPrepareGateInput {
+            step_id: TxStepId(format!("s{i}")),
+            pane_id: None,
+            policy_passed: true,
+            policy_reason_code: None,
+            reservation_available: true,
+            reservation_reason_code: None,
+            approval_satisfied: true,
+            approval_reason_code: None,
+            target_liveness: true,
+            liveness_reason_code: None,
+            required_approval: None,
+        })
+        .collect()
 }
 
 fn success_commit_inputs(num_steps: usize) -> Vec<TxCommitStepInput> {
@@ -160,6 +189,233 @@ fn lifecycle_checkpoint_receipt(
         decision_path: "test_fixture->lifecycle_checkpoint".into(),
     })
     .unwrap()
+}
+
+// ── Conformance Harness: Prepare → Commit → Compensate → Replay ─────────────
+
+#[test]
+fn conformance_prepare_commit_compensate_idempotent_replay_matrix() {
+    #[derive(Debug)]
+    struct Case {
+        requirement: &'static str,
+        name: &'static str,
+        num_steps: usize,
+        fail_at: Option<usize>,
+        expected_commit: TxCommitOutcome,
+        expected_committed: usize,
+        expected_failed: usize,
+        expected_skipped: usize,
+        expected_compensation: Option<TxCompensationOutcome>,
+        terminal_state: MissionTxState,
+    }
+
+    let cases = [
+        Case {
+            requirement: "MUST prepare all gates before commit and block terminal duplicate commit replay",
+            name: "all_ready_full_commit",
+            num_steps: 3,
+            fail_at: None,
+            expected_commit: TxCommitOutcome::FullyCommitted,
+            expected_committed: 3,
+            expected_failed: 0,
+            expected_skipped: 0,
+            expected_compensation: None,
+            terminal_state: MissionTxState::Committed,
+        },
+        Case {
+            requirement: "MUST compensate the committed prefix after partial failure and block terminal replay",
+            name: "partial_commit_full_compensation",
+            num_steps: 5,
+            fail_at: Some(4),
+            expected_commit: TxCommitOutcome::PartialFailure,
+            expected_committed: 3,
+            expected_failed: 1,
+            expected_skipped: 1,
+            expected_compensation: Some(TxCompensationOutcome::FullyRolledBack),
+            terminal_state: MissionTxState::RolledBack,
+        },
+    ];
+
+    for case in cases {
+        let prepare_contract = build_contract(case.num_steps, MissionTxState::Planned);
+        let gates = all_gates_pass(case.num_steps);
+        let prepare = evaluate_prepare_phase(
+            &prepare_contract.intent.tx_id,
+            &prepare_contract.plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            2_000,
+        )
+        .unwrap();
+        let prepare_replay = evaluate_prepare_phase(
+            &prepare_contract.intent.tx_id,
+            &prepare_contract.plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            2_000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepare.outcome,
+            TxPrepareOutcome::AllReady,
+            "[{}] {}",
+            case.name,
+            case.requirement
+        );
+        assert!(prepare.outcome.commit_eligible(), "[{}]", case.name);
+        assert_eq!(prepare.gate_inputs.len(), case.num_steps, "[{}]", case.name);
+        assert_eq!(prepare_replay.outcome, prepare.outcome, "[{}]", case.name);
+        assert_eq!(
+            prepare_replay.gate_inputs, prepare.gate_inputs,
+            "[{}]",
+            case.name
+        );
+
+        let commit_contract = build_contract(case.num_steps, MissionTxState::Prepared);
+        let commit_inputs = match case.fail_at {
+            Some(fail_at) => partial_commit_inputs(case.num_steps, fail_at),
+            None => success_commit_inputs(case.num_steps),
+        };
+        let commit = execute_commit_phase(
+            &commit_contract,
+            &commit_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            10_000,
+        )
+        .unwrap();
+        let commit_replay = execute_commit_phase(
+            &commit_contract,
+            &commit_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            10_000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            &commit.outcome, &case.expected_commit,
+            "[{}] {}",
+            case.name, case.requirement
+        );
+        assert_eq!(
+            commit.committed_count, case.expected_committed,
+            "[{}]",
+            case.name
+        );
+        assert_eq!(commit.failed_count, case.expected_failed, "[{}]", case.name);
+        assert_eq!(
+            commit.skipped_count, case.expected_skipped,
+            "[{}]",
+            case.name
+        );
+        assert_receipts_monotonic(&commit.receipts, case.name);
+        assert_eq!(
+            commit.canonical_string(),
+            commit_replay.canonical_string(),
+            "[{}] commit replay must be deterministic",
+            case.name
+        );
+
+        let compensation = if let Some(expected_compensation) = &case.expected_compensation {
+            let comp_contract = build_contract(case.num_steps, MissionTxState::Compensating);
+            let comp_inputs = success_comp_inputs(case.num_steps);
+            let comp =
+                execute_compensation_phase(&comp_contract, &commit, &comp_inputs, 20_000).unwrap();
+            let comp_replay =
+                execute_compensation_phase(&comp_contract, &commit, &comp_inputs, 20_000).unwrap();
+
+            assert_eq!(
+                &comp.outcome, expected_compensation,
+                "[{}] {}",
+                case.name, case.requirement
+            );
+            assert_eq!(
+                comp.compensated_count, case.expected_committed,
+                "[{}] compensation covers committed prefix only",
+                case.name
+            );
+            assert_eq!(comp.failed_count, 0, "[{}]", case.name);
+            assert_receipts_monotonic(&comp.receipts, case.name);
+            assert_eq!(
+                comp.canonical_string(),
+                comp_replay.canonical_string(),
+                "[{}] compensation replay must be deterministic",
+                case.name
+            );
+            Some(comp)
+        } else {
+            None
+        };
+
+        let mut terminal_contract = build_contract(case.num_steps, MissionTxState::Prepared);
+        terminal_contract
+            .receipts
+            .push(lifecycle_checkpoint_receipt(
+                &terminal_contract,
+                1,
+                case.terminal_state,
+                "conformance_terminal",
+                30_000,
+            ));
+        let resume = reconstruct_tx_resume_state(
+            &terminal_contract,
+            Some(&commit),
+            compensation.as_ref(),
+            31_000,
+        );
+        assert!(
+            resume.is_fully_resolved(),
+            "[{}] terminal replay resume must be resolved: {:?}",
+            case.name,
+            resume
+        );
+        assert_eq!(
+            resume.committed_step_ids.len(),
+            case.expected_committed,
+            "[{}]",
+            case.name
+        );
+        assert_eq!(
+            resume.compensated_step_ids.len(),
+            compensation.as_ref().map_or(0, |_| case.expected_committed),
+            "[{}]",
+            case.name
+        );
+        assert!(resume.pending_step_ids.is_empty(), "[{}]", case.name);
+
+        let record = build_execution_record(
+            &terminal_contract,
+            case.terminal_state,
+            Some(&commit.canonical_string()),
+            compensation
+                .as_ref()
+                .map(|comp| comp.canonical_string())
+                .as_deref(),
+        );
+        for phase in [TxPhase::Commit, TxPhase::Compensate] {
+            let duplicate = validate_tx_idempotency(&terminal_contract, phase, Some(&record));
+            let replay = validate_tx_idempotency(&terminal_contract, phase, Some(&record));
+            assert!(
+                duplicate.is_exact_duplicate(),
+                "[{}] terminal {:?} replay must be blocked: {:?}",
+                case.name,
+                phase,
+                duplicate
+            );
+            assert_eq!(
+                duplicate.canonical_string(),
+                replay.canonical_string(),
+                "[{}] idempotency replay verdict must be deterministic",
+                case.name
+            );
+            assert!(matches!(
+                duplicate.verdict,
+                TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
+            ));
+        }
+    }
 }
 
 // ── State Machine Transition Tests ──────────────────────────────────────────
