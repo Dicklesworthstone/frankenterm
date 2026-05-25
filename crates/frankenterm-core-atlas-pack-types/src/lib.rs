@@ -8,10 +8,9 @@
 //! - **Skyline** — simple, ~5% wasted, online; the default the bead
 //!   names for atlases below 2048².
 //! - **Maximal rectangles** — tighter (~2% wasted), slower; the bead's
-//!   default for atlases above 4096². Substrate carries the
-//!   `MaximalRectangles` placeholder type + the dispatch decision so
-//!   the integration layer can drop the algorithm in without
-//!   rewriting the selector.
+//!   default for atlases above 4096². The full
+//!   [`MaximalRectanglesPacker`] implementation and selector dispatch
+//!   live in this crate.
 //!
 //! ## What this module ships
 //!
@@ -46,17 +45,21 @@
 //!   rects into up to four maximal pieces, and prunes contained
 //!   rectangles on every alloc.
 //!
-//! ## What is deferred to follow-on beads
+//! ## Companion surfaces now wired outside this module
 //!
-//! - `BinPacker` wired into `frankenterm/window/src/bitmaps/atlas.rs`
-//!   (replace `AtlasAllocator` with `Box<dyn BinPacker>`).
-//! - Bench harness comparing packing efficiency on a representative
-//!   glyph corpus (Latin + CJK + Nerd Font + emoji).
-//! - JSON-line structured logging at
-//!   `tests/atlas_packing/logs/<scenario>.jsonl`.
-//! - `ft doctor` surface for `packing_efficiency_pct` /
-//!   `fragmentation_pct` / `packer_in_use`.
-//! - Per-release attestation entry (BR-RC-FOUNDATION.G3.1 cross-link).
+//! - `frankenterm/window/src/bitmaps/atlas.rs` consumes
+//!   `Box<dyn BinPacker>` and records packing metrics on allocation,
+//!   clear, and grow paths.
+//! - `crates/frankenterm-core/benches/atlas_packing.rs` compares
+//!   packing efficiency across representative glyph corpora.
+//! - `crates/frankenterm-core/tests/atlas_packing_jsonl_emission.rs`
+//!   covers structured JSON-line scenario logging.
+//! - `crates/frankenterm-core/src/atlas_doctor.rs` surfaces
+//!   `packing_efficiency_pct`, `fragmentation_pct`, and
+//!   `packer_in_use`-style rows.
+//! - `crates/frankenterm-core/examples/atlas_packing_attestation.rs`
+//!   refreshes `docs/perf/atlas-packing.json` for release
+//!   attestation bundles.
 
 #![allow(dead_code)]
 
