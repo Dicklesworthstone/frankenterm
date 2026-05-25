@@ -818,7 +818,7 @@ pub struct EventBusMetrics {
     /// disabled** for the rest of the process. This counter
     /// surfaces that state-loss to operators.
     ///
-    /// Six sources contribute to this counter:
+    /// Seven sources contribute to this counter:
     /// 1. `is_duplicate_delta_event` poison → dedup disabled
     ///    (cuckoo bypassed; duplicates leak through).
     /// 2. `delta_dedup_snapshot` poison → snapshot reports zero
@@ -832,6 +832,8 @@ pub struct EventBusMetrics {
     ///    None going forward.
     /// 6. `oldest_lag_ms` poison → reports None for that channel
     ///    even when events are queued.
+    /// 7. `observe_remote_causality` poison → remote causality
+    ///    frontier merge is dropped.
     ///
     /// `#![forbid(unsafe_code)]` and disciplined error handling
     /// make panics rare in this codebase, so this counter should
@@ -1348,10 +1350,13 @@ impl EventBus {
         &self,
         remote: &EventCausalityStamp,
     ) -> Option<EventCausalityStamp> {
-        self.causality_clock
-            .lock()
-            .ok()
-            .map(|mut clock| clock.observe_remote(remote, current_unix_time_ms()))
+        match self.causality_clock.lock() {
+            Ok(mut clock) => Some(clock.observe_remote(remote, current_unix_time_ms())),
+            Err(_) => {
+                self.record_bus_lock_poisoned();
+                None
+            }
+        }
     }
 
     /// br-ft-skec1: bump the bus_lock_poisoned_count counter.
@@ -2768,6 +2773,25 @@ mod tests {
         assert_eq!(merged.vector.get("remote"), 1);
         assert_eq!(merged.vector.get(DEFAULT_EVENT_CAUSALITY_NODE_ID), 1);
         assert_eq!(bus.stats().causality.vector_nodes, 2);
+    }
+
+    #[test]
+    fn observe_remote_causality_poison_increments_metric() {
+        let mut remote = EventCausalityClock::new("remote");
+        let remote_stamp = remote.record_local_event(10);
+        let bus = EventBus::new(10);
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = bus
+                .causality_clock
+                .lock()
+                .expect("causality clock lock before poison");
+            panic!("poison causality clock");
+        }));
+        assert!(poison.is_err());
+
+        assert!(bus.observe_remote_causality(&remote_stamp).is_none());
+        assert_eq!(bus.metrics().snapshot().bus_lock_poisoned_count, 1);
     }
 
     #[test]
