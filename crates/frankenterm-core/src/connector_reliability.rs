@@ -39,6 +39,8 @@ pub enum ConnectorErrorKind {
     ServiceUnavailable,
     /// Timeout waiting for response — safe to retry.
     Timeout,
+    /// Caller-initiated cancellation — not a connector failure.
+    Cancelled,
     /// Unknown error — classify as transient for safety.
     Unknown,
 }
@@ -75,6 +77,7 @@ impl ConnectorErrorKind {
             Self::Permanent => "permanent",
             Self::ServiceUnavailable => "service_unavailable",
             Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
             Self::Unknown => "unknown",
         }
     }
@@ -90,7 +93,16 @@ impl std::fmt::Display for ConnectorErrorKind {
 #[must_use]
 pub fn classify_connector_error(msg: &str) -> ConnectorErrorKind {
     let lower = msg.to_lowercase();
-    if lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests")
+    if lower.contains("cancelled")
+        || lower.contains("canceled")
+        || lower.contains("context cancelled")
+        || lower.contains("context canceled")
+        || lower.contains("aborted by caller")
+    {
+        ConnectorErrorKind::Cancelled
+    } else if lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("too many requests")
     {
         ConnectorErrorKind::RateLimited
     } else if lower.contains("unauthorized")
@@ -705,6 +717,10 @@ impl ConnectorReliabilityController {
         error_kind: ConnectorErrorKind,
         timestamp_ms: u64,
     ) -> Option<u64> {
+        if error_kind == ConnectorErrorKind::Cancelled {
+            return None;
+        }
+
         let err_str = error.into();
 
         // Trip circuit breaker if applicable
@@ -936,6 +952,22 @@ mod tests {
     }
 
     #[test]
+    fn connector_reliability_classify_cancelled() {
+        assert_eq!(
+            classify_connector_error("operation cancelled by caller"),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            classify_connector_error("context canceled"),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            classify_connector_error("request aborted by caller"),
+            ConnectorErrorKind::Cancelled
+        );
+    }
+
+    #[test]
     fn connector_reliability_classify_service_unavailable() {
         assert_eq!(
             classify_connector_error("503 Service Unavailable"),
@@ -980,6 +1012,7 @@ mod tests {
         assert!(ConnectorErrorKind::Unknown.is_retryable());
         assert!(!ConnectorErrorKind::AuthFailure.is_retryable());
         assert!(!ConnectorErrorKind::Permanent.is_retryable());
+        assert!(!ConnectorErrorKind::Cancelled.is_retryable());
     }
 
     #[test]
@@ -990,6 +1023,7 @@ mod tests {
         assert!(!ConnectorErrorKind::RateLimited.trips_breaker());
         assert!(!ConnectorErrorKind::AuthFailure.trips_breaker());
         assert!(!ConnectorErrorKind::Permanent.trips_breaker());
+        assert!(!ConnectorErrorKind::Cancelled.trips_breaker());
     }
 
     // ---- Dead-letter queue ----
@@ -1291,6 +1325,37 @@ mod tests {
     }
 
     #[test]
+    fn connector_reliability_controller_cancelled_is_neutral() {
+        let config = ConnectorReliabilityConfig {
+            circuit: ConnectorCircuitConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        let mut ctrl = ConnectorReliabilityController::new("test", config);
+
+        let action = sample_action("test", ConnectorActionKind::Notify);
+        let dlq_id = ctrl.record_failure(
+            &action,
+            "operation cancelled by caller",
+            ConnectorErrorKind::Cancelled,
+            1000,
+        );
+
+        assert!(dlq_id.is_none());
+        assert_eq!(ctrl.dlq().depth(), 0);
+        assert_eq!(
+            ctrl.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Closed
+        );
+        let snap = ctrl.telemetry_snapshot();
+        assert_eq!(snap.operations_failed, 0);
+        assert_eq!(snap.dlq.total_enqueued, 0);
+    }
+
+    #[test]
     fn connector_reliability_controller_circuit_trips() {
         let config = ConnectorReliabilityConfig {
             circuit: ConnectorCircuitConfig {
@@ -1406,6 +1471,7 @@ mod tests {
             ConnectorErrorKind::Permanent,
             ConnectorErrorKind::ServiceUnavailable,
             ConnectorErrorKind::Timeout,
+            ConnectorErrorKind::Cancelled,
             ConnectorErrorKind::Unknown,
         ] {
             let json = serde_json::to_string(&kind).unwrap();

@@ -28,6 +28,7 @@ fn arb_error_kind() -> impl Strategy<Value = ConnectorErrorKind> {
         Just(ConnectorErrorKind::Permanent),
         Just(ConnectorErrorKind::ServiceUnavailable),
         Just(ConnectorErrorKind::Timeout),
+        Just(ConnectorErrorKind::Cancelled),
         Just(ConnectorErrorKind::Unknown),
     ]
 }
@@ -76,6 +77,12 @@ proptest! {
     }
 
     #[test]
+    fn cancelled_is_neutral_for_retry_and_breaker(_unused in 0..1u8) {
+        prop_assert!(!ConnectorErrorKind::Cancelled.is_retryable());
+        prop_assert!(!ConnectorErrorKind::Cancelled.trips_breaker());
+    }
+
+    #[test]
     fn classify_rate_limit_messages(
         prefix in "[A-Z]{0,5}",
     ) {
@@ -91,6 +98,15 @@ proptest! {
         let msg = format!("request timed out after {secs}s");
         let kind = classify_connector_error(&msg);
         prop_assert_eq!(kind, ConnectorErrorKind::Timeout);
+    }
+
+    #[test]
+    fn classify_cancellation_messages(
+        spelling in prop_oneof![Just("cancelled"), Just("canceled")],
+    ) {
+        let msg = format!("operation {spelling} by caller");
+        let kind = classify_connector_error(&msg);
+        prop_assert_eq!(kind, ConnectorErrorKind::Cancelled);
     }
 }
 
