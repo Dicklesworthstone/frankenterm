@@ -949,9 +949,10 @@ fn validate_envelope_protocol_with_limits(
                 )));
             }
             if let Some(pane_uuid) = &pane.pane_uuid {
-                if !pane_uuids.insert(pane_uuid.as_str()) {
+                let normalized_pane_uuid = pane_uuid.trim();
+                if !pane_uuids.insert(normalized_pane_uuid) {
                     return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
-                        format!("PanesMeta contains duplicate pane_uuid {pane_uuid}"),
+                        format!("PanesMeta contains duplicate pane_uuid {normalized_pane_uuid}"),
                     )));
                 }
             }
@@ -2262,6 +2263,35 @@ mod tests {
         let err = agg
             .ingest_envelope(envelope)
             .expect_err("decoded panes snapshot must reject duplicate pane UUIDs");
+        assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+        assert_eq!(agg.total_rejected(), 1);
+        assert_eq!(agg.total_accepted(), 0);
+        assert_eq!(agg.agent_count(), 0);
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_rejects_panes_meta_duplicate_trimmed_pane_uuids() {
+        let mut agg = Aggregator::new(10);
+        let mut original = sample_pane_meta();
+        original.pane_uuid = Some("shared-pane-uuid".to_string());
+
+        let mut duplicate = sample_pane_meta();
+        duplicate.pane_id = 43;
+        duplicate.domain = "ssh:prod".to_string();
+        duplicate.pane_uuid = Some("  shared-pane-uuid\t".to_string());
+
+        let envelope = WireEnvelope::new(
+            1,
+            "agent-valid",
+            WirePayload::PanesMeta(PanesMeta {
+                panes: vec![original, duplicate],
+                timestamp_ms: 1_700_000_004_005,
+            }),
+        );
+
+        let err = agg
+            .ingest_envelope(envelope)
+            .expect_err("decoded panes snapshot must reject normalized duplicate pane UUIDs");
         assert!(matches!(err, WireProtocolError::InvalidJson(_)));
         assert_eq!(agg.total_rejected(), 1);
         assert_eq!(agg.total_accepted(), 0);
