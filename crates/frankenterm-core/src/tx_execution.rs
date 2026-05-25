@@ -1208,8 +1208,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             now_ms,
         ));
 
+        let batch_limit_exceeded = contract.plan.steps.len() > self.config.max_steps_per_batch;
+        if batch_limit_exceeded {
+            tracing::warn!(
+                plan_id = %contract.plan.plan_id.0,
+                step_count = contract.plan.steps.len(),
+                max_steps_per_batch = self.config.max_steps_per_batch,
+                "tx commit batch limit exceeded; suspending commit dispatch"
+            );
+        }
+
+        let safety_paused = self.config.paused || batch_limit_exceeded;
         let commit_inputs =
-            if self.config.kill_switch != MissionKillSwitchLevel::Off || self.config.paused {
+            if self.config.kill_switch != MissionKillSwitchLevel::Off || safety_paused {
                 Vec::new()
             } else {
                 self.executor
@@ -1220,7 +1231,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             contract,
             &commit_inputs,
             self.config.kill_switch,
-            self.config.paused,
+            safety_paused,
             now_ms,
         )
         .map_err(TxExecutionError::CommitPhase)?;
@@ -1954,6 +1965,51 @@ mod tests {
         assert!(paused.compensation_report.is_none());
         assert_eq!(paused.final_state, MissionTxState::Committing);
         assert_eq!(paused.outcome, TxOutcome::Pending);
+    }
+
+    #[test]
+    fn unwired_safety_controls_max_steps_per_batch_blocks_commit_dispatch() {
+        let mut oversized_contract = make_test_contract(2);
+        let oversized_engine = TxExecutionEngine::new(
+            CommitDispatchPanicExecutor,
+            TxExecutionConfig {
+                max_steps_per_batch: 1,
+                ..TxExecutionConfig::default()
+            },
+        );
+        let oversized = oversized_engine
+            .execute(&mut oversized_contract, 5000)
+            .unwrap();
+        let oversized_commit = oversized.commit_report.expect("commit report");
+        assert_eq!(
+            oversized_commit.outcome,
+            crate::plan::TxCommitOutcome::PauseSuspended
+        );
+        assert_eq!(oversized_commit.committed_count, 0);
+        assert_eq!(oversized_commit.failed_count, 0);
+        assert_eq!(oversized_commit.skipped_count, 2);
+        assert!(oversized.compensation_report.is_none());
+        assert_eq!(oversized.final_state, MissionTxState::Committing);
+        assert_eq!(oversized.outcome, TxOutcome::Pending);
+
+        let mut bounded_contract = make_test_contract(2);
+        let bounded_engine = TxExecutionEngine::new(
+            SyntheticStepExecutor,
+            TxExecutionConfig {
+                max_steps_per_batch: 2,
+                ..TxExecutionConfig::default()
+            },
+        );
+        let bounded = bounded_engine.execute(&mut bounded_contract, 5000).unwrap();
+        assert_eq!(bounded.final_state, MissionTxState::Committed);
+        assert_eq!(bounded.outcome, TxOutcome::Committed);
+        assert_eq!(
+            bounded
+                .commit_report
+                .expect("commit report")
+                .committed_count,
+            2,
+        );
     }
 
     #[test]

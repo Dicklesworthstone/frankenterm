@@ -1038,6 +1038,18 @@ impl Default for ApprovalTracker {
 }
 
 impl ApprovalTracker {
+    fn expire_pending_entry_if_stale(entry: &mut ApprovalEntry, now_ms: u64) -> bool {
+        if entry.status == ApprovalStatus::Pending
+            && entry.expires_at_ms > 0
+            && now_ms >= entry.expires_at_ms
+        {
+            entry.status = ApprovalStatus::Expired;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Create a new tracker with a given capacity.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
@@ -1098,6 +1110,9 @@ impl ApprovalTracker {
             .iter_mut()
             .find(|e| e.approval_id == approval_id)
         {
+            if Self::expire_pending_entry_if_stale(entry, now_ms) {
+                return false;
+            }
             if entry.status == ApprovalStatus::Pending {
                 entry.status = ApprovalStatus::Approved;
                 entry.decided_by = decided_by.to_string();
@@ -1115,6 +1130,9 @@ impl ApprovalTracker {
             .iter_mut()
             .find(|e| e.approval_id == approval_id)
         {
+            if Self::expire_pending_entry_if_stale(entry, now_ms) {
+                return false;
+            }
             if entry.status == ApprovalStatus::Pending {
                 entry.status = ApprovalStatus::Rejected;
                 entry.decided_by = decided_by.to_string();
@@ -1147,11 +1165,7 @@ impl ApprovalTracker {
     pub fn expire_stale(&mut self, now_ms: u64) -> usize {
         let mut count = 0;
         for entry in &mut self.entries {
-            if entry.status == ApprovalStatus::Pending
-                && entry.expires_at_ms > 0
-                && now_ms >= entry.expires_at_ms
-            {
-                entry.status = ApprovalStatus::Expired;
+            if Self::expire_pending_entry_if_stale(entry, now_ms) {
                 count += 1;
             }
         }
@@ -17573,6 +17587,45 @@ mod tests {
     }
 
     #[test]
+    fn unwired_safety_controls_approval_decisions_do_not_revive_expired_pending_entries() {
+        let mut tracker = ApprovalTracker::default();
+        let approve_id = tracker.submit("deploy", "bot", "prod", "ttl", "rule", 100, 500);
+        let reject_id = tracker.submit("scale", "bot", "infra", "ttl", "rule", 100, 500);
+        let active_id = tracker.submit("rotate", "bot", "key", "ttl", "rule", 100, 500);
+
+        assert!(
+            tracker.approve(&active_id, "admin", 499),
+            "approvals remain decidable before their expiry deadline",
+        );
+        assert_eq!(
+            tracker.get(&active_id).unwrap().status,
+            ApprovalStatus::Approved,
+        );
+
+        assert!(
+            !tracker.approve(&approve_id, "admin", 500),
+            "approval at the expiry boundary must fail closed",
+        );
+        let approve_entry = tracker.get(&approve_id).unwrap();
+        assert_eq!(approve_entry.status, ApprovalStatus::Expired);
+        assert_eq!(approve_entry.decided_by, "");
+        assert_eq!(approve_entry.decided_at_ms, 0);
+
+        assert!(
+            !tracker.reject(&reject_id, "admin", 600),
+            "rejection after expiry must not revive a stale pending approval",
+        );
+        let reject_entry = tracker.get(&reject_id).unwrap();
+        assert_eq!(reject_entry.status, ApprovalStatus::Expired);
+        assert_eq!(reject_entry.decided_by, "");
+        assert_eq!(reject_entry.decided_at_ms, 0);
+
+        assert_eq!(tracker.count_by_status(&ApprovalStatus::Expired), 2);
+        assert_eq!(tracker.count_by_status(&ApprovalStatus::Approved), 1);
+        assert_eq!(tracker.count_by_status(&ApprovalStatus::Pending), 0);
+    }
+
+    #[test]
     fn approval_tracker_eviction() {
         let mut tracker = ApprovalTracker::new(3);
         tracker.submit("a", "x", "r1", "r", "rule", 100, 0);
@@ -17596,7 +17649,15 @@ mod tests {
         // zero-capacity defense the deduplicators / tx_idempotency / LruCache
         // already carry.
         let mut tracker = ApprovalTracker::new(0);
-        let id = tracker.submit("send_text", "agent-1", "pane-1", "needs review", "rule.x", 100, 0);
+        let id = tracker.submit(
+            "send_text",
+            "agent-1",
+            "pane-1",
+            "needs review",
+            "rule.x",
+            100,
+            0,
+        );
         assert!(
             tracker.get(&id).is_some(),
             "a submitted approval must survive insert even at requested capacity 0"
