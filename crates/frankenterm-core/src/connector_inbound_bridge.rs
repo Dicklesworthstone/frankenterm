@@ -341,6 +341,10 @@ impl SignalDeduplicator {
     /// If new, records it and returns `true`.
     /// If duplicate, returns `false`.
     pub fn check_and_record(&mut self, correlation_id: &str, now_ms: u64) -> bool {
+        if correlation_id.trim().is_empty() {
+            return true;
+        }
+
         // [ft-bx4le] Zero-capacity short-circuit. The dedup_capacity
         // config field doesn't document a special 0 value, so operators
         // reasonably expect `dedup_capacity = 0` to mean "dedup
@@ -933,6 +937,25 @@ mod tests {
         assert_eq!(dedup.len(), 0);
     }
 
+    #[test]
+    fn dedup_blank_correlation_id_bypasses_cache() {
+        let mut dedup = SignalDeduplicator::new(10, Duration::from_secs(60));
+
+        for id in ["", " ", "\t\n"] {
+            assert!(
+                dedup.check_and_record(id, 1000),
+                "blank correlation_id {id:?} must not suppress connector signals"
+            );
+            assert!(
+                dedup.check_and_record(id, 1001),
+                "blank correlation_id {id:?} must remain uncached"
+            );
+        }
+
+        assert_eq!(dedup.len(), 0, "blank IDs must not consume cache slots");
+        assert!(dedup.is_empty());
+    }
+
     /// [ft-bx4le] Zero-capacity cache bypasses dedup entirely —
     /// every call returns `true` (signal is "new") and nothing is
     /// tracked. Pre-fix, the `len >= 0` check degraded the cache
@@ -1076,6 +1099,31 @@ mod tests {
         assert!(!r2.deduplicated);
 
         assert_eq!(bridge.telemetry_snapshot().signals_routed, 2);
+    }
+
+    #[test]
+    fn bridge_does_not_dedup_blank_correlation_id() {
+        let bus = make_bus();
+        let _sub = bus.subscribe_detections();
+        let mut bridge = default_bridge(bus);
+
+        let sig = test_signal("github", ConnectorSignalKind::Webhook)
+            .with_correlation_id(" ")
+            .with_timestamp_ms(1000);
+
+        let r1 = bridge.route_signal(&sig).unwrap();
+        assert!(!r1.deduplicated);
+
+        let r2 = bridge.route_signal(&sig).unwrap();
+        assert!(
+            !r2.deduplicated,
+            "blank correlation IDs carry no identity and must not suppress later signals"
+        );
+
+        let snap = bridge.telemetry_snapshot();
+        assert_eq!(snap.signals_received, 2);
+        assert_eq!(snap.signals_routed, 2);
+        assert_eq!(snap.signals_deduplicated, 0);
     }
 
     #[test]
