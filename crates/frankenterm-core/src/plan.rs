@@ -5464,7 +5464,7 @@ impl TxIdempotencyCheck {
 /// Validate whether a transaction phase can proceed given prior execution records.
 #[must_use]
 pub fn validate_tx_idempotency(
-    _contract: &MissionTxContract,
+    contract: &MissionTxContract,
     phase: TxPhase,
     record: Option<&TxExecutionRecord>,
 ) -> TxIdempotencyCheck {
@@ -5477,6 +5477,17 @@ pub fn validate_tx_idempotency(
             // compensated, or rolled back), block re-execution.
             // Note: `Failed` is NOT terminal — it can still be compensated.
             if rec.lifecycle_state.is_terminal() {
+                return TxIdempotencyCheck {
+                    verdict: TxIdempotencyVerdict::DoubleExecutionBlocked {
+                        original_state: rec.lifecycle_state,
+                    },
+                };
+            }
+            let expected_key = TxExecutionRecord::compute_tx_key(contract);
+            if rec.tx_id != contract.intent.tx_id
+                || rec.plan_id != contract.plan.plan_id
+                || rec.tx_idempotency_key != expected_key
+            {
                 return TxIdempotencyCheck {
                     verdict: TxIdempotencyVerdict::DoubleExecutionBlocked {
                         original_state: rec.lifecycle_state,

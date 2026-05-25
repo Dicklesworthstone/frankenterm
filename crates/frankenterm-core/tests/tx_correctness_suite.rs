@@ -829,6 +829,41 @@ fn idempotency_resume_after_crash_mid_commit() {
 }
 
 #[test]
+fn idempotency_rejects_mismatched_ledger_record_fail_closed() {
+    let contract = build_contract(3, MissionTxState::Prepared);
+    let mut foreign_contract = build_contract(3, MissionTxState::Prepared);
+    foreign_contract.intent.tx_id = TxId("tx:foreign".into());
+    foreign_contract.plan.tx_id = foreign_contract.intent.tx_id.clone();
+    foreign_contract.plan.plan_id = TxPlanId("plan:foreign".into());
+
+    let mut record =
+        build_execution_record(&foreign_contract, MissionTxState::Committing, None, None);
+    record.step_records.push(TxStepExecutionRecord {
+        step_id: TxStepId("s1".into()),
+        ordinal: 1,
+        phase: TxPhase::Commit,
+        succeeded: true,
+        step_idempotency_key: TxStepExecutionRecord::compute_step_key(
+            &foreign_contract.intent.tx_id,
+            &TxStepId("s1".into()),
+            &TxPhase::Commit,
+        ),
+        attempt_count: 1,
+        last_attempted_at_ms: 2_000,
+    });
+
+    let check = validate_tx_idempotency(&contract, TxPhase::Commit, Some(&record));
+
+    assert!(!check.should_proceed());
+    assert!(matches!(
+        check.verdict,
+        TxIdempotencyVerdict::DoubleExecutionBlocked {
+            original_state: MissionTxState::Committing
+        }
+    ));
+}
+
+#[test]
 fn idempotency_step_level_already_succeeded_guard() {
     let record = TxStepExecutionRecord {
         step_id: TxStepId("s1".into()),
