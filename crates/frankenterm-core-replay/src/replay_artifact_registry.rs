@@ -20,6 +20,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,12 @@ pub const MANIFEST_SCHEMA_VERSION: &str = "replay.manifest.v1";
 // Canonical value in TuningConfig::AuditTuning.
 pub const DEFAULT_RETENTION_DAYS: u64 =
     frankenterm_core::tuning_config::AuditTuning::DEFAULT_ARTIFACT_RETENTION_DAYS as u64;
+
+/// Maximum replay artifact size accepted by registry inspect/add/validate.
+///
+/// Mirrors the WAR replay recording cap so registry operations cannot be used
+/// as an unbounded artifact decoder or checksum sink.
+pub const MAX_REPLAY_ARTIFACT_BYTES: u64 = frankenterm_core::replay::MAX_RECORDING_BYTES;
 
 // ---------------------------------------------------------------------------
 // Sensitivity tier (mirrors replay_capture::CaptureSensitivityTier)
@@ -295,6 +302,10 @@ pub enum ManifestValidationError {
     MissingFile {
         path: String,
     },
+    UnreadableFile {
+        path: String,
+        reason: String,
+    },
     ChecksumMismatch {
         path: String,
         expected: String,
@@ -455,6 +466,15 @@ pub struct ArtifactRegistry {
 pub trait FsBackend: Send + Sync {
     /// Read file contents as bytes.
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, String>;
+    /// Read file contents as bytes while enforcing an upper bound.
+    fn read_file_bounded(&self, path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+        let size = self.file_size(path)?;
+        check_artifact_size(path, size, max_bytes)?;
+        let bytes = self.read_file(path)?;
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        check_artifact_size(path, len, max_bytes)?;
+        Ok(bytes)
+    }
     /// Check if a file exists.
     fn file_exists(&self, path: &Path) -> bool;
     /// Get file size in bytes.
@@ -473,6 +493,23 @@ pub struct RealFs;
 impl FsBackend for RealFs {
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, String> {
         std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))
+    }
+
+    fn read_file_bounded(&self, path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+        let size = self.file_size(path)?;
+        check_artifact_size(path, size, max_bytes)?;
+
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mut reader = file.take(max_bytes.saturating_add(1));
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        check_artifact_size(path, len, max_bytes)?;
+        Ok(bytes)
     }
 
     fn file_exists(&self, path: &Path) -> bool {
@@ -540,6 +577,10 @@ impl ArtifactRegistry {
         Ok(canonical_path)
     }
 
+    fn read_artifact_file(&self, path: &Path) -> Result<Vec<u8>, String> {
+        self.fs.read_file_bounded(path, MAX_REPLAY_ARTIFACT_BYTES)
+    }
+
     // ── List ─────────────────────────────────────────────────────────────
 
     /// List artifacts matching the given filter.
@@ -584,7 +625,7 @@ impl ArtifactRegistry {
 
         let integrity_ok = if file_exists {
             let access_path = self.resolve_existing_for_access(&entry.path)?;
-            match self.fs.read_file(&access_path) {
+            match self.read_artifact_file(&access_path) {
                 Ok(bytes) => sha256_bytes(&bytes) == entry.sha256,
                 Err(_) => false,
             }
@@ -628,7 +669,7 @@ impl ArtifactRegistry {
         }
 
         let access_path = self.resolve_existing_for_access(&normalized_path)?;
-        let bytes = self.fs.read_file(&access_path)?;
+        let bytes = self.read_artifact_file(&access_path)?;
         let sha256 = sha256_bytes(&bytes);
         let size_bytes = bytes.len() as u64;
 
@@ -748,13 +789,21 @@ impl ArtifactRegistry {
                     path: entry.path.clone(),
                 });
             } else if let Ok(access_path) = self.resolve_existing_for_access(&entry.path) {
-                if let Ok(bytes) = self.fs.read_file(&access_path) {
-                    let actual = sha256_bytes(&bytes);
-                    if actual != entry.sha256 {
-                        errors.push(ManifestValidationError::ChecksumMismatch {
+                match self.read_artifact_file(&access_path) {
+                    Ok(bytes) => {
+                        let actual = sha256_bytes(&bytes);
+                        if actual != entry.sha256 {
+                            errors.push(ManifestValidationError::ChecksumMismatch {
+                                path: entry.path.clone(),
+                                expected: entry.sha256.clone(),
+                                actual,
+                            });
+                        }
+                    }
+                    Err(reason) => {
+                        errors.push(ManifestValidationError::UnreadableFile {
                             path: entry.path.clone(),
-                            expected: entry.sha256.clone(),
-                            actual,
+                            reason,
                         });
                     }
                 }
@@ -814,6 +863,16 @@ impl ArtifactRegistry {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn check_artifact_size(path: &Path, size_bytes: u64, max_bytes: u64) -> Result<(), String> {
+    if size_bytes > max_bytes {
+        return Err(format!(
+            "artifact {} is {size_bytes} bytes; max allowed is {max_bytes} bytes",
+            path.display()
+        ));
+    }
+    Ok(())
+}
 
 /// Compute SHA-256 hex digest of raw bytes.
 #[must_use]
@@ -905,6 +964,42 @@ mod tests {
 
         fn contains_file(&self, path: &Path) -> bool {
             self.files.lock().unwrap().contains_key(path)
+        }
+    }
+
+    #[derive(Clone)]
+    struct OversizeFs {
+        read_calls: Arc<Mutex<usize>>,
+    }
+
+    impl OversizeFs {
+        fn new() -> Self {
+            Self {
+                read_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn read_calls(&self) -> usize {
+            *self.read_calls.lock().unwrap()
+        }
+    }
+
+    impl FsBackend for OversizeFs {
+        fn read_file(&self, _path: &Path) -> Result<Vec<u8>, String> {
+            *self.read_calls.lock().unwrap() += 1;
+            Ok(Vec::new())
+        }
+
+        fn file_exists(&self, _path: &Path) -> bool {
+            true
+        }
+
+        fn file_size(&self, _path: &Path) -> Result<u64, String> {
+            Ok(MAX_REPLAY_ARTIFACT_BYTES + 1)
+        }
+
+        fn remove_file(&self, _path: &Path) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -1293,6 +1388,28 @@ mod tests {
     }
 
     #[test]
+    fn inspect_oversized_artifact_fails_integrity_without_reading() {
+        let entry = make_entry("huge.ftreplay", "huge", b"small");
+        let fs = OversizeFs::new();
+        let reg = setup_registry(vec![entry], MockFs::new());
+        let reg = ArtifactRegistry::with_fs(
+            reg.into_manifest(),
+            PathBuf::from("/base"),
+            Box::new(fs.clone()),
+        );
+
+        let detail = reg.inspect("huge.ftreplay").unwrap();
+
+        assert!(detail.file_exists);
+        assert!(!detail.integrity_ok);
+        assert_eq!(
+            fs.read_calls(),
+            0,
+            "oversized replay artifact must be rejected before read_file allocates"
+        );
+    }
+
+    #[test]
     fn inspect_rejects_manifest_path_escape_before_reading() {
         let content = b"outside";
         let entry = make_entry("/outside.ftreplay", "outside", content);
@@ -1345,6 +1462,28 @@ mod tests {
         let result = reg.add("missing.ftreplay", "m", ArtifactSensitivityTier::T1, 2000);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn add_rejects_oversized_artifact_before_reading() {
+        let fs = OversizeFs::new();
+        let mut reg = ArtifactRegistry::with_fs(
+            ArtifactManifest::new(),
+            PathBuf::from("/base"),
+            Box::new(fs.clone()),
+        );
+
+        let err = reg
+            .add("huge.ftreplay", "huge", ArtifactSensitivityTier::T1, 2000)
+            .expect_err("oversized replay artifact must be rejected");
+
+        assert!(err.contains("max allowed"), "{err}");
+        assert_eq!(
+            fs.read_calls(),
+            0,
+            "oversized replay artifact must be rejected before read_file allocates"
+        );
+        assert!(reg.manifest().artifacts.is_empty());
     }
 
     #[test]
@@ -1627,6 +1766,34 @@ mod tests {
             errors
                 .iter()
                 .any(|e| matches!(e, ManifestValidationError::MissingFile { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_reports_oversized_artifact_as_unreadable_without_reading() {
+        let entry = make_entry("huge.ftreplay", "huge", b"small");
+        let fs = OversizeFs::new();
+        let reg = ArtifactRegistry::with_fs(
+            ArtifactManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION.to_string(),
+                last_updated_ms: 1000,
+                artifacts: vec![entry],
+            },
+            PathBuf::from("/base"),
+            Box::new(fs.clone()),
+        );
+
+        let errors = reg.validate();
+
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ManifestValidationError::UnreadableFile { path, reason }
+                if path == "huge.ftreplay" && reason.contains("max allowed")
+        )));
+        assert_eq!(
+            fs.read_calls(),
+            0,
+            "oversized replay artifact must be rejected before read_file allocates"
         );
     }
 
