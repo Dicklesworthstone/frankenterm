@@ -1413,11 +1413,11 @@ impl Mux {
         log::debug!("removing pane {}", pane_id);
         self.discard_high_rate_alert_state(pane_id);
         self.discard_client_focus_for_pane(pane_id);
+        self.discard_pending_pane_output_notification(pane_id);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);
             pane.kill();
-            self.discard_pending_pane_output_notification(pane_id);
             self.notify(MuxNotification::PaneRemoved(pane_id));
             changed = true;
         }
@@ -2667,6 +2667,45 @@ mod tests {
         executor
             .tick()
             .expect("scheduled pane-output drain should run");
+    }
+
+    #[test]
+    fn remove_pane_discards_pending_output_for_already_absent_pane() {
+        let _guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Mux::new(None);
+        let pane_outputs = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&pane_outputs);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::PaneOutput(pane_id) = notification {
+                observed.lock().push(pane_id);
+            }
+            true
+        });
+
+        mux.enqueue_pane_output_notification(7);
+        mux.remove_pane(7);
+
+        {
+            let pending = mux.pending_pane_output.lock();
+            assert!(
+                pending.pane_ids.is_empty(),
+                "remove_pane must clear queued output even when the pane is already absent",
+            );
+            assert!(
+                pending.queued.is_empty(),
+                "remove_pane must clear queued pane ids even when the pane is already absent",
+            );
+        }
+
+        mux.flush_pending_pane_output_notifications();
+        executor
+            .tick()
+            .expect("scheduled pane-output drain should run");
+        assert!(
+            pane_outputs.lock().is_empty(),
+            "stale pending output for an absent pane must not be dispatched",
+        );
     }
 
     #[test]
