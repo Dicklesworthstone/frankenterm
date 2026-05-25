@@ -6046,7 +6046,15 @@ impl PolicyEngine {
         // stale quarantine to any reused pane id. Gated on `consume_rate_limit`
         // so dry-run previews stay side-effect-free.
         if consume_rate_limit {
-            self.quarantine_registry.maybe_expire(checked_now_ms_u64());
+            let now_ms = checked_now_ms_u64();
+            self.quarantine_registry.maybe_expire(now_ms);
+            // Same auto-recovery gap for the global kill switch:
+            // trip_kill_switch_with_timeout promises the halt lifts after its
+            // timeout, but only if KillSwitch::tick runs — which nothing called.
+            // Tick it here so a timeout-armed kill switch recovers instead of
+            // blocking every action forever. (Indefinite trips set
+            // auto_disarm_at_ms = 0, so should_auto_disarm leaves them armed.)
+            self.quarantine_registry.tick_kill_switch(now_ms);
         }
 
         // ---- Quarantine check (earliest gate) ----

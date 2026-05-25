@@ -965,6 +965,18 @@ impl QuarantineRegistry {
         &self.kill_switch
     }
 
+    /// Process kill-switch auto-disarm on each authorize() tick.
+    ///
+    /// `trip_kill_switch_with_timeout` promises the global halt lifts after
+    /// `timeout_ms`, but that only happens if something calls `KillSwitch::tick`.
+    /// The authorize path calls this each tick; without it a timeout-armed kill
+    /// switch blocked ALL actions forever (`should_auto_disarm` requires
+    /// `auto_disarm_at_ms > 0`, so an indefinite `trip` is never touched).
+    /// Returns `true` if the kill switch auto-disarmed on this call.
+    pub fn tick_kill_switch(&mut self, now_ms: u64) -> bool {
+        self.kill_switch.tick(now_ms)
+    }
+
     /// Get the audit log.
     #[must_use]
     pub fn audit_log(&self) -> &VecDeque<QuarantineAuditEvent> {
@@ -1289,6 +1301,45 @@ mod tests {
             reg2.is_blocked_for_writes("c2"),
             "without auto_expire the quarantine persists past its TTL (manual release only)"
         );
+    }
+
+    #[test]
+    fn tick_kill_switch_auto_disarms_after_timeout_only() {
+        // Regression: the authorize path now ticks the kill switch each tick. A
+        // timeout-armed kill switch must auto-disarm once its timeout elapses
+        // (else a "temporary" global halt blocks every action forever); an
+        // indefinite trip (auto_disarm_at_ms = 0) must NEVER auto-disarm.
+        let mut reg = QuarantineRegistry::new();
+        assert!(reg.trip_kill_switch_with_timeout(
+            KillSwitchLevel::EmergencyHalt,
+            "op",
+            "maintenance",
+            1000,
+            5000,
+        ));
+        assert!(reg.kill_switch().is_emergency());
+        assert!(
+            !reg.tick_kill_switch(5999),
+            "must stay armed before the timeout elapses"
+        );
+        assert!(reg.kill_switch().is_emergency());
+        assert!(
+            reg.tick_kill_switch(6000),
+            "must auto-disarm at now+timeout"
+        );
+        assert!(
+            !reg.kill_switch().is_emergency(),
+            "a timeout-armed kill switch must auto-recover after its timeout"
+        );
+
+        // Indefinite trip never auto-disarms.
+        let mut reg2 = QuarantineRegistry::new();
+        assert!(reg2.trip_kill_switch(KillSwitchLevel::EmergencyHalt, "op", "breach", 1000));
+        assert!(
+            !reg2.tick_kill_switch(u64::MAX),
+            "an indefinite kill-switch trip must never auto-disarm"
+        );
+        assert!(reg2.kill_switch().is_emergency());
     }
 
     #[test]
