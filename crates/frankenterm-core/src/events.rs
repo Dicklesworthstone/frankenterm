@@ -1809,12 +1809,24 @@ impl EventDeduplicator {
 
         if let Some(entry) = self.entries.get_mut(key) {
             if now.duration_since(entry.last_seen) < self.window {
-                // Within window: duplicate
+                // Within window: duplicate. Refresh the insertion_order
+                // position so the next capacity-eviction pass treats this
+                // actively-hit key as freshly touched — the SAME reasoning the
+                // window-reset path below applies. Without this refresh, a hot
+                // key kept at its stale insertion_order position is evicted by
+                // the next N novel-key checks (N = its distance from the
+                // front); a follow-up in-window check of that key then
+                // spuriously returns `New` instead of `Duplicate` — a silent
+                // dedup failure under capacity pressure. (Disjoint-field borrow
+                // of `entries` + `insertion_order`, mirroring the reset path.)
                 entry.count += 1;
                 entry.last_seen = now;
-                return DedupeVerdict::Duplicate {
-                    suppressed_count: entry.count - 1,
-                };
+                let suppressed_count = entry.count - 1;
+                if let Some(pos) = self.insertion_order.iter().position(|k| k == key) {
+                    self.insertion_order.remove(pos);
+                }
+                self.insertion_order.push_back(key.to_string());
+                return DedupeVerdict::Duplicate { suppressed_count };
             }
             // Window expired: reset as new occurrence.
             // Refresh the insertion_order position so the next capacity
@@ -1981,11 +1993,24 @@ impl NotificationCooldown {
 
         if let Some(entry) = self.entries.get_mut(key) {
             if now.duration_since(entry.last_notified) < self.cooldown {
-                // Still in cooldown: suppress
+                // Still in cooldown: suppress. Refresh the insertion_order
+                // position for the SAME reason as the cooldown-expired Send
+                // path below [ft-hyrav]: a busy key that is actively being
+                // suppressed, if left at its stale insertion_order slot, is
+                // evicted by the next N novel-key checks. A follow-up
+                // in-cooldown hit of that key then returns `Send` instead of
+                // `Suppress` — a cooldown violation (duplicate notification,
+                // and the suppressed-since-last count is lost) under capacity
+                // pressure. `last_notified` is intentionally NOT advanced (the
+                // cooldown is anchored to the last SEND, not the last
+                // suppress); only eviction recency is refreshed.
                 entry.suppressed_since_notify += 1;
-                return CooldownVerdict::Suppress {
-                    total_suppressed: entry.suppressed_since_notify,
-                };
+                let total_suppressed = entry.suppressed_since_notify;
+                if let Some(pos) = self.insertion_order.iter().position(|k| k == key) {
+                    self.insertion_order.remove(pos);
+                }
+                self.insertion_order.push_back(key.to_string());
+                return CooldownVerdict::Suppress { total_suppressed };
             }
             // Cooldown expired: send with suppressed count
             let suppressed = entry.suppressed_since_notify;
@@ -3669,6 +3694,50 @@ mod tests {
         assert_eq!(dedup.check("b"), DedupeVerdict::New);
     }
 
+    // Regression: a key that is actively duplicated WITHIN its window must
+    // also refresh its insertion_order recency, so it is not evicted ahead of
+    // idle keys. This is the sibling of the window-reset case above; before the
+    // fix only the reset path refreshed, so a hot key kept its stale slot, was
+    // evicted by novel keys, and an in-window repeat spuriously returned `New`.
+    #[test]
+    fn dedup_within_window_duplicate_refreshes_insertion_order_against_capacity_eviction() {
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), 3);
+
+        // Fill to capacity. insertion_order: [a, b, c]
+        dedup.check("a");
+        dedup.check("b");
+        dedup.check("c");
+        assert_eq!(dedup.len(), 3);
+
+        // Hit "a" again within its window: Duplicate, and (with the fix) moved
+        // to the back of the eviction queue. insertion_order: [b, c, a]
+        assert_eq!(
+            dedup.check("a"),
+            DedupeVerdict::Duplicate { suppressed_count: 1 }
+        );
+
+        // A novel key at capacity evicts the oldest LIVE entry. With the fix
+        // that is "b" (not "a", which was just refreshed). order: [c, a, d]
+        dedup.check("d");
+        assert_eq!(dedup.len(), 3);
+
+        // "a" survived because it was actively duplicated — an in-window repeat
+        // is still a Duplicate (suppressed_count now 2). Before the fix "a" had
+        // been evicted and this returned `New`.
+        match dedup.check("a") {
+            DedupeVerdict::Duplicate { suppressed_count } => {
+                assert_eq!(suppressed_count, 2);
+            }
+            other @ DedupeVerdict::New => panic!(
+                "an actively-duplicated key must survive capacity eviction and \
+                 remain Duplicate; got {other:?}"
+            ),
+        }
+
+        // "b" was the evicted victim.
+        assert_eq!(dedup.check("b"), DedupeVerdict::New);
+    }
+
     // ---- NotificationCooldown tests ----
 
     #[test]
@@ -3775,6 +3844,59 @@ mod tests {
         // "a" was evicted, treated as new
         assert_eq!(
             cd.check("a"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
+    }
+
+    // Regression (sibling of the ft-hyrav expired-Send refresh below): a key
+    // actively SUPPRESSED within its cooldown must also refresh insertion_order
+    // recency, so it survives capacity eviction ahead of idle keys. Before the
+    // fix, only the expired-Send path refreshed; a busy suppressed key kept its
+    // stale slot, was evicted by novel keys, and an in-cooldown repeat then
+    // spuriously returned `Send` (a duplicate notification + lost suppressed
+    // count) under capacity pressure.
+    #[test]
+    fn cooldown_within_period_suppress_refreshes_insertion_order_against_capacity_eviction() {
+        let mut cd = NotificationCooldown::with_config(Duration::from_secs(300), 3);
+
+        // Fill to capacity. insertion_order: [a, b, c]
+        cd.check("a");
+        cd.check("b");
+        cd.check("c");
+        assert_eq!(cd.len(), 3);
+
+        // Suppress "a" within its cooldown: with the fix it moves to the back
+        // of the eviction queue. insertion_order: [b, c, a]
+        assert_eq!(
+            cd.check("a"),
+            CooldownVerdict::Suppress {
+                total_suppressed: 1
+            }
+        );
+
+        // A novel key at capacity evicts the oldest LIVE entry — "b" (not the
+        // just-refreshed "a"). insertion_order: [c, a, d]
+        cd.check("d");
+        assert_eq!(cd.len(), 3);
+
+        // "a" survived: an in-cooldown repeat is still Suppress, and its
+        // suppressed count carries forward (now 2). Before the fix "a" had been
+        // evicted and this returned `Send { suppressed_since_last: 0 }`.
+        match cd.check("a") {
+            CooldownVerdict::Suppress { total_suppressed } => {
+                assert_eq!(total_suppressed, 2);
+            }
+            other @ CooldownVerdict::Send { .. } => panic!(
+                "an actively-suppressed key must survive capacity eviction and \
+                 stay in cooldown; got {other:?}"
+            ),
+        }
+
+        // "b" was the evicted victim.
+        assert_eq!(
+            cd.check("b"),
             CooldownVerdict::Send {
                 suppressed_since_last: 0
             }
