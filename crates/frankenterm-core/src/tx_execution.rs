@@ -919,6 +919,15 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     .map_err(|err| TxExecutionError::PhaseTransition(err.to_string()))?;
             }
 
+            let forensic_bundle = self.maybe_build_forensic_bundle(
+                contract,
+                &ledger,
+                &mut events,
+                None,
+                &execution_id,
+                now_ms,
+            );
+
             return Ok(TxExecutionResult {
                 final_state,
                 outcome: contract.outcome.clone(),
@@ -927,7 +936,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 compensation_report: None,
                 events,
                 ledger,
-                forensic_bundle: None,
+                forensic_bundle,
                 decision_path,
                 reason_code: "prepare_not_eligible".to_string(),
             });
@@ -1035,6 +1044,15 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             now_ms,
         ));
 
+        let forensic_bundle = self.maybe_build_forensic_bundle(
+            contract,
+            &ledger,
+            &mut events,
+            None,
+            &execution_id,
+            now_ms,
+        );
+
         Ok(TxExecutionResult {
             final_state,
             outcome,
@@ -1043,7 +1061,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             compensation_report,
             events,
             ledger,
-            forensic_bundle: None,
+            forensic_bundle,
             decision_path,
             reason_code: format!("execution_{final_state}"),
         })
@@ -1081,6 +1099,14 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 let (final_state, outcome) = resume_terminal_outcome(contract, &resume_ctx);
                 contract.lifecycle_state = final_state;
                 contract.outcome = outcome.clone();
+                let forensic_bundle = self.maybe_build_forensic_bundle(
+                    contract,
+                    ledger,
+                    &mut events,
+                    Some(&resume_ctx),
+                    execution_id,
+                    now_ms,
+                );
                 Ok(TxExecutionResult {
                     final_state,
                     outcome,
@@ -1092,7 +1118,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     compensation_report: None,
                     events,
                     ledger: ledger.clone(),
-                    forensic_bundle: None,
+                    forensic_bundle,
                     decision_path: "resume->already_complete".to_string(),
                     reason_code: "already_complete".to_string(),
                 })
@@ -1585,6 +1611,42 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 events.push(event);
             }
         }
+    }
+
+    fn maybe_build_forensic_bundle(
+        &self,
+        contract: &MissionTxContract,
+        ledger: &TxExecutionLedger,
+        events: &mut Vec<TxObservabilityEvent>,
+        resume_ctx: Option<&crate::tx_idempotency::ResumeContext>,
+        execution_id: &str,
+        now_ms: i64,
+    ) -> Option<TxForensicBundle> {
+        if !self.config.produce_forensic_bundle {
+            return None;
+        }
+
+        events.push(self.make_event(
+            TxEventKind::BundleExported,
+            TxObservabilityPhase::Observability,
+            crate::tx_observability::reason_codes::BUNDLE_EXPORTED,
+            execution_id,
+            &contract.plan.plan_id.0,
+            ledger.phase(),
+            now_ms,
+        ));
+
+        let compiled_plan = compiled_plan_from_contract(contract);
+        Some(crate::tx_observability::build_forensic_bundle(
+            &compiled_plan,
+            ledger,
+            events,
+            resume_ctx,
+            "tx_execution_engine",
+            execution_id,
+            now_ms as u64,
+            &self.config.observability,
+        ))
     }
 }
 
@@ -2144,6 +2206,50 @@ mod tests {
         assert!(event_kinds.contains(&&TxEventKind::PrepareCompleted));
         assert!(event_kinds.contains(&&TxEventKind::CommitStarted));
         assert!(event_kinds.contains(&&TxEventKind::CommitCompleted));
+    }
+
+    #[test]
+    fn unwired_safety_controls_produce_forensic_bundle_respected() {
+        let mut enabled_contract = make_test_contract(2);
+        let enabled_engine =
+            TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let enabled = enabled_engine.execute(&mut enabled_contract, 5000).unwrap();
+
+        let bundle = enabled
+            .forensic_bundle
+            .as_ref()
+            .expect("default config should produce forensic bundle");
+        assert_eq!(bundle.metadata.generator, "tx_execution_engine");
+        assert_eq!(bundle.metadata.incident_id, "txe-5000");
+        assert_eq!(bundle.ledger.execution_id, enabled.ledger.execution_id());
+        assert!(bundle.chain_verification.chain_intact);
+        assert!(
+            enabled
+                .events
+                .iter()
+                .any(|event| event.kind == TxEventKind::BundleExported),
+            "bundle export must be visible in the observability stream",
+        );
+
+        let mut disabled_contract = make_test_contract(1);
+        let disabled_engine = TxExecutionEngine::new(
+            SyntheticStepExecutor,
+            TxExecutionConfig {
+                produce_forensic_bundle: false,
+                ..TxExecutionConfig::default()
+            },
+        );
+        let disabled = disabled_engine
+            .execute(&mut disabled_contract, 6000)
+            .unwrap();
+        assert!(disabled.forensic_bundle.is_none());
+        assert!(
+            disabled
+                .events
+                .iter()
+                .all(|event| event.kind != TxEventKind::BundleExported),
+            "disabled bundle production must not emit a bundle export event",
+        );
     }
 
     #[test]
