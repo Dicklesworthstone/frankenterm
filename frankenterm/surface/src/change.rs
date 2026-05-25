@@ -39,6 +39,10 @@ fn wrapped_end_relative_coordinate(extent: usize, delta: usize) -> usize {
     extent.saturating_sub(delta.saturating_add(1)) % extent
 }
 
+fn usize_to_isize_saturating(value: usize) -> isize {
+    isize::try_from(value).unwrap_or(isize::MAX)
+}
+
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum LineAttribute {
@@ -250,27 +254,30 @@ impl ChangeSequence {
             Change::Text(t) => {
                 for g in Graphemes::new(t.as_str()) {
                     if self.cursor_x == self.screen_cols {
-                        self.cursor_y += 1;
+                        self.cursor_y = self.cursor_y.saturating_add(1);
                         self.cursor_x = 0;
                     }
                     if g == "\n" {
-                        self.cursor_y += 1;
+                        self.cursor_y = self.cursor_y.saturating_add(1);
                     } else if g == "\r" {
                         self.cursor_x = 0;
                     } else if g == "\r\n" {
-                        self.cursor_y += 1;
+                        self.cursor_y = self.cursor_y.saturating_add(1);
                         self.cursor_x = 0;
                     } else {
                         let len = unicode_column_width(g, None);
-                        self.cursor_x += len;
+                        self.cursor_x = self.cursor_x.saturating_add(len);
                     }
                 }
                 self.update_render_height();
             }
             #[cfg(feature = "use_image")]
             Change::Image(im) => {
-                self.cursor_x += im.width;
-                self.render_y_max = self.render_y_max.max(self.cursor_y + im.height as isize);
+                self.cursor_x = self.cursor_x.saturating_add(im.width);
+                self.render_y_max = self.render_y_max.max(
+                    self.cursor_y
+                        .saturating_add(usize_to_isize_saturating(im.height)),
+                );
             }
             Change::ClearScreen(_) => {
                 self.cursor_x = 0;
@@ -734,6 +741,17 @@ mod test {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn change_sequence_text_cursor_math_saturates_extreme_state() {
+        let mut cs = ChangeSequence::new(usize::MAX, usize::MAX);
+        cs.cursor_x = usize::MAX - 1;
+        cs.cursor_y = isize::MAX - 1;
+
+        cs.add("ab\nc\r\nd");
+
+        assert_eq!(cs.current_cursor_position().1, isize::MAX);
     }
 
     #[test]

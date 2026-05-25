@@ -10,7 +10,6 @@ use crate::readbuf::ReadBuffer;
 use frankenterm_input_types::{ansi_us_unshift_fallback, ctrl_mapping};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
 use std::fmt::Write;
 
 pub use frankenterm_input_types::Modifiers;
