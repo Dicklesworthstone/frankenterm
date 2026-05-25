@@ -145,6 +145,35 @@ fn ewma_ignores_non_finite_observations() {
     );
 }
 
+/// Regression: `ExpHistogram::record` drops non-finite samples (NaN / ±inf)
+/// rather than letting them reach `value.log(base)` (which would land in a
+/// bogus bucket) or corrupt count/sum. The guard exists in `record_n` but was
+/// untested, so a refactor could silently drop it.
+#[test]
+fn exp_histogram_ignores_non_finite_records() {
+    let mut h = ExpHistogram::power_of_two(20);
+    for v in 1..=10u32 {
+        h.record(f64::from(v));
+    }
+    let count_before = h.count();
+    assert_eq!(count_before, 10);
+
+    h.record(f64::NAN);
+    h.record(f64::INFINITY);
+    h.record(f64::NEG_INFINITY);
+
+    assert_eq!(
+        h.count(),
+        count_before,
+        "non-finite records must be dropped, not counted"
+    );
+    let median = h.percentile(0.5).expect("populated histogram has a median");
+    assert!(
+        median.is_finite(),
+        "percentile must stay finite after non-finite record attempts ({median})"
+    );
+}
+
 /// Regression: `EwmaWithVariance` must also drop non-finite inputs before they
 /// poison either the mean or the variance (`(value - old_mean)^2`).
 #[test]
