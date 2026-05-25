@@ -1364,30 +1364,37 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step"
                         );
-                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                            reason,
-                        )) = e
-                        {
-                            record_workflow_terminal_action_maybe_cx(
-                                cx,
-                                &self.storage,
-                                &workflow_name,
-                                execution_id,
-                                pane_id,
-                                "workflow_aborted",
-                                "aborted",
-                                Some(&reason),
-                                Some(current_step),
-                                None,
-                                start_action_id,
-                            )
-                            .await;
-                            return WorkflowExecutionResult::Aborted {
-                                execution_id: execution_id.to_string(),
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
-                                step_index: current_step,
-                                elapsed_ms: elapsed_ms(start_time),
-                            };
+                            )) => {
+                                record_workflow_terminal_action_maybe_cx(
+                                    cx,
+                                    &self.storage,
+                                    &workflow_name,
+                                    execution_id,
+                                    pane_id,
+                                    "workflow_aborted",
+                                    "aborted",
+                                    Some(&reason),
+                                    Some(current_step),
+                                    None,
+                                    start_action_id,
+                                )
+                                .await;
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
                         }
                     }
                 }
@@ -1471,30 +1478,37 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step after jump"
                         );
-                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                            reason,
-                        )) = e
-                        {
-                            record_workflow_terminal_action_maybe_cx(
-                                cx,
-                                &self.storage,
-                                &workflow_name,
-                                execution_id,
-                                pane_id,
-                                "workflow_aborted",
-                                "aborted",
-                                Some(&reason),
-                                Some(current_step),
-                                None,
-                                start_action_id,
-                            )
-                            .await;
-                            return WorkflowExecutionResult::Aborted {
-                                execution_id: execution_id.to_string(),
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
-                                step_index: current_step,
-                                elapsed_ms: elapsed_ms(start_time),
-                            };
+                            )) => {
+                                record_workflow_terminal_action_maybe_cx(
+                                    cx,
+                                    &self.storage,
+                                    &workflow_name,
+                                    execution_id,
+                                    pane_id,
+                                    "workflow_aborted",
+                                    "aborted",
+                                    Some(&reason),
+                                    Some(current_step),
+                                    None,
+                                    start_action_id,
+                                )
+                                .await;
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
                         }
                     }
                 }
@@ -1809,30 +1823,37 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step after wait"
                         );
-                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                            reason,
-                        )) = e
-                        {
-                            record_workflow_terminal_action_maybe_cx(
-                                cx,
-                                &self.storage,
-                                &workflow_name,
-                                execution_id,
-                                pane_id,
-                                "workflow_aborted",
-                                "aborted",
-                                Some(&reason),
-                                Some(current_step),
-                                None,
-                                start_action_id,
-                            )
-                            .await;
-                            return WorkflowExecutionResult::Aborted {
-                                execution_id: execution_id.to_string(),
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
-                                step_index: current_step,
-                                elapsed_ms: elapsed_ms(start_time),
-                            };
+                            )) => {
+                                record_workflow_terminal_action_maybe_cx(
+                                    cx,
+                                    &self.storage,
+                                    &workflow_name,
+                                    execution_id,
+                                    pane_id,
+                                    "workflow_aborted",
+                                    "aborted",
+                                    Some(&reason),
+                                    Some(current_step),
+                                    None,
+                                    start_action_id,
+                                )
+                                .await;
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
                         }
                     }
                 }
@@ -1969,30 +1990,37 @@ impl WorkflowRunner {
                                     error = %e,
                                     "Failed to update execution step after send"
                                 );
-                                if let crate::Error::Workflow(
-                                    crate::error::WorkflowError::Aborted(reason),
-                                ) = e
-                                {
-                                    record_workflow_terminal_action_maybe_cx(
-                                        cx,
-                                        &self.storage,
-                                        &workflow_name,
-                                        execution_id,
-                                        pane_id,
-                                        "workflow_aborted",
-                                        "aborted",
-                                        Some(&reason),
-                                        Some(current_step),
-                                        None,
-                                        start_action_id,
-                                    )
-                                    .await;
-                                    return WorkflowExecutionResult::Aborted {
-                                        execution_id: execution_id.to_string(),
-                                        reason,
-                                        step_index: current_step,
-                                        elapsed_ms: elapsed_ms(start_time),
-                                    };
+                                match e {
+                                    crate::Error::Workflow(
+                                        crate::error::WorkflowError::Aborted(reason),
+                                    ) => {
+                                        record_workflow_terminal_action_maybe_cx(
+                                            cx,
+                                            &self.storage,
+                                            &workflow_name,
+                                            execution_id,
+                                            pane_id,
+                                            "workflow_aborted",
+                                            "aborted",
+                                            Some(&reason),
+                                            Some(current_step),
+                                            None,
+                                            start_action_id,
+                                        )
+                                        .await;
+                                        return WorkflowExecutionResult::Aborted {
+                                            execution_id: execution_id.to_string(),
+                                            reason,
+                                            step_index: current_step,
+                                            elapsed_ms: elapsed_ms(start_time),
+                                        };
+                                    }
+                                    other => {
+                                        return WorkflowExecutionResult::Error {
+                                            execution_id: Some(execution_id.to_string()),
+                                            error: other.to_string(),
+                                        };
+                                    }
                                 }
                             }
                         }
@@ -3976,6 +4004,106 @@ mod tests {
                 }
                 other => panic!("missing terminal persistence must not report success: {other:?}"),
             }
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    struct ProgressPersistenceProbeWorkflow {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Workflow for ProgressPersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "progress_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Continues once before completing to exercise progress persistence"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![
+                WorkflowStep::new("advance", "Advance"),
+                WorkflowStep::new("finish", "Finish"),
+            ]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match step_idx {
+                    0 => StepResult::Continue,
+                    1 => StepResult::done(serde_json::json!({ "ok": true })),
+                    _ => StepResult::abort("unexpected step"),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_progress_persistence_failure_stops_before_later_steps() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("progress_persistence_fail_closed.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let execution_id = "missing-progress-record";
+            let result = runner
+                .run_workflow(
+                    77,
+                    Arc::new(ProgressPersistenceProbeWorkflow {
+                        calls: Arc::clone(&calls),
+                    }),
+                    execution_id,
+                    0,
+                )
+                .await;
+
+            match result {
+                WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                } => {
+                    assert_eq!(id, execution_id);
+                    assert!(
+                        error.contains(execution_id),
+                        "progress persistence error should identify the execution: {error}"
+                    );
+                }
+                other => panic!("missing progress persistence must not keep running: {other:?}"),
+            }
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "runner must stop before executing later steps after progress persistence fails"
+            );
 
             storage.shutdown().await.unwrap();
         });
