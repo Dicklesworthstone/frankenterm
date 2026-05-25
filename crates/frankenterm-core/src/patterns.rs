@@ -1755,11 +1755,19 @@ fn load_pack_from_id(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> 
 
     if let Some(path) = pack_id.strip_prefix("file:") {
         let mut pack = load_pack_from_file(path, root)?;
-        pack.name = pack_id.to_string();
+        pack.name = file_pack_name_for_id(pack_id);
         return Ok(pack);
     }
 
     Err(PatternError::PackNotFound(pack_id.to_string()).into())
+}
+
+fn file_pack_name_for_id(pack_id: &str) -> String {
+    if pack_id.chars().any(char::is_whitespace) {
+        format!("file:{}", sha256_hex(pack_id.as_bytes()))
+    } else {
+        pack_id.to_string()
+    }
 }
 
 /// [ft-05hfm] Hard cap on pattern-pack file size before parse.
@@ -2089,6 +2097,13 @@ fn normalize_pack_overrides(
 fn normalize_pack_key(key: &str, packs: &[PatternPack]) -> Option<String> {
     if packs.iter().any(|p| p.name == key) {
         return Some(key.to_string());
+    }
+
+    if key.starts_with("file:") {
+        let candidate = file_pack_name_for_id(key);
+        if packs.iter().any(|p| p.name == candidate) {
+            return Some(candidate);
+        }
     }
 
     // Try finding a builtin pack by prefixing with "builtin:" if the key doesn't have it
@@ -4265,6 +4280,56 @@ rules:
 
         let engine = PatternEngine::from_config(&config).unwrap();
         assert!(engine.rules().iter().all(|r| r.id != "codex.test"));
+    }
+
+    #[test]
+    fn from_config_file_pack_path_with_spaces_loads_and_normalizes_overrides() {
+        let dir = tempfile::Builder::new()
+            .prefix("pattern pack dir ")
+            .tempdir()
+            .unwrap();
+        let pack_path = dir.path().join("test pack.yaml");
+        let yaml = r#"
+name: "test-pack-with-space-path"
+version: "0.1.0"
+rules:
+  - id: "codex.space_path"
+    agent_type: "codex"
+    event_type: "usage.warning"
+    severity: "info"
+    anchors: ["space-path-anchor"]
+    regex: null
+    description: "test rule"
+"#;
+        fs::write(&pack_path, yaml).unwrap();
+
+        let pack_id = format!("file:{}", pack_path.display());
+        assert!(
+            pack_id.chars().any(char::is_whitespace),
+            "test setup must exercise whitespace-bearing file: pack ids"
+        );
+
+        let pack = load_pack_from_id(&pack_id, None).unwrap();
+        assert!(pack.name.starts_with("file:sha256:"));
+        assert!(!pack.name.chars().any(char::is_whitespace));
+
+        let mut config = PatternsConfig {
+            packs: vec![pack_id.clone()],
+            ..PatternsConfig::default()
+        };
+        let mut override_cfg = PackOverride::default();
+        override_cfg
+            .severity_overrides
+            .insert("codex.space_path".to_string(), "critical".to_string());
+        config.pack_overrides.insert(pack_id, override_cfg);
+
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|rule| rule.id == "codex.space_path")
+            .unwrap();
+        assert_eq!(rule.severity, Severity::Critical);
     }
 
     #[test]
