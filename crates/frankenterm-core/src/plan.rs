@@ -4180,6 +4180,7 @@ fn validate_prepare_gate_step_ids(gate_inputs: &[TxPrepareGateInput]) -> Result<
 
 fn validate_compensation_input_step_ids(
     contract: &MissionTxContract,
+    commit_report: &TxCommitReport,
     comp_inputs: &[TxCompensationStepInput],
 ) -> Result<(), String> {
     let plan_step_ids: HashSet<&str> = contract
@@ -4188,11 +4189,24 @@ fn validate_compensation_input_step_ids(
         .iter()
         .map(|step| step.step_id.0.as_str())
         .collect();
+    let committed_step_ids: HashSet<&str> = commit_report
+        .step_results
+        .iter()
+        .filter(|result| result.outcome.is_committed())
+        .map(|result| result.step_id.0.as_str())
+        .collect();
     for input in comp_inputs {
         validate_tx_identifier("compensation input step_id", &input.for_step_id.0)?;
-        if !plan_step_ids.contains(input.for_step_id.0.as_str()) {
+        let step_id = input.for_step_id.0.as_str();
+        if !plan_step_ids.contains(step_id) {
             return Err(format!(
                 "compensation input references unknown step_id {}",
+                input.for_step_id.0
+            ));
+        }
+        if !committed_step_ids.contains(step_id) {
+            return Err(format!(
+                "compensation input references uncommitted step_id {}",
                 input.for_step_id.0
             ));
         }
@@ -4529,7 +4543,7 @@ pub fn execute_compensation_phase(
     contract.validate()?;
 
     validate_compensation_commit_report(contract, commit_report)?;
-    validate_compensation_input_step_ids(contract, comp_inputs)?;
+    validate_compensation_input_step_ids(contract, commit_report, comp_inputs)?;
 
     let committed_steps = commit_report
         .step_results
@@ -8363,8 +8377,20 @@ mod tests {
     }
 
     fn sample_comp_inputs(fail_step: Option<&str>) -> Vec<TxCompensationStepInput> {
-        ["tx-step:1", "tx-step:2", "tx-step:3"]
-            .into_iter()
+        sample_comp_inputs_for(&["tx-step:1", "tx-step:2", "tx-step:3"], fail_step)
+    }
+
+    fn sample_committed_comp_inputs(fail_step: Option<&str>) -> Vec<TxCompensationStepInput> {
+        sample_comp_inputs_for(&["tx-step:1", "tx-step:2"], fail_step)
+    }
+
+    fn sample_comp_inputs_for(
+        step_ids: &[&str],
+        fail_step: Option<&str>,
+    ) -> Vec<TxCompensationStepInput> {
+        step_ids
+            .iter()
+            .copied()
             .enumerate()
             .map(|(idx, step_id)| {
                 let should_fail = fail_step == Some(step_id);
@@ -9203,7 +9229,7 @@ mod tests {
 
         let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
         compensating_contract.receipts = commit_report.receipts.clone();
-        let mut comp_inputs = sample_comp_inputs(None);
+        let mut comp_inputs = sample_committed_comp_inputs(None);
         comp_inputs.insert(
             0,
             TxCompensationStepInput {
@@ -9338,7 +9364,7 @@ mod tests {
 
         let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
         compensating_contract.receipts = commit_report.receipts.clone();
-        let mut comp_inputs = sample_comp_inputs(None);
+        let mut comp_inputs = sample_committed_comp_inputs(None);
         comp_inputs.push(TxCompensationStepInput {
             for_step_id: TxStepId("..".to_string()),
             success: true,
@@ -9358,7 +9384,7 @@ mod tests {
             "unexpected compensation error: {comp_err}"
         );
 
-        let mut unknown_comp_inputs = sample_comp_inputs(None);
+        let mut unknown_comp_inputs = sample_committed_comp_inputs(None);
         unknown_comp_inputs.push(TxCompensationStepInput {
             for_step_id: TxStepId("tx-step:unknown".to_string()),
             success: true,
@@ -9376,6 +9402,42 @@ mod tests {
         assert!(
             unknown_comp_err.contains("compensation input references unknown step_id"),
             "unexpected unknown compensation error: {unknown_comp_err}"
+        );
+    }
+
+    #[test]
+    fn tx_compensation_phase_rejects_uncommitted_step_input() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let mut comp_inputs = sample_committed_comp_inputs(None);
+        comp_inputs.push(TxCompensationStepInput {
+            for_step_id: TxStepId("tx-step:3".to_string()),
+            success: true,
+            reason_code: "compensation_succeeded".to_string(),
+            error_code: None,
+            completed_at_ms: 20_999,
+        });
+
+        let comp_err = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &comp_inputs,
+            20_500,
+        )
+        .expect_err("compensation should reject inputs for uncommitted steps");
+        assert!(
+            comp_err.contains("compensation input references uncommitted step_id tx-step:3"),
+            "unexpected uncommitted compensation error: {comp_err}"
         );
     }
 
@@ -9434,7 +9496,7 @@ mod tests {
         let comp_report = execute_compensation_phase(
             &compensating_contract,
             &commit_report,
-            &sample_comp_inputs(None),
+            &sample_committed_comp_inputs(None),
             20_500,
         )
         .expect("compensation report");
@@ -9479,7 +9541,7 @@ mod tests {
         let comp_report = execute_compensation_phase(
             &compensating_contract,
             &commit_report,
-            &sample_comp_inputs(Some("tx-step:2")),
+            &sample_committed_comp_inputs(Some("tx-step:2")),
             20_500,
         )
         .expect("compensation report");
