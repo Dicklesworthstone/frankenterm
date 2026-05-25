@@ -1731,7 +1731,7 @@ fn to_u8(v: &CsiParam) -> Result<u8, ()> {
     match v {
         CsiParam::P(_) => Err(()),
         CsiParam::Integer(v) => {
-            if *v <= i64::from(u8::max_value()) {
+            if (0..=i64::from(u8::MAX)).contains(v) {
                 Ok(*v as u8)
             } else {
                 Err(())
@@ -3137,6 +3137,10 @@ mod test {
 
     #[test]
     fn color() {
+        assert!(to_u8(&CsiParam::Integer(-1)).is_err());
+        assert_eq!(to_u8(&CsiParam::Integer(255)), Ok(255));
+        assert!(to_u8(&CsiParam::Integer(256)).is_err());
+
         assert_eq!(
             parse('m', &[38, 2], "\x1b[38;2m"),
             vec![CSI::Unspecified(Box::new(Unspecified {
@@ -3156,6 +3160,25 @@ mod test {
             vec![CSI::Sgr(Sgr::Foreground(ColorSpec::TrueColor(
                 (255, 255, 255).into(),
             )))]
+        );
+        assert_eq!(
+            parse('m', &[38, 2, -1, 255, 255], "\x1b[38;2;-1;255;255m"),
+            vec![CSI::Unspecified(Box::new(Unspecified {
+                params: [
+                    CsiParam::Integer(38),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(2),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(-1),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(255),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(255)
+                ]
+                .to_vec(),
+                parameters_truncated: false,
+                control: 'm',
+            }))]
         );
         assert_eq!(
             parse('m', &[38, 5, 220, 255, 255], "\x1b[38:5:220m\x1b[255;255m"),

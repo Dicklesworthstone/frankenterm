@@ -1258,8 +1258,10 @@ impl ITermDimension {
     pub fn to_pixels(&self, cell_size: usize, num_cells: usize) -> Option<usize> {
         match self {
             ITermDimension::Automatic => None,
-            ITermDimension::Cells(n) => Some(((*n).max(0) as usize).saturating_mul(cell_size)),
-            ITermDimension::Pixels(n) => Some((*n).max(0) as usize),
+            ITermDimension::Cells(n) => {
+                Some(nonnegative_i64_to_usize_saturating(*n).saturating_mul(cell_size))
+            }
+            ITermDimension::Pixels(n) => Some(nonnegative_i64_to_usize_saturating(*n)),
             ITermDimension::Percent(n) => Some(percent_of_pixel_span(
                 (*n).clamp(0, 100) as usize,
                 num_cells,
@@ -1267,6 +1269,10 @@ impl ITermDimension {
             )),
         }
     }
+}
+
+fn nonnegative_i64_to_usize_saturating(value: i64) -> usize {
+    usize::try_from(value.max(0)).unwrap_or(usize::MAX)
 }
 
 fn percent_of_pixel_span(percent: usize, num_cells: usize, cell_size: usize) -> usize {
@@ -2508,7 +2514,7 @@ mod test {
     #[test]
     fn iterm_dimension_to_pixels_cells_saturates_overflow() {
         assert_eq!(
-            ITermDimension::Cells(i64::MAX).to_pixels(2, 80),
+            ITermDimension::Cells(i64::MAX).to_pixels(3, 80),
             Some(usize::MAX)
         );
     }
