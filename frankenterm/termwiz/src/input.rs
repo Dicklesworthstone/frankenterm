@@ -10,6 +10,8 @@ use crate::readbuf::ReadBuffer;
 use frankenterm_input_types::{ansi_us_unshift_fallback, ctrl_mapping};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
+#[cfg(any(windows, test))]
+use std::convert::TryFrom;
 use std::fmt::Write;
 
 pub use frankenterm_input_types::Modifiers;
@@ -1512,6 +1514,17 @@ impl InputParser {
         }
     }
 
+    fn is_unfinished_csi_input(bytes: &[u8]) -> bool {
+        if !bytes.starts_with(b"\x1b[") {
+            return false;
+        }
+
+        // CSI is complete once a final byte in the 0x40..=0x7e range arrives.
+        // Until then, keep buffering so fragmented input is interpreted the
+        // same way as one-shot input by the escape parser.
+        !bytes[2..].iter().any(|b| matches!(b, 0x40..=0x7e))
+    }
+
     fn dispatch_callback<F: FnMut(InputEvent)>(&mut self, mut callback: F, event: InputEvent) {
         match (self.state, event) {
             (
@@ -1625,10 +1638,12 @@ impl InputParser {
                             continue;
                         }
 
-                        // If we have a potential SGR mouse sequence prefix and more
-                        // data might come, wait for additional input before falling
-                        // through to keymap lookup
-                        if maybe_more && self.buf.as_slice().starts_with(b"\x1b[<") {
+                        // If we have a partial CSI sequence and more data
+                        // might come, wait for additional input before falling
+                        // through to keymap lookup. Otherwise a fragmented
+                        // escape sequence can be prematurely reclassified as
+                        // Alt-[ and diverge from one-shot parsing.
+                        if maybe_more && Self::is_unfinished_csi_input(self.buf.as_slice()) {
                             return;
                         }
                     }
@@ -1929,6 +1944,32 @@ mod test {
             ],
             inputs
         );
+    }
+
+    #[test]
+    fn fragmented_sgr_mouse_with_invalid_csi_param_bytes_matches_one_shot() {
+        let input = b"\x1b[\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff<1;10;20m";
+
+        let mut one_shot = InputParser::new();
+        let expected = one_shot.parse_as_vec(input, NO_MORE);
+        assert_eq!(
+            expected,
+            vec![InputEvent::Mouse(MouseEvent {
+                x: 10,
+                y: 20,
+                mouse_buttons: MouseButtons::NONE,
+                modifiers: Modifiers::NONE,
+            })],
+        );
+
+        let mut chunked = InputParser::new();
+        let mut inputs = Vec::new();
+        for chunk in input.chunks(3) {
+            chunked.parse(chunk, |evt| inputs.push(evt), MAYBE_MORE);
+        }
+        chunked.parse(b"", |evt| inputs.push(evt), NO_MORE);
+
+        assert_eq!(inputs, expected);
     }
 
     #[test]
