@@ -647,8 +647,9 @@ impl Surface {
     /// Without allocating resources, estimate how many Change entries
     /// we would produce in repaint_all for the current state.
     fn estimate_full_paint_cost(&self) -> usize {
-        // assume 1 per cell with 20% overhead for attribute changes
-        3 + (((self.width * self.height) as f64) * 1.2) as usize
+        // Assume 1 per cell with 20% overhead for attribute changes.
+        let cells = self.width.saturating_mul(self.height);
+        cells.saturating_add(cells / 5).saturating_add(3)
     }
 
     fn repaint_all(&self) -> Vec<Change> {
@@ -2493,6 +2494,24 @@ mod test {
         }]);
         assert_eq!(seq, SequenceNo::MAX);
         assert_eq!(s.current_seqno(), SequenceNo::MAX);
+    }
+
+    #[test]
+    fn estimate_full_paint_cost_uses_exact_integer_math() {
+        let s = Surface::new(80, 24);
+
+        assert_eq!(s.estimate_full_paint_cost(), 2_307);
+    }
+
+    #[test]
+    fn estimate_full_paint_cost_saturates_oversized_dimensions() {
+        let s = Surface {
+            width: usize::MAX,
+            height: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(s.estimate_full_paint_cost(), usize::MAX);
     }
 
     #[test]
