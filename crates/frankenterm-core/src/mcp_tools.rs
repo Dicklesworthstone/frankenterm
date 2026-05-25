@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
+use serde::de::DeserializeOwned;
+
 use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
 #[allow(unused_imports)]
 use crate::mcp_framework::{
@@ -56,14 +58,13 @@ use super::{
     HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
     MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
     MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-    MCP_ERR_WORKFLOW, McpToolError, Osc133State,
-    PaneCapabilities, PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter, PatternEngine,
-    PolicyDecision, PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults,
-    SearchQueryInput, SharedRateLimiter, StorageHandle, UnifiedSearchMode, WaitOptions, WaitResult,
-    WeztermError, WeztermHandleSource, Workflow, WorkflowExecutionResult, approval_command,
-    build_mcp_shared_rate_limiter, build_mcp_workflow_assembly,
-    build_policy_engine_with_shared_rate_limiter, default_wezterm_handle,
-    effective_search_fusion_backend, effective_search_fusion_weights,
+    MCP_ERR_WORKFLOW, McpToolError, Osc133State, PaneCapabilities, PaneFilterConfig, PaneInfo,
+    PaneReservation, PaneWaiter, PatternEngine, PolicyDecision, PolicyEngine, PolicyGatedInjector,
+    PolicyInput, SearchQueryDefaults, SearchQueryInput, SharedRateLimiter, StorageHandle,
+    UnifiedSearchMode, WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow,
+    WorkflowExecutionResult, approval_command, build_mcp_shared_rate_limiter,
+    build_mcp_workflow_assembly, build_policy_engine_with_shared_rate_limiter,
+    default_wezterm_handle, effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
     map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
     mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
@@ -312,6 +313,23 @@ fn validate_mcp_wait_timeout_secs(
         elapsed_ms(start),
     );
     Some(envelope_to_content(envelope))
+}
+
+fn parse_mcp_tool_params<T: DeserializeOwned>(
+    tool_name: &str,
+    arguments: serde_json::Value,
+    expected: &'static str,
+    start: Instant,
+) -> Result<T, McpResult<Vec<Content>>> {
+    serde_json::from_value(arguments).map_err(|err| {
+        let envelope = McpEnvelope::<()>::error(
+            MCP_ERR_INVALID_ARGS,
+            redact_mcp_output_secrets(&format!("Invalid params for {tool_name}: {err}")),
+            Some(expected.to_string()),
+            elapsed_ms(start),
+        );
+        envelope_to_content(envelope)
+    })
 }
 
 /// CASS timeout_secs schema bounds — single source of truth for
@@ -1671,11 +1689,15 @@ impl ToolHandler for WaGetTextTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: GetTextParams = serde_json::from_value(arguments).map_err(|err| {
-            McpError::internal_error(format!(
-                "wa.get_text schema/handler mismatch after framework validation: {err}"
-            ))
-        })?;
+        let params: GetTextParams = match parse_mcp_tool_params(
+            "wa.get_text",
+            arguments,
+            "Expected object matching wa.get_text input schema.",
+            start,
+        ) {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
 
         // ft-ii8ss: enforce a server-side bound on `tail` independent of the
         // tool-schema's advertised maximum. The schema is a contract with the
@@ -1968,11 +1990,15 @@ impl ToolHandler for WaWaitForTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: WaitForParams = serde_json::from_value(arguments).map_err(|err| {
-            McpError::internal_error(format!(
-                "wa.wait_for schema/handler mismatch after framework validation: {err}"
-            ))
-        })?;
+        let params: WaitForParams = match parse_mcp_tool_params(
+            "wa.wait_for",
+            arguments,
+            "Expected object matching wa.wait_for input schema.",
+            start,
+        ) {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
 
         // Enforce the advertised timeout range server-side. serde accepts any
         // u64, and some MCP clients do not validate against the tool schema.
@@ -2280,11 +2306,15 @@ impl ToolHandler for WaSearchTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: SearchParams = serde_json::from_value(arguments).map_err(|err| {
-            McpError::internal_error(format!(
-                "wa.search schema/handler mismatch after framework validation: {err}"
-            ))
-        })?;
+        let params: SearchParams = match parse_mcp_tool_params(
+            "wa.search",
+            arguments,
+            "Expected object matching wa.search input schema.",
+            start,
+        ) {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
 
         let parsed = match parse_unified_search_query(
             SearchQueryInput {
@@ -2929,11 +2959,15 @@ impl ToolHandler for WaSendTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: SendParams = serde_json::from_value(arguments).map_err(|err| {
-            McpError::internal_error(format!(
-                "wa.send schema/handler mismatch after framework validation: {err}"
-            ))
-        })?;
+        let params: SendParams = match parse_mcp_tool_params(
+            "wa.send",
+            arguments,
+            "Expected object matching wa.send input schema.",
+            start,
+        ) {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
 
         // Enforce the advertised timeout range server-side. `wa.send` uses
         // this bound for its optional wait_for phase.
@@ -3088,10 +3122,8 @@ impl ToolHandler for WaSendTool {
                     let timeout = std::time::Duration::from_secs(params.timeout_secs);
                     match waiter.wait_for(params.pane_id, matcher, timeout).await {
                         Ok(WaitResult::Matched { elapsed_ms, polls }) => {
-                            let pattern_out = redacted_wait_for
-                                .as_deref()
-                                .unwrap_or(pattern)
-                                .to_string();
+                            let pattern_out =
+                                redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
                             wait_for_data = Some(McpWaitForData {
                                 pane_id: params.pane_id,
                                 pattern: pattern_out,
@@ -3104,10 +3136,8 @@ impl ToolHandler for WaSendTool {
                         Ok(WaitResult::TimedOut {
                             elapsed_ms, polls, ..
                         }) => {
-                            let pattern_out = redacted_wait_for
-                                .as_deref()
-                                .unwrap_or(pattern)
-                                .to_string();
+                            let pattern_out =
+                                redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
                             wait_for_data = Some(McpWaitForData {
                                 pane_id: params.pane_id,
                                 pattern: pattern_out.clone(),
@@ -3120,10 +3150,8 @@ impl ToolHandler for WaSendTool {
                                 Some(format!("Timeout waiting for pattern '{pattern_out}'"));
                         }
                         Ok(WaitResult::Cancelled { reason, polls }) => {
-                            let pattern_out = redacted_wait_for
-                                .as_deref()
-                                .unwrap_or(pattern)
-                                .to_string();
+                            let pattern_out =
+                                redacted_wait_for.as_deref().unwrap_or(pattern).to_string();
                             wait_for_data = Some(McpWaitForData {
                                 pane_id: params.pane_id,
                                 pattern: pattern_out,
@@ -8758,7 +8786,16 @@ mod tests {
 
         assert_eq!(
             env.args(),
-            vec!["view", "-n", "42", "--json", "-C", "3", "--", "/tmp/session.md"]
+            vec![
+                "view",
+                "-n",
+                "42",
+                "--json",
+                "-C",
+                "3",
+                "--",
+                "/tmp/session.md"
+            ]
         );
         assert_eq!(envelope["ok"], true);
         assert_eq!(envelope["data"]["source_path"], "/tmp/session.md");
@@ -9549,7 +9586,8 @@ exit 17",
         // redaction-safe and the call never panics.
         let live_err = crate::wezterm::compile_wait_matcher(&format!("(?P<g>{secret}"), true)
             .expect_err("unclosed group must fail to compile");
-        let live_redacted = redact_mcp_output_secrets(&format!("Invalid regex pattern: {live_err}"));
+        let live_redacted =
+            redact_mcp_output_secrets(&format!("Invalid regex pattern: {live_err}"));
         assert!(
             !live_redacted.contains(&secret),
             "secret leaked through live fancy_regex compile error"
@@ -9899,6 +9937,65 @@ exit 17",
             .expect("wa.search should have required fields");
         let has_query = required.iter().any(|v| v.as_str() == Some("query"));
         assert!(has_query, "wa.search should require query");
+    }
+
+    #[test]
+    fn robot_parity_tools_return_invalid_args_envelopes_for_bad_json_params() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let cases = [
+            (
+                "wa.get_text",
+                WaGetTextTool::new(config(), None).call(
+                    &test_mcp_context(),
+                    serde_json::json!({"pane_id": secret.as_str()}),
+                ),
+            ),
+            (
+                "wa.wait_for",
+                WaWaitForTool::new(config(), None).call(
+                    &test_mcp_context(),
+                    serde_json::json!({"pane_id": secret.as_str(), "pattern": "ready"}),
+                ),
+            ),
+            (
+                "wa.search",
+                WaSearchTool::new(config(), db_path()).call(
+                    &test_mcp_context(),
+                    serde_json::json!({"query": "ready", "limit": secret.as_str()}),
+                ),
+            ),
+            (
+                "wa.send",
+                WaSendTool::new(config(), db_path()).call(
+                    &test_mcp_context(),
+                    serde_json::json!({"pane_id": secret.as_str(), "text": "ready"}),
+                ),
+            ),
+        ];
+
+        for (tool_name, result) in cases {
+            let envelope = parse_json_content(result.unwrap_or_else(|_| {
+                panic!("{tool_name} must return an FT-MCP envelope, not a framework error")
+            }));
+            assert_eq!(envelope["ok"], false, "{tool_name} envelope={envelope}");
+            assert_eq!(
+                envelope["error_code"],
+                crate::mcp_error::MCP_ERR_INVALID_ARGS,
+                "{tool_name} envelope={envelope}"
+            );
+            assert_eq!(envelope["data"], serde_json::Value::Null);
+            let rendered = envelope.to_string();
+            assert!(
+                !rendered.contains(&secret),
+                "{tool_name} leaked user-controlled bad input through envelope={envelope}"
+            );
+        }
     }
 
     /// br-ft-9ia4p: wa.search with pane_id pointing at a distributed
