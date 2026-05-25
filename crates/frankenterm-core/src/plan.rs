@@ -4138,6 +4138,28 @@ fn duplicate_commit_input_step_id(commit_inputs: &[TxCommitStepInput]) -> Option
     None
 }
 
+fn validate_commit_input_step_ids(
+    contract: &MissionTxContract,
+    commit_inputs: &[TxCommitStepInput],
+) -> Result<(), String> {
+    let plan_step_ids: HashSet<&str> = contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.step_id.0.as_str())
+        .collect();
+    for input in commit_inputs {
+        validate_tx_identifier("commit input step_id", &input.step_id.0)?;
+        if !plan_step_ids.contains(input.step_id.0.as_str()) {
+            return Err(format!(
+                "commit input references unknown step_id {}",
+                input.step_id.0
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn duplicate_compensation_input_step_id(comp_inputs: &[TxCompensationStepInput]) -> Option<&str> {
     let mut seen = HashSet::new();
     for input in comp_inputs {
@@ -4147,6 +4169,35 @@ fn duplicate_compensation_input_step_id(comp_inputs: &[TxCompensationStepInput])
         }
     }
     None
+}
+
+fn validate_prepare_gate_step_ids(gate_inputs: &[TxPrepareGateInput]) -> Result<(), String> {
+    for gate in gate_inputs {
+        validate_tx_identifier("prepare gate step_id", &gate.step_id.0)?;
+    }
+    Ok(())
+}
+
+fn validate_compensation_input_step_ids(
+    contract: &MissionTxContract,
+    comp_inputs: &[TxCompensationStepInput],
+) -> Result<(), String> {
+    let plan_step_ids: HashSet<&str> = contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.step_id.0.as_str())
+        .collect();
+    for input in comp_inputs {
+        validate_tx_identifier("compensation input step_id", &input.for_step_id.0)?;
+        if !plan_step_ids.contains(input.for_step_id.0.as_str()) {
+            return Err(format!(
+                "compensation input references unknown step_id {}",
+                input.for_step_id.0
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_compensation_commit_report(
@@ -4173,16 +4224,16 @@ fn validate_compensation_commit_report(
         .map(|step| step.step_id.0.as_str())
         .collect();
     let mut seen_committed_step_ids = HashSet::new();
-    for result in commit_report
-        .step_results
-        .iter()
-        .filter(|result| result.outcome.is_committed())
-    {
+    for result in &commit_report.step_results {
+        validate_tx_identifier("commit report step_id", &result.step_id.0)?;
         let step_id = result.step_id.0.as_str();
         if !plan_step_ids.contains(step_id) {
             return Err(format!(
-                "Compensation commit report references unknown committed step {step_id}"
+                "Compensation commit report references unknown step {step_id}"
             ));
+        }
+        if !result.outcome.is_committed() {
+            continue;
         }
         if !seen_committed_step_ids.insert(step_id) {
             return Err(format!(
@@ -4196,7 +4247,7 @@ fn validate_compensation_commit_report(
 
 /// Evaluate prepare phase gates and produce a report.
 pub fn evaluate_prepare_phase(
-    _tx_id: &TxId,
+    tx_id: &TxId,
     plan: &TxPlan,
     gate_inputs: &[TxPrepareGateInput],
     kill_switch: MissionKillSwitchLevel,
@@ -4205,6 +4256,22 @@ pub fn evaluate_prepare_phase(
     if plan.steps.is_empty() {
         return Err("Transaction plan has no steps".to_string());
     }
+    validate_tx_identifier("prepare tx_id", &tx_id.0)?;
+    validate_tx_identifier("plan tx_id", &plan.tx_id.0)?;
+    validate_tx_identifier("plan_id", &plan.plan_id.0)?;
+    if tx_id != &plan.tx_id {
+        return Err(format!(
+            "Prepare tx_id {} does not match plan tx_id {}",
+            tx_id.0, plan.tx_id.0
+        ));
+    }
+    for step in &plan.steps {
+        validate_tx_identifier("step_id", &step.step_id.0)?;
+    }
+    for compensation in &plan.compensations {
+        validate_tx_identifier("compensation step_id", &compensation.for_step_id.0)?;
+    }
+    validate_prepare_gate_step_ids(gate_inputs)?;
 
     if kill_switch == MissionKillSwitchLevel::HardStop {
         return Ok(TxPrepareReport {
@@ -4286,6 +4353,8 @@ pub fn execute_commit_phase(
     if contract.plan.steps.is_empty() {
         return Err("Transaction plan has no steps".to_string());
     }
+    contract.validate()?;
+    validate_commit_input_step_ids(contract, commit_inputs)?;
 
     if kill_switch != MissionKillSwitchLevel::Off {
         let error_code = match kill_switch {
@@ -4457,8 +4526,10 @@ pub fn execute_compensation_phase(
     if contract.plan.steps.is_empty() {
         return Err("Transaction plan has no steps".to_string());
     }
+    contract.validate()?;
 
     validate_compensation_commit_report(contract, commit_report)?;
+    validate_compensation_input_step_ids(contract, comp_inputs)?;
 
     let committed_steps = commit_report
         .step_results
@@ -9154,6 +9225,157 @@ mod tests {
         assert!(
             comp_err.contains("duplicate compensation input for tx step tx-step:2"),
             "unexpected compensation error: {comp_err}"
+        );
+    }
+
+    #[test]
+    fn tx_phase_reducers_reject_malformed_input_identifiers() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+
+        let prepare_tx_err = evaluate_prepare_phase(
+            &TxId("tx/escape".to_string()),
+            &contract.plan,
+            &tx_prepare_gate_inputs_allow_all(&contract),
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect_err("prepare should reject malformed tx id");
+        assert!(
+            prepare_tx_err.contains("prepare tx_id"),
+            "unexpected prepare tx id error: {prepare_tx_err}"
+        );
+
+        let prepare_mismatch_err = evaluate_prepare_phase(
+            &TxId("tx:other".to_string()),
+            &contract.plan,
+            &tx_prepare_gate_inputs_allow_all(&contract),
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect_err("prepare should reject mismatched tx id");
+        assert!(
+            prepare_mismatch_err.contains("does not match plan tx_id"),
+            "unexpected prepare mismatch error: {prepare_mismatch_err}"
+        );
+
+        let mut gate_inputs = tx_prepare_gate_inputs_allow_all(&contract);
+        gate_inputs.push(TxPrepareGateInput {
+            step_id: TxStepId("tx-step/escape".to_string()),
+            pane_id: Some(99),
+            policy_passed: true,
+            policy_reason_code: None,
+            reservation_available: true,
+            reservation_reason_code: None,
+            approval_satisfied: true,
+            approval_reason_code: None,
+            target_liveness: true,
+            liveness_reason_code: None,
+            required_approval: None,
+        });
+        let prepare_err = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &gate_inputs,
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect_err("prepare should reject malformed gate step id");
+        assert!(
+            prepare_err.contains("prepare gate step_id"),
+            "unexpected prepare error: {prepare_err}"
+        );
+
+        let mut commit_inputs = sample_commit_inputs(None);
+        commit_inputs.push(TxCommitStepInput {
+            step_id: TxStepId("tx-step\\escape".to_string()),
+            success: true,
+            reason_code: "commit_succeeded".to_string(),
+            error_code: None,
+            completed_at_ms: 10_999,
+        });
+        let commit_err = execute_commit_phase(
+            &contract,
+            &commit_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect_err("commit should reject malformed input step id");
+        assert!(
+            commit_err.contains("commit input step_id"),
+            "unexpected commit error: {commit_err}"
+        );
+
+        let mut unknown_commit_inputs = sample_commit_inputs(None);
+        unknown_commit_inputs.push(TxCommitStepInput {
+            step_id: TxStepId("tx-step:unknown".to_string()),
+            success: true,
+            reason_code: "commit_succeeded".to_string(),
+            error_code: None,
+            completed_at_ms: 10_999,
+        });
+        let unknown_commit_err = execute_commit_phase(
+            &contract,
+            &unknown_commit_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect_err("commit should reject unknown input step id");
+        assert!(
+            unknown_commit_err.contains("commit input references unknown step_id"),
+            "unexpected unknown commit error: {unknown_commit_err}"
+        );
+
+        let commit_report = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let mut comp_inputs = sample_comp_inputs(None);
+        comp_inputs.push(TxCompensationStepInput {
+            for_step_id: TxStepId("..".to_string()),
+            success: true,
+            reason_code: "compensation_succeeded".to_string(),
+            error_code: None,
+            completed_at_ms: 20_999,
+        });
+        let comp_err = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &comp_inputs,
+            20_500,
+        )
+        .expect_err("compensation should reject malformed input step id");
+        assert!(
+            comp_err.contains("compensation input step_id"),
+            "unexpected compensation error: {comp_err}"
+        );
+
+        let mut unknown_comp_inputs = sample_comp_inputs(None);
+        unknown_comp_inputs.push(TxCompensationStepInput {
+            for_step_id: TxStepId("tx-step:unknown".to_string()),
+            success: true,
+            reason_code: "compensation_succeeded".to_string(),
+            error_code: None,
+            completed_at_ms: 20_999,
+        });
+        let unknown_comp_err = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &unknown_comp_inputs,
+            20_500,
+        )
+        .expect_err("compensation should reject unknown input step id");
+        assert!(
+            unknown_comp_err.contains("compensation input references unknown step_id"),
+            "unexpected unknown compensation error: {unknown_comp_err}"
         );
     }
 
