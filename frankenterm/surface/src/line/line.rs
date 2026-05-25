@@ -812,7 +812,7 @@ impl Line {
             if !is_word(cell.str()) {
                 break;
             }
-            upper = cell.cell_index() + 1;
+            upper = cell.cell_index().saturating_add(cell.width().max(1));
         }
         for cell in cells.iter().rev() {
             if cell.cell_index() > click_col {
@@ -3057,6 +3057,16 @@ mod tests {
 
         let r = line.compute_double_click_range(1, |s| s != " ");
         assert_eq!(r, DoubleClickRange::Range(0..3));
+    }
+
+    #[test]
+    fn line_double_click_range_wide_only_word_covers_full_cell_width() {
+        let line = Line::from_text("中 ", &CellAttributes::default(), SEQ_ZERO, None);
+        let first = line.visible_cells().next().expect("wide first cell");
+        assert_eq!(first.width(), 2);
+
+        let r = line.compute_double_click_range(1, |s| s != " ");
+        assert_eq!(r, DoubleClickRange::Range(0..2));
     }
 
     #[test]
