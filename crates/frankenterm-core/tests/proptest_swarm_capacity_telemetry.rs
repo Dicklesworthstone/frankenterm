@@ -6,9 +6,8 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::chaos_scale_harness::FailureClass;
 use frankenterm_core::runtime_telemetry::{
-    SwarmCapacityCertificateConfig, SwarmCapacityDriftDetector,
+    FailureClass, SwarmCapacityCertificateConfig, SwarmCapacityDriftDetector,
     SwarmCapacityExpectedLossPolicyConfig, SwarmCapacityOutcome, SwarmCapacityRegressionBudget,
     SwarmCapacityRegressionGateStatus, SwarmCapacityStage, SwarmCapacityTelemetry,
     SwarmTailRiskMonitorConfig, SwarmTailRiskStatus,
@@ -192,7 +191,7 @@ fn record_outcome_dispatches_to_correct_counter() {
     assert_eq!(probe(SwarmCapacityOutcome::Timeout), (0, 0, 1, 0));
     // Non-timeout error: errors only.
     assert_eq!(
-        probe(SwarmCapacityOutcome::Error(FailureClass::CpuOverload)),
+        probe(SwarmCapacityOutcome::Error(FailureClass::Overload)),
         (0, 0, 0, 1)
     );
     // Timeout-classed error: both errors and timeouts increment.
