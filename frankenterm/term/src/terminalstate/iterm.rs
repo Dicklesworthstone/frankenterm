@@ -164,6 +164,9 @@ impl TerminalState {
 }
 
 fn checked_u32_image_dimensions(width: usize, height: usize) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
     Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
 }
 
@@ -174,6 +177,8 @@ mod tests {
     #[test]
     fn checked_u32_image_dimensions_rejects_overflow() {
         assert_eq!(checked_u32_image_dimensions(1, 1), Some((1, 1)));
+        assert_eq!(checked_u32_image_dimensions(0, 1), None);
+        assert_eq!(checked_u32_image_dimensions(1, 0), None);
 
         if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
             assert_eq!(checked_u32_image_dimensions(too_large, 1), None);
