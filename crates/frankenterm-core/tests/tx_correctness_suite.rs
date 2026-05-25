@@ -1237,21 +1237,49 @@ fn compensation_step_results_in_reverse_ordinal_order() {
 // ── Empty Plan Edge Cases ───────────────────────────────────────────────────
 
 #[test]
-fn empty_plan_commit_produces_empty_report() {
+fn empty_plan_phase_executors_reject_fail_closed() {
     let contract = build_contract(0, MissionTxState::Prepared);
     let inputs: Vec<TxCommitStepInput> = vec![];
-    let result = execute_commit_phase(
+    let prepare = evaluate_prepare_phase(
+        &contract.intent.tx_id,
+        &contract.plan,
+        &[],
+        MissionKillSwitchLevel::Off,
+        10_000,
+    )
+    .expect_err("prepare must reject empty tx plans");
+    assert!(prepare.contains("Transaction plan has no steps"));
+
+    let commit = execute_commit_phase(
         &contract,
         &inputs,
         MissionKillSwitchLevel::Off,
         false,
         10_000,
-    );
-    // Current implementation accepts empty plans and produces a fully-committed report.
-    let report = result.unwrap();
-    assert_eq!(report.committed_count, 0);
-    assert_eq!(report.failed_count, 0);
-    assert_eq!(report.skipped_count, 0);
+    )
+    .expect_err("commit must reject empty tx plans");
+    assert!(commit.contains("Transaction plan has no steps"));
+
+    let mut comp_contract = build_contract(0, MissionTxState::Compensating);
+    comp_contract.lifecycle_state = MissionTxState::Compensating;
+    let commit_report = frankenterm_core::plan::TxCommitReport {
+        tx_id: comp_contract.intent.tx_id.clone(),
+        plan_id: comp_contract.plan.plan_id.clone(),
+        outcome: TxCommitOutcome::ImmediateFailure,
+        step_results: vec![],
+        failure_boundary: None,
+        committed_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        decision_path: "test-empty".to_string(),
+        reason_code: "test-empty".to_string(),
+        error_code: Some("tx.test.empty".to_string()),
+        completed_at_ms: 10_000,
+        receipts: vec![],
+    };
+    let comp = execute_compensation_phase(&comp_contract, &commit_report, &[], 20_000)
+        .expect_err("compensation must reject empty tx plans");
+    assert!(comp.contains("Transaction plan has no steps"));
 }
 
 // ── Outcome Target State Consistency ────────────────────────────────────────

@@ -4074,6 +4074,10 @@ pub fn evaluate_prepare_phase(
     kill_switch: MissionKillSwitchLevel,
     _now_ms: i64,
 ) -> Result<TxPrepareReport, String> {
+    if plan.steps.is_empty() {
+        return Err("Transaction plan has no steps".to_string());
+    }
+
     if kill_switch == MissionKillSwitchLevel::HardStop {
         return Ok(TxPrepareReport {
             outcome: TxPrepareOutcome::Denied,
@@ -4149,6 +4153,10 @@ pub fn execute_commit_phase(
             "Commit requires prepared or committing tx state, got {}",
             contract.lifecycle_state
         ));
+    }
+
+    if contract.plan.steps.is_empty() {
+        return Err("Transaction plan has no steps".to_string());
     }
 
     if kill_switch != MissionKillSwitchLevel::Off {
@@ -4316,6 +4324,10 @@ pub fn execute_compensation_phase(
             "Compensation requires compensating tx state, got {}",
             contract.lifecycle_state
         ));
+    }
+
+    if contract.plan.steps.is_empty() {
+        return Err("Transaction plan has no steps".to_string());
     }
 
     let committed_steps = commit_report
