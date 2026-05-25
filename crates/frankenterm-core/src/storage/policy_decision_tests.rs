@@ -973,6 +973,133 @@ fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
     assert_eq!(matching_rows, 1);
 }
 
+/// Full-fidelity round-trip for the policy-denial audit persistence path.
+///
+/// `fresh_db_init_creates_policy_denied_audit_via_v24_migration` (above) only
+/// checks a denied record with all-None optionals lands a countable row by four
+/// columns. This pins the rest of the persistence contract that the MCP gate
+/// helpers (`persist_mcp_policy_denial`) and operator queries depend on:
+///   - every column round-trips with EXACT values (id populated, ts_ms, reason),
+///   - the three optional columns (agent_id, intent_hash, rule_id) persist their
+///     Some(..) values rather than collapsing to NULL,
+///   - the require_approval and require_approval_unsupported decision/reason_code
+///     pairs persist as DISTINCT rows (operators must be able to separate a
+///     dead-end unsupported-approval denial from a normal one).
+#[test]
+fn policy_denied_audit_roundtrips_all_fields_and_variants() {
+    let db_path = std::env::temp_dir().join(format!(
+        "frankenterm-policy-denied-audit-roundtrip-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos()
+    ));
+    let config = crate::storage_backend_trait::OpenConfig {
+        wal_mode: false,
+        ..crate::storage_backend_trait::OpenConfig::default()
+    };
+    {
+        let backend = RusqliteBackend::open_path(&db_path, &config)
+            .expect("open fresh policy_denied_audit DB");
+        let conn = backend.into_connection();
+        initialize_schema(&conn).unwrap();
+    }
+
+    // Record with every optional field populated and the require_approval
+    // decision/reason_code pair.
+    let approval = PolicyDeniedAuditRecord {
+        id: 0,
+        ts_ms: 1_700_000_123_456,
+        agent_id: Some("agent-42".to_string()),
+        tool_name: "wa.tx_run".to_string(),
+        intent_hash: Some("deadbeefcafef00d".to_string()),
+        reason: "human approval required before mutating tx".to_string(),
+        reason_code: PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL.to_string(),
+        rule_id: Some("policy.tx.require_approval".to_string()),
+        decision: PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL.to_string(),
+    };
+    let approval_id = record_policy_denial_audit_blocking(&db_path, &approval)
+        .expect("require_approval audit insert must succeed");
+    assert!(approval_id > 0, "insert must populate an autoincrement id");
+
+    // A second row using the unsupported-approval variant must persist as its
+    // own distinct decision/reason_code, not collapse into the row above.
+    let unsupported = PolicyDeniedAuditRecord {
+        id: 0,
+        ts_ms: 1_700_000_222_222,
+        agent_id: None,
+        tool_name: "wa.fleet_scale".to_string(),
+        intent_hash: None,
+        reason: "tool surface has no allow-once approval flow".to_string(),
+        reason_code: PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED.to_string(),
+        rule_id: None,
+        decision: PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL_UNSUPPORTED.to_string(),
+    };
+    let unsupported_id = record_policy_denial_audit_blocking(&db_path, &unsupported)
+        .expect("require_approval_unsupported audit insert must succeed");
+    assert_ne!(
+        approval_id, unsupported_id,
+        "each denial must occupy its own row"
+    );
+
+    let read_backend =
+        RusqliteBackend::open_path(&db_path, &config).expect("reopen policy_denied_audit DB");
+    let read_conn = read_backend.into_connection();
+
+    // Read the require_approval row back column-for-column and assert exact
+    // equality against what we wrote (with the id the insert returned).
+    let got = read_conn
+        .query_row(
+            "SELECT id, ts_ms, agent_id, tool_name, intent_hash, reason, reason_code, rule_id, decision
+             FROM policy_denied_audit WHERE id = ?1",
+            rusqlite::params![approval_id],
+            |row| {
+                Ok(PolicyDeniedAuditRecord {
+                    id: row.get(0)?,
+                    ts_ms: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    intent_hash: row.get(4)?,
+                    reason: row.get(5)?,
+                    reason_code: row.get(6)?,
+                    rule_id: row.get(7)?,
+                    decision: row.get(8)?,
+                })
+            },
+        )
+        .expect("read inserted require_approval row");
+    let expected = PolicyDeniedAuditRecord {
+        id: approval_id,
+        ..approval
+    };
+    assert_eq!(
+        got, expected,
+        "every column (including the Some(..) optionals) must round-trip exactly"
+    );
+
+    // The two decision variants must be distinguishable in the table.
+    let approval_rows: i64 = read_conn
+        .query_row(
+            "SELECT COUNT(*) FROM policy_denied_audit WHERE decision = ?1",
+            rusqlite::params![PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let unsupported_rows: i64 = read_conn
+        .query_row(
+            "SELECT COUNT(*) FROM policy_denied_audit WHERE decision = ?1",
+            rusqlite::params![PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL_UNSUPPORTED],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(approval_rows, 1, "require_approval row must be queryable on its own");
+    assert_eq!(
+        unsupported_rows, 1,
+        "require_approval_unsupported row must be queryable as a distinct class"
+    );
+}
+
 #[test]
 fn each_migration_step_can_be_reapplied_without_panicking() {
     for migration in MIGRATIONS.iter().skip(1) {
