@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use frankenterm_core_replay_types::replay_decision_graph::{
-    DecisionGraph, DecisionNode, DecisionType,
+    DecisionGraph, DecisionNode, DecisionType, EdgeType,
 };
 
 // ============================================================================
@@ -63,6 +63,12 @@ pub enum RootCause {
         baseline_ms: u64,
         candidate_ms: u64,
         delta_ms: u64,
+    },
+    /// Causal parents changed while decision content stayed stable.
+    CausalTopologyChange {
+        rule_id: String,
+        baseline_parents: Vec<String>,
+        candidate_parents: Vec<String>,
     },
     /// Unknown root cause.
     Unknown,
@@ -147,7 +153,7 @@ pub struct DiffSummary {
     pub added: u64,
     /// Decisions removed from baseline.
     pub removed: u64,
-    /// Decisions with different output.
+    /// Decisions with different content or causal parent topology.
     pub modified: u64,
     /// Decisions with shifted timing.
     pub shifted: u64,
@@ -253,13 +259,20 @@ impl DecisionDiff {
             if let Some(cand_node) = cand_exact.get(exact_key) {
                 // Exact match on key.
                 matched_cand.insert(exact_key.clone());
-                if node.l1_equivalent(cand_node) {
+                if node.l1_equivalent(cand_node)
+                    && causal_parent_context_equivalent(
+                        baseline,
+                        candidate,
+                        node.node_id,
+                        cand_node.node_id,
+                    )
+                {
                     // Unchanged.
                     unchanged += 1;
                 } else {
                     // Modified: same position, different decision content.
                     let root_cause = if config.attribute_root_causes {
-                        attribute_modified(node, cand_node)
+                        attribute_modified(baseline, candidate, node, cand_node)
                     } else {
                         RootCause::Unknown
                     };
@@ -276,13 +289,29 @@ impl DecisionDiff {
                 // Not exact match. Check for shifted.
                 let relaxed_key = (node.pane_id, node.decision_type, node.rule_id.clone());
                 let found_shifted = if let Some(cand_list) = cand_relaxed.get(&relaxed_key) {
-                    best_relaxed_match(cand_list, &matched_cand, node, config, true)
+                    best_relaxed_match(
+                        cand_list,
+                        &matched_cand,
+                        baseline,
+                        candidate,
+                        node,
+                        config,
+                        true,
+                    )
                 } else {
                     None
                 };
                 let found_shifted_modified = if found_shifted.is_none() {
                     cand_relaxed.get(&relaxed_key).and_then(|cand_list| {
-                        best_relaxed_match(cand_list, &matched_cand, node, config, false)
+                        best_relaxed_match(
+                            cand_list,
+                            &matched_cand,
+                            baseline,
+                            candidate,
+                            node,
+                            config,
+                            false,
+                        )
                     })
                 } else {
                     None
@@ -306,7 +335,7 @@ impl DecisionDiff {
                 } else if let Some((shifted_key, shifted_node)) = found_shifted_modified {
                     matched_cand.insert(shifted_key.clone());
                     let root_cause = if config.attribute_root_causes {
-                        attribute_modified(node, shifted_node)
+                        attribute_modified(baseline, candidate, node, shifted_node)
                     } else {
                         RootCause::Unknown
                     };
@@ -425,6 +454,8 @@ pub enum MissionCausalityCategory {
     AgentAssignment,
     /// Compensation, rollback, or recovery path diverged.
     CompensationPath,
+    /// Causal parent topology changed.
+    CausalTopology,
     /// A rule definition changed.
     RuleDefinition,
     /// A stable input hash changed.
@@ -682,6 +713,7 @@ fn classify_mission_category(
         match divergence.root_cause {
             RootCause::RuleDefinitionChange { .. } => MissionCausalityCategory::RuleDefinition,
             RootCause::InputDivergence { .. } => MissionCausalityCategory::InputDivergence,
+            RootCause::CausalTopologyChange { .. } => MissionCausalityCategory::CausalTopology,
             RootCause::TimingShift { .. } => MissionCausalityCategory::Timing,
             RootCause::NewDecision { .. } => MissionCausalityCategory::NewDecision,
             RootCause::DroppedDecision { .. } => MissionCausalityCategory::DroppedDecision,
@@ -709,6 +741,9 @@ fn mission_classification_text(
         RootCause::InputDivergence {
             upstream_rule_id, ..
         } => parts.push(upstream_rule_id.to_ascii_lowercase()),
+        RootCause::CausalTopologyChange { rule_id, .. } => {
+            parts.push(rule_id.to_ascii_lowercase());
+        }
         RootCause::OverrideApplied {
             rule_id,
             override_id,
@@ -763,6 +798,7 @@ fn root_cause_label(root_cause: &RootCause) -> &'static str {
         RootCause::NewDecision { .. } => "new_decision",
         RootCause::DroppedDecision { .. } => "dropped_decision",
         RootCause::TimingShift { .. } => "timing_shift",
+        RootCause::CausalTopologyChange { .. } => "causal_topology_change",
         RootCause::Unknown => "unknown",
     }
 }
@@ -808,6 +844,8 @@ fn indexed_exact_nodes<'a>(nodes: &[&'a DecisionNode]) -> Vec<(ExactKey, &'a Dec
 fn best_relaxed_match<'a>(
     candidates: &'a [(ExactKey, &'a DecisionNode)],
     matched_cand: &BTreeSet<ExactKey>,
+    baseline_graph: &DecisionGraph,
+    candidate_graph: &DecisionGraph,
     baseline: &DecisionNode,
     config: &DiffConfig,
     require_same_decision: bool,
@@ -819,7 +857,14 @@ fn best_relaxed_match<'a>(
             delta > 0
                 && delta <= config.time_tolerance_ms
                 && !matched_cand.contains(cand_key)
-                && (!require_same_decision || same_decision_ignoring_timing(baseline, candidate))
+                && (!require_same_decision
+                    || (same_decision_ignoring_timing(baseline, candidate)
+                        && causal_parent_context_equivalent(
+                            baseline_graph,
+                            candidate_graph,
+                            baseline.node_id,
+                            candidate.node_id,
+                        )))
         })
         .min_by_key(|(cand_key, candidate)| {
             (
@@ -838,8 +883,42 @@ fn same_decision_ignoring_timing(baseline: &DecisionNode, candidate: &DecisionNo
         && baseline.pane_id == candidate.pane_id
 }
 
+fn causal_parent_context_equivalent(
+    baseline_graph: &DecisionGraph,
+    candidate_graph: &DecisionGraph,
+    baseline_node_id: u64,
+    candidate_node_id: u64,
+) -> bool {
+    causal_parent_signature(baseline_graph, baseline_node_id)
+        == causal_parent_signature(candidate_graph, candidate_node_id)
+}
+
+fn causal_parent_signature(graph: &DecisionGraph, node_id: u64) -> Vec<String> {
+    let mut parents = graph
+        .edges()
+        .iter()
+        .filter(|edge| edge.to_node == node_id)
+        .map(|edge| format!("in:{}:{}", edge_type_label(edge.edge_type), edge.from_node))
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents
+}
+
+fn edge_type_label(edge_type: EdgeType) -> &'static str {
+    match edge_type {
+        EdgeType::TriggeredBy => "triggered_by",
+        EdgeType::PrecededBy => "preceded_by",
+        EdgeType::OverriddenBy => "overridden_by",
+    }
+}
+
 /// Attribute root cause for a Modified divergence.
-fn attribute_modified(baseline: &DecisionNode, candidate: &DecisionNode) -> RootCause {
+fn attribute_modified(
+    baseline_graph: &DecisionGraph,
+    candidate_graph: &DecisionGraph,
+    baseline: &DecisionNode,
+    candidate: &DecisionNode,
+) -> RootCause {
     if baseline.definition_hash != candidate.definition_hash {
         RootCause::RuleDefinitionChange {
             rule_id: baseline.rule_id.clone(),
@@ -850,6 +929,17 @@ fn attribute_modified(baseline: &DecisionNode, candidate: &DecisionNode) -> Root
         RootCause::InputDivergence {
             upstream_rule_id: baseline.rule_id.clone(),
             upstream_position: baseline.node_id,
+        }
+    } else if !causal_parent_context_equivalent(
+        baseline_graph,
+        candidate_graph,
+        baseline.node_id,
+        candidate.node_id,
+    ) {
+        RootCause::CausalTopologyChange {
+            rule_id: baseline.rule_id.clone(),
+            baseline_parents: causal_parent_signature(baseline_graph, baseline.node_id),
+            candidate_parents: causal_parent_signature(candidate_graph, candidate.node_id),
         }
     } else {
         RootCause::Unknown
@@ -1437,6 +1527,102 @@ mod tests {
             &diff.divergences[0].root_cause,
             RootCause::InputDivergence { .. }
         ));
+    }
+
+    #[test]
+    fn causal_parent_change_is_modified_not_identical() {
+        let base_events = vec![
+            make_event(
+                DecisionType::PatternMatch,
+                "root.detected",
+                100,
+                1,
+                "root_v1",
+                "matched",
+            ),
+            make_triggered_event(
+                DecisionType::WorkflowStep,
+                "workflow.prepare",
+                200,
+                1,
+                "prepare_v1",
+                "prepared",
+                Some(0),
+            ),
+            make_triggered_event(
+                DecisionType::WorkflowStep,
+                "workflow.execute",
+                300,
+                1,
+                "execute_v1",
+                "executed",
+                Some(1),
+            ),
+        ];
+        let cand_events = vec![
+            make_event(
+                DecisionType::PatternMatch,
+                "root.detected",
+                100,
+                1,
+                "root_v1",
+                "matched",
+            ),
+            make_triggered_event(
+                DecisionType::WorkflowStep,
+                "workflow.prepare",
+                200,
+                1,
+                "prepare_v1",
+                "prepared",
+                Some(0),
+            ),
+            make_triggered_event(
+                DecisionType::WorkflowStep,
+                "workflow.execute",
+                300,
+                1,
+                "execute_v1",
+                "executed",
+                Some(0),
+            ),
+        ];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.unchanged, 2);
+        assert_eq!(diff.summary.modified, 1);
+        assert_eq!(diff.summary.added, 0);
+        assert_eq!(diff.summary.removed, 0);
+        assert_eq!(diff.summary.shifted, 0);
+        assert!(diff.is_equivalent(EquivalenceLevel::L0));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L2));
+
+        let divergence = &diff.divergences[0];
+        assert_eq!(divergence.position, 2);
+        assert_eq!(divergence.divergence_type, DivergenceType::Modified);
+        assert!(matches!(
+            &divergence.root_cause,
+            RootCause::CausalTopologyChange {
+                rule_id,
+                baseline_parents,
+                candidate_parents,
+            } if rule_id == "workflow.execute"
+                && baseline_parents.iter().any(|parent| parent == "in:triggered_by:1")
+                && candidate_parents.iter().any(|parent| parent == "in:triggered_by:0")
+        ));
+
+        let mission = MissionCausalityDiff::from_decision_diff(&diff, &base, &cand);
+        assert_eq!(
+            mission.summary.first_category,
+            MissionCausalityCategory::CausalTopology
+        );
+        assert_eq!(
+            mission.reason_chains[0].divergence.category,
+            MissionCausalityCategory::CausalTopology
+        );
     }
 
     // ── is_equivalent levels ───────────────────────────────────────────
