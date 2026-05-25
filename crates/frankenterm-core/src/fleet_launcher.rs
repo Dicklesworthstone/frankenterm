@@ -316,6 +316,12 @@ pub enum MetadataProjectionFailure {
     PhaseNotFound { phase: u32 },
     /// Slot index out of bounds.
     SlotIndexOutOfBounds { index: u32, max: u32 },
+    /// Two or more slots share the same label.
+    DuplicateSlotLabel { label: String },
+    /// Two or more slots share the same lifecycle identity.
+    DuplicateLifecycleIdentity { stable_key: String },
+    /// A phase references a slot index that is not present in the plan.
+    PhaseSlotIndexMissing { phase: u32, slot_index: u32 },
     /// Phase index mismatch (slot references a phase that doesn't exist).
     PhaseSlotMismatch { slot_index: u32, claimed_phase: u32 },
     /// Inconsistent field: slot has missing or empty required fields.
@@ -331,6 +337,16 @@ impl std::fmt::Display for MetadataProjectionFailure {
             Self::PhaseNotFound { phase } => write!(f, "no phase {phase}"),
             Self::SlotIndexOutOfBounds { index, max } => {
                 write!(f, "slot index {index} out of bounds (max {max})")
+            }
+            Self::DuplicateSlotLabel { label } => write!(f, "duplicate slot label '{label}'"),
+            Self::DuplicateLifecycleIdentity { stable_key } => {
+                write!(f, "duplicate lifecycle identity '{stable_key}'")
+            }
+            Self::PhaseSlotIndexMissing { phase, slot_index } => {
+                write!(
+                    f,
+                    "phase {phase} references missing slot index {slot_index}"
+                )
             }
             Self::PhaseSlotMismatch {
                 slot_index,
@@ -423,15 +439,43 @@ impl LaunchPlan {
             }
         }
 
+        // Check uniqueness claims documented above.
+        let mut slot_labels = std::collections::HashSet::new();
+        let mut lifecycle_identities = std::collections::HashSet::new();
+        for slot in &self.slots {
+            if !slot_labels.insert(slot.label.as_str()) {
+                violations.push(MetadataProjectionFailure::DuplicateSlotLabel {
+                    label: slot.label.clone(),
+                });
+            }
+            let stable_key = slot.lifecycle_identity.stable_key();
+            if !lifecycle_identities.insert(stable_key.clone()) {
+                violations
+                    .push(MetadataProjectionFailure::DuplicateLifecycleIdentity { stable_key });
+            }
+        }
+
         // Check phase references
         let phase_indices: std::collections::HashSet<u32> =
             self.phases.iter().map(|p| p.index).collect();
+        let slot_indices: std::collections::HashSet<u32> =
+            self.slots.iter().map(|slot| slot.index).collect();
         for slot in &self.slots {
             if !phase_indices.contains(&slot.phase) {
                 violations.push(MetadataProjectionFailure::PhaseSlotMismatch {
                     slot_index: slot.index,
                     claimed_phase: slot.phase,
                 });
+            }
+        }
+        for phase in &self.phases {
+            for slot_index in &phase.slot_indices {
+                if !slot_indices.contains(slot_index) {
+                    violations.push(MetadataProjectionFailure::PhaseSlotIndexMissing {
+                        phase: phase.index,
+                        slot_index: *slot_index,
+                    });
+                }
             }
         }
 
@@ -2355,6 +2399,56 @@ mod tests {
             "expected no violations, got: {:?}",
             violations
         );
+    }
+
+    #[test]
+    fn launch_plan_invariants_detect_duplicate_label_and_identity() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("dup-inv-test", vec![agent_mix("claude", 2)]);
+        let mut plan = launcher.plan(&spec).unwrap();
+
+        plan.slots[1].label = plan.slots[0].label.clone();
+        plan.slots[1].lifecycle_identity = plan.slots[0].lifecycle_identity.clone();
+
+        let violations = plan.invariant_violations();
+        let duplicate_label = plan.slots[0].label.clone();
+        let duplicate_identity = plan.slots[0].lifecycle_identity.stable_key();
+        assert!(violations.iter().any(|violation| {
+            matches!(
+                violation,
+                MetadataProjectionFailure::DuplicateSlotLabel { label }
+                    if label == &duplicate_label
+            )
+        }));
+        assert!(violations.iter().any(|violation| {
+            matches!(
+                violation,
+                MetadataProjectionFailure::DuplicateLifecycleIdentity { stable_key }
+                    if stable_key == &duplicate_identity
+            )
+        }));
+    }
+
+    #[test]
+    fn launch_plan_invariants_detect_missing_phase_slot_reference() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("phase-inv-test", vec![agent_mix("claude", 2)]);
+        let mut plan = launcher.plan(&spec).unwrap();
+
+        plan.phases[0].slot_indices.push(99);
+
+        let violations = plan.invariant_violations();
+        assert!(violations.iter().any(|violation| {
+            matches!(
+                violation,
+                MetadataProjectionFailure::PhaseSlotIndexMissing {
+                    phase: 0,
+                    slot_index: 99,
+                }
+            )
+        }));
     }
 
     #[test]
