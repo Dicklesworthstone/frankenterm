@@ -2943,6 +2943,33 @@ pub struct TxStepId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TxPlanId(pub String);
 
+fn validate_tx_identifier(label: &str, value: &str) -> Result<(), String> {
+    let reason = if value.is_empty() {
+        Some("identifier cannot be empty")
+    } else if value.chars().any(char::is_whitespace) {
+        Some("identifier cannot contain whitespace")
+    } else if value.chars().any(char::is_control) {
+        Some("identifier cannot contain control characters")
+    } else if value.starts_with('~') || value.contains('/') || value.contains('\\') {
+        Some("identifier must not be path-like")
+    } else if value == "."
+        || value == ".."
+        || value.split(':').any(|part| matches!(part, "." | ".."))
+    {
+        Some("identifier cannot contain traversal components")
+    } else {
+        None
+    };
+
+    if let Some(reason) = reason {
+        return Err(format!(
+            "Transaction {label} {value:?} is invalid: {reason}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Intent describing a mission transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxIntent {
@@ -3005,6 +3032,11 @@ pub struct MissionTxContract {
 impl MissionTxContract {
     /// Validate contract consistency.
     pub fn validate(&self) -> Result<(), String> {
+        validate_tx_identifier("intent tx_id", &self.intent.tx_id.0)?;
+        validate_tx_identifier("plan tx_id", &self.plan.tx_id.0)?;
+        validate_tx_identifier("plan_id", &self.plan.plan_id.0)?;
+        validate_tx_identifier("correlation_id", &self.intent.correlation_id)?;
+
         if self.intent.tx_id != self.plan.tx_id {
             return Err(format!(
                 "Transaction intent tx_id {} does not match plan tx_id {}",
@@ -3022,6 +3054,7 @@ impl MissionTxContract {
             if step.step_id.0.is_empty() {
                 return Err("Transaction plan has a step with an empty step_id".to_string());
             }
+            validate_tx_identifier("step_id", &step.step_id.0)?;
             if !step_ids.insert(step.step_id.0.as_str()) {
                 return Err(format!(
                     "Transaction plan has duplicate step_id {}",
@@ -3039,6 +3072,7 @@ impl MissionTxContract {
         let mut compensation_step_ids = HashSet::new();
         for compensation in &self.plan.compensations {
             let for_step_id = compensation.for_step_id.0.as_str();
+            validate_tx_identifier("compensation step_id", for_step_id)?;
             if !step_ids.contains(for_step_id) {
                 return Err(format!(
                     "Transaction compensation references unknown step_id {}",
@@ -7362,10 +7396,10 @@ mod tests {
                 matches!(
                     err,
                     MissionValidationError::InvalidReservationPath {
-                        reservation_id,
-                        path,
+                        ref reservation_id,
+                        ref path,
                         ..
-                    } if reservation_id.0 == "reservation:bad-path" && path == invalid_path
+                    } if reservation_id.0 == "reservation:bad-path" && *path == invalid_path
                 ),
                 "expected invalid reservation path for {invalid_path:?}, got {err:?}"
             );
@@ -8115,6 +8149,58 @@ mod tests {
             lifecycle_state: state,
             outcome: TxOutcome::Pending,
             receipts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tx_contract_validate_rejects_path_like_identifiers() {
+        assert!(
+            sample_tx_contract(MissionTxState::Planned)
+                .validate()
+                .is_ok()
+        );
+
+        let mut cases = Vec::new();
+
+        let mut intent_tx_path = sample_tx_contract(MissionTxState::Planned);
+        intent_tx_path.intent.tx_id = TxId("tx/escape".to_string());
+        intent_tx_path.plan.tx_id = intent_tx_path.intent.tx_id.clone();
+        cases.push(("intent tx_id", intent_tx_path));
+
+        let mut plan_tx_path = sample_tx_contract(MissionTxState::Planned);
+        plan_tx_path.plan.tx_id = TxId("tx\\escape".to_string());
+        cases.push(("plan tx_id", plan_tx_path));
+
+        let mut traversal_plan = sample_tx_contract(MissionTxState::Planned);
+        traversal_plan.plan.plan_id = TxPlanId("plan:..".to_string());
+        cases.push(("plan_id", traversal_plan));
+
+        let mut control_correlation = sample_tx_contract(MissionTxState::Planned);
+        control_correlation.intent.correlation_id = "corr\nbad".to_string();
+        cases.push(("correlation_id", control_correlation));
+
+        let mut whitespace_step = sample_tx_contract(MissionTxState::Planned);
+        whitespace_step.plan.steps[0].step_id = TxStepId(" tx-step:1".to_string());
+        cases.push(("step_id", whitespace_step));
+
+        let mut path_like_compensation = sample_tx_contract(MissionTxState::Planned);
+        path_like_compensation.plan.compensations[0].for_step_id =
+            TxStepId("tx-step/1".to_string());
+        cases.push(("compensation step_id", path_like_compensation));
+
+        for (field, contract) in cases {
+            let err = match contract.validate() {
+                Ok(()) => panic!("{field} should reject invalid tx identifier"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(field),
+                "{field} should be named in validation error: {err}"
+            );
+            assert!(
+                err.contains("invalid"),
+                "{field} should fail as an invalid identifier: {err}"
+            );
         }
     }
 
