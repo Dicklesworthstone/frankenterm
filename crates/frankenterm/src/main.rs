@@ -20833,7 +20833,10 @@ fn distributed_remote_pane_uuid(
     pane_id: u64,
     pane_uuid: Option<&str>,
 ) -> Option<String> {
-    let raw = pane_uuid.unwrap_or("unknown");
+    let raw = pane_uuid
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
     let canonical_sender = distributed_normalize_identity(sender);
     Some(format!("distributed:{canonical_sender}:{pane_id}:{raw}"))
 }
@@ -61630,6 +61633,21 @@ recorder_backend = "frankensqlite"
         assert_eq!(a1, a3);
         assert_ne!(a1, b1);
         assert!(a1 >= (1_u64 << 62));
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_remote_pane_uuid_treats_blank_uuid_as_unknown() {
+        let missing = distributed_remote_pane_uuid("Agent-A", 7, None);
+        let blank = distributed_remote_pane_uuid("Agent-A", 7, Some(" \t "));
+        let trimmed = distributed_remote_pane_uuid("Agent-A", 7, Some(" remote-uuid "));
+
+        assert_eq!(missing, Some("distributed:agent-a:7:unknown".to_string()));
+        assert_eq!(blank, missing);
+        assert_eq!(
+            trimmed,
+            Some("distributed:agent-a:7:remote-uuid".to_string())
+        );
     }
 
     #[cfg(feature = "distributed")]

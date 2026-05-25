@@ -852,21 +852,25 @@ pub fn validate_sender_identity_with_limits(
     Ok(())
 }
 
+fn validate_optional_pane_uuid(
+    pane_uuid: Option<&str>,
+    label: &str,
+) -> Result<(), WireProtocolError> {
+    if pane_uuid.is_some_and(|pane_uuid| pane_uuid.trim().is_empty()) {
+        return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+            format!("{label} pane_uuid must not be empty when present"),
+        )));
+    }
+    Ok(())
+}
+
 fn validate_pane_meta(pane: &PaneMeta, label: &str) -> Result<(), WireProtocolError> {
     if pane.domain.trim().is_empty() {
         return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
             format!("{label} domain must not be empty"),
         )));
     }
-    if pane
-        .pane_uuid
-        .as_ref()
-        .is_some_and(|pane_uuid| pane_uuid.trim().is_empty())
-    {
-        return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
-            format!("{label} pane_uuid must not be empty when present"),
-        )));
-    }
+    validate_optional_pane_uuid(pane.pane_uuid.as_deref(), label)?;
     Ok(())
 }
 
@@ -920,6 +924,7 @@ fn validate_envelope_protocol_with_limits(
         }
     }
     if let WirePayload::Detection(detection) = &envelope.payload {
+        validate_optional_pane_uuid(detection.pane_uuid.as_deref(), "DetectionNotice")?;
         if !detection.confidence.is_finite() || !(0.0..=1.0).contains(&detection.confidence) {
             return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
                 format!(
@@ -2183,6 +2188,28 @@ mod tests {
             let Err(err) = agg.ingest_envelope(envelope) else {
                 panic!("decoded {label} pane metadata must reject blank pane UUIDs");
             };
+            assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+            assert_eq!(agg.total_rejected(), 1);
+            assert_eq!(agg.total_accepted(), 0);
+            assert_eq!(agg.agent_count(), 0);
+        }
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_rejects_blank_detection_notice_uuids() {
+        for (idx, pane_uuid) in [String::new(), " \t ".to_string()].into_iter().enumerate() {
+            let mut agg = Aggregator::new(10);
+            let mut detection = sample_detection();
+            detection.pane_uuid = Some(pane_uuid);
+            let envelope = WireEnvelope::new(
+                idx as u64 + 1,
+                "agent-valid",
+                WirePayload::Detection(detection),
+            );
+
+            let err = agg
+                .ingest_envelope(envelope)
+                .expect_err("decoded detection metadata must reject blank pane UUIDs");
             assert!(matches!(err, WireProtocolError::InvalidJson(_)));
             assert_eq!(agg.total_rejected(), 1);
             assert_eq!(agg.total_accepted(), 0);
