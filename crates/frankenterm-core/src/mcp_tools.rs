@@ -153,6 +153,15 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
 /// the payload reaches the injector / policy / wezterm pipeline.
 pub const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Hard cap for MCP wait pattern strings before substring matching or regex
+/// compilation.
+///
+/// `wa.wait_for.pattern` and `wa.send.wait_for` are control-plane selectors,
+/// not bulk payload channels. Keeping them bounded prevents malformed clients
+/// from forcing very large matcher allocation or expensive regex compilation
+/// before the normal timeout/tail guards can help.
+pub const MAX_MCP_WAIT_PATTERN_BYTES: usize = 64 * 1024;
+
 // br-ft-rnpuc: clock-anomaly observability for MCP tool audit
 // timestamps. mcp_tools.rs has 11 sites with the pattern
 // `i64::try_from(now_ms()).unwrap_or(0)` — when the u64 → i64
@@ -309,6 +318,31 @@ fn validate_mcp_wait_timeout_secs(
         Some(format!(
             "The {tool_name} tool schema declares timeout_secs with minimum: 1 and maximum: \
              {MAX_MCP_WAIT_TIMEOUT_SECS}; omit the field to use the default (30)."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
+
+fn validate_mcp_wait_pattern_bytes(
+    tool_name: &str,
+    field_name: &str,
+    pattern: &str,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if pattern.len() <= MAX_MCP_WAIT_PATTERN_BYTES {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!(
+            "{field_name} is {} bytes; max allowed is {MAX_MCP_WAIT_PATTERN_BYTES} bytes",
+            pattern.len()
+        ),
+        Some(format!(
+            "{tool_name} accepts wait patterns up to {MAX_MCP_WAIT_PATTERN_BYTES} bytes; \
+             use wa.search for large pane-output scans."
         )),
         elapsed_ms(start),
     );
@@ -1959,7 +1993,7 @@ impl ToolHandler for WaWaitForTool {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "Pane ID to wait on" },
-                    "pattern": { "type": "string", "description": "Pattern to match (substring or regex)" },
+                    "pattern": { "type": "string", "maxLength": MAX_MCP_WAIT_PATTERN_BYTES, "description": "Pattern to match (substring or regex)" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Timeout in seconds" },
                     "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 200, "description": "Tail lines to search. Server enforces 1..=10000 (ft-ymo2i); for full-buffer scans use wa.search instead." },
                     "regex": { "type": "boolean", "default": false, "description": "Treat pattern as regex" }
@@ -1992,6 +2026,11 @@ impl ToolHandler for WaWaitForTool {
         // u64, and some MCP clients do not validate against the tool schema.
         if let Some(error) =
             validate_mcp_wait_timeout_secs("wa.wait_for", params.timeout_secs, start)
+        {
+            return error;
+        }
+        if let Some(error) =
+            validate_mcp_wait_pattern_bytes("wa.wait_for", "pattern", &params.pattern, start)
         {
             return error;
         }
@@ -2926,7 +2965,7 @@ impl ToolHandler for WaSendTool {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "Pane ID to send to" },
                     "text": { "type": "string", "description": "Text to send" },
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview without sending" },
-                    "wait_for": { "type": "string", "description": "Wait for a pattern after sending" },
+                    "wait_for": { "type": "string", "maxLength": MAX_MCP_WAIT_PATTERN_BYTES, "description": "Wait for a pattern after sending" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Wait-for timeout (seconds)" },
                     "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" }
                 },
@@ -2958,6 +2997,13 @@ impl ToolHandler for WaSendTool {
         // this bound for its optional wait_for phase.
         if let Some(error) = validate_mcp_wait_timeout_secs("wa.send", params.timeout_secs, start) {
             return error;
+        }
+        if let Some(wait_for) = params.wait_for.as_deref() {
+            if let Some(error) =
+                validate_mcp_wait_pattern_bytes("wa.send", "wait_for", wait_for, start)
+            {
+                return error;
+            }
         }
 
         // [ft-05hfm] Bound the text payload before any downstream
@@ -7001,16 +7047,16 @@ mod tests {
     use super::set_cass_test_binary_override;
     use super::{
         ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
-        CompatRuntimeBuilder, Config, Content, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES,
-        McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool,
-        ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool,
-        WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool,
-        WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool,
-        WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaReleaseTool,
-        WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
-        WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
-        WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
-        authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        CompatRuntimeBuilder, Config, Content, MAX_MCP_WAIT_PATTERN_BYTES,
+        MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities,
+        PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool,
+        WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
+        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
+        WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
+        WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
+        WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
@@ -9928,6 +9974,31 @@ exit 17",
     }
 
     #[test]
+    fn wait_for_and_send_schemas_bound_wait_pattern_length() {
+        let wait_for_def = WaWaitForTool::new(config(), None).definition();
+        let wait_for_props = wait_for_def
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("wa.wait_for schema properties");
+        assert_eq!(
+            wait_for_props["pattern"]["maxLength"],
+            serde_json::json!(MAX_MCP_WAIT_PATTERN_BYTES)
+        );
+
+        let send_def = WaSendTool::new(config(), db_path()).definition();
+        let send_props = send_def
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("wa.send schema properties");
+        assert_eq!(
+            send_props["wait_for"]["maxLength"],
+            serde_json::json!(MAX_MCP_WAIT_PATTERN_BYTES)
+        );
+    }
+
+    #[test]
     fn wait_for_tool_rejects_above_max_timeout_secs() {
         let tool = WaWaitForTool::new(config(), None);
         let envelope = parse_json_content(
@@ -9949,6 +10020,36 @@ exit 17",
                 .as_str()
                 .is_some_and(|text| text.contains("timeout_secs must be in 1..=600")),
             "expected bounded timeout error, got {envelope:?}"
+        );
+    }
+
+    #[test]
+    fn wait_for_tool_rejects_oversized_pattern_before_regex_compile() {
+        let tool = WaWaitForTool::new(config(), None);
+        let pattern = "a".repeat(MAX_MCP_WAIT_PATTERN_BYTES + 1);
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 42,
+                    "pattern": pattern,
+                    "regex": true,
+                    "timeout_secs": 1
+                }),
+            )
+            .expect("wa.wait_for oversized pattern validation call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err = envelope["error"].as_str().expect("error string");
+        assert!(
+            err.contains("pattern is"),
+            "error should identify pattern field: {err}"
+        );
+        assert!(
+            err.contains(&MAX_MCP_WAIT_PATTERN_BYTES.to_string()),
+            "error should cite max pattern bytes: {err}"
         );
     }
 
@@ -10047,6 +10148,37 @@ exit 17",
                 .as_str()
                 .is_some_and(|text| text.contains("timeout_secs must be in 1..=600")),
             "expected bounded timeout error, got {envelope:?}"
+        );
+    }
+
+    #[test]
+    fn send_tool_rejects_oversized_wait_for_before_runtime_dispatch() {
+        let tool = WaSendTool::new(config(), db_path());
+        let wait_for = "ready".repeat((MAX_MCP_WAIT_PATTERN_BYTES / 5) + 1);
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 42,
+                    "text": "hello",
+                    "wait_for": wait_for,
+                    "wait_for_regex": true,
+                    "timeout_secs": 1
+                }),
+            )
+            .expect("wa.send oversized wait_for validation call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err = envelope["error"].as_str().expect("error string");
+        assert!(
+            err.contains("wait_for is"),
+            "error should identify wait_for field: {err}"
+        );
+        assert!(
+            err.contains(&MAX_MCP_WAIT_PATTERN_BYTES.to_string()),
+            "error should cite max pattern bytes: {err}"
         );
     }
 
