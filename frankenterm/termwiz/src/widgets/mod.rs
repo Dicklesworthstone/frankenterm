@@ -218,6 +218,26 @@ impl ScreenRelativeCoords {
 
 static WIDGET_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 
+fn next_saturating_widget_id(counter: &::std::sync::atomic::AtomicUsize) -> usize {
+    let mut current = counter.load(::std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            ::std::sync::atomic::Ordering::Relaxed,
+            ::std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn next_widget_id() -> usize {
+    next_saturating_widget_id(&WIDGET_ID)
+}
+
 /// The `WidgetId` uniquely describes an instance of a widget.
 /// Creating a new `WidgetId` generates a new unique identifier which can
 /// be safely copied and moved around; each copy refers to the same widget.
@@ -229,7 +249,7 @@ pub struct WidgetId(usize);
 
 impl WidgetId {
     pub fn new() -> Self {
-        WidgetId(WIDGET_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed))
+        WidgetId(next_widget_id())
     }
 }
 
@@ -872,6 +892,17 @@ mod test {
         fn render(&mut self, args: &mut RenderArgs) {
             args.cursor.visibility = CursorVisibility::Hidden;
         }
+    }
+
+    #[test]
+    fn widget_id_allocator_saturates_without_wrapping() {
+        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+        assert_eq!(next_saturating_widget_id(&counter), usize::MAX);
+        assert_eq!(
+            counter.load(::std::sync::atomic::Ordering::Relaxed),
+            usize::MAX
+        );
     }
 
     #[test]
