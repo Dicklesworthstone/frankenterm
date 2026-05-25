@@ -613,6 +613,16 @@ impl Aggregator {
             return Err(err);
         }
 
+        // If a sender reconnects after its local liveness window expires, do
+        // not let stale dedup state trap the reset sequence counter forever.
+        if self.stale_after_ms > 0
+            && self.agents.get(&envelope.sender).is_some_and(|session| {
+                received_at_ms.saturating_sub(session.last_seen_ms) >= self.stale_after_ms
+            })
+        {
+            self.agents.remove(&envelope.sender);
+        }
+
         let is_new = !self.agents.contains_key(&envelope.sender);
         if is_new && self.agents.len() >= self.max_agents {
             self.prune_stale_agents(received_at_ms);
@@ -2220,6 +2230,43 @@ mod tests {
         assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
         assert_eq!(agg.agent_last_seq("agent-b"), None);
         assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_stale_existing_sender_reset_is_not_trapped_by_old_dedup_state() {
+        let mut agg = Aggregator::with_stale_after(2, 50);
+
+        let first = WireEnvelope::new(5, "agent-a", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope_at(first, 100).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(5));
+
+        let restarted = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope_at(restarted, 200).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+
+        let snapshot = agg
+            .agent_session_snapshot("agent-a")
+            .expect("session recreated");
+        assert_eq!(snapshot.messages_received, 1);
+        assert_eq!(snapshot.duplicates_skipped, 0);
+        assert_eq!(snapshot.last_seen_ms, 200);
+        assert_eq!(agg.total_accepted(), 2);
+        assert_eq!(agg.total_rejected(), 0);
+
+        let duplicate_after_restart =
+            WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope_at(duplicate_after_restart, 210)
+                .unwrap(),
+            IngestResult::Duplicate { .. }
+        ));
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
     }
 
     #[test]
