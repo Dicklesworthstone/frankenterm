@@ -37,7 +37,7 @@ use std::sync::Once;
 
 use frankenterm_core::storage_backend_converter::{convert_db, copy_table, verify_equivalence};
 use frankenterm_core::storage_backend_trait::{
-    BackendError, OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+    BackendError, OpenConfig, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
 use proptest::prelude::*;
 use tracing::info;
@@ -109,6 +109,120 @@ fn insert_single_column_rows(backend: &RusqliteBackend, table: &str, rows: &[Str
                 &[ToSqlValue::Text(value.as_str())],
             )
             .expect("insert generated single-column row");
+    }
+}
+
+#[test]
+fn storage_backend_converter_preserves_blob_null_and_empty_text_cells() {
+    init_test_tracing_json();
+    let source = open_backend();
+    source
+        .execute_batch(
+            "CREATE TABLE typed_cells (id INTEGER, payload BLOB, maybe TEXT, empty TEXT);",
+        )
+        .expect("create source typed table");
+    source
+        .query_row_typed(
+            "INSERT INTO typed_cells (id, payload, maybe, empty) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                ToSqlValue::Integer(1),
+                ToSqlValue::Blob(&[0, 1, 2, 255]),
+                ToSqlValue::Null,
+                ToSqlValue::Text(""),
+            ],
+        )
+        .expect("insert source typed row");
+
+    let dest = open_backend();
+    dest.execute_batch(
+        "CREATE TABLE typed_cells (id INTEGER, payload BLOB, maybe TEXT, empty TEXT);",
+    )
+    .expect("create dest typed table");
+
+    let copied = copy_table(&source, &dest, "typed_cells").expect("copy typed table");
+    assert_eq!(copied, 1);
+    verify_equivalence(&source, &dest, &["typed_cells"]).expect("typed cells equivalent");
+
+    let rows = dest
+        .query_map_cells(
+            "SELECT id, payload, maybe, empty FROM typed_cells ORDER BY rowid",
+            &[],
+        )
+        .expect("read copied typed cells");
+    assert_eq!(
+        rows,
+        vec![vec![
+            SqlCell::Integer(1),
+            SqlCell::Blob(vec![0, 1, 2, 255]),
+            SqlCell::Null,
+            SqlCell::Text(String::new()),
+        ]]
+    );
+}
+
+#[test]
+fn storage_backend_converter_verify_detects_same_length_blob_mismatch() {
+    init_test_tracing_json();
+    let source = open_backend();
+    let dest = open_backend();
+    for backend in [&source, &dest] {
+        backend
+            .execute_batch("CREATE TABLE blobs (payload BLOB);")
+            .expect("create blob table");
+    }
+    source
+        .query_row_typed(
+            "INSERT INTO blobs (payload) VALUES (?1)",
+            &[ToSqlValue::Blob(&[1, 2, 3, 4])],
+        )
+        .expect("insert source blob");
+    dest.query_row_typed(
+        "INSERT INTO blobs (payload) VALUES (?1)",
+        &[ToSqlValue::Blob(&[9, 8, 7, 6])],
+    )
+    .expect("insert dest blob");
+
+    let err = verify_equivalence(&source, &dest, &["blobs"])
+        .expect_err("same-length blob mismatch must fail equivalence");
+    match err {
+        BackendError::Query(msg) => assert!(
+            msg.contains("row 0 column 0"),
+            "error message must locate blob mismatch, got: {msg}"
+        ),
+        other => panic!("expected BackendError::Query for blob mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn storage_backend_converter_verify_distinguishes_null_from_empty_text() {
+    init_test_tracing_json();
+    let source = open_backend();
+    let dest = open_backend();
+    for backend in [&source, &dest] {
+        backend
+            .execute_batch("CREATE TABLE nullable (value TEXT);")
+            .expect("create nullable table");
+    }
+    source
+        .query_row_typed(
+            "INSERT INTO nullable (value) VALUES (?1)",
+            &[ToSqlValue::Null],
+        )
+        .expect("insert source null");
+    dest.query_row_typed(
+        "INSERT INTO nullable (value) VALUES (?1)",
+        &[ToSqlValue::Text("")],
+    )
+    .expect("insert dest empty text");
+
+    let err = verify_equivalence(&source, &dest, &["nullable"])
+        .expect_err("NULL and empty TEXT must not compare equal");
+    match err {
+        BackendError::Query(msg) => assert!(
+            msg.contains("row 0 column 0"),
+            "error message must locate NULL/text mismatch, got: {msg}"
+        ),
+        other => panic!("expected BackendError::Query for NULL/text mismatch, got {other:?}"),
     }
 }
 

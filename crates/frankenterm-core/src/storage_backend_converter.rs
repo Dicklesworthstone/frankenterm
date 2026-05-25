@@ -2,9 +2,8 @@
 //!
 //! **Bead:** `ft-s03ox` / wa-2l27x.8.cont.migration_tool.
 //!
-//! Reads source rows via [`StorageBackend::query_map_strings`]
-//! and writes destination rows via INSERT statements composed
-//! against the destination's [`StorageBackend::execute`]. Pure
+//! Reads source rows via [`StorageBackend::query_map_cells`]
+//! and writes destination rows via typed INSERT bindings. Pure
 //! over the trait — works between any pair of backends that
 //! both implement the substrate ([`RusqliteBackend`] today,
 //! `FrankenSQLiteBackend` once `ft-kcdqp` lands).
@@ -43,12 +42,11 @@
 //!   already carry the same DDL (the wired-pass populates the
 //!   destination via the migration runner before invoking the
 //!   converter).
-//! - Cross-backend type-coercion (TEXT→INTEGER etc.) — every
-//!   value round-trips through the substrate's
-//!   [`encode_sqlite_value_as_string`] canonical encoding, so
-//!   integer columns land back as integers, blobs as
-//!   `<blob:N bytes>` placeholders. The wired-pass cont-bead
-//!   adds typed copy paths if blobs need byte-level fidelity.
+//! - Cross-backend type-coercion (TEXT→INTEGER etc.) — each value is
+//!   copied through the [`SqlCell`] / [`ToSqlValue`] storage-class
+//!   surface. Native backends preserve NULL and BLOB bytes; backends that
+//!   only implement the lossy default cell path must override it before
+//!   participating in fidelity-sensitive conversion.
 //!
 //! Cross-references:
 //! - `crates/frankenterm-core/src/storage_backend_trait.rs`
@@ -58,7 +56,7 @@
 //! - br-ft-l1jgo (call-site migration consumer of the same
 //!   StorageBackend trait surface).
 
-use crate::storage_backend_trait::{BackendError, StorageBackend};
+use crate::storage_backend_trait::{BackendError, SqlCell, StorageBackend, ToSqlValue};
 
 /// Result of a successful convert run. Counts what landed +
 /// surfaces a per-table digest the caller can pin in tests or
@@ -90,21 +88,10 @@ impl ConvertOutcome {
 /// per SQLite conventions. Values are routed through `?N`
 /// positional parameter binding to avoid string-injection.
 ///
-/// # Data-integrity warning — NOT blob/NULL safe
-///
-/// This copy round-trips every value through the *string* row pipeline
-/// (`query_map_strings` → `query_row_strings`), which is lossy for two value
-/// classes, so it must not be used on tables that carry them:
-/// - **BLOB columns are corrupted.** A blob reads back as the TEXT placeholder
-///   `<blob:N bytes>` and is re-inserted as that literal string, destroying the
-///   bytes. `verify_equivalence` cannot detect this (it stringifies both sides
-///   identically), so the corruption is silent.
-/// - **SQL NULL becomes empty TEXT** (`""`) on the destination.
-///
-/// Restrict callers to text/integer/real, non-NULL-significant tables until a
-/// `SqlCell`/`ToSqlValue`-binding copy path that preserves blob bytes and NULL
-/// is wired (the default trait param binding currently stringifies via
-/// `to_canonical_string`, so it does not help here).
+/// Values are read as [`SqlCell`] and bound as [`ToSqlValue`], preserving
+/// SQLite storage classes on native backends. This is intentionally stricter
+/// than the historical string pipeline, which flattened NULL to empty text and
+/// replaced BLOB contents with a size placeholder.
 pub fn copy_table(
     source: &dyn StorageBackend,
     dest: &dyn StorageBackend,
@@ -116,6 +103,8 @@ pub fn copy_table(
              identifiers (substrate-pass requires plain alphanumeric + underscore)"
         )));
     }
+    require_lossless_cells(source, "source")?;
+    require_lossless_cells(dest, "destination")?;
 
     // Discover columns by inspecting the first row's column
     // metadata. We use PRAGMA table_info(<table>) which returns
@@ -144,8 +133,9 @@ pub fn copy_table(
     let select_sql = format!("SELECT {column_list} FROM \"{table}\"");
     let insert_sql = format!("INSERT INTO \"{table}\" ({column_list}) VALUES ({placeholder_list})");
 
-    let rows = source.query_map_strings(&select_sql, &[])?;
-    for row in &rows {
+    let rows = source.query_map_cells(&select_sql, &[])?;
+    let mut param_rows = Vec::with_capacity(rows.len());
+    for row in rows {
         if row.len() != column_count {
             return Err(BackendError::Query(format!(
                 "table `{table}`: row width {} mismatches column count {}",
@@ -153,13 +143,16 @@ pub fn copy_table(
                 column_count,
             )));
         }
-        let params: Vec<&str> = row.iter().map(String::as_str).collect();
-        // Issue the INSERT through the dest's query_row_strings
-        // path so the same parameter-binding mechanics fire as
-        // the SELECT side. We don't need the result; pass through.
-        let _ = dest.query_row_strings(&insert_sql, &params)?;
+        param_rows.push(row.iter().map(sql_cell_to_owned_value).collect());
     }
-    Ok(rows.len())
+    let inserted = dest.execute_many(&insert_sql, &param_rows)?;
+    if inserted != param_rows.len() {
+        return Err(BackendError::Query(format!(
+            "table `{table}`: inserted {inserted} rows but expected {}",
+            param_rows.len()
+        )));
+    }
+    Ok(inserted)
 }
 
 /// Drive a full source→dest copy. Caller has already populated
@@ -195,23 +188,10 @@ pub fn convert_db(
 /// Verify row-count + content-hash equivalence between two
 /// backends across the named tables (scope item 3 of ft-s03ox).
 ///
-/// Returns `Ok(())` when every named table's
-/// `query_map_strings("SELECT * FROM <t> ORDER BY rowid", &[])`
-/// is byte-identical between the two backends. Returns the
-/// first divergence as `BackendError::Query` carrying the
-/// table name + row index + column index.
-///
-/// # Limitations
-///
-/// Comparison runs over the *string* row pipeline
-/// (`query_map_strings`), which is lossy for two value classes, so
-/// equivalence here is necessary but not fully sufficient for those:
-/// - **BLOBs** stringify to a `<blob:N bytes>` size placeholder, so two
-///   blobs of the *same length but different bytes* compare equal. Do not
-///   rely on this for blob-bearing tables; verify those over the
-///   `SqlCell` pipeline (`query_map_cells`) which carries raw bytes.
-/// - **NULL vs empty TEXT** both render as the empty string, so a SQL NULL
-///   and a real `""` compare equal.
+/// Returns `Ok(())` when every named table's typed
+/// `query_map_cells("SELECT * FROM <t> ORDER BY rowid", &[])` output is
+/// byte-identical between the two backends. Returns the first divergence as
+/// `BackendError::Query` carrying the table name + row index + column index.
 ///
 /// Ordering also assumes a rowid table (`ORDER BY rowid`); `WITHOUT ROWID`
 /// tables are out of scope for this verifier.
@@ -226,9 +206,14 @@ pub fn verify_equivalence(
                 "table name `{table}` is not a safe SQLite identifier"
             )));
         }
+    }
+    require_lossless_cells(a, "source")?;
+    require_lossless_cells(b, "destination")?;
+
+    for &table in tables {
         let sql = format!("SELECT * FROM \"{table}\" ORDER BY rowid");
-        let rows_a = a.query_map_strings(&sql, &[])?;
-        let rows_b = b.query_map_strings(&sql, &[])?;
+        let rows_a = a.query_map_cells(&sql, &[])?;
+        let rows_b = b.query_map_cells(&sql, &[])?;
         if rows_a.len() != rows_b.len() {
             return Err(BackendError::Query(format!(
                 "table `{table}` row-count mismatch: source has {} rows, \
@@ -248,6 +233,8 @@ pub fn verify_equivalence(
             }
             for (col_idx, (cell_a, cell_b)) in row_a.iter().zip(row_b.iter()).enumerate() {
                 if cell_a != cell_b {
+                    let cell_a = describe_cell(cell_a);
+                    let cell_b = describe_cell(cell_b);
                     return Err(BackendError::Query(format!(
                         "table `{table}` row {row_idx} column {col_idx}: \
                          source has `{cell_a}`, dest has `{cell_b}`"
@@ -257,6 +244,37 @@ pub fn verify_equivalence(
         }
     }
     Ok(())
+}
+
+fn sql_cell_to_owned_value(cell: &SqlCell) -> ToSqlValue<'static> {
+    match cell {
+        SqlCell::Null => ToSqlValue::Null,
+        SqlCell::Integer(i) => ToSqlValue::Integer(*i),
+        SqlCell::Real(f) => ToSqlValue::Real(*f),
+        SqlCell::Text(s) => ToSqlValue::OwnedText(s.clone()),
+        SqlCell::Blob(b) => ToSqlValue::OwnedBlob(b.clone()),
+    }
+}
+
+fn describe_cell(cell: &SqlCell) -> String {
+    match cell {
+        SqlCell::Null => "NULL".to_string(),
+        SqlCell::Integer(i) => i.to_string(),
+        SqlCell::Real(f) => f.to_string(),
+        SqlCell::Text(s) => s.clone(),
+        SqlCell::Blob(b) => format!("<blob:{} bytes>", b.len()),
+    }
+}
+
+fn require_lossless_cells(backend: &dyn StorageBackend, role: &str) -> Result<(), BackendError> {
+    if backend.supports_lossless_cells() {
+        return Ok(());
+    }
+    Err(BackendError::Query(format!(
+        "{role} backend `{}` does not advertise lossless SqlCell/ToSqlValue support; \
+         refusing storage conversion because trait-default cell paths flatten BLOB bytes and NULL values",
+        backend.backend_name()
+    )))
 }
 
 /// SQLite identifier safety: ASCII alphanumeric + underscore.
@@ -270,7 +288,7 @@ fn is_safe_identifier(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_backend_trait::{OpenConfig, RusqliteBackend};
+    use crate::storage_backend_trait::{MockBackend, OpenConfig, RusqliteBackend};
 
     fn populated_source() -> RusqliteBackend {
         let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
@@ -402,6 +420,29 @@ mod tests {
         let err = copy_table(&source, &dest, "nonexistent").unwrap_err();
         match err {
             BackendError::Query(msg) => assert!(msg.contains("does not exist")),
+            other => panic!("expected Query error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_converter_rejects_lossy_default_cell_backend() {
+        let source = MockBackend::new();
+        let dest = MockBackend::new();
+        let err = copy_table(&source, &dest, "p").unwrap_err();
+        match err {
+            BackendError::Query(msg) => {
+                assert!(msg.contains("source backend `mock`"));
+                assert!(msg.contains("lossless SqlCell/ToSqlValue support"));
+            }
+            other => panic!("expected Query error, got {other:?}"),
+        }
+
+        let err = verify_equivalence(&source, &dest, &["p"]).unwrap_err();
+        match err {
+            BackendError::Query(msg) => {
+                assert!(msg.contains("source backend `mock`"));
+                assert!(msg.contains("lossless SqlCell/ToSqlValue support"));
+            }
             other => panic!("expected Query error, got {other:?}"),
         }
     }

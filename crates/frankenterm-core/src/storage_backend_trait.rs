@@ -140,6 +140,18 @@ pub trait StorageBackend: Send + Sync {
     /// `"mock"`).
     fn backend_name(&self) -> &'static str;
 
+    /// True when [`Self::query_row_cells`] / [`Self::query_map_cells`] and
+    /// typed parameter binding preserve every SQLite storage class without
+    /// routing through the lossy string-canonical defaults.
+    ///
+    /// Backends must override this before participating in fidelity-sensitive
+    /// operations such as storage conversion. The default is conservative
+    /// because the trait defaults flatten BLOB bytes to a size placeholder and
+    /// cannot distinguish SQL NULL from empty TEXT.
+    fn supports_lossless_cells(&self) -> bool {
+        false
+    }
+
     // ------------------------------------------------------------------
     // br-ft-qgj81 substrate-pass: multi-column row reads.
     //
@@ -1155,6 +1167,10 @@ impl StorageBackend for RusqliteBackend {
 
     fn backend_name(&self) -> &'static str {
         "rusqlite"
+    }
+
+    fn supports_lossless_cells(&self) -> bool {
+        true
     }
 
     fn query_row_strings(
