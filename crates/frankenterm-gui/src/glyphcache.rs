@@ -957,6 +957,26 @@ impl GlyphCache {
         self.warm_up_glyphs(&Self::default_warmup_plan(), metrics, budget)
     }
 
+    /// ft-b4vw9: drop cached glyphs and block sprites whose `CellMetricKey` no
+    /// longer matches `current`. After a font scale change the key's embedded
+    /// `CellMetricKey` changes, so old-scale entries become unreachable from
+    /// new-scale lookups (`GlyphKey::metric` / `SizedBlockKey::size`) and would
+    /// otherwise accumulate dead across repeated scale changes. Returns the
+    /// number of entries removed.
+    ///
+    /// Isomorphism: every evicted entry is keyed by a `CellMetricKey != current`,
+    /// so no lookup at the current scale can resolve to it — rendered pixels are
+    /// unchanged. A later scale-back re-rasterizes the dropped glyphs identically
+    /// through `cached_glyph` (cache miss → same rasterizer, same metrics). This
+    /// reclaims the CPU-side `HashMap`s; the atlas is a bump allocator, so its
+    /// texture space is reclaimed only by a subsequent grow/rebuild, not here.
+    pub fn evict_stale_cell_metrics(&mut self, current: CellMetricKey) -> usize {
+        let before = self.glyph_cache.len() + self.block_glyphs.len();
+        self.glyph_cache.retain(|key, _| key.metric == current);
+        self.block_glyphs.retain(|key, _| key.size == current);
+        before - (self.glyph_cache.len() + self.block_glyphs.len())
+    }
+
     pub fn warm_up_glyphs(
         &mut self,
         requests: &[GlyphWarmupRequest],
@@ -1999,6 +2019,46 @@ mod tests {
             cache.tier_swap_doctor_report().aggregate.atlas_count,
             atlas_count_after_first,
             "re-warming an already-warm cache must not grow or rebuild the atlas"
+        );
+    }
+
+    // ft-b4vw9 eviction isomorphism: evicting against the CURRENT CellMetricKey
+    // removes nothing (no entry is stale), and evicting against a DIFFERENT
+    // metric removes exactly the entries keyed by the now-stale metric — the
+    // ones unreachable from new-scale lookups. Proves eviction touches only
+    // other-scale entries, never the current scale's, so rendering is unchanged.
+    // (Run verification deferred with the warm-up test: frankenterm-gui build is
+    // currently blocked by a `window`-lib E0308 under `headless-render`.)
+    #[test]
+    fn evict_stale_cell_metrics_removes_only_other_scale_entries() {
+        let (mut cache, metrics) = test_glyph_cache_with_atlas_size(1024);
+        cache.warm_up_default_glyphs(&metrics, Duration::from_secs(30));
+        let current: CellMetricKey = (&metrics).into();
+        let populated = cache.glyph_cache.len();
+        assert!(populated > 0, "warm-up must populate the glyph cache");
+
+        // Same metric => nothing is stale; current-scale entries are retained.
+        assert_eq!(cache.evict_stale_cell_metrics(current), 0);
+        assert_eq!(
+            cache.glyph_cache.len(),
+            populated,
+            "evicting against the current metric must retain every entry"
+        );
+
+        // A different metric => every current-scale entry is now stale.
+        let other = CellMetricKey {
+            pixel_width: current.pixel_width.wrapping_add(1),
+            pixel_height: current.pixel_height,
+        };
+        let evicted = cache.evict_stale_cell_metrics(other);
+        assert_eq!(
+            evicted, populated,
+            "all current-scale entries are stale relative to a different metric"
+        );
+        assert_eq!(
+            cache.glyph_cache.len(),
+            0,
+            "stale entries must be dropped"
         );
     }
 

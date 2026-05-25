@@ -143,13 +143,18 @@ impl super::TermWindow {
                 // fail-safe (logs + returns stats if the font cannot resolve);
                 // no-op when render_state is absent (headless / pre-init).
                 if let Some(render_state) = self.render_state.as_ref() {
-                    let _warm = render_state
-                        .glyph_cache
-                        .borrow_mut()
-                        .warm_up_default_glyphs(
-                            &self.render_metrics,
-                            SCALE_CHANGE_GLYPH_WARMUP_BUDGET,
-                        );
+                    let mut glyph_cache = render_state.glyph_cache.borrow_mut();
+                    // ft-b4vw9: drop now-unreachable old-CellMetricKey glyphs/
+                    // blocks before warming the new scale, so the CPU-side caches
+                    // stay bounded across repeated scale changes. Evicted entries
+                    // are keyed by a different CellMetricKey and can't be hit at
+                    // the new scale, so rendering is unchanged.
+                    let _evicted =
+                        glyph_cache.evict_stale_cell_metrics((&self.render_metrics).into());
+                    let _warm = glyph_cache.warm_up_default_glyphs(
+                        &self.render_metrics,
+                        SCALE_CHANGE_GLYPH_WARMUP_BUDGET,
+                    );
                 }
             }
             Err(err) => {
