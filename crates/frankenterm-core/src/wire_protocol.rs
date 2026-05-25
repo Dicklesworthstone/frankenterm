@@ -688,6 +688,14 @@ impl Aggregator {
     }
 
     pub fn rollback_accepted(&mut self, sender: &str, previous: Option<AgentSessionSnapshot>) {
+        let current_messages = self
+            .agents
+            .get(sender)
+            .map_or(0, |session| session.messages_received);
+        let previous_messages = previous
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.messages_received);
+
         match previous {
             Some(previous) => {
                 self.agents.insert(
@@ -704,11 +712,19 @@ impl Aggregator {
                 self.agents.remove(sender);
             }
         }
-        // Once a lifetime metric saturates we keep it sticky at MAX:
-        // rollback cannot know whether the accepted message actually
-        // incremented the saturated counter.
+        // Once a committed-accept metric saturates we keep it sticky at MAX:
+        // rollback cannot know which accepted message crossed the saturation
+        // boundary, so decrementing would under-report after saturation.
         if self.total_accepted != u64::MAX {
-            self.total_accepted = self.total_accepted.saturating_sub(1);
+            self.total_accepted = match current_messages.cmp(&previous_messages) {
+                std::cmp::Ordering::Greater => self
+                    .total_accepted
+                    .saturating_sub(current_messages - previous_messages),
+                std::cmp::Ordering::Less => self
+                    .total_accepted
+                    .saturating_add(previous_messages - current_messages),
+                std::cmp::Ordering::Equal => self.total_accepted,
+            };
         }
     }
 
@@ -2754,6 +2770,32 @@ mod tests {
         let result = agg.ingest_envelope_at(e2_retry, now + 20).unwrap();
         assert!(matches!(result, IngestResult::Accepted(_)));
         assert_eq!(agg.agent_last_seq("agent-a"), Some(2));
+    }
+
+    #[test]
+    fn aggregator_rollback_subtracts_all_uncommitted_accepts() {
+        let mut agg = Aggregator::new(10);
+        let now = 1_000i64;
+
+        let e1 = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e1, now).unwrap();
+        let snapshot_after_1 = agg.agent_session_snapshot("agent-a");
+
+        let e2 = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e2, now + 10).unwrap();
+        let e3 = WireEnvelope::new(3, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e3, now + 20).unwrap();
+        assert_eq!(agg.total_accepted(), 3);
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(3));
+
+        agg.rollback_accepted("agent-a", snapshot_after_1);
+
+        assert_eq!(
+            agg.total_accepted(),
+            1,
+            "rollback must subtract every accepted sequence newer than the snapshot"
+        );
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
     }
 
     #[test]

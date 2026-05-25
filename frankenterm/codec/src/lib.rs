@@ -905,14 +905,7 @@ impl Pdu {
             Ok(decoded) => {
                 let consumed = cursor.position() as usize;
                 let remain = buffer.len() - consumed;
-                // Remove `consumed` bytes from the start of the vec.
-                // Safety: the vec is just bytes and offsets are constrained.
-                // Use `copy` (memmove) instead of `copy_nonoverlapping` (memcpy)
-                // because source [consumed..consumed+remain] and dest [0..remain]
-                // overlap when consumed < remain.
-                unsafe {
-                    std::ptr::copy(buffer.as_ptr().add(consumed), buffer.as_mut_ptr(), remain);
-                }
+                buffer.copy_within(consumed.., 0);
                 buffer.truncate(remain);
                 Ok(Some(decoded))
             }
