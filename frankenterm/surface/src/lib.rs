@@ -555,8 +555,22 @@ impl Surface {
         let mut s = String::new();
 
         for line in &self.lines {
+            let mut col = 0usize;
             for cell in line.visible_cells() {
+                let cell_idx = cell.cell_index();
+                while col < cell_idx.min(self.width) {
+                    s.push(' ');
+                    col += 1;
+                }
+                if col >= self.width {
+                    break;
+                }
                 s.push_str(cell.str());
+                col = col.saturating_add(cell.width().max(1));
+            }
+            while col < self.width {
+                s.push(' ');
+                col += 1;
             }
             s.push('\n');
         }
@@ -1290,7 +1304,7 @@ mod test {
             y: Position::Absolute(1),
         });
         s.add_change(Change::ClearToEndOfLine(Default::default()));
-        assert_eq!(s.screen_chars_to_string(), "   \nw\nfoo\n");
+        assert_eq!(s.screen_chars_to_string(), "   \nw  \nfoo\n");
     }
 
     #[test]
@@ -1304,7 +1318,7 @@ mod test {
             y: Position::Absolute(1),
         });
         s.add_change(Change::ClearToEndOfScreen(Default::default()));
-        assert_eq!(s.screen_chars_to_string(), "hel\nw\n   \n");
+        assert_eq!(s.screen_chars_to_string(), "hel\nw  \n   \n");
 
         let (_seq, changes) = s.get_changes(0);
         assert_eq!(

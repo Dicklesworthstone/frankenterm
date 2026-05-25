@@ -29,6 +29,17 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+const MAX_MATERIALIZED_LINE_LEN: usize = u32::MAX as usize;
+
+fn normalize_cell_width(width: usize) -> usize {
+    width.clamp(1, 2)
+}
+
+fn checked_materialized_end(idx: usize, width: usize) -> Option<usize> {
+    let end = idx.checked_add(width)?;
+    (end <= MAX_MATERIALIZED_LINE_LEN).then_some(end)
+}
+
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneRange {
@@ -830,6 +841,11 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        let width = normalize_cell_width(width);
+        if checked_materialized_end(idx, width).is_none() {
+            return;
+        }
+
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
@@ -878,7 +894,10 @@ impl Line {
         // but in case one does sneak through, we need to ensure that
         // we grow the cells array to hold this bogus entry.
         // https://github.com/wezterm/wezterm/issues/768
-        let width = cell.width().max(1);
+        let width = normalize_cell_width(cell.width());
+        let Some(end_idx) = checked_materialized_end(idx, width) else {
+            return;
+        };
 
         self.invalidate_implicit_hyperlinks(seqno);
         self.invalidate_zones();
@@ -914,8 +933,8 @@ impl Line {
         // if the line isn't wide enough, pad it out with the default attributes.
         {
             let cells = self.coerce_vec_storage();
-            if idx + width > cells.len() {
-                cells.resize_with(idx + width, Cell::blank);
+            if end_idx > cells.len() {
+                cells.resize_with(end_idx, Cell::blank);
             }
         }
 
@@ -967,6 +986,12 @@ impl Line {
     }
 
     pub fn insert_cell(&mut self, x: usize, cell: Cell, right_margin: usize, seqno: SequenceNo) {
+        if right_margin == 0
+            || checked_materialized_end(x, normalize_cell_width(cell.width())).is_none()
+        {
+            return;
+        }
+
         self.invalidate_implicit_hyperlinks(seqno);
 
         let cells = self.coerce_vec_storage();
@@ -1025,16 +1050,21 @@ impl Line {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
+        if right_margin == 0 {
+            return;
+        }
+
         self.invalidate_implicit_hyperlinks(seqno);
         if x < self.len() {
             self.invalidate_grapheme_at_or_before(x);
             self.coerce_vec_storage().remove(x);
         }
-        if right_margin <= self.len() + 1
-        /* we just removed one */
-        {
+        // We just removed one cell above, so the old inclusive right margin maps
+        // to an insert index that may be exactly one past the current end.
+        let insert_idx = right_margin - 1;
+        if insert_idx <= self.len() {
             self.coerce_vec_storage()
-                .insert(right_margin - 1, Cell::blank_with_attrs(blank_attr));
+                .insert(insert_idx, Cell::blank_with_attrs(blank_attr));
         }
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
@@ -2086,6 +2116,19 @@ mod tests {
     }
 
     #[test]
+    fn line_set_cell_rejects_overflowing_index() {
+        let mut line = Line::with_width(1, SEQ_ZERO);
+        line.set_cell(usize::MAX, Cell::new('Z', CellAttributes::default()), 1);
+        assert_eq!(line.len(), 1);
+        assert_eq!(line.as_str().as_ref(), " ");
+
+        let mut clustered = Line::new(SEQ_ZERO);
+        clustered.set_cell_grapheme(usize::MAX, "Z", 1, CellAttributes::default(), 1);
+        assert_eq!(clustered.len(), 0);
+        assert_eq!(clustered.as_str().as_ref(), "");
+    }
+
+    #[test]
     fn line_erase_cell() {
         let mut line: Line = "abcde".into();
         line.erase_cell(2, 1);
@@ -2841,7 +2884,7 @@ mod tests {
 
     #[test]
     fn line_double_click_range_inside_wide_non_word_cell_stays_empty() {
-        let line = Line::from_text("❤a", &CellAttributes::default(), SEQ_ZERO, None);
+        let line = Line::from_text("❤️a", &CellAttributes::default(), SEQ_ZERO, None);
         let first = line.visible_cells().next().expect("wide first cell");
         assert_eq!(first.width(), 2);
 
@@ -2854,6 +2897,17 @@ mod tests {
         let mut line: Line = "abde".into();
         line.insert_cell(2, Cell::new('c', CellAttributes::default()), 5, 1);
         assert_eq!(line.columns_as_str(0..5), "abcde");
+    }
+
+    #[test]
+    fn line_zero_right_margin_edit_is_noop() {
+        let mut insert_line: Line = "abc".into();
+        insert_line.insert_cell(1, Cell::new('X', CellAttributes::default()), 0, 1);
+        assert_eq!(insert_line.as_str().as_ref(), "abc");
+
+        let mut erase_line: Line = "abc".into();
+        erase_line.erase_cell_with_margin(1, 0, 1, CellAttributes::blank());
+        assert_eq!(erase_line.as_str().as_ref(), "abc");
     }
 
     #[test]
