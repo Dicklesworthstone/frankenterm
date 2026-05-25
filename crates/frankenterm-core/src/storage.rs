@@ -16639,6 +16639,65 @@ fn seed_pane_backend(backend: &dyn StorageBackend, pane_id: i64, now_ms: i64) {
     .unwrap();
 }
 
+/// Exactness guard for the segment-write hot path: `append_segment_backend`
+/// must assign per-pane `seq` values that are gapless, strictly monotonic, and
+/// start at 0 — and each pane's sequence is independent of the others. This is
+/// the invariant the single-writer-thread serialization exists to uphold (the
+/// `SELECT MAX(seq)+1` then `INSERT` is only safe because one thread runs it).
+/// A regression that broke the `MAX(seq)+1` logic, or moved append off the
+/// serialized writer, would surface here as a gap, duplicate, or wrong start.
+#[test]
+fn append_segment_assigns_gapless_monotonic_independent_seqs() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+    seed_pane_backend(&backend, 2, 1_000);
+
+    // Pane 1: the first five appends must return seq 0,1,2,3,4 in order.
+    for expected in 0u64..5 {
+        let seg = append_segment_backend(&backend, 1, &format!("p1-{expected}"), None).unwrap();
+        assert_eq!(seg.seq, expected, "pane 1 seq must be gapless and start at 0");
+        assert_eq!(seg.pane_id, 1);
+    }
+    // Pane 2 is independent — its sequence also starts at 0.
+    for expected in 0u64..3 {
+        let seg = append_segment_backend(&backend, 2, &format!("p2-{expected}"), None).unwrap();
+        assert_eq!(seg.seq, expected, "pane 2 seq is independent of pane 1");
+    }
+    // Interleaving resumes each pane's own counter.
+    assert_eq!(append_segment_backend(&backend, 1, "p1-5", None).unwrap().seq, 5);
+    assert_eq!(append_segment_backend(&backend, 2, "p2-3", None).unwrap().seq, 3);
+
+    // DB-level: per pane, gapless ⟺ MAX(seq)+1 == COUNT(*), and no duplicate
+    // (pane_id, seq) pairs exist anywhere.
+    for (pane, count) in [(1i64, 6i64), (2, 4)] {
+        let row = backend
+            .query_row_typed(
+                "SELECT MAX(seq), COUNT(*) FROM output_segments WHERE pane_id = ?1",
+                &[ToSqlValue::Integer(pane)],
+            )
+            .unwrap()
+            .unwrap();
+        let reader = RowReader::new(&row);
+        let max_seq = reader.i64(0).unwrap();
+        let n = reader.i64(1).unwrap();
+        assert_eq!(n, count, "pane {pane} row count");
+        assert_eq!(max_seq + 1, n, "pane {pane} sequence has a gap: max={max_seq}, count={n}");
+    }
+    let dup_row = backend
+        .query_row_typed(
+            "SELECT COUNT(*) FROM (SELECT pane_id, seq FROM output_segments \
+             GROUP BY pane_id, seq HAVING COUNT(*) > 1)",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        RowReader::new(&dup_row).i64(0).unwrap(),
+        0,
+        "no duplicate (pane_id, seq) pairs may exist"
+    );
+}
+
 fn seed_pane_with_last_seen_backend(
     backend: &dyn StorageBackend,
     pane_id: i64,
