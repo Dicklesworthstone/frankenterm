@@ -77,6 +77,7 @@ fn stable_row_range_from_len(
     Some(start..end)
 }
 
+#[cfg(test)]
 fn stable_row_range_from_signed_len(
     start: StableRowIndex,
     len: StableRowIndex,

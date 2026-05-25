@@ -8,9 +8,9 @@ use crate::escape::{Action, CSI};
 use crate::keymap::{Found, KeyMap};
 use crate::readbuf::ReadBuffer;
 use frankenterm_input_types::{ansi_us_unshift_fallback, ctrl_mapping};
-use std::convert::TryFrom;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::fmt::Write;
 
 pub use frankenterm_input_types::Modifiers;
@@ -807,10 +807,12 @@ fn is_ascii(c: char) -> bool {
     (c as u32) < 0x80
 }
 
+#[cfg(any(windows, test))]
 fn signed_coord_to_u16_saturating(value: i16) -> u16 {
     u16::try_from(value).unwrap_or(if value < 0 { 0 } else { u16::MAX })
 }
 
+#[cfg(any(windows, test))]
 fn signed_coord_to_usize_saturating(value: i16) -> usize {
     usize::try_from(i32::from(value).max(0)).unwrap_or(0)
 }

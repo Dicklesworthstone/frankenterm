@@ -2,6 +2,7 @@ use crate::overlay::quickselect;
 use crate::scripting::guiwin::GuiWin;
 use config::configuration;
 use config::keyassignment::{InputSelector, InputSelectorEntry, KeyAssignment};
+use frankenterm_gui::selector_math::{selector_label_count, visible_mouse_entry_index};
 use mux::termwiztermtab::TermWizTerminal;
 use mux_lua::MuxPane;
 use nucleo_matcher::pattern::Pattern;
@@ -54,9 +55,19 @@ struct SelectorState {
 }
 
 impl SelectorState {
+    fn refresh_labels(&mut self) {
+        self.labels = quickselect::compute_labels_for_alphabet_with_preserved_case(
+            &self.args.alphabet,
+            selector_label_count(self.filtered_entries.len(), self.max_items),
+        );
+    }
+
     fn update_filter(&mut self) {
         if self.filter_term.is_empty() {
             self.filtered_entries = self.args.choices.clone();
+            self.active_idx = 0;
+            self.top_row = 0;
+            self.refresh_labels();
             return;
         }
 
@@ -89,6 +100,7 @@ impl SelectorState {
 
         self.active_idx = 0;
         self.top_row = 0;
+        self.refresh_labels();
     }
 
     fn render(&mut self, term: &mut TermWizTerminal) -> termwiz::Result<()> {
@@ -96,11 +108,8 @@ impl SelectorState {
         let max_width = size.cols.saturating_sub(6);
         let max_items = size.rows.saturating_sub(ROW_OVERHEAD);
         if max_items != self.max_items {
-            self.labels = quickselect::compute_labels_for_alphabet_with_preserved_case(
-                &self.args.alphabet,
-                self.filtered_entries.len().min(max_items + 1),
-            );
             self.max_items = max_items;
+            self.refresh_labels();
         }
 
         let mut changes = vec![
@@ -233,8 +242,11 @@ impl SelectorState {
     }
 
     fn move_down(&mut self) {
-        self.active_idx = (self.active_idx + 1).min(self.filtered_entries.len().saturating_sub(1));
-        if self.active_idx > self.top_row + self.max_items {
+        self.active_idx = self
+            .active_idx
+            .saturating_add(1)
+            .min(self.filtered_entries.len().saturating_sub(1));
+        if self.active_idx > self.top_row.saturating_add(self.max_items) {
             self.top_row = self.active_idx.saturating_sub(self.max_items);
         }
     }
@@ -251,7 +263,7 @@ impl SelectorState {
                         // since the number of labels is always <= self.max_items
                         // by construction, we have pos as usize <= self.max_items
                         // for free
-                        self.active_idx = self.top_row + pos as usize;
+                        self.active_idx = self.top_row.saturating_add(pos);
                         if self.launch(self.active_idx) {
                             break;
                         }
@@ -336,7 +348,7 @@ impl SelectorState {
                     if mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
                         self.top_row = self.top_row.saturating_sub(1);
                     } else {
-                        self.top_row += 1;
+                        self.top_row = self.top_row.saturating_add(1);
                         self.top_row = self.top_row.min(
                             self.filtered_entries
                                 .len()
@@ -344,15 +356,19 @@ impl SelectorState {
                                 .saturating_sub(1),
                         );
                     }
-                    if y > 0 && y as usize <= self.filtered_entries.len() {
-                        self.active_idx = self.top_row + y as usize - 1;
+                    if let Some(active_idx) =
+                        visible_mouse_entry_index(self.top_row, y, self.filtered_entries.len())
+                    {
+                        self.active_idx = active_idx;
                     }
                 }
                 InputEvent::Mouse(MouseEvent {
                     y, mouse_buttons, ..
                 }) => {
-                    if y > 0 && y as usize <= self.filtered_entries.len() {
-                        self.active_idx = self.top_row + y as usize - 1;
+                    if let Some(active_idx) =
+                        visible_mouse_entry_index(self.top_row, y, self.filtered_entries.len())
+                    {
+                        self.active_idx = active_idx;
 
                         if mouse_buttons == MouseButtons::LEFT {
                             if self.launch(self.active_idx) {

@@ -34,6 +34,16 @@ fn pop_instrumented_func(
     lock_or_recover(queue).pop_front()
 }
 
+fn wrap_main_thread_dispatch_scope(f: SpawnFunc) -> SpawnFunc {
+    Box::new(move || {
+        // Mark the duration of this task so promise::spawn::block_on
+        // can detect a would-be self-deadlock on the main thread and
+        // panic with a clear message instead of beach-balling.
+        let _dispatch_scope = promise::spawn::enter_main_thread_dispatch_scope();
+        f();
+    })
+}
+
 pub(crate) struct SpawnQueue {
     spawned_funcs: Mutex<VecDeque<InstrumentedSpawnFunc>>,
     spawned_funcs_low_pri: Mutex<VecDeque<InstrumentedSpawnFunc>>,
@@ -49,13 +59,7 @@ pub(crate) struct SpawnQueue {
 
 fn schedule_with_pri(runnable: Runnable, high_pri: bool) {
     SPAWN_QUEUE.spawn_impl(
-        Box::new(move || {
-            // Mark the duration of this task so promise::spawn::block_on
-            // can detect a would-be self-deadlock on the main thread and
-            // panic with a clear message instead of beach-balling.
-            let _dispatch_scope = promise::spawn::enter_main_thread_dispatch_scope();
-            runnable.run();
-        }),
+        wrap_main_thread_dispatch_scope(Box::new(move || runnable.run())),
         high_pri,
     );
 }
@@ -139,6 +143,45 @@ impl SpawnQueue {
             func();
         }
         self.has_any_queued()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_main_thread_dispatch_scope;
+
+    #[test]
+    fn main_thread_dispatch_wrapper_sets_and_clears_guard() {
+        assert!(!promise::spawn::is_in_main_thread_dispatch());
+
+        let wrapped = wrap_main_thread_dispatch_scope(Box::new(|| {
+            assert!(promise::spawn::is_in_main_thread_dispatch());
+        }));
+        wrapped();
+
+        assert!(
+            !promise::spawn::is_in_main_thread_dispatch(),
+            "dispatch guard must clear after a queued task returns"
+        );
+    }
+
+    #[test]
+    fn main_thread_dispatch_wrapper_makes_block_on_fail_closed() {
+        assert!(!promise::spawn::is_in_main_thread_dispatch());
+
+        let wrapped = wrap_main_thread_dispatch_scope(Box::new(|| {
+            let _ = promise::spawn::block_on(async { 1 });
+        }));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wrapped));
+        assert!(
+            result.is_err(),
+            "block_on inside a main-thread dispatch task must panic instead of deadlocking"
+        );
+        assert!(
+            !promise::spawn::is_in_main_thread_dispatch(),
+            "dispatch guard must clear when a queued task unwinds"
+        );
     }
 }
 
