@@ -455,6 +455,11 @@ pub struct QuarantineRegistry {
     audit_log: VecDeque<QuarantineAuditEvent>,
     telemetry: QuarantineTelemetry,
     max_audit_events: usize,
+    /// Whether [`Self::maybe_expire`] auto-expires TTL'd quarantines (the
+    /// `QuarantineConfig::auto_expire` policy, default on). The authorize path
+    /// calls `maybe_expire` each tick; without it a TTL'd quarantine never
+    /// transitioned to `Clear` and blocked its component forever.
+    auto_expire: bool,
 }
 
 impl QuarantineRegistry {
@@ -467,6 +472,7 @@ impl QuarantineRegistry {
             audit_log: VecDeque::new(),
             telemetry: QuarantineTelemetry::default(),
             max_audit_events: DEFAULT_MAX_AUDIT_EVENTS,
+            auto_expire: true,
         }
     }
 
@@ -479,6 +485,7 @@ impl QuarantineRegistry {
             audit_log: VecDeque::new(),
             telemetry: QuarantineTelemetry::default(),
             max_audit_events: config.max_audit_events,
+            auto_expire: config.auto_expire,
         }
     }
 
@@ -776,6 +783,27 @@ impl QuarantineRegistry {
             });
         }
         expired
+    }
+
+    /// Auto-expire TTL'd quarantines iff the `auto_expire` policy is enabled.
+    ///
+    /// This is the hook the authorize path calls each tick. Splitting it from
+    /// [`Self::expire_quarantines`] lets callers honor the
+    /// `QuarantineConfig::auto_expire` flag without re-reading config: when the
+    /// flag is off the registry is left untouched (operator opted into
+    /// manual-release-only). Returns the component IDs expired this call.
+    pub fn maybe_expire(&mut self, now_ms: u64) -> Vec<String> {
+        if self.auto_expire {
+            self.expire_quarantines(now_ms)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether auto-expiry is enabled for this registry.
+    #[must_use]
+    pub fn auto_expire_enabled(&self) -> bool {
+        self.auto_expire
     }
 
     // ---- Kill switch operations ----
@@ -1202,6 +1230,65 @@ mod tests {
         assert_eq!(expired, vec!["c1"]);
         assert!(!reg.is_quarantined("c1"));
         assert_eq!(reg.telemetry.quarantines_expired, 1);
+    }
+
+    #[test]
+    fn maybe_expire_honors_auto_expire_and_unblocks_enforcement() {
+        // Regression: the authorize path now calls maybe_expire each tick. With
+        // auto_expire on (default), a TTL'd quarantine must transition to Clear
+        // and stop blocking once expired — previously nothing called
+        // expire_quarantines, so is_blocked_* (state+severity only) blocked the
+        // component forever past its TTL. With auto_expire off, it must persist.
+        let mut reg = QuarantineRegistry::new();
+        assert!(reg.auto_expire_enabled());
+        reg.quarantine(
+            "c1",
+            ComponentKind::Connector,
+            QuarantineSeverity::Isolated,
+            test_reason(),
+            "op",
+            1000,
+            5000,
+        )
+        .unwrap();
+        assert!(
+            reg.is_blocked_for_writes("c1"),
+            "active quarantine must block before expiry"
+        );
+        assert!(reg.maybe_expire(4999).is_empty(), "not expired before TTL");
+        assert!(reg.is_blocked_for_writes("c1"));
+        assert_eq!(reg.maybe_expire(5000), vec!["c1"], "expires at TTL");
+        assert!(
+            !reg.is_blocked_for_writes("c1"),
+            "an expired quarantine must stop blocking writes"
+        );
+        assert!(!reg.is_blocked_for_all("c1"));
+
+        // auto_expire disabled: maybe_expire is a no-op, quarantine persists.
+        let config = QuarantineConfig {
+            auto_expire: false,
+            ..QuarantineConfig::default()
+        };
+        let mut reg2 = QuarantineRegistry::from_config(&config);
+        assert!(!reg2.auto_expire_enabled());
+        reg2.quarantine(
+            "c2",
+            ComponentKind::Connector,
+            QuarantineSeverity::Isolated,
+            test_reason(),
+            "op",
+            1000,
+            5000,
+        )
+        .unwrap();
+        assert!(
+            reg2.maybe_expire(9999).is_empty(),
+            "auto_expire off must make maybe_expire a no-op"
+        );
+        assert!(
+            reg2.is_blocked_for_writes("c2"),
+            "without auto_expire the quarantine persists past its TTL (manual release only)"
+        );
     }
 
     #[test]

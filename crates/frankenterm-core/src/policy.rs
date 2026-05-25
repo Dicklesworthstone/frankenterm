@@ -6037,6 +6037,18 @@ impl PolicyEngine {
     ) -> PolicyDecision {
         let mut context = DecisionContext::from_input(input);
 
+        // Auto-expire TTL'd quarantines on each real authorize() tick (the
+        // documented, default-on `QuarantineConfig::auto_expire` behavior).
+        // Without this, `expire_quarantines` was never called, so a quarantine
+        // with a finite `expires_at_ms` never transitioned to `Clear` and
+        // blocked its component forever (`is_blocked_*` only inspect state +
+        // severity, not expiry) — over-blocking auto-recovery and applying a
+        // stale quarantine to any reused pane id. Gated on `consume_rate_limit`
+        // so dry-run previews stay side-effect-free.
+        if consume_rate_limit {
+            self.quarantine_registry.maybe_expire(checked_now_ms_u64());
+        }
+
         // ---- Quarantine check (earliest gate) ----
         // If the kill switch is active at emergency level, block everything.
         if self.quarantine_registry.kill_switch().is_emergency() {
