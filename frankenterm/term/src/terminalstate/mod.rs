@@ -97,7 +97,9 @@ impl TabStop {
     }
 
     fn set_tab_stop(&mut self, col: usize) {
-        self.tabs[col] = true;
+        if let Some(tab) = self.tabs.get_mut(col) {
+            *tab = true;
+        }
     }
 
     fn find_prev_tab_stop(&self, col: usize) -> Option<usize> {
@@ -3314,6 +3316,13 @@ mod tests {
         assert!(!ts.tabs[5]);
         ts.set_tab_stop(5);
         assert!(ts.tabs[5]);
+    }
+
+    #[test]
+    fn tabstop_set_out_of_range_is_noop() {
+        let mut ts = TabStop::new(80, 8);
+        ts.set_tab_stop(usize::MAX);
+        assert_eq!(ts.tabs.len(), 80);
     }
 
     #[test]
