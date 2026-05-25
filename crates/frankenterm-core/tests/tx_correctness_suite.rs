@@ -926,6 +926,65 @@ fn resume_after_partial_commit_shows_correct_pending() {
 }
 
 #[test]
+fn resume_from_partial_commit_receipts_requires_compensation() {
+    let contract = build_contract(5, MissionTxState::Prepared);
+    let commit_inputs = partial_commit_inputs(5, 3);
+    let commit_report = execute_commit_phase(
+        &contract,
+        &commit_inputs,
+        MissionKillSwitchLevel::Off,
+        false,
+        10_000,
+    )
+    .unwrap();
+    assert!(commit_report.has_failures());
+
+    let mut receipt_contract = build_contract(5, MissionTxState::Failed);
+    receipt_contract.receipts = commit_report.receipts.clone();
+
+    let resume = reconstruct_tx_resume_state(&receipt_contract, None, None, 15_000);
+    assert!(resume.commit_phase_completed);
+    assert_eq!(resume.committed_step_ids.len(), 2);
+    assert!(resume.needs_compensation);
+    assert!(resume.has_pending_work());
+    assert!(!resume.is_fully_resolved());
+}
+
+#[test]
+fn resume_after_compensation_failure_keeps_residual_work() {
+    let contract = build_contract(5, MissionTxState::Prepared);
+    let commit_inputs = partial_commit_inputs(5, 4);
+    let commit_report = execute_commit_phase(
+        &contract,
+        &commit_inputs,
+        MissionKillSwitchLevel::Off,
+        false,
+        10_000,
+    )
+    .unwrap();
+    assert_eq!(commit_report.committed_count, 3);
+
+    let comp_contract = build_contract(5, MissionTxState::Compensating);
+    let mut comp_inputs = success_comp_inputs(5);
+    comp_inputs
+        .iter_mut()
+        .find(|input| input.for_step_id.0.as_str() == "s2")
+        .expect("s2 compensation input should exist")
+        .success = false;
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
+    assert!(comp_report.has_residual_risk());
+
+    let resume =
+        reconstruct_tx_resume_state(&contract, Some(&commit_report), Some(&comp_report), 25_000);
+    assert!(!resume.compensation_phase_completed);
+    assert_eq!(resume.compensated_step_ids, vec![TxStepId("s3".into())]);
+    assert!(resume.needs_compensation);
+    assert!(resume.has_pending_work());
+    assert!(!resume.is_fully_resolved());
+}
+
+#[test]
 fn resume_after_full_pipeline_is_resolved() {
     // Full commit
     let commit_contract = build_contract(3, MissionTxState::Prepared);

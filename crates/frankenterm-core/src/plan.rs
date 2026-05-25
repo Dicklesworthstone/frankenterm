@@ -5541,9 +5541,11 @@ pub fn reconstruct_tx_resume_state(
 
     let mut committed_step_ids = Vec::new();
     let mut commit_phase_completed = false;
+    let mut commit_had_failures = false;
 
     if let Some(cr) = commit_report {
         commit_phase_completed = true;
+        commit_had_failures = cr.has_failures();
         for result in &cr.step_results {
             let is_committed = matches!(result.outcome, TxCommitStepOutcome::Committed { .. });
             if is_committed {
@@ -5552,6 +5554,7 @@ pub fn reconstruct_tx_resume_state(
         }
     } else if let Ok(receipt_report) = mission_tx_rollback_commit_report(contract, now_ms) {
         commit_phase_completed = true;
+        commit_had_failures = receipt_report.has_failures();
         committed_step_ids.extend(
             receipt_report
                 .step_results
@@ -5565,14 +5568,24 @@ pub fn reconstruct_tx_resume_state(
     let mut compensation_phase_completed = false;
 
     if let Some(comp) = comp_report {
-        compensation_phase_completed = true;
-        // If compensation succeeded, all committed steps were compensated.
-        // If it failed (residual risk), none were fully compensated.
-        if comp.has_residual_risk() {
-            // Compensation failed; don't mark anything as compensated.
-        } else {
-            compensated_step_ids.clone_from(&committed_step_ids);
+        let committed_step_set = committed_step_ids
+            .iter()
+            .map(|step_id| step_id.0.as_str())
+            .collect::<HashSet<_>>();
+        let mut compensated_step_set = HashSet::new();
+        for result in &comp.step_results {
+            if result.outcome.is_committed() {
+                compensated_step_set.insert(result.step_id.0.as_str());
+                compensated_step_ids.push(result.step_id.clone());
+            }
         }
+        let outcome_can_complete = match comp.outcome {
+            TxCompensationOutcome::FullyRolledBack => true,
+            TxCompensationOutcome::NothingToCompensate => committed_step_set.is_empty(),
+            TxCompensationOutcome::CompensationFailed => false,
+        };
+        compensation_phase_completed =
+            outcome_can_complete && committed_step_set.is_subset(&compensated_step_set);
     }
 
     let pending_step_ids: Vec<TxStepId> = if commit_phase_completed {
@@ -5583,11 +5596,8 @@ pub fn reconstruct_tx_resume_state(
 
     // Compensation is needed if commit had failures, some steps were committed,
     // and compensation hasn't run yet.
-    let needs_compensation = if let Some(cr) = commit_report {
-        cr.has_failures() && !committed_step_ids.is_empty() && !compensation_phase_completed
-    } else {
-        false
-    };
+    let needs_compensation =
+        commit_had_failures && !committed_step_ids.is_empty() && !compensation_phase_completed;
 
     TxResumeState {
         pending_step_ids,
