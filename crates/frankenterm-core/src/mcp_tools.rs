@@ -184,6 +184,13 @@ pub const MAX_MCP_RULES_AGENT_TYPE_BYTES: usize = 64;
 /// large allocations or repeated scans through a tiny filter field.
 pub const MAX_MCP_STATE_AGENT_FILTER_BYTES: usize = 256;
 
+/// Hard cap for MCP CASS agent selectors before CASS/agent-provider parsing.
+///
+/// `wa.cass_search.agent` is an enum-like selector. Keep it bounded before
+/// normalization in downstream parser code so malformed clients cannot use a
+/// tiny filter field as an unbounded allocation path.
+pub const MAX_MCP_CASS_AGENT_FILTER_BYTES: usize = 64;
+
 // br-ft-rnpuc: clock-anomaly observability for MCP tool audit
 // timestamps. mcp_tools.rs has 11 sites with the pattern
 // `i64::try_from(now_ms()).unwrap_or(0)` — when the u64 → i64
@@ -437,6 +444,30 @@ fn validate_mcp_state_agent_filter_bytes(
         Some(format!(
             "{tool_name} accepts bounded agent filters only; use known selectors such as codex, \
              claude_code, or gemini."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
+
+fn validate_mcp_cass_agent_filter_bytes(
+    tool_name: &str,
+    agent: &str,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if agent.len() <= MAX_MCP_CASS_AGENT_FILTER_BYTES {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!(
+            "agent is {} bytes; max allowed is {MAX_MCP_CASS_AGENT_FILTER_BYTES} bytes",
+            agent.len()
+        ),
+        Some(format!(
+            "{tool_name} accepts only short agent selectors: codex, claude_code, gemini, cursor, \
+             aider, chatgpt."
         )),
         elapsed_ms(start),
     );
@@ -1301,7 +1332,7 @@ impl ToolHandler for WaCassSearchTool {
                     "query": { "type": "string", "description": "Search query string" },
                     "limit": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 10, "description": "Maximum results (0 = cass default)" },
                     "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Offset into results" },
-                    "agent": { "type": "string", "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt" },
+                    "agent": { "type": "string", "maxLength": MAX_MCP_CASS_AGENT_FILTER_BYTES, "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt" },
                     "workspace": { "type": "string", "description": "Workspace filter (cass-defined)" },
                     "days": { "type": "integer", "minimum": 0, "description": "Only sessions within the last N days" },
                     "fields": { "type": "string", "description": "Field selection (cass-defined; e.g. minimal)" },
@@ -1380,6 +1411,11 @@ impl ToolHandler for WaCassSearchTool {
         }
 
         let agent: Option<CassAgent> = if let Some(ref agent_str) = params.agent {
+            if let Some(error) =
+                validate_mcp_cass_agent_filter_bytes("wa.cass_search", agent_str, start)
+            {
+                return error;
+            }
             match parse_cass_agent(agent_str) {
                 Some(agent) => Some(agent),
                 None => {
@@ -7171,24 +7207,25 @@ mod tests {
     use super::set_cass_test_binary_override;
     use super::{
         ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
-        CompatRuntimeBuilder, Config, Content, MAX_MCP_RULES_AGENT_TYPE_BYTES,
-        MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_STATE_AGENT_FILTER_BYTES,
-        MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext,
-        PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
-        WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
-        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
-        WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
-        WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
-        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
-        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
-        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
-        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
-        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
-        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
-        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
-        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
-        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
+        CompatRuntimeBuilder, Config, Content, MAX_MCP_CASS_AGENT_FILTER_BYTES,
+        MAX_MCP_RULES_AGENT_TYPE_BYTES, MAX_MCP_RULES_TEST_TEXT_BYTES,
+        MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS,
+        MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
+        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool,
+        WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
+        WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
+        WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
+        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
+        WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
+        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
+        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
+        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
+        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
+        validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -9281,6 +9318,54 @@ exit 17",
                 .as_str()
                 .expect("error string")
                 .contains("[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn cass_search_rejects_oversized_agent_without_echoing_value() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let agent = format!(
+            "{secret}{}",
+            "x".repeat(MAX_MCP_CASS_AGENT_FILTER_BYTES + 1)
+        );
+
+        let envelope = parse_json_content(
+            WaCassSearchTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "query": "agent history",
+                        "agent": agent,
+                    }),
+                )
+                .expect("cass_search oversized-agent call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("max allowed")
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "oversized wa.cass_search agent leaked the caller-supplied value"
+        );
+    }
+
+    #[test]
+    fn cass_search_schema_declares_agent_max_length() {
+        let def = WaCassSearchTool.definition();
+        assert_eq!(
+            def.input_schema["properties"]["agent"]["maxLength"].as_u64(),
+            Some(MAX_MCP_CASS_AGENT_FILTER_BYTES as u64)
         );
     }
 
