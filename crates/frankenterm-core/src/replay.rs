@@ -255,6 +255,7 @@ fn decode_resize_payload(payload: &[u8]) -> Result<(u16, u16)> {
 
 /// Decode a [`RecordingFrame`] into its semantic representation.
 pub fn decode_frame(frame: &RecordingFrame) -> Result<DecodedFrame> {
+    frame.check_payload_len_matches()?;
     match frame.header.frame_type {
         FrameType::Output => Ok(DecodedFrame::Output(frame.payload.clone())),
         FrameType::Resize => {
@@ -1516,6 +1517,26 @@ mod tests {
         };
         let decoded = decode_frame(&frame).unwrap();
         assert!(matches!(decoded, DecodedFrame::Output(ref b) if b == b"hello"));
+    }
+
+    #[test]
+    fn decode_frame_rejects_declared_payload_len_mismatch() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Output,
+                flags: 0,
+                payload_len: 100,
+            },
+            payload: b"hello".to_vec(),
+        };
+        let err = decode_frame(&frame)
+            .expect_err("semantic replay decoder must reject malformed frame lengths");
+        let message = err.to_string();
+        assert!(
+            message.contains("payload_len=100") && message.contains("payload.len()=5"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

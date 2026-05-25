@@ -84,6 +84,14 @@ impl DeclaredLen {
 }
 
 fn exercise_frame(frame: &RecordingFrame) {
+    if frame.header.payload_len as usize != frame.payload.len() {
+        assert!(
+            decode_frame(frame).is_err(),
+            "payload_len mismatch must fail before semantic decoding"
+        );
+        return;
+    }
+
     match frame.header.frame_type {
         FrameType::Output => {
             let decoded = decode_frame(frame).expect("output frame should decode");
