@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 // br-ft-8na0z + br-ft-59hlx: partial-mount failure counter for
@@ -229,6 +229,7 @@ use crate::mcp_client::{
     ExternalServerConfig, FtMcpClient, McpClientContentItem, McpClientToolDefinition,
     discover_servers,
 };
+use crate::policy::Redactor;
 
 const LOG_TARGET: &str = "ft::mcp_proxy";
 
@@ -750,11 +751,16 @@ fn select_proxy_servers(
         let server = discovered
             .iter()
             .find(|item| item.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| format!("configured proxy server not found: {name}"))?;
+            .ok_or_else(|| {
+                format!(
+                    "configured proxy server not found: {}",
+                    redact_mcp_proxy_selection_text(name)
+                )
+            })?;
         if server.disabled {
             return Err(format!(
                 "configured proxy server is disabled: {}",
-                server.name
+                redact_mcp_proxy_selection_text(&server.name)
             ));
         }
 
@@ -797,6 +803,11 @@ fn select_proxy_servers(
     }
 
     Ok(selected)
+}
+
+fn redact_mcp_proxy_selection_text(text: &str) -> String {
+    static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
+    REDACTOR.redact(text)
 }
 
 fn sanitize_prefix_segment(name: &str) -> String {
@@ -1084,6 +1095,56 @@ mod tests {
 
         let err = select_proxy_servers(&settings, &discovered).unwrap_err();
         assert!(err.contains("configured proxy server not found"));
+    }
+
+    #[test]
+    fn select_proxy_servers_redacts_secret_shaped_missing_explicit_server() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let settings = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_mount_all_discovered: false,
+            proxy_servers: vec![secret.to_string()],
+            ..McpClientConfig::default()
+        };
+        let discovered = vec![make_server("alpha", false)];
+
+        let err = select_proxy_servers(&settings, &discovered).unwrap_err();
+
+        assert!(err.contains("configured proxy server not found"));
+        assert!(
+            !err.contains(secret),
+            "raw missing proxy server leaked in selection error: {err}"
+        );
+        assert!(
+            err.contains("[REDACTED]"),
+            "expected redaction marker in selection error: {err}"
+        );
+    }
+
+    #[test]
+    fn select_proxy_servers_redacts_secret_shaped_disabled_server() {
+        let secret = "sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let settings = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_mount_all_discovered: false,
+            proxy_servers: vec![secret.to_string()],
+            ..McpClientConfig::default()
+        };
+        let discovered = vec![make_server(secret, true)];
+
+        let err = select_proxy_servers(&settings, &discovered).unwrap_err();
+
+        assert!(err.contains("configured proxy server is disabled"));
+        assert!(
+            !err.contains(secret),
+            "raw disabled proxy server leaked in selection error: {err}"
+        );
+        assert!(
+            err.contains("[REDACTED]"),
+            "expected redaction marker in selection error: {err}"
+        );
     }
 
     #[test]
@@ -1640,6 +1701,29 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].name, "alpha");
         assert_eq!(selected[1].name, "beta");
+    }
+
+    #[test]
+    fn select_proxy_servers_redacts_secret_shaped_missing_preferred_server() {
+        let secret = "sk-ant-api03-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let settings = McpClientConfig {
+            proxy_mount_all_discovered: false,
+            preferred_servers: vec![secret.to_string()],
+            ..McpClientConfig::default()
+        };
+        let discovered = vec![make_server("alpha", false)];
+
+        let err = select_proxy_servers(&settings, &discovered).unwrap_err();
+
+        assert!(err.contains("configured proxy server not found"));
+        assert!(
+            !err.contains(secret),
+            "raw missing preferred proxy server leaked in selection error: {err}"
+        );
+        assert!(
+            err.contains("[REDACTED]"),
+            "expected redaction marker in selection error: {err}"
+        );
     }
 
     #[test]
