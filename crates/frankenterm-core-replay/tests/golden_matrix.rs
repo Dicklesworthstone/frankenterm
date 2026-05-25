@@ -322,3 +322,63 @@ fn decision_graph_json_roundtrip_matches_golden_artifact() {
     );
     assert_eq!(restored.to_json() + "\n", actual);
 }
+
+#[test]
+fn decision_graph_roundtrip_preserves_edge_topology() {
+    let restored =
+        DecisionGraph::from_json(&read_decision_graph_roundtrip_golden()).expect("golden parses");
+    let edges = restored
+        .edges()
+        .iter()
+        .map(|edge| format!("{:?}:{}->{}", edge.edge_type, edge.from_node, edge.to_node))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        edges,
+        vec![
+            "TriggeredBy:0->1",
+            "PrecededBy:0->1",
+            "TriggeredBy:1->2",
+            "PrecededBy:1->2",
+            "TriggeredBy:2->4",
+            "PrecededBy:2->4",
+        ]
+    );
+    assert_eq!(
+        restored
+            .nodes_canonical()
+            .into_iter()
+            .map(|node| node.rule_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "codex.usage.reached",
+            "workflow.cooldown.annotate",
+            "policy.wait.allowed",
+            "fleet.rate_limit.aggregate",
+            "operator.override.resume",
+        ]
+    );
+    assert_eq!(
+        restored.nodes_by_type(DecisionType::PolicyDecision).len(),
+        1
+    );
+}
+
+#[test]
+fn decision_graph_l1_roundtrip_ignores_transient_replay_metadata() {
+    let golden =
+        DecisionGraph::from_json(&read_decision_graph_roundtrip_golden()).expect("golden parses");
+    let linux = DecisionGraph::from_decisions(&representative_events(TARGETS[1]));
+
+    assert!(golden.l1_equivalent(&linux));
+    assert_ne!(
+        golden.to_json(),
+        linux.to_json(),
+        "target-specific wall_clock_ms/replay_run_id must remain visible in full graph JSON"
+    );
+    assert_eq!(
+        canonical_bytes(&canonical_output_for(TARGETS[0])),
+        canonical_bytes(&canonical_output_for(TARGETS[1])),
+        "canonical replay output should scrub target-specific transient metadata"
+    );
+}
