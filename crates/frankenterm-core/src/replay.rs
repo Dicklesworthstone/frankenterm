@@ -1221,10 +1221,22 @@ impl Recording {
 /// Returns duration in milliseconds.
 pub fn parse_duration_ms(s: &str) -> Result<u64> {
     let s = s.trim();
+    if s.is_empty() {
+        return Err(replay_backend_error(
+            "replay.parse_duration",
+            "Invalid duration: empty input",
+        ));
+    }
 
-    // Try raw integer (milliseconds)
-    if let Ok(ms) = s.parse::<u64>() {
-        return Ok(ms);
+    // Raw integer input is milliseconds. If it is all digits but too large,
+    // reject it instead of falling through and treating it as seconds.
+    if s.chars().all(|ch| ch.is_ascii_digit()) {
+        return s.parse::<u64>().map_err(|_| {
+            replay_backend_error(
+                "replay.parse_duration",
+                format!("Duration milliseconds out of range: '{s}'"),
+            )
+        });
     }
 
     let mut total_ms: u64 = 0;
@@ -1234,17 +1246,17 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
         if ch.is_ascii_digit() || ch == '.' {
             num_buf.push(ch);
         } else {
-            let val: f64 = num_buf.parse().map_err(|_| {
-                replay_backend_error(
-                    "replay.parse_duration",
-                    format!("Invalid duration component: '{num_buf}'"),
-                )
-            })?;
-            num_buf.clear();
+            let component_ms = duration_component_ms(&num_buf, ch, s)?;
             match ch {
-                'h' => total_ms += (val * 3_600_000.0) as u64,
-                'm' => total_ms += (val * 60_000.0) as u64,
-                's' => total_ms += (val * 1_000.0) as u64,
+                'h' | 'm' | 's' => {
+                    total_ms = total_ms.checked_add(component_ms).ok_or_else(|| {
+                        replay_backend_error(
+                            "replay.parse_duration",
+                            format!("Duration total out of range: '{s}'"),
+                        )
+                    })?;
+                    num_buf.clear();
+                }
                 _ => {
                     return Err(replay_backend_error(
                         "replay.parse_duration",
@@ -1257,13 +1269,45 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
 
     // Trailing number without unit → treat as seconds
     if !num_buf.is_empty() {
-        let val: f64 = num_buf.parse().map_err(|_| {
-            replay_backend_error("replay.parse_duration", format!("Invalid duration: '{s}'"))
+        let component_ms = duration_component_ms(&num_buf, 's', s)?;
+        total_ms = total_ms.checked_add(component_ms).ok_or_else(|| {
+            replay_backend_error(
+                "replay.parse_duration",
+                format!("Duration total out of range: '{s}'"),
+            )
         })?;
-        total_ms += (val * 1_000.0).round() as u64;
     }
 
     Ok(total_ms)
+}
+
+fn duration_component_ms(component: &str, unit: char, original: &str) -> Result<u64> {
+    let value: f64 = component.parse().map_err(|_| {
+        replay_backend_error(
+            "replay.parse_duration",
+            format!("Invalid duration component: '{component}'"),
+        )
+    })?;
+    let factor = match unit {
+        'h' => 3_600_000.0,
+        'm' => 60_000.0,
+        's' => 1_000.0,
+        _ => {
+            return Err(replay_backend_error(
+                "replay.parse_duration",
+                format!("Unknown duration unit '{unit}' in '{original}'"),
+            ));
+        }
+    };
+    let scaled = value * factor;
+    if !value.is_finite() || !scaled.is_finite() || scaled < 0.0 || scaled > u64::MAX as f64 {
+        return Err(replay_backend_error(
+            "replay.parse_duration",
+            format!("Duration component out of range: '{component}{unit}' in '{original}'"),
+        ));
+    }
+
+    Ok(scaled.round() as u64)
 }
 
 /// Minimal HTML escaping for embedding in HTML attributes and text content.
@@ -1963,6 +2007,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_ms_rejects_empty_input() {
+        let err = parse_duration_ms("   ").unwrap_err();
+        assert!(
+            err.to_string().contains("empty input"),
+            "empty duration should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_duration_ms_rejects_raw_millisecond_overflow() {
+        let max_ms = u64::MAX;
+        let too_large = format!("{max_ms}0");
+        let err = parse_duration_ms(&too_large).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "raw millisecond overflow should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
     fn parse_duration_ms_seconds() {
         assert_eq!(parse_duration_ms("90s").unwrap(), 90_000);
         assert_eq!(parse_duration_ms("1.5s").unwrap(), 1_500);
@@ -1984,6 +2048,24 @@ mod tests {
     fn parse_duration_ms_trailing_bare_number_as_seconds() {
         // "90" without unit is raw ms (parsed first), but "1m30" treats 30 as seconds
         assert_eq!(parse_duration_ms("1m30").unwrap(), 90_000);
+    }
+
+    #[test]
+    fn parse_duration_ms_rejects_component_overflow() {
+        let err = parse_duration_ms("18446744073709551615s").unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "duration component overflow should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_duration_ms_rejects_total_overflow() {
+        let err = parse_duration_ms("9223372036854776s9223372036854776s").unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "duration total overflow should be rejected, got: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------
