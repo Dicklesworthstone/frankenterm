@@ -193,6 +193,9 @@ pub async fn check_step_idempotency_maybe_cx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `run_async_test` calls `runtime.block_on(..)`; `block_on` is provided by
+    // the `CompatRuntime` trait, which must be in scope at the call site.
+    use crate::runtime_async::CompatRuntime;
     #[allow(unused_imports)]
     use crate::patterns::Detection;
 
