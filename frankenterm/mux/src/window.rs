@@ -179,6 +179,9 @@ impl Window {
             }
         }
         let tab = self.tabs.remove(idx);
+        if self.last_active == Some(tab.tab_id()) {
+            self.last_active = None;
+        }
         self.tab_stacks.remove_tab(tab.tab_id());
         self.fixup_active_tab_after_removal(active);
         tab
@@ -411,6 +414,34 @@ mod tests {
             window.tab_stack_count(),
             0,
             "stack should disappear after its final tab is removed"
+        );
+    }
+
+    #[test]
+    fn removing_tab_clears_stale_last_active_reference() {
+        let first = test_tab();
+        let second = test_tab();
+        let third = test_tab();
+        let second_id = second.tab_id();
+
+        let mut window = Window::new(None, None);
+        window.push(&first);
+        window.push(&second);
+        window.push(&third);
+        window.save_and_then_set_active(1);
+        window.save_and_then_set_active(2);
+        assert_eq!(window.last_active, Some(second_id));
+
+        window.remove_by_id(second_id);
+
+        assert_eq!(
+            window.last_active, None,
+            "remove_by_id must not retain a removed tab as last_active session state",
+        );
+        assert_eq!(
+            window.get_active().map(|tab| tab.tab_id()),
+            Some(third.tab_id()),
+            "removing stale last_active must not disturb the current active tab",
         );
     }
 
