@@ -322,6 +322,71 @@ fn matrix_covers_required_control_plane_surfaces_and_scenarios() {
 fn matrix_covers_representative_contract_cases() {
     let matrix = load_matrix();
 
+    for expected_code in [
+        "robot.pane_not_found",
+        "robot.policy_denied",
+        "robot.require_approval",
+        "robot.timeout",
+    ] {
+        let entry = matrix
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.transport == "robot"
+                    && entry.status == "error"
+                    && entry.expected_code.as_deref() == Some(expected_code)
+            })
+            .unwrap_or_else(|| panic!("matrix must pin Robot error envelope code {expected_code}"));
+        let envelope = entry
+            .envelope
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} must embed a golden error envelope", entry.id));
+        assert_eq!(
+            envelope.get("ok").and_then(Value::as_bool),
+            Some(false),
+            "{} must be an error envelope",
+            entry.id
+        );
+        assert!(
+            envelope.get("data").is_none(),
+            "{} error envelope must not carry data",
+            entry.id
+        );
+    }
+
+    for (surface, scenario) in [("wa.get_text", "blocked"), ("wa.search", "policy_required")] {
+        let entry = matrix
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.transport == "mcp"
+                    && entry.surface == surface
+                    && entry.scenario == scenario
+                    && entry.status == "error"
+                    && entry.expected_code.as_deref() == Some("FT-MCP-0006")
+            })
+            .unwrap_or_else(|| {
+                panic!("matrix must pin MCP policy envelope for {surface} {scenario}")
+            });
+        let envelope = entry
+            .envelope
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} must embed a golden MCP error envelope", entry.id));
+        assert_eq!(
+            envelope.get("mcp_version").and_then(Value::as_str),
+            Some("v1"),
+            "{} must pin MCP v1 envelope metadata",
+            entry.id
+        );
+        assert!(
+            entry
+                .proof_command
+                .contains("mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits"),
+            "{} must point at the MCP tool-contract policy conformance test",
+            entry.id
+        );
+    }
+
     assert!(
         matrix.entries.iter().any(|entry| entry.family == "send"
             && entry.action == "send_dry_run"
