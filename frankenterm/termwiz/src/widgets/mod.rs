@@ -512,7 +512,7 @@ impl<'widget> Ui<'widget> {
 
     /// Assign keyboard focus to the specified widget.
     pub fn set_focus(&mut self, id: WidgetId) {
-        if self.render.contains_key(&id) {
+        if self.graph.reachable_widgets().contains(&id) {
             self.focused = Some(id);
         }
     }
@@ -1332,6 +1332,49 @@ mod test {
         let new_root = ui.set_root(PaintCell);
 
         assert_eq!(ui.focused, Some(new_root));
+    }
+
+    #[test]
+    fn set_focus_ignores_unreachable_old_root_before_gc() {
+        #[derive(Clone)]
+        struct KeyRecorder {
+            name: &'static str,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl Widget for KeyRecorder {
+            fn render(&mut self, _args: &mut RenderArgs) {}
+
+            fn process_event(&mut self, event: &WidgetEvent, _args: &mut UpdateArgs) -> bool {
+                if matches!(event, WidgetEvent::Input(InputEvent::Key(_))) {
+                    self.log.lock().unwrap().push(self.name);
+                    return true;
+                }
+                false
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ui = Ui::new();
+        let old_root = ui.set_root(KeyRecorder {
+            name: "old",
+            log: Arc::clone(&log),
+        });
+        let new_root = ui.set_root(KeyRecorder {
+            name: "new",
+            log: Arc::clone(&log),
+        });
+
+        ui.set_focus(old_root);
+        assert_eq!(ui.focused, Some(new_root));
+
+        ui.queue_event(WidgetEvent::Input(InputEvent::Key(KeyEvent {
+            key: KeyCode::Enter,
+            modifiers: Modifiers::NONE,
+        })));
+        ui.process_event_queue().unwrap();
+
+        assert_eq!(*log.lock().unwrap(), vec!["new"]);
     }
 
     #[test]
