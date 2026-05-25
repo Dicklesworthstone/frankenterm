@@ -371,7 +371,9 @@ impl ResourceDigitalTwinKnobs {
         override_: &ResourceControlOverride,
     ) -> Result<(), ResourceDigitalTwinError> {
         match override_.action {
-            ResourceOverrideAction::ResetToDefault => return Ok(()),
+            ResourceOverrideAction::ResetToDefault => {
+                return self.reset_override_to_default(override_);
+            }
             ResourceOverrideAction::Disable => {
                 if override_.knob_id == "autotune.enabled" {
                     self.autotune_enabled = false;
@@ -422,6 +424,53 @@ impl ResourceDigitalTwinKnobs {
             }
             (ResourceOverrideDomain::AutoTune, "autotune.exploration_budget_percent") => {
                 self.autotune_exploration_budget_percent = parse_f64(override_, value)?;
+            }
+            _ => {
+                return Err(ResourceDigitalTwinError::InvalidOverride {
+                    knob_id: override_.knob_id.clone(),
+                    reason: "knob is not wired into the resource digital twin".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_override_to_default(
+        &mut self,
+        override_: &ResourceControlOverride,
+    ) -> Result<(), ResourceDigitalTwinError> {
+        let defaults = Self::default();
+        match (override_.domain, override_.knob_id.as_str()) {
+            (ResourceOverrideDomain::Admission, "admission.max_queue_utilization") => {
+                self.admission_max_queue_utilization = defaults.admission_max_queue_utilization;
+            }
+            (ResourceOverrideDomain::Admission, "admission.max_pending_items") => {
+                self.admission_max_pending_items = defaults.admission_max_pending_items;
+            }
+            (ResourceOverrideDomain::Qos, "qos.interactive_weight") => {
+                self.qos_interactive_weight = defaults.qos_interactive_weight;
+            }
+            (ResourceOverrideDomain::Qos, "qos.bulk_search_weight") => {
+                self.qos_bulk_search_weight = defaults.qos_bulk_search_weight;
+            }
+            (ResourceOverrideDomain::Topology, "topology.max_migrations_per_epoch") => {
+                self.topology_max_migrations_per_epoch = defaults.topology_max_migrations_per_epoch;
+            }
+            (ResourceOverrideDomain::Topology, "topology.locality_spread_factor") => {
+                self.topology_locality_spread_factor = defaults.topology_locality_spread_factor;
+            }
+            (ResourceOverrideDomain::MemoryTier, "memory.hot_resident_budget_bytes") => {
+                self.memory_hot_resident_budget_bytes = defaults.memory_hot_resident_budget_bytes;
+            }
+            (ResourceOverrideDomain::MemoryTier, "memory.search_cache_budget_bytes") => {
+                self.memory_search_cache_budget_bytes = defaults.memory_search_cache_budget_bytes;
+            }
+            (ResourceOverrideDomain::AutoTune, "autotune.enabled") => {
+                self.autotune_enabled = defaults.autotune_enabled;
+            }
+            (ResourceOverrideDomain::AutoTune, "autotune.exploration_budget_percent") => {
+                self.autotune_exploration_budget_percent =
+                    defaults.autotune_exploration_budget_percent;
             }
             _ => {
                 return Err(ResourceDigitalTwinError::InvalidOverride {
@@ -2291,6 +2340,45 @@ reason = "overly conservative pending threshold"
         assert_eq!(change.candidate_action, SimulatedAdmissionAction::Shed);
         assert_eq!(change.impact, CandidateImpact::Harmful);
         assert_eq!(simulation.diff.harmful_changes, 1);
+    }
+
+    #[test]
+    fn reset_to_default_restores_builtin_safe_knob_value() {
+        let mut baseline = ResourceDigitalTwinKnobs::default();
+        baseline.admission_max_pending_items = 20;
+        baseline.autotune_enabled = false;
+        let package = override_package(
+            r#"
+[[admission]]
+knob_id = "admission.max_pending_items"
+domain = "admission"
+action = "reset_to_default"
+reason = "undo a narrowed admission envelope"
+
+[[auto_tune]]
+knob_id = "autotune.enabled"
+domain = "auto_tune"
+action = "reset_to_default"
+reason = "restore default replay auto-tune consideration"
+"#,
+        );
+
+        let (candidate, applied) = baseline.apply_package(&package).unwrap();
+
+        assert_eq!(
+            candidate.admission_max_pending_items,
+            ResourceDigitalTwinKnobs::default().admission_max_pending_items
+        );
+        assert_eq!(
+            candidate.autotune_enabled,
+            ResourceDigitalTwinKnobs::default().autotune_enabled
+        );
+        assert_ne!(
+            candidate.admission_max_pending_items,
+            baseline.admission_max_pending_items
+        );
+        assert_ne!(candidate.autotune_enabled, baseline.autotune_enabled);
+        assert_eq!(applied.len(), 2);
     }
 
     #[test]
