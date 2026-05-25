@@ -1201,11 +1201,20 @@ pub struct ObservationRuntime {
     pattern_engine: Arc<RwLock<PatternEngine>>,
     /// Pane registry for discovery and tracking
     registry: Arc<RwLock<PaneRegistry>>,
-    /// Per-pane cursors for delta extraction
+    // LOCK ORDER (deadlock-avoidance doctrine): when more than one of the
+    // three per-pane maps below is held at once, they MUST be acquired in this
+    // declaration order — `cursors` → `detection_contexts` →
+    // `pane_activity_tracker`. Every multi-lock site already obeys it (e.g.
+    // `remove_runtime_pane_state_for_pane`, the observation-loop teardown, and
+    // the compaction pass). Acquiring them in a different order in a new call
+    // site would risk a lock-order-inversion deadlock under concurrency; add
+    // new multi-map critical sections in this order, or take one lock at a time.
+    /// Per-pane cursors for delta extraction. Lock-order rank 1 (acquire first).
     cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
-    /// Per-pane detection contexts for deduplication
+    /// Per-pane detection contexts for deduplication. Lock-order rank 2.
     detection_contexts: Arc<RwLock<HashMap<u64, DetectionContext>>>,
     /// Best-effort per-pane output activity tracker for health snapshots.
+    /// Lock-order rank 3 (acquire last).
     pane_activity_tracker: Arc<RwLock<HashMap<u64, PaneActivityState>>>,
     /// Shutdown flag for signaling tasks
     shutdown_flag: Arc<AtomicBool>,
