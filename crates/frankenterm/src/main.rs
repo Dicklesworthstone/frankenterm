@@ -20589,6 +20589,23 @@ fn distributed_normalize_identity(value: &str) -> String {
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_validate_handshake_agent_id(
+    agent_id: Option<&str>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
+) -> Result<Option<String>, frankenterm_core::distributed::DistributedSecurityError> {
+    let Some(agent_id) = agent_id else {
+        return Ok(None);
+    };
+    let trimmed = agent_id.trim();
+    if trimmed.is_empty() {
+        return Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed);
+    }
+    frankenterm_core::wire_protocol::validate_sender_identity_with_limits(trimmed, wire_limits)
+        .map_err(|_| frankenterm_core::distributed::DistributedSecurityError::AuthFailed)?;
+    Ok(Some(distributed_normalize_identity(trimmed)))
+}
+
+#[cfg(feature = "distributed")]
 const DISTRIBUTED_MESSAGE_TOO_LARGE_IO_ERROR_MARKER: &str = "distributed_message_too_large";
 
 #[cfg(feature = "distributed")]
@@ -21498,8 +21515,17 @@ async fn distributed_handle_connection<S>(
         return;
     }
 
+    let normalized_handshake_agent =
+        match distributed_validate_handshake_agent_id(handshake.agent_id.as_deref(), wire_limits) {
+            Ok(agent_id) => agent_id,
+            Err(err) => {
+                distributed_publish_security_error(&mut reader, err).await;
+                return;
+            }
+        };
+
     if !allow_agent_ids.is_empty() {
-        let Some(agent_id) = handshake.agent_id.as_deref() else {
+        let Some(agent_id) = normalized_handshake_agent.as_deref() else {
             distributed_publish_security_error(
                 &mut reader,
                 frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
@@ -21507,8 +21533,7 @@ async fn distributed_handle_connection<S>(
             .await;
             return;
         };
-        let normalized = distributed_normalize_identity(agent_id);
-        if !allow_agent_ids.contains(&normalized) {
+        if !allow_agent_ids.contains(agent_id) {
             distributed_publish_security_error(
                 &mut reader,
                 frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
@@ -21530,13 +21555,9 @@ async fn distributed_handle_connection<S>(
 
     distributed_publish_handshake_ok(&mut reader).await;
 
-    let normalized_handshake_agent = handshake
-        .agent_id
-        .as_deref()
-        .map(distributed_normalize_identity);
     let session_id = distributed_resolve_session_id(
         handshake.session_id.as_deref(),
-        handshake.agent_id.as_deref(),
+        normalized_handshake_agent.as_deref(),
         peer_addr,
     );
 
@@ -61705,6 +61726,36 @@ recorder_backend = "frankensqlite"
                 peer_addr
             ),
             "explicit-session"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_validate_handshake_agent_id_rejects_blank_and_invalid_ids() {
+        let limits = default_wire_limits();
+
+        assert_eq!(
+            distributed_validate_handshake_agent_id(None, limits),
+            Ok(None)
+        );
+        assert_eq!(
+            distributed_validate_handshake_agent_id(Some(" Agent-Case "), limits),
+            Ok(Some("agent-case".to_string()))
+        );
+
+        for agent_id in ["", " \t ", "agent:evil", "agent/evil"] {
+            assert_eq!(
+                distributed_validate_handshake_agent_id(Some(agent_id), limits),
+                Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed),
+                "present-but-invalid handshake agent_id must fail closed: {agent_id:?}",
+            );
+        }
+
+        let too_long = "a".repeat(limits.max_sender_id_len.saturating_add(1));
+        assert_eq!(
+            distributed_validate_handshake_agent_id(Some(&too_long), limits),
+            Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed),
+            "oversized handshake agent_id must fail closed before acknowledgement",
         );
     }
 
