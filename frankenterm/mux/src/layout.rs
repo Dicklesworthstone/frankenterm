@@ -414,7 +414,7 @@ fn assign_slot_indices(
             if *is_main && main_idx.is_none() {
                 *main_idx = Some(*counter);
             }
-            *counter += 1;
+            advance_layout_counter(counter);
         }
     }
 }
@@ -454,7 +454,7 @@ fn prune_empty_slots(
         }
         LayoutArrangement::Slot { is_main } => {
             let idx = *counter;
-            *counter += 1;
+            advance_layout_counter(counter);
             populated_slots
                 .get(idx)
                 .copied()
@@ -462,6 +462,10 @@ fn prune_empty_slots(
                 .then_some(LayoutArrangement::Slot { is_main: *is_main })
         }
     }
+}
+
+fn advance_layout_counter(counter: &mut usize) {
+    *counter = counter.saturating_add(1);
 }
 
 /// Recursively build a Tree from a LayoutArrangement.
@@ -519,9 +523,9 @@ fn build_tree_from_arrangement(
         }
         LayoutArrangement::Slot { .. } => {
             let idx = *slot_counter;
-            *slot_counter += 1;
+            advance_layout_counter(slot_counter);
             let leaf_idx = *leaf_counter;
-            *leaf_counter += 1;
+            advance_layout_counter(leaf_counter);
 
             let assigned = &slot_assignments[idx];
 
@@ -816,6 +820,15 @@ mod tests {
         let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 1.0, size);
         assert!(first.cols >= 1);
         assert!(second.cols >= 1);
+    }
+
+    #[test]
+    fn advance_layout_counter_saturates_at_usize_max() {
+        let mut counter = usize::MAX;
+
+        advance_layout_counter(&mut counter);
+
+        assert_eq!(counter, usize::MAX);
     }
 
     #[test]
