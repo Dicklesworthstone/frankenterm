@@ -73,6 +73,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::robot_ntm_surface::RobotNtmCommand;
+
 /// Replacement token written in place of a normalized field's
 /// original value. Constant per-category so harness output stays
 /// stable across runs.
@@ -505,6 +507,51 @@ impl NtmSubprocessCommand {
         Self::new(args, NtmRequestEncoding::JsonStdin)
     }
 
+    /// Build a command from a canonical `ntm ...` equivalence string.
+    ///
+    /// The leading `ntm` token is intentionally stripped because
+    /// [`NtmSubprocessInvoker`] owns the binary path. This keeps live parity
+    /// tests from accidentally shelling out to a second binary named in the
+    /// metadata.
+    pub fn try_from_ntm_command(
+        ntm_command: &str,
+        request_encoding: NtmRequestEncoding,
+    ) -> Result<Self, String> {
+        let mut parts = ntm_command.split_whitespace();
+        let Some(binary) = parts.next() else {
+            return Err("ntm command mapping cannot be empty".to_string());
+        };
+        if binary != "ntm" {
+            return Err(format!(
+                "ntm command mapping must start with `ntm`, got `{binary}` in `{ntm_command}`"
+            ));
+        }
+        let args: Vec<String> = parts.map(str::to_string).collect();
+        if args.is_empty() {
+            return Err(format!(
+                "ntm command mapping must include a subcommand after `ntm`: `{ntm_command}`"
+            ));
+        }
+        Ok(Self::new(args, request_encoding))
+    }
+
+    /// Build a subprocess command from a robot family's first declared NTM
+    /// equivalent.
+    pub fn try_from_robot_command(
+        command: &RobotNtmCommand,
+        request_encoding: NtmRequestEncoding,
+    ) -> Result<Self, String> {
+        let equivalence = command.ntm_equivalence();
+        let Some(ntm_command) = equivalence.ntm_commands.first() else {
+            return Err(format!(
+                "no ntm equivalent command declared for {}.{}",
+                command.family_name(),
+                command.action_name()
+            ));
+        };
+        Self::try_from_ntm_command(ntm_command, request_encoding)
+    }
+
     fn new<I, S>(args: I, request_encoding: NtmRequestEncoding) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -566,6 +613,23 @@ impl NtmSubprocessInvoker {
         self.commands
             .insert((family.into(), action.into()), command);
         self
+    }
+
+    /// Register the first canonical NTM equivalence for a robot command.
+    pub fn try_with_robot_command(
+        mut self,
+        command: &RobotNtmCommand,
+        request_encoding: NtmRequestEncoding,
+    ) -> Result<Self, String> {
+        let ntm_command = NtmSubprocessCommand::try_from_robot_command(command, request_encoding)?;
+        self.commands.insert(
+            (
+                command.family_name().to_string(),
+                command.action_name().to_string(),
+            ),
+            ntm_command,
+        );
+        Ok(self)
     }
 }
 
@@ -854,7 +918,7 @@ fn first_divergence(a: &Value, b: &Value, pointer: &str) -> String {
     match (a, b) {
         (Value::Object(am), Value::Object(bm)) => {
             for (k, av) in am {
-                let next_pointer = format!("{pointer}/{k}");
+                let next_pointer = child_pointer(pointer, k);
                 match bm.get(k) {
                     Some(bv) => {
                         let recursed = first_divergence(av, bv, &next_pointer);
@@ -894,9 +958,20 @@ fn first_divergence(a: &Value, b: &Value, pointer: &str) -> String {
     }
 }
 
+fn child_pointer(parent: &str, key: &str) -> String {
+    format!("{parent}/{}", escape_json_pointer_segment(key))
+}
+
+fn escape_json_pointer_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::robot_ntm_surface::{
+        ProfileCommand, ProfileShowRequest, ProfileValidateRequest, RobotNtmCommand,
+    };
     use serde_json::json;
     #[cfg(unix)]
     use std::fs;
@@ -999,6 +1074,17 @@ mod tests {
     }
 
     #[test]
+    fn first_divergence_escapes_json_pointer_segments() {
+        let a = json!({"a/b": {"c~d": 1}});
+        let b = json!({"a/b": {"c~d": 2}});
+        let exp = first_divergence(&a, &b, "");
+        assert!(
+            exp.contains("/a~1b/c~0d"),
+            "JSON pointer must escape `/` and `~`: {exp}"
+        );
+    }
+
+    #[test]
     fn mock_invoker_returns_registered_response() {
         let invoker =
             MockNtmInvoker::new().with_response("checkpoint", "save", json!({"ok": true}));
@@ -1013,6 +1099,48 @@ mod tests {
             .invoke("checkpoint", "save", &json!({}))
             .unwrap_err();
         assert!(err.contains("no response registered"));
+    }
+
+    #[test]
+    fn ntm_command_mapping_strips_owned_binary_token() {
+        let command = NtmSubprocessCommand::try_from_ntm_command(
+            "ntm profiles show",
+            NtmRequestEncoding::JsonStdin,
+        )
+        .expect("valid ntm command mapping");
+
+        assert_eq!(command.args, ["profiles", "show"]);
+        assert_eq!(command.request_encoding, NtmRequestEncoding::JsonStdin);
+    }
+
+    #[test]
+    fn ntm_command_mapping_rejects_non_ntm_binary() {
+        let err = NtmSubprocessCommand::try_from_ntm_command(
+            "ft robot profile show",
+            NtmRequestEncoding::JsonStdin,
+        )
+        .expect_err("non-ntm binary should be rejected");
+
+        assert!(err.contains("must start with `ntm`"), "{err}");
+    }
+
+    #[test]
+    fn robot_command_mapping_rejects_family_without_ntm_equivalent() {
+        let command = RobotNtmCommand::Profile(ProfileCommand::Validate(ProfileValidateRequest {
+            name: "default".to_string(),
+        }));
+
+        let result = NtmSubprocessInvoker::ntm()
+            .try_with_robot_command(&command, NtmRequestEncoding::JsonStdin);
+        let err = match result {
+            Ok(_) => panic!("profile.validate has no ntm equivalent and must not register"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("no ntm equivalent command declared for profile.validate"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]
@@ -1044,6 +1172,41 @@ printf '{"ok":true,"data":{"name":"default","timestamp":123}}'
             "show",
             NtmSubprocessCommand::json_stdin(["profile", "show", "--json"]),
         );
+
+        let response = invoker
+            .invoke("profile", "show", &json!({"name": "default"}))
+            .expect("subprocess response");
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["data"]["name"], json!("default"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_invoker_registers_robot_family_mapping() {
+        let (_dir, binary) = fake_ntm(
+            r#"#!/bin/sh
+if [ "$1" != "profiles" ] || [ "$2" != "show" ]; then
+  echo "unexpected args: $*" >&2
+  exit 64
+fi
+payload=$(cat)
+case "$payload" in
+  *default*) ;;
+  *)
+    echo "missing profile request payload: $payload" >&2
+    exit 65
+    ;;
+esac
+printf '{"ok":true,"data":{"name":"default","timestamp":123}}'
+"#,
+        );
+        let command = RobotNtmCommand::Profile(ProfileCommand::Show(ProfileShowRequest {
+            name: "default".to_string(),
+        }));
+        let invoker = NtmSubprocessInvoker::new(binary)
+            .try_with_robot_command(&command, NtmRequestEncoding::JsonStdin)
+            .expect("profile.show should map to its first ntm equivalent");
 
         let response = invoker
             .invoke("profile", "show", &json!({"name": "default"}))
