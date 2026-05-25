@@ -347,12 +347,13 @@ fn decide_pane_tier(
         if index_forces_defer {
             reasons.push(CaptureTierReason::IndexingSaturation.as_str().to_string());
         }
+        let receipt_reason = deferred_receipt_reason(environment, pane, &reasons);
         return build_decision(
             pane,
             CaptureIndexTier::Deferred,
             reasons,
             SearchCoverageDisclosure::DeferredWithGap,
-            Some(degraded_receipt(pane, &environment_reason(environment))),
+            Some(degraded_receipt(pane, &receipt_reason)),
         );
     }
 
@@ -442,9 +443,16 @@ fn degraded_receipt(pane: &PaneTierInput, reason: &str) -> DegradedFidelityRecei
     }
 }
 
-fn environment_reason(environment: &CaptureTierEnvironment) -> String {
+fn deferred_receipt_reason(
+    environment: &CaptureTierEnvironment,
+    pane: &PaneTierInput,
+    reasons: &[String],
+) -> String {
     format!(
-        "memory={}%, global_capture_backlog={}, global_index_backlog={}",
+        "reasons={}; pane_capture_backlog={}, pane_index_backlog={}, memory={}%, global_capture_backlog={}, global_index_backlog={}",
+        reasons.join("+"),
+        pane.capture_backlog_segments,
+        pane.pending_index_segments,
         environment.memory_pressure_pct,
         environment.global_capture_backlog_segments,
         environment.global_index_backlog_segments
@@ -615,6 +623,38 @@ mod tests {
             assert!(decision.has_explicit_gap_receipt());
         }
         assert!(report.deferred_without_receipts().is_empty());
+    }
+
+    #[test]
+    fn deferred_receipts_include_pane_local_backlog_context() {
+        let report = golden_report();
+        let pane_capture_backlog = report
+            .decisions
+            .iter()
+            .find(|decision| decision.pane_id == 4)
+            .and_then(|decision| decision.degraded_fidelity.as_ref())
+            .expect("pane 4 should have a degraded-fidelity receipt");
+        assert!(
+            pane_capture_backlog
+                .message
+                .contains("pane_capture_backlog=4500"),
+            "receipt should disclose pane-local capture backlog: {}",
+            pane_capture_backlog.message
+        );
+
+        let pane_index_backlog = report
+            .decisions
+            .iter()
+            .find(|decision| decision.pane_id == 5)
+            .and_then(|decision| decision.degraded_fidelity.as_ref())
+            .expect("pane 5 should have a degraded-fidelity receipt");
+        assert!(
+            pane_index_backlog
+                .message
+                .contains("pane_index_backlog=1500"),
+            "receipt should disclose pane-local index backlog: {}",
+            pane_index_backlog.message
+        );
     }
 
     #[test]
