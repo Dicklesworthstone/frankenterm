@@ -100,6 +100,16 @@ fn cap_wait_by_workflow_deadline(
     requested.min(deadline.saturating_duration_since(Instant::now()))
 }
 
+fn invalid_jump_target_reason(step: usize, step_count: usize) -> Option<String> {
+    if step < step_count {
+        None
+    } else {
+        Some(format!(
+            "jump target {step} is outside workflow step range 0..{step_count}"
+        ))
+    }
+}
+
 async fn wait_external_signal_maybe_cx(
     cx: Option<&crate::cx::Cx>,
     registry: &ExternalSignalRegistry,
@@ -1325,6 +1335,58 @@ impl WorkflowRunner {
                         return WorkflowExecutionResult::Aborted {
                             execution_id: execution_id.to_string(),
                             reason: format!("exceeded maximum jump count ({max_total_jumps})"),
+                            step_index: current_step,
+                            elapsed_ms: elapsed_ms(start_time),
+                        };
+                    }
+                    if let Some(reason) = invalid_jump_target_reason(step, step_count) {
+                        tracing::error!(
+                            execution_id,
+                            current_step,
+                            target_step = step,
+                            step_count,
+                            "Workflow jump target is outside the executable step range"
+                        );
+
+                        if let Err(e) = self
+                            .fail_execution_maybe_cx(cx, execution_id, &reason)
+                            .await
+                        {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "Failed to fail execution after invalid jump"
+                            );
+                        }
+                        if let Err(e) = self
+                            .mark_trigger_event_handled_maybe_cx(cx, execution_id, "aborted")
+                            .await
+                        {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "Failed to mark trigger event handled after invalid jump"
+                            );
+                        }
+                        workflow.cleanup(&mut ctx).await;
+                        record_workflow_terminal_action_maybe_cx(
+                            cx,
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_aborted",
+                            "aborted",
+                            Some(&reason),
+                            Some(current_step),
+                            Some(current_step + 1),
+                            start_action_id,
+                        )
+                        .await;
+
+                        return WorkflowExecutionResult::Aborted {
+                            execution_id: execution_id.to_string(),
+                            reason,
                             step_index: current_step,
                             elapsed_ms: elapsed_ms(start_time),
                         };
@@ -3767,6 +3829,23 @@ mod tests {
             ..WorkflowRunnerConfig::default()
         };
         assert_eq!(config.workflow_total_deadline_ms, 0);
+    }
+
+    #[test]
+    fn jump_target_inside_step_range_is_valid() {
+        assert!(invalid_jump_target_reason(0, 1).is_none());
+        assert!(invalid_jump_target_reason(2, 3).is_none());
+    }
+
+    #[test]
+    fn jump_target_at_or_beyond_step_count_is_invalid() {
+        let at_end = invalid_jump_target_reason(3, 3).expect("step_count is not executable");
+        assert!(at_end.contains("jump target 3"));
+        assert!(at_end.contains("0..3"));
+
+        let beyond_end = invalid_jump_target_reason(99, 3).expect("beyond step_count is invalid");
+        assert!(beyond_end.contains("jump target 99"));
+        assert!(beyond_end.contains("0..3"));
     }
 
     // -------------------------------------------------------------------------
