@@ -884,7 +884,15 @@ impl QuarantineRegistry {
         });
     }
 
-    /// Tick the kill switch for auto-disarm.
+    /// Process kill-switch auto-disarm on each `authorize()` tick.
+    ///
+    /// `trip_kill_switch_with_timeout` promises the global halt lifts after
+    /// `timeout_ms`, but that only happens if something calls `KillSwitch::tick`.
+    /// The authorize path calls this each tick; without it a timeout-armed kill
+    /// switch blocked ALL actions forever (`should_auto_disarm` requires
+    /// `auto_disarm_at_ms > 0`, so an indefinite `trip` is never touched).
+    /// Returns `true` if the kill switch auto-disarmed on this call, emitting a
+    /// `KillSwitchAutoDisarmed` audit event on that transition.
     pub fn tick_kill_switch(&mut self, now_ms: u64) -> bool {
         if self.kill_switch.tick(now_ms) {
             self.emit_audit(QuarantineAuditEvent {
@@ -963,18 +971,6 @@ impl QuarantineRegistry {
     #[must_use]
     pub fn kill_switch(&self) -> &KillSwitch {
         &self.kill_switch
-    }
-
-    /// Process kill-switch auto-disarm on each authorize() tick.
-    ///
-    /// `trip_kill_switch_with_timeout` promises the global halt lifts after
-    /// `timeout_ms`, but that only happens if something calls `KillSwitch::tick`.
-    /// The authorize path calls this each tick; without it a timeout-armed kill
-    /// switch blocked ALL actions forever (`should_auto_disarm` requires
-    /// `auto_disarm_at_ms > 0`, so an indefinite `trip` is never touched).
-    /// Returns `true` if the kill switch auto-disarmed on this call.
-    pub fn tick_kill_switch(&mut self, now_ms: u64) -> bool {
-        self.kill_switch.tick(now_ms)
     }
 
     /// Get the audit log.
