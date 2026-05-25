@@ -90,6 +90,10 @@ where
 }
 
 impl ClusteredLine {
+    fn normalize_cell_width(cell_width: usize) -> u16 {
+        cell_width.clamp(1, 2) as u16
+    }
+
     pub fn new() -> Self {
         Self {
             text: String::with_capacity(80),
@@ -119,14 +123,15 @@ impl ClusteredLine {
         let mut text = String::new();
         let mut clusters = vec![];
         let mut any_double = false;
-        let mut len = 0;
+        let mut len = 0usize;
         let mut last_cell_width = None;
 
         for cell in iter {
-            len += cell.width();
-            last_cell_width = NonZeroU8::new(cell.width() as u8);
+            let cell_width = Self::normalize_cell_width(cell.width());
+            len = len.saturating_add(usize::from(cell_width));
+            last_cell_width = NonZeroU8::new(cell_width as u8);
 
-            if cell.width() > 1 {
+            if cell_width > 1 {
                 any_double = true;
                 is_double_wide.set(cell.cell_index(), true);
             }
@@ -135,20 +140,29 @@ impl ClusteredLine {
 
             last_cluster = match last_cluster.take() {
                 None => Some(Cluster {
-                    cell_width: cell.width() as u16,
+                    cell_width,
                     attrs: cell.attrs().clone(),
                 }),
                 Some(cluster) if cluster.attrs != *cell.attrs() => {
                     clusters.push(cluster);
                     Some(Cluster {
-                        cell_width: cell.width() as u16,
+                        cell_width,
                         attrs: cell.attrs().clone(),
                     })
                 }
-                Some(mut cluster) => {
-                    cluster.cell_width += cell.width() as u16;
-                    Some(cluster)
-                }
+                Some(mut cluster) => match cluster.cell_width.checked_add(cell_width) {
+                    Some(width) => {
+                        cluster.cell_width = width;
+                        Some(cluster)
+                    }
+                    None => {
+                        clusters.push(cluster);
+                        Some(Cluster {
+                            cell_width,
+                            attrs: cell.attrs().clone(),
+                        })
+                    }
+                },
             };
         }
 
@@ -194,7 +208,7 @@ impl ClusteredLine {
     }
 
     pub fn append_grapheme(&mut self, text: &str, cell_width: usize, attrs: CellAttributes) {
-        let cell_width = cell_width as u16;
+        let cell_width = Self::normalize_cell_width(cell_width);
         let new_cluster = match self.clusters.last() {
             Some(cluster) => {
                 if cluster.attrs != attrs {
@@ -232,11 +246,11 @@ impl ClusteredLine {
             self.is_double_wide.replace(bitset);
         }
         self.last_cell_width = NonZeroU8::new(cell_width as u8);
-        self.len += cell_width as u32;
+        self.len = self.len.saturating_add(u32::from(cell_width));
     }
 
     pub fn append(&mut self, cell: Cell) {
-        let cell_width = cell.width() as u16;
+        let cell_width = Self::normalize_cell_width(cell.width());
         let new_cluster = match self.clusters.last() {
             Some(cluster) => {
                 if cluster.attrs != *cell.attrs() {
@@ -277,7 +291,7 @@ impl ClusteredLine {
             self.is_double_wide.replace(bitset);
         }
         self.last_cell_width = NonZeroU8::new(cell_width as u8);
-        self.len += cell_width as u32;
+        self.len = self.len.saturating_add(u32::from(cell_width));
     }
 
     pub fn prune_trailing_blanks(&mut self) -> bool {
@@ -384,6 +398,7 @@ impl<'a> Iterator for ClusterLineCellIter<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
     #[cfg(target_pointer_width = "64")]
@@ -393,5 +408,52 @@ mod test {
         assert_eq!(core::mem::size_of::<Vec<Cluster>>(), 24);
         assert_eq!(core::mem::size_of::<Option<Box<FixedBitSet>>>(), 8);
         assert_eq!(core::mem::size_of::<Option<NonZeroU8>>(), 1);
+    }
+
+    #[test]
+    fn append_grapheme_normalizes_zero_and_extreme_widths() {
+        let mut line = ClusteredLine::new();
+        line.append_grapheme("a", 0, CellAttributes::default());
+        line.append_grapheme("b", usize::MAX, CellAttributes::default());
+
+        assert_eq!(line.len(), 3);
+        let cells: Vec<_> = line
+            .iter()
+            .map(|cell| (cell.cell_index(), cell.str().to_string(), cell.width()))
+            .collect();
+        assert_eq!(
+            cells,
+            vec![(0, "a".to_string(), 1), (1, "b".to_string(), 2)]
+        );
+        assert_eq!(line.clusters[0].cell_width, 3);
+    }
+
+    #[test]
+    fn from_cell_vec_splits_cluster_runs_before_u16_overflow() {
+        let cells = vec![Cell::new_grapheme_with_width("x", 2, CellAttributes::default()); 40_000];
+        let line = ClusteredLine::from_cell_vec(
+            cells.len() * 2,
+            cells
+                .iter()
+                .enumerate()
+                .map(|(idx, cell)| CellRef::CellRef {
+                    cell_index: idx * 2,
+                    cell,
+                }),
+        );
+
+        assert_eq!(line.len(), 80_000);
+        assert!(
+            line.clusters.iter().all(|cluster| cluster.cell_width > 0),
+            "cluster run widths must never wrap to zero"
+        );
+        assert!(
+            line.clusters.len() > 1,
+            "same-attribute runs must split before u16 overflow"
+        );
+        assert_eq!(
+            line.iter().map(|cell| cell.width()).sum::<usize>(),
+            line.len()
+        );
     }
 }
