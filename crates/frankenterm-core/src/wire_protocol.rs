@@ -898,6 +898,16 @@ fn validate_envelope_protocol_with_limits(
             )));
         }
     }
+    if let WirePayload::Detection(detection) = &envelope.payload {
+        if !detection.confidence.is_finite() || !(0.0..=1.0).contains(&detection.confidence) {
+            return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+                format!(
+                    "DetectionNotice confidence ({}) must be finite and in [0, 1]",
+                    detection.confidence
+                ),
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2039,6 +2049,41 @@ mod tests {
         assert!(matches!(err, WireProtocolError::InvalidJson(_)));
         assert_eq!(agg.total_rejected(), 1);
         assert_eq!(agg.total_accepted(), 0);
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_rejects_detection_notice_with_invalid_confidence() {
+        let mut agg = Aggregator::new(10);
+        for (idx, confidence) in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -f64::EPSILON,
+            1.0 + f64::EPSILON,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut detection = sample_detection();
+            detection.confidence = confidence;
+            let envelope = WireEnvelope::new(
+                idx as u64 + 1,
+                "agent-valid",
+                WirePayload::Detection(detection),
+            );
+
+            let err = agg
+                .ingest_envelope(envelope)
+                .expect_err("decoded envelope path must reject invalid detection confidence");
+            assert!(
+                matches!(err, WireProtocolError::InvalidJson(_)),
+                "expected InvalidJson for confidence {confidence:?}, got {err:?}"
+            );
+        }
+
+        assert_eq!(agg.total_rejected(), 5);
+        assert_eq!(agg.total_accepted(), 0);
+        assert_eq!(agg.agent_count(), 0);
     }
 
     #[test]
