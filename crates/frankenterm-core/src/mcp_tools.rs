@@ -162,6 +162,14 @@ pub const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 /// before the normal timeout/tail guards can help.
 pub const MAX_MCP_WAIT_PATTERN_BYTES: usize = 64 * 1024;
 
+/// Hard cap for MCP rule-test text before feeding it into the pattern engine.
+///
+/// `wa.rules_test` is a control-plane conformance/debug surface, not a bulk
+/// pane-output ingestion path. Keep it bounded so malformed MCP clients cannot
+/// force unbounded anchor scans and regex matching work inside a synchronous
+/// tool handler.
+pub const MAX_MCP_RULES_TEST_TEXT_BYTES: usize = 256 * 1024;
+
 // br-ft-rnpuc: clock-anomaly observability for MCP tool audit
 // timestamps. mcp_tools.rs has 11 sites with the pattern
 // `i64::try_from(now_ms()).unwrap_or(0)` — when the u64 → i64
@@ -343,6 +351,30 @@ fn validate_mcp_wait_pattern_bytes(
         Some(format!(
             "{tool_name} accepts wait patterns up to {MAX_MCP_WAIT_PATTERN_BYTES} bytes; \
              use wa.search for large pane-output scans."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
+
+fn validate_mcp_rules_test_text_bytes(
+    tool_name: &str,
+    text: &str,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if text.len() <= MAX_MCP_RULES_TEST_TEXT_BYTES {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!(
+            "text is {} bytes; max allowed is {MAX_MCP_RULES_TEST_TEXT_BYTES} bytes",
+            text.len()
+        ),
+        Some(format!(
+            "{tool_name} accepts bounded sample text only; use pane capture/search surfaces for \
+             large outputs."
         )),
         elapsed_ms(start),
     );
@@ -1100,7 +1132,7 @@ impl ToolHandler for WaRulesTestTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "Text to test pattern detection against" },
+                    "text": { "type": "string", "maxLength": MAX_MCP_RULES_TEST_TEXT_BYTES, "description": "Text to test pattern detection against" },
                     "trace": { "type": "boolean", "default": false, "description": "Include trace information in matches" }
                 },
                 "required": ["text"],
@@ -1126,6 +1158,12 @@ impl ToolHandler for WaRulesTestTool {
             Ok(params) => params,
             Err(response) => return response,
         };
+
+        if let Some(error) =
+            validate_mcp_rules_test_text_bytes("wa.rules_test", &params.text, start)
+        {
+            return error;
+        }
 
         let engine = PatternEngine::new();
         let detections = engine.detect(&params.text);
@@ -7047,23 +7085,23 @@ mod tests {
     use super::set_cass_test_binary_override;
     use super::{
         ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
-        CompatRuntimeBuilder, Config, Content, MAX_MCP_WAIT_PATTERN_BYTES,
-        MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities,
-        PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool,
-        WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
-        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
-        WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
-        WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-        WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
-        validate_cass_timeout_secs,
+        CompatRuntimeBuilder, Config, Content, MAX_MCP_RULES_TEST_TEXT_BYTES,
+        MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext,
+        PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
+        WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
+        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
+        WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
+        WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
+        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
+        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
+        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -8418,6 +8456,51 @@ mod tests {
         assert!(
             !envelope.to_string().contains("sk-ant-api03-"),
             "malformed-argument envelope leaked the caller-supplied secret"
+        );
+    }
+
+    #[test]
+    fn rules_test_rejects_oversized_text_without_echoing_text() {
+        let tool = WaRulesTestTool;
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let text = format!("{secret}{}", "x".repeat(MAX_MCP_RULES_TEST_TEXT_BYTES + 1));
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "text": text,
+                    "trace": true,
+                }),
+            )
+            .expect("rules_test oversized-text call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("max allowed")
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "oversized wa.rules_test envelope leaked caller-supplied text"
+        );
+    }
+
+    #[test]
+    fn rules_test_schema_declares_text_max_length() {
+        let def = WaRulesTestTool.definition();
+        assert_eq!(
+            def.input_schema["properties"]["text"]["maxLength"].as_u64(),
+            Some(MAX_MCP_RULES_TEST_TEXT_BYTES as u64)
         );
     }
 
