@@ -22,6 +22,10 @@ use frankenterm_core::plan::{
     Mission, MissionId, MissionLifecycleState, MissionLifecycleTransitionKind, MissionOwnership,
     mission_lifecycle_transition_table,
 };
+use frankenterm_core::tx_plan_compiler::{
+    CompensationKind, CompilerConfig, PlannerAssignment, PreconditionKind, RejectedAssignment,
+    StepRisk, compile_tx_plan,
+};
 
 // =============================================================================
 // Constants
@@ -66,6 +70,25 @@ fn make_mission(state: MissionLifecycleState) -> Mission {
     );
     m.lifecycle_state = state;
     m
+}
+
+fn tx_assignment(
+    bead_id: &str,
+    agent_id: &str,
+    score: f64,
+    tags: &[&str],
+    dependency_bead_ids: &[&str],
+) -> PlannerAssignment {
+    PlannerAssignment {
+        bead_id: bead_id.to_string(),
+        agent_id: agent_id.to_string(),
+        score,
+        tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+        dependency_bead_ids: dependency_bead_ids
+            .iter()
+            .map(|bead_id| (*bead_id).to_string())
+            .collect(),
+    }
 }
 
 fn state_strategy() -> impl Strategy<Value = MissionLifecycleState> {
@@ -274,6 +297,208 @@ fn is_terminal_consistent_with_terminal_states_list() {
             state
         );
     }
+}
+
+#[test]
+fn mission_running_primary_transitions_and_tx_plan_compiler_conformance() {
+    let running_cases = [
+        (
+            MissionLifecycleTransitionKind::Cancel,
+            MissionLifecycleState::Cancelled,
+        ),
+        (
+            MissionLifecycleTransitionKind::Retry,
+            MissionLifecycleState::RetryPending,
+        ),
+        (
+            MissionLifecycleTransitionKind::Complete,
+            MissionLifecycleState::Completed,
+        ),
+        (
+            MissionLifecycleTransitionKind::Fail,
+            MissionLifecycleState::Failed,
+        ),
+        (
+            MissionLifecycleTransitionKind::Block,
+            MissionLifecycleState::Blocked,
+        ),
+    ];
+
+    let allowed = MissionLifecycleState::Running.allowed_transitions();
+    for (idx, (transition, target)) in running_cases.iter().copied().enumerate() {
+        assert!(
+            allowed.contains(&transition),
+            "Running must allow {transition:?}; allowed={allowed:?}"
+        );
+        assert_ne!(
+            target,
+            MissionLifecycleState::Paused,
+            "primary Running transition {transition:?} must not route through Paused"
+        );
+        assert_eq!(
+            MissionLifecycleState::Running
+                .apply_transition(transition)
+                .expect("Running transition should be table-valid"),
+            target,
+            "Running --{transition:?}--> should land in {target:?}"
+        );
+
+        let mut mission = make_mission(MissionLifecycleState::Running);
+        let transitioned_at_ms = 2_000_000 + i64::try_from(idx).unwrap();
+        let result = mission
+            .transition_lifecycle(target, transition, transitioned_at_ms)
+            .expect("mission transition should accept the Running primary transition");
+        assert_eq!(result, target);
+        assert_eq!(mission.lifecycle_state, target);
+        assert_eq!(mission.updated_at_ms, Some(transitioned_at_ms));
+    }
+
+    let mut blocked = make_mission(MissionLifecycleState::Running);
+    let invalid_pause = blocked.transition_lifecycle(
+        MissionLifecycleState::Paused,
+        MissionLifecycleTransitionKind::Block,
+        3_000_000,
+    );
+    assert!(
+        invalid_pause.is_err(),
+        "Running --Block--> must not be accepted as a pause transition"
+    );
+    assert_eq!(blocked.lifecycle_state, MissionLifecycleState::Running);
+    assert_eq!(blocked.updated_at_ms, None);
+    assert!(
+        MissionLifecycleState::Running
+            .apply_transition(MissionLifecycleTransitionKind::PauseRequested)
+            .is_err(),
+        "PauseRequested is not part of the Running primary transition contract"
+    );
+
+    let assignments = vec![
+        tx_assignment("mission-root", "agent-root", 0.95, &[], &[]),
+        tx_assignment(
+            "mission-context",
+            "agent-low-confidence",
+            0.25,
+            &[],
+            &["mission-root", "external-observation"],
+        ),
+        tx_assignment(
+            "mission-critical",
+            "agent-critical",
+            0.92,
+            &["critical"],
+            &["mission-root"],
+        ),
+        tx_assignment(
+            "mission-context",
+            "agent-duplicate",
+            0.99,
+            &["destructive"],
+            &["external-duplicate-only"],
+        ),
+        tx_assignment("", "agent-empty", 0.5, &[], &[]),
+    ];
+    let config = CompilerConfig {
+        default_compensation: CompensationKind::RetryWithBackoff { max_retries: 2 },
+        context_freshness_threshold: 0.5,
+        context_freshness_max_age_ms: 12_345,
+        ..CompilerConfig::default()
+    };
+    let plan = compile_tx_plan("mission-running-primary", &assignments, &config);
+    let plan_again = compile_tx_plan("mission-running-primary", &assignments, &config);
+
+    assert_eq!(plan.plan_hash, plan_again.plan_hash);
+    assert_eq!(
+        plan.execution_order,
+        vec![
+            "step-mission-root".to_string(),
+            "step-mission-context".to_string(),
+            "step-mission-critical".to_string(),
+        ]
+    );
+    assert_eq!(
+        plan.parallel_levels,
+        vec![
+            vec!["step-mission-root".to_string()],
+            vec![
+                "step-mission-context".to_string(),
+                "step-mission-critical".to_string(),
+            ],
+        ]
+    );
+    assert_eq!(plan.rejected_assignments.len(), 2);
+    assert!(
+        plan.rejected_assignments.iter().any(|assignment| {
+            assignment.bead_id == "mission-context"
+                && assignment.agent_id == "agent-duplicate"
+                && assignment
+                    .reason
+                    .starts_with(RejectedAssignment::REASON_DUPLICATE_BEAD_ID_PREFIX)
+        }),
+        "duplicate bead_id should be retained only as rejected assignment evidence"
+    );
+    assert!(
+        plan.rejected_assignments.iter().any(|assignment| {
+            assignment.bead_id.is_empty()
+                && assignment.agent_id == "agent-empty"
+                && assignment.reason == RejectedAssignment::REASON_EMPTY_BEAD_ID
+        }),
+        "empty bead_id should be retained as rejected assignment evidence"
+    );
+    assert_eq!(plan.rejected_edges.len(), 1);
+    assert_eq!(
+        plan.rejected_edges[0].from_step,
+        "step-external-observation"
+    );
+    assert_eq!(plan.rejected_edges[0].to_step, "step-mission-context");
+    assert!(
+        plan.rejected_edges[0]
+            .reason
+            .contains("external-observation")
+    );
+
+    let context_step = plan
+        .steps
+        .iter()
+        .find(|step| step.id == "step-mission-context")
+        .expect("context-sensitive step should compile");
+    assert_eq!(
+        context_step.depends_on,
+        vec!["step-mission-root".to_string()]
+    );
+    assert_eq!(context_step.risk, StepRisk::High);
+    assert!(context_step.preconditions.iter().any(|precondition| {
+        precondition.kind == PreconditionKind::PolicyApproved && precondition.required
+    }));
+    assert!(context_step.preconditions.iter().any(|precondition| {
+        precondition.kind == PreconditionKind::ContextFresh { max_age_ms: 12_345 }
+            && precondition.required
+    }));
+    assert_eq!(context_step.compensations.len(), 1);
+    assert_eq!(
+        context_step.compensations[0].action_type,
+        CompensationKind::RetryWithBackoff { max_retries: 2 }
+    );
+
+    let critical_step = plan
+        .steps
+        .iter()
+        .find(|step| step.id == "step-mission-critical")
+        .expect("critical step should compile");
+    assert_eq!(
+        critical_step.depends_on,
+        vec!["step-mission-root".to_string()]
+    );
+    assert_eq!(critical_step.risk, StepRisk::Critical);
+    assert_eq!(critical_step.compensations.len(), 1);
+    assert_eq!(
+        critical_step.compensations[0].action_type,
+        CompensationKind::RetryWithBackoff { max_retries: 2 }
+    );
+    assert_eq!(plan.risk_summary.total_steps, 3);
+    assert_eq!(plan.risk_summary.high_risk_count, 1);
+    assert_eq!(plan.risk_summary.critical_risk_count, 1);
+    assert_eq!(plan.risk_summary.uncompensated_steps, 0);
+    assert_eq!(plan.risk_summary.overall_risk, StepRisk::Critical);
 }
 
 // =============================================================================
