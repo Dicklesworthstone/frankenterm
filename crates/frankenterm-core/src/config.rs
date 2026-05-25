@@ -2758,7 +2758,14 @@ pub struct RedactionConfig {
     /// Redact in audit logs
     pub redact_audit: bool,
 
-    /// Redact in stored segments
+    /// Redact secrets in stored capture segments.
+    ///
+    /// NOTE: the storage persistence path (`redact_segment_for_persistence`)
+    /// already redacts every appended segment unconditionally, so stored
+    /// segments never contain raw secrets regardless of this flag. The default
+    /// is therefore `true` to reflect that reality — a previous `false` default
+    /// ("only redact in audit") falsely implied stored segments held raw
+    /// secrets, which could lead operators to mishandle persisted data.
     pub redact_segments: bool,
 }
 
@@ -2776,7 +2783,10 @@ impl Default for RedactionConfig {
             ],
             placeholder: "[REDACTED]".to_string(),
             redact_audit: true,
-            redact_segments: false, // Only redact in audit by default
+            // Stored segments are always redacted on the persistence path; the
+            // default reflects that (see field doc) rather than implying raw
+            // secrets are stored.
+            redact_segments: true,
         }
     }
 }
