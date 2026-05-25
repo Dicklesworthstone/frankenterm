@@ -1239,13 +1239,17 @@ fn find_split_budget(
                     overrides,
                 ));
             }
-            *counter += 1;
+            advance_split_budget_counter(counter);
             if let Some(result) = find_split_budget(left, target_index, counter, overrides) {
                 return Some(result);
             }
             find_split_budget(right, target_index, counter, overrides)
         }
     }
+}
+
+fn advance_split_budget_counter(counter: &mut usize) {
+    *counter = counter.saturating_add(1);
 }
 
 fn adjust_x_size(
@@ -4407,6 +4411,15 @@ mod test {
 
         assert_eq!(recency.count, usize::MAX);
         assert_eq!(recency.score(7), usize::MAX);
+    }
+
+    #[test]
+    fn split_budget_counter_saturates_at_usize_max() {
+        let mut counter = usize::MAX;
+
+        advance_split_budget_counter(&mut counter);
+
+        assert_eq!(counter, usize::MAX);
     }
 
     #[test]
