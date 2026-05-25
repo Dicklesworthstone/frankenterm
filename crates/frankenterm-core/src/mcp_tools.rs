@@ -1557,17 +1557,14 @@ impl ToolHandler for WaStateTool {
         let params = if arguments.is_null() {
             StateParams::default()
         } else {
-            match serde_json::from_value::<StateParams>(arguments) {
+            match parse_mcp_tool_params(
+                "wa.state",
+                arguments,
+                "Expected object with optional domain/agent/pane_id",
+                start,
+            ) {
                 Ok(params) => params,
-                Err(err) => {
-                    let envelope = McpEnvelope::<()>::error(
-                        MCP_ERR_INVALID_ARGS,
-                        format!("Invalid params: {err}"),
-                        Some("Expected object with optional domain/agent/pane_id".to_string()),
-                        elapsed_ms(start),
-                    );
-                    return envelope_to_content(envelope);
-                }
+                Err(response) => return response,
             }
         };
 
@@ -9251,6 +9248,39 @@ exit 17",
         assert!(
             json.contains("[REDACTED]"),
             "expected redaction marker in wa.state JSON"
+        );
+    }
+
+    #[test]
+    fn wa_state_malformed_args_redacts_serde_error_value() {
+        let tool = WaStateTool::new(PaneFilterConfig::default(), None);
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "domain": "local",
+                    "pane_id": secret,
+                }),
+            )
+            .expect("wa.state bad-arg call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(
+            envelope["hint"],
+            "Expected object with optional domain/agent/pane_id"
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "malformed wa.state args leaked the caller-supplied secret"
         );
     }
 
