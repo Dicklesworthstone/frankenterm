@@ -1774,14 +1774,10 @@ fn capacity_admission_artifact(
     plan: &MissionObjectivePlan,
     steps: &[MissionObjectivePlanStep],
 ) -> MissionObjectiveCapacityAdmissionArtifact {
-    let has_actionable_step = steps
-        .iter()
-        .any(|step| step.status == MissionObjectivePlanStatus::Actionable);
     let action = match plan.plan_status {
         MissionObjectivePlanStatus::Actionable
         | MissionObjectivePlanStatus::PlanningOnly
         | MissionObjectivePlanStatus::NoReadyWork => "admit",
-        MissionObjectivePlanStatus::Degraded if has_actionable_step => "admit",
         MissionObjectivePlanStatus::Degraded => "defer",
         MissionObjectivePlanStatus::WaitingOwner
         | MissionObjectivePlanStatus::WaitingExternal
@@ -2343,6 +2339,55 @@ mod tests {
             step.reason_codes
                 .iter()
                 .any(|code| code == "agent_mail.beads_fallback_available")
+        );
+    }
+
+    #[test]
+    fn degraded_source_defers_capacity_admission_even_with_actionable_candidate() {
+        let plan = plan_mission_objective(
+            &MissionObjectivePlannerInput::new(NOW_MS, "test", "continue under stale telemetry")
+                .with_source_snapshot(
+                    MissionObjectiveSourceSnapshot::new(
+                        "resource_cockpit.status",
+                        MissionObjectiveSourceKind::ResourceCockpit,
+                    )
+                    .degraded("capacity.telemetry_degraded"),
+                )
+                .with_source_snapshot(
+                    MissionObjectiveSourceSnapshot::new(
+                        "beads.ready",
+                        MissionObjectiveSourceKind::Beads,
+                    )
+                    .with_reason_code("beads.ready_available"),
+                )
+                .with_candidate(
+                    MissionObjectiveCandidateWork::new(
+                        "ready-under-degraded-capacity",
+                        MissionObjectiveCandidateReadiness::ReadyBead,
+                    )
+                    .target_bead_id("ft-ready"),
+                ),
+        );
+
+        assert_eq!(plan.plan_status, MissionObjectivePlanStatus::Degraded);
+        let step = &plan.plan_steps[0];
+        assert_eq!(step.status, MissionObjectivePlanStatus::Actionable);
+        assert_eq!(
+            step.action_kind,
+            MissionObjectiveActionKind::ChooseReadyBead
+        );
+
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            value["capacity_admission"]["action"],
+            serde_json::json!("defer")
+        );
+        assert!(
+            value["capacity_admission"]["reason_codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|code| code == "capacity.telemetry_degraded")
         );
     }
 
