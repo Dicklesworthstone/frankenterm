@@ -382,7 +382,8 @@ proptest! {
         prop_assert_eq!(
             shifted_result,
             base + offset,
-            "translation by {offset} must shift the percentile by the same amount"
+            "translation by {} must shift the percentile by the same amount",
+            offset
         );
     }
 
