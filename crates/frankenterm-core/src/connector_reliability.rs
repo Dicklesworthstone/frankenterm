@@ -700,13 +700,28 @@ impl ConnectorReliabilityController {
         }
     }
 
-    /// Check if the connector's circuit allows an operation.
+    /// Check whether a new operation may proceed.
+    ///
+    /// Gates on two independent backpressure signals: the circuit breaker AND
+    /// load shedding. Shedding fires when the dead-letter queue has backed up to
+    /// or past `shed_threshold` — a signal that failed work is accumulating
+    /// faster than it drains, so new operations are refused until the DLQ
+    /// recovers, regardless of circuit state. (Previously `is_shedding` was
+    /// computed but never consulted by any production path, so the configured
+    /// `shed_threshold` had no effect — load shedding never actually fired.)
     pub fn allow_operation(&mut self) -> bool {
+        self.telemetry.operations_attempted = self.telemetry.operations_attempted.saturating_add(1);
+
+        // Load shedding takes precedence: if the DLQ is saturated, refuse new
+        // work even when the circuit is closed.
+        if self.is_shedding() {
+            return false;
+        }
+
         let allowed = self.circuit.allow();
         if !allowed {
             self.telemetry.circuit_rejections = self.telemetry.circuit_rejections.saturating_add(1);
         }
-        self.telemetry.operations_attempted = self.telemetry.operations_attempted.saturating_add(1);
         allowed
     }
 
@@ -1078,6 +1093,48 @@ mod tests {
             !controller.allow_operation(),
             "an open circuit must reject further operations"
         );
+    }
+
+    /// Regression: load shedding must actually fire. When the dead-letter queue
+    /// backs up to shed_threshold, allow_operation must refuse new work even
+    /// while the circuit breaker is Closed. Previously is_shedding() was never
+    /// consulted, so the shed_threshold config had no effect.
+    #[test]
+    fn connector_reliability_sheds_when_dlq_saturated_even_with_closed_circuit() {
+        let config = ConnectorReliabilityConfig {
+            shed_threshold: 3,
+            ..Default::default() // auto_dlq: true, default circuit (does not trip on RateLimited)
+        };
+        let mut ctrl = ConnectorReliabilityController::new("slack", config);
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+
+        // Healthy to start: circuit closed, DLQ empty, ops allowed.
+        assert!(ctrl.allow_operation());
+        assert!(!ctrl.is_shedding());
+
+        // RateLimited is retryable (auto-enqueued to DLQ) but does NOT trip the
+        // breaker, so we drive the DLQ to shed_threshold while the circuit stays
+        // Closed — isolating the shedding path from circuit rejection.
+        for i in 0..3 {
+            ctrl.record_failure(&action, "rate limited", ConnectorErrorKind::RateLimited, 1000 + i);
+        }
+        assert_eq!(ctrl.dlq().depth(), 3, "three retryable failures enqueued");
+        assert!(ctrl.is_shedding(), "DLQ at shed_threshold");
+        assert_eq!(
+            ctrl.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Closed,
+            "RateLimited must not trip the breaker — isolate the shedding path"
+        );
+        assert!(
+            !ctrl.allow_operation(),
+            "load shedding must refuse new work when the DLQ is saturated, even with a closed circuit"
+        );
+
+        // Drain the DLQ below the threshold; shedding must stop.
+        let ids: Vec<u64> = ctrl.dlq().pending_entries().iter().map(|e| e.id).collect();
+        ctrl.dlq_mut().remove(ids[0]);
+        assert!(!ctrl.is_shedding(), "DLQ drained below threshold");
+        assert!(ctrl.allow_operation(), "operations resume once the DLQ recovers");
     }
 
     // ---- Dead-letter queue ----
