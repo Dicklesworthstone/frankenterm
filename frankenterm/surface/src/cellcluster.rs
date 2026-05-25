@@ -37,7 +37,11 @@ impl CellCluster {
         if self.byte_to_cell_idx.is_empty() {
             self.first_cell_idx.saturating_add(byte_idx)
         } else {
-            self.byte_to_cell_idx[byte_idx]
+            self.byte_to_cell_idx
+                .get(byte_idx)
+                .copied()
+                .or_else(|| self.byte_to_cell_idx.last().copied())
+                .unwrap_or(self.first_cell_idx)
         }
     }
 
@@ -45,7 +49,11 @@ impl CellCluster {
         if self.byte_to_cell_width.is_empty() {
             1
         } else {
-            self.byte_to_cell_width[byte_idx]
+            self.byte_to_cell_width
+                .get(byte_idx)
+                .copied()
+                .or_else(|| self.byte_to_cell_width.last().copied())
+                .unwrap_or(1)
         }
     }
 
@@ -405,6 +413,12 @@ mod tests {
         assert_eq!(c.byte_to_cell_idx(1), 10);
     }
 
+    #[test]
+    fn byte_to_cell_idx_populated_map_clamps_past_end() {
+        let c = make_cluster("é", 10, 1);
+        assert_eq!(c.byte_to_cell_idx(usize::MAX), 10);
+    }
+
     // ── byte_to_cell_width ────────────────────────────
 
     #[test]
@@ -417,6 +431,12 @@ mod tests {
     fn byte_to_cell_width_populated_map() {
         let c = make_cluster("X", 0, 2);
         assert_eq!(c.byte_to_cell_width(0), 2);
+    }
+
+    #[test]
+    fn byte_to_cell_width_populated_map_clamps_past_end() {
+        let c = make_cluster("X", 0, 2);
+        assert_eq!(c.byte_to_cell_width(usize::MAX), 2);
     }
 
     // ── CellCluster::add ──────────────────────────────
