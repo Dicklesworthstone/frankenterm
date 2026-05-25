@@ -58,8 +58,19 @@ pub fn reset_wezterm_lock_poisoned_count_for_test() {
 /// and bump the `WEZTERM_LOCK_POISONED_COUNT` observability counter
 /// on recovery. [ft-wd0fc]
 fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
-    WEZTERM_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    saturating_increment_u64(&WEZTERM_LOCK_POISONED_COUNT);
     poison.into_inner()
+}
+
+fn saturating_increment_u64(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return current,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Boxed future for WezTerm interface operations.
@@ -5395,6 +5406,14 @@ mod tests {
     fn next_retry_attempt_saturates_at_usize_max() {
         assert_eq!(next_retry_attempt(0), 1);
         assert_eq!(next_retry_attempt(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn saturating_increment_u64_refuses_to_wrap() {
+        let counter = AtomicU64::new(u64::MAX);
+
+        assert_eq!(saturating_increment_u64(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     // =====================================================================
