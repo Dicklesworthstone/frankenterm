@@ -14963,6 +14963,55 @@ mod tests {
     }
 
     #[test]
+    fn kill_switch_emergency_takes_precedence_over_rate_limit() {
+        // Security precedence invariant: hard denials (kill switch / quarantine
+        // / revocation) are evaluated BEFORE the rate-limit gate in
+        // evaluate_authorization. So an action that would otherwise be
+        // rate-limited (which maps to RequireApproval) must, under an active
+        // emergency halt, still be DENIED — never reported as
+        // "require approval / retry later", which would falsely imply the
+        // action could succeed once budget or an approval token is obtained.
+        // Locks the gate ordering against a future reorder that put the
+        // rate-limit gate ahead of the hard-stop gates.
+        use crate::policy_quarantine::*;
+
+        // limit_per_pane = 1: the second SendText to a pane is rate-limited.
+        let mut engine = PolicyEngine::new(1, 100, false);
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        // Exhaust the per-pane budget and confirm the rate-limit gate fires.
+        assert!(engine.authorize(&input).is_allowed());
+        let limited = engine.authorize(&input);
+        assert!(
+            limited.requires_approval(),
+            "second call must hit the rate-limit gate (RequireApproval)"
+        );
+        assert_eq!(limited.rule_id(), Some("policy.rate_limit"));
+
+        // Trip the emergency kill switch. The same still-rate-limited action
+        // must now be DENIED by the kill switch, not returned as
+        // require-approval.
+        engine.quarantine_registry_mut().trip_kill_switch(
+            KillSwitchLevel::EmergencyHalt,
+            "incident-commander",
+            "precedence regression guard",
+            1000,
+        );
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_denied(),
+            "emergency halt must DENY even a rate-limited action, got {decision:?}"
+        );
+        assert_eq!(
+            decision.rule_id(),
+            Some("policy.kill_switch"),
+            "hard kill-switch deny must take precedence over the rate-limit gate"
+        );
+    }
+
+    #[test]
     fn kill_switch_soft_stop_blocks_writes_on_any_pane() {
         use crate::policy_quarantine::*;
         let mut engine = PolicyEngine::permissive();
