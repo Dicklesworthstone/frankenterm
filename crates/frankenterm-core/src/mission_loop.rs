@@ -2257,6 +2257,8 @@ pub struct RejectedPinRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PinRejectionReason {
+    /// Target bead is also excluded by an `Exclude` override.
+    BeadExcluded,
     /// Target agent is also excluded by an `ExcludeAgent` override.
     AgentExcluded,
     /// Target agent is not present in the candidate agents list at all.
@@ -2273,6 +2275,7 @@ pub enum PinRejectionReason {
 impl PinRejectionReason {
     fn safety_gate_name(&self) -> Option<&'static str> {
         match self {
+            Self::BeadExcluded => Some("operator.override.pin.bead_excluded"),
             Self::AgentExcluded => Some("operator.override.pin.agent_excluded"),
             Self::AgentNotFound => Some("operator.override.pin.agent_not_found"),
             Self::AgentZeroCapacity => Some("operator.override.pin.agent_zero_capacity"),
@@ -2416,10 +2419,13 @@ impl MissionLoop {
                 .unwrap_or_default();
 
             // Validation in the order operators most expect to see in
-            // a rejection report: bead-level → agent existence → agent
-            // availability → agent exclusion. Each rejection produces
-            // exactly one RejectedPinRecord and skips the pin emission.
-            let rejection_reason = if !scored.scored.iter().any(|c| c.bead_id == *bead_id) {
+            // a rejection report: bead exclusion → bead scoring →
+            // agent existence → agent exclusion → agent availability.
+            // Each rejection produces exactly one RejectedPinRecord
+            // and skips the pin emission.
+            let rejection_reason = if excluded_beads.contains(bead_id) {
+                Some(PinRejectionReason::BeadExcluded)
+            } else if !scored.scored.iter().any(|c| c.bead_id == *bead_id) {
                 Some(PinRejectionReason::BeadNotScored)
             } else if let Some(agent) = agents.iter().find(|a| a.agent_id == *target_agent) {
                 if excluded_agents.contains(target_agent) {
@@ -5584,6 +5590,55 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_with_pin_and_exclude_bead_rejects_pinned_bead() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.apply_override(make_override(
+            "exclude-b1",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b1".to_string(),
+            },
+        ))
+        .unwrap();
+        ml.apply_override(make_override(
+            "pin-b1",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "alpha".to_string(),
+            },
+        ))
+        .unwrap();
+
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 1, &[])];
+        let agents = vec![ready_agent("alpha"), ready_agent("beta")];
+        let ctx = PlannerExtractionContext::default();
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        assert!(
+            decision.assignment_set.get_assignment("b1").is_none(),
+            "pin override must not bypass an explicit bead exclusion"
+        );
+        let rejection = decision
+            .assignment_set
+            .get_rejection("b1")
+            .expect("excluded pinned bead should be rejected");
+        assert!(rejection.reasons.iter().any(|reason| matches!(
+            reason,
+            RejectionReason::SafetyGateDenied { gate_name }
+                if gate_name == "operator.override.pin.bead_excluded"
+                    || gate_name == "operator.override.exclude_bead"
+        )));
+
+        let summary = ml.state.last_override_summary.as_ref().unwrap();
+        assert!(summary.excluded_beads.contains(&"b1".to_string()));
+        assert!(summary.pinned_assignments.is_empty());
+        assert_eq!(summary.rejected_pinned_assignments.len(), 1);
+        assert_eq!(
+            summary.rejected_pinned_assignments[0].reason,
+            PinRejectionReason::BeadExcluded
+        );
+    }
+
+    #[test]
     fn evaluate_with_pin_and_exclude_agent_rejects_pinned_bead() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         ml.apply_override(make_override(
@@ -6301,11 +6356,12 @@ mod tests {
     /// br-ft-gweu3: serde stability for the new RejectedPinRecord +
     /// PinRejectionReason types. Pins the wire format so external
     /// operator tooling can parse rejection records without
-    /// surprise renames. Universal-quantifier sweep over all four
-    /// reason variants.
+    /// surprise renames. Universal-quantifier sweep over every
+    /// reason variant.
     #[test]
     fn rejected_pin_record_serde_roundtrip_ft_gweu3() {
         for reason in [
+            PinRejectionReason::BeadExcluded,
             PinRejectionReason::AgentExcluded,
             PinRejectionReason::AgentNotFound,
             PinRejectionReason::AgentZeroCapacity,
@@ -6321,6 +6377,7 @@ mod tests {
             let roundtrip: RejectedPinRecord = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(roundtrip, original, "ft-gweu3: roundtrip must be lossless");
             let expected_str = match reason {
+                PinRejectionReason::BeadExcluded => "bead_excluded",
                 PinRejectionReason::AgentExcluded => "agent_excluded",
                 PinRejectionReason::AgentNotFound => "agent_not_found",
                 PinRejectionReason::AgentZeroCapacity => "agent_zero_capacity",
