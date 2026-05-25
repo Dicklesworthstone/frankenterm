@@ -191,6 +191,13 @@ pub const MAX_MCP_STATE_AGENT_FILTER_BYTES: usize = 256;
 /// tiny filter field as an unbounded allocation path.
 pub const MAX_MCP_CASS_AGENT_FILTER_BYTES: usize = 64;
 
+/// Hard cap for MCP CASS query strings before dispatching to the CASS subprocess.
+///
+/// `wa.cass_search.query` is a search expression, not a bulk payload channel.
+/// Bound it before trim checks and process dispatch so malformed clients cannot
+/// force very large argv/payload handling through the MCP server.
+pub const MAX_MCP_CASS_QUERY_BYTES: usize = 64 * 1024;
+
 // br-ft-rnpuc: clock-anomaly observability for MCP tool audit
 // timestamps. mcp_tools.rs has 11 sites with the pattern
 // `i64::try_from(now_ms()).unwrap_or(0)` — when the u64 → i64
@@ -468,6 +475,30 @@ fn validate_mcp_cass_agent_filter_bytes(
         Some(format!(
             "{tool_name} accepts only short agent selectors: codex, claude_code, gemini, cursor, \
              aider, chatgpt."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
+
+fn validate_mcp_cass_query_bytes(
+    tool_name: &str,
+    query: &str,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if query.len() <= MAX_MCP_CASS_QUERY_BYTES {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!(
+            "query is {} bytes; max allowed is {MAX_MCP_CASS_QUERY_BYTES} bytes",
+            query.len()
+        ),
+        Some(format!(
+            "{tool_name} accepts bounded search expressions only; narrow the query before calling \
+             cass."
         )),
         elapsed_ms(start),
     );
@@ -1329,7 +1360,7 @@ impl ToolHandler for WaCassSearchTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query string" },
+                    "query": { "type": "string", "maxLength": MAX_MCP_CASS_QUERY_BYTES, "description": "Search query string" },
                     "limit": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 10, "description": "Maximum results (0 = cass default)" },
                     "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Offset into results" },
                     "agent": { "type": "string", "maxLength": MAX_MCP_CASS_AGENT_FILTER_BYTES, "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt" },
@@ -1362,6 +1393,10 @@ impl ToolHandler for WaCassSearchTool {
             Ok(params) => params,
             Err(response) => return response,
         };
+
+        if let Some(error) = validate_mcp_cass_query_bytes("wa.cass_search", &params.query, start) {
+            return error;
+        }
 
         if params.query.trim().is_empty() {
             let envelope = McpEnvelope::<()>::error(
@@ -7208,7 +7243,7 @@ mod tests {
     use super::{
         ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
         CompatRuntimeBuilder, Config, Content, MAX_MCP_CASS_AGENT_FILTER_BYTES,
-        MAX_MCP_RULES_AGENT_TYPE_BYTES, MAX_MCP_RULES_TEST_TEXT_BYTES,
+        MAX_MCP_CASS_QUERY_BYTES, MAX_MCP_RULES_AGENT_TYPE_BYTES, MAX_MCP_RULES_TEST_TEXT_BYTES,
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS,
         MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
         StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool,
@@ -9318,6 +9353,50 @@ exit 17",
                 .as_str()
                 .expect("error string")
                 .contains("[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn cass_search_rejects_oversized_query_without_echoing_value() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let query = format!("{secret}{}", "x".repeat(MAX_MCP_CASS_QUERY_BYTES + 1));
+
+        let envelope = parse_json_content(
+            WaCassSearchTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "query": query,
+                    }),
+                )
+                .expect("cass_search oversized-query call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("max allowed")
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "oversized wa.cass_search query leaked the caller-supplied value"
+        );
+    }
+
+    #[test]
+    fn cass_search_schema_declares_query_max_length() {
+        let def = WaCassSearchTool.definition();
+        assert_eq!(
+            def.input_schema["properties"]["query"]["maxLength"].as_u64(),
+            Some(MAX_MCP_CASS_QUERY_BYTES as u64)
         );
     }
 
