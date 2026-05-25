@@ -694,7 +694,12 @@ impl PaneSnapshotManager {
         output_features: Option<SnapshotOutputFeatures>,
     ) -> ContextSnapshot {
         let snapshot_id = self.next_snapshot_id;
-        self.next_snapshot_id += 1;
+        // br-ft-pu2mg saturating-counter convention: plateau at u64::MAX rather
+        // than debug-panicking / release-wrapping this monotonic id generator on
+        // overflow. At the (unreachable, ~1.8e19-snapshot) boundary the id stops
+        // advancing instead of wrapping to 0; the correlation_id below still
+        // carries now_us so emitted correlation strings stay distinct.
+        self.next_snapshot_id = self.next_snapshot_id.saturating_add(1);
         self.last_snapshot_us = now_us;
 
         let correlation_id = format!("ctx-{}-{}-{}", self.pane_id, snapshot_id, now_us);
@@ -894,6 +899,29 @@ mod tests {
         assert_eq!(cfg.max_env_vars, 32);
         assert!(cfg.capture_env);
         assert!((cfg.bocpd_threshold - 0.7).abs() < f64::EPSILON);
+    }
+
+    // br-ft-pu2mg: the monotonic snapshot-id generator must plateau at u64::MAX
+    // rather than debug-panic / release-wrap on overflow. Seeds next_snapshot_id
+    // at the boundary and captures once more. Without saturating_add,
+    // `self.next_snapshot_id += 1` overflow-panics in debug.
+    #[test]
+    fn snapshot_id_generator_saturates_at_u64_max() {
+        let mut mgr = PaneSnapshotManager::new(7, test_config());
+        mgr.next_snapshot_id = u64::MAX;
+        let snap = mgr.create_snapshot(
+            base_us(),
+            SnapshotTrigger::Manual {
+                reason: "boundary".to_string(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(snap.snapshot_id, u64::MAX, "the boundary snapshot takes id u64::MAX");
+        assert_eq!(
+            mgr.next_snapshot_id, u64::MAX,
+            "id generator must saturate at u64::MAX, not wrap to 0"
+        );
     }
 
     #[test]
