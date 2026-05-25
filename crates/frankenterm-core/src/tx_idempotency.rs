@@ -799,7 +799,7 @@ pub struct DeduplicationGuard {
     capacity: usize,
     /// Map: idempotency key → (execution_id, outcome, timestamp_ms).
     entries: BTreeMap<String, DeduplicationEntry>,
-    /// FIFO order for eviction.
+    /// Oldest-to-newest record/update order for eviction.
     order: VecDeque<String>,
 }
 
@@ -842,11 +842,13 @@ impl DeduplicationGuard {
     ) {
         let key_str = idem_key.as_str().to_string();
 
-        // If already present, update in place (no eviction needed).
+        // If already present, update in place and refresh eviction order.
         if let Some(entry) = self.entries.get_mut(&key_str) {
             entry.execution_id = execution_id.to_string();
             entry.outcome = outcome;
             entry.timestamp_ms = timestamp_ms;
+            self.order.retain(|existing| existing != &key_str);
+            self.order.push_back(key_str);
             return;
         }
 
@@ -1960,12 +1962,13 @@ mod tests {
             "a",
             2000,
         );
-        match outcome {
-            Err(IdempotencyError::DuplicateExecution { key: k }) => {
-                assert_eq!(k, key.as_str());
-            }
-            other => panic!("expected DuplicateExecution after deserialize+append, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                &outcome,
+                Err(IdempotencyError::DuplicateExecution { key: k }) if k == key.as_str()
+            ),
+            "expected DuplicateExecution after deserialize+append, got {outcome:?}"
+        );
 
         // After the self-heal, an unrelated key must still
         // succeed — the guard should not block legitimate appends.
@@ -2232,6 +2235,45 @@ mod tests {
         assert_eq!(guard.len(), 1);
         let entry = guard.check(&key).unwrap();
         assert!(matches!(entry.outcome, StepOutcome::Success { .. }));
+    }
+
+    #[test]
+    fn dedup_update_refreshes_eviction_order() {
+        let mut guard = DeduplicationGuard::new(2);
+        let refreshed = make_key("p1", "refreshed");
+        let stale = make_key("p1", "stale");
+        let newest = make_key("p1", "newest");
+
+        guard.record(&refreshed, "exec-1", StepOutcome::Pending, 1000);
+        guard.record(&stale, "exec-1", StepOutcome::Pending, 2000);
+        guard.record(
+            &refreshed,
+            "exec-2",
+            StepOutcome::Success {
+                result: Some("refreshed".to_string()),
+            },
+            3000,
+        );
+        guard.record(&newest, "exec-1", StepOutcome::Pending, 4000);
+
+        assert_eq!(guard.len(), 2);
+        assert!(
+            guard.check(&refreshed).is_some(),
+            "refreshed key must remain resident under capacity pressure"
+        );
+        assert!(
+            guard.check(&stale).is_none(),
+            "least-recently recorded key should evict first"
+        );
+        assert!(guard.check(&newest).is_some());
+
+        let refreshed_entry = guard.check(&refreshed).unwrap();
+        assert_eq!(refreshed_entry.execution_id, "exec-2");
+        assert_eq!(refreshed_entry.timestamp_ms, 3000);
+        assert!(matches!(
+            refreshed_entry.outcome,
+            StepOutcome::Success { .. }
+        ));
     }
 
     #[test]
