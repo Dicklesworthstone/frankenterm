@@ -864,6 +864,25 @@ fn validate_optional_pane_uuid(
     Ok(())
 }
 
+fn validate_detection_identifier(value: &str, field: &str) -> Result<(), WireProtocolError> {
+    if value.trim().is_empty() {
+        return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+            format!("DetectionNotice {field} must not be empty"),
+        )));
+    }
+    if value.split('.').any(|segment| segment.trim().is_empty()) {
+        return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+            format!("DetectionNotice {field} must not contain empty dot-separated segments"),
+        )));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+            format!("DetectionNotice {field} must not contain whitespace"),
+        )));
+    }
+    Ok(())
+}
+
 fn validate_pane_meta(pane: &PaneMeta, label: &str) -> Result<(), WireProtocolError> {
     if pane.domain.trim().is_empty() {
         return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
@@ -925,6 +944,8 @@ fn validate_envelope_protocol_with_limits(
     }
     if let WirePayload::Detection(detection) = &envelope.payload {
         validate_optional_pane_uuid(detection.pane_uuid.as_deref(), "DetectionNotice")?;
+        validate_detection_identifier(&detection.rule_id, "rule_id")?;
+        validate_detection_identifier(&detection.event_type, "event_type")?;
         if !detection.confidence.is_finite() || !(0.0..=1.0).contains(&detection.confidence) {
             return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
                 format!(
@@ -2135,6 +2156,39 @@ mod tests {
         assert_eq!(agg.total_rejected(), 5);
         assert_eq!(agg.total_accepted(), 0);
         assert_eq!(agg.agent_count(), 0);
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_rejects_detection_notice_malformed_ids() {
+        for (idx, mutate) in [
+            (|detection: &mut DetectionNotice| detection.rule_id.clear())
+                as fn(&mut DetectionNotice),
+            |detection| detection.rule_id = "codex..usage".to_string(),
+            |detection| detection.rule_id = "codex usage".to_string(),
+            |detection| detection.event_type = " \t ".to_string(),
+            |detection| detection.event_type = "usage..reached".to_string(),
+            |detection| detection.event_type = "usage reached".to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut agg = Aggregator::new(10);
+            let mut detection = sample_detection();
+            mutate(&mut detection);
+            let envelope = WireEnvelope::new(
+                idx as u64 + 1,
+                "agent-valid",
+                WirePayload::Detection(detection),
+            );
+
+            let err = agg
+                .ingest_envelope(envelope)
+                .expect_err("decoded detection metadata must reject malformed ids");
+            assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+            assert_eq!(agg.total_rejected(), 1);
+            assert_eq!(agg.total_accepted(), 0);
+            assert_eq!(agg.agent_count(), 0);
+        }
     }
 
     #[test]
