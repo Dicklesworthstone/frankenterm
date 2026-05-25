@@ -847,24 +847,18 @@ impl WorkflowRunner {
                 "Workflow resume step is outside the executable step range"
             );
             if let Err(e) = self
-                .fail_execution_maybe_cx(cx, execution_id, &reason)
+                .persist_aborted_execution_maybe_cx(cx, execution_id, &reason, "aborted")
                 .await
             {
-                tracing::warn!(
+                tracing::error!(
                     execution_id,
                     error = %e,
-                    "Failed to fail execution after invalid resume step"
+                    "Failed to persist abort after invalid resume step; not reporting aborted"
                 );
-            }
-            if let Err(e) = self
-                .mark_trigger_event_handled_maybe_cx(cx, execution_id, "aborted")
-                .await
-            {
-                tracing::warn!(
-                    execution_id,
-                    error = %e,
-                    "Failed to mark trigger event handled after invalid resume step"
-                );
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: e.to_string(),
+                };
             }
             record_workflow_terminal_action_maybe_cx(
                 cx,
@@ -1423,24 +1417,23 @@ impl WorkflowRunner {
                         );
 
                         if let Err(e) = self
-                            .fail_execution_maybe_cx(cx, execution_id, &reason)
+                            .persist_aborted_execution_maybe_cx(
+                                cx,
+                                execution_id,
+                                &reason,
+                                "aborted",
+                            )
                             .await
                         {
-                            tracing::warn!(
+                            tracing::error!(
                                 execution_id,
                                 error = %e,
-                                "Failed to fail execution after invalid jump"
+                                "Failed to persist abort after invalid jump; not reporting aborted"
                             );
-                        }
-                        if let Err(e) = self
-                            .mark_trigger_event_handled_maybe_cx(cx, execution_id, "aborted")
-                            .await
-                        {
-                            tracing::warn!(
-                                execution_id,
-                                error = %e,
-                                "Failed to mark trigger event handled after invalid jump"
-                            );
+                            return WorkflowExecutionResult::Error {
+                                execution_id: Some(execution_id.to_string()),
+                                error: e.to_string(),
+                            };
                         }
                         workflow.cleanup(&mut ctx).await;
                         record_workflow_terminal_action_maybe_cx(
@@ -3069,6 +3062,19 @@ impl WorkflowRunner {
             .await
     }
 
+    async fn persist_aborted_execution_maybe_cx(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        execution_id: &str,
+        reason: &str,
+        handled_status: &str,
+    ) -> crate::Result<()> {
+        self.fail_execution_maybe_cx(cx, execution_id, reason)
+            .await?;
+        self.mark_trigger_event_handled_maybe_cx(cx, execution_id, handled_status)
+            .await
+    }
+
     async fn fail_execution(&self, execution_id: &str, error: &str) -> crate::Result<()> {
         let mut record = self
             .storage
@@ -4104,6 +4110,85 @@ mod tests {
                 1,
                 "runner must stop before executing later steps after progress persistence fails"
             );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    struct InvalidJumpPersistenceProbeWorkflow;
+
+    impl Workflow for InvalidJumpPersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "invalid_jump_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Attempts an invalid jump to exercise abort persistence"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("bad_jump", "Bad jump")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move { StepResult::JumpTo { step: 99 } })
+        }
+    }
+
+    #[test]
+    fn workflow_invalid_jump_abort_persistence_failure_is_not_reported_aborted() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("invalid_jump_persistence_fail_closed.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let execution_id = "missing-invalid-jump-record";
+            let result = runner
+                .run_workflow(
+                    77,
+                    Arc::new(InvalidJumpPersistenceProbeWorkflow),
+                    execution_id,
+                    0,
+                )
+                .await;
+
+            match result {
+                WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                } => {
+                    assert_eq!(id, execution_id);
+                    assert!(
+                        error.contains(execution_id),
+                        "abort persistence error should identify the execution: {error}"
+                    );
+                }
+                other => panic!("missing abort persistence must not report aborted: {other:?}"),
+            }
 
             storage.shutdown().await.unwrap();
         });
