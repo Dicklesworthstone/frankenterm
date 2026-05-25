@@ -524,7 +524,7 @@ impl ConnectorInboundBridge {
                     "inbound signal deduplicated"
                 );
                 return Ok(BridgeRouteResult {
-                    rule_id: signal.rule_id(),
+                    rule_id: self.resolve_rule_id(signal),
                     deduplicated: true,
                     delivered_count: 0,
                     correlation_id: signal.correlation_id.clone(),
@@ -1121,6 +1121,32 @@ mod tests {
 
         let result = bridge.route_signal(&sig).unwrap();
         assert_eq!(result.rule_id, "custom.gh_event.push");
+    }
+
+    #[test]
+    fn bridge_deduplicated_result_uses_rule_id_override() {
+        let bus = make_bus();
+        let _sub = bus.subscribe_detections();
+        let mut overrides = HashMap::new();
+        overrides.insert("github.webhook".to_string(), "custom.gh_event".to_string());
+        let config = ConnectorInboundBridgeConfig {
+            rule_id_overrides: overrides,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorInboundBridge::new(bus, config);
+
+        let sig = test_signal("github", ConnectorSignalKind::Webhook)
+            .with_sub_type("push")
+            .with_correlation_id("dup-override");
+
+        let first = bridge.route_signal(&sig).unwrap();
+        assert_eq!(first.rule_id, "custom.gh_event.push");
+        assert!(!first.deduplicated);
+
+        let duplicate = bridge.route_signal(&sig).unwrap();
+        assert_eq!(duplicate.rule_id, "custom.gh_event.push");
+        assert!(duplicate.deduplicated);
+        assert_eq!(duplicate.delivered_count, 0);
     }
 
     #[test]
