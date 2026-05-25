@@ -711,9 +711,15 @@ fn unique_proxy_tools_by_exposed_name(
             continue;
         }
 
+        let redacted_server_name = redact_mcp_proxy_selection_text(server_name);
+        let redacted_external_name = redact_mcp_proxy_selection_text(&external_name);
+        let redacted_exposed_name = redact_mcp_proxy_selection_text(&exposed_name);
         let message = format!(
             "mcp proxy duplicate exposed tool name for server '{server_name}' tool \
-             '{external_name}': {exposed_name}"
+             '{external_name}': {exposed_name}",
+            server_name = redacted_server_name,
+            external_name = redacted_external_name,
+            exposed_name = redacted_exposed_name,
         );
         if fail_fast {
             return Err(crate::error::ConfigError::ValidationError(message).into());
@@ -727,9 +733,9 @@ fn unique_proxy_tools_by_exposed_name(
         tracing::warn!(
             target: LOG_TARGET,
             event = "mcp_proxy_duplicate_exposed_tool_name",
-            server = %server_name,
-            tool = %external_name,
-            exposed_name = %exposed_name,
+            server = %redacted_server_name,
+            tool = %redacted_external_name,
+            exposed_name = %redacted_exposed_name,
             fallback_to_local = settings.proxy_fallback_to_local,
             strict = settings.proxy_strict,
             "Remote MCP server advertised a duplicate proxied tool name; skipping duplicate"
@@ -1199,6 +1205,43 @@ mod tests {
         let err = super::unique_proxy_tools_by_exposed_name("srv", "remote/srv", tools, &settings)
             .expect_err("strict duplicate handling must fail composition");
         assert!(err.to_string().contains("duplicate exposed tool name"));
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            0,
+            "strict mode returns an error instead of recording a soft skip"
+        );
+    }
+
+    #[test]
+    fn unique_proxy_tools_by_exposed_name_redacts_secret_shaped_duplicate_tool() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+        let settings = McpClientConfig {
+            proxy_strict: true,
+            proxy_fallback_to_local: false,
+            ..McpClientConfig::default()
+        };
+        let secret = "sk-ant-api03-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+        let tools = vec![make_safe_tool(secret), make_safe_tool(secret)];
+
+        let err = super::unique_proxy_tools_by_exposed_name(
+            "srv",
+            &format!("remote/srv/{secret}"),
+            tools,
+            &settings,
+        )
+        .expect_err("strict duplicate handling must fail composition");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("duplicate exposed tool name"));
+        assert!(
+            !rendered.contains(secret),
+            "raw duplicate proxy tool secret leaked in error: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "expected redaction marker in duplicate proxy tool error: {rendered}"
+        );
         assert_eq!(
             super::mcp_proxy_mount_failure_count(),
             0,
