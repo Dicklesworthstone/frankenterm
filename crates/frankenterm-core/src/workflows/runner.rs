@@ -1502,28 +1502,23 @@ impl WorkflowRunner {
                     // Workflow completed
                     let elapsed_ms = elapsed_ms(start_time);
 
-                    // Update execution to completed
                     if let Err(e) = self
-                        .complete_execution_maybe_cx(cx, execution_id, Some(result.clone()))
+                        .persist_completed_execution_maybe_cx(
+                            cx,
+                            execution_id,
+                            Some(result.clone()),
+                        )
                         .await
                     {
-                        tracing::warn!(
+                        tracing::error!(
                             execution_id,
                             error = %e,
-                            "Failed to complete execution"
+                            "Workflow completion persistence failed; not reporting completed"
                         );
-                    }
-
-                    // Mark trigger event as handled
-                    if let Err(e) = self
-                        .mark_trigger_event_handled_maybe_cx(cx, execution_id, "completed")
-                        .await
-                    {
-                        tracing::warn!(
-                            execution_id,
-                            error = %e,
-                            "Failed to mark trigger event as handled"
-                        );
+                        return WorkflowExecutionResult::Error {
+                            execution_id: Some(execution_id.to_string()),
+                            error: e.to_string(),
+                        };
                     }
 
                     // Release lock
@@ -2218,26 +2213,18 @@ impl WorkflowRunner {
         let result = serde_json::json!({ "status": "completed" });
 
         if let Err(e) = self
-            .complete_execution_maybe_cx(cx, execution_id, Some(result.clone()))
+            .persist_completed_execution_maybe_cx(cx, execution_id, Some(result.clone()))
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 execution_id,
                 error = %e,
-                "Failed to complete execution"
+                "Workflow completion persistence failed; not reporting completed"
             );
-        }
-
-        // Mark trigger event as handled
-        if let Err(e) = self
-            .mark_trigger_event_handled_maybe_cx(cx, execution_id, "completed")
-            .await
-        {
-            tracing::warn!(
-                execution_id,
-                error = %e,
-                "Failed to mark trigger event as handled"
-            );
+            return WorkflowExecutionResult::Error {
+                execution_id: Some(execution_id.to_string()),
+                error: e.to_string(),
+            };
         }
 
         record_workflow_terminal_action_maybe_cx(
@@ -3040,6 +3027,18 @@ impl WorkflowRunner {
                 .await;
         }
         self.complete_execution(execution_id, result).await
+    }
+
+    async fn persist_completed_execution_maybe_cx(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        execution_id: &str,
+        result: Option<serde_json::Value>,
+    ) -> crate::Result<()> {
+        self.complete_execution_maybe_cx(cx, execution_id, result)
+            .await?;
+        self.mark_trigger_event_handled_maybe_cx(cx, execution_id, "completed")
+            .await
     }
 
     async fn fail_execution(&self, execution_id: &str, error: &str) -> crate::Result<()> {
@@ -3896,6 +3895,90 @@ mod tests {
             ..WorkflowRunnerConfig::default()
         };
         assert_eq!(config.workflow_total_deadline_ms, 0);
+    }
+
+    struct CompletionPersistenceProbeWorkflow;
+
+    impl Workflow for CompletionPersistenceProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "completion_persistence_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Completes immediately to exercise terminal persistence"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::done(serde_json::json!({ "ok": true })),
+                    _ => StepResult::abort("unexpected step"),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn workflow_completion_persistence_failure_is_not_reported_completed() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("completion_persistence_fail_closed.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let handle: crate::wezterm::WeztermHandle =
+                Arc::new(crate::wezterm::MockWezterm::new());
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                handle,
+            ));
+            let runner = WorkflowRunner::new(
+                WorkflowEngine::default(),
+                Arc::new(PaneWorkflowLockManager::new()),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            let execution_id = "missing-completion-record";
+            let result = runner
+                .run_workflow(
+                    77,
+                    Arc::new(CompletionPersistenceProbeWorkflow),
+                    execution_id,
+                    0,
+                )
+                .await;
+
+            match result {
+                WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                } => {
+                    assert_eq!(id, execution_id);
+                    assert!(
+                        error.contains(execution_id),
+                        "completion persistence error should identify the execution: {error}"
+                    );
+                }
+                other => panic!("missing terminal persistence must not report success: {other:?}"),
+            }
+
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]
