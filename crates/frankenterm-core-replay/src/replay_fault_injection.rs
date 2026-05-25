@@ -305,17 +305,31 @@ impl FaultPresets {
     /// rate_limit_storm: burst of events in tight window to test backpressure.
     #[must_use]
     pub fn rate_limit_storm(pane_id: &str, burst_count: usize, seed: u64) -> FaultSpec {
-        FaultSpec {
-            name: "rate_limit_storm".to_string(),
-            description: format!("Inject burst of {burst_count} events for pane {pane_id}"),
-            seed,
-            faults: vec![FaultType::Duplicate {
+        let effective_count = burst_count.min(MAX_DUPLICATE_COUNT);
+        let description = if burst_count > MAX_DUPLICATE_COUNT {
+            format!(
+                "Inject burst of {effective_count} events for pane {pane_id} (requested {burst_count}, capped at {MAX_DUPLICATE_COUNT})"
+            )
+        } else {
+            format!("Inject burst of {effective_count} events for pane {pane_id}")
+        };
+        let faults = if effective_count == 0 {
+            Vec::new()
+        } else {
+            vec![FaultType::Duplicate {
                 filter: EventFilter {
                     pane_id: Some(pane_id.to_string()),
                     ..EventFilter::match_all()
                 },
-                count: burst_count,
-            }],
+                count: effective_count,
+            }]
+        };
+
+        FaultSpec {
+            name: "rate_limit_storm".to_string(),
+            description,
+            seed,
+            faults,
         }
     }
 
@@ -1238,6 +1252,30 @@ mutation = "later"
         let evt = make_event("e1", "p1", "data", 100, 0);
         let result = inj.process(evt);
         assert_eq!(result.len(), 6); // 1 original + 5 copies
+    }
+
+    #[test]
+    fn preset_rate_limit_storm_zero_is_valid_noop() {
+        let spec = FaultPresets::rate_limit_storm("p1", 0, 42);
+        spec.validate().expect("zero burst preset should be valid");
+        assert!(spec.faults.is_empty());
+        let mut inj = FaultInjector::new(spec);
+        let evt = make_event("e1", "p1", "data", 100, 0);
+        let result = inj.process(evt);
+        assert_eq!(result.len(), 1);
+        assert_eq!(inj.log().count(), 0);
+    }
+
+    #[test]
+    fn preset_rate_limit_storm_caps_excessive_count() {
+        let spec = FaultPresets::rate_limit_storm("p1", MAX_DUPLICATE_COUNT + 1, 42);
+        spec.validate()
+            .expect("capped burst preset should remain valid");
+        match &spec.faults[0] {
+            FaultType::Duplicate { count, .. } => assert_eq!(*count, MAX_DUPLICATE_COUNT),
+            other => panic!("expected duplicate fault, got {other:?}"),
+        }
+        assert!(spec.description.contains("capped"));
     }
 
     #[test]
