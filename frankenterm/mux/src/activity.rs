@@ -4,18 +4,34 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
+fn try_increment_count(counter: &AtomicUsize) -> bool {
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Create and hold on to an Activity while you are processing
 /// the direct result of a user initiated action, such as preparing
 /// to open a window.
 /// Once you have opened the window, drop the activity.
 /// The activity is used to keep the frontend alive even if there
 /// may be no windows present in the mux.
-pub struct Activity {}
+pub struct Activity {
+    counted: bool,
+}
 
 impl Activity {
     pub fn new() -> Self {
-        COUNT.fetch_add(1, Ordering::SeqCst);
-        Self {}
+        Self {
+            counted: try_increment_count(&COUNT),
+        }
     }
 
     pub fn count() -> usize {
@@ -25,7 +41,9 @@ impl Activity {
 
 impl Drop for Activity {
     fn drop(&mut self) {
-        COUNT.fetch_sub(1, Ordering::SeqCst);
+        if self.counted {
+            COUNT.fetch_sub(1, Ordering::SeqCst);
+        }
 
         if !promise::spawn::is_scheduler_configured() {
             return;
@@ -37,5 +55,18 @@ impl Drop for Activity {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_increment_count_refuses_to_wrap() {
+        let counter = AtomicUsize::new(usize::MAX);
+
+        assert!(!try_increment_count(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), usize::MAX);
     }
 }
