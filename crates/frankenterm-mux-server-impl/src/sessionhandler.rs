@@ -433,6 +433,48 @@ impl SessionHandler {
             }
         }
 
+        fn pane_exists_now(pane_id: PaneId) -> anyhow::Result<bool> {
+            let mux = session_mux()?;
+            Ok(mux.get_pane(pane_id).is_some())
+        }
+
+        fn respond_if_pane_unavailable<SND>(pane_id: PaneId, send_response: &SND) -> bool
+        where
+            SND: Fn(anyhow::Result<Pdu>),
+        {
+            match pane_exists_now(pane_id) {
+                Ok(true) => false,
+                Ok(false) => {
+                    send_response(Err(anyhow!("no such pane {}", pane_id)));
+                    true
+                }
+                Err(err) => {
+                    send_response(Err(err));
+                    true
+                }
+            }
+        }
+
+        fn respond_liveness_if_pane_unavailable<SND>(pane_id: PaneId, send_response: &SND) -> bool
+        where
+            SND: Fn(anyhow::Result<Pdu>),
+        {
+            match pane_exists_now(pane_id) {
+                Ok(true) => false,
+                Ok(false) => {
+                    send_response(Ok(Pdu::LivenessResponse(LivenessResponse {
+                        pane_id,
+                        is_alive: false,
+                    })));
+                    true
+                }
+                Err(err) => {
+                    send_response(Err(err));
+                    true
+                }
+            }
+        }
+
         match decoded.pdu {
             Pdu::Ping(Ping {}) => send_response(Ok(Pdu::Pong(Pong {}))),
             Pdu::SetWindowWorkspace(SetWindowWorkspace {
@@ -656,7 +698,7 @@ impl SessionHandler {
             }
 
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
-                if respond_if_mux_unavailable(&send_response) {
+                if respond_if_pane_unavailable(pane_id, &send_response) {
                     return;
                 }
                 let sender = self.to_write_tx.clone();
@@ -719,7 +761,7 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SendPaste(SendPaste { pane_id, data }) => {
-                if respond_if_mux_unavailable(&send_response) {
+                if respond_if_pane_unavailable(pane_id, &send_response) {
                     return;
                 }
                 let sender = self.to_write_tx.clone();
@@ -892,7 +934,7 @@ impl SessionHandler {
                 event,
                 input_serial,
             }) => {
-                if respond_if_mux_unavailable(&send_response) {
+                if respond_if_pane_unavailable(pane_id, &send_response) {
                     return;
                 }
                 let sender = self.to_write_tx.clone();
@@ -945,7 +987,7 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }) => {
-                if respond_if_mux_unavailable(&send_response) {
+                if respond_if_pane_unavailable(pane_id, &send_response) {
                     return;
                 }
                 let sender = self.to_write_tx.clone();
@@ -1017,7 +1059,7 @@ impl SessionHandler {
             }
 
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
-                if respond_if_mux_unavailable(&send_response) {
+                if respond_liveness_if_pane_unavailable(pane_id, &send_response) {
                     return;
                 }
                 let sender = self.to_write_tx.clone();
@@ -2570,6 +2612,8 @@ mod tests {
     enum MissingMuxPaneOp {
         WriteToPane { pane_id: PaneId, data: Vec<u8> },
         SendPaste { pane_id: PaneId, data: String },
+        SendKeyDown { pane_id: PaneId },
+        SendMouseEvent { pane_id: PaneId },
         GetPaneRenderChanges { pane_id: PaneId },
         KillPane { pane_id: PaneId },
     }
@@ -2634,6 +2678,26 @@ mod tests {
                     Pdu::WriteToPane(WriteToPane { pane_id, data })
                 }
                 Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste { pane_id, data }),
+                Self::SendKeyDown { pane_id } => Pdu::SendKeyDown(SendKeyDown {
+                    pane_id,
+                    event: termwiz::input::KeyEvent {
+                        key: KeyCode::Char('x'),
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    input_serial: InputSerial::empty(),
+                }),
+                Self::SendMouseEvent { pane_id } => Pdu::SendMouseEvent(SendMouseEvent {
+                    pane_id,
+                    event: MouseEvent {
+                        kind: wezterm_term::input::MouseEventKind::Move,
+                        x: 0,
+                        y: 0,
+                        x_pixel_offset: 0,
+                        y_pixel_offset: 0,
+                        button: wezterm_term::input::MouseButton::None,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                }),
                 Self::GetPaneRenderChanges { pane_id } => {
                     Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id })
                 }
@@ -2770,6 +2834,8 @@ mod tests {
                 .prop_map(|(pane_id, data)| MissingMuxPaneOp::WriteToPane { pane_id, data }),
             (0usize..4096, "[a-zA-Z0-9 _./-]{0,64}")
                 .prop_map(|(pane_id, data)| { MissingMuxPaneOp::SendPaste { pane_id, data } }),
+            (0usize..4096).prop_map(|pane_id| MissingMuxPaneOp::SendKeyDown { pane_id }),
+            (0usize..4096).prop_map(|pane_id| MissingMuxPaneOp::SendMouseEvent { pane_id }),
             (0usize..4096).prop_map(|pane_id| MissingMuxPaneOp::GetPaneRenderChanges { pane_id }),
             (0usize..4096).prop_map(|pane_id| MissingMuxPaneOp::KillPane { pane_id }),
         ]
@@ -3715,6 +3781,66 @@ mod tests {
                 prop_assert!(
                     handler.per_pane.is_empty(),
                     "missing-mux cancel path retained per-pane state after step {}: {:?}",
+                    idx,
+                    op
+                );
+            }
+        }
+
+        #[test]
+        fn prop_present_mux_missing_pane_paths_do_not_retain_per_pane_state(
+            ops in proptest::collection::vec(arb_missing_mux_pane_op(), 1..64)
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let executor = SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new(sender);
+
+            for (idx, op) in ops.into_iter().enumerate() {
+                let serial = idx as u64 + 1;
+                handler.process_one(DecodedPdu {
+                    serial,
+                    pdu: op.clone().into_pdu(),
+                });
+                tick_until_response(&executor, &captured, idx + 1);
+
+                let captured = captured.lock().expect("captured response lock");
+                let response = captured.last().expect("missing-pane path should respond");
+                prop_assert_eq!(response.serial, serial);
+                match (&op, &response.pdu) {
+                    (
+                        MissingMuxPaneOp::GetPaneRenderChanges { pane_id },
+                        Pdu::LivenessResponse(LivenessResponse {
+                            pane_id: response_pane_id,
+                            is_alive: false,
+                        }),
+                    ) => {
+                        prop_assert_eq!(response_pane_id, pane_id);
+                    }
+                    (_, Pdu::ErrorResponse(ErrorResponse { reason })) => {
+                        prop_assert!(
+                            reason.contains("no such pane"),
+                            "present-mux missing-pane path should report missing pane for {:?}, got {reason}",
+                            op
+                        );
+                    }
+                    other => {
+                        prop_assert!(
+                            false,
+                            "present-mux missing-pane path for {:?} returned {other:?}",
+                            op
+                        );
+                    }
+                }
+                drop(captured);
+
+                prop_assert!(
+                    handler.per_pane.is_empty(),
+                    "present-mux missing-pane path retained per-pane state after step {}: {:?}",
                     idx,
                     op
                 );
