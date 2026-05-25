@@ -4443,6 +4443,10 @@ pub struct PolicyEngine {
     rate_limiter: SharedRateLimiter,
     /// Whether to require prompt active before mutating sends
     require_prompt_active: bool,
+    /// Whether to gate sends to panes in the alternate screen (the
+    /// `[safety].block_alt_screen` policy). Defaults off in `new()` so direct
+    /// constructions/tests are unaffected; `from_config` sets it from config.
+    block_alt_screen: bool,
     /// Command safety gate configuration
     command_gate: CommandGateConfig,
     /// Whether trauma-guard intervention is enabled.
@@ -4505,6 +4509,7 @@ impl PolicyEngine {
                 rate_limit_global,
             ))),
             require_prompt_active,
+            block_alt_screen: false,
             command_gate: CommandGateConfig::default(),
             trauma_guard_enabled: true,
             policy_rules: PolicyRulesConfig::default(),
@@ -4563,6 +4568,7 @@ impl PolicyEngine {
             config.require_prompt_active,
         )
         .with_command_gate_config(config.command_gate.clone())
+        .with_block_alt_screen(config.block_alt_screen)
         .with_policy_rules(config.rules.clone())
         .with_decision_log_config(config.decision_log.clone());
         engine.quarantine_registry = QuarantineRegistry::from_config(&config.quarantine);
@@ -4668,6 +4674,14 @@ impl PolicyEngine {
     #[must_use]
     pub fn with_command_gate_config(mut self, command_gate: CommandGateConfig) -> Self {
         self.command_gate = command_gate;
+        self
+    }
+
+    /// Builder: enable gating of sends to alternate-screen panes
+    /// (`[safety].block_alt_screen`).
+    #[must_use]
+    pub fn with_block_alt_screen(mut self, block_alt_screen: bool) -> Self {
+        self.block_alt_screen = block_alt_screen;
         self
     }
 
@@ -6580,6 +6594,39 @@ impl PolicyEngine {
                 None,
                 Some("prompt gate not applicable".to_string()),
             );
+        }
+
+        // Block sends to alternate-screen panes ([safety].block_alt_screen).
+        // A fullscreen TUI (vim/less/htop) in the alt screen interprets injected
+        // text as app keystrokes, not shell input, so sending into it is unsafe.
+        // The flag is honored here (it was previously dead: configured but never
+        // enforced, and `is_input_safe` — which checks alt_screen — was never
+        // called on a production path). Untrusted actors require approval;
+        // trusted actors (operator) may deliberately drive a TUI.
+        if self.block_alt_screen
+            && matches!(
+                input.action,
+                ActionKind::SendText
+                    | ActionKind::SendControl
+                    | ActionKind::SendCtrlC
+                    | ActionKind::SendCtrlD
+                    | ActionKind::SendCtrlZ
+            )
+            && input.capabilities.alt_screen == Some(true)
+            && !input.actor.is_trusted()
+        {
+            context.record_rule(
+                "policy.block_alt_screen",
+                true,
+                Some("require_approval"),
+                Some("pane in alternate screen".to_string()),
+            );
+            context.set_determining_rule("policy.block_alt_screen");
+            return PolicyDecision::require_approval_with_rule(
+                "Pane is in the alternate screen (fullscreen app) - approval required before sending",
+                "policy.block_alt_screen",
+            )
+            .with_context(context);
         }
 
         // Check reservation conflicts
@@ -10725,6 +10772,39 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval()); // Rate limited
         assert_eq!(decision.rule_id(), Some("policy.rate_limit"));
+    }
+
+    #[test]
+    fn block_alt_screen_gates_untrusted_sends_to_alt_screen_panes() {
+        // Regression: [safety].block_alt_screen was configured (default on) but
+        // never enforced — no PolicyEngine field, no gate, and is_input_safe
+        // (which inspects alt_screen) was dead in production. Now it is wired:
+        // an untrusted send to an alternate-screen pane requires approval, a
+        // trusted actor is not gated by this rule, and with the flag off nothing
+        // is gated.
+        let make = |actor: ActorKind| {
+            PolicyInput::new(ActionKind::SendText, actor)
+                .with_pane(1)
+                .with_capabilities(PaneCapabilities::alt_screen())
+        };
+
+        // Enabled: untrusted (Robot) send to an alt-screen pane requires approval.
+        let mut engine = PolicyEngine::new(10, 100, false).with_block_alt_screen(true);
+        let decision = engine.authorize(&make(ActorKind::Robot));
+        assert!(
+            decision.requires_approval(),
+            "untrusted send to alt-screen pane must require approval, got {decision:?}"
+        );
+        assert_eq!(decision.rule_id(), Some("policy.block_alt_screen"));
+
+        // Trusted actor (Human) may deliberately drive a TUI — not gated here.
+        let decision = engine.authorize(&make(ActorKind::Human));
+        assert_ne!(decision.rule_id(), Some("policy.block_alt_screen"));
+
+        // Disabled (the new() default): not gated even for an untrusted actor.
+        let mut engine_off = PolicyEngine::new(10, 100, false);
+        let decision = engine_off.authorize(&make(ActorKind::Robot));
+        assert_ne!(decision.rule_id(), Some("policy.block_alt_screen"));
     }
 
     #[test]
