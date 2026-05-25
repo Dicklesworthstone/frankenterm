@@ -213,6 +213,22 @@ mod tests {
         generic_api_pattern(&cx);
     }
 
+    /// Type-level seal guard: compiles iff `T: RuntimeProof`. Needs no value,
+    /// so it covers sealed types whose construction would otherwise require a
+    /// running runtime (`JoinHandle`/`JoinSet`/`Runtime`).
+    fn assert_type_impls_proof<T: RuntimeProof>() {}
+
+    #[test]
+    fn task_and_runtime_handles_impl_runtime_proof() {
+        // JoinHandle / JoinSet / Runtime are sealed above (lines 131-138) but
+        // were previously untested — only Mutex/RwLock/Semaphore/broadcast/
+        // oneshot/Cx had assertions. Pin their RuntimeProof membership at the
+        // type level so dropping any of these impls fails the build loudly.
+        assert_type_impls_proof::<runtime_async::task::JoinHandle<()>>();
+        assert_type_impls_proof::<runtime_async::task::JoinSet<()>>();
+        assert_type_impls_proof::<runtime_async::Runtime>();
+    }
+
     // The compile-fail doctest demonstrating that tokio::sync::Mutex is
     // rejected by the seal lives on `assert_runtime_proof` itself (above);
     // doctests on private items are not picked up by rustdoc.
