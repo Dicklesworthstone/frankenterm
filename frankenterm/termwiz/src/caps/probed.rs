@@ -8,6 +8,14 @@ use std::io::{Read, Write};
 const TMUX_BEGIN: &str = "\u{1b}Ptmux;\u{1b}";
 const TMUX_END: &str = "\u{1b}\\";
 
+fn positive_i64_to_usize_saturating(value: i64) -> Option<usize> {
+    if value <= 0 {
+        None
+    } else {
+        Some(usize::try_from(value).unwrap_or(usize::MAX))
+    }
+}
+
 /// Represents a terminal name and version.
 /// The name XtVersion is because this value is produced
 /// by querying the terminal using the XTVERSION escape
@@ -178,9 +186,10 @@ impl<'a> ProbeCapabilities<'a> {
                             Window::ResizeWindowCells { width, height } => {
                                 let width = width.unwrap_or(1);
                                 let height = height.unwrap_or(1);
-                                if width > 0 && height > 0 {
-                                    let width = width as usize;
-                                    let height = height as usize;
+                                if let (Some(width), Some(height)) = (
+                                    positive_i64_to_usize_saturating(width),
+                                    positive_i64_to_usize_saturating(height),
+                                ) {
                                     if swapped_cols_rows {
                                         size.rows = width;
                                         size.cols = height;
@@ -193,9 +202,10 @@ impl<'a> ProbeCapabilities<'a> {
                             Window::ReportCellSizePixelsResponse { width, height } => {
                                 let width = width.unwrap_or(1);
                                 let height = height.unwrap_or(1);
-                                if width > 0 && height > 0 {
-                                    let width = width as usize;
-                                    let height = height as usize;
+                                if let (Some(width), Some(height)) = (
+                                    positive_i64_to_usize_saturating(width),
+                                    positive_i64_to_usize_saturating(height),
+                                ) {
                                     size.xpixel = width;
                                     size.ypixel = height;
                                 }
@@ -237,5 +247,16 @@ mod test {
             let version = XtVersion(input.to_string());
             assert_eq!(version.name_and_version(), result, "{input}");
         }
+    }
+
+    #[test]
+    fn positive_i64_to_usize_saturates_large_values() {
+        assert_eq!(positive_i64_to_usize_saturating(0), None);
+        assert_eq!(positive_i64_to_usize_saturating(-1), None);
+        assert_eq!(positive_i64_to_usize_saturating(42), Some(42));
+        assert_eq!(
+            positive_i64_to_usize_saturating(i64::MAX),
+            Some(usize::try_from(i64::MAX).unwrap_or(usize::MAX))
+        );
     }
 }
