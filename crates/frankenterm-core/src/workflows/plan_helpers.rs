@@ -128,7 +128,7 @@ pub async fn check_step_idempotency_with_cx(
             "continue" | "done" => true,
             "send_text" => {
                 if let Some(ref summary) = log.policy_summary {
-                    policy_summary_decision_is_allow(summary).unwrap_or(true)
+                    policy_summary_decision_is_allow(summary).unwrap_or(false)
                 } else {
                     true
                 }
@@ -515,6 +515,57 @@ mod tests {
             assert!(
                 matches!(result, IdempotencyCheckResult::PartiallyExecuted { .. }),
                 "cancelled ledger lookup must fail closed, got {result:?}"
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn malformed_send_text_policy_summary_fails_closed_as_partial() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("idempotency_malformed_policy_summary.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = crate::storage::StorageHandle::new(&db_path).await.unwrap();
+            let key = crate::plan::IdempotencyKey("step:malformed-policy".to_string());
+
+            storage
+                .insert_step_log(
+                    "exec-malformed-policy",
+                    None,
+                    0,
+                    "send",
+                    Some(key.0.clone()),
+                    Some("send_text".to_string()),
+                    "send_text",
+                    Some(r#"{"idempotency_key":"step:malformed-policy"}"#.to_string()),
+                    Some("{not-valid-policy-json".to_string()),
+                    None,
+                    None,
+                    100,
+                    125,
+                )
+                .await
+                .unwrap();
+
+            let result = check_step_idempotency_with_cx(
+                &crate::cx::for_testing(),
+                &storage,
+                "exec-malformed-policy",
+                &key,
+                0,
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    IdempotencyCheckResult::PartiallyExecuted { started_at: 100 }
+                ),
+                "malformed policy summary must not be treated as an allowed send_text replay: {result:?}"
             );
             storage.shutdown().await.unwrap();
         });
