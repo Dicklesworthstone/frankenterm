@@ -39,6 +39,7 @@ fn wrapped_end_relative_coordinate(extent: usize, delta: usize) -> usize {
     extent.saturating_sub(delta.saturating_add(1)) % extent
 }
 
+#[cfg(feature = "use_image")]
 fn usize_to_isize_saturating(value: usize) -> isize {
     isize::try_from(value).unwrap_or(isize::MAX)
 }

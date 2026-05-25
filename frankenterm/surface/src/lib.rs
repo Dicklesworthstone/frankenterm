@@ -291,7 +291,7 @@ impl Surface {
         // full repaint, and that is what we want.
         // We only do this if we have any changes buffered.
         if !self.changes.is_empty() {
-            self.seqno += 1;
+            self.seqno = self.seqno.saturating_add(1);
             self.changes.clear();
         }
 
@@ -311,13 +311,13 @@ impl Surface {
     /// Efficiently apply a series of changes
     /// Returns the sequence number at the end of the change.
     pub fn add_changes(&mut self, mut changes: Vec<Change>) -> SequenceNo {
-        let seq = self.seqno.saturating_sub(1) + changes.len();
+        let seq = self.seqno.saturating_sub(1).saturating_add(changes.len());
 
         for change in &changes {
             self.apply_change(&change);
         }
 
-        self.seqno += changes.len();
+        self.seqno = self.seqno.saturating_add(changes.len());
         self.changes.append(&mut changes);
 
         seq
@@ -326,7 +326,7 @@ impl Surface {
     /// Apply a change and return the sequence number at the end of the change.
     pub fn add_change<C: Into<Change>>(&mut self, change: C) -> SequenceNo {
         let seq = self.seqno;
-        self.seqno += 1;
+        self.seqno = self.seqno.saturating_add(1);
         let change = change.into();
         self.apply_change(&change);
         self.changes.push(change);
@@ -2479,6 +2479,23 @@ mod test {
     }
 
     #[test]
+    fn surface_seqno_saturates_at_max_when_adding_changes() {
+        let mut s = Surface::new(2, 1);
+        s.seqno = SequenceNo::MAX;
+
+        let seq = s.add_change("a");
+        assert_eq!(seq, SequenceNo::MAX);
+        assert_eq!(s.current_seqno(), SequenceNo::MAX);
+
+        let seq = s.add_changes(vec![Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(0),
+        }]);
+        assert_eq!(seq, SequenceNo::MAX);
+        assert_eq!(s.current_seqno(), SequenceNo::MAX);
+    }
+
+    #[test]
     fn surface_screen_lines_count() {
         let s = Surface::new(4, 3);
         assert_eq!(s.screen_lines().len(), 3);
@@ -2792,6 +2809,18 @@ mod test {
             Change::CursorVisibility(CursorVisibility::Hidden)
         ));
         assert!(matches!(changes[1], Change::ClearScreen(_)));
+    }
+
+    #[test]
+    fn resize_with_buffered_changes_saturates_seqno() {
+        let mut s = Surface::new(2, 1);
+        s.seqno = SequenceNo::MAX;
+        s.changes
+            .push(Change::CursorVisibility(CursorVisibility::Hidden));
+
+        s.resize(2, 1);
+        assert_eq!(s.current_seqno(), SequenceNo::MAX);
+        assert!(s.changes.is_empty());
     }
 
     #[test]
