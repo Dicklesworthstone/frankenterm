@@ -2321,6 +2321,9 @@ impl<'a> CSIParser<'a> {
             ] => (*p0, *p1, *p2),
             _ => return Err(()),
         };
+        let p0: u16 = p0.try_into().map_err(|_| ())?;
+        let x: u16 = p1.try_into().map_err(|_| ())?;
+        let y: u16 = p2.try_into().map_err(|_| ())?;
 
         // 'M' encodes a press, 'm' a release.
         let button = match (self.control, p0 & 0b110_0011) {
@@ -2371,8 +2374,8 @@ impl<'a> CSIParser<'a> {
             6,
             params,
             MouseReport::SGR1006 {
-                x: p1 as u16,
-                y: p2 as u16,
+                x,
+                y,
                 button,
                 modifiers,
             },
@@ -3341,6 +3344,42 @@ mod test {
                 modifiers: Modifiers::NONE,
             })]
         );
+    }
+
+    #[test]
+    fn mouse_sgr1006_rejects_wrapping_integer_fields() {
+        for params in [
+            [
+                CsiParam::P(b'<'),
+                CsiParam::Integer(-1),
+                CsiParam::P(b';'),
+                CsiParam::Integer(12),
+                CsiParam::P(b';'),
+                CsiParam::Integer(300),
+            ],
+            [
+                CsiParam::P(b'<'),
+                CsiParam::Integer(0),
+                CsiParam::P(b';'),
+                CsiParam::Integer(i64::from(u16::MAX) + 1),
+                CsiParam::P(b';'),
+                CsiParam::Integer(300),
+            ],
+            [
+                CsiParam::P(b'<'),
+                CsiParam::Integer(0),
+                CsiParam::P(b';'),
+                CsiParam::Integer(12),
+                CsiParam::P(b';'),
+                CsiParam::Integer(-1),
+            ],
+        ] {
+            let res: Vec<_> = CSI::parse(&params, false, 'M').collect();
+            assert!(
+                res.iter().all(|csi| !matches!(csi, CSI::Mouse(_))),
+                "SGR1006 mouse fields must reject instead of wrapping: {params:?}"
+            );
+        }
     }
 
     #[test]
