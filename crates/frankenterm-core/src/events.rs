@@ -546,7 +546,10 @@ pub fn event_identity_key(detection: &Detection, pane_id: u64, pane_uuid: Option
     parts.push(IDENTITY_KEY_VERSION.to_string());
     parts.push(detection.rule_id.clone());
     parts.push(detection.event_type.clone());
-    parts.push(pane_uuid.map_or_else(|| format!("pane:{pane_id}"), |uuid| uuid.to_string()));
+    parts.push(match pane_uuid {
+        Some(uuid) if !uuid.trim().is_empty() => uuid.to_string(),
+        _ => format!("pane:{pane_id}"),
+    });
 
     if let Some(extracted) = normalized_extracted(&detection.extracted, &redactor) {
         parts.push(extracted);
@@ -3995,7 +3998,11 @@ mod tests {
 
         match dedup.check("k") {
             DedupeVerdict::Duplicate { suppressed_count } => {
-                assert_eq!(suppressed_count, u64::MAX - 1, "count saturates, suppressed = MAX-1");
+                assert_eq!(
+                    suppressed_count,
+                    u64::MAX - 1,
+                    "count saturates, suppressed = MAX-1"
+                );
             }
             other @ DedupeVerdict::New => {
                 panic!("in-window repeat must be Duplicate; got {other:?}")
@@ -4193,7 +4200,11 @@ mod tests {
 
         match cd.check("k") {
             CooldownVerdict::Suppress { total_suppressed } => {
-                assert_eq!(total_suppressed, u64::MAX, "suppressed count saturates at u64::MAX");
+                assert_eq!(
+                    total_suppressed,
+                    u64::MAX,
+                    "suppressed count saturates at u64::MAX"
+                );
             }
             other @ CooldownVerdict::Send { .. } => {
                 panic!("in-cooldown repeat must Suppress; got {other:?}")
@@ -4353,6 +4364,25 @@ mod tests {
         let key = event_identity_key(&detection, 7, None);
         assert!(key.starts_with("evt:"));
         assert_eq!(key.len(), 68); // "evt:" + 64 hex chars
+    }
+
+    #[test]
+    fn event_identity_key_treats_blank_pane_uuid_as_absent() {
+        let detection = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+
+        let absent = event_identity_key(&detection, 7, None);
+        assert_eq!(event_identity_key(&detection, 7, Some("")), absent);
+        assert_eq!(event_identity_key(&detection, 7, Some(" \t\n")), absent);
+        assert_ne!(
+            event_identity_key(&detection, 8, Some(" ")),
+            absent,
+            "blank pane UUIDs must fall back to pane_id so panes do not share \
+             one notification/mute identity"
+        );
     }
 
     #[test]
