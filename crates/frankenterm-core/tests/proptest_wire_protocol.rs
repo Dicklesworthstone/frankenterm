@@ -742,6 +742,87 @@ fn invalid_json_rejected() {
     assert!(err.is_err());
 }
 
+fn valid_gap_payload() -> WirePayload {
+    WirePayload::Gap(GapNotice {
+        pane_id: 7,
+        seq_before: 10,
+        seq_after: 11,
+        reason: "heartbeat-gap".to_string(),
+        detected_at_ms: 1_700_000_000_000,
+    })
+}
+
+fn assert_decoded_envelope_fails_closed<F>(label: &str, envelope: WireEnvelope, expected_error: F)
+where
+    F: FnOnce(&WireProtocolError) -> bool,
+{
+    let sender = envelope.sender.clone();
+    let mut agg = Aggregator::new(8);
+    let err = match agg.ingest_envelope(envelope) {
+        Ok(result) => panic!("{label}: invalid envelope was accepted: {result:?}"),
+        Err(err) => err,
+    };
+
+    assert!(expected_error(&err), "{label}: unexpected error: {err:?}");
+    assert_eq!(agg.total_rejected(), 1, "{label}: rejection counted");
+    assert_eq!(agg.total_accepted(), 0, "{label}: no acceptance counted");
+    assert_eq!(agg.agent_count(), 0, "{label}: no sender session opened");
+    assert_eq!(
+        agg.agent_last_seq(&sender),
+        None,
+        "{label}: no last-seq state recorded"
+    );
+}
+
+#[test]
+fn decoded_envelope_matrix_fails_closed_before_sender_state_mutation() {
+    let mut wrong_version = WireEnvelope::new(1, "agent-a", valid_gap_payload());
+    wrong_version.version = PROTOCOL_VERSION + 1;
+    assert_decoded_envelope_fails_closed("version mismatch", wrong_version, |err| {
+        matches!(err, WireProtocolError::VersionMismatch { .. })
+    });
+
+    let invalid_sender = WireEnvelope::new(1, "agent:invalid", valid_gap_payload());
+    assert_decoded_envelope_fails_closed("invalid sender", invalid_sender, |err| {
+        matches!(err, WireProtocolError::InvalidSender { .. })
+    });
+
+    let max_seq = WireEnvelope::new(u64::MAX, "agent-a", valid_gap_payload());
+    assert_decoded_envelope_fails_closed("reserved max seq", max_seq, |err| {
+        matches!(err, WireProtocolError::InvalidSequence { .. })
+    });
+
+    let bad_delta = WireEnvelope::new(
+        1,
+        "agent-a",
+        WirePayload::PaneDelta(PaneDelta {
+            pane_id: 7,
+            seq: 2,
+            content: "ok".to_string(),
+            content_len: 3,
+            captured_at_ms: 1_700_000_000_100,
+        }),
+    );
+    assert_decoded_envelope_fails_closed("pane delta content_len mismatch", bad_delta, |err| {
+        matches!(err, WireProtocolError::InvalidJson(_))
+    });
+
+    let bad_gap = WireEnvelope::new(
+        1,
+        "agent-a",
+        WirePayload::Gap(GapNotice {
+            pane_id: 7,
+            seq_before: 8,
+            seq_after: 8,
+            reason: "non-advancing".to_string(),
+            detected_at_ms: 1_700_000_000_200,
+        }),
+    );
+    assert_decoded_envelope_fails_closed("non-advancing gap", bad_gap, |err| {
+        matches!(err, WireProtocolError::InvalidJson(_))
+    });
+}
+
 #[test]
 fn pane_delta_with_mismatched_content_len_is_rejected() {
     let invalid = serde_json::json!({

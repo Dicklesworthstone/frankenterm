@@ -12,12 +12,16 @@
 //! operations via its circuit breaker, auto-enqueues failed actions to
 //! the DLQ, and replay plans batch retries with backoff.
 
-use frankenterm_core::circuit_breaker::CircuitStateKind;
+use std::time::Duration;
+
+use frankenterm_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
 use frankenterm_core::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
 use frankenterm_core::connector_reliability::{
     ConnectorCircuitConfig, ConnectorErrorKind, ConnectorReliabilityConfig,
     ConnectorReliabilityController, DeadLetterQueueConfig,
 };
+use frankenterm_core::retry::{RetryPolicy, with_retry_and_circuit_cx};
+use frankenterm_core::{Error, Result};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -36,7 +40,7 @@ fn fast_circuit_config() -> ConnectorReliabilityConfig {
         circuit: ConnectorCircuitConfig {
             failure_threshold: 3,
             success_threshold: 1,
-            cooldown: std::time::Duration::from_millis(10),
+            cooldown: Duration::from_millis(10),
         },
         dlq: DeadLetterQueueConfig {
             max_entries: 100,
@@ -46,6 +50,29 @@ fn fast_circuit_config() -> ConnectorReliabilityConfig {
         auto_dlq: true,
         shed_threshold: 50,
     }
+}
+
+fn transition_circuit_config() -> ConnectorReliabilityConfig {
+    ConnectorReliabilityConfig {
+        circuit: ConnectorCircuitConfig {
+            failure_threshold: 2,
+            success_threshold: 2,
+            cooldown: Duration::ZERO,
+        },
+        ..fast_circuit_config()
+    }
+}
+
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_async::CompatRuntime;
+
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build runtime_async current-thread runtime");
+    CompatRuntime::block_on(&runtime, future);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -107,6 +134,113 @@ fn error_kind_drives_breaker_and_dlq_behavior() {
 
     // DLQ should have 3 entries (transient + transient + timeout).
     assert_eq!(ctrl.dlq().depth(), 3);
+}
+
+/// Circuit breaker transitions are exact: Closed → Open after the configured
+/// failure threshold, Open → HalfOpen only after cooldown admits a probe,
+/// HalfOpen → Closed after the configured success threshold, and any half-open
+/// failure re-opens fail-closed.
+#[test]
+fn connector_circuit_breaker_state_transition_contract() {
+    let mut ctrl = ConnectorReliabilityController::new("pager-duty", transition_circuit_config());
+
+    assert!(ctrl.allow_operation());
+    let status = ctrl.circuit_status();
+    assert_eq!(status.state, CircuitStateKind::Closed);
+    assert_eq!(status.consecutive_failures, 0);
+
+    let action1 = make_action(ConnectorActionKind::Notify, "transition-1");
+    ctrl.record_failure(&action1, "timeout", ConnectorErrorKind::Timeout, 1000);
+    let status = ctrl.circuit_status();
+    assert_eq!(status.state, CircuitStateKind::Closed);
+    assert_eq!(status.consecutive_failures, 1);
+
+    let action2 = make_action(ConnectorActionKind::Notify, "transition-2");
+    ctrl.record_failure(&action2, "timeout", ConnectorErrorKind::Timeout, 1100);
+    let status = ctrl.circuit_status();
+    assert_eq!(status.state, CircuitStateKind::Open);
+    assert_eq!(status.consecutive_failures, 2);
+
+    assert!(
+        ctrl.allow_operation(),
+        "zero cooldown should admit a single half-open probe"
+    );
+    let status = ctrl.circuit_status();
+    assert_eq!(status.state, CircuitStateKind::HalfOpen);
+    assert_eq!(status.half_open_successes, Some(0));
+
+    ctrl.record_success();
+    let status = ctrl.circuit_status();
+    assert_eq!(status.state, CircuitStateKind::HalfOpen);
+    assert_eq!(status.half_open_successes, Some(1));
+
+    ctrl.record_success();
+    let status = ctrl.circuit_status();
+    assert_eq!(status.state, CircuitStateKind::Closed);
+    assert_eq!(status.consecutive_failures, 0);
+
+    let action3 = make_action(ConnectorActionKind::Notify, "transition-3");
+    ctrl.record_failure(&action3, "timeout", ConnectorErrorKind::Timeout, 1200);
+    let action4 = make_action(ConnectorActionKind::Notify, "transition-4");
+    ctrl.record_failure(&action4, "timeout", ConnectorErrorKind::Timeout, 1300);
+    assert_eq!(ctrl.circuit_status().state, CircuitStateKind::Open);
+
+    assert!(ctrl.allow_operation());
+    assert_eq!(ctrl.circuit_status().state, CircuitStateKind::HalfOpen);
+
+    let action5 = make_action(ConnectorActionKind::Notify, "transition-5");
+    ctrl.record_failure(
+        &action5,
+        "probe still timed out",
+        ConnectorErrorKind::Timeout,
+        1400,
+    );
+    assert_eq!(ctrl.circuit_status().state, CircuitStateKind::Open);
+    assert_eq!(ctrl.dlq().depth(), 5);
+}
+
+/// Caller cancellation is not a connector/backend fault: it must return
+/// Cancelled without incrementing circuit failures or opening the breaker.
+#[test]
+fn connector_circuit_breaker_cancellation_is_not_failure() {
+    run_async_test(async {
+        let cx = frankenterm_core::cx::for_request();
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(3),
+        };
+        let mut circuit = CircuitBreaker::with_name(
+            "connector-cancel",
+            CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)),
+        );
+
+        for attempt in 0..2 {
+            let result: Result<()> =
+                with_retry_and_circuit_cx(&cx, &policy, &mut circuit, || async move {
+                    Err(Error::Cancelled(format!(
+                        "connector operation cancelled attempt {attempt}"
+                    )))
+                })
+                .await;
+
+            assert!(matches!(result, Err(Error::Cancelled(_))));
+            let status = circuit.status();
+            assert_eq!(status.state, CircuitStateKind::Closed);
+            assert_eq!(status.consecutive_failures, 0);
+            assert!(
+                circuit.allow(),
+                "cancellation must not trip a failure-threshold=1 breaker"
+            );
+        }
+
+        let telemetry = circuit.telemetry().snapshot();
+        assert_eq!(telemetry.failures_recorded, 0);
+        assert_eq!(telemetry.trips_total, 0);
+        assert_eq!(telemetry.successes_recorded, 0);
+    });
 }
 
 /// DLQ replay plan batches entries for retry, and successful replays
