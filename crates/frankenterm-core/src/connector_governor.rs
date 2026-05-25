@@ -358,6 +358,13 @@ impl Default for QuotaConfig {
     }
 }
 
+fn warning_threshold_reached(usage_fraction: f64, warning_threshold: f64) -> bool {
+    if !warning_threshold.is_finite() || !(0.0..=1.0).contains(&warning_threshold) {
+        return true;
+    }
+    usage_fraction >= warning_threshold
+}
+
 /// Sliding-window quota tracker.
 #[derive(Debug)]
 pub struct QuotaTracker {
@@ -430,7 +437,7 @@ impl QuotaTracker {
     /// Whether usage is at or above the warning threshold.
     #[must_use]
     pub fn is_warning(&mut self, now_ms: u64) -> bool {
-        self.usage_fraction(now_ms) >= self.config.warning_threshold
+        warning_threshold_reached(self.usage_fraction(now_ms), self.config.warning_threshold)
     }
 
     /// Whether quota is exhausted.
@@ -580,7 +587,7 @@ impl CostBudget {
     /// Whether budget is at warning level.
     #[must_use]
     pub fn is_warning(&mut self, now_ms: u64) -> bool {
-        self.usage_fraction(now_ms) >= self.config.warning_threshold
+        warning_threshold_reached(self.usage_fraction(now_ms), self.config.warning_threshold)
     }
 
     /// Whether budget is exhausted.
@@ -1650,6 +1657,23 @@ mod tests {
     }
 
     #[test]
+    fn quota_invalid_warning_thresholds_warn() {
+        for warning_threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let config = QuotaConfig {
+                max_actions: 10,
+                window_ms: 60_000,
+                warning_threshold,
+            };
+            let mut qt = QuotaTracker::new(config);
+
+            assert!(
+                qt.is_warning(0),
+                "invalid warning threshold {warning_threshold:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn quota_snapshot_serde_roundtrip() {
         let snap = QuotaSnapshot {
             used: 50,
@@ -1734,6 +1758,20 @@ mod tests {
             cb.record(&ConnectorActionKind::Notify, i * 100);
         }
         assert!(cb.is_warning(5000)); // 50/100 = 0.5
+    }
+
+    #[test]
+    fn cost_budget_invalid_warning_thresholds_warn() {
+        for warning_threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut config = CostBudgetConfig::default();
+            config.warning_threshold = warning_threshold;
+            let mut cb = CostBudget::new(config);
+
+            assert!(
+                cb.is_warning(0),
+                "invalid warning threshold {warning_threshold:?} must fail closed"
+            );
+        }
     }
 
     #[test]
