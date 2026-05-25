@@ -214,10 +214,14 @@ pub fn discover_servers(config: &Config) -> McpClientResult<Vec<ExternalServerCo
         search_path_count = search_paths.len(),
         "Discovered outbound MCP servers"
     );
+    let redacted_search_paths: Vec<String> = search_paths
+        .iter()
+        .map(|path| redact_mcp_client_text(path))
+        .collect();
     tracing::debug!(
         target: LOG_TARGET,
         event = "mcp_client_discover_paths",
-        paths = ?search_paths,
+        paths = ?redacted_search_paths,
         "Outbound MCP client discovery search paths"
     );
 
@@ -795,6 +799,43 @@ mod tests {
 
         let discovered = discover_servers(&config).expect("discover servers");
         assert!(discovered.is_empty());
+    }
+
+    #[test]
+    fn discover_servers_redacts_secret_shaped_discovery_paths_in_logs() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.include_default_paths = false;
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        config.mcp_client.discovery_paths = vec![format!("/tmp/{secret}/mcp-config.json")];
+
+        let (_guard, events) = install_capture();
+        let discovered = discover_servers(&config).expect("discover servers");
+
+        assert!(
+            discovered.is_empty(),
+            "missing discovery path should simply produce no servers"
+        );
+        let captured = events.lock().expect("lock logs").clone();
+        let path_event = captured
+            .iter()
+            .find(|event| {
+                event.target == LOG_TARGET
+                    && event
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| field_matches(value, "mcp_client_discover_paths"))
+            })
+            .expect("discover paths debug event should be captured");
+        let paths = path_event.fields.get("paths").expect("paths field");
+        assert!(
+            !paths.contains(secret),
+            "raw discovery path secret leaked in MCP client log field: {paths}"
+        );
+        assert!(
+            paths.contains("[REDACTED]"),
+            "expected redaction marker in MCP client discovery paths: {paths}"
+        );
     }
 
     #[test]
