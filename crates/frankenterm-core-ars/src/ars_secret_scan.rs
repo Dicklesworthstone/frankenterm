@@ -330,6 +330,12 @@ impl ArsSecretScanner {
         source: &str,
         findings: &mut Vec<ScanFinding>,
     ) {
+        let entropy_threshold = if self.config.entropy_threshold.is_finite() {
+            self.config.entropy_threshold
+        } else {
+            0.0
+        };
+
         // Split on whitespace and common delimiters.
         for token in
             text.split(|c: char| c.is_whitespace() || c == '=' || c == ':' || c == '"' || c == '\'')
@@ -345,7 +351,7 @@ impl ArsSecretScanner {
             }
 
             let entropy = shannon_entropy(token);
-            if entropy >= self.config.entropy_threshold {
+            if entropy >= entropy_threshold {
                 let token_start = token.as_ptr() as usize - text.as_ptr() as usize;
                 let token_end = token_start + len;
 
