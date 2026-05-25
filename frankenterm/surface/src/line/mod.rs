@@ -8,7 +8,7 @@ mod vecstorage;
 
 pub use cellref::CellRef;
 pub use line::{
-    DoubleClickRange, Line, LineWrapReport, LineWrapScorecard, MonospaceKpCostModel,
-    MonospaceWrapMode, MonospaceWrapPlan, KP_BADNESS_INF, KP_DEFAULT_LOOKAHEAD_LIMIT,
-    KP_DEFAULT_MAX_DP_STATES,
+    DoubleClickRange, KP_BADNESS_INF, KP_DEFAULT_LOOKAHEAD_LIMIT, KP_DEFAULT_MAX_DP_STATES, Line,
+    LineWrapReport, LineWrapScorecard, LineWrapWidthPrefixScratch, MonospaceKpCostModel,
+    MonospaceWrapMode, MonospaceWrapPlan,
 };

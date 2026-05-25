@@ -4,7 +4,8 @@ use crate::config::BidiMode;
 use crossbeam::thread;
 use frankenterm_surface::SequenceNo;
 use frankenterm_surface::line::{
-    LineWrapScorecard as MonospaceLineWrapScorecard, MonospaceKpCostModel, MonospaceWrapMode,
+    LineWrapScorecard as MonospaceLineWrapScorecard, LineWrapWidthPrefixScratch,
+    MonospaceKpCostModel, MonospaceWrapMode,
 };
 use log::{debug, warn};
 use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
@@ -62,6 +63,7 @@ pub struct Screen {
     rewrap_cache: Option<LogicalLineWrapCache>,
     rewrap_scratch_slots: Vec<Option<RewrapScratch>>,
     rewrap_row_prefix_scratch: Vec<usize>,
+    rewrap_width_prefix_scratch: LineWrapWidthPrefixScratch,
     cold_scrollback_worker: ColdScrollbackReflowWorker,
     resize_wrap_policy: ResizeWrapPolicy,
     last_resize_wrap_scorecard: Option<ResizeWrapScorecard>,
@@ -788,6 +790,7 @@ impl Screen {
             rewrap_cache: None,
             rewrap_scratch_slots: Vec::new(),
             rewrap_row_prefix_scratch: Vec::new(),
+            rewrap_width_prefix_scratch: LineWrapWidthPrefixScratch::default(),
             cold_scrollback_worker: ColdScrollbackReflowWorker::default(),
             resize_wrap_policy: ResizeWrapPolicy::from_terminal_configuration(config.as_ref()),
             last_resize_wrap_scorecard: None,
@@ -1172,22 +1175,41 @@ impl Screen {
         physical_cols: usize,
         seqno: SequenceNo,
         policy: ResizeWrapPolicy,
+        width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
     ) -> (Vec<Line>, Option<MonospaceLineWrapScorecard>) {
         if line.len() <= physical_cols {
             return (vec![line], None);
         }
 
         if policy.scorecard_enabled {
-            let report = line.wrap_with_report(physical_cols, seqno, policy.kp_cost_model);
+            let report = line.wrap_with_report_and_width_prefix_scratch(
+                physical_cols,
+                seqno,
+                policy.kp_cost_model,
+                width_prefix_scratch,
+            );
             return (report.lines, Some(report.scorecard));
         }
 
         if policy.kp_cost_model == MonospaceKpCostModel::terminal_default() {
-            return (line.wrap(physical_cols, seqno), None);
+            return (
+                line.wrap_with_cost_model_and_width_prefix_scratch(
+                    physical_cols,
+                    seqno,
+                    policy.kp_cost_model,
+                    width_prefix_scratch,
+                )
+                .0,
+                None,
+            );
         }
 
-        let (wrapped, _mode) =
-            line.wrap_with_cost_model(physical_cols, seqno, policy.kp_cost_model);
+        let (wrapped, _mode) = line.wrap_with_cost_model_and_width_prefix_scratch(
+            physical_cols,
+            seqno,
+            policy.kp_cost_model,
+            width_prefix_scratch,
+        );
         (wrapped, None)
     }
 
@@ -1197,6 +1219,7 @@ impl Screen {
         physical_cols: usize,
         seqno: SequenceNo,
         policy: ResizeWrapPolicy,
+        width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
     ) -> (RewrapScratch, Option<MonospaceLineWrapScorecard>)
     where
         T: ReflowLogicalLine,
@@ -1207,13 +1230,18 @@ impl Screen {
         }
 
         let line = logical_line.clone_line(physical_lines);
-        let (lines, scorecard) =
-            Self::wrap_single_logical_line_for_resize(line, physical_cols, seqno, policy);
+        let (lines, scorecard) = Self::wrap_single_logical_line_for_resize(
+            line,
+            physical_cols,
+            seqno,
+            policy,
+            width_prefix_scratch,
+        );
         (RewrapScratch::Lines(lines), scorecard)
     }
 
     fn wrap_logical_line_for_resize<T>(
-        &self,
+        &mut self,
         logical_line: &T,
         physical_cols: usize,
         seqno: SequenceNo,
@@ -1227,6 +1255,7 @@ impl Screen {
             physical_cols,
             seqno,
             self.resize_wrap_policy,
+            &mut self.rewrap_width_prefix_scratch,
         )
     }
 
@@ -1731,6 +1760,7 @@ impl Screen {
                     let physical_lines = &self.lines;
                     handles.push(scope.spawn(move |_| {
                         let mut wrapped = Vec::with_capacity(end - start);
+                        let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
                         for (offset, line) in logical_slice.iter().enumerate() {
                             let idx = start + offset;
                             let (wrapped_lines, line_scorecard) =
@@ -1740,6 +1770,7 @@ impl Screen {
                                     physical_cols,
                                     seqno,
                                     wrap_policy,
+                                    &mut width_prefix_scratch,
                                 );
                             wrapped.push((idx, wrapped_lines, line_scorecard));
                         }
@@ -3621,6 +3652,7 @@ mod tests {
         let cursor = screen.resize(test_size(4, 4, 96), cursor, 1, false);
         let first_slots_capacity = screen.rewrap_scratch_slots.capacity();
         let first_prefix_capacity = screen.rewrap_row_prefix_scratch.capacity();
+        let first_width_prefix_capacity = screen.rewrap_width_prefix_scratch.capacity();
         let used_slots = screen.rewrap_row_prefix_scratch.len().saturating_sub(1);
         assert!(
             screen.rewrap_scratch_slots[..used_slots]
@@ -3637,6 +3669,10 @@ mod tests {
         assert!(
             screen.rewrap_row_prefix_scratch.capacity() >= first_prefix_capacity,
             "row-prefix scratch buffer should be reused across resize cycles"
+        );
+        assert!(
+            screen.rewrap_width_prefix_scratch.capacity() >= first_width_prefix_capacity,
+            "width-prefix scratch buffer should be reused across resize cycles"
         );
     }
 

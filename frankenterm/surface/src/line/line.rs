@@ -5,7 +5,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{VecStorage, VecStorageIter};
-use crate::{Change, SequenceNo, SEQ_ZERO};
+use crate::{Change, SEQ_ZERO, SequenceNo};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -265,6 +265,24 @@ impl Line {
         self.wrap_with_report(width, seqno, cost_model).into_parts()
     }
 
+    /// Wrap the line using an explicit bounded Knuth-Plass cost model while
+    /// reusing caller-owned width-prefix scratch.
+    pub fn wrap_with_cost_model_and_width_prefix_scratch(
+        self,
+        width: usize,
+        seqno: SequenceNo,
+        cost_model: MonospaceKpCostModel,
+        width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
+    ) -> (Vec<Self>, MonospaceWrapMode) {
+        self.wrap_with_report_and_width_prefix_scratch(
+            width,
+            seqno,
+            cost_model,
+            width_prefix_scratch,
+        )
+        .into_parts()
+    }
+
     /// Wrap the line and return a scorecard that can be used by
     /// resize-time readability gates.
     pub fn wrap_with_report(
@@ -273,16 +291,51 @@ impl Line {
         seqno: SequenceNo,
         cost_model: MonospaceKpCostModel,
     ) -> LineWrapReport {
+        let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
+        self.wrap_with_report_and_width_prefix_scratch(
+            width,
+            seqno,
+            cost_model,
+            &mut width_prefix_scratch,
+        )
+    }
+
+    /// Wrap the line and return a scorecard while reusing caller-owned
+    /// prefix-width scratch for Knuth-Plass line-width queries.
+    pub fn wrap_with_report_and_width_prefix_scratch(
+        self,
+        width: usize,
+        seqno: SequenceNo,
+        cost_model: MonospaceKpCostModel,
+        width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
+    ) -> LineWrapReport {
         let mut cells: Vec<CellRef> = self.visible_cells().collect();
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
             let tokens: Vec<Cell> = cells.into_iter().map(|cell| cell.as_cell()).collect();
-            let plan = bounded_monospace_wrap_plan(&tokens, width, cost_model);
-            let selected_candidate =
-                evaluate_break_offsets(&tokens, &plan.break_offsets, width, cost_model);
-            let greedy_offsets = greedy_break_offsets_from_tokens(&tokens, width);
-            let greedy_candidate =
-                evaluate_break_offsets(&tokens, &greedy_offsets, width, cost_model);
+            width_prefix_scratch.rebuild(&tokens);
+            let plan = bounded_monospace_wrap_plan_with_width_prefix(
+                &tokens,
+                width,
+                cost_model,
+                width_prefix_scratch,
+            );
+            let selected_candidate = evaluate_break_offsets_with_width_prefix(
+                &tokens,
+                &plan.break_offsets,
+                width,
+                cost_model,
+                width_prefix_scratch,
+            );
+            let greedy_offsets =
+                greedy_break_offsets_from_width_prefix(&tokens, width, width_prefix_scratch);
+            let greedy_candidate = evaluate_break_offsets_with_width_prefix(
+                &tokens,
+                &greedy_offsets,
+                width,
+                cost_model,
+                width_prefix_scratch,
+            );
 
             LineWrapReport {
                 lines: materialize_wrap_lines_from_tokens(&tokens, &plan.break_offsets, seqno),
@@ -302,6 +355,7 @@ impl Line {
                 },
             }
         } else {
+            width_prefix_scratch.clear();
             LineWrapReport {
                 lines: vec![self],
                 scorecard: LineWrapScorecard {
@@ -1476,6 +1530,50 @@ pub struct LineWrapReport {
     pub scorecard: LineWrapScorecard,
 }
 
+/// Reusable prefix-width storage for resize-time line wrapping.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LineWrapWidthPrefixScratch {
+    widths: Vec<u128>,
+}
+
+impl LineWrapWidthPrefixScratch {
+    pub fn clear(&mut self) {
+        self.widths.clear();
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.widths.capacity()
+    }
+
+    fn rebuild(&mut self, tokens: &[Cell]) {
+        self.widths.clear();
+        self.widths.reserve(tokens.len().saturating_add(1));
+        self.widths.push(0);
+
+        let mut total = 0u128;
+        for token in tokens {
+            total = total.saturating_add(token.width() as u128);
+            self.widths.push(total);
+        }
+    }
+
+    #[inline]
+    fn width_between(&self, start: usize, end: usize) -> usize {
+        let Some(&start_width) = self.widths.get(start) else {
+            return 0;
+        };
+        let Some(&end_width) = self.widths.get(end) else {
+            return 0;
+        };
+        if end <= start {
+            return 0;
+        }
+
+        let width = end_width.saturating_sub(start_width);
+        width.min(usize::MAX as u128) as usize
+    }
+}
+
 impl LineWrapReport {
     fn into_parts(self) -> (Vec<Line>, MonospaceWrapMode) {
         let mode = self.scorecard.mode;
@@ -1483,13 +1581,25 @@ impl LineWrapReport {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn greedy_break_offsets_from_tokens(tokens: &[Cell], width: usize) -> Vec<usize> {
+    let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
+    width_prefix_scratch.rebuild(tokens);
+    greedy_break_offsets_from_width_prefix(tokens, width, &width_prefix_scratch)
+}
+
+#[inline]
+fn greedy_break_offsets_from_width_prefix(
+    tokens: &[Cell],
+    width: usize,
+    width_prefix: &LineWrapWidthPrefixScratch,
+) -> Vec<usize> {
     let mut offsets = Vec::new();
     let mut current_width = 0usize;
 
-    for (idx, token) in tokens.iter().enumerate() {
-        let token_width = token.width();
+    for idx in 0..tokens.len() {
+        let token_width = width_prefix.width_between(idx, idx + 1);
         let need_new_line = current_width > 0 && current_width.saturating_add(token_width) > width;
         if need_new_line {
             offsets.push(idx);
@@ -1508,10 +1618,11 @@ fn fallback_wrap_plan(
     width: usize,
     estimated_states: usize,
     evaluated_states: usize,
+    width_prefix: &LineWrapWidthPrefixScratch,
 ) -> MonospaceWrapPlan {
     MonospaceWrapPlan {
         mode: MonospaceWrapMode::Fallback,
-        break_offsets: greedy_break_offsets_from_tokens(tokens, width),
+        break_offsets: greedy_break_offsets_from_width_prefix(tokens, width, width_prefix),
         estimated_states,
         evaluated_states,
     }
@@ -1519,10 +1630,22 @@ fn fallback_wrap_plan(
 
 /// Compute a bounded DP wrap plan and deterministically fall back to greedy wrapping
 /// when the configured state budget would be exceeded.
+#[cfg(test)]
 pub(crate) fn bounded_monospace_wrap_plan(
     tokens: &[Cell],
     width: usize,
     model: MonospaceKpCostModel,
+) -> MonospaceWrapPlan {
+    let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
+    width_prefix_scratch.rebuild(tokens);
+    bounded_monospace_wrap_plan_with_width_prefix(tokens, width, model, &width_prefix_scratch)
+}
+
+fn bounded_monospace_wrap_plan_with_width_prefix(
+    tokens: &[Cell],
+    width: usize,
+    model: MonospaceKpCostModel,
+    width_prefix: &LineWrapWidthPrefixScratch,
 ) -> MonospaceWrapPlan {
     if tokens.is_empty() {
         return MonospaceWrapPlan {
@@ -1536,7 +1659,7 @@ pub(crate) fn bounded_monospace_wrap_plan(
     let token_count = tokens.len();
     let estimated_states = model.estimated_dp_states(token_count);
     if width == 0 || model.should_fallback(token_count) {
-        return fallback_wrap_plan(tokens, width, estimated_states, 0);
+        return fallback_wrap_plan(tokens, width, estimated_states, 0, width_prefix);
     }
 
     let mut evaluated_states = 0usize;
@@ -1554,14 +1677,19 @@ pub(crate) fn bounded_monospace_wrap_plan(
             continue;
         };
 
-        let mut line_width = 0usize;
         let max_end = (start + model.lookahead_limit).min(token_count);
 
         for end in (start + 1)..=max_end {
-            line_width = line_width.saturating_add(tokens[end - 1].width());
+            let line_width = width_prefix.width_between(start, end);
             evaluated_states = evaluated_states.saturating_add(1);
             if evaluated_states > model.max_dp_states {
-                return fallback_wrap_plan(tokens, width, estimated_states, evaluated_states);
+                return fallback_wrap_plan(
+                    tokens,
+                    width,
+                    estimated_states,
+                    evaluated_states,
+                    width_prefix,
+                );
             }
 
             let is_last_line = end == token_count;
@@ -1614,16 +1742,23 @@ pub(crate) fn bounded_monospace_wrap_plan(
             estimated_states,
             evaluated_states,
         },
-        None => fallback_wrap_plan(tokens, width, estimated_states, evaluated_states),
+        None => fallback_wrap_plan(
+            tokens,
+            width,
+            estimated_states,
+            evaluated_states,
+            width_prefix,
+        ),
     }
 }
 
 #[inline]
-fn evaluate_break_offsets(
+fn evaluate_break_offsets_with_width_prefix(
     tokens: &[Cell],
     break_offsets: &[usize],
     width: usize,
     model: MonospaceKpCostModel,
+    width_prefix: &LineWrapWidthPrefixScratch,
 ) -> MonospaceBreakCandidate {
     let mut total_cost = 0u64;
     let mut forced_breaks = 0usize;
@@ -1638,9 +1773,7 @@ fn evaluate_break_offsets(
             continue;
         }
 
-        let line_width = tokens[start..end]
-            .iter()
-            .fold(0usize, |acc, token| acc.saturating_add(token.width()));
+        let line_width = width_prefix.width_between(start, end);
         let is_last_line = end == tokens.len();
 
         let (line_cost, forced_inc) = if line_width > width {
@@ -1669,9 +1802,7 @@ fn evaluate_break_offsets(
     }
 
     if start < tokens.len() {
-        let line_width = tokens[start..]
-            .iter()
-            .fold(0usize, |acc, token| acc.saturating_add(token.width()));
+        let line_width = width_prefix.width_between(start, tokens.len());
         let (line_cost, forced_inc) = if line_width > width {
             if tokens.len() == start + 1 {
                 let overflow_cols = line_width.saturating_sub(width) as u64;
@@ -2383,6 +2514,52 @@ mod tests {
         let a = bounded_monospace_wrap_plan(&tokens, 5, model);
         let b = bounded_monospace_wrap_plan(&tokens, 5, model);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn width_prefix_scratch_preserves_wrap_report_equivalence() {
+        let mut tuned_model = MonospaceKpCostModel::terminal_default();
+        tuned_model.badness_scale = 37_000;
+        tuned_model.forced_break_penalty = 9_000;
+        tuned_model.lookahead_limit = 6;
+
+        let cases = [
+            (
+                "ascii_ties",
+                "ab cd ef gh ij",
+                5,
+                MonospaceKpCostModel::terminal_default(),
+            ),
+            (
+                "wide_cells",
+                "ab表cd界ef",
+                4,
+                MonospaceKpCostModel::terminal_default(),
+            ),
+            (
+                "overwide",
+                "a表b",
+                1,
+                MonospaceKpCostModel::terminal_default(),
+            ),
+            ("tuned", "one two three four", 7, tuned_model),
+        ];
+
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        for (name, text, width, model) in cases {
+            let expected: Line = text.into();
+            let expected = expected.wrap_with_report(width, 7, model);
+            let actual: Line = text.into();
+            let actual =
+                actual.wrap_with_report_and_width_prefix_scratch(width, 7, model, &mut scratch);
+
+            assert_eq!(actual, expected, "case {name}");
+            assert!(
+                scratch.capacity() >= text.chars().count().saturating_add(1),
+                "case {} should retain prefix storage",
+                name
+            );
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
