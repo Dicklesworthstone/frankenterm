@@ -11,6 +11,7 @@ use crate::mcp_framework::{
     OutboundFrameworkError, discover_server_configs,
 };
 use crate::policy::Redactor;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 pub use frankenterm_core_mcp::{
@@ -392,6 +393,7 @@ fn discovery_disabled_error() -> McpClientError {
 }
 
 fn server_not_found_error(server: &str) -> McpClientError {
+    let server = redact_mcp_client_text(server);
     McpClientError::new(
         ERR_SERVER_NOT_FOUND,
         format!("Outbound MCP server not found: {server}"),
@@ -400,6 +402,7 @@ fn server_not_found_error(server: &str) -> McpClientError {
 }
 
 fn server_disabled_error(server: &str) -> McpClientError {
+    let server = redact_mcp_client_text(server);
     McpClientError::new(
         ERR_SERVER_DISABLED,
         format!("Outbound MCP server is disabled: {server}"),
@@ -414,6 +417,11 @@ fn remote_error_reports_unsupported(message_lower: &str) -> bool {
         || message_lower.contains("robot.unsupported")
 }
 
+fn redact_mcp_client_text(text: &str) -> String {
+    static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
+    REDACTOR.redact(text)
+}
+
 fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
     // [ft-qde8p] Redact secrets from the remote error text before it lands in
     // `McpClientError.message`. The message flows straight into tracing warn
@@ -423,8 +431,9 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
     // probes the raw `err.message` (for "timed out" / "failed to spawn"
     // keywords) because those are structural sentinels that must survive any
     // secret-pattern match, but only the redacted `base` is carried forward.
-    let redacted_remote = Redactor::new().redact(&err.message);
-    let base = format!("server '{server}': {redacted_remote}");
+    let redacted_remote = redact_mcp_client_text(&err.message);
+    let redacted_server = redact_mcp_client_text(server);
+    let base = format!("server '{redacted_server}': {redacted_remote}");
     let message_lower = err.message.to_ascii_lowercase();
 
     match err.code {
@@ -506,8 +515,8 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
 mod tests {
     use super::{
         Config, ERR_METHOD_NOT_FOUND, ERR_PARSE, ERR_PROMPT_NOT_FOUND, ERR_PROTOCOL,
-        ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN,
-        ERR_TOOL_EXECUTION, ERR_UNSUPPORTED, ExternalServerConfig, FrameworkMcpError,
+        ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SERVER_NOT_FOUND,
+        ERR_SPAWN, ERR_TOOL_EXECUTION, ERR_UNSUPPORTED, ExternalServerConfig, FrameworkMcpError,
         FrameworkMcpErrorCode, FtMcpClient, LOG_TARGET, McpClientConfig, McpClientContentItem,
         McpClientError, McpClientToolDefinition, discover_servers, map_mcp_error,
         report_server_outcome, select_server, select_server_via_bandit,
@@ -716,6 +725,29 @@ mod tests {
     }
 
     #[test]
+    fn map_mcp_error_redacts_secret_shaped_server_names() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = map_mcp_error(secret, FrameworkMcpError::tool_error("remote failed"));
+
+        assert_eq!(err.code, ERR_TOOL_EXECUTION);
+        assert!(
+            !err.message.contains(secret),
+            "raw server name leaked in mapped MCP client error: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("[REDACTED]"),
+            "expected redaction marker in mapped MCP client error: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("remote failed"),
+            "non-secret remote error text should survive redaction: {}",
+            err.message,
+        );
+    }
+
+    #[test]
     fn discover_servers_from_custom_path() {
         let temp_dir = tempdir().expect("temp dir");
         let config_path = temp_dir.path().join("mcp-config.json");
@@ -824,6 +856,27 @@ mod tests {
 
         let err = select_server(&config, &discovered, Some("filesystem")).unwrap_err();
         assert_eq!(err.code, ERR_SERVER_DISABLED);
+    }
+
+    #[test]
+    fn select_server_redacts_secret_shaped_requested_server_on_not_found() {
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let err = select_server(&config, &[], Some(secret)).unwrap_err();
+
+        assert_eq!(err.code, ERR_SERVER_NOT_FOUND);
+        assert!(
+            !err.message.contains(secret),
+            "raw requested server leaked in selection error: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("[REDACTED]"),
+            "expected redaction marker in selection error: {}",
+            err.message,
+        );
     }
 
     #[test]
