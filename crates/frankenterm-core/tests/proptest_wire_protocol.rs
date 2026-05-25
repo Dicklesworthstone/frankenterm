@@ -705,6 +705,91 @@ proptest! {
     }
 }
 
+fn gap_envelope(seq: u64, sender: &str) -> WireEnvelope {
+    WireEnvelope::new(seq, sender, valid_gap_payload())
+}
+
+#[test]
+fn aggregator_dedup_scope_is_per_sender_conformance() {
+    let mut agg = Aggregator::new(4);
+
+    assert!(matches!(
+        agg.ingest_envelope(gap_envelope(5, "agent-a")).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+    assert!(matches!(
+        agg.ingest_envelope(gap_envelope(5, "agent-b")).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+
+    let duplicate = agg.ingest_envelope(gap_envelope(4, "agent-a")).unwrap();
+    assert!(matches!(
+        duplicate,
+        IngestResult::Duplicate { ref sender, seq }
+            if sender == "agent-a" && seq == 4
+    ));
+
+    assert!(matches!(
+        agg.ingest_envelope(gap_envelope(6, "agent-b")).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+
+    assert_eq!(agg.agent_count(), 2);
+    assert_eq!(agg.agent_last_seq("agent-a"), Some(5));
+    assert_eq!(agg.agent_last_seq("agent-b"), Some(6));
+    assert_eq!(agg.total_accepted(), 3);
+    assert_eq!(agg.total_rejected(), 0);
+}
+
+#[test]
+fn aggregator_stale_session_pruning_uses_local_receive_clock_conformance() {
+    let mut agg = Aggregator::with_stale_after(2, 50);
+
+    let mut first = gap_envelope(1, "agent-a");
+    first.sent_at_ms = 999_999;
+    assert!(matches!(
+        agg.ingest_envelope_at(first, 100).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+
+    let mut second = gap_envelope(1, "agent-b");
+    second.sent_at_ms = 1;
+    assert!(matches!(
+        agg.ingest_envelope_at(second, 120).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+
+    let early_new_sender = gap_envelope(1, "agent-c");
+    let err = agg
+        .ingest_envelope_at(early_new_sender, 149)
+        .expect_err("both tracked sessions are still fresh by local receive time");
+    assert!(matches!(err, WireProtocolError::TooManyAgents { .. }));
+    assert_eq!(agg.agent_count(), 2);
+    assert_eq!(agg.total_rejected(), 1);
+
+    let mut duplicate_refresh = gap_envelope(1, "agent-a");
+    duplicate_refresh.sent_at_ms = 0;
+    assert!(matches!(
+        agg.ingest_envelope_at(duplicate_refresh, 160).unwrap(),
+        IngestResult::Duplicate { .. }
+    ));
+    assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+
+    let mut late_new_sender = gap_envelope(1, "agent-c");
+    late_new_sender.sent_at_ms = 0;
+    assert!(matches!(
+        agg.ingest_envelope_at(late_new_sender, 190).unwrap(),
+        IngestResult::Accepted(_)
+    ));
+
+    assert_eq!(agg.agent_count(), 2);
+    assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+    assert_eq!(agg.agent_last_seq("agent-b"), None);
+    assert_eq!(agg.agent_last_seq("agent-c"), Some(1));
+    assert_eq!(agg.total_accepted(), 3);
+    assert_eq!(agg.total_rejected(), 1);
+}
+
 // ============================================================================
 // Constants
 // ============================================================================

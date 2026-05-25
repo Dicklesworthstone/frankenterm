@@ -8,8 +8,9 @@ use frankenterm_core::connector_host_runtime::{
 };
 
 use frankenterm_core::connector_mesh::{
-    ConnectorMesh, ConnectorMeshConfig, HostHealth, MeshFailureEvent, MeshHealthSnapshot, MeshHost,
-    MeshTelemetrySnapshot, MeshZone, RoutingDecision, RoutingRequest, RoutingStrategy,
+    ConnectorMesh, ConnectorMeshConfig, ConnectorMeshError, HostHealth, MeshFailureEvent,
+    MeshHealthSnapshot, MeshHost, MeshTelemetrySnapshot, MeshZone, RoutingDecision, RoutingRequest,
+    RoutingStrategy,
 };
 
 fn arb_host_health() -> impl Strategy<Value = HostHealth> {
@@ -126,6 +127,164 @@ fn build_mesh(n: usize, zone_id: &str) -> ConnectorMesh {
             .unwrap();
     }
     mesh
+}
+
+fn route_request(
+    connector_id: &str,
+    strategy: RoutingStrategy,
+    preferred_zone: Option<&str>,
+) -> RoutingRequest {
+    RoutingRequest {
+        connector_id: connector_id.to_string(),
+        required_capabilities: vec![ConnectorCapability::Invoke],
+        preferred_zone: preferred_zone.map(str::to_string),
+        strategy: Some(strategy),
+    }
+}
+
+fn register_zone_pair(mesh: &mut ConnectorMesh) {
+    mesh.register_zone(MeshZone::new("z-east", "East"))
+        .expect("register z-east");
+    mesh.register_zone(MeshZone::new("z-west", "West"))
+        .expect("register z-west");
+}
+
+#[test]
+fn routing_strategy_least_loaded_selects_most_remaining_capacity_conformance() {
+    let mut mesh = ConnectorMesh::new(ConnectorMeshConfig::default());
+    register_zone_pair(&mut mesh);
+
+    let mut east_low = make_host("east-low", "z-east");
+    east_low.active_connectors = 8;
+    east_low.max_connectors = 10;
+    mesh.register_host(east_low).unwrap();
+
+    let mut east_full = make_host("east-full", "z-east");
+    east_full.active_connectors = 10;
+    east_full.max_connectors = 10;
+    mesh.register_host(east_full).unwrap();
+
+    let mut west_high = make_host("west-high", "z-west");
+    west_high.active_connectors = 1;
+    west_high.max_connectors = 12;
+    mesh.register_host(west_high).unwrap();
+
+    let mut west_unreachable = make_host("west-unreachable", "z-west");
+    west_unreachable.health = HostHealth::Unreachable;
+    west_unreachable.active_connectors = 0;
+    west_unreachable.max_connectors = 100;
+    mesh.register_host(west_unreachable).unwrap();
+
+    let request = route_request("conn-least", RoutingStrategy::LeastLoaded, None);
+    let decision = mesh.route(&request, 10_000).unwrap();
+
+    assert_eq!(decision.host_id, "west-high");
+    assert_eq!(decision.zone_id, "z-west");
+    assert_eq!(decision.strategy_used, RoutingStrategy::LeastLoaded);
+    assert_eq!(
+        mesh.get_host("west-high").unwrap().active_connectors,
+        2,
+        "successful routing increments the selected host load"
+    );
+    assert_eq!(
+        mesh.get_host("west-unreachable").unwrap().active_connectors,
+        0,
+        "unreachable hosts must not be selected"
+    );
+}
+
+#[test]
+fn routing_strategy_zone_affinity_prefers_requested_zone_conformance() {
+    let mut mesh = ConnectorMesh::new(ConnectorMeshConfig::default());
+    register_zone_pair(&mut mesh);
+
+    let mut east_low = make_host("east-low", "z-east");
+    east_low.active_connectors = 8;
+    east_low.max_connectors = 10;
+    mesh.register_host(east_low).unwrap();
+
+    let mut east_high = make_host("east-high", "z-east");
+    east_high.active_connectors = 3;
+    east_high.max_connectors = 10;
+    mesh.register_host(east_high).unwrap();
+
+    let mut west_high = make_host("west-high", "z-west");
+    west_high.active_connectors = 0;
+    west_high.max_connectors = 100;
+    mesh.register_host(west_high).unwrap();
+
+    let request = route_request("conn-zone", RoutingStrategy::ZoneAffinity, Some("z-east"));
+    let decision = mesh.route(&request, 10_100).unwrap();
+
+    assert_eq!(decision.host_id, "east-high");
+    assert_eq!(decision.zone_id, "z-east");
+    assert_eq!(decision.strategy_used, RoutingStrategy::ZoneAffinity);
+    assert_eq!(
+        mesh.get_host("west-high").unwrap().active_connectors,
+        0,
+        "zone affinity must prefer eligible hosts in the requested zone before cross-zone capacity"
+    );
+}
+
+#[test]
+fn routing_strategy_zone_affinity_fails_closed_without_cross_zone_fallback() {
+    let config = ConnectorMeshConfig {
+        allow_cross_zone_fallback: false,
+        ..ConnectorMeshConfig::default()
+    };
+    let mut mesh = ConnectorMesh::new(config);
+    register_zone_pair(&mut mesh);
+    mesh.register_host(make_host("west-only", "z-west"))
+        .unwrap();
+
+    let request = route_request(
+        "conn-no-fallback",
+        RoutingStrategy::ZoneAffinity,
+        Some("z-east"),
+    );
+    let err = mesh.route(&request, 10_200).expect_err(
+        "zone affinity must fail when preferred zone has no eligible host and fallback is disabled",
+    );
+
+    assert!(matches!(err, ConnectorMeshError::RoutingFailed { .. }));
+    let telemetry = mesh.telemetry().snapshot();
+    assert_eq!(telemetry.routing_requests, 1);
+    assert_eq!(telemetry.routing_successes, 0);
+    assert_eq!(telemetry.routing_failures, 1);
+}
+
+#[test]
+fn routing_strategy_round_robin_cycles_sorted_eligible_hosts_conformance() {
+    let mut mesh = ConnectorMesh::new(ConnectorMeshConfig::default());
+    mesh.register_zone(MeshZone::new("z-main", "Main")).unwrap();
+    for host_id in ["h-a", "h-b", "h-c"] {
+        mesh.register_host(make_host(host_id, "z-main")).unwrap();
+    }
+
+    let mut selected = Vec::new();
+    for idx in 0..5 {
+        let request = route_request(
+            &format!("conn-round-{idx}"),
+            RoutingStrategy::RoundRobin,
+            None,
+        );
+        selected.push(mesh.route(&request, 11_000 + idx).unwrap().host_id);
+    }
+
+    assert_eq!(selected, ["h-a", "h-b", "h-c", "h-a", "h-b"]);
+    assert_eq!(
+        mesh.routing_history()
+            .iter()
+            .map(|decision| decision.strategy_used)
+            .collect::<Vec<_>>(),
+        vec![
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::RoundRobin,
+        ]
+    );
 }
 
 proptest! {
