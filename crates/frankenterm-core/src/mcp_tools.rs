@@ -198,6 +198,12 @@ pub const MAX_MCP_CASS_AGENT_FILTER_BYTES: usize = 64;
 /// force very large argv/payload handling through the MCP server.
 pub const MAX_MCP_CASS_QUERY_BYTES: usize = 64 * 1024;
 
+/// Hard cap for account service selectors accepted through MCP tools.
+///
+/// Service names are small enumerated identifiers. Keep malformed account tool
+/// arguments out of storage/Caut dispatch and out of error/audit text.
+pub const MAX_MCP_ACCOUNT_SERVICE_BYTES: usize = 64;
+
 // br-ft-rnpuc: clock-anomaly observability for MCP tool audit
 // timestamps. mcp_tools.rs has 11 sites with the pattern
 // `i64::try_from(now_ms()).unwrap_or(0)` — when the u64 → i64
@@ -499,6 +505,30 @@ fn validate_mcp_cass_query_bytes(
         Some(format!(
             "{tool_name} accepts bounded search expressions only; narrow the query before calling \
              cass."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
+
+fn validate_mcp_account_service_bytes(
+    tool_name: &str,
+    service: &str,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if service.len() <= MAX_MCP_ACCOUNT_SERVICE_BYTES {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!(
+            "service is {} bytes; max allowed is {MAX_MCP_ACCOUNT_SERVICE_BYTES} bytes",
+            service.len()
+        ),
+        Some(format!(
+            "{tool_name} accepts short service identifiers only; use a supported account service \
+             alias."
         )),
         elapsed_ms(start),
     );
@@ -5119,7 +5149,7 @@ impl ToolHandler for WaAccountsTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "service": { "type": "string", "description": "Service name (openai, anthropic, google)" }
+                    "service": { "type": "string", "maxLength": MAX_MCP_ACCOUNT_SERVICE_BYTES, "description": "Service name (openai, anthropic, google)" }
                 },
                 "required": ["service"],
                 "additionalProperties": false
@@ -5151,6 +5181,12 @@ impl ToolHandler for WaAccountsTool {
                 return envelope_to_content(envelope);
             }
         };
+
+        if let Some(error) =
+            validate_mcp_account_service_bytes("wa.accounts", params.service.as_str(), start)
+        {
+            return error;
+        }
 
         let db_path = Arc::clone(&self.db_path);
         let runtime = CompatRuntimeBuilder::current_thread()
@@ -5244,7 +5280,7 @@ impl ToolHandler for WaAccountsRefreshTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "service": { "type": "string", "description": "Service name (openai)" }
+                    "service": { "type": "string", "maxLength": MAX_MCP_ACCOUNT_SERVICE_BYTES, "description": "Service name (openai)" }
                 },
                 "additionalProperties": false
             }),
@@ -5280,6 +5316,13 @@ impl ToolHandler for WaAccountsRefreshTool {
             }
         };
 
+        if let Some(service) = params.service.as_deref()
+            && let Some(error) =
+                validate_mcp_account_service_bytes("wa.accounts_refresh", service, start)
+        {
+            return error;
+        }
+
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
@@ -5293,7 +5336,7 @@ impl ToolHandler for WaAccountsRefreshTool {
                 let caut_service = parse_caut_service(&service).ok_or_else(|| {
                     McpToolError::new(
                         MCP_ERR_INVALID_ARGS,
-                        format!("Unknown service: {service}"),
+                        "Unknown service".to_string(),
                         Some(format!(
                             "Supported services: {}",
                             crate::caut::CautService::supported_cli_inputs().join(", ")
@@ -7242,25 +7285,25 @@ mod tests {
     use super::set_cass_test_binary_override;
     use super::{
         ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
-        CompatRuntimeBuilder, Config, Content, MAX_MCP_CASS_AGENT_FILTER_BYTES,
-        MAX_MCP_CASS_QUERY_BYTES, MAX_MCP_RULES_AGENT_TYPE_BYTES, MAX_MCP_RULES_TEST_TEXT_BYTES,
-        MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS,
-        MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
-        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool,
-        WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
-        WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-        WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
-        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
-        WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
-        validate_cass_timeout_secs,
+        CompatRuntimeBuilder, Config, Content, MAX_MCP_ACCOUNT_SERVICE_BYTES,
+        MAX_MCP_CASS_AGENT_FILTER_BYTES, MAX_MCP_CASS_QUERY_BYTES, MAX_MCP_RULES_AGENT_TYPE_BYTES,
+        MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_STATE_AGENT_FILTER_BYTES,
+        MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext,
+        PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
+        WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
+        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
+        WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
+        WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
+        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
+        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
+        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -8489,6 +8532,68 @@ mod tests {
         assert!(def.input_schema["properties"].get("pane_id").is_some());
         assert!(def.input_schema["properties"].get("dry_run").is_some());
         assert!(def.input_schema["properties"].get("force").is_none());
+    }
+
+    #[test]
+    fn accounts_service_args_do_not_echo_malformed_values() {
+        let secret = "sk-ant-api03-account-service-secret";
+        let oversized = format!("{secret}{}", "x".repeat(MAX_MCP_ACCOUNT_SERVICE_BYTES + 1));
+
+        let accounts_envelope = parse_json_content(
+            WaAccountsTool::new(db_path())
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "service": oversized,
+                    }),
+                )
+                .expect("accounts oversized service returns envelope"),
+        );
+        assert_eq!(accounts_envelope["ok"], false);
+        assert_eq!(accounts_envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            accounts_envelope["error"]
+                .as_str()
+                .expect("accounts error string")
+                .contains("max allowed")
+        );
+        assert!(
+            !accounts_envelope.to_string().contains("sk-ant-api03-"),
+            "wa.accounts oversized service leaked caller-supplied value"
+        );
+
+        let refresh_envelope = parse_json_content(
+            WaAccountsRefreshTool::new(config(), db_path())
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "service": secret,
+                    }),
+                )
+                .expect("accounts_refresh unknown service returns envelope"),
+        );
+        assert_eq!(refresh_envelope["ok"], false);
+        assert_eq!(refresh_envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(refresh_envelope["error"].as_str(), Some("Unknown service"));
+        assert!(
+            !refresh_envelope.to_string().contains("sk-ant-api03-"),
+            "wa.accounts_refresh unknown service leaked caller-supplied value"
+        );
+    }
+
+    #[test]
+    fn accounts_schema_declares_service_max_length() {
+        let accounts = WaAccountsTool::new(db_path()).definition();
+        assert_eq!(
+            accounts.input_schema["properties"]["service"]["maxLength"].as_u64(),
+            Some(MAX_MCP_ACCOUNT_SERVICE_BYTES as u64)
+        );
+
+        let refresh = WaAccountsRefreshTool::new(config(), db_path()).definition();
+        assert_eq!(
+            refresh.input_schema["properties"]["service"]["maxLength"].as_u64(),
+            Some(MAX_MCP_ACCOUNT_SERVICE_BYTES as u64)
+        );
     }
 
     #[test]
