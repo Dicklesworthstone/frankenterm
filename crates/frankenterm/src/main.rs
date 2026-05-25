@@ -6294,6 +6294,9 @@ fn should_show_toon_stats(cli_stats: bool) -> bool {
     cli_stats || std::env::var("TOON_STATS").is_ok()
 }
 
+const ROBOT_RESPONSE_SCHEMA_VERSION: u32 =
+    frankenterm_core::robot_types::RobotResponse::<()>::SCHEMA_VERSION;
+
 /// JSON envelope for robot mode responses
 #[derive(serde::Serialize)]
 struct RobotResponse<T> {
@@ -6309,6 +6312,7 @@ struct RobotResponse<T> {
     elapsed_ms: u64,
     version: String,
     now: u64,
+    schema_version: u32,
 }
 
 impl<T> RobotResponse<T> {
@@ -6322,6 +6326,7 @@ impl<T> RobotResponse<T> {
             elapsed_ms,
             version: frankenterm_core::VERSION.to_string(),
             now: now_ms(),
+            schema_version: ROBOT_RESPONSE_SCHEMA_VERSION,
         }
     }
 
@@ -6340,6 +6345,7 @@ impl<T> RobotResponse<T> {
             elapsed_ms,
             version: frankenterm_core::VERSION.to_string(),
             now: now_ms(),
+            schema_version: ROBOT_RESPONSE_SCHEMA_VERSION,
         }
     }
 }
@@ -11808,6 +11814,7 @@ fn robot_fleet_error_with_data(
         elapsed_ms,
         version: frankenterm_core::VERSION.to_string(),
         now: now_ms(),
+        schema_version: ROBOT_RESPONSE_SCHEMA_VERSION,
     }
 }
 
@@ -66003,6 +66010,10 @@ log_level = "debug"
         assert_eq!(json["elapsed_ms"], 42);
         assert!(json["version"].is_string());
         assert!(json["now"].is_number());
+        assert_eq!(
+            json["schema_version"],
+            u64::from(ROBOT_RESPONSE_SCHEMA_VERSION)
+        );
     }
 
     #[test]
@@ -66023,6 +66034,36 @@ log_level = "debug"
         assert_eq!(json["elapsed_ms"], 99);
         assert!(json["version"].is_string());
         assert!(json["now"].is_number());
+        assert_eq!(
+            json["schema_version"],
+            u64::from(ROBOT_RESPONSE_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn robot_response_error_with_data_preserves_schema_version() {
+        let resp = robot_fleet_error_with_data(
+            "robot.fleet.plan_error",
+            "fleet plan failed",
+            Some("Inspect data.requested.".to_string()),
+            serde_json::json!({
+                "family": "fleet",
+                "action": "scale",
+                "requested": {
+                    "count": 3,
+                },
+            }),
+            13,
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["data"]["family"], "fleet");
+        assert_eq!(json["error_code"], "robot.fleet.plan_error");
+        assert_eq!(
+            json["schema_version"],
+            u64::from(ROBOT_RESPONSE_SCHEMA_VERSION)
+        );
     }
 
     #[test]
