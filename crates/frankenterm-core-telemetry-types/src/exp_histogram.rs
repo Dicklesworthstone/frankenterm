@@ -277,12 +277,17 @@ impl ExpHistogram {
             "histogram parameters must match for merge"
         );
 
+        // Saturating to match `record_n`'s overflow discipline: a long-running
+        // fleet rollup that merges many per-pane histograms could otherwise
+        // overflow a u64 count, which panics in debug and silently wraps in
+        // release. The record path is already hardened with saturating_add;
+        // merge must be too, or the two ingest routes disagree at the limit.
         for (a, b) in self.buckets.iter_mut().zip(other.buckets.iter()) {
-            *a += b;
+            *a = a.saturating_add(*b);
         }
-        self.underflow += other.underflow;
-        self.overflow += other.overflow;
-        self.count += other.count;
+        self.underflow = self.underflow.saturating_add(other.underflow);
+        self.overflow = self.overflow.saturating_add(other.overflow);
+        self.count = self.count.saturating_add(other.count);
         self.sum += other.sum;
         if other.min < self.min {
             self.min = other.min;
@@ -604,6 +609,39 @@ mod tests {
         assert_eq!(h1.count(), 4);
         assert_eq!(h1.min(), Some(1.0));
         assert_eq!(h1.max(), Some(500.0));
+    }
+
+    /// Regression: merge must saturate (not overflow) bucket/underflow/overflow/
+    /// count, matching `record_n`'s discipline. Pre-fix, plain `+=` panicked in
+    /// debug (overflow) / wrapped in release when a fleet rollup pushed a u64
+    /// count past its limit. The same value (4.0) lands in the same bucket in
+    /// both histograms, so both the per-bucket and total counters are exercised.
+    #[test]
+    fn merge_saturates_on_count_overflow() {
+        let mut h1 = ExpHistogram::power_of_two(10);
+        let mut h2 = ExpHistogram::power_of_two(10);
+        h1.record_n(4.0, u64::MAX);
+        h2.record_n(4.0, u64::MAX);
+        // record_n already saturated each to u64::MAX; merging must not panic
+        // or wrap — it must clamp at u64::MAX.
+        h1.merge(&h2);
+        assert_eq!(h1.count(), u64::MAX, "merged count must saturate, not wrap");
+        let bucket_total: u64 = h1.bucket_details().iter().map(|d| d.count).sum();
+        assert_eq!(bucket_total, u64::MAX, "merged bucket count must saturate, not wrap");
+    }
+
+    #[test]
+    fn merge_saturates_underflow_and_overflow() {
+        let mut h1 = ExpHistogram::power_of_two(4); // buckets for [1, 2^4)
+        let mut h2 = ExpHistogram::power_of_two(4);
+        // value <= 0 -> underflow; value >= 2^4=16 -> overflow.
+        h1.record_n(-1.0, u64::MAX);
+        h2.record_n(-1.0, u64::MAX);
+        h1.record_n(64.0, u64::MAX);
+        h2.record_n(64.0, u64::MAX);
+        h1.merge(&h2); // must not panic/wrap
+        assert_eq!(h1.underflow(), u64::MAX, "underflow must saturate on merge");
+        assert_eq!(h1.overflow(), u64::MAX, "overflow must saturate on merge");
     }
 
     #[test]
