@@ -274,11 +274,13 @@ impl DecisionDiff {
                 // Not exact match. Check for shifted.
                 let relaxed_key = (node.pane_id, node.rule_id.clone());
                 let found_shifted = if let Some(cand_list) = cand_relaxed.get(&relaxed_key) {
-                    cand_list.iter().find(|(cand_key, cn)| {
-                        let delta = cn.timestamp_ms.abs_diff(node.timestamp_ms);
-                        delta <= config.time_tolerance_ms
-                            && delta > 0
-                            && !matched_cand.contains(cand_key)
+                    best_relaxed_match(cand_list, &matched_cand, node, config, true)
+                } else {
+                    None
+                };
+                let found_shifted_modified = if found_shifted.is_none() {
+                    cand_relaxed.get(&relaxed_key).and_then(|cand_list| {
+                        best_relaxed_match(cand_list, &matched_cand, node, config, false)
                     })
                 } else {
                     None
@@ -299,6 +301,21 @@ impl DecisionDiff {
                         },
                     });
                     shifted += 1;
+                } else if let Some((shifted_key, shifted_node)) = found_shifted_modified {
+                    matched_cand.insert(shifted_key.clone());
+                    let root_cause = if config.attribute_root_causes {
+                        attribute_modified(node, shifted_node)
+                    } else {
+                        RootCause::Unknown
+                    };
+                    divergences.push(Divergence {
+                        position,
+                        divergence_type: DivergenceType::Modified,
+                        baseline_node: Some(DivergenceNode::from_decision_node(node)),
+                        candidate_node: Some(DivergenceNode::from_decision_node(shifted_node)),
+                        root_cause,
+                    });
+                    modified += 1;
                 } else {
                     // Removed.
                     divergences.push(Divergence {
@@ -781,6 +798,30 @@ fn indexed_exact_nodes<'a>(nodes: &[&'a DecisionNode]) -> Vec<(ExactKey, &'a Dec
         .collect()
 }
 
+fn best_relaxed_match<'a>(
+    candidates: &'a [(ExactKey, &'a DecisionNode)],
+    matched_cand: &BTreeSet<ExactKey>,
+    baseline: &DecisionNode,
+    config: &DiffConfig,
+    require_same_output: bool,
+) -> Option<&'a (ExactKey, &'a DecisionNode)> {
+    candidates
+        .iter()
+        .filter(|(cand_key, candidate)| {
+            let delta = candidate.timestamp_ms.abs_diff(baseline.timestamp_ms);
+            delta > 0
+                && delta <= config.time_tolerance_ms
+                && !matched_cand.contains(cand_key)
+                && (!require_same_output || candidate.output_hash == baseline.output_hash)
+        })
+        .min_by_key(|(cand_key, candidate)| {
+            (
+                candidate.timestamp_ms.abs_diff(baseline.timestamp_ms),
+                cand_key.clone(),
+            )
+        })
+}
+
 /// Attribute root cause for a Modified divergence.
 fn attribute_modified(baseline: &DecisionNode, candidate: &DecisionNode) -> RootCause {
     if baseline.definition_hash != candidate.definition_hash {
@@ -1074,6 +1115,91 @@ mod tests {
         assert_eq!(diff.summary.shifted, 0);
         assert_eq!(diff.summary.removed, 1);
         assert_eq!(diff.summary.added, 1);
+    }
+
+    #[test]
+    fn shifted_with_output_change_is_modified_not_l1_equivalent() {
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            150,
+            1,
+            "def1",
+            "out_changed",
+        )];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.shifted, 0);
+        assert_eq!(diff.summary.modified, 1);
+        assert_eq!(diff.summary.added, 0);
+        assert_eq!(diff.summary.removed, 0);
+        assert!(diff.is_equivalent(EquivalenceLevel::L0));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+        assert_eq!(
+            diff.divergences[0].divergence_type,
+            DivergenceType::Modified
+        );
+        assert_eq!(
+            diff.divergences[0]
+                .candidate_node
+                .as_ref()
+                .expect("modified shifted candidate is retained")
+                .timestamp_ms,
+            150
+        );
+    }
+
+    #[test]
+    fn shifted_prefers_same_output_before_nearer_changed_output() {
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![
+            make_event(
+                DecisionType::PatternMatch,
+                "r1",
+                110,
+                1,
+                "def1",
+                "out_changed",
+            ),
+            make_event(DecisionType::PatternMatch, "r1", 150, 1, "def1", "out1"),
+        ];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.shifted, 1);
+        assert_eq!(diff.summary.modified, 0);
+        assert_eq!(diff.summary.added, 1);
+        let shifted = diff
+            .divergences
+            .iter()
+            .find(|divergence| divergence.divergence_type == DivergenceType::Shifted)
+            .expect("same-output candidate should be classified as shifted");
+        assert_eq!(
+            shifted
+                .candidate_node
+                .as_ref()
+                .expect("shifted candidate is retained")
+                .timestamp_ms,
+            150
+        );
     }
 
     // ── Root cause: rule definition change ──────────────────────────────
