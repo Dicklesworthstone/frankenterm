@@ -4447,6 +4447,11 @@ pub struct PolicyEngine {
     /// `[safety].block_alt_screen` policy). Defaults off in `new()` so direct
     /// constructions/tests are unaffected; `from_config` sets it from config.
     block_alt_screen: bool,
+    /// Whether to require approval for sends after a recent capture gap (the
+    /// `[safety].block_recent_gap` policy). Defaults ON in `new()` because the
+    /// recent-gap gate has always fired unconditionally — this preserves that
+    /// behavior while making the documented toggle honor a `false` config.
+    block_recent_gap: bool,
     /// Command safety gate configuration
     command_gate: CommandGateConfig,
     /// Whether trauma-guard intervention is enabled.
@@ -4510,6 +4515,7 @@ impl PolicyEngine {
             ))),
             require_prompt_active,
             block_alt_screen: false,
+            block_recent_gap: true,
             command_gate: CommandGateConfig::default(),
             trauma_guard_enabled: true,
             policy_rules: PolicyRulesConfig::default(),
@@ -4569,6 +4575,7 @@ impl PolicyEngine {
         )
         .with_command_gate_config(config.command_gate.clone())
         .with_block_alt_screen(config.block_alt_screen)
+        .with_block_recent_gap(config.block_recent_gap)
         .with_policy_rules(config.rules.clone())
         .with_decision_log_config(config.decision_log.clone());
         engine.quarantine_registry = QuarantineRegistry::from_config(&config.quarantine);
@@ -4682,6 +4689,14 @@ impl PolicyEngine {
     #[must_use]
     pub fn with_block_alt_screen(mut self, block_alt_screen: bool) -> Self {
         self.block_alt_screen = block_alt_screen;
+        self
+    }
+
+    /// Builder: control whether a recent capture gap gates sends
+    /// (`[safety].block_recent_gap`).
+    #[must_use]
+    pub fn with_block_recent_gap(mut self, block_recent_gap: bool) -> Self {
+        self.block_recent_gap = block_recent_gap;
         self
     }
 
@@ -6513,15 +6528,19 @@ impl PolicyEngine {
             }
         }
 
-        // Check for recent capture gaps (safety check for send actions)
-        if matches!(
-            input.action,
-            ActionKind::SendText
-                | ActionKind::SendControl
-                | ActionKind::SendCtrlC
-                | ActionKind::SendCtrlD
-                | ActionKind::SendCtrlZ
-        ) && input.capabilities.has_recent_gap
+        // Check for recent capture gaps (safety check for send actions).
+        // Gated by `block_recent_gap` ([safety].block_recent_gap) — previously
+        // this fired unconditionally and the documented toggle did not exist.
+        if self.block_recent_gap
+            && matches!(
+                input.action,
+                ActionKind::SendText
+                    | ActionKind::SendControl
+                    | ActionKind::SendCtrlC
+                    | ActionKind::SendCtrlD
+                    | ActionKind::SendCtrlZ
+            )
+            && input.capabilities.has_recent_gap
         {
             // Recent gap means we might have missed output - require approval
             if !input.actor.is_trusted() {
@@ -10805,6 +10824,35 @@ mod tests {
         let mut engine_off = PolicyEngine::new(10, 100, false);
         let decision = engine_off.authorize(&make(ActorKind::Robot));
         assert_ne!(decision.rule_id(), Some("policy.block_alt_screen"));
+    }
+
+    #[test]
+    fn block_recent_gap_toggle_is_honored() {
+        // Regression: [safety].block_recent_gap was a documented config option
+        // with NO real field — the recent-gap gate fired unconditionally and the
+        // toggle could not disable it. The flag is now real and honored.
+        let make = || {
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(1)
+                .with_capabilities(PaneCapabilities {
+                    has_recent_gap: true,
+                    ..Default::default()
+                })
+        };
+
+        // Default (true in new()): a recent gap gates an untrusted send.
+        let mut engine = PolicyEngine::new(10, 100, false);
+        let decision = engine.authorize(&make());
+        assert!(
+            decision.requires_approval(),
+            "recent gap must gate untrusted send by default, got {decision:?}"
+        );
+        assert_eq!(decision.rule_id(), Some("policy.recent_gap"));
+
+        // Disabled via config: the documented toggle now actually disables it.
+        let mut engine_off = PolicyEngine::new(10, 100, false).with_block_recent_gap(false);
+        let decision = engine_off.authorize(&make());
+        assert_ne!(decision.rule_id(), Some("policy.recent_gap"));
     }
 
     #[test]

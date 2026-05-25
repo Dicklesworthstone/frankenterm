@@ -2232,6 +2232,11 @@ pub struct SafetyConfig {
     /// Block sends to alt-screen applications (vim, less, etc.)
     pub block_alt_screen: bool,
 
+    /// Require approval for sends when a recent capture gap was detected
+    /// (output may have been missed). Enabled by default; set false to allow
+    /// sends through despite a recent gap.
+    pub block_recent_gap: bool,
+
     /// Capability gating rules
     pub capabilities: CapabilityConfig,
 
@@ -2309,6 +2314,7 @@ impl Default for SafetyConfig {
             rate_limit_global: 100,
             require_prompt_active: true,
             block_alt_screen: true,
+            block_recent_gap: true,
             capabilities: CapabilityConfig::default(),
             approval: ApprovalConfig::default(),
             redaction: RedactionConfig::default(),
