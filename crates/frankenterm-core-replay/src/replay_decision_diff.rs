@@ -380,6 +380,7 @@ impl DecisionDiff {
                 position += 1;
             }
         }
+        normalize_divergence_positions(&mut divergences);
 
         let summary = DiffSummary {
             total_baseline: base_nodes.len() as u64,
@@ -841,6 +842,58 @@ fn indexed_exact_nodes<'a>(nodes: &[&'a DecisionNode]) -> Vec<(ExactKey, &'a Dec
         .collect()
 }
 
+fn normalize_divergence_positions(divergences: &mut [Divergence]) {
+    divergences.sort_by_key(divergence_order_key);
+    for (position, divergence) in divergences.iter_mut().enumerate() {
+        divergence.position = position as u64;
+    }
+}
+
+fn divergence_order_key(divergence: &Divergence) -> (u64, u64, String, u8, DecisionType, u64) {
+    let node = earliest_divergence_node(divergence);
+    (
+        node.map_or(u64::MAX, |node| node.timestamp_ms),
+        node.map_or(u64::MAX, |node| node.pane_id),
+        node.map_or_else(String::new, |node| node.rule_id.clone()),
+        divergence_type_order(divergence.divergence_type),
+        node.map_or(DecisionType::NoOp, |node| node.decision_type),
+        node.map_or(u64::MAX, |node| node.node_id),
+    )
+}
+
+fn earliest_divergence_node(divergence: &Divergence) -> Option<&DivergenceNode> {
+    match (&divergence.baseline_node, &divergence.candidate_node) {
+        (Some(baseline), Some(candidate)) => {
+            if divergence_node_order_key(candidate) < divergence_node_order_key(baseline) {
+                Some(candidate)
+            } else {
+                Some(baseline)
+            }
+        }
+        (Some(node), None) | (None, Some(node)) => Some(node),
+        (None, None) => None,
+    }
+}
+
+fn divergence_node_order_key(node: &DivergenceNode) -> (u64, u64, &str, DecisionType, u64) {
+    (
+        node.timestamp_ms,
+        node.pane_id,
+        node.rule_id.as_str(),
+        node.decision_type,
+        node.node_id,
+    )
+}
+
+fn divergence_type_order(divergence_type: DivergenceType) -> u8 {
+    match divergence_type {
+        DivergenceType::Removed => 0,
+        DivergenceType::Modified => 1,
+        DivergenceType::Shifted => 2,
+        DivergenceType::Added => 3,
+    }
+}
+
 fn best_relaxed_match<'a>(
     candidates: &'a [(ExactKey, &'a DecisionNode)],
     matched_cand: &BTreeSet<ExactKey>,
@@ -898,10 +951,33 @@ fn causal_parent_signature(graph: &DecisionGraph, node_id: u64) -> Vec<String> {
         .edges()
         .iter()
         .filter(|edge| edge.to_node == node_id)
-        .map(|edge| format!("in:{}:{}", edge_type_label(edge.edge_type), edge.from_node))
+        .filter_map(|edge| {
+            graph.get_node(edge.from_node).map(|parent| {
+                format!(
+                    "in:{}:{}:{}:{}",
+                    edge_type_label(edge.edge_type),
+                    parent.pane_id,
+                    decision_type_label(parent.decision_type),
+                    parent.rule_id
+                )
+            })
+        })
         .collect::<Vec<_>>();
     parents.sort();
     parents
+}
+
+fn decision_type_label(decision_type: DecisionType) -> &'static str {
+    match decision_type {
+        DecisionType::PatternMatch => "pattern_match",
+        DecisionType::WorkflowStep => "workflow_step",
+        DecisionType::PolicyDecision => "policy_decision",
+        DecisionType::AlertFired => "alert_fired",
+        DecisionType::OverrideApplied => "override_applied",
+        DecisionType::BarrierDecision => "barrier_decision",
+        DecisionType::NoOp => "no_op",
+        DecisionType::PolicyEvaluation => "policy_evaluation",
+    }
 }
 
 fn edge_type_label(edge_type: EdgeType) -> &'static str {
@@ -1050,6 +1126,137 @@ mod tests {
         assert_eq!(diff.summary.added, 1);
         assert_eq!(diff.summary.unchanged, 1);
         assert!(!diff.is_equivalent(EquivalenceLevel::L0));
+    }
+
+    #[test]
+    fn early_added_candidate_decision_is_first_divergence() {
+        let base_events = vec![
+            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
+            make_event(
+                DecisionType::WorkflowStep,
+                "workflow.late",
+                200,
+                1,
+                "late_v1",
+                "late_old",
+            ),
+        ];
+        let cand_events = vec![
+            make_event(
+                DecisionType::AlertFired,
+                "alert.early",
+                50,
+                2,
+                "early_v1",
+                "early",
+            ),
+            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
+            make_event(
+                DecisionType::WorkflowStep,
+                "workflow.late",
+                200,
+                1,
+                "late_v1",
+                "late_changed",
+            ),
+        ];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.added, 1);
+        assert_eq!(diff.summary.modified, 1);
+        assert_eq!(diff.divergences.len(), 2);
+        assert_eq!(diff.divergences[0].position, 0);
+        assert_eq!(diff.divergences[0].divergence_type, DivergenceType::Added);
+        assert_eq!(
+            diff.divergences[0]
+                .candidate_node
+                .as_ref()
+                .expect("early added candidate is retained")
+                .rule_id,
+            "alert.early"
+        );
+        assert_eq!(diff.divergences[1].position, 1);
+        assert_eq!(
+            diff.divergences[1].divergence_type,
+            DivergenceType::Modified
+        );
+
+        let mission = MissionCausalityDiff::from_decision_diff(&diff, &base, &cand);
+        assert_eq!(
+            mission.summary.first_category,
+            MissionCausalityCategory::NewDecision
+        );
+    }
+
+    #[test]
+    fn unrelated_early_candidate_decision_does_not_rewrite_parent_topology() {
+        let base_events = vec![
+            make_event(
+                DecisionType::PatternMatch,
+                "root.detected",
+                100,
+                1,
+                "root_v1",
+                "matched",
+            ),
+            make_triggered_event(
+                DecisionType::WorkflowStep,
+                "workflow.execute",
+                200,
+                1,
+                "execute_v1",
+                "executed",
+                Some(0),
+            ),
+        ];
+        let cand_events = vec![
+            make_event(
+                DecisionType::AlertFired,
+                "alert.early",
+                50,
+                2,
+                "early_v1",
+                "early",
+            ),
+            make_event(
+                DecisionType::PatternMatch,
+                "root.detected",
+                100,
+                1,
+                "root_v1",
+                "matched",
+            ),
+            make_triggered_event(
+                DecisionType::WorkflowStep,
+                "workflow.execute",
+                200,
+                1,
+                "execute_v1",
+                "executed",
+                Some(1),
+            ),
+        ];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.added, 1);
+        assert_eq!(diff.summary.unchanged, 2);
+        assert_eq!(diff.summary.modified, 0);
+        assert_eq!(diff.summary.removed, 0);
+        assert_eq!(diff.divergences.len(), 1);
+        assert_eq!(diff.divergences[0].position, 0);
+        assert_eq!(diff.divergences[0].divergence_type, DivergenceType::Added);
+        assert_eq!(
+            diff.divergences[0]
+                .candidate_node
+                .as_ref()
+                .expect("early added candidate is retained")
+                .rule_id,
+            "alert.early"
+        );
     }
 
     // ── Removed decision ───────────────────────────────────────────────
@@ -1610,8 +1817,12 @@ mod tests {
                 baseline_parents,
                 candidate_parents,
             } if rule_id == "workflow.execute"
-                && baseline_parents.iter().any(|parent| parent == "in:triggered_by:1")
-                && candidate_parents.iter().any(|parent| parent == "in:triggered_by:0")
+                && baseline_parents
+                    .iter()
+                    .any(|parent| parent == "in:triggered_by:1:workflow_step:workflow.prepare")
+                && candidate_parents
+                    .iter()
+                    .any(|parent| parent == "in:triggered_by:1:pattern_match:root.detected")
         ));
 
         let mission = MissionCausalityDiff::from_decision_diff(&diff, &base, &cand);
