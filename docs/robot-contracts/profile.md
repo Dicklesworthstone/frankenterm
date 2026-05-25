@@ -12,9 +12,11 @@ workspace `agent_profiles` table. `list`, `show`, `validate`, and dry-run
 `apply` are wired through the storage-only handler. Non-dry-run `apply` routes
 through `handle_profile_apply_with_executor`, which builds a shared fleet
 mutation plan, spawns through the mux bridge, persists `profiles_applied_log`
-receipts, and rolls back prior spawned panes on mid-apply failure. The ntm
-differential test consumes the state-machine model + the
-`crate::robot_ntm_differential::DifferentialHarness` from `ft-hac7w.1.1`.
+receipts, and rolls back prior spawned panes on mid-apply failure. The current
+profile corpus consumes the state-machine model plus the
+`crate::robot_ntm_differential::DifferentialHarness` from `ft-hac7w.1.1`
+through an in-process mirror invoker. That is mirror-conformance evidence, not
+live `ntm profiles` subprocess parity.
 
 ## Family overview
 
@@ -246,7 +248,7 @@ ft-t9a6q.1 / .2 / .3:
   `tests/robot_family_conformance.rs`).
 - State-space proof at
   `crate::robot_profile_state_machine`.
-- NTM mirror differential harness in
+- NTM mirror-conformance harness in
   `tests/robot_profile_ntm_differential.rs`.
 
 **Wired-pass (partially shipped):**

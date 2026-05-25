@@ -6,13 +6,15 @@
 //! # What this is
 //!
 //! The bridge plan requires that every robot family with an `ntm`
-//! equivalent shows zero observable divergence on a 1000-request
-//! fuzz corpus. This module is the methodology shared by every
-//! per-family bead (`ft-hac7w.2`…`ft-hac7w.6`): a request stream
-//! flows through ft's native handler AND through `ntm` (as a
-//! subprocess), the two responses are normalized via the rule
-//! table in the companion doc, and the harness asserts byte-for-byte
-//! equality on the normalized values.
+//! equivalent eventually shows zero observable divergence against a
+//! real `ntm` subprocess on a 1000-request fuzz corpus. This module is
+//! the methodology shared by every per-family bead
+//! (`ft-hac7w.2`…`ft-hac7w.6`): a request stream flows through ft's
+//! native handler and an [`NtmInvoker`], the two responses are
+//! normalized via the rule table in the companion doc, and the harness
+//! asserts byte-for-byte equality on the normalized values. Only
+//! [`NtmSubprocessInvoker`] produces live `ntm` parity evidence; mirror
+//! invokers are substrate/conformance evidence only.
 //!
 //! Per-family beads plug into this harness by supplying:
 //!
@@ -38,24 +40,23 @@
 //! - The [`DivergenceReport`] data type the harness returns when
 //!   responses diverge after normalization.
 //!
-//! What this commit does NOT ship (filed as follow-on beads):
+//! What this module does NOT ship (filed as follow-on beads):
 //!
 //! - The 1000-request fuzz corpus per family — each per-family
 //!   bead authors its own corpus.
 //! - The CI integration that runs the corpus on every PR — filed
 //!   as a follow-on bead because the corpus must exist first.
-//! - The actual `ntm` subprocess invoker (mocked for now via the
-//!   [`NtmInvoker`] trait so the harness compiles + tests pass
-//!   without a real `ntm` binary on the build machine).
+//! - Family-specific command mappings for every `ntm` surface.
 //!
 //! # Why a trait-shaped invoker
 //!
 //! `ntm` is an external CLI; on a developer machine without `ntm`
 //! installed, the harness must still compile and run its
 //! self-tests. The [`NtmInvoker`] trait abstracts the subprocess:
-//! the production implementation shells out to `ntm <subcommand>
-//! --json <request>`; tests use a [`MockNtmInvoker`] that returns
-//! pre-canned responses keyed by `(family, action, request_hash)`.
+//! [`NtmSubprocessInvoker`] shells out through explicit per-action
+//! command mappings; tests can use [`MockNtmInvoker`] or other
+//! mirror invokers when they are proving only native-handler
+//! conformance rather than live `ntm` parity.
 //!
 //! # Cross-references
 //!
@@ -66,6 +67,11 @@
 
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Replacement token written in place of a normalized field's
 /// original value. Constant per-category so harness output stays
@@ -449,6 +455,262 @@ pub trait NtmInvoker {
     fn invoke(&self, family: &str, action: &str, request: &Value) -> Result<Value, String>;
 }
 
+/// How a subprocess command receives the robot-family request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtmRequestEncoding {
+    /// Do not pass the request to the subprocess. Use only for commands whose
+    /// request is fully represented by static command-line arguments.
+    Omit,
+    /// Append the serialized request JSON as the final command-line argument.
+    JsonArg,
+    /// Write the serialized request JSON to stdin.
+    JsonStdin,
+}
+
+/// Command mapping for one `(family, action)` pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtmSubprocessCommand {
+    args: Vec<String>,
+    request_encoding: NtmRequestEncoding,
+}
+
+impl NtmSubprocessCommand {
+    /// Invoke the command with no serialized request payload.
+    #[must_use]
+    pub fn no_request<I, S>(args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(args, NtmRequestEncoding::Omit)
+    }
+
+    /// Invoke the command with the request JSON appended as the final argument.
+    #[must_use]
+    pub fn json_arg<I, S>(args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(args, NtmRequestEncoding::JsonArg)
+    }
+
+    /// Invoke the command with the request JSON written to stdin.
+    #[must_use]
+    pub fn json_stdin<I, S>(args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(args, NtmRequestEncoding::JsonStdin)
+    }
+
+    fn new<I, S>(args: I, request_encoding: NtmRequestEncoding) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            args: args.into_iter().map(Into::into).collect(),
+            request_encoding,
+        }
+    }
+}
+
+/// Real subprocess-backed invoker for differential evidence.
+///
+/// The invoker is intentionally explicit about command mappings: different
+/// `ntm` families expose different CLIs, and a mirror test must not silently
+/// graduate into "real ntm parity" just because a binary happens to exist.
+pub struct NtmSubprocessInvoker {
+    binary: PathBuf,
+    timeout: Duration,
+    commands: BTreeMap<(String, String), NtmSubprocessCommand>,
+}
+
+impl NtmSubprocessInvoker {
+    /// Default timeout for one `ntm` subprocess invocation.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Construct an invoker for a concrete binary path or PATH-resolved name.
+    #[must_use]
+    pub fn new(binary: impl Into<PathBuf>) -> Self {
+        Self {
+            binary: binary.into(),
+            timeout: Self::DEFAULT_TIMEOUT,
+            commands: BTreeMap::new(),
+        }
+    }
+
+    /// Construct an invoker for the default `ntm` binary.
+    #[must_use]
+    pub fn ntm() -> Self {
+        Self::new("ntm")
+    }
+
+    /// Override the per-invocation timeout.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Register a command mapping for one robot family action.
+    #[must_use]
+    pub fn with_command(
+        mut self,
+        family: impl Into<String>,
+        action: impl Into<String>,
+        command: NtmSubprocessCommand,
+    ) -> Self {
+        self.commands
+            .insert((family.into(), action.into()), command);
+        self
+    }
+}
+
+impl NtmInvoker for NtmSubprocessInvoker {
+    fn invoke(&self, family: &str, action: &str, request: &Value) -> Result<Value, String> {
+        let command = self
+            .commands
+            .get(&(family.to_string(), action.to_string()))
+            .ok_or_else(|| format!("no ntm subprocess command registered for {family}.{action}"))?;
+
+        run_ntm_subprocess(&self.binary, command, request, self.timeout, family, action)
+    }
+}
+
+fn run_ntm_subprocess(
+    binary: &Path,
+    command: &NtmSubprocessCommand,
+    request: &Value,
+    timeout: Duration,
+    family: &str,
+    action: &str,
+) -> Result<Value, String> {
+    let mut process = Command::new(binary);
+    process.args(&command.args);
+    if command.request_encoding == NtmRequestEncoding::JsonArg {
+        process.arg(request.to_string());
+    }
+
+    let mut child = process
+        .stdin(match command.request_encoding {
+            NtmRequestEncoding::JsonStdin => Stdio::piped(),
+            NtmRequestEncoding::Omit | NtmRequestEncoding::JsonArg => Stdio::null(),
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "failed to spawn ntm subprocess for {family}.{action} ({}): {err}",
+                describe_ntm_command(binary, &command.args)
+            )
+        })?;
+
+    if command.request_encoding == NtmRequestEncoding::JsonStdin {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("ntm subprocess stdin unavailable for {family}.{action}"))?;
+        if let Err(err) = stdin.write_all(request.to_string().as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "failed to write request JSON to ntm subprocess for {family}.{action}: {err}"
+            ));
+        }
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("ntm subprocess stdout unavailable for {family}.{action}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("ntm subprocess stderr unavailable for {family}.{action}"))?;
+    let stdout_reader = thread::spawn(move || read_stream(stdout));
+    let stderr_reader = thread::spawn(move || read_stream(stderr));
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = join_reader(stdout_reader, "stdout")?;
+                let stderr = join_reader(stderr_reader, "stderr")?;
+                if !status.success() {
+                    return Err(format!(
+                        "ntm subprocess for {family}.{action} exited with {status}: {}",
+                        trim_bytes_for_error(&stderr)
+                    ));
+                }
+                return serde_json::from_slice(&stdout).map_err(|err| {
+                    format!(
+                        "ntm subprocess for {family}.{action} returned invalid JSON: {err}; stdout={}",
+                        trim_bytes_for_error(&stdout)
+                    )
+                });
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_reader(stdout_reader, "stdout");
+                let _ = join_reader(stderr_reader, "stderr");
+                return Err(format!(
+                    "ntm subprocess for {family}.{action} timed out after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "failed while waiting for ntm subprocess for {family}.{action}: {err}"
+                ));
+            }
+        }
+    }
+}
+
+fn read_stream(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_reader(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>, String> {
+    handle
+        .join()
+        .map_err(|_| format!("ntm subprocess {stream_name} reader panicked"))?
+        .map_err(|err| format!("failed to read ntm subprocess {stream_name}: {err}"))
+}
+
+fn trim_bytes_for_error(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.len() > 512 {
+        let mut end = 512;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &trimmed[..end])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn describe_ntm_command(binary: &Path, args: &[String]) -> String {
+    let mut parts = vec![binary.display().to_string()];
+    parts.extend(args.iter().cloned());
+    parts.join(" ")
+}
+
 /// In-memory mock NTM invoker for testing. Indexed by
 /// `(family, action)`; the harness asserts on whatever response
 /// the test pre-loaded.
@@ -636,6 +898,10 @@ fn first_divergence(a: &Value, b: &Value, pointer: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn normalize_trivial_drift_rewrites_timestamp_keys() {
@@ -747,5 +1013,143 @@ mod tests {
             .invoke("checkpoint", "save", &json!({}))
             .unwrap_err();
         assert!(err.contains("no response registered"));
+    }
+
+    #[cfg(unix)]
+    fn fake_ntm(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ntm-fake");
+        fs::write(&path, contents).expect("write fake ntm");
+        let mut perms = fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod fake ntm");
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_invoker_returns_successful_json_response() {
+        let (_dir, binary) = fake_ntm(
+            r#"#!/bin/sh
+if [ "$1" != "profile" ] || [ "$2" != "show" ] || [ "$3" != "--json" ]; then
+  echo "unexpected args: $*" >&2
+  exit 64
+fi
+cat >/dev/null
+printf '{"ok":true,"data":{"name":"default","timestamp":123}}'
+"#,
+        );
+        let invoker = NtmSubprocessInvoker::new(binary).with_command(
+            "profile",
+            "show",
+            NtmSubprocessCommand::json_stdin(["profile", "show", "--json"]),
+        );
+
+        let response = invoker
+            .invoke("profile", "show", &json!({"name": "default"}))
+            .expect("subprocess response");
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["data"]["name"], json!("default"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_invoker_reports_missing_binary() {
+        let invoker = NtmSubprocessInvoker::new("/definitely/not/ntm").with_command(
+            "profile",
+            "list",
+            NtmSubprocessCommand::no_request(["profiles", "list", "--json"]),
+        );
+
+        let err = invoker
+            .invoke("profile", "list", &json!({}))
+            .expect_err("missing binary should fail");
+
+        assert!(err.contains("failed to spawn"), "{err}");
+        assert!(err.contains("profile.list"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_invoker_reports_nonzero_exit_with_stderr() {
+        let (_dir, binary) = fake_ntm(
+            r#"#!/bin/sh
+echo "profile not found" >&2
+exit 7
+"#,
+        );
+        let invoker = NtmSubprocessInvoker::new(binary).with_command(
+            "profile",
+            "show",
+            NtmSubprocessCommand::json_arg(["profiles", "show", "--json"]),
+        );
+
+        let err = invoker
+            .invoke("profile", "show", &json!({"name": "missing"}))
+            .expect_err("nonzero exit should fail");
+
+        assert!(err.contains("profile.show"), "{err}");
+        assert!(err.contains("profile not found"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_invoker_reports_invalid_json() {
+        let (_dir, binary) = fake_ntm(
+            r#"#!/bin/sh
+printf 'not-json'
+"#,
+        );
+        let invoker = NtmSubprocessInvoker::new(binary).with_command(
+            "profile",
+            "list",
+            NtmSubprocessCommand::no_request(["profiles", "list", "--json"]),
+        );
+
+        let err = invoker
+            .invoke("profile", "list", &json!({}))
+            .expect_err("invalid json should fail");
+
+        assert!(err.contains("invalid JSON"), "{err}");
+        assert!(err.contains("not-json"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_invoker_times_out() {
+        let (_dir, binary) = fake_ntm(
+            r#"#!/bin/sh
+sleep 2
+printf '{"ok":true}'
+"#,
+        );
+        let invoker = NtmSubprocessInvoker::new(binary)
+            .with_timeout(Duration::from_millis(20))
+            .with_command(
+                "profile",
+                "list",
+                NtmSubprocessCommand::no_request(["profiles", "list", "--json"]),
+            );
+
+        let err = invoker
+            .invoke("profile", "list", &json!({}))
+            .expect_err("timeout should fail");
+
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("profile.list"), "{err}");
+    }
+
+    #[test]
+    fn subprocess_invoker_requires_explicit_action_mapping() {
+        let invoker = NtmSubprocessInvoker::ntm();
+        let err = invoker
+            .invoke("profile", "list", &json!({}))
+            .expect_err("missing mapping should fail");
+
+        assert!(
+            err.contains("no ntm subprocess command registered"),
+            "{err}"
+        );
     }
 }

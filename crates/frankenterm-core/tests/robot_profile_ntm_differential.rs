@@ -184,7 +184,7 @@ fn required_default_params(action: &ActionContract) -> Value {
 }
 
 #[test]
-fn profile_family_differential_matches_ntm_mirror_for_1000_contract_requests() {
+fn profile_family_mirror_conformance_matches_native_handler_for_1000_contract_requests() {
     let contract = profile_family_contract();
     let cases_per_action = PROFILE_DIFFERENTIAL_CASES / contract.actions.len();
     let remainder = PROFILE_DIFFERENTIAL_CASES % contract.actions.len();

@@ -7,7 +7,8 @@
 ## Why this document exists
 
 The bridge plan requires that every robot family with an `ntm`
-equivalent shows zero observable divergence on a fuzz corpus.
+equivalent eventually shows zero observable divergence against a real
+`ntm` subprocess on a fuzz corpus.
 "Zero divergence" is meaningless without specifying *what is
 observable* — timestamps, process IDs, ephemeral file paths, and
 log line ordering all naturally diverge between two independent
@@ -17,9 +18,22 @@ assertion fires, and the categories of difference it must NEVER
 normalize away (those are real bugs).
 
 The harness in `robot_ntm_differential.rs` consumes this list
-mechanically: each rule is a `(json_pointer_pattern, replacement)`
-pair the harness applies to both responses before equality
-comparison.
+mechanically: each rule is a `(field_name, replacement)` pair the
+harness applies to both responses before equality comparison. The
+matching is by JSON object key at any depth, not by exact JSON pointer.
+
+## Evidence classes
+
+The differential substrate now has two explicit evidence classes:
+
+| Class | Invoker | What it proves |
+| --- | --- | --- |
+| Mirror conformance | `MockNtmInvoker` or a family-specific mirror invoker | The native handler and the generated corpus agree with a deterministic in-process model. This is useful substrate coverage, but it is not live `ntm` subprocess parity. |
+| Real subprocess differential | `NtmSubprocessInvoker` with an explicit `(family, action)` command mapping | The native handler and a real `ntm` command both ran and their normalized JSON outputs matched, or the run produced a structured subprocess error/skip reason. |
+
+Closeout language must name which class ran. A mirror-only corpus must
+not be described as "zero divergence against ntm" unless a real
+subprocess lane also ran for that family.
 
 ## Layered structure
 
@@ -104,7 +118,7 @@ The contract's `concurrency` field drives this:
 
 1. Discover a new trivial- or operational-drift field via a
    harness failure. (The error message points at the JSON pointer
-   that diverged.)
+   where the first unmatched value diverged.)
 2. Decide whether the field belongs on Layer 1 or Layer 2 by
    asking: "Could two correct implementations of the same protocol
    ever produce different values here?" If yes → Layer 1; if only
