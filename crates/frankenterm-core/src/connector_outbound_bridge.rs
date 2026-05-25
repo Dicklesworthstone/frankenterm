@@ -1031,15 +1031,22 @@ impl ConnectorOutboundBridge {
     ) -> Result<OutboundDispatchResult, OutboundBridgeError> {
         self.telemetry.events_received = self.telemetry.events_received.saturating_add(1);
 
-        // Generate or use existing correlation ID
-        let correlation_id = event.correlation_id.clone().unwrap_or_else(|| {
-            format!(
-                "out-{}-{}-{}",
-                event.source.as_str(),
-                event.timestamp_ms,
-                event.pane_id.unwrap_or(0)
-            )
-        });
+        // Generate or use an explicit non-blank correlation ID.
+        let explicit_correlation_id = event
+            .correlation_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty());
+        let correlation_id = explicit_correlation_id.map_or_else(
+            || {
+                format!(
+                    "out-{}-{}-{}",
+                    event.source.as_str(),
+                    event.timestamp_ms,
+                    event.pane_id.unwrap_or(0)
+                )
+            },
+            str::to_string,
+        );
 
         // 1. Deduplication
         //
@@ -1060,7 +1067,7 @@ impl ConnectorOutboundBridge {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default(),
         );
-        if event.correlation_id.is_some()
+        if explicit_correlation_id.is_some()
             && !self
                 .deduplicator
                 .check_and_record(&correlation_id, dedup_now_ms)
@@ -1894,8 +1901,17 @@ mod tests {
         assert!(!r2.deduplicated);
         assert_eq!(r1.actions_dispatched.len(), 1);
         assert_eq!(r2.actions_dispatched.len(), 1);
+        assert_eq!(r1.correlation_id, "out-custom-1000-0");
+        assert_eq!(r2.correlation_id, "out-custom-1000-0");
+        assert_eq!(r1.actions_dispatched[0].correlation_id, r1.correlation_id);
+        assert_eq!(r2.actions_dispatched[0].correlation_id, r2.correlation_id);
         assert_eq!(bridge.telemetry().events_deduplicated, 0);
         assert_eq!(bridge.pending_action_count(), 2);
+
+        let actions = bridge.drain_actions();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].correlation_id, "out-custom-1000-0");
+        assert_eq!(actions[1].correlation_id, "out-custom-1000-0");
     }
 
     #[test]
