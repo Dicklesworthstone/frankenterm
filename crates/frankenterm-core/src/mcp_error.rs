@@ -12,6 +12,7 @@ pub(crate) const MCP_ERR_POLICY: &str = "FT-MCP-0006";
 pub(crate) const MCP_ERR_PANE_NOT_FOUND: &str = "FT-MCP-0007";
 pub(crate) const MCP_ERR_WORKFLOW: &str = "FT-MCP-0008";
 pub(crate) const MCP_ERR_TIMEOUT: &str = "FT-MCP-0009";
+pub(crate) const MCP_ERR_NOT_IMPLEMENTED: &str = "FT-MCP-0010";
 pub(crate) const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0011";
 pub(crate) const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0013";
@@ -74,6 +75,7 @@ fn redacted_mcp_error_message(error: &Error, code: &'static str) -> String {
         (MCP_ERR_STORAGE, _) => "Storage unavailable".to_string(),
         (MCP_ERR_INTERNAL, _) => "Internal error".to_string(),
         (MCP_ERR_CONFIG, _) => "Configuration unavailable".to_string(),
+        (MCP_ERR_NOT_IMPLEMENTED, _) => "MCP surface unavailable".to_string(),
         _ => error.to_string(),
     }
 }
@@ -139,6 +141,16 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
         Error::Storage(_) => (MCP_ERR_STORAGE, None),
         Error::Workflow(_) => (MCP_ERR_WORKFLOW, None),
         Error::Policy(_) => (MCP_ERR_POLICY, None),
+        Error::RuntimeOperation {
+            operation: "mcp_bridge.build_server_with_db",
+            ..
+        } => (
+            MCP_ERR_NOT_IMPLEMENTED,
+            Some(
+                "Supply a database path or call build_server_degraded(config) to opt into the stripped no-db catalog."
+                    .to_string(),
+            ),
+        ),
         _ => (MCP_ERR_INTERNAL, None),
     }
 }
@@ -147,7 +159,7 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
 mod tests {
     use super::{
         MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INTERNAL,
-        MCP_ERR_INVALID_ARGS, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
+        MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
         MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE,
         MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
         map_caut_error, map_mcp_error,
@@ -172,6 +184,7 @@ mod tests {
             MCP_ERR_PANE_NOT_FOUND,
             MCP_ERR_WORKFLOW,
             MCP_ERR_TIMEOUT,
+            MCP_ERR_NOT_IMPLEMENTED,
             MCP_ERR_FTS_QUERY,
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
@@ -196,10 +209,12 @@ mod tests {
             MCP_ERR_PANE_NOT_FOUND,
             MCP_ERR_WORKFLOW,
             MCP_ERR_TIMEOUT,
+            MCP_ERR_NOT_IMPLEMENTED,
             MCP_ERR_FTS_QUERY,
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
+            MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
             MCP_ERR_INTERNAL,
         ];
         for code in codes {
@@ -221,6 +236,7 @@ mod tests {
             (MCP_ERR_PANE_NOT_FOUND, "FT-MCP-0007"),
             (MCP_ERR_WORKFLOW, "FT-MCP-0008"),
             (MCP_ERR_TIMEOUT, "FT-MCP-0009"),
+            (MCP_ERR_NOT_IMPLEMENTED, "FT-MCP-0010"),
             (MCP_ERR_FTS_QUERY, "FT-MCP-0011"),
             (MCP_ERR_RESERVATION_CONFLICT, "FT-MCP-0012"),
             (MCP_ERR_CAUT, "FT-MCP-0013"),
@@ -300,6 +316,21 @@ mod tests {
         assert_eq!(io_err.code, MCP_ERR_INTERNAL);
         assert_eq!(io_err.message, "Internal error");
         assert!(!io_err.message.contains("id_rsa"));
+    }
+
+    #[test]
+    fn mcp_tool_error_from_strict_no_db_bridge_error_uses_public_message() {
+        let err = Error::runtime_backend(
+            "mcp_bridge.build_server_with_db",
+            "build_server_with_db called with db_path=None and skipped wa.secret_tool",
+        );
+        let mcp_err = McpToolError::from_error(err);
+
+        assert_eq!(mcp_err.code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(mcp_err.message, "MCP surface unavailable");
+        assert!(!mcp_err.message.contains("db_path=None"));
+        assert!(!mcp_err.message.contains("wa.secret_tool"));
+        assert!(mcp_err.hint.unwrap().contains("build_server_degraded"));
     }
 
     // ========================================================================
@@ -386,6 +417,18 @@ mod tests {
         let err = Error::runtime_backend("mcp test runtime", "unexpected");
         let (code, _) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_INTERNAL);
+    }
+
+    #[test]
+    fn map_strict_no_db_bridge_error_is_not_implemented() {
+        let err = Error::runtime_backend(
+            "mcp_bridge.build_server_with_db",
+            "build_server_with_db called with db_path=None",
+        );
+        let (code, hint) = map_mcp_error(&err);
+
+        assert_eq!(code, MCP_ERR_NOT_IMPLEMENTED);
+        assert!(hint.unwrap().contains("build_server_degraded"));
     }
 
     // ========================================================================
