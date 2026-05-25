@@ -42,10 +42,9 @@ use crate::config::{Config, PaneFilterConfig};
 use crate::error::WeztermError;
 use crate::ingest::Osc133State;
 use crate::mcp_error::{
-    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY,
-    MCP_ERR_INVALID_ARGS, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
-    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError,
-    map_cass_error, map_caut_error, map_mcp_error,
+    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
+    MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
+    MCP_ERR_WORKFLOW, McpToolError, map_cass_error, map_caut_error, map_mcp_error,
 };
 #[cfg(test)]
 use crate::mcp_error::{MCP_ERR_INTERNAL, MCP_ERR_RESERVATION_CONFLICT};
@@ -2820,12 +2819,30 @@ mod tests {
     }
 
     #[test]
-    fn encode_mcp_contents_toon_invalid_json_returns_err() {
+    fn encode_mcp_contents_toon_invalid_json_returns_error_envelope() {
         let contents = vec![Content::Text {
-            text: "not valid json {[}".to_string(),
+            text: "not valid json {[} sk-ant-api03-stale-mcp-test-secret".to_string(),
         }];
         let result = encode_mcp_contents(contents, McpOutputFormat::Toon);
-        assert!(result.is_err());
+        let contents = result.expect("malformed tool output should return an FT-MCP envelope");
+        assert_eq!(contents.len(), 1);
+        match &contents[0] {
+            Content::Text { text } => {
+                let v: serde_json::Value =
+                    serde_json::from_str(text).expect("transcode failure envelope is JSON");
+                assert_eq!(v["ok"].as_bool(), Some(false));
+                assert_eq!(v["error_code"], MCP_ERR_INTERNAL);
+                assert_eq!(
+                    v["error"].as_str(),
+                    Some("Unable to transcode MCP payload to TOON")
+                );
+                assert!(
+                    !v.to_string().contains("sk-ant-api03-"),
+                    "malformed MCP tool output leaked through transcode failure envelope"
+                );
+            }
+            _ => panic!("expected text content"), // ubs:ignore
+        }
     }
 
     // ── envelope_to_content tests ────────────────────────────────────────
