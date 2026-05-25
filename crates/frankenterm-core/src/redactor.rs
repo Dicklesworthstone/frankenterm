@@ -1370,6 +1370,97 @@ mod tests {
     }
 
     #[test]
+    fn streaming_redactor_catches_keyed_secrets_fed_one_byte_per_chunk() {
+        // N-chunk coverage. Every other streaming-split test feeds a secret in
+        // exactly two chunks (`[..split]` + `[split..]`). Feeding one byte per
+        // `redact_chunk` call drives the pending-buffer accumulation and
+        // tail-overlap carry across MANY calls — the extreme chunking the
+        // `redactor_no_leak` fuzz target explores but no deterministic test
+        // pinned. The streamed output must equal batch redaction byte-for-byte
+        // and never leak the value. Covers the ft-b1p6x collapsed
+        // no-separator keyed class (key name abutting the value).
+        let value = "deadbeef0123456789abcdef01234567";
+        for key in ["azureopenai_key", "devicecode", "usercode"] {
+            let input = format!("before {key}={value} after");
+            let expected = Redactor::new().redact(&input).into_bytes();
+            assert_ne!(
+                expected,
+                input.as_bytes(),
+                "fixture must actually redact key={key}"
+            );
+
+            let mut streaming = StreamingRedactor::new();
+            let mut out = Vec::new();
+            for byte in input.as_bytes() {
+                out.extend(streaming.redact_chunk(std::slice::from_ref(byte)).bytes);
+            }
+            out.extend(streaming.finish().bytes);
+
+            assert_eq!(
+                out, expected,
+                "key={key}: byte-at-a-time streaming diverged from batch redaction"
+            );
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(
+                !rendered.contains(value),
+                "key={key}: byte-at-a-time streaming leaked {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_metamorphic_streaming_equals_batch_across_boundary() {
+        // Metamorphic relation (testing-metamorphic) for chunk boundaries:
+        //   batch:     redact(x + y)            — catches a boundary-spanning secret
+        //   piecewise: redact(x) + redact(y)    — LEAKS (neither half holds the
+        //                                          whole secret)
+        //   streaming: StreamingRedactor[x, y]  — MUST equal batch
+        // The streaming redactor is the boundary-correct primitive: at every
+        // split its output must equal batch redaction and never leak the secret.
+        // We also assert the naive piecewise relation DOES leak at some split,
+        // so the fixture is guaranteed to exercise a genuine cross-boundary
+        // secret (and the test fails loudly if streaming is ever "simplified"
+        // into the piecewise form).
+        let secret = "AKIAIOSFODNN7EXAMPLE"; // AWS access key id (single token)
+        let whole = format!("env AWS_ACCESS_KEY_ID={secret} done");
+        let batch = Redactor::new();
+        let expected = batch.redact(&whole);
+        assert!(!expected.contains(secret), "batch redaction must scrub the secret");
+
+        let mut any_piecewise_leak = false;
+        for split in 1..whole.len() {
+            let x = &whole[..split];
+            let y = &whole[split..];
+
+            let mut streaming = StreamingRedactor::new();
+            let mut out = Vec::new();
+            out.extend(streaming.redact_chunk(x.as_bytes()).bytes);
+            out.extend(streaming.redact_chunk(y.as_bytes()).bytes);
+            out.extend(streaming.finish().bytes);
+            let streamed = String::from_utf8(out).expect("utf8 stream output");
+
+            assert_eq!(
+                streamed, expected,
+                "streaming diverged from batch at split={split}"
+            );
+            assert!(
+                !streamed.contains(secret),
+                "streaming leaked the secret at split={split}: {streamed:?}"
+            );
+
+            let piecewise = format!("{}{}", batch.redact(x), batch.redact(y));
+            if piecewise.contains(secret) {
+                any_piecewise_leak = true;
+            }
+        }
+        assert!(
+            any_piecewise_leak,
+            "fixture no longer exercises a cross-boundary secret: naive piecewise \
+             redaction never leaked at any split"
+        );
+    }
+
+    #[test]
     fn streaming_redactor_never_leaks_any_corpus_positive_across_splits() {
         // Class guard (ft-b1p6x). The per-sample streaming-split tests above each
         // pin one secret. STREAMING_SECRET_ANCHORS is a hand-maintained list, so a
