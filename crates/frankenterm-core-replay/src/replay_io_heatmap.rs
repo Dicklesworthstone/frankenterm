@@ -538,12 +538,11 @@ fn estimate_freshness_lag_ms(
         StorageAdmissionAction::RunNow => 0,
         StorageAdmissionAction::Throttle => {
             ceil_div(workload.write_bytes_per_sec, policy.hot_write_bytes_per_sec)
-                * policy.write_lag_ms_per_hot_multiple
+                .saturating_mul(policy.write_lag_ms_per_hot_multiple)
         }
         StorageAdmissionAction::Shard => policy.search_burst_lag_ms,
-        StorageAdmissionAction::Defer => {
-            ceil_div(workload.compaction_debt_bytes, GIB) * policy.compaction_lag_ms_per_gib
-        }
+        StorageAdmissionAction::Defer => ceil_div(workload.compaction_debt_bytes, GIB)
+            .saturating_mul(policy.compaction_lag_ms_per_gib),
         StorageAdmissionAction::MarkCoverageDegraded => workload
             .pending_index_segments
             .saturating_mul(policy.freshness_lag_ms_per_index_segment)
@@ -557,6 +556,8 @@ fn estimate_freshness_lag_ms(
 fn ceil_div(value: u64, divisor: u64) -> u64 {
     if value == 0 {
         0
+    } else if divisor == 0 {
+        u64::MAX
     } else {
         1 + (value - 1) / divisor
     }
@@ -761,6 +762,59 @@ mod tests {
             cell.reasons
                 .contains(&"recovery_after_pressure_drops".to_string())
         );
+    }
+
+    #[test]
+    fn heatmap_zero_write_threshold_does_not_panic() {
+        let policy = StorageIndexHeatPolicy {
+            hot_write_bytes_per_sec: 0,
+            write_lag_ms_per_hot_multiple: 2,
+            ..StorageIndexHeatPolicy::default()
+        };
+        let workloads = vec![StorageIndexWorkloadInput {
+            workload_id: "zero-threshold".to_string(),
+            workload_class: "write_heavy_capture".to_string(),
+            pane_count: 1,
+            write_bytes_per_sec: 1,
+            pending_index_segments: 0,
+            compaction_debt_bytes: 0,
+            replay_artifact_read_bytes_per_sec: 0,
+            search_queries_per_sec: 0,
+            pressure_drop_observed: false,
+            previous_action: None,
+            capture_tier_summary: capture_summary(1, 1, 0, 0, 0),
+        }];
+
+        let report = evaluate_storage_index_heatmap(&policy, &workloads);
+        let cell = cell(&report, "zero-threshold");
+        assert_eq!(cell.admission_action, StorageAdmissionAction::Throttle);
+        assert_eq!(cell.estimated_freshness_lag_ms, u64::MAX);
+    }
+
+    #[test]
+    fn heatmap_compaction_lag_estimate_saturates() {
+        let policy = StorageIndexHeatPolicy {
+            compaction_lag_ms_per_gib: u64::MAX,
+            ..StorageIndexHeatPolicy::default()
+        };
+        let workloads = vec![StorageIndexWorkloadInput {
+            workload_id: "huge-compaction".to_string(),
+            workload_class: "compaction_backlog".to_string(),
+            pane_count: 1,
+            write_bytes_per_sec: 0,
+            pending_index_segments: 0,
+            compaction_debt_bytes: 2 * GIB,
+            replay_artifact_read_bytes_per_sec: 0,
+            search_queries_per_sec: 0,
+            pressure_drop_observed: false,
+            previous_action: None,
+            capture_tier_summary: capture_summary(1, 1, 0, 0, 0),
+        }];
+
+        let report = evaluate_storage_index_heatmap(&policy, &workloads);
+        let cell = cell(&report, "huge-compaction");
+        assert_eq!(cell.admission_action, StorageAdmissionAction::Defer);
+        assert_eq!(cell.estimated_freshness_lag_ms, u64::MAX);
     }
 
     #[test]
