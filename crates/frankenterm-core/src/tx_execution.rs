@@ -17,8 +17,8 @@
 //! every transition emits observability events with reason codes.
 
 use crate::plan::{
-    MissionKillSwitchLevel, MissionTxContract, MissionTxState, TxCommitOutcome, TxCommitReport,
-    TxCommitStepInput, TxCompensationReport, TxCompensationStepInput, TxOutcome,
+    MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction, TxCommitOutcome,
+    TxCommitReport, TxCommitStepInput, TxCompensationReport, TxCompensationStepInput, TxOutcome,
     TxPrepareApprovalChecker, TxPrepareEvaluationContext, TxPrepareGateInput, TxPrepareOutcome,
     TxPreparePolicyAuthorizer, TxPrepareReport, TxPrepareTargetLookup, evaluate_prepare_phase,
     execute_commit_phase, execute_compensation_phase,
@@ -31,6 +31,7 @@ use crate::tx_observability::{
     TxEventKind, TxForensicBundle, TxObservabilityConfig, TxObservabilityEvent,
     TxObservabilityPhase,
 };
+use crate::tx_plan_compiler::StepRisk;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -1358,7 +1359,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 .append(
                     idem_key,
                     outcome,
-                    crate::tx_plan_compiler::StepRisk::Low,
+                    contract_step_risk(contract, step_result.step_id.0.as_str()),
                     &format!("agent-{}", step_result.step_id.0),
                     now_ms as u64,
                 )
@@ -1437,12 +1438,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
                 ledger
                     .append(
-                    idem_key,
-                    outcome,
-                    crate::tx_plan_compiler::StepRisk::Low,
-                    &format!("agent-{step_id}"),
-                    now_ms as u64,
-                )
+                        idem_key,
+                        outcome,
+                        compensation_step_risk(contract, step_id),
+                        &format!("agent-{step_id}"),
+                        now_ms as u64,
+                    )
                     .map_err(|err| {
                         TxExecutionError::LedgerWrite(format!(
                             "failed to record compensation step {step_id} in idempotency ledger: {err}"
@@ -1692,7 +1693,7 @@ fn compiled_plan_from_contract(contract: &MissionTxContract) -> crate::tx_plan_c
                 depends_on: Vec::new(),
                 preconditions: Vec::new(),
                 compensations,
-                risk: crate::tx_plan_compiler::StepRisk::Low,
+                risk: contract_step_risk(contract, step.step_id.0.as_str()),
                 score: 1.0,
             }
         })
@@ -1704,6 +1705,31 @@ fn compiled_plan_from_contract(contract: &MissionTxContract) -> crate::tx_plan_c
         vec![execution_order.clone()]
     };
 
+    let high_risk_count = steps
+        .iter()
+        .filter(|step| step.risk == StepRisk::High)
+        .count();
+    let critical_risk_count = steps
+        .iter()
+        .filter(|step| step.risk == StepRisk::Critical)
+        .count();
+    let uncompensated_steps = steps
+        .iter()
+        .filter(|step| {
+            matches!(step.risk, StepRisk::High | StepRisk::Critical)
+                && step.compensations.is_empty()
+        })
+        .count();
+    let overall_risk = if critical_risk_count > 0 {
+        StepRisk::Critical
+    } else if high_risk_count > 0 {
+        StepRisk::High
+    } else if steps.iter().any(|step| step.risk == StepRisk::Medium) {
+        StepRisk::Medium
+    } else {
+        StepRisk::Low
+    };
+
     crate::tx_plan_compiler::TxPlan {
         plan_id: contract.plan.plan_id.0.clone(),
         plan_hash: 0,
@@ -1712,14 +1738,50 @@ fn compiled_plan_from_contract(contract: &MissionTxContract) -> crate::tx_plan_c
         parallel_levels,
         risk_summary: crate::tx_plan_compiler::TxRiskSummary {
             total_steps: contract.plan.steps.len(),
-            high_risk_count: 0,
-            critical_risk_count: 0,
-            uncompensated_steps: 0,
-            overall_risk: crate::tx_plan_compiler::StepRisk::Low,
+            high_risk_count,
+            critical_risk_count,
+            uncompensated_steps,
+            overall_risk,
         },
         rejected_edges: Vec::new(),
         rejected_assignments: Vec::new(),
     }
+}
+
+fn action_execution_risk(action: &StepAction) -> StepRisk {
+    match action {
+        StepAction::WaitFor { .. } | StepAction::MarkEventHandled { .. } => StepRisk::Low,
+        StepAction::AcquireLock { .. }
+        | StepAction::ReleaseLock { .. }
+        | StepAction::StoreData { .. } => StepRisk::Medium,
+        StepAction::SendText { .. }
+        | StepAction::RunWorkflow { .. }
+        | StepAction::ValidateApproval { .. }
+        | StepAction::NestedPlan { .. }
+        | StepAction::Custom { .. } => StepRisk::High,
+    }
+}
+
+fn contract_step_risk(contract: &MissionTxContract, step_id: &str) -> StepRisk {
+    contract
+        .plan
+        .steps
+        .iter()
+        .find(|step| step.step_id.0 == step_id)
+        .map(|step| action_execution_risk(&step.action))
+        .unwrap_or(StepRisk::High)
+}
+
+fn compensation_step_risk(contract: &MissionTxContract, step_id: &str) -> StepRisk {
+    let original_risk = contract_step_risk(contract, step_id);
+    let compensation_risk = contract
+        .plan
+        .compensations
+        .iter()
+        .find(|compensation| compensation.for_step_id.0 == step_id)
+        .map(|compensation| action_execution_risk(&compensation.action))
+        .unwrap_or(StepRisk::High);
+    original_risk.max(compensation_risk)
 }
 
 fn resume_terminal_outcome(
@@ -2250,6 +2312,47 @@ mod tests {
                 .all(|event| event.kind != TxEventKind::BundleExported),
             "disabled bundle production must not emit a bundle export event",
         );
+    }
+
+    #[test]
+    fn execution_ledger_and_bundle_preserve_action_risk() {
+        let mut contract = make_test_contract(3);
+        contract.plan.steps[0].action = StepAction::MarkEventHandled { event_id: 42 };
+        contract.plan.steps[1].action = StepAction::StoreData {
+            key: "mission-metadata".to_string(),
+            value: serde_json::json!({"status": "prepared"}),
+        };
+
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        let ledger_risks = result
+            .ledger
+            .records()
+            .iter()
+            .map(|record| record.risk)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ledger_risks,
+            vec![StepRisk::Low, StepRisk::Medium, StepRisk::High],
+            "tx execution must not flatten all ledger records to low risk"
+        );
+
+        let bundle = result
+            .forensic_bundle
+            .as_ref()
+            .expect("default execution exports forensic bundle");
+        assert_eq!(
+            bundle.plan.step_risks,
+            vec![
+                ("step-0".to_string(), StepRisk::Low),
+                ("step-1".to_string(), StepRisk::Medium),
+                ("step-2".to_string(), StepRisk::High),
+            ]
+        );
+        assert_eq!(bundle.plan.high_risk_count, 1);
+        assert_eq!(bundle.plan.critical_risk_count, 0);
+        assert_eq!(bundle.plan.overall_risk, StepRisk::High);
     }
 
     #[test]
