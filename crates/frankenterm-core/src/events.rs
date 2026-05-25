@@ -2371,6 +2371,80 @@ impl NotificationGate {
 mod tests {
     use super::*;
 
+    /// Structure-aware fuzz / property coverage for the untrusted user-var
+    /// payload decoder (OSC 1337 base64 → UTF-8 → JSON). Crash-discovery
+    /// oriented: the decoder must never panic, lenient mode must be total over
+    /// arbitrary input, and the parsed fields must satisfy their invariants.
+    /// Lives inline because `base64` is a normal (non-dev) dependency, so the
+    /// project's `tests/*_fuzz.rs` integration convention can't reach it here.
+    mod decode_fuzz {
+        use crate::events::UserVarPayload;
+        use base64::Engine;
+        use proptest::prelude::*;
+
+        fn b64(bytes: &[u8]) -> String {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+
+        proptest! {
+            /// Arbitrary input never panics; lenient decode is total; the raw
+            /// value is echoed verbatim; `event_type` implies `event_data`.
+            #[test]
+            fn decode_arbitrary_string_is_total_in_lenient_mode(raw in ".*") {
+                let lenient = UserVarPayload::decode(&raw, true)
+                    .expect("lenient decode must be total over any input");
+                prop_assert_eq!(&lenient.value, &raw);
+                if lenient.event_type.is_some() {
+                    prop_assert!(
+                        lenient.event_data.is_some(),
+                        "event_type present implies event_data present"
+                    );
+                }
+                // Strict mode must also never panic (Ok or Err both acceptable).
+                let _ = UserVarPayload::decode(&raw, false);
+            }
+
+            /// Valid base64 of arbitrary bytes never panics the decoder and is
+            /// total in lenient mode.
+            #[test]
+            fn decode_valid_base64_of_arbitrary_bytes_is_total(
+                bytes in prop::collection::vec(any::<u8>(), 0..256)
+            ) {
+                let encoded = b64(&bytes);
+                let lenient = UserVarPayload::decode(&encoded, true)
+                    .expect("lenient decode must be total");
+                prop_assert_eq!(&lenient.value, &encoded);
+                let _ = UserVarPayload::decode(&encoded, false);
+            }
+
+            /// A valid base64-encoded JSON object exposes its string `type`.
+            #[test]
+            fn decode_extracts_type_from_valid_base64_json(
+                ty in "[a-zA-Z0-9_]{1,24}",
+                n in any::<i64>(),
+            ) {
+                let json = serde_json::json!({ "type": ty, "n": n }).to_string();
+                let encoded = b64(json.as_bytes());
+                let payload = UserVarPayload::decode(&encoded, false)
+                    .expect("valid base64 JSON decodes in strict mode");
+                prop_assert_eq!(payload.event_type.as_deref(), Some(ty.as_str()));
+                prop_assert!(payload.event_data.is_some());
+            }
+
+            /// When strict decode succeeds, lenient decode agrees on the parsed
+            /// fields (strict is a refinement of lenient, not a divergence).
+            #[test]
+            fn strict_success_agrees_with_lenient(raw in ".*") {
+                if let Ok(strict) = UserVarPayload::decode(&raw, false) {
+                    let lenient = UserVarPayload::decode(&raw, true)
+                        .expect("lenient total");
+                    prop_assert_eq!(strict.event_type, lenient.event_type);
+                    prop_assert_eq!(strict.event_data, lenient.event_data);
+                }
+            }
+        }
+    }
+
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
     /// `EventSubscriber::recv_cx` path runs under seed-locked virtual-time
     /// scheduling. We publish a single event into the bus, drain it through
