@@ -177,6 +177,13 @@ pub const MAX_MCP_RULES_TEST_TEXT_BYTES: usize = 256 * 1024;
 /// clients cannot force large string allocations through a tiny selector.
 pub const MAX_MCP_RULES_AGENT_TYPE_BYTES: usize = 64;
 
+/// Hard cap for MCP state agent filters before case-insensitive matching.
+///
+/// `wa.state.agent` is a selector over pane titles and known agent families.
+/// Bound it before normalization/matching so malformed clients cannot force
+/// large allocations or repeated scans through a tiny filter field.
+pub const MAX_MCP_STATE_AGENT_FILTER_BYTES: usize = 256;
+
 // br-ft-rnpuc: clock-anomaly observability for MCP tool audit
 // timestamps. mcp_tools.rs has 11 sites with the pattern
 // `i64::try_from(now_ms()).unwrap_or(0)` — when the u64 → i64
@@ -406,6 +413,30 @@ fn validate_mcp_rules_agent_type_bytes(
         Some(format!(
             "{tool_name} accepts only short agent type selectors: codex, claude_code, gemini, \
              wezterm."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
+
+fn validate_mcp_state_agent_filter_bytes(
+    tool_name: &str,
+    agent: &str,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if agent.len() <= MAX_MCP_STATE_AGENT_FILTER_BYTES {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!(
+            "agent is {} bytes; max allowed is {MAX_MCP_STATE_AGENT_FILTER_BYTES} bytes",
+            agent.len()
+        ),
+        Some(format!(
+            "{tool_name} accepts bounded agent filters only; use known selectors such as codex, \
+             claude_code, or gemini."
         )),
         elapsed_ms(start),
     );
@@ -1654,7 +1685,7 @@ impl ToolHandler for WaStateTool {
                 "type": "object",
                 "properties": {
                     "domain": { "type": "string" },
-                    "agent": { "type": "string" },
+                    "agent": { "type": "string", "maxLength": MAX_MCP_STATE_AGENT_FILTER_BYTES },
                     "pane_id": { "type": "integer", "minimum": 0 }
                 },
                 "additionalProperties": false
@@ -1682,6 +1713,12 @@ impl ToolHandler for WaStateTool {
                 Err(response) => return response,
             }
         };
+
+        if let Some(agent) = params.agent.as_deref() {
+            if let Some(error) = validate_mcp_state_agent_filter_bytes("wa.state", agent, start) {
+                return error;
+            }
+        }
 
         let db_path = self.db_path.as_ref().map(Arc::clone);
 
@@ -7135,23 +7172,23 @@ mod tests {
     use super::{
         ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
         CompatRuntimeBuilder, Config, Content, MAX_MCP_RULES_AGENT_TYPE_BYTES,
-        MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS,
-        MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
-        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool,
-        WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
-        WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-        WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
-        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
-        WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
-        validate_cass_timeout_secs,
+        MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_STATE_AGENT_FILTER_BYTES,
+        MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext,
+        PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
+        WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
+        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
+        WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
+        WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
+        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
+        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
+        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -9568,6 +9605,10 @@ exit 17",
             props.get("pane_id").is_some(),
             "wa.state missing 'pane_id' param"
         );
+        assert_eq!(
+            props["agent"]["maxLength"].as_u64(),
+            Some(MAX_MCP_STATE_AGENT_FILTER_BYTES as u64)
+        );
     }
 
     #[test]
@@ -9632,6 +9673,44 @@ exit 17",
         assert!(
             !envelope.to_string().contains("sk-ant-api03-"),
             "malformed wa.state args leaked the caller-supplied secret"
+        );
+    }
+
+    #[test]
+    fn wa_state_rejects_oversized_agent_filter_without_echoing_value() {
+        let tool = WaStateTool::new(PaneFilterConfig::default(), None);
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let agent = format!(
+            "{secret}{}",
+            "x".repeat(MAX_MCP_STATE_AGENT_FILTER_BYTES + 1)
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "agent": agent,
+                }),
+            )
+            .expect("wa.state oversized-agent call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("max allowed")
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "oversized wa.state agent filter leaked the caller-supplied value"
         );
     }
 
