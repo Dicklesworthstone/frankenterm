@@ -69,7 +69,10 @@ fn replay_watch_channel_closed(operation: &'static str) -> crate::Error {
 ///
 /// Returns the parsed frame and the offset immediately after it.
 fn parse_frame(data: &[u8], offset: usize) -> crate::Result<(RecordingFrame, usize)> {
-    if data.len() < offset + FRAME_HEADER_LEN {
+    let header_end = offset.checked_add(FRAME_HEADER_LEN).ok_or_else(|| {
+        replay_backend_error("replay.parse_frame", "frame header offset overflow")
+    })?;
+    if data.len() < header_end {
         return Err(replay_backend_error(
             "replay.parse_frame",
             "unexpected EOF reading frame header",
@@ -96,8 +99,10 @@ fn parse_frame(data: &[u8], offset: usize) -> crate::Result<(RecordingFrame, usi
         }
     };
 
-    let payload_start = offset + FRAME_HEADER_LEN;
-    let payload_end = payload_start + payload_len;
+    let payload_start = header_end;
+    let payload_end = payload_start.checked_add(payload_len).ok_or_else(|| {
+        replay_backend_error("replay.parse_frame", "frame payload length overflow")
+    })?;
     if data.len() < payload_end {
         return Err(replay_backend_error(
             "replay.parse_frame",
@@ -171,7 +176,11 @@ impl Recording {
         }
 
         let keyframes = build_keyframe_index(&frames);
-        let duration_ms = frames.last().map_or(0, |f| f.header.timestamp_ms);
+        let duration_ms = frames
+            .iter()
+            .map(|frame| frame.header.timestamp_ms)
+            .max()
+            .unwrap_or(0);
 
         Ok(Self {
             frames,
@@ -1446,6 +1455,22 @@ mod tests {
     }
 
     #[test]
+    fn recording_duration_uses_max_timestamp_for_nonmonotonic_input() {
+        let data = build_recording(&[
+            (300, FrameType::Output, b"late".to_vec()),
+            (100, FrameType::Output, b"early".to_vec()),
+        ]);
+
+        let recording = Recording::from_bytes(&data).unwrap();
+
+        assert_eq!(recording.frames.len(), 2);
+        assert_eq!(
+            recording.duration_ms, 300,
+            "duration must describe the full timeline even if a malformed input regresses"
+        );
+    }
+
+    #[test]
     fn parse_empty_recording() {
         let recording = Recording::from_bytes(&[]).unwrap();
         assert!(recording.frames.is_empty());
@@ -1466,6 +1491,16 @@ mod tests {
         data[10..14].copy_from_slice(&100u32.to_le_bytes()); // payload_len = 100
         let result = parse_frame(&data, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_frame_rejects_header_offset_overflow() {
+        let err = parse_frame(&[], usize::MAX - (FRAME_HEADER_LEN / 2))
+            .expect_err("overflowing header offset must fail without panicking");
+        assert!(
+            err.to_string().contains("frame header offset overflow"),
+            "overflowing header offset should be explicit, got: {err}"
+        );
     }
 
     #[test]
