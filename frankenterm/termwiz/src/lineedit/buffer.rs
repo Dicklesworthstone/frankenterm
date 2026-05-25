@@ -177,15 +177,7 @@ impl LineEditBuffer {
                 position
             }
             Movement::StartOfLine => 0,
-            Movement::EndOfLine => {
-                let mut cursor =
-                    GraphemeCursor::new(self.line.len().saturating_sub(1), self.line.len(), false);
-                if let Ok(Some(pos)) = cursor.next_boundary(&self.line, 0) {
-                    pos
-                } else {
-                    self.cursor
-                }
-            }
+            Movement::EndOfLine => self.line.len(),
             Movement::None => self.cursor,
         }
     }
@@ -364,6 +356,21 @@ mod tests {
         assert_eq!(buf.get_cursor(), 5);
     }
 
+    #[test]
+    fn end_of_line_moves_to_multibyte_end() {
+        let mut buf = LineEditBuffer::new("café", 0);
+        buf.exec_movement(Movement::EndOfLine);
+        assert_eq!(buf.get_cursor(), "café".len());
+    }
+
+    #[test]
+    fn end_of_line_moves_to_combining_grapheme_end() {
+        let line = "a\u{0301}";
+        let mut buf = LineEditBuffer::new(line, 0);
+        buf.exec_movement(Movement::EndOfLine);
+        assert_eq!(buf.get_cursor(), line.len());
+    }
+
     // ── Movement: ForwardWord / BackwardWord ────────────────
 
     #[test]
@@ -425,6 +432,14 @@ mod tests {
         buf.kill_text(Movement::EndOfLine, Movement::None);
         assert_eq!(buf.get_line(), "hello");
         assert_eq!(buf.get_cursor(), 5);
+    }
+
+    #[test]
+    fn kill_to_end_of_line_removes_multibyte_tail() {
+        let mut buf = LineEditBuffer::new("café", 3);
+        buf.kill_text(Movement::EndOfLine, Movement::None);
+        assert_eq!(buf.get_line(), "caf");
+        assert_eq!(buf.get_cursor(), 3);
     }
 
     #[test]
