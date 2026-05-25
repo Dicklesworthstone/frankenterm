@@ -227,19 +227,42 @@ fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, ProfileHandl
         .ok_or_else(|| ProfileHandlerError::BadParams(format!("missing required field `{key}`")))
 }
 
-fn opt_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
-    params.get(key).and_then(Value::as_str)
+fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, ProfileHandlerError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| ProfileHandlerError::BadParams(format!("`{key}` must be a string"))),
+    }
 }
 
-fn opt_u32(params: &Value, key: &str) -> Option<u32> {
-    params
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
+fn opt_u32(params: &Value, key: &str) -> Result<Option<u32>, ProfileHandlerError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(value) => {
+            let Some(number) = value.as_u64() else {
+                return Err(ProfileHandlerError::BadParams(format!(
+                    "`{key}` must be an unsigned 32-bit integer"
+                )));
+            };
+            u32::try_from(number).map(Some).map_err(|_| {
+                ProfileHandlerError::BadParams(format!(
+                    "`{key}` must be an unsigned 32-bit integer"
+                ))
+            })
+        }
+    }
 }
 
-fn opt_bool(params: &Value, key: &str) -> Option<bool> {
-    params.get(key).and_then(Value::as_bool)
+fn opt_bool(params: &Value, key: &str) -> Result<Option<bool>, ProfileHandlerError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| ProfileHandlerError::BadParams(format!("`{key}` must be a boolean"))),
+    }
 }
 
 fn to_value<T: serde::Serialize>(v: &T) -> Result<Value, ProfileHandlerError> {
@@ -256,8 +279,8 @@ fn summarize(profile: AgentProfile) -> ProfileSummary {
 }
 
 fn handle_list(params: &Value, backend: &dyn StorageBackend) -> Result<Value, ProfileHandlerError> {
-    let role_filter = opt_str(params, "role_filter");
-    let tag_filter = opt_str(params, "tag_filter").map(str::to_string);
+    let role_filter = opt_str(params, "role_filter")?;
+    let tag_filter = opt_str(params, "tag_filter")?.map(str::to_string);
     let rows = list_agent_profiles(backend, role_filter).map_err(ProfileHandlerError::Storage)?;
     let profiles: Vec<ProfileSummary> = rows
         .into_iter()
@@ -324,8 +347,8 @@ fn handle_apply(
     backend: &dyn StorageBackend,
 ) -> Result<Value, ProfileHandlerError> {
     let name = require_str(params, "name")?;
-    let count = opt_u32(params, "count").unwrap_or(1);
-    let dry_run = opt_bool(params, "dry_run").unwrap_or(false);
+    let count = opt_u32(params, "count")?.unwrap_or(1);
+    let dry_run = opt_bool(params, "dry_run")?.unwrap_or(false);
 
     // Verify the row exists before reporting any "would spawn" plan.
     let _profile = get_agent_profile(backend, name)
@@ -563,8 +586,8 @@ pub fn handle_profile_apply_with_executor<E: ProfileApplyMutationExecutor>(
     now_ms: i64,
 ) -> Result<Value, ProfileHandlerError> {
     let name = require_str(params, "name")?;
-    let count = opt_u32(params, "count").unwrap_or(1);
-    let dry_run = opt_bool(params, "dry_run").unwrap_or(false);
+    let count = opt_u32(params, "count")?.unwrap_or(1);
+    let dry_run = opt_bool(params, "dry_run")?.unwrap_or(false);
     let env_overrides = parse_env_overrides(params)?;
 
     if count == 0 {
@@ -1392,6 +1415,41 @@ mod tests {
             }
             other => panic!("expected SpawnFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_rejects_wrong_type_dry_run_before_defaulting_to_mutation() {
+        let conn = fresh_conn();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+
+        let err = handle_profile_command(
+            "apply",
+            &json!({ "name": "ready", "dry_run": "false" }),
+            &conn,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.bad_params");
+        assert!(err.to_string().contains("`dry_run` must be a boolean"));
+    }
+
+    #[test]
+    fn live_apply_rejects_wrong_type_dry_run_before_spawn() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+
+        let err = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "dry_run": "false" }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.bad_params");
+        assert!(err.to_string().contains("`dry_run` must be a boolean"));
+        assert!(executor.spawned.is_empty());
     }
 
     #[test]
