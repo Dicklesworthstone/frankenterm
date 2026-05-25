@@ -27,11 +27,15 @@ pub struct CellCluster {
 }
 
 impl CellCluster {
+    fn normalize_cell_width(width: usize) -> u8 {
+        width.clamp(1, 2) as u8
+    }
+
     /// Given a byte index into `self.text`, return the corresponding
     /// cell index in the originating line.
     pub fn byte_to_cell_idx(&self, byte_idx: usize) -> usize {
         if self.byte_to_cell_idx.is_empty() {
-            self.first_cell_idx + byte_idx
+            self.first_cell_idx.saturating_add(byte_idx)
         } else {
             self.byte_to_cell_idx[byte_idx]
         }
@@ -240,6 +244,7 @@ impl CellCluster {
         cell_idx: usize,
         width: usize,
     ) -> CellCluster {
+        let width = Self::normalize_cell_width(width);
         let mut idx = Vec::new();
         if text.len() > 1 {
             // Prefer to avoid pushing any index data; this saves
@@ -253,7 +258,7 @@ impl CellCluster {
         let mut byte_to_cell_width = Vec::new();
         if width > 1 {
             for _ in 0..text.len() {
-                byte_to_cell_width.push(width as u8);
+                byte_to_cell_width.push(width);
             }
         }
         let mut storage = String::with_capacity(hint);
@@ -261,7 +266,7 @@ impl CellCluster {
 
         CellCluster {
             attrs,
-            width,
+            width: usize::from(width),
             text: storage,
             presentation,
             byte_to_cell_idx: idx,
@@ -273,7 +278,8 @@ impl CellCluster {
 
     /// Add to this cluster
     fn add(&mut self, text: &str, cell_idx: usize, width: usize) {
-        self.width += width;
+        let width = Self::normalize_cell_width(width);
+        self.width = self.width.saturating_add(usize::from(width));
         if !self.byte_to_cell_idx.is_empty() {
             // We had at least one multi-byte cell in the past
             for _ in 0..text.len() {
@@ -282,7 +288,8 @@ impl CellCluster {
         } else if text.len() > 1 {
             // Extrapolate the indices so far
             for n in 0..self.text.len() {
-                self.byte_to_cell_idx.push(n + self.first_cell_idx);
+                self.byte_to_cell_idx
+                    .push(self.first_cell_idx.saturating_add(n));
             }
             // Now add this new multi-byte cell text
             for _ in 0..text.len() {
@@ -293,7 +300,7 @@ impl CellCluster {
         if !self.byte_to_cell_width.is_empty() {
             // We had at least one double-wide cell in the past
             for _ in 0..text.len() {
-                self.byte_to_cell_width.push(width as u8);
+                self.byte_to_cell_width.push(width);
             }
         } else if width > 1 {
             // Extrapolate the widths so far; they must all be single width
@@ -302,7 +309,7 @@ impl CellCluster {
             }
             // and add the current double width cell
             for _ in 0..text.len() {
-                self.byte_to_cell_width.push(width as u8);
+                self.byte_to_cell_width.push(width);
             }
         }
         self.text.push_str(text);
@@ -363,6 +370,13 @@ mod tests {
     }
 
     #[test]
+    fn new_clamps_extreme_cell_width() {
+        let c = make_cluster("A", 0, usize::MAX);
+        assert_eq!(c.width, 2);
+        assert_eq!(c.byte_to_cell_width(0), 2);
+    }
+
+    #[test]
     fn new_single_width_no_cell_width_map() {
         let c = make_cluster("x", 0, 1);
         assert!(c.byte_to_cell_width.is_empty());
@@ -375,6 +389,12 @@ mod tests {
         let c = make_cluster("a", 3, 1);
         // empty byte_to_cell_idx: returns first_cell_idx + byte_idx
         assert_eq!(c.byte_to_cell_idx(0), 3);
+    }
+
+    #[test]
+    fn byte_to_cell_idx_empty_map_saturates_overflow() {
+        let c = make_cluster("a", usize::MAX, 1);
+        assert_eq!(c.byte_to_cell_idx(1), usize::MAX);
     }
 
     #[test]
@@ -419,7 +439,7 @@ mod tests {
         // After adding multi-byte, idx map should be extrapolated
         assert_eq!(c.byte_to_cell_idx.len(), "aé".len());
         assert_eq!(c.byte_to_cell_idx[0], 0); // "a" -> cell 0
-                                              // "é" bytes -> cell 1
+        // "é" bytes -> cell 1
         for i in 1..c.byte_to_cell_idx.len() {
             assert_eq!(c.byte_to_cell_idx[i], 1);
         }
@@ -442,6 +462,31 @@ mod tests {
         assert_eq!(c.byte_to_cell_width.len(), "aW".len());
         assert_eq!(c.byte_to_cell_width[0], 1);
         assert_eq!(c.byte_to_cell_width[1], 2);
+    }
+
+    #[test]
+    fn add_clamps_extreme_width() {
+        let mut c = make_cluster("a", 0, 1);
+        c.add("W", 1, usize::MAX);
+        assert_eq!(c.width, 3);
+        assert_eq!(c.byte_to_cell_width[1], 2);
+    }
+
+    #[test]
+    fn add_saturates_total_width() {
+        let mut c = make_cluster("a", 0, 1);
+        c.width = usize::MAX - 1;
+        c.add("b", 1, 2);
+        assert_eq!(c.width, usize::MAX);
+    }
+
+    #[test]
+    fn add_multibyte_extrapolated_indices_saturate() {
+        let mut c = make_cluster("a", usize::MAX, 1);
+        c.add("é", usize::MAX, 1);
+        assert_eq!(c.byte_to_cell_idx[0], usize::MAX);
+        assert_eq!(c.byte_to_cell_idx[1], usize::MAX);
+        assert_eq!(c.byte_to_cell_idx[2], usize::MAX);
     }
 
     #[test]
