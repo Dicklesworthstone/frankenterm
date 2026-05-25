@@ -8,6 +8,7 @@ use crate::{Mux, MuxNotification, Pane};
 use anyhow::{Context, anyhow};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
+use std::convert::TryFrom;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};

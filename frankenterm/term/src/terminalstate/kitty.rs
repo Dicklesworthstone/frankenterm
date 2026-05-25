@@ -13,6 +13,7 @@ use frankenterm_escape_parser::apc::{
 };
 use frankenterm_surface::change::ImageData;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;

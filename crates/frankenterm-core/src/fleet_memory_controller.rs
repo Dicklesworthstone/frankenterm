@@ -1155,8 +1155,11 @@ fn ceil_mul_div_usize(multiplicand: usize, numerator: usize, denominator: usize)
         return 0;
     }
 
-    let product = u128::from(multiplicand).saturating_mul(u128::from(numerator));
-    let denominator = u128::from(denominator);
+    // u128 does not implement From<usize> (usize is platform-dependent),
+    // but it implements From<u64> and usize always fits in u64 on all
+    // supported targets. Cast through u64.
+    let product = u128::from(multiplicand as u64).saturating_mul(u128::from(numerator as u64));
+    let denominator = u128::from(denominator as u64);
     debug_assert!(denominator > 0);
 
     let rounded = product.div_ceil(denominator);
@@ -1164,8 +1167,11 @@ fn ceil_mul_div_usize(multiplicand: usize, numerator: usize, denominator: usize)
 }
 
 fn floor_mul_div_usize(multiplicand: usize, numerator: usize, denominator: usize) -> usize {
-    let product = u128::from(multiplicand).saturating_mul(u128::from(numerator));
-    let denominator = u128::from(denominator);
+    // u128 does not implement From<usize> (usize is platform-dependent),
+    // but it implements From<u64> and usize always fits in u64 on all
+    // supported targets. Cast through u64.
+    let product = u128::from(multiplicand as u64).saturating_mul(u128::from(numerator as u64));
+    let denominator = u128::from(denominator as u64);
     debug_assert!(denominator > 0);
 
     usize::try_from(product / denominator).unwrap_or(usize::MAX)

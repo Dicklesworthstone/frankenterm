@@ -2710,7 +2710,7 @@ impl WeztermClient {
             match runner().await {
                 Ok(output) => return Ok(output),
                 Err(err) => {
-                    if attempt >= self.retry_attempts || !is_retryable_error(&err) {
+                    if attempt >= self.retry_attempts as usize || !is_retryable_error(&err) {
                         return Err(err);
                     }
                     if self.retry_delay_ms > 0 {
@@ -2746,7 +2746,7 @@ impl WeztermClient {
             match runner().await {
                 Ok(output) => return Ok(output),
                 Err(err) => {
-                    if attempt >= self.retry_attempts || !is_retryable_error(&err) {
+                    if attempt >= self.retry_attempts as usize || !is_retryable_error(&err) {
                         return Err(err);
                     }
                     if self.retry_delay_ms > 0 {

@@ -3,6 +3,8 @@
 //! input from the user as part of eg: setting up an ssh
 //! session.
 
+use std::convert::TryFrom;
+
 use crate::Mux;
 use crate::domain::{Domain, DomainId, DomainState, alloc_domain_id};
 use crate::pane::{

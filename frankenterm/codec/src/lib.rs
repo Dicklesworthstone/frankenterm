@@ -38,7 +38,7 @@ use smol::io::AsyncWriteExt;
 use smol::prelude::*;
 
 use std::collections::HashMap;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::{Cursor, Read};
 use std::ops::Range;
 use std::path::PathBuf;

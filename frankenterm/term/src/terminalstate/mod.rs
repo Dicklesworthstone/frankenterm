@@ -3,6 +3,7 @@
 #![allow(clippy::range_plus_one)]
 use super::*;
 use crate::color::{ColorPalette, RgbColor};
+use std::convert::TryFrom;
 use crate::config::{BidiMode, NewlineCanon};
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::UnicodeVersion;
@@ -2148,7 +2149,10 @@ impl TerminalState {
             0
         };
         let screen = self.screen_mut();
-        let mut checksum = 0;
+        // checksum is u16 — the function returns u16 below (32u16 fallback).
+        // Without an explicit type the integer literal is `{integer}`,
+        // which makes `.wrapping_add(u16::from(...))` ambiguous.
+        let mut checksum: u16 = 0;
         /*
         debug!(
             "checksum left={} top={} right={} bottom={}",
@@ -2375,12 +2379,17 @@ impl TerminalState {
                     // So this is here for now until a better solution is found.
                     // <https://github.com/wezterm/wezterm/issues/3548>
                     EraseInLine::EraseToEndOfLine => {
-                        if self.wrap_next {
+                        // Bind the start of the range to a variable: without
+                        // the binding (or extra parens), the parser treats
+                        // the `if` block as a statement and then the trailing
+                        // `..cols` becomes a RangeTo, which then doesn't unify
+                        // with the other match arms that produce Range<usize>.
+                        let start = if self.wrap_next {
                             next_col_saturating(cx)
                         } else {
                             cx
-                        }
-                        ..cols
+                        };
+                        start..cols
                     }
                     EraseInLine::EraseToStartOfLine => 0..next_col_saturating(cx),
                     EraseInLine::EraseLine => 0..cols,

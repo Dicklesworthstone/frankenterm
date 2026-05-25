@@ -308,7 +308,7 @@ impl FleetScrollbackCoordinator {
         pane_infos: &[PaneScrollbackInfo],
         registry: &frankenterm_alloc::PaneArenaRegistry,
     ) -> usize {
-        let mut updated = 0;
+        let mut updated: usize = 0;
         for info in pane_infos {
             if registry
                 .set_tracked_bytes(info.pane_id, info.estimated_memory_bytes)
@@ -392,7 +392,7 @@ impl FleetScrollbackCoordinator {
     ) -> (u64, u64, usize) {
         let mut total_pages: u64 = 0;
         let mut total_bytes: u64 = 0;
-        let mut applied = 0;
+        let mut applied: usize = 0;
 
         let targets = &plan.targets;
         let max = self.config.max_targets_per_cycle.min(targets.len());
@@ -432,7 +432,7 @@ impl FleetScrollbackCoordinator {
     ) -> (u64, u64, usize) {
         let mut total_pages: u64 = 0;
         let mut total_bytes: u64 = 0;
-        let mut targets = 0;
+        let mut targets: usize = 0;
 
         for info in pane_infos {
             if info.warm_pages == 0 {

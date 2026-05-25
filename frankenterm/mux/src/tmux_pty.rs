@@ -4,6 +4,7 @@ use crate::tmux_commands::{KillPane, Resize, SendKeys};
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty};
+use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use termwiz::tmux_cc::TmuxPaneId;

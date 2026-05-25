@@ -2,6 +2,7 @@ use crate::TerminalState;
 use crate::input::*;
 use crate::terminalstate::MouseEncoding;
 use anyhow::bail;
+use std::convert::TryFrom;
 use std::io::Write;
 
 fn sgr_pixel_coord(cell: usize, total_pixels: usize, cells: usize, pixel_offset: isize) -> usize {

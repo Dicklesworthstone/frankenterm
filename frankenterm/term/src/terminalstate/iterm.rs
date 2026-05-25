@@ -5,6 +5,7 @@ use ::image::imageops::FilterType;
 use frankenterm_cell::image::ImageDataType;
 use frankenterm_escape_parser::osc::ITermFileData;
 use log::error;
+use std::convert::TryFrom;
 
 impl TerminalState {
     pub(crate) fn set_image(&mut self, image: ITermFileData) {

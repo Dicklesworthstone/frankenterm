@@ -7,6 +7,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_term::TerminalSize;
 use promise::Promise;
 use promise::spawn::block_on;
+use std::convert::TryFrom;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use termwiz::cell::{CellAttributes, unicode_column_width};

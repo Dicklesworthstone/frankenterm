@@ -6,6 +6,7 @@ use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
 use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
+use std::convert::TryFrom;
 use frankenterm_term::{
     Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
     StableRowIndex, TerminalConfiguration, TerminalSize,
@@ -191,7 +192,9 @@ impl LogicalLine {
     }
 
     pub fn xy_to_logical_x(&self, x: usize, y: StableRowIndex) -> usize {
-        let mut offset = 0;
+        // Explicit type — without it the literal is `{integer}` and
+        // `saturating_add` becomes ambiguous below.
+        let mut offset: usize = 0;
         for (idx, line) in self.physical_lines.iter().enumerate() {
             let Some(phys_y) = stable_row_offset(self.first_row, idx) else {
                 break;
@@ -502,11 +505,16 @@ pub fn impl_for_each_logical_line_via_get_logical_lines<P: Pane + ?Sized>(
     let mut logical = pane.get_logical_lines(lines);
 
     for line in &mut logical {
+        // Capture the length up front: once we start populating
+        // `line_refs` with `&mut`s into `line.physical_lines`, we
+        // cannot re-borrow `line.physical_lines` immutably to read
+        // `.len()` while those mutable refs are still live.
+        let phys_count = line.physical_lines.len();
         let mut line_refs = vec![];
         for phys in line.physical_lines.iter_mut() {
             line_refs.push(phys);
         }
-        let Some(range) = stable_row_span(line.first_row, line.physical_lines.len()) else {
+        let Some(range) = stable_row_span(line.first_row, phys_count) else {
             break;
         };
         let should_continue = for_line.with_logical_line_mut(range, &mut line_refs);
