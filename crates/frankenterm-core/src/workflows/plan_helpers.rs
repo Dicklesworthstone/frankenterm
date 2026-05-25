@@ -79,13 +79,11 @@ pub async fn check_step_idempotency(
 /// ft-xbnl0.2.3 Cx-first sibling of [`check_step_idempotency`].
 ///
 /// Tick 186: routes the single storage call (get_step_logs)
-/// through get_step_logs_with_cx. On cx-cancel the check returns
-/// `NotExecuted` (matching the legacy "storage error → NotExecuted"
-/// degrade contract) so the caller proceeds to run the step from
-/// scratch rather than aborting. This is conservative — a
-/// cancelled idempotency check is indistinguishable from a step
-/// that has truly not run; the cancellation itself will surface
-/// at the next `cx.checkpoint()` (e.g. tick 181's per-step seam).
+/// through get_step_logs_with_cx. On cx-cancel or storage failure,
+/// the check fails closed as `PartiallyExecuted`: an unavailable
+/// idempotency ledger is indistinguishable from an incomplete
+/// side-effecting step, so replay must stop instead of running the
+/// step from scratch.
 pub async fn check_step_idempotency_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -94,7 +92,9 @@ pub async fn check_step_idempotency_with_cx(
     step_index: usize,
 ) -> IdempotencyCheckResult {
     let Ok(logs) = storage.get_step_logs_with_cx(cx, execution_id).await else {
-        return IdempotencyCheckResult::NotExecuted;
+        return IdempotencyCheckResult::PartiallyExecuted {
+            started_at: now_ms(),
+        };
     };
 
     let mut latest_completed: Option<(i64, Option<String>)> = None;
@@ -195,6 +195,28 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::patterns::Detection;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build plan helper test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     // ========================================================================
     // Mock Workflow for plan generation tests
@@ -462,5 +484,39 @@ mod tests {
         let result = IdempotencyCheckResult::NotExecuted;
         let debug = format!("{:?}", result);
         assert!(debug.contains("NotExecuted"));
+    }
+
+    #[test]
+    fn idempotency_lookup_cancellation_fails_closed_as_partial() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("idempotency_lookup_cancelled.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = crate::storage::StorageHandle::new(&db_path).await.unwrap();
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("idempotency lookup cancelled"),
+            );
+
+            let result = check_step_idempotency_with_cx(
+                &cx,
+                &storage,
+                "exec-idempotency-cancelled",
+                &crate::plan::IdempotencyKey("step:cancelled-ledger".to_string()),
+                0,
+            )
+            .await;
+
+            assert!(
+                matches!(result, IdempotencyCheckResult::PartiallyExecuted { .. }),
+                "cancelled ledger lookup must fail closed, got {result:?}"
+            );
+            storage.shutdown().await.unwrap();
+        });
     }
 }
