@@ -1,14 +1,14 @@
 use frankenterm_core_replay::replay_decision_diff::{
-    DecisionDiff, DiffConfig, DivergenceType, EquivalenceLevel, MissionCausalityCategory,
-    RootCause,
+    DecisionDiff, DiffConfig, DivergenceType, EquivalenceLevel, MissionCausalityCategory, RootCause,
 };
 use frankenterm_core_replay_types::recorder_metadata::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEventSource,
     RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core_replay_types::replay_decision_graph::{
-    DecisionEvent, DecisionGraph, DecisionType,
+    CausalEdge, DecisionEvent, DecisionGraph, DecisionNode, DecisionType,
 };
+use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -66,6 +66,20 @@ struct RecorderMetadataGolden {
     ingress_kinds: Vec<RecorderIngressKind>,
     segment_kinds: Vec<RecorderSegmentKind>,
     control_marker_types: Vec<RecorderControlMarkerType>,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionEventSpec {
+    decision_type: DecisionType,
+    pane_id: u64,
+    rule_suffix: u16,
+    definition_suffix: u16,
+    input_suffix: u16,
+    output_suffix: u16,
+    timestamp_ms: u64,
+    trigger_previous: bool,
+    override_two_back: bool,
+    confidence_pct: u8,
 }
 
 fn golden_path() -> PathBuf {
@@ -196,6 +210,121 @@ fn decision(
     );
     event.triggered_by = triggered_by;
     event
+}
+
+fn arb_decision_type() -> impl Strategy<Value = DecisionType> {
+    prop_oneof![
+        Just(DecisionType::PatternMatch),
+        Just(DecisionType::WorkflowStep),
+        Just(DecisionType::PolicyDecision),
+        Just(DecisionType::AlertFired),
+        Just(DecisionType::OverrideApplied),
+        Just(DecisionType::BarrierDecision),
+        Just(DecisionType::NoOp),
+        Just(DecisionType::PolicyEvaluation),
+    ]
+}
+
+fn arb_decision_event_specs() -> impl Strategy<Value = Vec<DecisionEventSpec>> {
+    prop::collection::vec(
+        (
+            arb_decision_type(),
+            0_u64..8,
+            0_u16..256,
+            0_u16..256,
+            0_u16..256,
+            0_u16..256,
+            0_u64..10_000,
+            any::<bool>(),
+            any::<bool>(),
+            0_u8..=100,
+        ),
+        0..32,
+    )
+    .prop_map(|rows| {
+        rows.into_iter()
+            .map(
+                |(
+                    decision_type,
+                    pane_id,
+                    rule_suffix,
+                    definition_suffix,
+                    input_suffix,
+                    output_suffix,
+                    timestamp_ms,
+                    trigger_previous,
+                    override_two_back,
+                    confidence_pct,
+                )| DecisionEventSpec {
+                    decision_type,
+                    pane_id,
+                    rule_suffix,
+                    definition_suffix,
+                    input_suffix,
+                    output_suffix,
+                    timestamp_ms,
+                    trigger_previous,
+                    override_two_back,
+                    confidence_pct,
+                },
+            )
+            .collect()
+    })
+}
+
+fn events_from_specs(specs: &[DecisionEventSpec]) -> Vec<DecisionEvent> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let mut event = DecisionEvent::new(
+                spec.decision_type,
+                spec.pane_id,
+                format!("det.rule.{}", spec.rule_suffix),
+                &format!(
+                    "definition-version={};kind={:?}",
+                    spec.definition_suffix, spec.decision_type
+                ),
+                &format!(
+                    "pane={};input={};position={index}",
+                    spec.pane_id, spec.input_suffix
+                ),
+                serde_json::json!({
+                    "output": spec.output_suffix,
+                    "pane": spec.pane_id,
+                    "kind": format!("{:?}", spec.decision_type),
+                }),
+                Some(format!("parent-{index}")),
+                Some(f64::from(spec.confidence_pct) / 100.0),
+                spec.timestamp_ms,
+            );
+            event.triggered_by = if index > 0 && spec.trigger_previous {
+                Some((index - 1) as u64)
+            } else {
+                None
+            };
+            event.overrides = if index > 1 && spec.override_two_back {
+                Some((index - 2) as u64)
+            } else {
+                None
+            };
+            event.wall_clock_ms = spec.timestamp_ms.saturating_add(123_456);
+            event.replay_run_id = format!("determinism-run-{}", index % 3);
+            event
+        })
+        .collect()
+}
+
+fn graph_node_signature(graph: &DecisionGraph) -> Vec<DecisionNode> {
+    graph
+        .nodes_canonical()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn graph_edge_signature(graph: &DecisionGraph) -> Vec<CausalEdge> {
+    graph.edges().to_vec()
 }
 
 fn canonical_output_for(target_triple: &str) -> CanonicalReplayOutput {
@@ -574,7 +703,10 @@ fn forensics_diff_conformance_classifies_policy_causal_chain() {
         .as_ref()
         .expect("mission diff reports the first divergence");
     assert_eq!(first_mission.position, 1);
-    assert_eq!(first_mission.category, MissionCausalityCategory::PolicyDecision);
+    assert_eq!(
+        first_mission.category,
+        MissionCausalityCategory::PolicyDecision
+    );
     assert_eq!(first_mission.divergence_type, DivergenceType::Modified);
     assert_eq!(
         first_mission.evidence_refs,
@@ -679,7 +811,10 @@ fn forensics_diff_conformance_preserves_timing_equivalence_levels() {
     );
 
     let mission = diff.to_mission_causality_diff(&baseline, &candidate);
-    assert_eq!(mission.summary.first_category, MissionCausalityCategory::Timing);
+    assert_eq!(
+        mission.summary.first_category,
+        MissionCausalityCategory::Timing
+    );
     assert_eq!(
         mission
             .first_divergence
@@ -719,4 +854,23 @@ fn recorder_metadata_enum_catalog_roundtrips_through_golden_artifact() {
         serde_json::from_str(&read_recorder_metadata_roundtrip_golden())
             .expect("checked-in metadata golden JSON round-trips");
     assert_eq!(restored_golden, build_recorder_metadata_golden());
+}
+
+proptest! {
+    #[test]
+    fn replay_decision_graph_determinism_property_same_input_yields_identical_graph(
+        specs in arb_decision_event_specs(),
+    ) {
+        let events = events_from_specs(&specs);
+        let first = DecisionGraph::from_decisions(&events);
+        let second = DecisionGraph::from_decisions(&events);
+
+        prop_assert_eq!(first.to_json(), second.to_json());
+        prop_assert_eq!(graph_node_signature(&first), graph_node_signature(&second));
+        prop_assert_eq!(graph_edge_signature(&first), graph_edge_signature(&second));
+        prop_assert_eq!(first.roots().len(), second.roots().len());
+        prop_assert!(first.l1_equivalent(&second));
+        prop_assert!(first.is_dag());
+        prop_assert!(second.is_dag());
+    }
 }

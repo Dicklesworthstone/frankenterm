@@ -626,6 +626,110 @@ mod tests {
     }
 
     #[test]
+    fn recorder_backpressure_defers_at_capture_threshold_not_before() {
+        let policy = CaptureTierPolicy::default();
+        let panes = vec![
+            PaneTierInput {
+                pane_id: 10,
+                bytes_per_sec: 0,
+                idle_ms: 1_000,
+                capture_backlog_segments: policy.deferred_backlog_segments - 1,
+                pending_index_segments: 0,
+                retained_bytes: 0,
+                previous_tier: Some(CaptureIndexTier::Warm),
+            },
+            PaneTierInput {
+                pane_id: 11,
+                bytes_per_sec: 0,
+                idle_ms: 1_000,
+                capture_backlog_segments: policy.deferred_backlog_segments,
+                pending_index_segments: 0,
+                retained_bytes: 0,
+                previous_tier: Some(CaptureIndexTier::Warm),
+            },
+        ];
+        let report = evaluate_adaptive_capture_tiers(
+            &policy,
+            &CaptureTierEnvironment::low_pressure(),
+            &panes,
+        );
+
+        let below_threshold = &report.decisions[0];
+        assert_eq!(below_threshold.pane_id, 10);
+        assert_eq!(below_threshold.tier, CaptureIndexTier::Warm);
+        assert_eq!(
+            below_threshold.search_coverage,
+            SearchCoverageDisclosure::BufferedCatchup
+        );
+        assert!(below_threshold.degraded_fidelity.is_none());
+
+        let at_threshold = &report.decisions[1];
+        assert_eq!(at_threshold.pane_id, 11);
+        assert_eq!(at_threshold.tier, CaptureIndexTier::Deferred);
+        assert_eq!(
+            at_threshold.search_coverage,
+            SearchCoverageDisclosure::DeferredWithGap
+        );
+        assert!(at_threshold.has_explicit_gap_receipt());
+        assert!(
+            at_threshold
+                .reasons
+                .contains(&"capture_backlog_pressure".to_string())
+        );
+        assert!(report.deferred_without_receipts().is_empty());
+    }
+
+    #[test]
+    fn recorder_backpressure_global_thresholds_force_receipts_for_quiet_panes() {
+        let policy = CaptureTierPolicy::default();
+        let environment = CaptureTierEnvironment {
+            memory_pressure_pct: policy.recovery_memory_pressure_pct,
+            global_capture_backlog_segments: policy.deferred_backlog_segments,
+            global_index_backlog_segments: policy.indexing_saturation_segments,
+        };
+        let panes = vec![PaneTierInput {
+            pane_id: 12,
+            bytes_per_sec: 0,
+            idle_ms: policy.cold_idle_ms.saturating_mul(2),
+            capture_backlog_segments: 0,
+            pending_index_segments: 0,
+            retained_bytes: 0,
+            previous_tier: Some(CaptureIndexTier::Deferred),
+        }];
+        let report = evaluate_adaptive_capture_tiers(&policy, &environment, &panes);
+        let decision = &report.decisions[0];
+
+        assert_eq!(decision.tier, CaptureIndexTier::Deferred);
+        assert_eq!(
+            decision.reasons,
+            vec![
+                "capture_backlog_pressure".to_string(),
+                "indexing_saturation".to_string(),
+            ]
+        );
+        assert_eq!(
+            decision.search_coverage,
+            SearchCoverageDisclosure::DeferredWithGap
+        );
+        let receipt = decision
+            .degraded_fidelity
+            .as_ref()
+            .expect("global backpressure must emit a degraded-fidelity receipt");
+        assert!(receipt.explicit_gap);
+        assert!(
+            receipt.message.contains("global_capture_backlog=4096"),
+            "receipt should disclose global capture backlog: {}",
+            receipt.message
+        );
+        assert!(
+            receipt.message.contains("global_index_backlog=1024"),
+            "receipt should disclose global indexing backlog: {}",
+            receipt.message
+        );
+        assert!(report.deferred_without_receipts().is_empty());
+    }
+
+    #[test]
     fn deferred_receipts_include_pane_local_backlog_context() {
         let report = golden_report();
         let pane_capture_backlog = report
