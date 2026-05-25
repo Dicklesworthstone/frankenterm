@@ -761,6 +761,7 @@ where
         commit_report
             .step_results
             .iter()
+            .rev()
             .filter(|result| result.outcome.is_committed())
             .map(|result| {
                 if fail_for_step == Some(result.step_id.0.as_str()) {
@@ -2977,10 +2978,12 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].success);
         assert!(results[1].success);
+        assert_eq!(results[0].for_step_id.0, "s2");
+        assert_eq!(results[1].for_step_id.0, "s1");
         assert_eq!(results[0].reason_code, "send_text_succeeded");
         rt.block_on(async {
             let pane = mock.pane_state(0).await.expect("pane should exist");
-            assert_eq!(pane.content, "rollback-1rollback-2");
+            assert_eq!(pane.content, "rollback-2rollback-1");
         });
     }
 
