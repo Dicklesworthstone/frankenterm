@@ -1223,6 +1223,14 @@ impl Mux {
             .retain(|(alert_pane_id, _), _| *alert_pane_id != pane_id);
     }
 
+    fn discard_client_focus_for_pane(&self, pane_id: PaneId) {
+        for client in self.clients.write().values_mut() {
+            if client.focused_pane_id == Some(pane_id) {
+                client.focused_pane_id = None;
+            }
+        }
+    }
+
     fn flush_pending_pane_output_notifications(&self) {
         loop {
             let pane_ids = {
@@ -1397,6 +1405,7 @@ impl Mux {
     fn remove_pane_internal(&self, pane_id: PaneId) {
         log::debug!("removing pane {}", pane_id);
         self.discard_high_rate_alert_state(pane_id);
+        self.discard_client_focus_for_pane(pane_id);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);
@@ -2514,6 +2523,37 @@ mod tests {
         assert!(
             last.contains_key(&(8, HighRateAlertKind::Progress)),
             "tearing down one pane must not clear dedupe state for unrelated live panes",
+        );
+    }
+
+    #[test]
+    fn remove_pane_discards_client_focus_for_removed_pane() {
+        let mux = Mux::new(None);
+        let removed_client = Arc::new(ClientId::new());
+        let unrelated_client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&removed_client));
+        mux.register_client(Arc::clone(&unrelated_client));
+        mux.record_focus_for_client(&removed_client, 7);
+        mux.record_focus_for_client(&unrelated_client, 8);
+
+        {
+            let clients = mux.clients.read();
+            assert_eq!(clients[removed_client.as_ref()].focused_pane_id, Some(7));
+            assert_eq!(clients[unrelated_client.as_ref()].focused_pane_id, Some(8));
+        }
+
+        mux.remove_pane(7);
+
+        let clients = mux.clients.read();
+        assert_eq!(
+            clients[removed_client.as_ref()].focused_pane_id,
+            None,
+            "remove_pane must clear per-client focus state for the removed pane",
+        );
+        assert_eq!(
+            clients[unrelated_client.as_ref()].focused_pane_id,
+            Some(8),
+            "removing one pane must not clear client focus for unrelated panes",
         );
     }
 
