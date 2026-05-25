@@ -1949,7 +1949,7 @@ impl Tab {
 impl TabInner {
     fn new(size: &TerminalSize) -> Self {
         Self {
-            id: TAB_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
+            id: crate::next_saturating_usize_id(&TAB_ID),
             pane: Some(Tree::new()),
             floating_panes: vec![],
             floating_focus: None,

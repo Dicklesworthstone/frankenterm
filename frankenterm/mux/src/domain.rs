@@ -37,7 +37,7 @@ pub enum DomainState {
 }
 
 pub fn alloc_domain_id() -> DomainId {
-    DOMAIN_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+    crate::next_saturating_usize_id(&DOMAIN_ID)
 }
 
 #[derive(Debug, Clone, PartialEq)]

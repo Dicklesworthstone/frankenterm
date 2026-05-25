@@ -3,7 +3,7 @@ use chrono::serde::ts_milliseconds;
 use chrono::{DateTime, Utc};
 use serde::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::time::SystemTime;
 
 static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -25,7 +25,7 @@ pub struct ClientId {
 
 impl ClientId {
     pub fn new() -> Self {
-        let id = CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        let id = crate::next_saturating_usize_id(&CLIENT_ID);
         Self {
             hostname: hostname::get()
                 .map(|s| s.to_string_lossy().to_string())

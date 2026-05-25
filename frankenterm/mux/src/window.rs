@@ -34,7 +34,7 @@ pub struct Window {
 impl Window {
     pub fn new(workspace: Option<String>, initial_position: Option<GuiPosition>) -> Self {
         Self {
-            id: WIN_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
+            id: crate::next_saturating_usize_id(&WIN_ID),
             tabs: vec![],
             active: 0,
             last_active: None,

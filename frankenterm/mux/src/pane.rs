@@ -25,7 +25,7 @@ static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUs
 pub type PaneId = usize;
 
 pub fn alloc_pane_id() -> PaneId {
-    PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+    crate::next_saturating_usize_id(&PANE_ID)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
