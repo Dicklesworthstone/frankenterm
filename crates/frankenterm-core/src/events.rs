@@ -883,6 +883,17 @@ struct ChannelLagTracker {
     subscriber_positions: Mutex<Vec<Weak<AtomicU64>>>,
 }
 
+fn saturating_atomic_add(counter: &AtomicU64, delta: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(delta);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl ChannelLagTracker {
     fn register(&self, poison_counter: &AtomicU64) -> Arc<AtomicU64> {
         let position = Arc::new(AtomicU64::new(self.sent_seq.load(Ordering::Relaxed)));
@@ -910,7 +921,7 @@ impl ChannelLagTracker {
     }
 
     fn record_send(&self) {
-        self.sent_seq.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.sent_seq, 1);
     }
 
     fn queued_len(&self, poison_counter: &AtomicU64) -> usize {
@@ -1289,7 +1300,10 @@ impl EventBus {
             receiver: self.delta_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
-            observed_seq: Some(self.delta_tracker.register(&self.metrics.bus_lock_poisoned_count)),
+            observed_seq: Some(
+                self.delta_tracker
+                    .register(&self.metrics.bus_lock_poisoned_count),
+            ),
         }
     }
 
@@ -1303,7 +1317,10 @@ impl EventBus {
             receiver: self.detection_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
-            observed_seq: Some(self.detection_tracker.register(&self.metrics.bus_lock_poisoned_count)),
+            observed_seq: Some(
+                self.detection_tracker
+                    .register(&self.metrics.bus_lock_poisoned_count),
+            ),
         }
     }
 
@@ -1317,14 +1334,19 @@ impl EventBus {
             receiver: self.signal_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
-            observed_seq: Some(self.signal_tracker.register(&self.metrics.bus_lock_poisoned_count)),
+            observed_seq: Some(
+                self.signal_tracker
+                    .register(&self.metrics.bus_lock_poisoned_count),
+            ),
         }
     }
 
     /// Snapshot queue depths and oldest message lag per channel
     #[must_use]
     pub fn stats(&self) -> EventBusStats {
-        let delta_queued = self.delta_tracker.queued_len(&self.metrics.bus_lock_poisoned_count);
+        let delta_queued = self
+            .delta_tracker
+            .queued_len(&self.metrics.bus_lock_poisoned_count);
         let detection_queued = self
             .detection_tracker
             .queued_len(&self.metrics.bus_lock_poisoned_count);
@@ -1416,7 +1438,9 @@ impl EventBus {
                 // no way to detect that the dedup gate had stopped
                 // catching duplicates of newly-seen keys.
                 let verdict = dedup.check(&key);
-                if dedup.load_factor() >= Self::DELTA_DEDUP_SATURATION_THRESHOLD || verdict == CuckooDedupVerdict::NewButFull {
+                if dedup.load_factor() >= Self::DELTA_DEDUP_SATURATION_THRESHOLD
+                    || verdict == CuckooDedupVerdict::NewButFull
+                {
                     self.metrics
                         .delta_dedup_full_count
                         .fetch_add(1, Ordering::Relaxed);
@@ -1679,16 +1703,16 @@ impl EventSubscriber {
             Either::Left((result, _)) => match result {
                 Ok(event) => {
                     if let Some(position) = &self.observed_seq {
-                        position.fetch_add(1, Ordering::Relaxed);
+                        saturating_atomic_add(position, 1);
                     }
                     Ok(event)
                 }
                 Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
                 Err(broadcast::RecvError::Cancelled) => Err(RecvError::Cancelled),
                 Err(broadcast::RecvError::Lagged(n)) => {
-                    self.lagged_count += n;
+                    self.lagged_count = self.lagged_count.saturating_add(n);
                     if let Some(position) = &self.observed_seq {
-                        position.fetch_add(n, Ordering::Relaxed);
+                        saturating_atomic_add(position, n);
                     }
                     // br-ft-lb5x7: bump source #1 (recv-side,
                     // +missed_count per Lagged event PER SUBSCRIBER).
@@ -1712,7 +1736,7 @@ impl EventSubscriber {
         match crate::runtime_async::broadcast_try_recv(&mut self.receiver) {
             Ok(event) => {
                 if let Some(position) = &self.observed_seq {
-                    position.fetch_add(1, Ordering::Relaxed);
+                    saturating_atomic_add(position, 1);
                 }
                 Some(Ok(event))
             }
@@ -1721,9 +1745,9 @@ impl EventSubscriber {
                 Some(Err(RecvError::Closed))
             }
             Err(crate::runtime_async::BroadcastTryRecvError::Lagged(n)) => {
-                self.lagged_count += n;
+                self.lagged_count = self.lagged_count.saturating_add(n);
                 if let Some(position) = &self.observed_seq {
-                    position.fetch_add(n, Ordering::Relaxed);
+                    saturating_atomic_add(position, n);
                 }
                 // br-ft-lb5x7: bump source #2 (recv-side, same
                 // shape as #1 but on the try_recv path). Same
@@ -2455,6 +2479,65 @@ mod tests {
         drop(live);
     }
 
+    #[test]
+    fn lag_tracker_sequence_counters_saturate_at_u64_max() {
+        let tracker = ChannelLagTracker::default();
+        let poison_counter = AtomicU64::new(0);
+        tracker.sent_seq.store(u64::MAX - 1, Ordering::Relaxed);
+
+        let position = tracker.register(&poison_counter);
+        assert_eq!(position.load(Ordering::Relaxed), u64::MAX - 1);
+
+        tracker.record_send();
+        tracker.record_send();
+
+        assert_eq!(
+            tracker.sent_seq.load(Ordering::Relaxed),
+            u64::MAX,
+            "sent sequence must saturate instead of wrapping to zero"
+        );
+        assert_eq!(
+            tracker.queued_len(&poison_counter),
+            1,
+            "saturated sent_seq should still report the single unconsumed event"
+        );
+    }
+
+    #[test]
+    fn subscriber_lag_accounting_saturates_at_u64_max() {
+        let bus = EventBus::new(1);
+        let mut sub = bus.subscribe_deltas();
+        sub.lagged_count = u64::MAX - 1;
+        if let Some(position) = &sub.observed_seq {
+            position.store(u64::MAX - 1, Ordering::Relaxed);
+        }
+
+        for seq in 0..4 {
+            let _ = bus.publish(Event::SegmentCaptured {
+                pane_id: 1,
+                seq,
+                content_len: 1,
+            });
+        }
+
+        assert!(
+            matches!(sub.try_recv(), Some(Err(RecvError::Lagged { .. }))),
+            "capacity-one subscriber should observe lag after four queued deltas"
+        );
+        assert_eq!(
+            sub.lagged_count(),
+            u64::MAX,
+            "subscriber lag total must saturate instead of wrapping"
+        );
+        if let Some(position) = &sub.observed_seq {
+            assert_eq!(
+                position.load(Ordering::Relaxed),
+                u64::MAX,
+                "subscriber observed position must saturate instead of wrapping"
+            );
+        }
+    }
+
     /// br-ft-skec1 sites #7/#8: a poisoned subscriber-positions mutex must
     /// surface via bus_lock_poisoned_count rather than silently dropping a
     /// subscriber's registration (register) or under-reporting backlog as 0
@@ -2991,7 +3074,10 @@ mod tests {
             assert_eq!(unrouted, 0, "signal event with no subscriber is dropped");
 
             let m = bus.metrics().snapshot();
-            assert_eq!(m.events_published, 3, "every publish call counts as published");
+            assert_eq!(
+                m.events_published, 3,
+                "every publish call counts as published"
+            );
             assert_eq!(m.events_delivered, 1);
             assert_eq!(m.events_dropped_dedup, 1);
             assert_eq!(m.events_dropped_no_subscribers, 1);
@@ -2999,15 +3085,20 @@ mod tests {
             // The closed forensic invariant in event-units.
             assert_eq!(
                 m.events_published,
-                m.events_delivered
-                    + m.events_dropped_no_subscribers
-                    + m.events_dropped_dedup,
+                m.events_delivered + m.events_dropped_no_subscribers + m.events_dropped_dedup,
                 "conservation: published must equal delivered + no_subscriber + dedup drops"
             );
 
             // Drain the one delivered event so the subscriber isn't seen as lagged.
             let event = delta_sub.recv().await.unwrap();
-            assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, seq: 1, .. }));
+            assert!(matches!(
+                event,
+                Event::SegmentCaptured {
+                    pane_id: 5,
+                    seq: 1,
+                    ..
+                }
+            ));
         });
     }
 
@@ -3798,7 +3889,9 @@ mod tests {
         // to the back of the eviction queue. insertion_order: [b, c, a]
         assert_eq!(
             dedup.check("a"),
-            DedupeVerdict::Duplicate { suppressed_count: 1 }
+            DedupeVerdict::Duplicate {
+                suppressed_count: 1
+            }
         );
 
         // A novel key at capacity evicts the oldest LIVE entry. With the fix
@@ -3844,7 +3937,10 @@ mod tests {
         for j in 0..50 {
             let hot = dedup.check("k0");
             let hot_is_dup = matches!(hot, DedupeVerdict::Duplicate { .. });
-            assert!(hot_is_dup, "iteration {j}: hot key must stay Duplicate, got {hot:?}");
+            assert!(
+                hot_is_dup,
+                "iteration {j}: hot key must stay Duplicate, got {hot:?}"
+            );
             assert_eq!(dedup.check(&format!("novel{j}")), DedupeVerdict::New);
             assert_eq!(
                 dedup.len(),
