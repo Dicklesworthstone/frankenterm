@@ -500,7 +500,7 @@ impl Line {
     /// before falling back to the specified direction.
     pub fn set_direction(&mut self, direction: Direction, auto_detect: bool, seqno: SequenceNo) {
         self.bits
-            .set(LineBits::RTL, direction == Direction::LeftToRight);
+            .set(LineBits::RTL, direction == Direction::RightToLeft);
         self.bits.set(LineBits::AUTO_DETECT_DIRECTION, auto_detect);
         self.update_last_change_seqno(seqno);
     }
@@ -2147,6 +2147,38 @@ mod tests {
             let (enabled, got) = line.bidi_info();
             assert!(enabled);
             assert_eq!(got, hint, "roundtrip failed for {:?}", hint);
+        }
+    }
+
+    #[test]
+    fn line_set_direction_roundtrip() {
+        for (direction, auto_detect, expected) in [
+            (
+                Direction::LeftToRight,
+                false,
+                ParagraphDirectionHint::LeftToRight,
+            ),
+            (
+                Direction::RightToLeft,
+                false,
+                ParagraphDirectionHint::RightToLeft,
+            ),
+            (
+                Direction::LeftToRight,
+                true,
+                ParagraphDirectionHint::AutoLeftToRight,
+            ),
+            (
+                Direction::RightToLeft,
+                true,
+                ParagraphDirectionHint::AutoRightToLeft,
+            ),
+        ] {
+            let mut line = Line::with_width(5, SEQ_ZERO);
+            line.set_direction(direction, auto_detect, 1);
+            let (enabled, got) = line.bidi_info();
+            assert!(!enabled);
+            assert_eq!(got, expected);
         }
     }
 
