@@ -438,15 +438,25 @@ pub fn compile_tx_plan(
 /// Classify risk based on tags and score.
 fn classify_risk(tags: &[String], score: f64) -> StepRisk {
     for tag in tags {
-        let normalized = tag.trim().to_ascii_lowercase().replace('_', "-");
+        let normalized = normalize_risk_tag(tag);
         match normalized.as_str() {
-            "critical" | "destructive" => return StepRisk::Critical,
+            "critical" | "critical-path" | "destructive" | "destructive-action" => {
+                return StepRisk::Critical;
+            }
             "risky"
             | "unsafe"
+            | "unsafe-op"
+            | "unsafe-operation"
             | "high-risk"
+            | "high-risk-op"
+            | "high-risk-operation"
             | "danger"
+            | "danger-zone"
             | "dangerous"
             | "approval"
+            | "approval-required"
+            | "needs-approval"
+            | "operator-approval"
             | "requires-approval"
             | "requires-operator-approval" => return StepRisk::High,
             _ => {}
@@ -459,6 +469,15 @@ fn classify_risk(tags: &[String], score: f64) -> StepRisk {
         return StepRisk::Medium;
     }
     StepRisk::Low
+}
+
+fn normalize_risk_tag(tag: &str) -> String {
+    tag.trim()
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1065,12 +1084,20 @@ mod tests {
         for tag in [
             "high-risk",
             "high_risk",
+            "high risk",
+            "high/risk/op",
             "danger",
+            "danger-zone",
             "dangerous",
             "approval",
+            "approval-required",
+            "needs approval",
+            "operator_approval",
             "requires-approval",
             "requires-operator-approval",
+            "requires operator approval",
             "RISKY",
+            "unsafe:op",
         ] {
             let assignments = vec![assignment_with_tags("b1", "a1", 0.9, &[tag])];
             let plan = compile_tx_plan("p1", &assignments, &CompilerConfig::default());
@@ -1079,6 +1106,31 @@ mod tests {
                 !plan.steps[0].compensations.is_empty(),
                 "mission risky label {tag:?} must get automatic compensation"
             );
+        }
+    }
+
+    #[test]
+    fn compile_mission_critical_label_variants_auto_compensate() {
+        for tag in ["critical path", "destructive-action", "DESTRUCTIVE/action"] {
+            let assignments = vec![assignment_with_tags("b1", "a1", 0.9, &[tag])];
+            let plan = compile_tx_plan("p1", &assignments, &CompilerConfig::default());
+            assert_eq!(plan.steps[0].risk, StepRisk::Critical, "tag={tag}");
+            assert!(
+                !plan.steps[0].compensations.is_empty(),
+                "mission critical label {tag:?} must get automatic compensation"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_risk_classification_ignores_negated_fragments() {
+        for tag in [
+            "non-destructive",
+            "approval-not-needed",
+            "not unsafe",
+            "danger-review-complete",
+        ] {
+            assert_eq!(classify_risk(&[tag.to_string()], 0.9), StepRisk::Low);
         }
     }
 
