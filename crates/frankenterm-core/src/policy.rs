@@ -5605,9 +5605,13 @@ impl PolicyEngine {
         by: &str,
         reason: &str,
         now_ms: u64,
-    ) {
-        self.quarantine_registry
-            .trip_kill_switch(level, by, reason, now_ms);
+    ) -> bool {
+        if !self
+            .quarantine_registry
+            .trip_kill_switch(level, by, reason, now_ms)
+        {
+            return false;
+        }
         self.audit_chain.append(
             AuditEntryKind::KillSwitchAction,
             by,
@@ -5616,6 +5620,7 @@ impl PolicyEngine {
             now_ms,
         );
         self.compliance_engine.record_kill_switch_trip();
+        true
     }
 
     /// Calculate risk score for the given input
@@ -15273,12 +15278,12 @@ mod tests {
         use crate::policy_quarantine::*;
         let mut engine = PolicyEngine::permissive();
 
-        engine.trip_kill_switch(
+        assert!(engine.trip_kill_switch(
             KillSwitchLevel::EmergencyHalt,
             "operator",
             "critical incident",
             3000,
-        );
+        ));
 
         assert!(engine.quarantine_registry().kill_switch().is_emergency());
 
@@ -15287,6 +15292,38 @@ mod tests {
         assert_eq!(entry.kind, AuditEntryKind::KillSwitchAction);
         assert_eq!(entry.entity_ref, "kill_switch");
         assert!(entry.description.contains("emergency_halt"));
+    }
+
+    #[test]
+    fn reentrant_lower_kill_switch_trip_does_not_emit_policy_audit_or_compliance_trip() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        assert!(engine.trip_kill_switch(
+            KillSwitchLevel::EmergencyHalt,
+            "operator",
+            "critical incident",
+            3000,
+        ));
+        assert!(!engine.trip_kill_switch(
+            KillSwitchLevel::SoftStop,
+            "stale-automation",
+            "late lower-severity retry",
+            3001,
+        ));
+
+        assert_eq!(
+            engine.quarantine_registry().kill_switch().level,
+            KillSwitchLevel::EmergencyHalt
+        );
+        assert_eq!(engine.audit_chain().len(), 1);
+        assert_eq!(
+            engine
+                .compliance_engine()
+                .counters()
+                .total_kill_switch_trips,
+            1
+        );
     }
 
     #[test]

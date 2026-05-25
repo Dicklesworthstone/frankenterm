@@ -243,6 +243,7 @@ impl KillSwitch {
         self.changed_at_ms = now_ms;
         self.changed_by = by.to_string();
         self.reason = reason.to_string();
+        self.auto_disarm_at_ms = 0;
     }
 
     /// Arm with auto-disarm timeout.
@@ -780,13 +781,22 @@ impl QuarantineRegistry {
     // ---- Kill switch operations ----
 
     /// Trip the kill switch.
+    ///
+    /// Returns `true` when the trip escalated the switch. Reentrant trips at
+    /// the same or a lower level are ignored; lowering the switch must go
+    /// through [`Self::reset_kill_switch`] so a stale caller cannot downgrade a
+    /// stronger active stop.
     pub fn trip_kill_switch(
         &mut self,
         level: KillSwitchLevel,
         by: &str,
         reason: &str,
         now_ms: u64,
-    ) {
+    ) -> bool {
+        if level <= self.kill_switch.level {
+            return false;
+        }
+
         self.kill_switch.trip(level, by, reason, now_ms);
         self.telemetry.kill_switch_trips += 1;
         self.emit_audit(QuarantineAuditEvent {
@@ -797,9 +807,13 @@ impl QuarantineRegistry {
             actor: by.to_string(),
             detail: format!("kill switch tripped to {level}: {reason}"),
         });
+        true
     }
 
     /// Trip the kill switch with auto-disarm timeout.
+    ///
+    /// Returns `true` when the trip escalated the switch. Reentrant trips at
+    /// the same or a lower level are ignored.
     pub fn trip_kill_switch_with_timeout(
         &mut self,
         level: KillSwitchLevel,
@@ -807,7 +821,11 @@ impl QuarantineRegistry {
         reason: &str,
         now_ms: u64,
         timeout_ms: u64,
-    ) {
+    ) -> bool {
+        if level <= self.kill_switch.level {
+            return false;
+        }
+
         self.kill_switch
             .trip_with_timeout(level, by, reason, now_ms, timeout_ms);
         self.telemetry.kill_switch_trips += 1;
@@ -821,6 +839,7 @@ impl QuarantineRegistry {
                 "kill switch tripped to {level} (auto-disarm in {timeout_ms}ms): {reason}"
             ),
         });
+        true
     }
 
     /// Reset the kill switch.
@@ -1250,6 +1269,42 @@ mod tests {
 
         assert!(reg.tick_kill_switch(6000));
         assert!(reg.kill_switch().allows_new_workflows());
+    }
+
+    #[test]
+    fn kill_switch_reentrant_trips_cannot_downgrade_or_reuse_stale_timeout() {
+        let mut reg = QuarantineRegistry::new();
+
+        assert!(reg.trip_kill_switch_with_timeout(
+            KillSwitchLevel::SoftStop,
+            "automation",
+            "temporary pause",
+            1000,
+            5000,
+        ));
+        assert_eq!(reg.kill_switch().auto_disarm_at_ms, 6000);
+
+        assert!(reg.trip_kill_switch(
+            KillSwitchLevel::EmergencyHalt,
+            "operator",
+            "permanent incident response",
+            2000,
+        ));
+        assert_eq!(reg.kill_switch().level, KillSwitchLevel::EmergencyHalt);
+        assert_eq!(reg.kill_switch().auto_disarm_at_ms, 0);
+
+        assert!(!reg.trip_kill_switch(
+            KillSwitchLevel::SoftStop,
+            "stale-automation",
+            "late lower-severity retry",
+            3000,
+        ));
+        assert_eq!(reg.kill_switch().level, KillSwitchLevel::EmergencyHalt);
+        assert_eq!(reg.telemetry.kill_switch_trips, 2);
+
+        assert!(!reg.tick_kill_switch(6000));
+        assert_eq!(reg.kill_switch().level, KillSwitchLevel::EmergencyHalt);
+        assert!(reg.kill_switch().is_emergency());
     }
 
     #[test]
