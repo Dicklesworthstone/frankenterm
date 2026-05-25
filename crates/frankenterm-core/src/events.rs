@@ -884,17 +884,27 @@ struct ChannelLagTracker {
 }
 
 impl ChannelLagTracker {
-    fn register(&self) -> Arc<AtomicU64> {
+    fn register(&self, poison_counter: &AtomicU64) -> Arc<AtomicU64> {
         let position = Arc::new(AtomicU64::new(self.sent_seq.load(Ordering::Relaxed)));
-        if let Ok(mut guard) = self.subscriber_positions.lock() {
-            // Prune positions whose subscriber has been dropped before pushing
-            // the new one. Without this, `subscriber_positions` grows without
-            // bound under subscribe/drop churn whenever lag is never queried —
-            // `queued_len`/`oldest_lag_ms` are the only other places that prune,
-            // and they are caller-driven. This keeps the vec bounded by the
-            // live subscriber count regardless of query cadence.
-            guard.retain(|weak| weak.strong_count() > 0);
-            guard.push(Arc::downgrade(&position));
+        match self.subscriber_positions.lock() {
+            Ok(mut guard) => {
+                // Prune positions whose subscriber has been dropped before pushing
+                // the new one. Without this, `subscriber_positions` grows without
+                // bound under subscribe/drop churn whenever lag is never queried —
+                // `queued_len`/`oldest_lag_ms` are the only other places that prune,
+                // and they are caller-driven. This keeps the vec bounded by the
+                // live subscriber count regardless of query cadence.
+                guard.retain(|weak| weak.strong_count() > 0);
+                guard.push(Arc::downgrade(&position));
+            }
+            Err(_) => {
+                // br-ft-skec1 site #7: subscriber-positions mutex poisoned →
+                // this subscriber's position is never registered, so it is
+                // invisible to queued_len/oldest_lag_ms and its backlog is
+                // silently undercounted for its entire lifetime. Surface the
+                // loss for parity with the other br-ft-skec1 sites.
+                poison_counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
         position
     }
@@ -903,11 +913,17 @@ impl ChannelLagTracker {
         self.sent_seq.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn queued_len(&self) -> usize {
+    fn queued_len(&self, poison_counter: &AtomicU64) -> usize {
         let sent = self.sent_seq.load(Ordering::Relaxed);
         let mut positions = match self.subscriber_positions.lock() {
             Ok(guard) => guard,
-            Err(_) => return 0,
+            Err(_) => {
+                // br-ft-skec1 site #8: subscriber-positions mutex poisoned →
+                // queued_len reports 0 (no backlog), masking a genuine backlog.
+                // Surface the loss for parity with oldest_lag_ms (site #6).
+                poison_counter.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
         };
         positions.retain(|position| position.strong_count() > 0);
         let Some(slowest) = positions
@@ -1273,7 +1289,7 @@ impl EventBus {
             receiver: self.delta_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
-            observed_seq: Some(self.delta_tracker.register()),
+            observed_seq: Some(self.delta_tracker.register(&self.metrics.bus_lock_poisoned_count)),
         }
     }
 
@@ -1287,7 +1303,7 @@ impl EventBus {
             receiver: self.detection_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
-            observed_seq: Some(self.detection_tracker.register()),
+            observed_seq: Some(self.detection_tracker.register(&self.metrics.bus_lock_poisoned_count)),
         }
     }
 
@@ -1301,16 +1317,20 @@ impl EventBus {
             receiver: self.signal_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
-            observed_seq: Some(self.signal_tracker.register()),
+            observed_seq: Some(self.signal_tracker.register(&self.metrics.bus_lock_poisoned_count)),
         }
     }
 
     /// Snapshot queue depths and oldest message lag per channel
     #[must_use]
     pub fn stats(&self) -> EventBusStats {
-        let delta_queued = self.delta_tracker.queued_len();
-        let detection_queued = self.detection_tracker.queued_len();
-        let signal_queued = self.signal_tracker.queued_len();
+        let delta_queued = self.delta_tracker.queued_len(&self.metrics.bus_lock_poisoned_count);
+        let detection_queued = self
+            .detection_tracker
+            .queued_len(&self.metrics.bus_lock_poisoned_count);
+        let signal_queued = self
+            .signal_tracker
+            .queued_len(&self.metrics.bus_lock_poisoned_count);
 
         EventBusStats {
             capacity: self.capacity,
@@ -2417,11 +2437,12 @@ mod tests {
     #[test]
     fn lag_tracker_register_prunes_dropped_positions() {
         let tracker = ChannelLagTracker::default();
+        let poison_counter = AtomicU64::new(0);
         for _ in 0..100 {
-            let position = tracker.register();
+            let position = tracker.register(&poison_counter);
             drop(position); // subscriber dropped without any intervening lag query
         }
-        let live = tracker.register();
+        let live = tracker.register(&poison_counter);
         let len = tracker
             .subscriber_positions
             .lock()
@@ -2432,6 +2453,46 @@ mod tests {
             "register must prune dropped positions; vec len={len} (expected <= 2)"
         );
         drop(live);
+    }
+
+    /// br-ft-skec1 sites #7/#8: a poisoned subscriber-positions mutex must
+    /// surface via bus_lock_poisoned_count rather than silently dropping a
+    /// subscriber's registration (register) or under-reporting backlog as 0
+    /// (queued_len). Uses the same force-poison-via-catch_unwind recipe as
+    /// observe_remote_causality_poison_increments_metric.
+    #[test]
+    fn lag_tracker_register_and_queued_len_surface_poison() {
+        let bus = EventBus::new(10);
+
+        // Poison the delta tracker's subscriber-positions mutex.
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = bus
+                .delta_tracker
+                .subscriber_positions
+                .lock()
+                .expect("subscriber_positions lock before poison");
+            panic!("poison subscriber positions");
+        }));
+        assert!(poison.is_err());
+
+        // subscribe_deltas() -> delta_tracker.register(): the poisoned lock
+        // must bump the counter, not silently skip registration.
+        let _sub = bus.subscribe_deltas();
+        let after_register = bus.metrics().snapshot().bus_lock_poisoned_count;
+        assert!(
+            after_register >= 1,
+            "register must surface the poisoned-lock loss (got {after_register})"
+        );
+
+        // stats() -> delta_tracker.queued_len(): the poisoned lock must bump
+        // again instead of masking the backlog as 0.
+        let _ = bus.stats();
+        let after_queued = bus.metrics().snapshot().bus_lock_poisoned_count;
+        assert!(
+            after_queued > after_register,
+            "queued_len must surface the poisoned-lock loss too \
+             (register={after_register}, after_stats={after_queued})"
+        );
     }
 
     /// Structure-aware fuzz / property coverage for the untrusted user-var
