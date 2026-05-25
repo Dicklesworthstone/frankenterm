@@ -1053,6 +1053,109 @@ fn distributed_streaming_e2e_rejects_malformed_wire_without_persisting() {
 }
 
 #[test]
+fn wire_protocol_versioning_codec_roundtrip_conformance_distributed_envelope_fail_closed() {
+    run_async_test(async {
+        use frankenterm_core::wire_protocol::{PROTOCOL_VERSION, WireProtocolError};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir
+            .path()
+            .join("distributed_streaming_version_mismatch.db");
+        let mut bridge = DistributedBridge::new(db_path.to_str().expect("db path"))
+            .await
+            .expect("bridge");
+
+        let mut future_version =
+            WireEnvelope::new(1, "agent-version", WirePayload::PaneMeta(pane_meta(35)));
+        future_version.version = PROTOCOL_VERSION + 1;
+        let future_json = future_version.to_json().expect("future-version json");
+        let err = bridge
+            .ingest_raw(&future_json)
+            .await
+            .expect_err("future protocol version must be rejected from raw JSON");
+        let wire_err = err
+            .downcast_ref::<WireProtocolError>()
+            .expect("expected WireProtocolError");
+        assert!(
+            matches!(
+                wire_err,
+                WireProtocolError::VersionMismatch { expected, got }
+                    if *expected == PROTOCOL_VERSION && *got == PROTOCOL_VERSION + 1
+            ),
+            "expected future-version mismatch, got {wire_err:?}"
+        );
+
+        let legacy_version = PROTOCOL_VERSION
+            .checked_sub(1)
+            .expect("distributed protocol versioning test requires nonzero current version");
+        let mut legacy_decoded =
+            WireEnvelope::new(1, "agent-version", WirePayload::PaneMeta(pane_meta(36)));
+        legacy_decoded.version = legacy_version;
+        let err = bridge
+            .ingest_envelope(legacy_decoded)
+            .await
+            .expect_err("legacy protocol version must be rejected after decoding too");
+        let wire_err = err
+            .downcast_ref::<WireProtocolError>()
+            .expect("expected WireProtocolError");
+        assert!(
+            matches!(
+                wire_err,
+                WireProtocolError::VersionMismatch { expected, got }
+                    if *expected == PROTOCOL_VERSION && *got == legacy_version
+            ),
+            "expected legacy-version mismatch, got {wire_err:?}"
+        );
+
+        assert_eq!(bridge.aggregator.total_rejected(), 2);
+        assert_eq!(bridge.aggregator.total_accepted(), 0);
+        assert_eq!(bridge.aggregator.agent_count(), 0);
+        assert!(
+            bridge.storage.get_panes().await.expect("panes").is_empty(),
+            "version-mismatched metadata must not persist"
+        );
+        assert!(
+            bridge
+                .storage
+                .search("VERSION_RECOVERY_MARKER")
+                .await
+                .expect("search")
+                .is_empty(),
+            "version-mismatched deltas must not become searchable"
+        );
+
+        bridge
+            .ingest_envelope(WireEnvelope::new(
+                1,
+                "agent-version-current",
+                WirePayload::PaneMeta(pane_meta(37)),
+            ))
+            .await
+            .expect("current protocol version should recover");
+        bridge
+            .ingest_envelope(WireEnvelope::new(
+                2,
+                "agent-version-current",
+                WirePayload::PaneDelta(pane_delta(37, 0, "VERSION_RECOVERY_MARKER")),
+            ))
+            .await
+            .expect("current protocol delta should persist");
+
+        let panes = bridge.storage.get_panes().await.expect("panes");
+        let hits = bridge
+            .storage
+            .search("VERSION_RECOVERY_MARKER")
+            .await
+            .expect("search");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, 37);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(bridge.aggregator.total_rejected(), 2);
+        assert_eq!(bridge.aggregator.total_accepted(), 2);
+    });
+}
+
+#[test]
 fn distributed_streaming_e2e_rejects_invalid_sender_and_recovers_with_valid_sender() {
     run_async_test(async {
         use frankenterm_core::wire_protocol::WireProtocolError;

@@ -14,9 +14,12 @@
 //! first routing through the encoder — that way every byte on the wire is
 //! under test control.
 
+use std::path::PathBuf;
+
 use codec::{
-    CompressionMode, DecodedPdu, ErrorResponse, GetCodecVersion, GetTlsCreds, ListPanes, Pdu, Ping,
-    Pong, UnitResponse,
+    CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompressionMode, DecodedPdu, ErrorResponse,
+    GetCodecVersion, GetCodecVersionResponse, GetTlsCreds, ListPanes, Pdu, Ping, Pong,
+    UnitResponse,
 };
 
 // Mirror private constants from `codec::lib`. Kept in lockstep by the
@@ -327,6 +330,19 @@ fn conformance_pdu_roundtrip_matrix_preserves_serial_payload_and_streaming() {
     assert_roundtrip_modes("error-response", 65_536, || {
         Pdu::ErrorResponse(ErrorResponse {
             reason: "roundtrip-payload".to_string(),
+        })
+    });
+}
+
+#[test]
+fn wire_protocol_versioning_codec_roundtrip_conformance_pdu_version_response_modes() {
+    assert_roundtrip_modes("get-codec-version-response", 27, || {
+        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+            codec_vers: CODEC_VERSION,
+            version_string: "frankenterm-conformance".to_string(),
+            executable_path: PathBuf::from("/opt/frankenterm/bin/ft"),
+            config_file_path: Some(PathBuf::from("/etc/frankenterm/ft.toml")),
+            min_supported: CODEC_VERSION_MIN_SUPPORTED,
         })
     });
 }
