@@ -632,10 +632,26 @@ mod test {
 
         let cases = [
             Golden {
+                name: "text exactly fills row without eager wrap",
+                rows: 3,
+                cols: 4,
+                changes: vec![Change::Text("abcd".into())],
+                cursor: (4, 0),
+                render_height: 0,
+            },
+            Golden {
                 name: "text crosses right edge",
                 rows: 3,
                 cols: 4,
                 changes: vec![Change::Text("abcdE".into())],
+                cursor: (1, 1),
+                render_height: 1,
+            },
+            Golden {
+                name: "carriage return newline resets wrapped row",
+                rows: 3,
+                cols: 4,
+                changes: vec![Change::Text("abc\r\nZ".into())],
                 cursor: (1, 1),
                 render_height: 1,
             },
@@ -648,6 +664,23 @@ mod test {
                     y: Position::Relative(-1),
                 }],
                 cursor: (3, 2),
+                render_height: 2,
+            },
+            Golden {
+                name: "positive relative cursor wraps across both axes",
+                rows: 3,
+                cols: 4,
+                changes: vec![
+                    Change::CursorPosition {
+                        x: Position::Absolute(3),
+                        y: Position::Absolute(2),
+                    },
+                    Change::CursorPosition {
+                        x: Position::Relative(2),
+                        y: Position::Relative(2),
+                    },
+                ],
+                cursor: (1, 1),
                 render_height: 2,
             },
             Golden {
@@ -668,6 +701,17 @@ mod test {
                 changes: vec![Change::CursorPosition {
                     x: Position::EndRelative(usize::MAX),
                     y: Position::EndRelative(usize::MAX),
+                }],
+                cursor: (0, 0),
+                render_height: 0,
+            },
+            Golden {
+                name: "zero-sized surface relative motion stays at origin",
+                rows: 0,
+                cols: 0,
+                changes: vec![Change::CursorPosition {
+                    x: Position::Relative(-1),
+                    y: Position::Relative(1),
                 }],
                 cursor: (0, 0),
                 render_height: 0,

@@ -15,8 +15,8 @@
 //! under test control.
 
 use codec::{
-    DecodedPdu, ErrorResponse, GetCodecVersion, GetTlsCreds, ListPanes, Pdu, Ping, Pong,
-    UnitResponse,
+    CompressionMode, DecodedPdu, ErrorResponse, GetCodecVersion, GetTlsCreds, ListPanes, Pdu, Ping,
+    Pong, UnitResponse,
 };
 
 // Mirror private constants from `codec::lib`. Kept in lockstep by the
@@ -278,6 +278,59 @@ fn conformance_golden_zero_body_control_pdu_wire_bytes() {
     }
 }
 
+fn assert_roundtrip_modes<F>(label: &str, serial: u64, make_pdu: F)
+where
+    F: Fn() -> Pdu,
+{
+    for mode in [
+        CompressionMode::Auto,
+        CompressionMode::Never,
+        CompressionMode::Always,
+    ] {
+        let expected = make_pdu();
+        let mut encoded = Vec::new();
+        expected
+            .encode_with_mode(&mut encoded, serial, mode)
+            .unwrap_or_else(|err| panic!("{label}: encode_with_mode({mode:?}) failed: {err}"));
+
+        let decoded = Pdu::decode(encoded.as_slice())
+            .unwrap_or_else(|err| panic!("{label}: decode after {mode:?} failed: {err}"));
+        assert_eq!(decoded.serial, serial, "{label}: decoded serial drifted");
+        assert_eq!(decoded.pdu, expected, "{label}: decoded PDU drifted");
+
+        let mut streaming = encoded.clone();
+        streaming.extend_from_slice(b"NEXT");
+        let streamed = Pdu::stream_decode(&mut streaming)
+            .unwrap_or_else(|err| panic!("{label}: stream_decode after {mode:?} failed: {err}"))
+            .unwrap_or_else(|| panic!("{label}: stream_decode returned None for complete frame"));
+        assert_eq!(streamed.serial, serial, "{label}: streamed serial drifted");
+        assert_eq!(streamed.pdu, make_pdu(), "{label}: streamed PDU drifted");
+        assert_eq!(
+            streaming, b"NEXT",
+            "{label}: stream_decode must leave trailing bytes for the next frame"
+        );
+    }
+}
+
+#[test]
+fn conformance_pdu_roundtrip_matrix_preserves_serial_payload_and_streaming() {
+    assert_roundtrip_modes("ping", 0, || Pdu::Ping(Ping {}));
+    assert_roundtrip_modes("pong", 127, || Pdu::Pong(Pong {}));
+    assert_roundtrip_modes("list-panes", 128, || Pdu::ListPanes(ListPanes {}));
+    assert_roundtrip_modes("get-codec-version", 26, || {
+        Pdu::GetCodecVersion(GetCodecVersion {})
+    });
+    assert_roundtrip_modes("get-tls-creds", 28, || Pdu::GetTlsCreds(GetTlsCreds {}));
+    assert_roundtrip_modes("unit-response", 16_384, || {
+        Pdu::UnitResponse(UnitResponse {})
+    });
+    assert_roundtrip_modes("error-response", 65_536, || {
+        Pdu::ErrorResponse(ErrorResponse {
+            reason: "roundtrip-payload".to_string(),
+        })
+    });
+}
+
 // -----------------------------------------------------------------------------
 // 3. Boundary length 0 — ErrorResponse with empty reason
 // -----------------------------------------------------------------------------
@@ -474,6 +527,79 @@ fn conformance_two_back_to_back_pdus_decode_cleanly() {
 
     let third = Pdu::stream_decode(&mut wire).unwrap();
     assert!(third.is_none(), "empty buffer after two PDUs must be None");
+}
+
+#[test]
+fn conformance_mixed_mux_pdu_roundtrip_preserves_order_under_all_compression_modes() {
+    let cases = [
+        (
+            "ping-never",
+            101,
+            CompressionMode::Never,
+            Pdu::Ping(Ping {}),
+        ),
+        ("pong-auto", 102, CompressionMode::Auto, Pdu::Pong(Pong {})),
+        (
+            "unit-response-always",
+            103,
+            CompressionMode::Always,
+            Pdu::UnitResponse(UnitResponse {}),
+        ),
+        (
+            "error-response-never",
+            104,
+            CompressionMode::Never,
+            Pdu::ErrorResponse(ErrorResponse {
+                reason: "mux roundtrip marker".to_string(),
+            }),
+        ),
+        (
+            "list-panes-auto",
+            105,
+            CompressionMode::Auto,
+            Pdu::ListPanes(ListPanes {}),
+        ),
+        (
+            "get-codec-version-always",
+            106,
+            CompressionMode::Always,
+            Pdu::GetCodecVersion(GetCodecVersion {}),
+        ),
+        (
+            "get-tls-creds-never",
+            107,
+            CompressionMode::Never,
+            Pdu::GetTlsCreds(GetTlsCreds {}),
+        ),
+    ];
+
+    let mut stream = Vec::new();
+    for (label, serial, mode, pdu) in &cases {
+        let mut frame = Vec::new();
+        pdu.encode_with_mode(&mut frame, *serial, *mode)
+            .unwrap_or_else(|err| panic!("{label}: encode_with_mode({mode:?}) failed: {err}"));
+
+        let decoded = Pdu::decode(frame.as_slice())
+            .unwrap_or_else(|err| panic!("{label}: direct decode failed: {err}"));
+        assert_eq!(decoded.serial, *serial, "{label}: direct serial");
+        assert_eq!(&decoded.pdu, pdu, "{label}: direct pdu");
+
+        stream.extend(frame);
+    }
+
+    for (idx, (label, serial, _mode, pdu)) in cases.iter().enumerate() {
+        let decoded = Pdu::stream_decode(&mut stream)
+            .unwrap_or_else(|err| panic!("{label}: stream decode failed: {err}"))
+            .unwrap_or_else(|| panic!("{label}: missing stream frame at index {idx}"));
+        assert_eq!(decoded.serial, *serial, "{label}: stream serial");
+        assert_eq!(&decoded.pdu, pdu, "{label}: stream pdu");
+    }
+
+    assert!(
+        stream.is_empty(),
+        "stream_decode left {} bytes after the mixed PDU stream",
+        stream.len()
+    );
 }
 
 // -----------------------------------------------------------------------------
