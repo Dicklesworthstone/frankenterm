@@ -262,6 +262,19 @@ pub fn validate_token(
     let expected_parts = TokenParts::parse(expected);
     let presented_parts = TokenParts::parse(presented);
 
+    // Fail closed on an empty EXPECTED secret. `constant_time_eq("", "")`
+    // returns true, so a blank/unconfigured expected token — an env var or token
+    // file that resolves to "", or any caller that bypasses the empty-checking
+    // credential resolver — would authenticate a client presenting an empty
+    // token, an auth bypass while auth appears enabled. A real configured secret
+    // is never empty. (Same blank-value class as the detection-pane-uuid guard;
+    // the credential resolver already rejects empty, this hardens the public
+    // validation primitive itself. Note: when an identity is present TokenParts
+    // guarantees a non-empty secret, so this only fires on the no-identity path.)
+    if expected_parts.secret.is_empty() {
+        return Err(DistributedSecurityError::AuthFailed);
+    }
+
     if let Some(expected_identity) = expected_parts.identity {
         let expected_norm = normalize_identity(expected_identity);
         // Use constant-time comparison for identity to avoid timing side-channels.
@@ -2952,6 +2965,31 @@ KBAhs4snj5QspGFqkazmIw==
             resolve_expected_token(&config),
             Err(DistributedCredentialError::TokenMissing)
         ));
+    }
+
+    // Fail-open regression: validate_token must NOT authenticate an empty
+    // EXPECTED secret. Pre-fix, expected_token=Some("") passed the None check
+    // and constant_time_eq("","") returned true, so a blank/unconfigured token
+    // (env var or file resolving to "") authenticated any empty presented token
+    // while auth appeared enabled.
+    #[test]
+    fn validate_token_rejects_empty_expected_secret() {
+        // The bypass: empty expected + empty presented must now FAIL.
+        assert!(
+            validate_token(DistributedAuthMode::Token, Some(""), Some(""), None).is_err(),
+            "empty expected secret must never authenticate"
+        );
+        // Empty expected vs any presented also fails.
+        assert!(
+            validate_token(DistributedAuthMode::Token, Some(""), Some("anything"), None).is_err()
+        );
+        // A real matching secret still authenticates; a wrong one still fails.
+        assert!(
+            validate_token(DistributedAuthMode::Token, Some("s3cret"), Some("s3cret"), None).is_ok()
+        );
+        assert!(
+            validate_token(DistributedAuthMode::Token, Some("s3cret"), Some("nope"), None).is_err()
+        );
     }
 
     #[test]
