@@ -547,7 +547,7 @@ pub fn event_identity_key(detection: &Detection, pane_id: u64, pane_uuid: Option
     parts.push(detection.rule_id.clone());
     parts.push(detection.event_type.clone());
     parts.push(match pane_uuid {
-        Some(uuid) if !uuid.trim().is_empty() => uuid.to_string(),
+        Some(uuid) if !uuid.trim().is_empty() => uuid.trim().to_string(),
         _ => format!("pane:{pane_id}"),
     });
 
@@ -4382,6 +4382,27 @@ mod tests {
             absent,
             "blank pane UUIDs must fall back to pane_id so panes do not share \
              one notification/mute identity"
+        );
+    }
+
+    #[test]
+    fn event_identity_key_trims_pane_uuid_for_dedupe() {
+        let detection = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+
+        let canonical = event_identity_key(&detection, 7, Some("remote-uuid"));
+        assert_eq!(
+            event_identity_key(&detection, 7, Some(" remote-uuid\t")),
+            canonical,
+            "equivalent distributed pane UUIDs should share the same event identity"
+        );
+        assert_ne!(
+            event_identity_key(&detection, 8, Some(" remote-uuid\t")),
+            event_identity_key(&detection, 8, None),
+            "nonblank pane UUIDs should still win over pane_id fallback after trimming"
         );
     }
 
