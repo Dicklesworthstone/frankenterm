@@ -50181,8 +50181,8 @@ async fn handle_session_command(
                 candidate.state,
                 frankenterm_core::scrollback_mmap_recovery::OrphanState::Orphaned
             ) {
-                let state = session_orphan_state_label(&candidate.state);
-                let err = format!("scrollback {pane_uuid} is {state}, not recoverable");
+                let err = session_orphan_recoverability_error(&candidate, &pane_uuid)
+                    .expect("non-orphaned candidate must not be recoverable");
                 exit_session_orphan_error(&err, output_format);
             }
 
@@ -50225,6 +50225,9 @@ async fn handle_session_command(
             let scrollback_dir = default_scrollback_recovery_dir();
             let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid)
                 .unwrap_or_else(|err| exit_session_orphan_error(&err, output_format));
+            if let Some(err) = session_orphan_discardability_error(&candidate, &pane_uuid) {
+                exit_session_orphan_error(&err, output_format);
+            }
             let lock_path = candidate.path.with_extension("bin.lock");
 
             std::fs::remove_file(&candidate.path).map_err(|err| {
@@ -50308,12 +50311,12 @@ fn resolve_session_orphan_output_format(format: &str) -> SnapshotSessionOutputFo
 fn scan_session_orphans_for_cli(
     scrollback_dir: &Path,
 ) -> anyhow::Result<Vec<frankenterm_core::scrollback_mmap_recovery::OrphanCandidate>> {
-    use frankenterm_core::scrollback_mmap_recovery::{AlwaysOrphaned, scan_orphans};
+    use frankenterm_core::scrollback_mmap_recovery::{FlockLockProbe, scan_orphans};
 
     if !scrollback_dir.exists() {
         return Ok(Vec::new());
     }
-    scan_orphans(scrollback_dir, &AlwaysOrphaned).map_err(|err| {
+    scan_orphans(scrollback_dir, &FlockLockProbe).map_err(|err| {
         anyhow::anyhow!(
             "Failed to scan scrollback directory {}: {err}",
             scrollback_dir.display()
@@ -50342,6 +50345,37 @@ fn find_session_orphan_candidate(
                 scrollback_dir.display()
             )
         })
+}
+
+fn session_orphan_recoverability_error(
+    candidate: &frankenterm_core::scrollback_mmap_recovery::OrphanCandidate,
+    pane_uuid: &str,
+) -> Option<String> {
+    if matches!(
+        candidate.state,
+        frankenterm_core::scrollback_mmap_recovery::OrphanState::Orphaned
+    ) {
+        return None;
+    }
+
+    let state = session_orphan_state_label(&candidate.state);
+    Some(format!(
+        "scrollback {pane_uuid} is {state}, not recoverable"
+    ))
+}
+
+fn session_orphan_discardability_error(
+    candidate: &frankenterm_core::scrollback_mmap_recovery::OrphanCandidate,
+    pane_uuid: &str,
+) -> Option<String> {
+    if !matches!(
+        candidate.state,
+        frankenterm_core::scrollback_mmap_recovery::OrphanState::Locked
+    ) {
+        return None;
+    }
+
+    Some(format!("scrollback {pane_uuid} is locked, not discardable"))
 }
 
 fn exit_session_orphan_error(message: &str, format: SnapshotSessionOutputFormat) -> ! {
@@ -58059,6 +58093,50 @@ recorder_backend = "frankensqlite"
             redacted.contains("[REDACTED]"),
             "expected redaction marker in wait-for pattern output"
         );
+    }
+
+    #[test]
+    fn session_orphan_cli_scan_marks_live_writer_locked() {
+        use frankenterm_core::scrollback_mmap_writer::{MmapScrollback, MmapScrollbackConfig};
+
+        let dir = tempfile::tempdir().expect("create scrollback tempdir");
+        let pane_uuid = "ab".repeat(32);
+        let writer = MmapScrollback::open(
+            MmapScrollbackConfig::new(dir.path(), pane_uuid.clone()).with_cap_bytes(1024),
+        )
+        .expect("open mmap scrollback writer");
+
+        let candidates = scan_session_orphans_for_cli(dir.path()).expect("scan while writer lives");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                session_orphan_candidate_uuid(candidate).as_deref() == Some(&pane_uuid)
+            })
+            .expect("writer candidate is present");
+        assert_eq!(session_orphan_state_label(&candidate.state), "locked");
+        assert!(
+            session_orphan_recoverability_error(candidate, &pane_uuid)
+                .expect("locked candidate is not recoverable")
+                .contains("locked")
+        );
+        assert!(
+            session_orphan_discardability_error(candidate, &pane_uuid)
+                .expect("locked candidate is not discardable")
+                .contains("locked")
+        );
+
+        drop(writer);
+
+        let candidates = scan_session_orphans_for_cli(dir.path()).expect("scan after writer drops");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                session_orphan_candidate_uuid(candidate).as_deref() == Some(&pane_uuid)
+            })
+            .expect("orphan candidate is present");
+        assert_eq!(session_orphan_state_label(&candidate.state), "orphaned");
+        assert!(session_orphan_recoverability_error(candidate, &pane_uuid).is_none());
+        assert!(session_orphan_discardability_error(candidate, &pane_uuid).is_none());
     }
 
     #[test]

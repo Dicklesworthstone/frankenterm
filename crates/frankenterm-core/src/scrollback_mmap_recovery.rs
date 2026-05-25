@@ -35,18 +35,17 @@
 //!   `<pane_uuid>.bin` (e.g. someone dropped a `.txt` next to the
 //!   scrollback files); skip without raising.
 //!
-//! # What this module does NOT ship (filed as follow-on)
+//! # What still lives outside this scanner
 //!
-//! - The interactive picker UI (a11y-clean keyboard-navigable
-//!   prompt) — filed as `ft-5te6x.cont.picker`.
-//! - The CLI commands `ft session list-orphans` /
-//!   `ft session recover <id>` / `ft session discard <id>` —
-//!   filed as `ft-5te6x.cont.cli`.
-//! - The actual `mmap()` of the recovered file's content for read
-//!   access — depends on `ft-z4u60` (the wiring follow-up to
-//!   ft-kscfg) shipping the read-side `MmapScrollback::open`.
-//!   This module concerns itself only with the *header-level*
-//!   classification; ring-content access is the next layer.
+//! - The CLI commands `ft session list-orphans`, `ft session recover
+//!   <id>`, and `ft session discard <id>` are wired in
+//!   `crates/frankenterm/src/main.rs`; production CLI scanning uses
+//!   [`FlockLockProbe`] so live writers remain locked and disabled.
+//! - `ft session recover <id>` currently creates the replacement pane
+//!   but still needs to replay mmap records into that pane instead of
+//!   reporting `pending_mmap_read_side` (`ft-4q0yg`).
+//! - This module remains the header-level classifier; byte replay and
+//!   pane attachment live in the recovery command layer.
 //!
 //! # Why ship the scanner first
 //!
@@ -65,11 +64,14 @@
 //! orphan is a file whose lock is gone or whose lock is available
 //! to a fresh `flock(LOCK_EX | LOCK_NB)` attempt. This module
 //! exposes the lock-probe boundary as a [`LockProbe`] trait so
-//! tests can substitute a deterministic probe — the production
-//! implementation (a real `flock` call) lives under `ft-z4u60`.
+//! tests can substitute a deterministic probe while the CLI uses
+//! [`FlockLockProbe`].
 
 use crate::scrollback_mmap_format::{HEADER_SIZE, HeaderDecodeError, ScrollbackHeader};
+use fs2::FileExt;
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// Classification of one candidate file in a scrollback directory.
@@ -445,8 +447,8 @@ fn format_accessibility_label(
 }
 
 /// Probe whether a `<pane_uuid>.bin.lock` is held by a live owner.
-/// Production implementation calls `flock(LOCK_EX | LOCK_NB)`;
-/// tests substitute a deterministic probe via a closure-impl.
+/// Production uses a nonblocking exclusive flock; tests substitute a
+/// deterministic probe via a closure-impl.
 pub trait LockProbe {
     /// Returns `true` if the lock is currently held by another
     /// process (i.e. the corresponding `.bin` is owned by a live
@@ -467,16 +469,41 @@ where
 
 /// Default lock probe used when the caller has no override.
 /// Returns `false` for every input — no lock = orphan. The
-/// production probe (with the real `flock` syscall) is wired in
-/// under `ft-z4u60`; until then, the default treats every file as
-/// orphaned, which is the safe direction (the picker just shows
-/// extra entries; the operator can discard them).
+/// production CLI path uses [`FlockLockProbe`] instead; this fallback
+/// is intentionally deterministic for tests and for callers that
+/// explicitly choose best-effort offline scanning.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AlwaysOrphaned;
 
 impl LockProbe for AlwaysOrphaned {
     fn is_locked(&self, _lock_path: &Path) -> bool {
         false
+    }
+}
+
+/// Production lock probe for CLI recovery scans.
+///
+/// The writer creates `<pane_uuid>.bin.lock` and holds an exclusive
+/// advisory lock for the lifetime of the scrollback writer. The probe
+/// never creates a missing lock file: missing means no live owner, while
+/// open or lock errors fail closed as locked so recover/discard cannot
+/// race a writer we cannot inspect.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FlockLockProbe;
+
+impl LockProbe for FlockLockProbe {
+    fn is_locked(&self, lock_path: &Path) -> bool {
+        let lock_file = match OpenOptions::new().read(true).write(true).open(lock_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => false,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => true,
+            Err(_) => true,
+        }
     }
 }
 
@@ -788,6 +815,42 @@ mod tests {
         write_valid_scrollback(&dir, 0x99);
         let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
         assert_eq!(out[0].state, OrphanState::Orphaned);
+    }
+
+    #[test]
+    fn flock_lock_probe_treats_missing_lock_as_orphan() {
+        let dir = temp_dir("flock_missing");
+        write_valid_scrollback(&dir, 0x9A);
+
+        let out = scan_orphans(&dir, &FlockLockProbe).unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state, OrphanState::Orphaned);
+    }
+
+    #[test]
+    fn flock_lock_probe_detects_live_lock_holder() {
+        let dir = temp_dir("flock_held");
+        let path = write_valid_scrollback(&dir, 0x9B);
+        let lock_path = path.with_extension("bin.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock_exclusive().unwrap();
+
+        let out = scan_orphans(&dir, &FlockLockProbe).unwrap();
+        let candidate = out
+            .iter()
+            .find(|candidate| candidate.path == path)
+            .expect("scrollback candidate present");
+
+        assert_eq!(candidate.state, OrphanState::Locked);
+        assert!(candidate.header_ok().is_some());
+        FileExt::unlock(&lock_file).unwrap();
     }
 
     #[test]

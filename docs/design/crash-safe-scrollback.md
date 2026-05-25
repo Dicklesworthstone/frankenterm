@@ -15,11 +15,11 @@ maps them so future operators can reach either via the cross-link.
 
 | Canonical (ft-2okh0.5.x) | Session decomposition | Scope |
 | ------------------------ | --------------------- | ----- |
-| `ft-2okh0.5.1` mmap-backed scrollback (page-aligned, kill-9 survivable) | `ft-kscfg` mmap scrollback file format + write path | Format substrate at `crates/frankenterm-core/src/scrollback_mmap_format.rs` (256-byte header, tagged-length records, 17 round-trip tests). Wired-pass: `ft-z4u60` (mmap + msync ingest wiring) + `ft-kscfg.crypto` (encryption-at-rest impl). |
-| `ft-2okh0.5.2` recovery protocol on launch | `ft-5te6x` recovery protocol — discover orphan scrollback + session-restore prompt | Orphan scanner at `crates/frankenterm-core/src/scrollback_mmap_recovery.rs` (OrphanState taxonomy, LockProbe trait, 14 tests). Wired-pass: `ft-rc94n` (picker UI) + `ft-qliwa` (CLI commands). |
-| `ft-2okh0.5.3` native tmux control protocol speaker | `ft-hs5f6` native tmux control-protocol speaker (Tier-1 RPC subset) | Wire-format substrate at `crates/frankenterm-core/src/tmux_control_protocol.rs` (TmuxCommand enum, parse_command + TmuxResponse encoder, 23 unit tests). Wired-pass blocker: `ft-l4cef`; current daemon slice probes tmux line protocol, supports read-only `list-sessions` / `list-windows`, and returns explicit typed `%error` frames for Tier-2 `pipe-pane` / `copy-mode`, while mutating commands and the notification stream remain pending. `ft-2h56m` closed only the socket-lock/listener slice. |
+| `ft-2okh0.5.1` mmap-backed scrollback (page-aligned, kill-9 survivable) | `ft-kscfg` mmap scrollback file format + write path | Format substrate at `crates/frankenterm-core/src/scrollback_mmap_format.rs` (256-byte header, tagged-length records, 17 round-trip tests). Ingest write-path wiring is in `append_captured_segment_to_mmap_scrollback`; encryption-at-rest remains separate follow-up work. |
+| `ft-2okh0.5.2` recovery protocol on launch | `ft-5te6x` recovery protocol — discover orphan scrollback + session-restore prompt | Orphan scanner at `crates/frankenterm-core/src/scrollback_mmap_recovery.rs` (OrphanState taxonomy, LockProbe trait, production `FlockLockProbe`). CLI commands are present and respect live writer locks; the remaining live blocker is `ft-4q0yg` (recover-command byte replay). |
+| `ft-2okh0.5.3` native tmux control protocol speaker | `ft-hs5f6` native tmux control-protocol speaker (Tier-1 RPC subset) | Wire-format substrate at `crates/frankenterm-core/src/tmux_control_protocol.rs` (TmuxCommand enum, parse_command + TmuxResponse encoder, 25 unit tests). Wired-pass blocker: `ft-l4cef`; current daemon slice probes tmux line protocol, supports read-only `list-sessions` / `list-windows`, and returns explicit typed `%error` frames for Tier-2 `pipe-pane` / `copy-mode`, while mutating commands and the notification stream remain pending. `ft-2h56m` closed only the socket-lock/listener slice. |
 | `ft-2okh0.5.4` tmux compatibility test corpus | `ft-53zsr` tmux compatibility matrix verification | Compatibility matrix doc at `docs/term-emulator/tmux-compat-matrix.md` with substrate-pass / wired-pass taxonomy. |
-| `ft-2okh0.5.5` crash-recovery adversarial fuzz — kill-9 stress test corpus | `ft-0ulxc` crash-recovery test fixture: kill -9 mid-session integrity | 7 substrate invariant tests at `crates/frankenterm-core/tests/crash_recovery_kill9.rs` (pre-msync byte safety, pane_uuid continuity, bounded loss, mid-header tear, mid-cursor tear, msync boundary, header-only edge case). E2e placeholder `#[ignore]`'d on `ft-z4u60` + `ft-5te6x.cont.cli`. |
+| `ft-2okh0.5.5` crash-recovery adversarial fuzz — kill-9 stress test corpus | `ft-0ulxc` crash-recovery test fixture: kill -9 mid-session integrity | 7 substrate invariant tests at `crates/frankenterm-core/tests/crash_recovery_kill9.rs` (pre-msync byte safety, pane_uuid continuity, bounded loss, mid-header tear, mid-cursor tear, msync boundary, header-only edge case). E2e placeholder `#[ignore]`'d on `ft-4q0yg` until recover-command byte replay exists. |
 
 This document is the foundational decision record that unblocks
 all sub-bead implementations under both decompositions. It pins
@@ -109,9 +109,9 @@ The `.bin` file is a **fixed-header + ring buffer** layout:
 
 ## Write path contract
 
-1. The ingest pipeline (currently writing to in-memory ring at
-   `crates/frankenterm-core/src/ingest.rs`) gets a
-   `MmapScrollback::append(pane_uuid, payload)` shim.
+1. The ingest pipeline writes captured segments through
+   `append_captured_segment_to_mmap_scrollback`, which delegates to
+   `MmapScrollback::append`.
 2. `append` runs the **redactor** (ft-x0666 G10 surface) before
    the mmap write. Secrets never reach disk.
 3. `append` writes into the ring at `write_cursor_bytes`, wraps

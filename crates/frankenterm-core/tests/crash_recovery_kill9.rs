@@ -43,25 +43,25 @@
 //!
 //! The bead's full e2e test (spawn ft as a subprocess + `kill -9` +
 //! `ft session recover <pane_id>` + assert byte-for-byte hash match)
-//! requires two pieces that are not yet wired:
+//! now has the write-path and command-shell substrate, but still
+//! needs the recovery command to replay mmap records into the newly
+//! spawned pane:
 //!
-//! - `MmapScrollback::append(pane_uuid, payload)` — the write-path
-//!   wiring that lands under **ft-z4u60** (filed at the close-out
-//!   of ft-kscfg).
-//! - `ft session recover <pane_id>` CLI — the picker / restore
-//!   command that lands under **ft-5te6x.cont.cli**.
+//! - `ft session recover <pane_id>` currently reports
+//!   `pending_mmap_read_side` instead of replaying records
+//!   (**ft-4q0yg**).
 //!
-//! Until both ship, the e2e fixture has nothing live to crash.
+//! Until that ships, the e2e fixture has no live byte-replay path to
+//! assert against.
 //! Truncation is the substrate-level analog of `kill -9`: bytes
 //! that *did* hit `MS_SYNC` correspond to bytes the OS would have
 //! flushed before the kill; bytes after the truncation point
 //! correspond to the in-flight buffer that gets lost.
 //!
 //! The full e2e test (spawn-and-kill) is included in this file as
-//! [`spawn_and_kill_e2e_PLACEHOLDER`] gated with `#[ignore]` and a
-//! `cfg(unix)` so CI picks it up automatically once ft-z4u60 and
-//! ft-5te6x.cont.cli land. The ignore annotation documents the
-//! exact unblock list inline.
+//! [`spawn_and_kill_e2e_placeholder`] gated with `#[ignore]` and a
+//! `cfg(unix)` so CI picks it up automatically once ft-4q0yg lands.
+//! The ignore annotation documents the exact unblock list inline.
 //!
 //! # Why `cfg(unix)`
 //!
@@ -350,18 +350,17 @@ fn regression_guard_kill_immediately_after_header_write() {
 /// hash match against the pre-kill snapshot.
 ///
 /// **Currently `#[ignore]`** because the e2e path requires:
-/// - `MmapScrollback::append(pane_uuid, payload)` — write-path
-///   wiring landing under **ft-z4u60**.
-/// - `ft session recover <pane_id>` CLI — picker / restore command
-///   landing under **ft-5te6x.cont.cli**.
+/// - `ft session recover <pane_id>` byte replay, tracked by
+///   **ft-4q0yg**. The write path and command shell exist; the
+///   command still reports `pending_mmap_read_side`.
 ///
-/// Once both unblock, drop the `#[ignore]` and replace the body
+/// Once that unblocks, drop the `#[ignore]` and replace the body
 /// with the full subprocess fixture. The substrate invariants
 /// above already guard the format-level contract, so the e2e test
 /// only needs to prove the wiring honors that contract under a
 /// real `kill -9 <pid>` signal.
 #[test]
-#[ignore = "blocked on ft-z4u60 (mmap append wiring) + ft-5te6x.cont.cli (recover CLI)"]
+#[ignore = "blocked on ft-4q0yg (recover byte replay + active SIGKILL e2e)"]
 fn spawn_and_kill_e2e_placeholder() {
     // Intentionally empty. Kept as a tracker so `cargo test
     // -- --ignored` lists the deferred coverage gap by name.
