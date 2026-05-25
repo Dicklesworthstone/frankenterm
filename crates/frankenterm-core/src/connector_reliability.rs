@@ -60,11 +60,20 @@ impl ConnectorErrorKind {
     }
 
     /// Whether this error should trip the circuit breaker.
+    ///
+    /// `Unknown` is included for the same reason it is treated as retryable:
+    /// the variant is documented as "classify as transient for safety", and it
+    /// is the catch-all for every error string `classify_connector_error` does
+    /// not recognise. Excluding it left a real protection gap — a connector
+    /// whose upstream is persistently failing with an unrecognised error format
+    /// would be retried (and DLQ'd) forever while the breaker never opened. A
+    /// single sporadic unknown error still cannot trip the breaker on its own;
+    /// it takes `failure_threshold` consecutive failures while Closed.
     #[must_use]
     pub const fn trips_breaker(self) -> bool {
         matches!(
             self,
-            Self::ServiceUnavailable | Self::Timeout | Self::Transient
+            Self::ServiceUnavailable | Self::Timeout | Self::Transient | Self::Unknown
         )
     }
 
@@ -1020,10 +1029,55 @@ mod tests {
         assert!(ConnectorErrorKind::ServiceUnavailable.trips_breaker());
         assert!(ConnectorErrorKind::Timeout.trips_breaker());
         assert!(ConnectorErrorKind::Transient.trips_breaker());
+        // Unknown trips the breaker: it is the catch-all for unrecognised
+        // errors and is documented as "classify as transient for safety", so
+        // it must give the same circuit protection as Transient. Without this,
+        // a persistently-failing connector emitting unrecognised errors would
+        // never open the circuit.
+        assert!(ConnectorErrorKind::Unknown.trips_breaker());
+        // Consistency with is_retryable: every kind that trips the breaker is
+        // also retryable (the breaker only guards transient/retryable failures).
+        assert!(ConnectorErrorKind::Unknown.is_retryable());
         assert!(!ConnectorErrorKind::RateLimited.trips_breaker());
         assert!(!ConnectorErrorKind::AuthFailure.trips_breaker());
         assert!(!ConnectorErrorKind::Permanent.trips_breaker());
         assert!(!ConnectorErrorKind::Cancelled.trips_breaker());
+    }
+
+    /// Regression: persistent Unknown failures must eventually open the circuit
+    /// breaker (end-to-end through the reliability controller), not retry the
+    /// dead upstream forever. Pre-fix, Unknown did not trip the breaker, so the
+    /// circuit stayed Closed no matter how many unknown errors arrived.
+    #[test]
+    fn connector_reliability_unknown_failures_open_circuit() {
+        let config = ConnectorReliabilityConfig {
+            circuit: ConnectorCircuitConfig {
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown: Duration::from_secs(60),
+            },
+            ..Default::default()
+        };
+        let mut controller = ConnectorReliabilityController::new("slack", config);
+        let action = sample_action("slack", ConnectorActionKind::Notify);
+
+        assert_eq!(
+            controller.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Closed
+        );
+        for i in 0..3 {
+            assert!(controller.allow_operation(), "ops allowed while closed (i={i})");
+            controller.record_failure(&action, "weird upstream glitch", ConnectorErrorKind::Unknown, 1000 + i);
+        }
+        assert_eq!(
+            controller.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Open,
+            "the circuit must open after failure_threshold consecutive Unknown failures"
+        );
+        assert!(
+            !controller.allow_operation(),
+            "an open circuit must reject further operations"
+        );
     }
 
     // ---- Dead-letter queue ----
