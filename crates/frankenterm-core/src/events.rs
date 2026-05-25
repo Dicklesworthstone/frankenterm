@@ -552,9 +552,23 @@ pub fn event_identity_key(detection: &Detection, pane_id: u64, pane_uuid: Option
         parts.push(extracted);
     }
 
-    let joined = parts.join("|");
-    let digest = Sha256::digest(joined.as_bytes());
+    let digest = Sha256::digest(length_framed_parts(parts.iter().map(String::as_str)).as_bytes());
     format!("evt:{}", hex_encode(&digest))
+}
+
+fn length_framed_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut framed = String::new();
+    for part in parts {
+        append_length_framed_part(&mut framed, part);
+    }
+    framed
+}
+
+fn append_length_framed_part(target: &mut String, part: &str) {
+    use std::fmt::Write;
+    let _ = write!(target, "{}:", part.len());
+    target.push_str(part);
+    target.push('|');
 }
 
 fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> Option<String> {
@@ -563,7 +577,8 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
         return None;
     }
 
-    let mut parts: Vec<String> = Vec::new();
+    let mut framed = String::new();
+    let mut has_parts = false;
     let mut entries: Vec<(&str, &serde_json::Value)> = obj
         .iter()
         .map(|(key, value)| (key.as_str(), value))
@@ -605,15 +620,16 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
             truncate_to_char_boundary(&mut rendered, IDENTITY_MAX_VALUE_LEN);
         }
 
-        parts.push(format!("{key}={rendered}"));
+        append_length_framed_part(&mut framed, key);
+        append_length_framed_part(&mut framed, &rendered);
+        has_parts = true;
     }
 
-    if parts.is_empty() {
+    if !has_parts {
         return None;
     }
 
-    parts.sort();
-    Some(parts.join(","))
+    Some(framed)
 }
 
 fn truncate_to_char_boundary(value: &mut String, max_len: usize) {
@@ -1868,9 +1884,13 @@ impl EventDeduplicator {
                 // spuriously returns `New` instead of `Duplicate` — a silent
                 // dedup failure under capacity pressure. (Disjoint-field borrow
                 // of `entries` + `insertion_order`, mirroring the reset path.)
-                entry.count += 1;
+                // br-ft-pu2mg saturating-counter convention (parity with the
+                // EventSubscriber `lagged_count` accumulator): plateau at
+                // u64::MAX rather than debug-panicking / release-wrapping on
+                // overflow of this long-lived per-key suppression counter.
+                entry.count = entry.count.saturating_add(1);
                 entry.last_seen = now;
-                let suppressed_count = entry.count - 1;
+                let suppressed_count = entry.count.saturating_sub(1);
                 if let Some(pos) = self.insertion_order.iter().position(|k| k == key) {
                     self.insertion_order.remove(pos);
                 }
@@ -2053,7 +2073,10 @@ impl NotificationCooldown {
                 // pressure. `last_notified` is intentionally NOT advanced (the
                 // cooldown is anchored to the last SEND, not the last
                 // suppress); only eviction recency is refreshed.
-                entry.suppressed_since_notify += 1;
+                // br-ft-pu2mg saturating-counter convention (see EventDeduplicator
+                // above / lagged_count): plateau at u64::MAX rather than
+                // debug-panicking / release-wrapping on overflow.
+                entry.suppressed_since_notify = entry.suppressed_since_notify.saturating_add(1);
                 let total_suppressed = entry.suppressed_since_notify;
                 if let Some(pos) = self.insertion_order.iter().position(|k| k == key) {
                     self.insertion_order.remove(pos);
@@ -3956,6 +3979,35 @@ mod tests {
         );
     }
 
+    // br-ft-pu2mg: the per-key suppression counter must plateau at u64::MAX, not
+    // debug-panic / release-wrap on overflow. Seeds the count at the boundary
+    // (mirrors the lagged_count saturation test) and checks one more in-window
+    // hit. Without saturating_add, `entry.count += 1` overflow-panics in debug.
+    #[test]
+    fn dedup_suppressed_count_saturates_at_u64_max() {
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), 4);
+        assert_eq!(dedup.check("k"), DedupeVerdict::New);
+        dedup
+            .entries
+            .get_mut("k")
+            .expect("entry present after first check")
+            .count = u64::MAX;
+
+        match dedup.check("k") {
+            DedupeVerdict::Duplicate { suppressed_count } => {
+                assert_eq!(suppressed_count, u64::MAX - 1, "count saturates, suppressed = MAX-1");
+            }
+            other @ DedupeVerdict::New => {
+                panic!("in-window repeat must be Duplicate; got {other:?}")
+            }
+        }
+        assert_eq!(
+            dedup.entries.get("k").map(|e| e.count),
+            Some(u64::MAX),
+            "count must stay saturated at u64::MAX, not wrap to 0"
+        );
+    }
+
     // ---- NotificationCooldown tests ----
 
     #[test]
@@ -4121,6 +4173,34 @@ mod tests {
         );
     }
 
+    // br-ft-pu2mg: the per-key suppressed-since-notify counter must plateau at
+    // u64::MAX, not debug-panic / release-wrap on overflow. Seeds the counter at
+    // the boundary and checks one more in-cooldown hit. Without saturating_add,
+    // `entry.suppressed_since_notify += 1` overflow-panics in debug.
+    #[test]
+    fn cooldown_suppressed_count_saturates_at_u64_max() {
+        let mut cd = NotificationCooldown::with_config(Duration::from_secs(300), 4);
+        assert_eq!(
+            cd.check("k"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
+        cd.entries
+            .get_mut("k")
+            .expect("entry present after first check")
+            .suppressed_since_notify = u64::MAX;
+
+        match cd.check("k") {
+            CooldownVerdict::Suppress { total_suppressed } => {
+                assert_eq!(total_suppressed, u64::MAX, "suppressed count saturates at u64::MAX");
+            }
+            other @ CooldownVerdict::Send { .. } => {
+                panic!("in-cooldown repeat must Suppress; got {other:?}")
+            }
+        }
+    }
+
     // [ft-hyrav] When a cooldown expires and Send fires, the insertion_order
     // position for that key must be refreshed so the next LRU eviction
     // doesn't pick it over an older-but-truly-dormant key. Pre-fix, the
@@ -4273,6 +4353,56 @@ mod tests {
         let key = event_identity_key(&detection, 7, None);
         assert!(key.starts_with("evt:"));
         assert_eq!(key.len(), 68); // "evt:" + 64 hex chars
+    }
+
+    #[test]
+    fn event_identity_key_distinguishes_delimiter_bearing_core_fields() {
+        let left = make_detection(
+            "a|b",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let mut right = make_detection(
+            "a",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        right.event_type = "b|test".to_string();
+
+        assert_ne!(
+            event_identity_key(&left, 7, None),
+            event_identity_key(&right, 7, None),
+            "identity preimage must be length-framed so separators in fields \
+             cannot collapse distinct detections"
+        );
+    }
+
+    #[test]
+    fn event_identity_key_distinguishes_delimiter_bearing_extracted_fields() {
+        let mut left = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        left.extracted = serde_json::json!({
+            "a=b": "c,d",
+        });
+
+        let mut right = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        right.extracted = serde_json::json!({
+            "a": "b=c,d",
+        });
+
+        assert_ne!(
+            event_identity_key(&left, 7, None),
+            event_identity_key(&right, 7, None),
+            "extracted-field identity projection must frame keys and values \
+             separately so '=' and ',' inside payloads cannot collide"
+        );
     }
 
     #[test]
