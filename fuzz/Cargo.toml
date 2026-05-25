@@ -155,6 +155,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "redactor_no_leak"
+path = "fuzz_targets/redactor_no_leak.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "native_events_wire"
 path = "fuzz_targets/native_events_wire.rs"
 doc = false
