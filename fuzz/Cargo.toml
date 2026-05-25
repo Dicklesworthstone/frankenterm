@@ -355,6 +355,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "replay_recording_structured"
+path = "fuzz_targets/replay_recording_structured.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "replay_control_toml"
 path = "fuzz_targets/replay_control_toml.rs"
 doc = false
