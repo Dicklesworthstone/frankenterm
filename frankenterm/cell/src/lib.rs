@@ -671,6 +671,16 @@ impl TeenyString {
         }
     }
 
+    const fn normalize_explicit_width(width: usize) -> usize {
+        if width > 2 {
+            2
+        } else if width == 0 {
+            1
+        } else {
+            width
+        }
+    }
+
     pub fn from_str(
         s: &str,
         width: Option<usize>,
@@ -690,7 +700,9 @@ impl TeenyString {
 
         let bytes = s.as_bytes();
         let len = bytes.len();
-        let width = width.unwrap_or_else(|| grapheme_column_width(s, unicode_version));
+        let width = width
+            .map(Self::normalize_explicit_width)
+            .unwrap_or_else(|| grapheme_column_width(s, unicode_version));
 
         if len < core::mem::size_of::<u64>() && width < 3 {
             let mut word = 0u64;
@@ -1892,6 +1904,22 @@ mod test {
         let c = Cell::new_grapheme_with_width("AB", 2, CellAttributes::blank());
         assert_eq!(c.str(), "AB");
         assert_eq!(c.width(), 2);
+    }
+
+    #[test]
+    fn cell_new_grapheme_with_width_normalizes_explicit_extremes() {
+        let zero = Cell::new_grapheme_with_width("Z", 0, CellAttributes::blank());
+        assert_eq!(zero.str(), "Z");
+        assert_eq!(zero.width(), 1);
+
+        let huge_inline = Cell::new_grapheme_with_width("Z", usize::MAX, CellAttributes::blank());
+        assert_eq!(huge_inline.str(), "Z");
+        assert_eq!(huge_inline.width(), 2);
+
+        let huge_heap =
+            Cell::new_grapheme_with_width("abcdefgh", usize::MAX, CellAttributes::blank());
+        assert_eq!(huge_heap.str(), "abcdefgh");
+        assert_eq!(huge_heap.width(), 2);
     }
 
     #[test]
