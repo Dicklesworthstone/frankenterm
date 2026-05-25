@@ -553,10 +553,15 @@ fn execute_step_action(
             tracing::info!(event_id, "mark_event_handled step");
             (true, "mark_event_handled_succeeded".to_string(), None)
         }
-        crate::plan::StepAction::ValidateApproval { approval_code } => {
-            tracing::info!(code = %approval_code, "validate_approval step (advisory pass)");
-            (true, "validate_approval_succeeded".to_string(), None)
-        }
+        crate::plan::StepAction::ValidateApproval { .. } => (
+            false,
+            "validate_approval_unwired".to_string(),
+            Some(
+                "FTX_APPROVAL_UNWIRED: ValidateApproval cannot succeed without scoped approval \
+                 consumption; rely on prepare approval gates until a scoped consume path is wired"
+                    .to_string(),
+            ),
+        ),
         crate::plan::StepAction::RunWorkflow { workflow_id, .. } => (
             false,
             "unsupported_action".to_string(),
@@ -2990,6 +2995,30 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("RunWorkflow")
+        );
+    }
+
+    #[test]
+    fn pane_executor_validate_approval_fails_closed_until_wired() {
+        let mock = mock_wezterm_handle();
+        let executor = make_pane_executor(mock);
+        let contract = make_pane_contract(vec![(
+            "approval".to_string(),
+            StepAction::ValidateApproval {
+                approval_code: "ABC12345".to_string(),
+            },
+        )]);
+
+        let results = executor.execute_steps(&contract, None, 5_000);
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert_eq!(results[0].reason_code, "validate_approval_unwired");
+        let error = results[0].error_code.as_deref().expect("error code");
+        assert!(error.contains("FTX_APPROVAL_UNWIRED"));
+        assert!(
+            !error.contains("ABC12345"),
+            "approval code must not be copied into failure evidence"
         );
     }
 
