@@ -13,7 +13,7 @@
 // and proves under `cargo test -p frankenterm-core-telemetry-types`.
 // =============================================================================
 
-use frankenterm_core_telemetry_types::ewma::Ewma;
+use frankenterm_core_telemetry_types::ewma::{Ewma, EwmaWithVariance};
 use frankenterm_core_telemetry_types::exp_histogram::ExpHistogram;
 
 /// Quantile monotonicity: `percentile(p)` is non-decreasing in `p`. The cdf
@@ -116,4 +116,53 @@ fn ewma_monotone_bounded_approach_to_constant() {
         );
         prev = v;
     }
+}
+
+/// Regression (NaN-poisoning defect): non-finite observations must be dropped,
+/// not fold into the smoothed value. Before the `value.is_finite()` guard in
+/// `Ewma::observe`, a single NaN/inf permanently poisoned `value`.
+#[test]
+fn ewma_ignores_non_finite_observations() {
+    let mut e = Ewma::with_half_life_ms(100.0);
+    e.observe(10.0, 0);
+    let baseline = e.value();
+    assert_eq!(baseline, 10.0, "first finite observation seeds the value");
+
+    e.observe(f64::NAN, 25);
+    assert_eq!(e.value(), baseline, "a NaN observation must be ignored");
+    e.observe(f64::INFINITY, 50);
+    assert_eq!(e.value(), baseline, "a +inf observation must be ignored");
+    e.observe(f64::NEG_INFINITY, 75);
+    assert_eq!(e.value(), baseline, "a -inf observation must be ignored");
+    assert!(e.value().is_finite(), "value stays finite after non-finite inputs");
+
+    // A finite observation after the skipped ones still updates normally.
+    e.observe(20.0, 100);
+    let v = e.value();
+    assert!(
+        v.is_finite() && v > baseline && v < 20.0,
+        "a finite observation after dropped NaNs still moves the ewma ({v})"
+    );
+}
+
+/// Regression: `EwmaWithVariance` must also drop non-finite inputs before they
+/// poison either the mean or the variance (`(value - old_mean)^2`).
+#[test]
+fn ewma_with_variance_ignores_non_finite_observations() {
+    let mut e = EwmaWithVariance::with_half_life_ms(100.0);
+    e.observe(10.0, 0);
+    e.observe(14.0, 50); // establishes both mean and variance
+    let mean_before = e.mean();
+    let var_before = e.variance();
+    assert!(mean_before.is_finite() && var_before.is_finite());
+
+    e.observe(f64::NAN, 100);
+    assert_eq!(e.mean(), mean_before, "NaN must not change the mean");
+    assert_eq!(e.variance(), var_before, "NaN must not change the variance");
+
+    e.observe(f64::INFINITY, 150);
+    assert!(
+        e.mean().is_finite() && e.variance().is_finite(),
+        "mean/variance stay finite after non-finite inputs"
+    );
 }

@@ -80,6 +80,15 @@ impl Ewma {
 
     /// Observe a new value at the given timestamp (milliseconds).
     pub fn observe(&mut self, value: f64, time_ms: u64) {
+        // Drop non-finite inputs (NaN / ±inf): a single NaN would otherwise
+        // poison `value` permanently — every later convex update
+        // `(1-alpha)*value + alpha*new` stays NaN, and downstream threshold
+        // comparisons against a NaN ewma silently fail. Matches
+        // `ExpHistogram::record_n`, which also drops non-finite samples without
+        // counting them.
+        if !value.is_finite() {
+            return;
+        }
         self.count += 1;
         if !self.initialized {
             self.value = value;
@@ -181,6 +190,12 @@ impl EwmaWithVariance {
 
     /// Observe a new value.
     pub fn observe(&mut self, value: f64, time_ms: u64) {
+        // Drop non-finite inputs before they reach the mean or the
+        // variance update (`(value - old_mean)^2`), either of which a
+        // NaN / ±inf would poison permanently. See `Ewma::observe`.
+        if !value.is_finite() {
+            return;
+        }
         let old_mean = self.mean.value();
         self.mean.observe(value, time_ms);
 
