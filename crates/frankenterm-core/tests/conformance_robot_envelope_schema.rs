@@ -44,6 +44,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const ROBOT_ERROR_MATRIX: &str = include_str!("golden_robot_envelope/robot_error_matrix.json");
+
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -137,6 +139,71 @@ fn load_success_envelope(path: &Path) -> Option<Value> {
     let bytes = fs::read(path).ok()?;
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     v.as_object()?.get("success_envelope").cloned()
+}
+
+#[test]
+fn robot_error_matrix_fixture_validates_required_codes() {
+    let schema = load_envelope_schema();
+    let matrix: Value =
+        serde_json::from_str(ROBOT_ERROR_MATRIX).expect("robot error matrix must be valid JSON");
+    assert_eq!(matrix["schema_version"], "ft.robot.error_matrix.v1");
+
+    let cases = matrix["cases"]
+        .as_array()
+        .expect("robot error matrix must contain cases");
+    assert_eq!(
+        cases.len(),
+        4,
+        "matrix should pin exactly the four canonical robot error envelopes"
+    );
+
+    let mut observed = std::collections::BTreeSet::new();
+    for case in cases {
+        let id = case["id"].as_str().expect("case id");
+        let expected_code = case["expected_code"].as_str().expect("expected_code");
+        let envelope = case
+            .get("envelope")
+            .expect("case must embed a robot envelope");
+
+        schema
+            .validate(envelope)
+            .unwrap_or_else(|errors| panic_validation_errors(id, errors));
+        assert_eq!(
+            envelope.get("ok").and_then(Value::as_bool),
+            Some(false),
+            "{id} must be an error envelope"
+        );
+        assert!(
+            envelope.get("data").is_none(),
+            "{id} error envelope must not carry data"
+        );
+        assert_eq!(
+            envelope.get("error_code").and_then(Value::as_str),
+            Some(expected_code),
+            "{id} must keep expected_code and envelope.error_code aligned"
+        );
+        assert!(
+            envelope
+                .get("hint")
+                .and_then(Value::as_str)
+                .is_some_and(|hint| !hint.trim().is_empty()),
+            "{id} must carry an actionable hint"
+        );
+        observed.insert(expected_code.to_string());
+    }
+
+    assert_eq!(
+        observed,
+        [
+            "robot.pane_not_found".to_string(),
+            "robot.policy_denied".to_string(),
+            "robot.require_approval".to_string(),
+            "robot.timeout".to_string(),
+        ]
+        .into_iter()
+        .collect(),
+        "robot error matrix must pin pane_not_found, policy_denied, require_approval, and timeout"
+    );
 }
 
 #[test]
