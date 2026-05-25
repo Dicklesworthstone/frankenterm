@@ -630,18 +630,30 @@ pub struct RuntimeLockMemoryTelemetrySnapshot {
 
 impl RuntimeLockMemoryTelemetrySnapshot {
     /// Update the latest global lock/memory telemetry snapshot.
+    ///
+    /// Poison-recovery (parity with the `unwrap_or_else(|e| e.into_inner())`
+    /// pattern used for every global-state lock in runtime_telemetry.rs): a
+    /// poisoned lock previously caused `if let Ok` to SILENTLY DROP the update,
+    /// taking lock/memory telemetry permanently dark with no signal. The write
+    /// critical section is a single infallible assignment, so the guarded data
+    /// is never torn — recover the guard and apply the update instead of losing
+    /// it.
     pub fn update_global(snapshot: Self) {
         let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(snapshot);
-        }
+        let mut guard = lock.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(snapshot);
     }
 
     /// Get the latest lock/memory telemetry snapshot.
+    ///
+    /// Poison-recovery sibling of [`Self::update_global`]: a poisoned lock
+    /// previously made `.ok()` return `None`, masking a present snapshot as
+    /// "no telemetry". Recover the guard and return the value.
     #[must_use]
     pub fn get_global() -> Option<Self> {
         let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
-        lock.read().ok().and_then(|guard| guard.clone())
+        let guard = lock.read().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
     }
 }
 
@@ -8143,6 +8155,63 @@ mod tests {
         assert_eq!(snap, cloned);
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("RuntimeLockMemoryTelemetrySnapshot"));
+    }
+
+    /// Round-trip plus poisoned-lock recovery for the global lock/memory
+    /// telemetry snapshot. Pre-fix, `update_global` used `if let Ok` (silently
+    /// dropping the update on a poisoned lock) and `get_global` used `.ok()`
+    /// (returning None), so a poisoned lock took telemetry permanently dark.
+    /// Post-fix both recover via `unwrap_or_else(|e| e.into_inner())`, matching
+    /// the global-state lock idiom used throughout runtime_telemetry.rs.
+    ///
+    /// One test (not split) so the process-global static is touched on a single
+    /// thread — no inter-test race on the shared value.
+    #[test]
+    fn lock_memory_snapshot_global_round_trip_and_poison_recovery() {
+        let snap = RuntimeLockMemoryTelemetrySnapshot {
+            timestamp_ms: 777_777,
+            avg_storage_lock_wait_ms: 1.0,
+            p50_storage_lock_wait_ms: 0.5,
+            p95_storage_lock_wait_ms: 3.0,
+            max_storage_lock_wait_ms: 5.0,
+            storage_lock_contention_events: 2,
+            avg_storage_lock_hold_ms: 2.0,
+            p50_storage_lock_hold_ms: 1.5,
+            p95_storage_lock_hold_ms: 6.0,
+            max_storage_lock_hold_ms: 8.0,
+            cursor_snapshot_bytes_last: 1024,
+            p50_cursor_snapshot_bytes: 1024,
+            p95_cursor_snapshot_bytes: 2048,
+            cursor_snapshot_bytes_max: 4096,
+            avg_cursor_snapshot_bytes: 1500.0,
+        };
+
+        // Basic round-trip on a healthy lock.
+        RuntimeLockMemoryTelemetrySnapshot::update_global(snap.clone());
+        assert_eq!(
+            RuntimeLockMemoryTelemetrySnapshot::get_global().map(|s| s.timestamp_ms),
+            Some(777_777),
+            "update_global value must be retrievable via get_global"
+        );
+
+        // Poison the global lock by panicking while holding the write guard.
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
+            let _guard = lock.write().unwrap_or_else(|e| e.into_inner());
+            panic!("poison global lock/memory telemetry lock");
+        }));
+        assert!(poison.is_err());
+
+        // After poison: update_global must RECOVER and apply the new snapshot
+        // (not silently drop it), and get_global must recover and return it.
+        let mut snap2 = snap;
+        snap2.timestamp_ms = 888_888;
+        RuntimeLockMemoryTelemetrySnapshot::update_global(snap2);
+        assert_eq!(
+            RuntimeLockMemoryTelemetrySnapshot::get_global().map(|s| s.timestamp_ms),
+            Some(888_888),
+            "update/get must recover from a poisoned lock and not lose the update"
+        );
     }
 
     // =========================================================================
