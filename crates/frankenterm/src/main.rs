@@ -20627,6 +20627,34 @@ fn distributed_validate_handshake_session_id(
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_build_allow_agent_ids(
+    distributed_config: &frankenterm_core::config::DistributedConfig,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut allow_agent_ids = std::collections::HashSet::new();
+    for raw_agent_id in &distributed_config.allow_agent_ids {
+        let trimmed = raw_agent_id.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("distributed.allow_agent_ids entries must be non-empty");
+        }
+        frankenterm_core::wire_protocol::validate_sender_identity_with_limits(trimmed, wire_limits)
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "distributed.allow_agent_ids contains invalid entry {trimmed:?}: {err}"
+                )
+            })?;
+
+        let normalized = distributed_normalize_identity(trimmed);
+        if !allow_agent_ids.insert(normalized.clone()) {
+            anyhow::bail!(
+                "distributed.allow_agent_ids contains duplicate entry {trimmed:?} after normalization"
+            );
+        }
+    }
+    Ok(allow_agent_ids)
+}
+
+#[cfg(feature = "distributed")]
 const DISTRIBUTED_MESSAGE_TOO_LARGE_IO_ERROR_MARKER: &str = "distributed_message_too_large";
 
 #[cfg(feature = "distributed")]
@@ -21778,12 +21806,7 @@ async fn spawn_distributed_listener(
             Ok(token) => token,
             Err(err) => anyhow::bail!("Failed to resolve distributed token: {err}"),
         };
-    let allow_agent_ids: HashSet<String> = distributed_config
-        .allow_agent_ids
-        .iter()
-        .map(|agent| distributed_normalize_identity(agent))
-        .filter(|agent| !agent.is_empty())
-        .collect();
+    let allow_agent_ids = distributed_build_allow_agent_ids(&distributed_config, wire_limits)?;
     let allow_agent_ids = Arc::new(allow_agent_ids);
 
     // bind_addr is the server-side listener address (aggregator mode).
@@ -61818,6 +61841,36 @@ recorder_backend = "frankensqlite"
             Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed),
             "oversized handshake session_id must fail closed before replay-state allocation",
         );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_build_allow_agent_ids_rejects_blank_invalid_and_duplicate_entries() {
+        let limits = default_wire_limits();
+        let mut config = frankenterm_core::config::DistributedConfig::default();
+
+        assert!(
+            distributed_build_allow_agent_ids(&config, limits)
+                .expect("empty allowlist is unrestricted")
+                .is_empty()
+        );
+
+        config.allow_agent_ids = vec![" Agent-1 ".to_string()];
+        let allowlist =
+            distributed_build_allow_agent_ids(&config, limits).expect("valid allowlist");
+        assert!(allowlist.contains("agent-1"));
+
+        for bad_entries in [
+            vec![" \t ".to_string()],
+            vec!["agent:bad".to_string()],
+            vec!["Agent-1".to_string(), "agent-1".to_string()],
+        ] {
+            config.allow_agent_ids = bad_entries;
+            assert!(
+                distributed_build_allow_agent_ids(&config, limits).is_err(),
+                "malformed allow_agent_ids must fail closed before listener start"
+            );
+        }
     }
 
     #[cfg(feature = "distributed")]
