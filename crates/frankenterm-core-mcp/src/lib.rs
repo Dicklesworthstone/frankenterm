@@ -66,6 +66,22 @@ impl Default for McpClientConfig {
     }
 }
 
+fn redact_mcp_client_config_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("sk-")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("password")
+        || lower.contains("bearer")
+    {
+        "[REDACTED]".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 impl McpClientConfig {
     /// Validate the MCP client config invariants before runtime use.
     pub fn validate(&self) -> Result<(), String> {
@@ -102,6 +118,7 @@ impl McpClientConfig {
             }
             let canonical = trimmed.to_ascii_lowercase();
             if !seen_servers.insert(canonical) {
+                let trimmed = redact_mcp_client_config_name(trimmed);
                 return Err(format!(
                     "mcp_client.preferred_servers contains duplicate server name: {trimmed}"
                 ));
@@ -130,6 +147,7 @@ impl McpClientConfig {
                 }
                 let canonical = trimmed.to_ascii_lowercase();
                 if !seen_proxy_servers.insert(canonical) {
+                    let trimmed = redact_mcp_client_config_name(trimmed);
                     return Err(format!(
                         "mcp_client.proxy_servers contains duplicate server name: {trimmed}"
                     ));
@@ -444,6 +462,54 @@ mod tests {
         let err = config.validate().expect_err("duplicate preferred server");
 
         assert!(err.contains("duplicate server name"));
+    }
+
+    #[test]
+    fn mcp_client_config_redacts_secret_shaped_duplicate_preferred_server() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let config = McpClientConfig {
+            preferred_servers: vec![secret.to_string(), secret.to_ascii_uppercase()],
+            ..McpClientConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("duplicate preferred server should fail");
+
+        assert!(err.contains("duplicate server name"));
+        assert!(
+            !err.contains(secret),
+            "raw preferred server secret leaked in validation error: {err}"
+        );
+        assert!(
+            err.contains("[REDACTED]"),
+            "expected redaction marker in validation error: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_client_config_redacts_secret_shaped_duplicate_proxy_server() {
+        let secret = "sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB";
+        let config = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_servers: vec![secret.to_string(), secret.to_ascii_uppercase()],
+            ..McpClientConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("duplicate proxy server should fail");
+
+        assert!(err.contains("duplicate server name"));
+        assert!(
+            !err.contains(secret),
+            "raw proxy server secret leaked in validation error: {err}"
+        );
+        assert!(
+            err.contains("[REDACTED]"),
+            "expected redaction marker in validation error: {err}"
+        );
     }
 
     #[test]
