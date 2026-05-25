@@ -29,8 +29,8 @@ use std::collections::{HashSet, VecDeque};
 
 use frankenterm_core::plan::{MissionKillSwitchLevel, MissionTxState};
 use frankenterm_core::tx_killswitch_model::{
-    KillSwitchAction, KillSwitchModelState, apply, check_safety, enabled_actions,
-    hard_stop_admits_progress, is_drained,
+    KillSwitchAction, KillSwitchModelState, KillSwitchTraceRow, apply, check_safety,
+    enabled_actions, hard_stop_admits_progress, is_drained, parse_trace_jsonl, render_trace_jsonl,
 };
 use proptest::prelude::*;
 
@@ -52,6 +52,44 @@ fn next_lcg(seed: &mut u64) -> u64 {
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     *seed
+}
+
+fn replay_schedule(
+    step_count: u8,
+    schedule: &[KillSwitchAction],
+) -> (KillSwitchModelState, String) {
+    let mut state = KillSwitchModelState::initial(step_count);
+    let mut rows = Vec::with_capacity(schedule.len());
+
+    for (step_idx, action) in schedule.iter().copied().enumerate() {
+        let actions = enabled_actions(&state);
+        assert!(
+            actions.contains(&action),
+            "action {action:?} not enabled at replay step {step_idx} from {state:?}; enabled={actions:?}"
+        );
+
+        let next = apply(&state, action);
+        let violations = check_safety(&next);
+        assert!(
+            violations.is_empty(),
+            "safety violation after replay step {step_idx}: {next:?}: {violations:?}"
+        );
+        assert!(
+            hard_stop_admits_progress(&next),
+            "HardStop progress invariant violated after replay step {step_idx}: {next:?}"
+        );
+
+        rows.push(KillSwitchTraceRow {
+            step_idx: step_idx as u64,
+            from_state: state,
+            action,
+            to_state: next.clone(),
+            safety_violations: violations,
+        });
+        state = next;
+    }
+
+    (state, render_trace_jsonl(&rows))
 }
 
 // ============================================================================
@@ -194,6 +232,66 @@ fn every_reachable_hard_stop_state_admits_progress_to_drained() {
         "no HardStop states reached — model is broken"
     );
     println!("verified hard-stop progress on {hard_stop_states_seen} reachable HardStop states");
+}
+
+// ============================================================================
+// Test 3b — Deterministic compensation replay after mid-commit HardStop
+// ============================================================================
+
+#[test]
+fn mid_commit_hard_stop_compensation_replay_is_deterministic() {
+    let schedule = [
+        KillSwitchAction::Plan,
+        KillSwitchAction::Prepare,
+        KillSwitchAction::BeginCommit,
+        KillSwitchAction::CommitStep { step_id: 0 },
+        KillSwitchAction::CommitStep { step_id: 1 },
+        KillSwitchAction::FlipKillSwitch {
+            to: MissionKillSwitchLevel::HardStop,
+        },
+        KillSwitchAction::FailCommit,
+        KillSwitchAction::BeginCompensate,
+        KillSwitchAction::CompensateStep { step_id: 0 },
+        KillSwitchAction::CompensateStep { step_id: 1 },
+        KillSwitchAction::FinishCompensate,
+        KillSwitchAction::RollBack,
+    ];
+
+    let (first_state, first_jsonl) = replay_schedule(3, &schedule);
+    let (second_state, second_jsonl) = replay_schedule(3, &schedule);
+
+    assert_eq!(first_state, second_state);
+    assert_eq!(
+        first_jsonl, second_jsonl,
+        "mid-commit compensation trace must replay byte-for-byte"
+    );
+    assert_eq!(first_state.tx_state, MissionTxState::RolledBack);
+    assert_eq!(first_state.kill_switch, MissionKillSwitchLevel::HardStop);
+    assert_eq!(first_state.compensated_steps, first_state.committed_steps);
+    assert_eq!(first_state.committed_steps.len(), 2);
+    assert!(is_drained(&first_state));
+
+    let parsed = parse_trace_jsonl(&first_jsonl).expect("trace JSONL parses");
+    assert_eq!(parsed.len(), schedule.len());
+    assert!(parsed.iter().all(|row| row.safety_violations.is_empty()));
+    assert!(parsed.iter().any(|row| matches!(
+        row.action,
+        KillSwitchAction::FlipKillSwitch {
+            to: MissionKillSwitchLevel::HardStop
+        }
+    )));
+    assert!(
+        parsed
+            .iter()
+            .any(|row| matches!(row.action, KillSwitchAction::FailCommit))
+    );
+    assert_eq!(
+        parsed
+            .iter()
+            .filter(|row| matches!(row.action, KillSwitchAction::CompensateStep { .. }))
+            .count(),
+        2
+    );
 }
 
 // ============================================================================

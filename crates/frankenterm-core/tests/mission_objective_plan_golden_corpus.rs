@@ -9,7 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use frankenterm_core::mission_objective_plan::{
-    MissionObjectivePlannerInput, build_mission_objective_plan_surface_data, plan_mission_objective,
+    MissionObjectiveActionKind, MissionObjectiveCandidateReadiness, MissionObjectiveCandidateWork,
+    MissionObjectiveCapacityPosture, MissionObjectivePlanStatus, MissionObjectivePlannerInput,
+    MissionObjectiveRiskLevel, build_mission_objective_plan_surface_data, plan_mission_objective,
 };
 use jsonschema::Validator;
 use serde::Deserialize;
@@ -174,6 +176,100 @@ fn top_step_field(surface_value: &Value, field: &str) -> String {
         .first()
         .unwrap_or_else(|| panic!("plan has no top step in generated golden"));
     string_field(first, &format!("/{field}"))
+}
+
+#[test]
+fn mission_objective_capacity_admit_defer_matrix_is_deterministic() {
+    #[derive(Debug)]
+    struct Case {
+        name: &'static str,
+        posture: MissionObjectiveCapacityPosture,
+        expected_status: MissionObjectivePlanStatus,
+        expected_action: MissionObjectiveActionKind,
+        expected_risk: MissionObjectiveRiskLevel,
+        expected_capacity_action: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "capacity_admits_ready_work",
+            posture: MissionObjectiveCapacityPosture::Admit,
+            expected_status: MissionObjectivePlanStatus::Actionable,
+            expected_action: MissionObjectiveActionKind::ChooseReadyBead,
+            expected_risk: MissionObjectiveRiskLevel::Low,
+            expected_capacity_action: "admit",
+        },
+        Case {
+            name: "capacity_defers_ready_work",
+            posture: MissionObjectiveCapacityPosture::Defer,
+            expected_status: MissionObjectivePlanStatus::WaitingExternal,
+            expected_action: MissionObjectiveActionKind::WaitExternal,
+            expected_risk: MissionObjectiveRiskLevel::High,
+            expected_capacity_action: "defer",
+        },
+        Case {
+            name: "capacity_pause_denies_new_claim",
+            posture: MissionObjectiveCapacityPosture::Pause,
+            expected_status: MissionObjectivePlanStatus::WaitingExternal,
+            expected_action: MissionObjectiveActionKind::WaitExternal,
+            expected_risk: MissionObjectiveRiskLevel::High,
+            expected_capacity_action: "defer",
+        },
+    ];
+
+    for case in cases {
+        let input = MissionObjectivePlannerInput::new(1_700_000_000_000, "test", case.name)
+            .with_candidate(
+                MissionObjectiveCandidateWork::new(
+                    format!("candidate.{}", case.name),
+                    MissionObjectiveCandidateReadiness::ReadyBead,
+                )
+                .target_bead_id(format!("ft-{}", case.name))
+                .capacity_posture(case.posture),
+            );
+
+        let plan = plan_mission_objective(&input);
+        let replay = plan_mission_objective(&input);
+
+        assert_eq!(
+            plan, replay,
+            "{}: planner replay must be deterministic",
+            case.name
+        );
+        assert_eq!(plan.plan_status, case.expected_status, "{}", case.name);
+        assert_eq!(plan.risk_level, case.expected_risk, "{}", case.name);
+        assert!(plan.dry_run, "{}", case.name);
+        assert!(!plan.side_effects_executed, "{}", case.name);
+        assert!(!plan.raw_pane_content_stored, "{}", case.name);
+
+        let step = plan
+            .plan_steps
+            .first()
+            .unwrap_or_else(|| panic!("{}: expected one candidate step", case.name));
+        assert_eq!(step.action_kind, case.expected_action, "{}", case.name);
+        assert_eq!(step.risk_level, case.expected_risk, "{}", case.name);
+
+        let value = serde_json::to_value(&plan)
+            .unwrap_or_else(|err| panic!("{}: serialize plan artifact: {err}", case.name));
+        assert_eq!(
+            value
+                .pointer("/capacity_admission/action")
+                .and_then(Value::as_str),
+            Some(case.expected_capacity_action),
+            "{}: capacity admission action",
+            case.name
+        );
+        assert_eq!(
+            value
+                .pointer("/capacity_admission/reason_codes")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default(),
+            plan.reason_codes.len(),
+            "{}: capacity artifact must carry planner reason-code set",
+            case.name
+        );
+    }
 }
 
 #[test]
