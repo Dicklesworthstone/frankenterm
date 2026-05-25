@@ -6239,6 +6239,22 @@ rules:
     }
 
     #[test]
+    fn mark_seen_key_refreshes_expired_key_without_duplicate_order_entry() {
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::ZERO);
+
+        assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
+        assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
+
+        assert_eq!(ctx.seen_count(), 1);
+        assert_eq!(ctx.seen_order.len(), 1);
+        assert_eq!(
+            ctx.seen_order.front().map(String::as_str),
+            Some("codex.test:repeat")
+        );
+    }
+
+    #[test]
     fn detection_dedup_key_includes_extracted() {
         let d1 = Detection {
             rule_id: "test.rule".into(),
