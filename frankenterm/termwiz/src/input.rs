@@ -1368,6 +1368,17 @@ impl InputParser {
             (KeyCode::Home, b'7'),
             (KeyCode::End, b'8'),
         ] {
+            for (suffix, modifiers) in modifier_combos_including_meta() {
+                let key = format!("\x1b[{}{}~", *c as char, suffix);
+                map.insert(
+                    key,
+                    InputEvent::Key(KeyEvent {
+                        key: *keycode,
+                        modifiers: *modifiers,
+                    }),
+                );
+            }
+
             for (suffix, modifiers) in &[
                 (b'~', Modifiers::NONE),
                 (b'$', Modifiers::SHIFT),
@@ -2171,6 +2182,51 @@ mod test {
             ],
             res
         );
+    }
+
+    #[test]
+    fn parse_csi_ss3_key_modifier_conformance_matrix() {
+        let cases = [
+            (b"\x1b[A".as_slice(), KeyCode::UpArrow, Modifiers::NONE),
+            (b"\x1b[1;2A", KeyCode::UpArrow, Modifiers::SHIFT),
+            (b"\x1b[1;3D", KeyCode::LeftArrow, Modifiers::ALT),
+            (b"\x1b[1;5F", KeyCode::End, Modifiers::CTRL),
+            (
+                b"\x1b[1;8H",
+                KeyCode::Home,
+                Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT,
+            ),
+            (b"\x1bOA", KeyCode::ApplicationUpArrow, Modifiers::NONE),
+            (b"\x1bO1;2A", KeyCode::ApplicationUpArrow, Modifiers::SHIFT),
+            (
+                b"\x1bO1;7D",
+                KeyCode::ApplicationLeftArrow,
+                Modifiers::CTRL | Modifiers::ALT,
+            ),
+            (b"\x1bOP", KeyCode::Function(1), Modifiers::NONE),
+            (b"\x1b[1;2P", KeyCode::Function(1), Modifiers::SHIFT),
+            (
+                b"\x1b[1;8S",
+                KeyCode::Function(4),
+                Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT,
+            ),
+            (b"\x1b[5;5~", KeyCode::PageUp, Modifiers::CTRL),
+            (
+                b"\x1b[6;8~",
+                KeyCode::PageDown,
+                Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT,
+            ),
+        ];
+
+        for (input, key, modifiers) in cases {
+            let mut p = InputParser::new();
+            assert_eq!(
+                p.parse_as_vec(input, NO_MORE),
+                vec![InputEvent::Key(KeyEvent { key, modifiers })],
+                "input {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[test]

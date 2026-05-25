@@ -620,6 +620,79 @@ mod test {
     }
 
     #[test]
+    fn change_sequence_cursor_wrap_goldens() {
+        struct Golden {
+            name: &'static str,
+            rows: usize,
+            cols: usize,
+            changes: Vec<Change>,
+            cursor: (usize, isize),
+            render_height: usize,
+        }
+
+        let cases = [
+            Golden {
+                name: "text crosses right edge",
+                rows: 3,
+                cols: 4,
+                changes: vec![Change::Text("abcdE".into())],
+                cursor: (1, 1),
+                render_height: 1,
+            },
+            Golden {
+                name: "negative relative cursor wraps from origin",
+                rows: 3,
+                cols: 4,
+                changes: vec![Change::CursorPosition {
+                    x: Position::Relative(-1),
+                    y: Position::Relative(-1),
+                }],
+                cursor: (3, 2),
+                render_height: 2,
+            },
+            Golden {
+                name: "end-relative zero targets last cell",
+                rows: 3,
+                cols: 4,
+                changes: vec![Change::CursorPosition {
+                    x: Position::EndRelative(0),
+                    y: Position::EndRelative(0),
+                }],
+                cursor: (3, 2),
+                render_height: 2,
+            },
+            Golden {
+                name: "oversized end-relative wraps to origin",
+                rows: 3,
+                cols: 4,
+                changes: vec![Change::CursorPosition {
+                    x: Position::EndRelative(usize::MAX),
+                    y: Position::EndRelative(usize::MAX),
+                }],
+                cursor: (0, 0),
+                render_height: 0,
+            },
+        ];
+
+        for case in cases {
+            let mut cs = ChangeSequence::new(case.rows, case.cols);
+            cs.add_changes(case.changes);
+            assert_eq!(
+                cs.current_cursor_position(),
+                case.cursor,
+                "{} cursor",
+                case.name
+            );
+            assert_eq!(
+                cs.render_height(),
+                case.render_height,
+                "{} height",
+                case.name
+            );
+        }
+    }
+
+    #[test]
     fn change_sequence_scroll_resets_cursor() {
         let mut cs = ChangeSequence::new(24, 80);
         cs.add("Hello World");
