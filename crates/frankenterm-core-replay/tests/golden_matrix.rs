@@ -1,13 +1,22 @@
+use frankenterm_core_replay::replay_decision_diff::{
+    DecisionDiff, DiffConfig, DivergenceType, EquivalenceLevel, MissionCausalityCategory,
+    RootCause,
+};
+use frankenterm_core_replay_types::recorder_metadata::{
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEventSource,
+    RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
+};
 use frankenterm_core_replay_types::replay_decision_graph::{
     DecisionEvent, DecisionGraph, DecisionType,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
 const GOLDEN_SCHEMA: &str = "ft.replay.golden_matrix.v1";
 const CANONICAL_SCHEMA: &str = "ft.replay.canonical_output.v1";
+const RECORDER_METADATA_GOLDEN_SCHEMA: &str = "ft.recorder.metadata.roundtrip.v1";
 const TARGETS: &[&str] = &["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"];
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -47,6 +56,18 @@ struct EventSummary {
     effects: Vec<u64>,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RecorderMetadataGolden {
+    schema: String,
+    recorder_event_schema_version: String,
+    event_sources: Vec<RecorderEventSource>,
+    text_encodings: Vec<RecorderTextEncoding>,
+    redaction_levels: Vec<RecorderRedactionLevel>,
+    ingress_kinds: Vec<RecorderIngressKind>,
+    segment_kinds: Vec<RecorderSegmentKind>,
+    control_marker_types: Vec<RecorderControlMarkerType>,
+}
+
 fn golden_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/replay/cross_arch_decision_matrix.json")
@@ -55,6 +76,11 @@ fn golden_path() -> PathBuf {
 fn decision_graph_roundtrip_golden_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/replay/decision_graph_roundtrip.v1.json")
+}
+
+fn recorder_metadata_roundtrip_golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/replay/recorder_metadata_roundtrip.v1.json")
 }
 
 fn representative_events(target_triple: &str) -> Vec<DecisionEvent> {
@@ -249,6 +275,47 @@ fn build_matrix() -> GoldenMatrix {
     }
 }
 
+fn build_recorder_metadata_golden() -> RecorderMetadataGolden {
+    RecorderMetadataGolden {
+        schema: RECORDER_METADATA_GOLDEN_SCHEMA.to_string(),
+        recorder_event_schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        event_sources: vec![
+            RecorderEventSource::WeztermMux,
+            RecorderEventSource::RobotMode,
+            RecorderEventSource::Mcp,
+            RecorderEventSource::WorkflowEngine,
+            RecorderEventSource::Beads,
+            RecorderEventSource::Rch,
+            RecorderEventSource::AgentMail,
+            RecorderEventSource::Git,
+            RecorderEventSource::OperatorAction,
+            RecorderEventSource::RecoveryFlow,
+        ],
+        text_encodings: vec![RecorderTextEncoding::Utf8],
+        redaction_levels: vec![
+            RecorderRedactionLevel::None,
+            RecorderRedactionLevel::Partial,
+            RecorderRedactionLevel::Full,
+        ],
+        ingress_kinds: vec![
+            RecorderIngressKind::SendText,
+            RecorderIngressKind::Paste,
+            RecorderIngressKind::WorkflowAction,
+        ],
+        segment_kinds: vec![
+            RecorderSegmentKind::Delta,
+            RecorderSegmentKind::Gap,
+            RecorderSegmentKind::Snapshot,
+        ],
+        control_marker_types: vec![
+            RecorderControlMarkerType::PromptBoundary,
+            RecorderControlMarkerType::Resize,
+            RecorderControlMarkerType::PolicyDecision,
+            RecorderControlMarkerType::ApprovalCheckpoint,
+        ],
+    }
+}
+
 fn read_golden() -> String {
     fs::read_to_string(golden_path()).expect("golden matrix fixture is checked in")
 }
@@ -256,6 +323,11 @@ fn read_golden() -> String {
 fn read_decision_graph_roundtrip_golden() -> String {
     fs::read_to_string(decision_graph_roundtrip_golden_path())
         .expect("decision graph round-trip fixture is checked in")
+}
+
+fn read_recorder_metadata_roundtrip_golden() -> String {
+    fs::read_to_string(recorder_metadata_roundtrip_golden_path())
+        .expect("recorder metadata round-trip fixture is checked in")
 }
 
 #[test]
@@ -381,4 +453,270 @@ fn decision_graph_l1_roundtrip_ignores_transient_replay_metadata() {
         canonical_bytes(&canonical_output_for(TARGETS[1])),
         "canonical replay output should scrub target-specific transient metadata"
     );
+}
+
+#[test]
+fn forensics_diff_conformance_classifies_policy_causal_chain() {
+    let baseline = DecisionGraph::from_decisions(&[
+        decision(
+            DecisionType::PatternMatch,
+            42,
+            "usage.limit.detected",
+            "pattern=usage-limit;version=1",
+            "pane=42 usage limit marker",
+            serde_json::json!({"matched": true}),
+            None,
+            0.99,
+            1_000,
+        ),
+        decision(
+            DecisionType::PolicyDecision,
+            42,
+            "policy.approval_required",
+            "policy=approval;version=7",
+            "usage limit marker produced approval policy input",
+            serde_json::json!({"decision": "allow"}),
+            Some(0),
+            1.0,
+            1_010,
+        ),
+        decision(
+            DecisionType::WorkflowStep,
+            42,
+            "workflow.continue_after_policy",
+            "step=continue;requires=policy.approval_required",
+            "policy allow emitted continue workflow input",
+            serde_json::json!({"next": "continue"}),
+            Some(1),
+            1.0,
+            1_020,
+        ),
+    ]);
+    let candidate = DecisionGraph::from_decisions(&[
+        decision(
+            DecisionType::PatternMatch,
+            42,
+            "usage.limit.detected",
+            "pattern=usage-limit;version=1",
+            "pane=42 usage limit marker",
+            serde_json::json!({"matched": true}),
+            None,
+            0.99,
+            1_000,
+        ),
+        decision(
+            DecisionType::PolicyDecision,
+            42,
+            "policy.approval_required",
+            "policy=approval;version=7",
+            "usage limit marker produced approval policy input",
+            serde_json::json!({"decision": "require_approval"}),
+            Some(0),
+            1.0,
+            1_010,
+        ),
+        decision(
+            DecisionType::WorkflowStep,
+            42,
+            "workflow.pause_for_approval",
+            "step=pause;requires=policy.approval_required",
+            "policy approval emitted pause workflow input",
+            serde_json::json!({"next": "wait_for_operator"}),
+            Some(1),
+            1.0,
+            1_020,
+        ),
+    ]);
+
+    let diff = DecisionDiff::diff(&baseline, &candidate, &DiffConfig::default());
+    assert_eq!(diff.summary.total_baseline, 3);
+    assert_eq!(diff.summary.total_candidate, 3);
+    assert_eq!(diff.summary.unchanged, 1);
+    assert_eq!(diff.summary.modified, 1);
+    assert_eq!(diff.summary.removed, 1);
+    assert_eq!(diff.summary.added, 1);
+    assert_eq!(diff.summary.shifted, 0);
+    assert!(!diff.is_equivalent(EquivalenceLevel::L0));
+    assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+    assert!(!diff.is_equivalent(EquivalenceLevel::L2));
+
+    let first = &diff.divergences[0];
+    assert_eq!(first.position, 1);
+    assert_eq!(first.divergence_type, DivergenceType::Modified);
+    assert_eq!(first.root_cause, RootCause::Unknown);
+    assert_eq!(
+        first
+            .baseline_node
+            .as_ref()
+            .expect("modified diff has a baseline node")
+            .rule_id,
+        "policy.approval_required"
+    );
+    assert_eq!(
+        first
+            .candidate_node
+            .as_ref()
+            .expect("modified diff has a candidate node")
+            .rule_id,
+        "policy.approval_required"
+    );
+
+    let mission = diff.to_mission_causality_diff(&baseline, &candidate);
+    assert!(!mission.summary.identical);
+    assert_eq!(mission.summary.total_divergences, 3);
+    assert_eq!(
+        mission.summary.first_category,
+        MissionCausalityCategory::PolicyDecision
+    );
+
+    let first_mission = mission
+        .first_divergence
+        .as_ref()
+        .expect("mission diff reports the first divergence");
+    assert_eq!(first_mission.position, 1);
+    assert_eq!(first_mission.category, MissionCausalityCategory::PolicyDecision);
+    assert_eq!(first_mission.divergence_type, DivergenceType::Modified);
+    assert_eq!(
+        first_mission.evidence_refs,
+        vec![
+            "divergence_position:1",
+            "divergence_type:Modified",
+            "root_cause:unknown",
+            "baseline_node:1",
+            "candidate_node:1",
+        ]
+    );
+
+    let first_chain = &mission.reason_chains[0];
+    assert_eq!(
+        first_chain
+            .upstream_chain
+            .iter()
+            .map(|node| node.rule_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["usage.limit.detected"]
+    );
+    assert_eq!(
+        first_chain
+            .downstream_effects
+            .iter()
+            .map(|node| node.rule_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["workflow.pause_for_approval"]
+    );
+
+    let mission_json = mission.to_json();
+    assert!(!mission_json.contains("approval policy input"));
+    assert!(!mission_json.contains("wait_for_operator"));
+}
+
+#[test]
+fn forensics_diff_conformance_preserves_timing_equivalence_levels() {
+    let baseline = DecisionGraph::from_decisions(&[
+        decision(
+            DecisionType::PatternMatch,
+            7,
+            "prompt.boundary",
+            "pattern=prompt-boundary;version=2",
+            "pane=7 prompt boundary",
+            serde_json::json!({"matched": true}),
+            None,
+            1.0,
+            2_000,
+        ),
+        decision(
+            DecisionType::WorkflowStep,
+            7,
+            "workflow.dispatch_next",
+            "step=dispatch-next;version=4",
+            "prompt boundary dispatched next step",
+            serde_json::json!({"next": "dispatch"}),
+            Some(0),
+            1.0,
+            2_040,
+        ),
+    ]);
+    let candidate = DecisionGraph::from_decisions(&[
+        decision(
+            DecisionType::PatternMatch,
+            7,
+            "prompt.boundary",
+            "pattern=prompt-boundary;version=2",
+            "pane=7 prompt boundary",
+            serde_json::json!({"matched": true}),
+            None,
+            1.0,
+            2_000,
+        ),
+        decision(
+            DecisionType::WorkflowStep,
+            7,
+            "workflow.dispatch_next",
+            "step=dispatch-next;version=4",
+            "prompt boundary dispatched next step",
+            serde_json::json!({"next": "dispatch"}),
+            Some(0),
+            1.0,
+            2_095,
+        ),
+    ]);
+
+    let diff = DecisionDiff::diff(&baseline, &candidate, &DiffConfig::default());
+    assert_eq!(diff.summary.unchanged, 1);
+    assert_eq!(diff.summary.shifted, 1);
+    assert_eq!(diff.summary.total_divergences(), 1);
+    assert!(diff.is_equivalent(EquivalenceLevel::L0));
+    assert!(diff.is_equivalent(EquivalenceLevel::L1));
+    assert!(!diff.is_equivalent(EquivalenceLevel::L2));
+    assert_eq!(diff.divergences[0].divergence_type, DivergenceType::Shifted);
+    assert_eq!(
+        diff.divergences[0].root_cause,
+        RootCause::TimingShift {
+            baseline_ms: 2_040,
+            candidate_ms: 2_095,
+            delta_ms: 55,
+        }
+    );
+
+    let mission = diff.to_mission_causality_diff(&baseline, &candidate);
+    assert_eq!(mission.summary.first_category, MissionCausalityCategory::Timing);
+    assert_eq!(
+        mission
+            .first_divergence
+            .as_ref()
+            .expect("timing diff has a first divergence")
+            .evidence_refs,
+        vec![
+            "divergence_position:1",
+            "divergence_type:Shifted",
+            "root_cause:timing_shift",
+            "baseline_node:1",
+            "candidate_node:1",
+        ]
+    );
+}
+
+#[test]
+fn recorder_metadata_enum_catalog_roundtrips_through_golden_artifact() {
+    let expected = build_recorder_metadata_golden();
+    let actual = serde_json::to_string_pretty(&expected).expect("metadata serializes") + "\n";
+    let path = recorder_metadata_roundtrip_golden_path();
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        fs::write(&path, &actual).expect("recorder metadata golden fixture can be updated");
+    }
+
+    assert_eq!(
+        read_recorder_metadata_roundtrip_golden(),
+        actual,
+        "recorder metadata golden fixture drifted: {path:?}"
+    );
+
+    let restored_actual: RecorderMetadataGolden =
+        serde_json::from_str(&actual).expect("generated metadata JSON round-trips");
+    assert_eq!(restored_actual, expected);
+
+    let restored_golden: RecorderMetadataGolden =
+        serde_json::from_str(&read_recorder_metadata_roundtrip_golden())
+            .expect("checked-in metadata golden JSON round-trips");
+    assert_eq!(restored_golden, build_recorder_metadata_golden());
 }

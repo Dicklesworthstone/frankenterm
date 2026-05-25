@@ -1,0 +1,40 @@
+{
+  "schema": "ft.recorder.metadata.roundtrip.v1",
+  "recorder_event_schema_version": "ft.recorder.event.v1",
+  "event_sources": [
+    "wezterm_mux",
+    "robot_mode",
+    "mcp",
+    "workflow_engine",
+    "beads",
+    "rch",
+    "agent_mail",
+    "git",
+    "operator_action",
+    "recovery_flow"
+  ],
+  "text_encodings": [
+    "utf8"
+  ],
+  "redaction_levels": [
+    "none",
+    "partial",
+    "full"
+  ],
+  "ingress_kinds": [
+    "send_text",
+    "paste",
+    "workflow_action"
+  ],
+  "segment_kinds": [
+    "delta",
+    "gap",
+    "snapshot"
+  ],
+  "control_marker_types": [
+    "prompt_boundary",
+    "resize",
+    "policy_decision",
+    "approval_checkpoint"
+  ]
+}
