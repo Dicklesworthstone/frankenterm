@@ -108,6 +108,7 @@ pub struct Divergence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DivergenceNode {
     pub node_id: u64,
+    pub decision_type: DecisionType,
     pub rule_id: String,
     pub definition_hash: String,
     pub output_hash: String,
@@ -119,6 +120,7 @@ impl DivergenceNode {
     fn from_decision_node(node: &DecisionNode) -> Self {
         Self {
             node_id: node.node_id,
+            decision_type: node.decision_type,
             rule_id: node.rule_id.clone(),
             definition_hash: node.definition_hash.clone(),
             output_hash: node.output_hash.clone(),
@@ -201,13 +203,13 @@ pub struct DecisionDiff {
 }
 
 /// Key for matching decisions across graphs.
-type MatchKey = (u64, u64, String); // (timestamp_ms, pane_id, rule_id)
+type MatchKey = (u64, u64, DecisionType, String); // (timestamp_ms, pane_id, decision_type, rule_id)
 
 /// Exact key including a stable ordinal for duplicate match keys.
-type ExactKey = (u64, u64, String, usize); // (timestamp_ms, pane_id, rule_id, duplicate_ordinal)
+type ExactKey = (u64, u64, DecisionType, String, usize); // (timestamp_ms, pane_id, decision_type, rule_id, duplicate_ordinal)
 
 /// Relaxed key ignoring timestamp (for shifted detection).
-type RelaxedKey = (u64, String); // (pane_id, rule_id)
+type RelaxedKey = (u64, DecisionType, String); // (pane_id, decision_type, rule_id)
 
 impl DecisionDiff {
     /// Diff two decision graphs.
@@ -227,7 +229,7 @@ impl DecisionDiff {
         let mut cand_relaxed: BTreeMap<RelaxedKey, Vec<(ExactKey, &DecisionNode)>> =
             BTreeMap::new();
         for (exact_key, node) in &cand_indexed {
-            let key = (node.pane_id, node.rule_id.clone());
+            let key = (node.pane_id, node.decision_type, node.rule_id.clone());
             cand_relaxed
                 .entry(key)
                 .or_default()
@@ -272,7 +274,7 @@ impl DecisionDiff {
                 }
             } else {
                 // Not exact match. Check for shifted.
-                let relaxed_key = (node.pane_id, node.rule_id.clone());
+                let relaxed_key = (node.pane_id, node.decision_type, node.rule_id.clone());
                 let found_shifted = if let Some(cand_list) = cand_relaxed.get(&relaxed_key) {
                     best_relaxed_match(cand_list, &matched_cand, node, config, true)
                 } else {
@@ -789,9 +791,14 @@ fn indexed_exact_nodes<'a>(nodes: &[&'a DecisionNode]) -> Vec<(ExactKey, &'a Dec
     nodes
         .iter()
         .map(|node| {
-            let match_key = (node.timestamp_ms, node.pane_id, node.rule_id.clone());
+            let match_key = (
+                node.timestamp_ms,
+                node.pane_id,
+                node.decision_type,
+                node.rule_id.clone(),
+            );
             let ordinal = duplicate_ordinals.entry(match_key.clone()).or_default();
-            let exact_key = (match_key.0, match_key.1, match_key.2, *ordinal);
+            let exact_key = (match_key.0, match_key.1, match_key.2, match_key.3, *ordinal);
             *ordinal += 1;
             (exact_key, *node)
         })
@@ -995,6 +1002,53 @@ mod tests {
         assert_eq!(diff.summary.modified, 1);
         assert!(diff.is_equivalent(EquivalenceLevel::L0));
         assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+    }
+
+    #[test]
+    fn diff_detects_decision_type_change_as_structural_divergence() {
+        let base_events = vec![make_event(
+            DecisionType::PolicyDecision,
+            "policy.same_rule",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::WorkflowStep,
+            "policy.same_rule",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.unchanged, 0);
+        assert_eq!(diff.summary.removed, 1);
+        assert_eq!(diff.summary.added, 1);
+        assert_eq!(diff.summary.modified, 0);
+        assert!(!diff.is_equivalent(EquivalenceLevel::L0));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L2));
+        assert_eq!(
+            diff.divergences[0]
+                .baseline_node
+                .as_ref()
+                .expect("removed divergence should retain baseline node")
+                .decision_type,
+            DecisionType::PolicyDecision
+        );
+        assert_eq!(
+            diff.divergences[1]
+                .candidate_node
+                .as_ref()
+                .expect("added divergence should retain candidate node")
+                .decision_type,
+            DecisionType::WorkflowStep
+        );
     }
 
     #[test]
