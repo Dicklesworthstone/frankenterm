@@ -47,7 +47,7 @@ pub struct HllStats {
 ///
 /// # Example
 /// ```
-/// use frankenterm_core::hyperloglog::HyperLogLog;
+/// use frankenterm_core_telemetry_types::hyperloglog::HyperLogLog;
 ///
 /// let mut hll = HyperLogLog::new();
 /// for i in 0..10000u64 {

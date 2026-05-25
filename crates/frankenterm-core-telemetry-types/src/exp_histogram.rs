@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::exp_histogram::ExpHistogram;
+/// use frankenterm_core_telemetry_types::exp_histogram::ExpHistogram;
 ///
 /// let mut h = ExpHistogram::new(2.0, 0, 20); // base=2, buckets for [1, 2^20)
 /// h.record(1.5);

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::ewma::Ewma;
+/// use frankenterm_core_telemetry_types::ewma::Ewma;
 ///
 /// let mut ewma = Ewma::with_half_life_ms(1000.0); // 1 second half-life
 /// ewma.observe(100.0, 0);
@@ -153,7 +153,7 @@ impl Ewma {
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::ewma::EwmaWithVariance;
+/// use frankenterm_core_telemetry_types::ewma::EwmaWithVariance;
 ///
 /// let mut tracker = EwmaWithVariance::with_half_life_ms(1000.0);
 /// for i in 0..20 {
@@ -281,7 +281,7 @@ impl EwmaWithVariance {
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::ewma::RateEstimator;
+/// use frankenterm_core_telemetry_types::ewma::RateEstimator;
 ///
 /// let mut rate = RateEstimator::with_half_life_ms(5000.0);
 /// rate.tick(1000);

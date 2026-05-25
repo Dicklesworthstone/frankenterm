@@ -90,7 +90,7 @@ pub struct CmsStats {
 ///
 /// # Example
 /// ```
-/// use frankenterm_core::count_min_sketch::CountMinSketch;
+/// use frankenterm_core_telemetry_types::count_min_sketch::CountMinSketch;
 ///
 /// let mut cms = CountMinSketch::new();
 /// for _ in 0..100 {
