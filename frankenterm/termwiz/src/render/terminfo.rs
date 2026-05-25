@@ -13,7 +13,6 @@ use crate::escape::{Esc, OneBased};
 use crate::image::{ImageData, ImageDataType, TextureCoordinate};
 use crate::render::RenderTty;
 use crate::surface::{Change, CursorShape, CursorVisibility, LineAttribute, Position};
-use std::convert::TryFrom;
 use finl_unicode::grapheme_clusters::Graphemes;
 #[cfg(feature = "use_image")]
 use image::codecs::gif::GifEncoder;
@@ -24,6 +23,7 @@ use image::{
     Delay, ExtendedColorType, Frame, GenericImage, GenericImageView, ImageBuffer, ImageEncoder,
     Rgba, RgbaImage,
 };
+use std::convert::TryFrom;
 use std::io::Write;
 use terminfo::{Capability as TermInfoCapability, capability as cap};
 
@@ -522,8 +522,8 @@ impl TerminfoRenderer {
                 out,
                 "{}",
                 CSI::Cursor(Cursor::Position {
-                    line: OneBased::from_zero_based(x),
-                    col: OneBased::from_zero_based(y),
+                    line: OneBased::from_zero_based(y),
+                    col: OneBased::from_zero_based(x),
                 })
             )?;
         }
@@ -1553,6 +1553,25 @@ mod test {
                 Action::Control(ControlCode::CarriageReturn),
                 Action::CSI(CSI::Cursor(Cursor::Right(u32::MAX))),
             ]
+        );
+    }
+
+    #[test]
+    fn render_absolute_cursor_fallback_preserves_row_and_column_order() {
+        let mut out = FakeTerm::new(no_terminfo_all_enabled());
+
+        out.render(&[Change::CursorPosition {
+            x: Position::Absolute(2),
+            y: Position::Absolute(1),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            out.parse(),
+            vec![Action::CSI(CSI::Cursor(Cursor::Position {
+                line: OneBased::new(2),
+                col: OneBased::new(3),
+            }))]
         );
     }
 
