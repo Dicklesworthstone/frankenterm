@@ -82,6 +82,14 @@ fn add_u32_to_i64_saturating(value: i64, delta: u32) -> i64 {
     value.saturating_add(i64::from(delta))
 }
 
+fn next_col_saturating(col: usize) -> usize {
+    col.saturating_add(1)
+}
+
+fn next_row_saturating(row: i64) -> i64 {
+    row.saturating_add(1)
+}
+
 fn last_col_in(range: &std::ops::Range<usize>) -> usize {
     range.end.saturating_sub(1)
 }
@@ -817,7 +825,9 @@ impl TerminalState {
         self.erase_in_display(EraseInDisplay::EraseScrollback);
 
         let row_index = self.screen.phys_row(self.cursor.y);
-        let rows = self.screen.lines_in_phys_range(row_index..row_index + 1);
+        let rows = self
+            .screen
+            .lines_in_phys_range(row_index..row_index.saturating_add(1));
 
         self.erase_in_display(EraseInDisplay::EraseDisplay);
 
@@ -1197,7 +1207,7 @@ impl TerminalState {
             self.scroll_up(1);
             y
         } else {
-            y + 1
+            next_row_saturating(y)
         };
         self.set_cursor_pos(&Position::Absolute(x as i64), &Position::Absolute(y as i64));
     }
@@ -2364,8 +2374,15 @@ impl TerminalState {
                     // in the test suite.
                     // So this is here for now until a better solution is found.
                     // <https://github.com/wezterm/wezterm/issues/3548>
-                    EraseInLine::EraseToEndOfLine => cx + if self.wrap_next { 1 } else { 0 }..cols,
-                    EraseInLine::EraseToStartOfLine => 0..cx + 1,
+                    EraseInLine::EraseToEndOfLine => {
+                        if self.wrap_next {
+                            next_col_saturating(cx)
+                        } else {
+                            cx
+                        }
+                        ..cols
+                    }
+                    EraseInLine::EraseToStartOfLine => 0..next_col_saturating(cx),
                     EraseInLine::EraseLine => 0..cols,
                 };
 
@@ -2452,13 +2469,13 @@ impl TerminalState {
 
                         line.set_cell(x, cell.clone(), seqno);
                     }
-                    x += 1;
+                    x = next_col_saturating(x);
                     if x > last_col_in(&left_and_right_margins) {
                         x = left_and_right_margins.start;
                         if y == last_row_in(&top_and_bottom_margins) {
                             self.scroll_up(1);
                         } else {
-                            y += 1;
+                            y = next_row_saturating(y);
                             if y > last_row_in(&top_and_bottom_margins) {
                                 y = top_and_bottom_margins.end;
                             }
@@ -3651,6 +3668,10 @@ mod tests {
         assert_eq!(add_u32_to_usize_saturating(usize::MAX, 3), usize::MAX);
         assert_eq!(add_u32_to_i64_saturating(5, 3), 8);
         assert_eq!(add_u32_to_i64_saturating(i64::MAX, 3), i64::MAX);
+        assert_eq!(next_col_saturating(5), 6);
+        assert_eq!(next_col_saturating(usize::MAX), usize::MAX);
+        assert_eq!(next_row_saturating(5), 6);
+        assert_eq!(next_row_saturating(i64::MAX), i64::MAX);
         assert_eq!(last_col_in(&(0..0)), 0);
         assert_eq!(last_col_in(&(2..5)), 4);
         assert_eq!(last_row_in(&(0..0)), 0);
