@@ -240,8 +240,22 @@ impl FtviIndex {
         cursor.read_exact(&mut count_buf)?;
         let count = u32::from_le_bytes(count_buf) as usize;
 
-        let mut ids = Vec::with_capacity(count);
-        let mut vectors = Vec::with_capacity(count);
+        // `count` is an attacker/corruption-controlled length prefix. Each
+        // record occupies exactly `8 + dimension*2` bytes (id + f16 vector), so
+        // a well-formed file cannot contain more records than the remaining
+        // bytes allow. Cap the up-front reservation by that physical bound;
+        // otherwise a malformed or truncated file (e.g. count = u32::MAX) would
+        // reserve tens of GB and abort the process before `read_exact` can
+        // surface the EOF. The loop below still reads exactly `count` records
+        // and returns an error if the data runs short.
+        let consumed = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
+        let remaining = data.len().saturating_sub(consumed);
+        let record_size = 8 + dimension * 2; // dimension is u16 -> no overflow
+        let max_records = remaining / record_size; // record_size >= 8, never zero
+        let prealloc = count.min(max_records);
+
+        let mut ids = Vec::with_capacity(prealloc);
+        let mut vectors = Vec::with_capacity(prealloc);
 
         let mut id_buf = [0u8; 8];
         let mut half_buf = [0u8; 2];
@@ -700,5 +714,75 @@ mod tests {
         let idx = make_index(&[(1, vec![1.0, 0.0])]);
         assert!(!idx.is_empty());
         assert_eq!(idx.len(), 1);
+    }
+
+    /// Build a valid FTVI header (magic + version + dimension) followed by an
+    /// arbitrary count and an arbitrary (possibly too-short) body.
+    fn ftvi_header_with_count(dimension: u16, count: u32, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&dimension.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    /// Regression: a corrupt/tampered length prefix (`count = u32::MAX`) with a
+    /// short body must return an `Err`, not abort the process via a multi-GB
+    /// `Vec::with_capacity`. The fact that this test returns at all (rather than
+    /// aborting the test binary) is the assertion that preallocation is bounded.
+    #[test]
+    fn from_bytes_oversized_count_does_not_overcommit() {
+        // dimension 8 => record_size = 8 + 16 = 24 bytes. Provide one full
+        // record's worth of body but claim u32::MAX records.
+        let body = vec![0u8; 24];
+        let data = ftvi_header_with_count(8, u32::MAX, &body);
+        let err = FtviIndex::from_bytes(&data)
+            .expect_err("oversized count with short body must error, not OOM");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Regression: `count` larger than the body (but not absurd) must surface a
+    /// clean EOF error rather than succeeding with truncated data.
+    #[test]
+    fn from_bytes_truncated_body_errors() {
+        // dimension 4 => record_size = 16. Claim 3 records, supply only 1.
+        let body = vec![0u8; 16];
+        let data = ftvi_header_with_count(4, 3, &body);
+        let err = FtviIndex::from_bytes(&data).expect_err("truncated body must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A header that claims more records than the body holds must not allocate
+    /// based on the claimed count. We can't directly observe capacity through
+    /// the error path, so assert the well-formed case still round-trips exactly
+    /// the records present — i.e. the cap never under-allocates a valid file.
+    #[test]
+    fn from_bytes_well_formed_large_count_round_trips() {
+        let records: Vec<(u64, Vec<f32>)> =
+            (0..1000u64).map(|i| (i, vec![i as f32, 0.0, 0.0, 0.0])).collect();
+        let refs: Vec<(u64, &[f32])> =
+            records.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let data = write_ftvi_vec(4, &refs).unwrap();
+        let idx = FtviIndex::from_bytes(&data).unwrap();
+        assert_eq!(idx.len(), 1000);
+        assert_eq!(idx.id_at(0), 0);
+        assert_eq!(idx.id_at(999), 999);
+    }
+
+    /// Zero-dimension records (id only, record_size = 8) must still parse and
+    /// the preallocation bound (which divides by record_size) must not panic.
+    #[test]
+    fn from_bytes_zero_dimension_records() {
+        let mut body = Vec::new();
+        for id in 0..3u64 {
+            body.extend_from_slice(&id.to_le_bytes());
+        }
+        let data = ftvi_header_with_count(0, 3, &body);
+        let idx = FtviIndex::from_bytes(&data).unwrap();
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.dimension(), 0);
+        assert!(idx.vector_at(0).is_empty());
     }
 }
