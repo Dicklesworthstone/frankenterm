@@ -5691,6 +5691,40 @@ steps:
         }
     }
 
+    /// Disabled workflow that still matches detections; used to ensure
+    /// trigger selection fails closed before acquiring pane locks.
+    struct DisabledMatchingWorkflow;
+
+    impl Workflow for DisabledMatchingWorkflow {
+        fn name(&self) -> &'static str {
+            "disabled_matching"
+        }
+
+        fn description(&self) -> &'static str {
+            "Disabled workflow that must never be selected"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("disabled_matching")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("disabled_step", "Should not run")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move { StepResult::abort("disabled workflow should not execute") })
+        }
+
+        fn is_enabled(&self) -> bool {
+            false
+        }
+    }
+
     /// Workflow with a single idempotent SendText step.
     struct IdempotentSendWorkflow;
 
@@ -6140,6 +6174,50 @@ steps:
                     .iter()
                     .any(|workflow| workflow.id == execution_id),
                 "Failed validation should not leave an incomplete workflow behind"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Test: disabled workflows must not start even when their trigger matches.
+    #[test]
+    fn disabled_workflow_trigger_is_ignored_without_lock_or_record() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_disabled_workflow_trigger.db")
+                .to_string_lossy()
+                .to_string();
+
+            let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 432u64;
+
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(DisabledMatchingWorkflow));
+
+            let detection = make_test_detection("disabled_matching.trigger");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+
+            match start_result {
+                WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
+                    assert_eq!(rule_id, "disabled_matching.trigger");
+                }
+                other => panic!("Disabled workflow must not start, got {other:?}"),
+            }
+
+            assert!(
+                lock_manager.is_locked(pane_id).is_none(),
+                "Disabled workflow must not acquire the pane lock"
+            );
+            assert!(
+                storage
+                    .find_incomplete_workflows()
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "Disabled workflow must not create persisted execution state"
             );
 
             storage.shutdown().await.unwrap();

@@ -175,14 +175,16 @@ async fn wait_condition_pause_maybe_cx(
     match condition {
         WaitCondition::PaneIdle {
             idle_threshold_ms, ..
-        } => wait_required_duration_maybe_cx(
-            cx,
-            Duration::from_millis(*idle_threshold_ms),
-            timeout,
-            label,
-            "pane idle wait",
-        )
-        .await,
+        } => {
+            wait_required_duration_maybe_cx(
+                cx,
+                Duration::from_millis(*idle_threshold_ms),
+                timeout,
+                label,
+                "pane idle wait",
+            )
+            .await
+        }
         WaitCondition::Pattern { rule_id, .. } => Err(crate::Error::Workflow(
             crate::error::WorkflowError::Aborted(format!(
                 "{label}: pattern wait '{rule_id}' requires a pane text source; use \
@@ -224,14 +226,16 @@ async fn wait_condition_pause_maybe_cx(
             )
             .await
         }
-        WaitCondition::Sleep { duration_ms } => wait_required_duration_maybe_cx(
-            cx,
-            Duration::from_millis(*duration_ms),
-            timeout,
-            label,
-            "sleep wait",
-        )
-        .await,
+        WaitCondition::Sleep { duration_ms } => {
+            wait_required_duration_maybe_cx(
+                cx,
+                Duration::from_millis(*duration_ms),
+                timeout,
+                label,
+                "sleep wait",
+            )
+            .await
+        }
     }
 }
 
@@ -556,7 +560,10 @@ impl WorkflowRunner {
             .workflows
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        workflows.iter().find(|w| w.handles(detection)).cloned()
+        workflows
+            .iter()
+            .find(|w| w.is_enabled() && w.handles(detection))
+            .cloned()
     }
 
     /// Find a workflow by name.
@@ -3916,8 +3923,7 @@ mod tests {
 
     #[test]
     fn resume_step_beyond_completion_boundary_is_invalid() {
-        let reason =
-            invalid_resume_step_reason(4, 3).expect("resume beyond step_count is invalid");
+        let reason = invalid_resume_step_reason(4, 3).expect("resume beyond step_count is invalid");
         assert!(reason.contains("resume step 4"));
         assert!(reason.contains("0..=3"));
     }
@@ -4268,10 +4274,7 @@ mod tests {
             run_async_test(async {
                 for (condition, expected_reason) in [
                     (WaitCondition::pane_idle(60), "pane idle wait timed out"),
-                    (
-                        WaitCondition::stable_tail(60),
-                        "stable tail wait timed out",
-                    ),
+                    (WaitCondition::stable_tail(60), "stable tail wait timed out"),
                 ] {
                     let start = std::time::Instant::now();
                     let err = wait_condition_pause_maybe_cx(
