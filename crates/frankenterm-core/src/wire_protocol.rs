@@ -939,12 +939,13 @@ fn validate_envelope_protocol_with_limits(
         let mut pane_uuids = std::collections::HashSet::with_capacity(panes_meta.panes.len());
         for pane in &panes_meta.panes {
             validate_pane_meta(pane, "PanesMeta pane")?;
-            let route_key = (pane.domain.as_str(), pane.pane_id);
+            let normalized_domain = pane.domain.trim();
+            let route_key = (normalized_domain, pane.pane_id);
             if !route_keys.insert(route_key) {
                 return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
                     format!(
                         "PanesMeta contains duplicate pane route key domain={} pane_id={}",
-                        pane.domain, pane.pane_id
+                        normalized_domain, pane.pane_id
                     ),
                 )));
             }
@@ -2237,6 +2238,35 @@ mod tests {
         let err = agg
             .ingest_envelope(envelope)
             .expect_err("decoded panes snapshot must reject duplicate route keys");
+        assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+        assert_eq!(agg.total_rejected(), 1);
+        assert_eq!(agg.total_accepted(), 0);
+        assert_eq!(agg.agent_count(), 0);
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_rejects_panes_meta_duplicate_trimmed_route_keys() {
+        let mut agg = Aggregator::new(10);
+        let mut original = sample_pane_meta();
+        original.pane_uuid = Some("route-original-uuid".to_string());
+
+        let mut duplicate = sample_pane_meta();
+        duplicate.domain = " local\t".to_string();
+        duplicate.pane_uuid = Some("route-duplicate-uuid".to_string());
+        duplicate.title = Some("duplicate trimmed route".to_string());
+
+        let envelope = WireEnvelope::new(
+            1,
+            "agent-valid",
+            WirePayload::PanesMeta(PanesMeta {
+                panes: vec![original, duplicate],
+                timestamp_ms: 1_700_000_004_006,
+            }),
+        );
+
+        let err = agg
+            .ingest_envelope(envelope)
+            .expect_err("decoded panes snapshot must reject duplicate trimmed route keys");
         assert!(matches!(err, WireProtocolError::InvalidJson(_)));
         assert_eq!(agg.total_rejected(), 1);
         assert_eq!(agg.total_accepted(), 0);
