@@ -2279,6 +2279,15 @@ impl Mission {
                         reservation_intent.reservation_id.clone(),
                     ));
                 }
+                for path in &reservation_intent.paths {
+                    if let Some(reason) = invalid_reservation_path_reason(path) {
+                        return Err(MissionValidationError::InvalidReservationPath {
+                            reservation_id: reservation_intent.reservation_id.clone(),
+                            path: path.clone(),
+                            reason,
+                        });
+                    }
+                }
             }
         }
 
@@ -2499,6 +2508,32 @@ fn dispatch_pane_id_for_wait_condition(condition: &WaitCondition) -> Option<u64>
     }
 }
 
+fn invalid_reservation_path_reason(path: &str) -> Option<&'static str> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Some("path cannot be empty");
+    }
+    if trimmed != path {
+        return Some("path cannot contain leading or trailing whitespace");
+    }
+    if path.chars().any(char::is_control) {
+        return Some("path cannot contain control characters");
+    }
+    if path.starts_with('/') || path.starts_with('~') || path.as_bytes().get(1) == Some(&b':') {
+        return Some("path must be workspace-relative");
+    }
+    if path.contains('\\') {
+        return Some("path must use forward slashes");
+    }
+    if path
+        .split('/')
+        .any(|component| matches!(component, "." | ".."))
+    {
+        return Some("path cannot contain traversal components");
+    }
+    None
+}
+
 /// Errors from mission dispatch operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissionDispatchError {
@@ -2535,6 +2570,11 @@ pub enum MissionValidationError {
     UnknownCandidateReference(CandidateActionId),
     EmptyAssignee(AssignmentId),
     EmptyReservationPaths(ReservationIntentId),
+    InvalidReservationPath {
+        reservation_id: ReservationIntentId,
+        path: String,
+        reason: &'static str,
+    },
     LifecycleStateOutcomeMismatch {
         state: MissionLifecycleState,
         detail: &'static str,
@@ -2570,6 +2610,15 @@ impl fmt::Display for MissionValidationError {
             Self::EmptyReservationPaths(id) => {
                 write!(f, "Reservation intent has empty paths: {}", id.0)
             }
+            Self::InvalidReservationPath {
+                reservation_id,
+                path,
+                reason,
+            } => write!(
+                f,
+                "Reservation intent {} has invalid path {:?}: {}",
+                reservation_id.0, path, reason
+            ),
             Self::LifecycleStateOutcomeMismatch { state, detail } => {
                 write!(f, "Mission lifecycle state mismatch ({state}): {detail}")
             }
@@ -7283,6 +7332,44 @@ mod tests {
             err,
             MissionValidationError::EmptyReservationPaths(_)
         ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_traversing_reservation_paths() {
+        for invalid_path in [
+            "",
+            " crates/frankenterm-core/src/plan.rs",
+            "/tmp/frankenterm/escape",
+            "../outside",
+            "crates/../wire_protocol.rs",
+            "crates\\frankenterm-core\\src\\plan.rs",
+            "C:/Users/jemanuel/projects/frankenterm",
+            "crates/frankenterm-core/src/\nplan.rs",
+        ] {
+            let mut mission = sample_mission();
+            mission.assignments[0].reservation_intent = Some(ReservationIntent {
+                reservation_id: ReservationIntentId("reservation:bad-path".to_string()),
+                requested_by: MissionActorRole::Dispatcher,
+                paths: vec![invalid_path.to_string()],
+                exclusive: false,
+                reason: None,
+                requested_at_ms: 1_704_000_000_111,
+                expires_at_ms: None,
+            });
+
+            let err = mission.validate().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    MissionValidationError::InvalidReservationPath {
+                        reservation_id,
+                        path,
+                        ..
+                    } if reservation_id.0 == "reservation:bad-path" && path == invalid_path
+                ),
+                "expected invalid reservation path for {invalid_path:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]
