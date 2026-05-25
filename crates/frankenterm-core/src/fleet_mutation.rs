@@ -318,6 +318,7 @@ impl FleetMutationReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FleetMutationPlanError {
+    EmptyPlanId,
     EmptyPlan,
     EmptyStepId {
         step_index: usize,
@@ -337,6 +338,7 @@ pub enum FleetMutationPlanError {
 impl std::fmt::Display for FleetMutationPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EmptyPlanId => f.write_str("fleet mutation plan_id must not be empty"),
             Self::EmptyPlan => f.write_str("fleet mutation plan must contain at least one step"),
             Self::EmptyStepId { step_index } => {
                 write!(
@@ -427,13 +429,16 @@ impl FleetMutationLedger {
 }
 
 fn validate_plan(plan: &FleetMutationPlan) -> Result<(), FleetMutationPlanError> {
+    if plan.plan_id.trim().is_empty() {
+        return Err(FleetMutationPlanError::EmptyPlanId);
+    }
     if plan.steps.is_empty() {
         return Err(FleetMutationPlanError::EmptyPlan);
     }
 
     let mut seen = BTreeMap::<&str, usize>::new();
     for (index, step) in plan.steps.iter().enumerate() {
-        if step.step_id.is_empty() {
+        if step.step_id.trim().is_empty() {
             return Err(FleetMutationPlanError::EmptyStepId { step_index: index });
         }
         if let Some(first_index) = seen.insert(step.step_id.as_str(), index) {
@@ -1241,6 +1246,34 @@ mod tests {
             err,
             FleetMutationPlanError::DuplicateStepId { .. }
         ));
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn empty_plan_id_is_rejected_before_execution() {
+        let plan = FleetMutationPlan::new("  ", false, vec![spawn_step("spawn-1")]);
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+
+        let err = ledger
+            .execute_plan(&plan, &mut executor)
+            .expect_err("whitespace plan_id should fail");
+
+        assert_eq!(err, FleetMutationPlanError::EmptyPlanId);
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn whitespace_step_id_is_rejected_before_execution() {
+        let plan = FleetMutationPlan::new("plan-whitespace-step", false, vec![spawn_step("  ")]);
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+
+        let err = ledger
+            .execute_plan(&plan, &mut executor)
+            .expect_err("whitespace step_id should fail");
+
+        assert_eq!(err, FleetMutationPlanError::EmptyStepId { step_index: 0 });
         assert!(executor.calls.is_empty());
     }
 
