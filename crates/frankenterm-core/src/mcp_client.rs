@@ -30,6 +30,7 @@ const ERR_METHOD_NOT_FOUND: &str = "mcp_client.method_not_found";
 const ERR_INVALID_PARAMS: &str = "mcp_client.invalid_params";
 const ERR_TOOL_EXECUTION: &str = "mcp_client.tool_execution";
 const ERR_REQUEST_CANCELLED: &str = "mcp_client.request_cancelled";
+const ERR_UNSUPPORTED: &str = "mcp_client.unsupported";
 const ERR_PROTOCOL: &str = "mcp_client.protocol";
 // br-ft-m3c9s: distinguishable framework-error variants get
 // dedicated codes so operators can triage by class instead of
@@ -406,6 +407,13 @@ fn server_disabled_error(server: &str) -> McpClientError {
     .with_hint("Enable the server entry in its mcpServers config before connecting.")
 }
 
+fn remote_error_reports_unsupported(message_lower: &str) -> bool {
+    message_lower.contains("ft-mcp-0010")
+        || message_lower.contains("robot.not_implemented")
+        || message_lower.contains("robot.feature_not_available")
+        || message_lower.contains("robot.unsupported")
+}
+
 fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
     // [ft-qde8p] Redact secrets from the remote error text before it lands in
     // `McpClientError.message`. The message flows straight into tracing warn
@@ -424,6 +432,16 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
             .with_hint("Verify method compatibility between FrankenTerm and the external server."),
         FrameworkMcpErrorCode::InvalidParams => McpClientError::new(ERR_INVALID_PARAMS, base)
             .with_hint("Check tool arguments and request schema."),
+        FrameworkMcpErrorCode::ToolExecutionError
+        | FrameworkMcpErrorCode::InternalError
+        | FrameworkMcpErrorCode::Custom(_)
+            if remote_error_reports_unsupported(&message_lower) =>
+        {
+            McpClientError::new(ERR_UNSUPPORTED, base).with_hint(
+                "The remote MCP server reported an unsupported or unavailable surface; \
+                 check feature flags or call a supported tool.",
+            )
+        }
         FrameworkMcpErrorCode::ToolExecutionError => McpClientError::new(ERR_TOOL_EXECUTION, base)
             .with_hint("Inspect remote tool logs and retry with validated arguments."),
         FrameworkMcpErrorCode::RequestCancelled => McpClientError::new(ERR_REQUEST_CANCELLED, base)
@@ -489,10 +507,10 @@ mod tests {
     use super::{
         Config, ERR_METHOD_NOT_FOUND, ERR_PARSE, ERR_PROMPT_NOT_FOUND, ERR_PROTOCOL,
         ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN,
-        ERR_TOOL_EXECUTION, ExternalServerConfig, FrameworkMcpError, FrameworkMcpErrorCode,
-        FtMcpClient, LOG_TARGET, McpClientConfig, McpClientContentItem, McpClientError,
-        McpClientToolDefinition, discover_servers, map_mcp_error, report_server_outcome,
-        select_server, select_server_via_bandit,
+        ERR_TOOL_EXECUTION, ERR_UNSUPPORTED, ExternalServerConfig, FrameworkMcpError,
+        FrameworkMcpErrorCode, FtMcpClient, LOG_TARGET, McpClientConfig, McpClientContentItem,
+        McpClientError, McpClientToolDefinition, discover_servers, map_mcp_error,
+        report_server_outcome, select_server, select_server_via_bandit,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -516,6 +534,29 @@ mod tests {
         let err = map_mcp_error("mock", FrameworkMcpError::tool_error("boom"));
         assert_eq!(err.code, ERR_TOOL_EXECUTION);
         assert!(err.message.contains("boom"));
+    }
+
+    #[test]
+    fn map_mcp_error_remote_not_implemented_gets_unsupported_code() {
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::tool_error(format!(
+                "remote envelope FT-MCP-0010 robot.not_implemented for {secret}"
+            )),
+        );
+
+        assert_eq!(err.code, ERR_UNSUPPORTED);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("unsupported"))
+        );
+        assert!(
+            !err.message.contains(secret),
+            "remote unsupported mapping leaked caller-supplied secret"
+        );
+        assert!(err.message.contains("[REDACTED]"));
     }
 
     #[test]
