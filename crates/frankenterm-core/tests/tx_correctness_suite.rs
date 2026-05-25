@@ -665,6 +665,58 @@ fn pipeline_compensation_step_counts_sum() {
     }
 }
 
+#[test]
+fn compensation_rejects_foreign_commit_report_identity() {
+    let commit_contract = build_contract(3, MissionTxState::Prepared);
+    let commit_inputs = success_commit_inputs(3);
+    let mut commit_report = execute_commit_phase(
+        &commit_contract,
+        &commit_inputs,
+        MissionKillSwitchLevel::Off,
+        false,
+        10_000,
+    )
+    .unwrap();
+    commit_report.tx_id = TxId("tx:foreign".into());
+    commit_report.plan_id = TxPlanId("plan:foreign".into());
+
+    let comp_contract = build_contract(3, MissionTxState::Compensating);
+    let comp_inputs = success_comp_inputs(3);
+    let err = execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000)
+        .expect_err("foreign commit report must not drive compensation");
+
+    assert!(
+        err.contains("does not match contract tx_id"),
+        "unexpected compensation identity error: {err}"
+    );
+}
+
+#[test]
+fn compensation_rejects_duplicate_committed_steps_in_report() {
+    let commit_contract = build_contract(3, MissionTxState::Prepared);
+    let commit_inputs = success_commit_inputs(3);
+    let mut commit_report = execute_commit_phase(
+        &commit_contract,
+        &commit_inputs,
+        MissionKillSwitchLevel::Off,
+        false,
+        10_000,
+    )
+    .unwrap();
+    let duplicate = commit_report.step_results[0].clone();
+    commit_report.step_results.push(duplicate);
+
+    let comp_contract = build_contract(3, MissionTxState::Compensating);
+    let comp_inputs = success_comp_inputs(3);
+    let err = execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000)
+        .expect_err("duplicate committed step report must fail closed");
+
+    assert!(
+        err.contains("duplicate committed step"),
+        "unexpected duplicate compensation error: {err}"
+    );
+}
+
 // ── Receipt Chain Invariants ────────────────────────────────────────────────
 
 #[test]

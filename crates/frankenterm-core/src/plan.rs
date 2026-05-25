@@ -4066,6 +4066,51 @@ fn duplicate_compensation_input_step_id(comp_inputs: &[TxCompensationStepInput])
     None
 }
 
+fn validate_compensation_commit_report(
+    contract: &MissionTxContract,
+    commit_report: &TxCommitReport,
+) -> Result<(), String> {
+    if commit_report.tx_id != contract.intent.tx_id {
+        return Err(format!(
+            "Compensation commit report tx_id {} does not match contract tx_id {}",
+            commit_report.tx_id.0, contract.intent.tx_id.0
+        ));
+    }
+    if commit_report.plan_id != contract.plan.plan_id {
+        return Err(format!(
+            "Compensation commit report plan_id {} does not match contract plan_id {}",
+            commit_report.plan_id.0, contract.plan.plan_id.0
+        ));
+    }
+
+    let plan_step_ids: HashSet<&str> = contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.step_id.0.as_str())
+        .collect();
+    let mut seen_committed_step_ids = HashSet::new();
+    for result in commit_report
+        .step_results
+        .iter()
+        .filter(|result| result.outcome.is_committed())
+    {
+        let step_id = result.step_id.0.as_str();
+        if !plan_step_ids.contains(step_id) {
+            return Err(format!(
+                "Compensation commit report references unknown committed step {step_id}"
+            ));
+        }
+        if !seen_committed_step_ids.insert(step_id) {
+            return Err(format!(
+                "duplicate committed step {step_id} in commit report: compensation would be order-dependent"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Evaluate prepare phase gates and produce a report.
 pub fn evaluate_prepare_phase(
     _tx_id: &TxId,
@@ -4329,6 +4374,8 @@ pub fn execute_compensation_phase(
     if contract.plan.steps.is_empty() {
         return Err("Transaction plan has no steps".to_string());
     }
+
+    validate_compensation_commit_report(contract, commit_report)?;
 
     let committed_steps = commit_report
         .step_results
