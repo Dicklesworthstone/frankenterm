@@ -230,20 +230,21 @@ struct TokenParts<'a> {
 }
 
 impl<'a> TokenParts<'a> {
-    fn parse(token: &'a str) -> Self {
+    fn parse(token: &'a str) -> Result<Self, DistributedSecurityError> {
         if let Some((identity, secret)) = token.split_once(':') {
-            if !identity.trim().is_empty() && !secret.is_empty() {
-                return Self {
-                    identity: Some(identity),
-                    secret,
-                };
+            if identity.trim().is_empty() || secret.trim().is_empty() {
+                return Err(DistributedSecurityError::AuthFailed);
             }
+            return Ok(Self {
+                identity: Some(identity),
+                secret,
+            });
         }
 
-        Self {
+        Ok(Self {
             identity: None,
             secret: token,
-        }
+        })
     }
 }
 
@@ -259,19 +260,18 @@ pub fn validate_token(
 
     let expected = expected_token.ok_or(DistributedSecurityError::MissingToken)?;
     let presented = presented_token.ok_or(DistributedSecurityError::MissingToken)?;
-    let expected_parts = TokenParts::parse(expected);
-    let presented_parts = TokenParts::parse(presented);
+    let expected_parts = TokenParts::parse(expected)?;
+    let presented_parts = TokenParts::parse(presented)?;
 
     // Fail closed on an empty EXPECTED secret. `constant_time_eq("", "")`
     // returns true, so a blank/unconfigured expected token — an env var or token
     // file that resolves to "", or any caller that bypasses the empty-checking
     // credential resolver — would authenticate a client presenting an empty
     // token, an auth bypass while auth appears enabled. A real configured secret
-    // is never empty. (Same blank-value class as the detection-pane-uuid guard;
-    // the credential resolver already rejects empty, this hardens the public
-    // validation primitive itself. Note: when an identity is present TokenParts
-    // guarantees a non-empty secret, so this only fires on the no-identity path.)
-    if expected_parts.secret.is_empty() {
+    // is never empty. Malformed identity-bearing tokens such as `agent:` are
+    // rejected by TokenParts::parse before they can downgrade into bare shared
+    // secrets.
+    if expected_parts.secret.trim().is_empty() || presented_parts.secret.trim().is_empty() {
         return Err(DistributedSecurityError::AuthFailed);
     }
 
@@ -2111,7 +2111,7 @@ KBAhs4snj5QspGFqkazmIw==
             secret in "[a-zA-Z0-9_-]{1,24}"
         ) {
             let token = format!("{identity}:{secret}");
-            let parts = TokenParts::parse(&token);
+            let parts = TokenParts::parse(&token).expect("valid identity token");
             prop_assert_eq!(parts.identity, Some(identity.as_str()));
             prop_assert_eq!(parts.secret, secret.as_str());
         }
@@ -2630,38 +2630,42 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn token_parts_parse_with_identity() {
-        let parts = TokenParts::parse("agent-1:mysecret");
+        let parts = TokenParts::parse("agent-1:mysecret").expect("valid identity token");
         assert_eq!(parts.identity, Some("agent-1"));
         assert_eq!(parts.secret, "mysecret");
     }
 
     #[test]
     fn token_parts_parse_without_identity() {
-        let parts = TokenParts::parse("bare-secret");
+        let parts = TokenParts::parse("bare-secret").expect("valid bare token");
         assert!(parts.identity.is_none());
         assert_eq!(parts.secret, "bare-secret");
     }
 
     #[test]
     fn token_parts_parse_empty_identity() {
-        // ":secret" => empty identity, treated as no identity
-        let parts = TokenParts::parse(":secret");
-        assert!(parts.identity.is_none());
-        assert_eq!(parts.secret, ":secret");
+        assert_eq!(
+            TokenParts::parse(":secret").expect_err("empty identity must fail closed"),
+            DistributedSecurityError::AuthFailed
+        );
     }
 
     #[test]
     fn token_parts_parse_empty_secret() {
-        // "identity:" => empty secret, treated as no identity
-        let parts = TokenParts::parse("identity:");
-        assert!(parts.identity.is_none());
-        assert_eq!(parts.secret, "identity:");
+        assert_eq!(
+            TokenParts::parse("identity:").expect_err("empty identity secret must fail closed"),
+            DistributedSecurityError::AuthFailed
+        );
+        assert_eq!(
+            TokenParts::parse("identity: \t").expect_err("blank identity secret must fail closed"),
+            DistributedSecurityError::AuthFailed
+        );
     }
 
     #[test]
     fn token_parts_parse_multiple_colons() {
         // First colon splits identity from secret
-        let parts = TokenParts::parse("agent:secret:extra");
+        let parts = TokenParts::parse("agent:secret:extra").expect("valid identity token");
         assert_eq!(parts.identity, Some("agent"));
         assert_eq!(parts.secret, "secret:extra");
     }
@@ -2985,10 +2989,53 @@ KBAhs4snj5QspGFqkazmIw==
         );
         // A real matching secret still authenticates; a wrong one still fails.
         assert!(
-            validate_token(DistributedAuthMode::Token, Some("s3cret"), Some("s3cret"), None).is_ok()
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("s3cret"),
+                Some("s3cret"),
+                None
+            )
+            .is_ok()
         );
         assert!(
-            validate_token(DistributedAuthMode::Token, Some("s3cret"), Some("nope"), None).is_err()
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("s3cret"),
+                Some("nope"),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_token_rejects_identity_tokens_without_real_secret() {
+        for (expected, presented, client_identity) in [
+            ("agent:", "agent:", Some("agent")),
+            ("agent: \t", "agent: \t", Some("agent")),
+            (":secret", ":secret", None),
+        ] {
+            assert_eq!(
+                validate_token(
+                    DistributedAuthMode::Token,
+                    Some(expected),
+                    Some(presented),
+                    client_identity,
+                ),
+                Err(DistributedSecurityError::AuthFailed),
+                "malformed token syntax must not authenticate expected={expected:?} presented={presented:?}",
+            );
+        }
+
+        assert_eq!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("secret"),
+                Some("agent:"),
+                None,
+            ),
+            Err(DistributedSecurityError::AuthFailed),
+            "malformed presented identity token must be rejected before comparison"
         );
     }
 
