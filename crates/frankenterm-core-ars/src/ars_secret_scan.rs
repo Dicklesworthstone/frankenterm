@@ -288,29 +288,21 @@ impl ArsSecretScanner {
                 ("custom_pattern", DetectionMethod::PatternMatch)
             };
 
-            // Extract surrounding context (up to 10 chars before, 20 after).
-            let ctx_start = mat.start().saturating_sub(10);
-            let ctx_end = (mat.end() + 20).min(text.len());
-
-            let mut safe_start = ctx_start;
-            while safe_start > 0 && !text.is_char_boundary(safe_start) {
-                safe_start -= 1;
-            }
-
-            let mut safe_end = ctx_end;
-            while safe_end < text.len() && !text.is_char_boundary(safe_end) {
-                safe_end += 1;
-            }
-
-            let context = &text[safe_start..safe_end];
-
+            // Surface a byte-free descriptor only — never any source bytes.
+            // BUILTIN_PATTERNS match secret *prefixes*, so a surrounding window
+            // would leak live secret bytes at its trailing edge (which falls
+            // inside the secret body that continues past the matched prefix) and
+            // could leak at its leading edge (which may overlap an adjacent
+            // secret). The byte offsets recorded below already locate the
+            // finding precisely; the matched bytes themselves are never stored
+            // in the serialized, persisted finding.
             findings.push(ScanFinding {
                 pattern_name: pattern_name.to_string(),
                 block_index,
                 source: source.to_string(),
                 byte_offset: mat.start(),
                 match_len: mat.end() - mat.start(),
-                context_redacted: redact_context(context),
+                context_redacted: format!("[REDACTED:{pattern_name}]"),
                 detection_method,
                 entropy: None,
             });
@@ -564,18 +556,6 @@ fn is_trivially_low_entropy(token: &str) -> bool {
     false
 }
 
-/// Redact the middle of a context string, keeping only the edges.
-fn redact_context(context: &str) -> String {
-    let chars: Vec<char> = context.chars().collect();
-    if chars.len() <= 8 {
-        return "[REDACTED]".to_string();
-    }
-    let prefix: String = chars[..4].iter().collect();
-    let suffix_start = chars.len().saturating_sub(4);
-    let suffix: String = chars[suffix_start..].iter().collect();
-    format!("{}...{}", prefix, suffix)
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -763,24 +743,22 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn redact_short_context() {
-        assert_eq!(redact_context("ab"), "[REDACTED]");
-    }
-
-    #[test]
-    fn redact_long_context() {
-        let result = redact_context("hello world, this is a test");
-        assert!(result.starts_with("hell"));
-        assert!(result.ends_with("test"));
-        assert!(result.contains("..."));
-    }
-
-    #[test]
-    fn redact_multibyte_context() {
-        let result = redact_context("🦀🦀🦀🦀...secret...🦀🦀🦀🦀");
-        assert!(result.starts_with("🦀🦀🦀🦀"));
-        assert!(result.ends_with("🦀🦀🦀🦀"));
-        assert!(result.contains("..."));
+    fn pattern_finding_context_is_byte_free_descriptor() {
+        let scanner = default_scanner();
+        let secret = "sk-abc1234567890abcdef1234567890abcdef12345678";
+        let cmds = vec![make_cmd(0, &format!("export KEY={secret}"), Some(0))];
+        let verdict = scanner.scan_commands(&cmds);
+        let ScanVerdict::Contaminated(c) = &verdict else {
+            panic!("expected contamination");
+        };
+        let pattern_finding = c
+            .findings
+            .iter()
+            .find(|f| f.detection_method == DetectionMethod::PatternMatch)
+            .expect("a pattern-match finding");
+        // The descriptor names the pattern but carries no source bytes.
+        assert!(pattern_finding.context_redacted.starts_with("[REDACTED:"));
+        assert!(pattern_finding.context_redacted.ends_with(']'));
     }
 
     // -------------------------------------------------------------------------
@@ -1348,6 +1326,40 @@ mod tests {
                     !finding.context_redacted.contains(secret),
                     "context should not contain full secret"
                 );
+            }
+        }
+    }
+
+    /// Regression for the partial-secret leak: `redact_context` used to keep the
+    /// first/last 4 chars of a context window, but BUILTIN_PATTERNS match secret
+    /// *prefixes*, so the window's trailing edge fell inside the secret body and
+    /// leaked live bytes (e.g. `xpor...def1`). No 4-byte run of the secret body
+    /// may appear in any persisted finding, regardless of the secret's position.
+    #[test]
+    fn findings_never_leak_partial_secret() {
+        let scanner = default_scanner();
+        let secret = "sk-abc1234567890abcdef1234567890abcdef12345678";
+        let body = &secret[3..]; // bytes after the matched `sk-` prefix
+        for cmd_text in [
+            secret.to_string(),                      // at start: no leading context
+            format!("export KEY={secret}"),          // embedded
+            format!("token: {secret} trailing ok"),  // trailing context present
+        ] {
+            let cmds = vec![make_cmd(0, &cmd_text, Some(0))];
+            let verdict = scanner.scan_commands(&cmds);
+            if let ScanVerdict::Contaminated(c) = &verdict {
+                for finding in &c.findings {
+                    for window in body.as_bytes().windows(4) {
+                        let frag = std::str::from_utf8(window).unwrap();
+                        assert!(
+                            !finding.context_redacted.contains(frag),
+                            "context_redacted {:?} leaked secret fragment {:?} (cmd {:?})",
+                            finding.context_redacted,
+                            frag,
+                            cmd_text
+                        );
+                    }
+                }
             }
         }
     }

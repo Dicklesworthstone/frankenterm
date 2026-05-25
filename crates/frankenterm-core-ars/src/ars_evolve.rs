@@ -809,7 +809,7 @@ mod tests {
         engine.total_evolutions = u64::MAX;
         engine.total_deprecations = u64::MAX;
 
-        assert!(engine.evolve(&make_request(v1)).is_evolved());
+        assert!(engine.evolve(&make_request(v1)).is_success());
         let stats = engine.stats();
 
         assert_eq!(stats.total_evolutions, u64::MAX);

@@ -461,8 +461,8 @@ impl ReplayHarness {
 
     /// Count passes (and applicable total).
     fn count_passes(&self, verdicts: &[ReplayVerdict]) -> (usize, usize) {
-        let mut passes = 0;
-        let mut total = 0;
+        let mut passes: usize = 0;
+        let mut total: usize = 0;
 
         for v in verdicts {
             match v {
