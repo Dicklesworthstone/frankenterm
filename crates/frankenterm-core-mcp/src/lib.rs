@@ -226,10 +226,26 @@ impl McpClientToolDefinition {
     pub fn is_destructive(&self) -> bool {
         self.annotations
             .as_ref()
-            .and_then(|annotations| annotations.get("destructive"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|annotations| {
+                annotation_bool(annotations, "destructive")
+                    || annotation_bool(annotations, "destructiveHint")
+            })
     }
+
+    #[must_use]
+    pub fn has_malformed_annotations(&self) -> bool {
+        self.annotations
+            .as_ref()
+            .is_some_and(|annotations| !annotations.is_object())
+    }
+}
+
+fn annotation_bool(annotations: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    annotations
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Framework-neutral outbound MCP content item.
@@ -444,6 +460,39 @@ mod tests {
         };
 
         assert!(tool.is_destructive());
+    }
+
+    #[test]
+    fn destructive_hint_annotation_is_detected() {
+        let tool = McpClientToolDefinition {
+            name: "delete_branch".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!({"destructiveHint": true})),
+        };
+
+        assert!(tool.is_destructive());
+    }
+
+    #[test]
+    fn malformed_annotations_are_not_destructive_but_are_detectable() {
+        let tool = McpClientToolDefinition {
+            name: "mystery".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!("not-an-object")),
+        };
+
+        assert!(!tool.is_destructive());
+        assert!(tool.has_malformed_annotations());
     }
 
     #[test]
