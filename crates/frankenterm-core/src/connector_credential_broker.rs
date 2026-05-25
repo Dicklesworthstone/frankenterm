@@ -548,6 +548,16 @@ impl ConnectorCredentialBroker {
         requested_scope: CredentialScope,
         now_ms: u64,
     ) -> Result<CredentialLease, CredentialBrokerError> {
+        // Sweep expired leases first. `expire_leases` is otherwise never called
+        // in production, so leases never left `Active` and the
+        // `max_concurrent_leases` check below counted long-expired leases
+        // against the limit — a connector that accumulated `max_concurrent`
+        // expired-but-Active leases could never obtain a new one
+        // (credential-access DoS), and the lease TTL was effectively dormant.
+        // Sweeping here makes the TTL functional and keeps the active count and
+        // per-credential/per-provider counters accurate.
+        self.expire_leases(now_ms);
+
         // Verify credential exists and is active
         let credential = self.credentials.get(credential_id).ok_or_else(|| {
             CredentialBrokerError::CredentialNotFound {
@@ -1523,6 +1533,46 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], lease.lease_id);
         assert_eq!(broker.telemetry.leases_expired, 1);
+    }
+
+    #[test]
+    fn request_lease_sweeps_expired_leases_freeing_capacity() {
+        // Regression: request_lease now sweeps expired leases before the
+        // max_concurrent_leases check. Previously expire_leases was never called
+        // in production, so expired-but-Active leases counted against the cap
+        // forever — once a connector hit the cap with expired leases it could
+        // never obtain a new lease (credential-access DoS), and the lease TTL
+        // was effectively dormant.
+        let mut broker = setup_broker();
+        let scope = || CredentialScope::new("github", "repos/foo", vec!["read".into()]);
+
+        // Fill the per-connector cap (5) at t=1000; each lease carries the
+        // provider's 1h default TTL.
+        let mut last_expiry = 0u64;
+        for _ in 0..5 {
+            let lease = broker
+                .request_lease("conn-1", "cred-1", scope(), 1000)
+                .unwrap();
+            last_expiry = lease.expires_at_ms;
+        }
+        // Cap reached: a 6th request at the same time is rejected.
+        let err = broker
+            .request_lease("conn-1", "cred-1", scope(), 1000)
+            .unwrap_err();
+        assert!(matches!(err, CredentialBrokerError::MaxLeasesExceeded { .. }));
+
+        // After all five leases expire, a new request MUST succeed — the sweep
+        // frees the capacity. Pre-fix this returned MaxLeasesExceeded forever.
+        let after_expiry = last_expiry.saturating_add(1);
+        let lease = broker
+            .request_lease("conn-1", "cred-1", scope(), after_expiry)
+            .expect("expired leases must be swept, freeing a new lease slot");
+        assert!(lease.expires_at_ms > after_expiry);
+        // Counter reflects only the one live lease (5 expired -> 0, then +1).
+        assert_eq!(
+            broker.get_credential("cred-1").unwrap().active_lease_count,
+            1
+        );
     }
 
     #[test]
