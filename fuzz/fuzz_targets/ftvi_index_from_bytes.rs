@@ -44,6 +44,12 @@ enum WireMode {
     BadMagic([u8; 4]),
     BadVersion(u16),
     InflatedCount(u8),
+    /// Overwrite the 4-byte count header with an arbitrary u32 (incl. u32::MAX).
+    /// `InflatedCount(u8)` can only bump the real count by <=256, so it could
+    /// never reach the pathological length-prefix range that drove an unbounded
+    /// `Vec::with_capacity` in `from_bytes`. This variant exercises that class:
+    /// a huge count with a short body must return an error, never OOM-abort.
+    SetCount(u32),
     InflatedDimension(u16),
 }
 
@@ -190,6 +196,11 @@ fn apply_wire_mode(bytes: &mut Vec<u8>, wire_mode: &WireMode) {
                 let count = u32::from_le_bytes(count_bytes);
                 let inflated = count.saturating_add(u32::from(*extra).saturating_add(1));
                 bytes[8..12].copy_from_slice(&inflated.to_le_bytes());
+            }
+        }
+        WireMode::SetCount(count) => {
+            if bytes.len() >= 12 {
+                bytes[8..12].copy_from_slice(&count.to_le_bytes());
             }
         }
         WireMode::InflatedDimension(seed) => {
