@@ -3959,6 +3959,7 @@ dependencies = [
  "clap",
  "codec",
  "frankenterm-core",
+ "frankenterm-core-replay",
  "frankenterm-escape-parser",
  "frankenterm-mux-server-impl",
  "frankenterm-scripting",
