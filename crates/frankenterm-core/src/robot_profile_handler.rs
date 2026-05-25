@@ -91,6 +91,8 @@ use crate::storage::profiles_applied_log_sql::{
 };
 use crate::storage_backend_trait::StorageBackend;
 
+const PROFILE_APPLY_COUNT_MAX: u32 = 256;
+
 /// Failure modes the handler exposes to its caller. The wire-level
 /// envelope at `main.rs` translates each variant into a typed
 /// `RobotResponse` error code; the conformance test only sees the
@@ -349,7 +351,7 @@ fn handle_apply(
     backend: &dyn StorageBackend,
 ) -> Result<Value, ProfileHandlerError> {
     let name = require_str(params, "name")?;
-    let count = opt_u32(params, "count")?.unwrap_or(1);
+    let count = validate_profile_apply_count(opt_u32(params, "count")?.unwrap_or(1))?;
     let dry_run = opt_bool(params, "dry_run")?.unwrap_or(false);
 
     // Verify the row exists before reporting any "would spawn" plan.
@@ -588,15 +590,9 @@ pub fn handle_profile_apply_with_executor<E: ProfileApplyMutationExecutor>(
     now_ms: i64,
 ) -> Result<Value, ProfileHandlerError> {
     let name = require_str(params, "name")?;
-    let count = opt_u32(params, "count")?.unwrap_or(1);
+    let count = validate_profile_apply_count(opt_u32(params, "count")?.unwrap_or(1))?;
     let dry_run = opt_bool(params, "dry_run")?.unwrap_or(false);
     let env_overrides = parse_env_overrides(params)?;
-
-    if count == 0 {
-        return Err(ProfileHandlerError::BadParams(
-            "`count` must be greater than zero".to_string(),
-        ));
-    }
 
     let profile = get_agent_profile(backend, name)
         .map_err(ProfileHandlerError::Storage)?
@@ -705,6 +701,20 @@ pub fn handle_profile_apply_with_executor<E: ProfileApplyMutationExecutor>(
             })
         }
     }
+}
+
+fn validate_profile_apply_count(count: u32) -> Result<u32, ProfileHandlerError> {
+    if count == 0 {
+        return Err(ProfileHandlerError::BadParams(
+            "`count` must be greater than zero".to_string(),
+        ));
+    }
+    if count > PROFILE_APPLY_COUNT_MAX {
+        return Err(ProfileHandlerError::BadParams(format!(
+            "`count` must be <= {PROFILE_APPLY_COUNT_MAX} (got {count})"
+        )));
+    }
+    Ok(count)
 }
 
 fn parse_env_overrides(params: &Value) -> Result<HashMap<String, String>, ProfileHandlerError> {
@@ -1467,6 +1477,40 @@ mod tests {
     }
 
     #[test]
+    fn apply_rejects_zero_count_before_spawn_error() {
+        let conn = fresh_conn();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+
+        let err = handle_profile_command("apply", &json!({ "name": "ready", "count": 0 }), &conn)
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.bad_params");
+        assert!(
+            err.to_string()
+                .contains("`count` must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn apply_rejects_oversized_count_before_spawn_error() {
+        let conn = fresh_conn();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+
+        let err = handle_profile_command(
+            "apply",
+            &json!({ "name": "ready", "count": PROFILE_APPLY_COUNT_MAX + 1 }),
+            &conn,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.bad_params");
+        assert!(
+            err.to_string()
+                .contains(&format!("`count` must be <= {PROFILE_APPLY_COUNT_MAX}"))
+        );
+    }
+
+    #[test]
     fn live_apply_rejects_wrong_type_dry_run_before_spawn() {
         let conn = fresh_conn_with_apply_log();
         insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
@@ -1482,6 +1526,32 @@ mod tests {
 
         assert_eq!(err.error_code(), "robot.profile.bad_params");
         assert!(err.to_string().contains("`dry_run` must be a boolean"));
+        assert!(executor.spawned.is_empty());
+    }
+
+    #[test]
+    fn live_apply_rejects_oversized_count_before_allocating_spawn_specs() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+
+        let err = handle_profile_apply_with_executor(
+            &json!({
+                "name": "ready",
+                "count": PROFILE_APPLY_COUNT_MAX + 1,
+                "dry_run": false
+            }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.bad_params");
+        assert!(
+            err.to_string()
+                .contains(&format!("`count` must be <= {PROFILE_APPLY_COUNT_MAX}"))
+        );
         assert!(executor.spawned.is_empty());
     }
 
