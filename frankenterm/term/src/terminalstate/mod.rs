@@ -82,6 +82,22 @@ fn add_u32_to_i64_saturating(value: i64, delta: u32) -> i64 {
     value.saturating_add(i64::from(delta))
 }
 
+fn last_col_in(range: &std::ops::Range<usize>) -> usize {
+    range.end.saturating_sub(1)
+}
+
+fn last_row_in(range: &std::ops::Range<i64>) -> i64 {
+    range.end.saturating_sub(1)
+}
+
+fn last_col_for_width(cols: usize) -> usize {
+    cols.saturating_sub(1)
+}
+
+fn last_row_for_height(rows: usize) -> i64 {
+    usize_to_i64_saturating(rows).saturating_sub(1)
+}
+
 fn next_sequence_no(seqno: SequenceNo) -> SequenceNo {
     seqno.saturating_add(1)
 }
@@ -1177,7 +1193,7 @@ impl TerminalState {
             self.cursor.x
         };
         let y = self.cursor.y;
-        let y = if y == self.top_and_bottom_margins.end - 1 {
+        let y = if y == last_row_in(&self.top_and_bottom_margins) {
             self.scroll_up(1);
             y
         } else {
@@ -1190,7 +1206,7 @@ impl TerminalState {
     /// If the cursor is at the bottom margin, the page scrolls up.
     fn c1_index(&mut self) {
         if self.left_and_right_margins.contains(&self.cursor.x) {
-            if self.cursor.y == self.top_and_bottom_margins.end - 1 {
+            if self.cursor.y == last_row_in(&self.top_and_bottom_margins) {
                 self.scroll_up(1);
             } else {
                 self.set_cursor_pos(&Position::Relative(0), &Position::Relative(1));
@@ -1210,9 +1226,9 @@ impl TerminalState {
         let seqno = self.seqno;
         let x = match self.tabs.find_next_tab_stop(self.cursor.x) {
             Some(x) => x,
-            None => self.left_and_right_margins.end - 1,
+            None => last_col_in(&self.left_and_right_margins),
         };
-        self.cursor.x = x.min(self.left_and_right_margins.end - 1);
+        self.cursor.x = x.min(last_col_in(&self.left_and_right_margins));
         self.cursor.seqno = seqno;
     }
 
@@ -2437,13 +2453,13 @@ impl TerminalState {
                         line.set_cell(x, cell.clone(), seqno);
                     }
                     x += 1;
-                    if x > left_and_right_margins.end - 1 {
+                    if x > last_col_in(&left_and_right_margins) {
                         x = left_and_right_margins.start;
-                        if y == top_and_bottom_margins.end - 1 {
+                        if y == last_row_in(&top_and_bottom_margins) {
                             self.scroll_up(1);
                         } else {
                             y += 1;
-                            if y > top_and_bottom_margins.end - 1 {
+                            if y > last_row_in(&top_and_bottom_margins) {
                                 y = top_and_bottom_margins.end;
                             }
                         }
@@ -2552,11 +2568,11 @@ impl TerminalState {
                 let cols = self.screen().physical_cols;
                 let new_x = if self.cursor.x >= self.left_and_right_margins.end {
                     // outside the margin, so allow movement to screen edge
-                    add_u32_to_usize_saturating(self.cursor.x, n).min(cols - 1)
+                    add_u32_to_usize_saturating(self.cursor.x, n).min(last_col_for_width(cols))
                 } else {
                     // Else constrain to margin
                     add_u32_to_usize_saturating(self.cursor.x, n)
-                        .min(self.left_and_right_margins.end - 1)
+                        .min(last_col_in(&self.left_and_right_margins))
                 };
 
                 self.cursor.x = new_x;
@@ -2593,12 +2609,11 @@ impl TerminalState {
                 let new_y = if self.cursor.y >= self.top_and_bottom_margins.end {
                     // below the bottom margin, so allow movement to
                     // bottom of screen
-                    add_u32_to_i64_saturating(self.cursor.y, n)
-                        .min(usize_to_i64_saturating(rows).saturating_sub(1))
+                    add_u32_to_i64_saturating(self.cursor.y, n).min(last_row_for_height(rows))
                 } else {
                     // Else constrain to bottom margin
                     add_u32_to_i64_saturating(self.cursor.y, n)
-                        .min(self.top_and_bottom_margins.end - 1)
+                        .min(last_row_in(&self.top_and_bottom_margins))
                 };
 
                 self.cursor.y = new_y;
@@ -2623,7 +2638,7 @@ impl TerminalState {
                 } else {
                     col
                 };
-                self.cursor.x = col.min(self.screen().physical_cols - 1);
+                self.cursor.x = col.min(last_col_for_width(self.screen().physical_cols));
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -2652,12 +2667,11 @@ impl TerminalState {
                 let new_y = if self.cursor.y >= self.top_and_bottom_margins.end {
                     // below the bottom margin, so allow movement to
                     // bottom of screen
-                    add_u32_to_i64_saturating(self.cursor.y, n)
-                        .min(usize_to_i64_saturating(rows).saturating_sub(1))
+                    add_u32_to_i64_saturating(self.cursor.y, n).min(last_row_for_height(rows))
                 } else {
                     // Else constrain to bottom margin
                     add_u32_to_i64_saturating(self.cursor.y, n)
-                        .min(self.top_and_bottom_margins.end - 1)
+                        .min(last_row_in(&self.top_and_bottom_margins))
                 };
 
                 self.cursor.y = new_y;
@@ -3637,6 +3651,14 @@ mod tests {
         assert_eq!(add_u32_to_usize_saturating(usize::MAX, 3), usize::MAX);
         assert_eq!(add_u32_to_i64_saturating(5, 3), 8);
         assert_eq!(add_u32_to_i64_saturating(i64::MAX, 3), i64::MAX);
+        assert_eq!(last_col_in(&(0..0)), 0);
+        assert_eq!(last_col_in(&(2..5)), 4);
+        assert_eq!(last_row_in(&(0..0)), 0);
+        assert_eq!(last_row_in(&(2..5)), 4);
+        assert_eq!(last_col_for_width(0), 0);
+        assert_eq!(last_col_for_width(5), 4);
+        assert_eq!(last_row_for_height(0), 0);
+        assert_eq!(last_row_for_height(5), 4);
     }
 
     // ── ScreenOrAlt ────────────────────────────────────────────
