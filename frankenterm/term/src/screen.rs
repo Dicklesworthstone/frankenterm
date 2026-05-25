@@ -431,6 +431,11 @@ struct LogicalLineWrapCache {
     wrap_key_order: VecDeque<WrapCacheKey>,
 }
 
+enum WrappedResizeLines {
+    Cached(Vec<Vec<Line>>),
+    Scratch { logical_count: usize },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ScrollbackSpillOutcome {
     cold_lines_evicted: usize,
@@ -1371,12 +1376,13 @@ impl Screen {
         }
     }
 
-    fn take_wrapped_from_scratch(&mut self, logical_count: usize) -> Vec<Vec<Line>> {
+    fn clone_wrapped_from_scratch(&self, logical_count: usize) -> Vec<Vec<Line>> {
         let mut wrapped = Vec::with_capacity(logical_count);
-        for slot in self.rewrap_scratch_slots.iter_mut().take(logical_count) {
+        for slot in self.rewrap_scratch_slots.iter().take(logical_count) {
             wrapped.push(
-                slot.take()
-                    .expect("missing wrapped line result after planner"),
+                slot.as_ref()
+                    .expect("missing wrapped line result after planner")
+                    .clone(),
             );
         }
         wrapped
@@ -1395,12 +1401,29 @@ impl Screen {
         }
     }
 
+    fn rebuild_rewrap_row_prefix_scratch_from_slots(&mut self, logical_count: usize) {
+        self.rewrap_row_prefix_scratch.clear();
+        self.rewrap_row_prefix_scratch
+            .reserve(logical_count.saturating_add(1));
+        self.rewrap_row_prefix_scratch.push(0);
+
+        let mut total_rows = 0usize;
+        for slot in self.rewrap_scratch_slots.iter().take(logical_count) {
+            total_rows = total_rows.saturating_add(
+                slot.as_ref()
+                    .expect("missing wrapped line result after planner")
+                    .len(),
+            );
+            self.rewrap_row_prefix_scratch.push(total_rows);
+        }
+    }
+
     fn logical_wraps_for_resize(
         &mut self,
         source_signature: u64,
         physical_cols: usize,
         seqno: SequenceNo,
-    ) -> (Vec<Vec<Line>>, usize, bool, bool, usize) {
+    ) -> (WrappedResizeLines, usize, bool, bool, usize) {
         let wrap_key = WrapCacheKey {
             physical_cols,
             dpi: self.dpi,
@@ -1418,7 +1441,7 @@ impl Screen {
                     let cache_entries = entry.wrapped_by_key.len();
                     self.rewrap_cache = cache;
                     return (
-                        wrapped,
+                        WrappedResizeLines::Cached(wrapped),
                         logical_count,
                         logical_cache_hit,
                         wrap_cache_hit,
@@ -1426,17 +1449,17 @@ impl Screen {
                     );
                 }
 
-                let wrapped = self.wrap_logical_lines_for_resize(
+                self.wrap_logical_lines_for_resize(
                     &entry.logical_lines,
                     physical_cols,
                     seqno,
                     Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
                 );
-                entry.insert_wrapped(wrap_key, wrapped.clone());
+                entry.insert_wrapped(wrap_key, self.clone_wrapped_from_scratch(logical_count));
                 let cache_entries = entry.wrapped_by_key.len();
                 self.rewrap_cache = cache;
                 return (
-                    wrapped,
+                    WrappedResizeLines::Scratch { logical_count },
                     logical_count,
                     logical_cache_hit,
                     wrap_cache_hit,
@@ -1447,18 +1470,18 @@ impl Screen {
 
         let logical_lines = self.rebuild_logical_lines_from_physical(seqno);
         let logical_count = logical_lines.len();
-        let wrapped = self.wrap_logical_lines_for_resize(
+        self.wrap_logical_lines_for_resize(
             &logical_lines,
             physical_cols,
             seqno,
             Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
         );
         let mut new_cache = LogicalLineWrapCache::new(source_signature, logical_lines);
-        new_cache.insert_wrapped(wrap_key, wrapped.clone());
+        new_cache.insert_wrapped(wrap_key, self.clone_wrapped_from_scratch(logical_count));
         let cache_entries = new_cache.wrapped_by_key.len();
         self.rewrap_cache = Some(new_cache);
         (
-            wrapped,
+            WrappedResizeLines::Scratch { logical_count },
             logical_count,
             logical_cache_hit,
             wrap_cache_hit,
@@ -1490,10 +1513,10 @@ impl Screen {
         physical_cols: usize,
         seqno: SequenceNo,
         reflow_plan: Option<&ViewportReflowPlan>,
-    ) -> Vec<Vec<Line>> {
+    ) {
         let logical_count = logical_lines.len();
         if logical_count == 0 {
-            return vec![];
+            return;
         }
 
         let wrap_policy = self.resize_wrap_policy;
@@ -1671,8 +1694,6 @@ impl Screen {
             self.last_resize_wrap_scorecard = None;
             self.last_resize_wrap_gate_payload = None;
         }
-
-        self.take_wrapped_from_scratch(logical_count)
     }
 
     fn rewrap_lines(
@@ -1699,7 +1720,12 @@ impl Screen {
         let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
         let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
             self.logical_wraps_for_resize(source_signature, physical_cols, seqno);
-        self.rebuild_rewrap_row_prefix_scratch(&wrapped);
+        match &wrapped {
+            WrappedResizeLines::Cached(wrapped) => self.rebuild_rewrap_row_prefix_scratch(wrapped),
+            WrappedResizeLines::Scratch { logical_count } => {
+                self.rebuild_rewrap_row_prefix_scratch_from_slots(*logical_count);
+            }
+        }
         let mut adjusted_cursor = (cursor_x, cursor_y);
         let wrapped_count = self.rewrap_row_prefix_scratch.last().copied().unwrap_or(0);
         if let Some((logical_idx, logical_x)) = logical_cursor {
@@ -1740,10 +1766,25 @@ impl Screen {
             rewrapped.reserve(additional);
         }
         let mut pruned_rows = 0usize;
-        for lines in wrapped {
-            for mut line in lines {
-                line.update_last_change_seqno(seqno);
-                rewrapped.push_back(line);
+        match wrapped {
+            WrappedResizeLines::Cached(wrapped) => {
+                for lines in wrapped {
+                    for mut line in lines {
+                        line.update_last_change_seqno(seqno);
+                        rewrapped.push_back(line);
+                    }
+                }
+            }
+            WrappedResizeLines::Scratch { logical_count } => {
+                for slot in self.rewrap_scratch_slots.iter_mut().take(logical_count) {
+                    let lines = slot
+                        .take()
+                        .expect("missing wrapped line result after planner");
+                    for mut line in lines {
+                        line.update_last_change_seqno(seqno);
+                        rewrapped.push_back(line);
+                    }
+                }
             }
         }
         self.lines = rewrapped;
@@ -3451,6 +3492,57 @@ mod tests {
             screen.rewrap_row_prefix_scratch.capacity() >= first_prefix_capacity,
             "row-prefix scratch buffer should be reused across resize cycles"
         );
+    }
+
+    #[test]
+    fn resize_reflow_scratch_move_matches_cached_wrap_output() {
+        let attrs = CellAttributes::blank();
+        let seed_lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcdefghijkl", &attrs, 0),
+            Line::from_text("mnop", &attrs, 0, None),
+            Line::from_text_with_wrapped_last_col("qrstuv", &attrs, 0),
+            Line::from_text("wxyz", &attrs, 0, None),
+            Line::new(0),
+        ]);
+        let cursor = test_cursor(2, 3, 1);
+
+        let mut cached = test_screen(4, 6, 96);
+        cached.lines = seed_lines;
+        let cursor = cached.resize(test_size(4, 4, 96), cursor, 1, false);
+        let cursor = cached.resize(test_size(4, 6, 96), cursor, 2, false);
+
+        let mut direct = test_screen(cached.physical_rows, cached.physical_cols, cached.dpi);
+        direct.lines = cached.lines.clone();
+        direct.rewrap_cache = None;
+
+        let cached_cursor = cached.resize(test_size(4, 4, 96), cursor, 3, false);
+        let direct_cursor = direct.resize(test_size(4, 4, 96), cursor, 3, false);
+
+        let cached_lines: Vec<_> = cached
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.as_str().to_string(),
+                    line.current_seqno(),
+                    line.last_cell_was_wrapped(),
+                )
+            })
+            .collect();
+        let direct_lines: Vec<_> = direct
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.as_str().to_string(),
+                    line.current_seqno(),
+                    line.last_cell_was_wrapped(),
+                )
+            })
+            .collect();
+
+        assert_eq!(cached_cursor, direct_cursor);
+        assert_eq!(cached_lines, direct_lines);
     }
 
     #[test]
