@@ -244,6 +244,7 @@ fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str 
 /// Returns one of:
 /// - `\"not_json\"` for malformed or non-UTF-8 input
 /// - `\"not_object\"` when the top-level payload isn't an object
+/// - `\"unsupported_method\"` when a JSON-RPC request isn't `tools/call`
 /// - `\"bad_params\"` when `params` exists but isn't an object
 /// - `\"missing_name\"` when no tool name is present
 /// - `\"unknown_tool\"` when the tool name isn't a known `wa.*` tool
@@ -261,9 +262,12 @@ pub fn __fuzz_parse_tool_call_request(input: &[u8]) -> &'static str {
         Some(object) => object,
         None => return "not_object",
     };
-    let call_object = match object.get("params") {
-        Some(Value::Object(params)) => params,
-        Some(_) => return "bad_params",
+    let call_object = match object.get("method") {
+        Some(Value::String(method)) if method == "tools/call" => match object.get("params") {
+            Some(Value::Object(params)) => params,
+            _ => return "bad_params",
+        },
+        Some(_) => return "unsupported_method",
         None => object,
     };
     let tool_name = match call_object
@@ -1165,6 +1169,42 @@ mod tests {
                 .collect();
             PaneFilterConfig { include, exclude }
         })
+    }
+
+    #[cfg(feature = "fuzz")]
+    #[test]
+    fn fuzz_parse_tool_call_request_rejects_unsupported_jsonrpc_method() {
+        let request = br#"{"method":"initialize","params":{"name":"wa.state","arguments":null}}"#;
+
+        assert_eq!(
+            __fuzz_parse_tool_call_request(request),
+            "unsupported_method"
+        );
+    }
+
+    #[cfg(feature = "fuzz")]
+    #[test]
+    fn fuzz_parse_tool_call_request_accepts_tools_call_and_direct_forms() {
+        let tools_call =
+            br#"{"method":"tools/call","params":{"name":"wa.state","arguments":null}}"#;
+        let direct_name = br#"{"name":"wa.state","arguments":null}"#;
+        let direct_tool = br#"{"tool":"wa.state","args":null}"#;
+
+        assert_eq!(__fuzz_parse_tool_call_request(tools_call), "parsed");
+        assert_eq!(__fuzz_parse_tool_call_request(direct_name), "parsed");
+        assert_eq!(__fuzz_parse_tool_call_request(direct_tool), "parsed");
+    }
+
+    #[cfg(feature = "fuzz")]
+    #[test]
+    fn fuzz_parse_tool_call_request_rejects_tools_call_without_object_params() {
+        for request in [
+            br#"{"method":"tools/call"}"#.as_slice(),
+            br#"{"method":"tools/call","params":null}"#,
+            br#"{"method":"tools/call","params":[]}"#,
+        ] {
+            assert_eq!(__fuzz_parse_tool_call_request(request), "bad_params");
+        }
     }
 
     fn sample_mcp_tx_contract() -> crate::plan::MissionTxContract {
