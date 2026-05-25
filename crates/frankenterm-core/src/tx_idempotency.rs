@@ -2580,6 +2580,52 @@ mod tests {
     }
 
     #[test]
+    fn store_archived_terminal_ledger_keeps_replay_dedup_until_ttl() {
+        let mut store = IdempotencyStore::new(IdempotencyPolicy {
+            dedup_ttl_ms: 10_000,
+            ..IdempotencyPolicy::default()
+        });
+        let plan = make_plan(1);
+        store.create_ledger("exec-1", &plan).unwrap();
+        store
+            .get_ledger_mut("exec-1")
+            .unwrap()
+            .transition_phase(TxPhase::Preparing)
+            .unwrap();
+
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let outcome = StepOutcome::Success {
+            result: Some("archived".to_string()),
+        };
+        store
+            .record_execution(
+                "exec-1",
+                key.clone(),
+                outcome.clone(),
+                StepRisk::Low,
+                "agent-a",
+                1_000,
+            )
+            .unwrap();
+        store
+            .get_ledger_mut("exec-1")
+            .unwrap()
+            .transition_phase(TxPhase::Committing)
+            .unwrap();
+        store
+            .get_ledger_mut("exec-1")
+            .unwrap()
+            .transition_phase(TxPhase::Completed)
+            .unwrap();
+
+        let archived = store.archive_ledger("exec-1").unwrap();
+
+        assert_eq!(archived.phase(), TxPhase::Completed);
+        assert_eq!(store.active_count(), 0);
+        assert_eq!(store.check_dedup(&key), Some(&outcome));
+    }
+
+    #[test]
     fn store_archive_non_terminal_rejected() {
         let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
         let plan = make_plan(1);
@@ -2644,6 +2690,66 @@ mod tests {
         // Still in ledger (not evicted from there), but global dedup evicted.
         // The check_dedup also looks at ledgers, so it will still find it.
         assert!(store.check_dedup(&key).is_some());
+    }
+
+    #[test]
+    fn store_expired_replay_dedup_does_not_erase_resume_evidence() {
+        let mut store = IdempotencyStore::new(IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..IdempotencyPolicy::default()
+        });
+        let plan = make_plan(2);
+        store.create_ledger("exec-1", &plan).unwrap();
+        store.create_ledger("exec-2", &plan).unwrap();
+        for execution_id in ["exec-1", "exec-2"] {
+            store
+                .get_ledger_mut(execution_id)
+                .unwrap()
+                .transition_phase(TxPhase::Preparing)
+                .unwrap();
+        }
+
+        let old_key = make_key("test-plan", &plan.steps[0].id);
+        store
+            .record_execution(
+                "exec-1",
+                old_key.clone(),
+                StepOutcome::Success {
+                    result: Some("old".to_string()),
+                },
+                StepRisk::Low,
+                "agent-a",
+                1_000,
+            )
+            .unwrap();
+
+        let newer_key = make_key("test-plan", &plan.steps[1].id);
+        store
+            .record_execution(
+                "exec-2",
+                newer_key.clone(),
+                StepOutcome::Success {
+                    result: Some("newer".to_string()),
+                },
+                StepRisk::Low,
+                "agent-b",
+                1_201,
+            )
+            .unwrap();
+
+        assert!(
+            store.check_dedup(&old_key).is_none(),
+            "dedup replay must expire against the store logical clock"
+        );
+        assert!(store.check_dedup(&newer_key).is_some());
+
+        let ctx = store.resume_context("exec-1", &plan).unwrap();
+        assert_eq!(
+            ctx.recommendation,
+            ResumeRecommendation::ContinueFromCheckpoint
+        );
+        assert_eq!(ctx.completed_steps, vec![plan.steps[0].id.clone()]);
+        assert_eq!(ctx.remaining_steps, vec![plan.steps[1].id.clone()]);
     }
 
     #[test]

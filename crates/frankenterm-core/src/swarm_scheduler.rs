@@ -3503,6 +3503,80 @@ mod tests {
     }
 
     #[test]
+    fn operating_envelope_admits_healthy_and_fails_closed_on_missing_or_critical_telemetry() {
+        let controller = SwarmAdmissionController::default();
+
+        let healthy = controller.evaluate(
+            &background_admission_request(),
+            &admission_telemetry(0.10, FleetPressureTier::Normal),
+        );
+        assert_eq!(healthy.action, AdmissionAction::Admit);
+        assert_eq!(healthy.counters.admitted, 1);
+        assert!(healthy.reason_codes.contains(&AdmissionReasonCode::Healthy));
+        assert!(
+            !healthy
+                .reason_codes
+                .contains(&AdmissionReasonCode::FailClosedMissingTelemetry)
+        );
+
+        let missing = controller.evaluate(
+            &mission_critical_admission_request(),
+            &SwarmAdmissionTelemetry {
+                queue_pressure: None,
+                fleet_pressure: None,
+                memory_tier_budget: None,
+                latency_stage_pressures: None,
+                herd_wave_pressure: None,
+            },
+        );
+        assert_eq!(
+            missing.action,
+            AdmissionAction::Defer,
+            "missing mandatory telemetry must not be priority-protected into Admit"
+        );
+        assert_eq!(missing.counters.deferred, 1);
+        for reason in [
+            AdmissionReasonCode::MissingQueueTelemetry,
+            AdmissionReasonCode::MissingFleetTelemetry,
+            AdmissionReasonCode::MissingMemoryTierTelemetry,
+            AdmissionReasonCode::MissingLatencyTelemetry,
+            AdmissionReasonCode::FailClosedMissingTelemetry,
+        ] {
+            assert!(
+                missing.reason_codes.contains(&reason),
+                "missing fail-closed summary omitted {reason:?}: {:?}",
+                missing.reason_codes
+            );
+        }
+
+        let critical = controller.evaluate(
+            &background_admission_request(),
+            &SwarmAdmissionTelemetry::new(
+                admission_queue_pressure(1.25),
+                FleetPressureTier::Emergency,
+                over_budget_tier_budget(),
+                over_budget_stage_pressure(1.25),
+            ),
+        );
+        assert_eq!(critical.action, AdmissionAction::Shed);
+        assert_eq!(critical.counters.shed, 1);
+        assert!(critical.raw_pressure_severity >= AdmissionAction::Shed.severity());
+        assert!(critical.effective_pressure_severity >= AdmissionAction::Shed.severity());
+        for reason in [
+            AdmissionReasonCode::QueueOverCapacity,
+            AdmissionReasonCode::FleetPressure,
+            AdmissionReasonCode::MemoryTierPressure,
+            AdmissionReasonCode::LatencyStageOverBudget,
+        ] {
+            assert!(
+                critical.reason_codes.contains(&reason),
+                "critical telemetry summary omitted {reason:?}: {:?}",
+                critical.reason_codes
+            );
+        }
+    }
+
+    #[test]
     fn admission_priority_protection_prevents_low_priority_inversion_ft_t1ktp() {
         let controller = SwarmAdmissionController::default();
         let telemetry = admission_telemetry(0.0, FleetPressureTier::Emergency);
