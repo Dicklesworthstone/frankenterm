@@ -1086,17 +1086,14 @@ impl ToolHandler for WaRulesTestTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: RulesTestParams = match serde_json::from_value(arguments) {
-            Ok(p) => p,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Invalid params: {err}"),
-                    Some("Expected object with text (required), trace".to_string()),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
+        let params: RulesTestParams = match parse_mcp_tool_params(
+            "wa.rules_test",
+            arguments,
+            "Expected object with text (required), trace",
+            start,
+        ) {
+            Ok(params) => params,
+            Err(response) => return response,
         };
 
         let engine = PatternEngine::new();
@@ -8286,6 +8283,39 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("execution_id, pane_id, or active=true")
+        );
+    }
+
+    #[test]
+    fn rules_test_malformed_args_redacts_serde_error_value() {
+        let tool = WaRulesTestTool;
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "text": "plain pane output",
+                    "trace": secret,
+                }),
+            )
+            .expect("rules_test bad-arg call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(
+            envelope["hint"],
+            "Expected object with text (required), trace"
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "malformed-argument envelope leaked the caller-supplied secret"
         );
     }
 
