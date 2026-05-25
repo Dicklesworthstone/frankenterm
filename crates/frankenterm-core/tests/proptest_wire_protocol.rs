@@ -8,6 +8,7 @@
 use frankenterm_core::wire_protocol::{
     AgentStreamer, Aggregator, BackoffConfig, ConnectionState, GapNotice, IngestResult,
     MAX_MESSAGE_SIZE, PROTOCOL_VERSION, PaneDelta, PaneMeta, PanesMeta, WireEnvelope, WirePayload,
+    WireProtocolError,
 };
 use proptest::prelude::*;
 
@@ -63,7 +64,42 @@ fn arb_pane_delta() -> impl Strategy<Value = PaneDelta> {
         })
 }
 
+fn arb_pane_delta_with_content_len_mismatch() -> impl Strategy<Value = PaneDelta> {
+    (
+        0..1000u64,
+        0..10000u64,
+        "[a-zA-Z0-9 ]{0,100}",
+        1_000_000_000_000i64..2_000_000_000_000i64,
+    )
+        .prop_map(|(pane_id, seq, content, captured_at_ms)| PaneDelta {
+            pane_id,
+            seq,
+            content_len: content.len().saturating_add(1),
+            content,
+            captured_at_ms,
+        })
+}
+
 fn arb_gap_notice() -> impl Strategy<Value = GapNotice> {
+    (
+        0..1000u64,
+        0..10000u64,
+        1..10000u64,
+        "[a-z_]{1,30}",
+        1_000_000_000_000i64..2_000_000_000_000i64,
+    )
+        .prop_map(
+            |(pane_id, seq_before, seq_span, reason, detected_at_ms)| GapNotice {
+                pane_id,
+                seq_before,
+                seq_after: seq_before + seq_span,
+                reason,
+                detected_at_ms,
+            },
+        )
+}
+
+fn arb_invalid_gap_notice() -> impl Strategy<Value = GapNotice> {
     (
         0..1000u64,
         0..10000u64,
@@ -72,10 +108,10 @@ fn arb_gap_notice() -> impl Strategy<Value = GapNotice> {
         1_000_000_000_000i64..2_000_000_000_000i64,
     )
         .prop_map(
-            |(pane_id, seq_before, seq_after, reason, detected_at_ms)| GapNotice {
+            |(pane_id, seq_before, backstep, reason, detected_at_ms)| GapNotice {
                 pane_id,
                 seq_before,
-                seq_after,
+                seq_after: seq_before.saturating_sub(backstep),
                 reason,
                 detected_at_ms,
             },
@@ -731,6 +767,58 @@ fn pane_delta_with_mismatched_content_len_is_rejected() {
         err.is_err(),
         "mismatched PaneDelta content_len must be rejected"
     );
+}
+
+proptest! {
+    #[test]
+    fn envelope_rejects_pane_delta_content_len_mismatch(
+        delta in arb_pane_delta_with_content_len_mismatch(),
+    ) {
+        let envelope = WireEnvelope::new(1, "agent-a", WirePayload::PaneDelta(delta));
+        let bytes = envelope.to_json().expect("serialize invalid pane delta envelope");
+
+        let err = WireEnvelope::from_json(&bytes).expect_err(
+            "decoded envelope path must fail closed on mismatched PaneDelta content_len",
+        );
+        prop_assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn envelope_rejects_gap_notice_with_non_increasing_bounds(
+        gap in arb_invalid_gap_notice(),
+    ) {
+        let envelope = WireEnvelope::new(1, "agent-a", WirePayload::Gap(gap));
+        let bytes = envelope.to_json().expect("serialize invalid gap envelope");
+
+        let err = WireEnvelope::from_json(&bytes).expect_err(
+            "decoded envelope path must fail closed when GapNotice bounds do not advance",
+        );
+        prop_assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn aggregator_rejects_decoded_invalid_payload_without_opening_session(
+        delta in arb_pane_delta_with_content_len_mismatch(),
+        gap in arb_invalid_gap_notice(),
+        use_gap in proptest::bool::ANY,
+    ) {
+        let payload = if use_gap {
+            WirePayload::Gap(gap)
+        } else {
+            WirePayload::PaneDelta(delta)
+        };
+        let mut agg = Aggregator::new(10);
+        let envelope = WireEnvelope::new(1, "agent-a", payload);
+
+        let err = agg.ingest_envelope(envelope).expect_err(
+            "aggregator must validate decoded envelopes before mutating sender sessions",
+        );
+        prop_assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+        prop_assert_eq!(agg.total_rejected(), 1);
+        prop_assert_eq!(agg.total_accepted(), 0);
+        prop_assert_eq!(agg.agent_count(), 0);
+        prop_assert_eq!(agg.agent_last_seq("agent-a"), None);
+    }
 }
 
 // ============================================================================
