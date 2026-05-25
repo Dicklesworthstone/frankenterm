@@ -1,9 +1,9 @@
 use crate::screen::Screens;
 use crate::{Appearance, Connection, GeometryOrigin, RequestedWindowGeometry, ResolvedGeometry};
-use anyhow::anyhow;
 use anyhow::Result as Fallible;
-use config::keyassignment::KeyAssignment;
+use anyhow::anyhow;
 use config::DimensionContext;
+use config::keyassignment::KeyAssignment;
 use promise::{Future, Promise};
 use std::cell::RefCell;
 use std::fmt::Display;
@@ -170,9 +170,12 @@ pub trait ConnectionOps {
 #[cfg(test)]
 mod tests {
     use super::{
+        ApplicationEvent, ConnectionOps, EVENT_HANDLER, Fallible, RequestedWindowGeometry,
         fail_window_op_for_destroyed_window, new_window_op_promise, nop_event_handler,
-        ApplicationEvent, ConnectionOps, Fallible, EVENT_HANDLER,
     };
+    use crate::screen::{ScreenInfo, Screens};
+    use config::{Dimension, GeometryOrigin};
+    use std::collections::HashMap;
     use std::future::Future as StdFuture;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,9 +197,144 @@ mod tests {
         }
     }
 
+    struct GeometryConnection {
+        screens: Option<Screens>,
+        dpi: f64,
+    }
+
+    impl ConnectionOps for GeometryConnection {
+        fn name(&self) -> String {
+            "geometry-test".to_string()
+        }
+
+        fn default_dpi(&self) -> f64 {
+            self.dpi
+        }
+
+        fn screens(&self) -> anyhow::Result<Screens> {
+            self.screens
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("screen query unavailable"))
+        }
+
+        fn terminate_message_loop(&self) {}
+
+        fn run_message_loop(&self) -> Fallible<()> {
+            Ok(())
+        }
+    }
+
+    fn screen_info(name: &str, x: isize, y: isize, width: isize, height: isize) -> ScreenInfo {
+        ScreenInfo {
+            name: name.to_string(),
+            rect: euclid::rect(x, y, width, height),
+            scale: 1.0,
+            max_fps: None,
+            effective_dpi: None,
+        }
+    }
+
+    fn test_screens() -> Screens {
+        let main = screen_info("main", 0, 0, 1920, 1080);
+        let active = screen_info("active", 100, 200, 800, 600);
+        let named = screen_info("sidecar", -1200, 50, 1200, 900);
+        let by_name = HashMap::from([(named.name.clone(), named)]);
+
+        Screens {
+            main,
+            active,
+            by_name,
+            virtual_rect: euclid::rect(-1200, 0, 3120, 1100),
+        }
+    }
+
     fn reentrant_event_handler(_event: ApplicationEvent) {
         assert!(EVENT_HANDLER.try_lock().is_ok());
         EVENT_HANDLER_TEST_CALLED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn resolve_geometry_uses_requested_origin_bounds_and_offsets() {
+        struct Case {
+            name: &'static str,
+            origin: GeometryOrigin,
+            expected_x: Option<i32>,
+            expected_y: Option<i32>,
+            expected_width: usize,
+            expected_height: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "active screen offsets percent x and point height",
+                origin: GeometryOrigin::ActiveScreen,
+                expected_x: Some(300),
+                expected_y: Some(212),
+                expected_width: 400,
+                expected_height: 144,
+            },
+            Case {
+                name: "named screen applies negative origin",
+                origin: GeometryOrigin::Named("sidecar".to_string()),
+                expected_x: Some(-900),
+                expected_y: Some(62),
+                expected_width: 600,
+                expected_height: 144,
+            },
+            Case {
+                name: "missing named screen falls back to main",
+                origin: GeometryOrigin::Named("missing".to_string()),
+                expected_x: Some(480),
+                expected_y: Some(12),
+                expected_width: 960,
+                expected_height: 144,
+            },
+        ];
+
+        let conn = GeometryConnection {
+            screens: Some(test_screens()),
+            dpi: 144.0,
+        };
+
+        for case in cases {
+            let resolved = conn.resolve_geometry(RequestedWindowGeometry {
+                width: Dimension::Percent(0.5),
+                height: Dimension::Points(72.0),
+                x: Some(Dimension::Percent(0.25)),
+                y: Some(Dimension::Pixels(12.9)),
+                origin: case.origin,
+            });
+
+            assert_eq!(resolved.x, case.expected_x, "{} x", case.name);
+            assert_eq!(resolved.y, case.expected_y, "{} y", case.name);
+            assert_eq!(resolved.width, case.expected_width, "{} width", case.name);
+            assert_eq!(
+                resolved.height, case.expected_height,
+                "{} height",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_geometry_falls_back_to_virtual_canvas_when_screen_query_fails() {
+        let conn = GeometryConnection {
+            screens: None,
+            dpi: 96.0,
+        };
+
+        let resolved = conn.resolve_geometry(RequestedWindowGeometry {
+            width: Dimension::Percent(0.5),
+            height: Dimension::Pixels(600.9),
+            x: None,
+            y: None,
+            origin: GeometryOrigin::ActiveScreen,
+        });
+
+        assert_eq!(resolved.x, None);
+        assert_eq!(resolved.y, None);
+        assert_eq!(resolved.width, 32767);
+        assert_eq!(resolved.height, 600);
     }
 
     #[test]

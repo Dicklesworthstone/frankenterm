@@ -386,3 +386,88 @@ impl ResizeIncrement {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_state_capability_and_level_goldens() {
+        struct Case {
+            name: &'static str,
+            state: WindowState,
+            can_resize: bool,
+            can_paint: bool,
+            level: WindowLevel,
+        }
+
+        let cases = [
+            Case {
+                name: "normal",
+                state: WindowState::default(),
+                can_resize: true,
+                can_paint: true,
+                level: WindowLevel::Normal,
+            },
+            Case {
+                name: "full screen",
+                state: WindowState::FULL_SCREEN,
+                can_resize: false,
+                can_paint: true,
+                level: WindowLevel::Normal,
+            },
+            Case {
+                name: "maximized",
+                state: WindowState::MAXIMIZED,
+                can_resize: false,
+                can_paint: true,
+                level: WindowLevel::Normal,
+            },
+            Case {
+                name: "hidden",
+                state: WindowState::HIDDEN,
+                can_resize: true,
+                can_paint: false,
+                level: WindowLevel::Normal,
+            },
+            Case {
+                name: "always on top wins over bottom",
+                state: WindowState::ALWAYS_ON_BOTTOM | WindowState::ALWAYS_ON_TOP,
+                can_resize: true,
+                can_paint: true,
+                level: WindowLevel::AlwaysOnTop,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                case.state.can_resize(),
+                case.can_resize,
+                "{} resize",
+                case.name
+            );
+            assert_eq!(
+                case.state.can_paint(),
+                case.can_paint,
+                "{} paint",
+                case.name
+            );
+            assert_eq!(
+                case.state.as_window_level(),
+                case.level,
+                "{} level",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_resize_increment_uses_one_cell_increments_without_base_size() {
+        let disabled = ResizeIncrement::disabled();
+
+        assert_eq!(disabled.x, 1);
+        assert_eq!(disabled.y, 1);
+        assert_eq!(disabled.base_width, 0);
+        assert_eq!(disabled.base_height, 0);
+    }
+}

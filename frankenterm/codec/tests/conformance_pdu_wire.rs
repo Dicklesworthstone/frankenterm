@@ -602,6 +602,56 @@ fn conformance_mixed_mux_pdu_roundtrip_preserves_order_under_all_compression_mod
     );
 }
 
+#[test]
+fn conformance_mux_pdu_roundtrip_decodes_one_byte_chunks_in_order() {
+    let cases = [
+        (201, CompressionMode::Never, Pdu::Ping(Ping {})),
+        (
+            202,
+            CompressionMode::Always,
+            Pdu::ErrorResponse(ErrorResponse {
+                reason: "chunked mux stream".repeat(4),
+            }),
+        ),
+        (
+            203,
+            CompressionMode::Auto,
+            Pdu::GetCodecVersion(GetCodecVersion {}),
+        ),
+        (
+            204,
+            CompressionMode::Never,
+            Pdu::UnitResponse(UnitResponse {}),
+        ),
+    ];
+
+    let mut wire = Vec::new();
+    let mut expected = Vec::new();
+    for (serial, mode, pdu) in cases {
+        pdu.encode_with_mode(&mut wire, serial, mode)
+            .unwrap_or_else(|err| panic!("encode_with_mode({mode:?}) failed: {err}"));
+        expected.push((serial, pdu));
+    }
+
+    let mut buffer = Vec::new();
+    let mut actual = Vec::new();
+    for byte in wire {
+        buffer.push(byte);
+        while let Some(decoded) =
+            Pdu::stream_decode(&mut buffer).expect("stream_decode one-byte chunk")
+        {
+            actual.push((decoded.serial, decoded.pdu));
+        }
+    }
+
+    assert_eq!(actual, expected);
+    assert!(
+        buffer.is_empty(),
+        "one-byte chunked decode left {} bytes",
+        buffer.len()
+    );
+}
+
 // -----------------------------------------------------------------------------
 // 12. Non-canonical leb128 — valid wire frames must use the actual bytes
 //     consumed on the wire, not the decoder's re-encoded canonical lengths.
