@@ -442,6 +442,13 @@ impl Surface {
     }
 
     fn scroll_region_up(&mut self, start: usize, size: usize, count: usize) {
+        let end = start.saturating_add(size).min(self.height);
+        if start >= end {
+            return;
+        }
+        let size = end - start;
+        let count = min(count, size);
+
         // Replace the first lines with empty lines
         for index in start..start + min(count, size) {
             self.lines[index] = Line::with_width(self.width, self.seqno);
@@ -453,6 +460,13 @@ impl Surface {
     }
 
     fn scroll_region_down(&mut self, start: usize, size: usize, count: usize) {
+        let end = start.saturating_add(size).min(self.height);
+        if start >= end {
+            return;
+        }
+        let size = end - start;
+        let count = min(count, size);
+
         // Replace the last lines with empty lines
         for index in start + size - min(count, size)..start + size {
             self.lines[index] = Line::with_width(self.width, self.seqno);
@@ -2472,6 +2486,30 @@ mod test {
     }
 
     #[test]
+    fn scroll_region_up_clamps_oversized_region_to_surface() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: 2,
+            region_size: usize::MAX,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nddd\n   \n");
+    }
+
+    #[test]
+    fn scroll_region_up_oversized_count_clears_clamped_region() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: 1,
+            region_size: usize::MAX,
+            scroll_count: usize::MAX,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\n   \n   \n   \n");
+    }
+
+    #[test]
     fn scroll_region_down() {
         let mut s = Surface::new(3, 4);
         s.add_change("aaabbbcccddd");
@@ -2482,6 +2520,35 @@ mod test {
             scroll_count: 1,
         });
         assert_eq!(s.screen_chars_to_string(), "aaa\n   \nbbb\nddd\n");
+    }
+
+    #[test]
+    fn scroll_region_down_clamps_oversized_region_to_surface() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionDown {
+            first_row: 1,
+            region_size: usize::MAX,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\n   \nbbb\nccc\n");
+    }
+
+    #[test]
+    fn scroll_region_out_of_range_or_zero_count_is_noop() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: usize::MAX,
+            region_size: usize::MAX,
+            scroll_count: usize::MAX,
+        });
+        s.add_change(Change::ScrollRegionDown {
+            first_row: 1,
+            region_size: usize::MAX,
+            scroll_count: 0,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nccc\nddd\n");
     }
 
     // === Line attribute tests ===
@@ -2601,9 +2668,11 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::Title("myterm".to_string()));
         let (_seq, changes) = s.get_changes(0);
-        assert!(changes
-            .iter()
-            .any(|c| matches!(c, Change::Title(t) if t == "myterm")));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::Title(t) if t == "myterm"))
+        );
     }
 
     // === repaint includes cursor shape ===
@@ -2613,9 +2682,11 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::CursorShape(CursorShape::SteadyUnderline));
         let (_seq, changes) = s.get_changes(0);
-        assert!(changes
-            .iter()
-            .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline))));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline)))
+        );
     }
 
     // === hidden cursor not shown in repaint ===
