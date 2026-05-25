@@ -32,6 +32,8 @@ jobs:
             corpus: fuzz/contract_blocker_radar/corpus
           - target: contract_resource_cockpit
             corpus: fuzz/contract_resource_cockpit/corpus
+          - target: redactor_no_leak
+            corpus: fuzz/redactor_no_leak/corpus
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -64,6 +66,8 @@ jobs:
             corpus: fuzz/contract_blocker_radar/corpus
           - target: contract_resource_cockpit
             corpus: fuzz/contract_resource_cockpit/corpus
+          - target: redactor_no_leak
+            corpus: fuzz/redactor_no_leak/corpus
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
