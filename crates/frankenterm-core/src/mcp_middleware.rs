@@ -1,7 +1,8 @@
 //! Middleware wrappers for MCP tool handling.
 
 use super::{
-    MCP_ERR_INVALID_ARGS, McpEnvelope, elapsed_ms, envelope_to_content, record_mcp_audit_sync,
+    MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, McpEnvelope, elapsed_ms, envelope_to_content,
+    record_mcp_audit_sync,
 };
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
@@ -90,22 +91,31 @@ pub(super) fn encode_mcp_contents(
 ) -> McpResult<Vec<Content>> {
     match format {
         McpOutputFormat::Json => Ok(contents),
-        McpOutputFormat::Toon => contents
-            .into_iter()
-            .map(|content| match content {
-                Content::Text { text } => {
-                    let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
-                        McpError::internal_error(format!(
-                            "Unable to transcode MCP payload to TOON: {e}"
-                        ))
-                    })?;
-                    Ok(Content::Text {
-                        text: toon_rust::encode(value, None),
-                    })
+        McpOutputFormat::Toon => {
+            let mut encoded = Vec::with_capacity(contents.len());
+            for content in contents {
+                match content {
+                    Content::Text { text } => {
+                        let value = match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                return envelope_to_content(McpEnvelope::<()>::error(
+                                    MCP_ERR_INTERNAL,
+                                    "Unable to transcode MCP payload to TOON",
+                                    Some(format!("Tool output was not valid JSON: {err}")),
+                                    0,
+                                ));
+                            }
+                        };
+                        encoded.push(Content::Text {
+                            text: toon_rust::encode(value, None),
+                        });
+                    }
+                    other => encoded.push(other),
                 }
-                other => Ok(other),
-            })
-            .collect(),
+            }
+            Ok(encoded)
+        }
     }
 }
 
@@ -550,12 +560,27 @@ mod tests {
     }
 
     #[test]
-    fn encode_toon_invalid_json_returns_error() {
+    fn encode_toon_invalid_json_returns_error_envelope() {
         let contents = vec![Content::Text {
-            text: "not valid json".to_string(),
+            text: "not valid json sk-ant-api03-middleware-secret".to_string(),
         }];
-        let result = encode_mcp_contents(contents, McpOutputFormat::Toon);
-        assert!(result.is_err());
+        let result = encode_mcp_contents(contents, McpOutputFormat::Toon)
+            .expect("malformed tool output should return an FT-MCP envelope");
+
+        assert_eq!(result.len(), 1);
+        let text = match &result[0] {
+            Content::Text { text } => text,
+            other => panic!("expected text envelope, got {other:?}"),
+        };
+        let envelope: serde_json::Value =
+            serde_json::from_str(text).expect("transcode failure envelope is JSON");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], crate::mcp_error::MCP_ERR_INTERNAL);
+        assert_eq!(envelope["error"], "Unable to transcode MCP payload to TOON");
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "malformed MCP tool output leaked through transcode failure envelope"
+        );
     }
 
     #[test]
