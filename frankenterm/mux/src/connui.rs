@@ -14,6 +14,8 @@ use termwiz::lineedit::*;
 use termwiz::surface::{Change, Position};
 use termwiz::terminal::*;
 
+const MAX_COUNTDOWN_PROGRESS_WIDTH: usize = 4096;
+
 #[derive(Default)]
 struct PasswordPromptHost {
     history: BasicHistory,
@@ -147,7 +149,9 @@ impl ConnectionUIImpl {
             // Render a progress bar underneath the countdown text by reversing
             // out the text for the elapsed portion of time.
             let remain = deadline - now;
-            let term_width = self.term.get_screen_size().map(|s| s.cols).unwrap_or(80);
+            let term_width = bounded_countdown_progress_width(
+                self.term.get_screen_size().map(|s| s.cols).unwrap_or(80),
+            );
             let elapsed_nanos = duration.saturating_sub(remain).as_nanos();
             let prog_width = scaled_progress_width(term_width, elapsed_nanos, duration_nanos);
             let message = format!("{} ({:.0?})", reason, remain);
@@ -209,6 +213,10 @@ impl ConnectionUIImpl {
 
         Ok(())
     }
+}
+
+fn bounded_countdown_progress_width(term_width: usize) -> usize {
+    term_width.min(MAX_COUNTDOWN_PROGRESS_WIDTH)
 }
 
 fn scaled_progress_width(term_width: usize, elapsed_nanos: u128, duration_nanos: u128) -> usize {
@@ -592,6 +600,15 @@ mod tests {
         assert_eq!(
             scaled_progress_width(usize::MAX, u128::MAX - 1, u128::MAX),
             usize::MAX
+        );
+    }
+
+    #[test]
+    fn countdown_progress_width_is_bounded() {
+        assert_eq!(bounded_countdown_progress_width(80), 80);
+        assert_eq!(
+            bounded_countdown_progress_width(usize::MAX),
+            MAX_COUNTDOWN_PROGRESS_WIDTH
         );
     }
 
