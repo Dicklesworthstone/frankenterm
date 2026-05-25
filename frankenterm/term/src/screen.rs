@@ -60,7 +60,7 @@ pub struct Screen {
 
     pub(crate) saved_cursor: Option<SavedCursor>,
     rewrap_cache: Option<LogicalLineWrapCache>,
-    rewrap_scratch_slots: Vec<Option<Vec<Line>>>,
+    rewrap_scratch_slots: Vec<Option<RewrapScratch>>,
     rewrap_row_prefix_scratch: Vec<usize>,
     cold_scrollback_worker: ColdScrollbackReflowWorker,
     resize_wrap_policy: ResizeWrapPolicy,
@@ -436,6 +436,18 @@ enum WrappedResizeLines {
     Scratch { logical_count: usize },
 }
 
+#[derive(Debug, Clone)]
+enum LogicalLineForResize {
+    PhysicalLine(usize),
+    Owned(Line),
+}
+
+#[derive(Debug, Clone)]
+enum RewrapScratch {
+    PhysicalLine(usize),
+    Lines(Vec<Line>),
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ScrollbackSpillOutcome {
     cold_lines_evicted: usize,
@@ -606,6 +618,58 @@ impl LogicalLineWrapCache {
     fn clear_wraps(&mut self) {
         self.wrapped_by_key.clear();
         self.wrap_key_order.clear();
+    }
+}
+
+trait ReflowLogicalLine {
+    fn line<'a>(&'a self, physical_lines: &'a VecDeque<Line>) -> &'a Line;
+
+    fn clone_line(&self, physical_lines: &VecDeque<Line>) -> Line {
+        self.line(physical_lines).clone()
+    }
+
+    fn scratch_for_unwrapped(&self) -> RewrapScratch;
+}
+
+impl ReflowLogicalLine for LogicalLineForResize {
+    fn line<'a>(&'a self, physical_lines: &'a VecDeque<Line>) -> &'a Line {
+        match self {
+            Self::PhysicalLine(idx) => &physical_lines[*idx],
+            Self::Owned(line) => line,
+        }
+    }
+
+    fn scratch_for_unwrapped(&self) -> RewrapScratch {
+        match self {
+            Self::PhysicalLine(idx) => RewrapScratch::PhysicalLine(*idx),
+            Self::Owned(line) => RewrapScratch::Lines(vec![line.clone()]),
+        }
+    }
+}
+
+impl ReflowLogicalLine for Line {
+    fn line<'a>(&'a self, _physical_lines: &'a VecDeque<Line>) -> &'a Line {
+        self
+    }
+
+    fn scratch_for_unwrapped(&self) -> RewrapScratch {
+        RewrapScratch::Lines(vec![self.clone()])
+    }
+}
+
+impl RewrapScratch {
+    fn row_count(&self) -> usize {
+        match self {
+            Self::PhysicalLine(_) => 1,
+            Self::Lines(lines) => lines.len(),
+        }
+    }
+
+    fn clone_lines(&self, physical_lines: &VecDeque<Line>) -> Vec<Line> {
+        match self {
+            Self::PhysicalLine(idx) => vec![physical_lines[*idx].clone()],
+            Self::Lines(lines) => lines.clone(),
+        }
     }
 }
 
@@ -1127,6 +1191,45 @@ impl Screen {
         (wrapped, None)
     }
 
+    fn wrap_logical_line_source_for_resize<T>(
+        logical_line: &T,
+        physical_lines: &VecDeque<Line>,
+        physical_cols: usize,
+        seqno: SequenceNo,
+        policy: ResizeWrapPolicy,
+    ) -> (RewrapScratch, Option<MonospaceLineWrapScorecard>)
+    where
+        T: ReflowLogicalLine,
+    {
+        let line = logical_line.line(physical_lines);
+        if line.len() <= physical_cols {
+            return (logical_line.scratch_for_unwrapped(), None);
+        }
+
+        let line = logical_line.clone_line(physical_lines);
+        let (lines, scorecard) =
+            Self::wrap_single_logical_line_for_resize(line, physical_cols, seqno, policy);
+        (RewrapScratch::Lines(lines), scorecard)
+    }
+
+    fn wrap_logical_line_for_resize<T>(
+        &self,
+        logical_line: &T,
+        physical_cols: usize,
+        seqno: SequenceNo,
+    ) -> (RewrapScratch, Option<MonospaceLineWrapScorecard>)
+    where
+        T: ReflowLogicalLine,
+    {
+        Self::wrap_logical_line_source_for_resize(
+            logical_line,
+            &self.lines,
+            physical_cols,
+            seqno,
+            self.resize_wrap_policy,
+        )
+    }
+
     fn compute_layout_signature_for_lines<'a, I>(lines: I) -> u64
     where
         I: IntoIterator<Item = &'a Line>,
@@ -1331,17 +1434,32 @@ impl Screen {
         );
     }
 
-    fn rebuild_logical_lines_from_physical(&self, seqno: SequenceNo) -> Vec<Line> {
-        let mut logical_lines: Vec<Line> = Vec::with_capacity(self.lines.len());
+    fn rebuild_logical_lines_from_physical(&self, seqno: SequenceNo) -> Vec<LogicalLineForResize> {
+        let mut logical_lines: Vec<LogicalLineForResize> = Vec::with_capacity(self.lines.len());
         let mut logical_line: Option<Line> = None;
 
-        for mut line in self.lines.iter().cloned() {
-            line.update_last_change_seqno(seqno);
-            let was_wrapped = line.last_cell_was_wrapped();
+        for (idx, physical_line) in self.lines.iter().enumerate() {
+            let was_wrapped = physical_line.last_cell_was_wrapped();
+            let mut line = if logical_line.is_some() || was_wrapped {
+                let mut line = physical_line.clone();
+                line.update_last_change_seqno(seqno);
+                Some(line)
+            } else {
+                None
+            };
 
-            if was_wrapped {
-                line.set_last_cell_was_wrapped(false, seqno);
+            if !was_wrapped {
+                if let Some(mut prior) = logical_line.take() {
+                    prior.append_line(line.take().expect("continued line must be owned"), seqno);
+                    logical_lines.push(LogicalLineForResize::Owned(prior));
+                } else {
+                    logical_lines.push(LogicalLineForResize::PhysicalLine(idx));
+                }
+                continue;
             }
+
+            let mut line = line.take().expect("wrapped line must be owned");
+            line.set_last_cell_was_wrapped(false, seqno);
 
             let line = match logical_line.take() {
                 None => line,
@@ -1356,11 +1474,11 @@ impl Screen {
                 continue;
             }
 
-            logical_lines.push(line);
+            logical_lines.push(LogicalLineForResize::Owned(line));
         }
 
         if let Some(line) = logical_line.take() {
-            logical_lines.push(line);
+            logical_lines.push(LogicalLineForResize::Owned(line));
         }
 
         logical_lines
@@ -1382,7 +1500,7 @@ impl Screen {
             wrapped.push(
                 slot.as_ref()
                     .expect("missing wrapped line result after planner")
-                    .clone(),
+                    .clone_lines(&self.lines),
             );
         }
         wrapped
@@ -1412,7 +1530,7 @@ impl Screen {
             total_rows = total_rows.saturating_add(
                 slot.as_ref()
                     .expect("missing wrapped line result after planner")
-                    .len(),
+                    .row_count(),
             );
             self.rewrap_row_prefix_scratch.push(total_rows);
         }
@@ -1476,7 +1594,11 @@ impl Screen {
             seqno,
             Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
         );
-        let mut new_cache = LogicalLineWrapCache::new(source_signature, logical_lines);
+        let cache_logical_lines = logical_lines
+            .iter()
+            .map(|line| line.clone_line(&self.lines))
+            .collect();
+        let mut new_cache = LogicalLineWrapCache::new(source_signature, cache_logical_lines);
         new_cache.insert_wrapped(wrap_key, self.clone_wrapped_from_scratch(logical_count));
         let cache_entries = new_cache.wrapped_by_key.len();
         self.rewrap_cache = Some(new_cache);
@@ -1507,13 +1629,15 @@ impl Screen {
         }
     }
 
-    fn wrap_logical_lines_for_resize(
+    fn wrap_logical_lines_for_resize<T>(
         &mut self,
-        logical_lines: &[Line],
+        logical_lines: &[T],
         physical_cols: usize,
         seqno: SequenceNo,
         reflow_plan: Option<&ViewportReflowPlan>,
-    ) {
+    ) where
+        T: ReflowLogicalLine + Sync,
+    {
         let logical_count = logical_lines.len();
         if logical_count == 0 {
             return;
@@ -1575,13 +1699,9 @@ impl Screen {
             let batch_workers = worker_count.min(batch_len);
             if batch_workers <= 1 || batch_len < batch_workers.saturating_mul(8) {
                 for idx in batch.logical_range.clone() {
-                    let line = logical_lines[idx].clone();
-                    let (wrapped, line_scorecard) = Self::wrap_single_logical_line_for_resize(
-                        line,
-                        physical_cols,
-                        seqno,
-                        wrap_policy,
-                    );
+                    let logical_line = &logical_lines[idx];
+                    let (wrapped, line_scorecard) =
+                        self.wrap_logical_line_for_resize(logical_line, physical_cols, seqno);
                     if let (Some(scorecard), Some(line_scorecard)) =
                         (wrap_scorecard.as_mut(), line_scorecard)
                     {
@@ -1608,13 +1728,15 @@ impl Screen {
                     }
                     let end = (start + chunk_size).min(batch.logical_range.end);
                     let logical_slice = &logical_lines[start..end];
+                    let physical_lines = &self.lines;
                     handles.push(scope.spawn(move |_| {
                         let mut wrapped = Vec::with_capacity(end - start);
                         for (offset, line) in logical_slice.iter().enumerate() {
                             let idx = start + offset;
                             let (wrapped_lines, line_scorecard) =
-                                Self::wrap_single_logical_line_for_resize(
-                                    line.clone(),
+                                Self::wrap_logical_line_source_for_resize(
+                                    line,
+                                    physical_lines,
                                     physical_cols,
                                     seqno,
                                     wrap_policy,
@@ -1666,9 +1788,8 @@ impl Screen {
             if self.rewrap_scratch_slots[idx].is_some() {
                 continue;
             }
-            let line = logical_lines[idx].clone();
             let (wrapped, line_scorecard) =
-                Self::wrap_single_logical_line_for_resize(line, physical_cols, seqno, wrap_policy);
+                self.wrap_logical_line_for_resize(&logical_lines[idx], physical_cols, seqno);
             if let (Some(scorecard), Some(line_scorecard)) =
                 (wrap_scorecard.as_mut(), line_scorecard)
             {
@@ -1759,35 +1880,60 @@ impl Screen {
         }
 
         let required_capacity = estimated_capacity.max(physical_rows);
-        let mut rewrapped = std::mem::take(&mut self.lines);
-        rewrapped.clear();
-        let additional = required_capacity.saturating_sub(rewrapped.capacity());
-        if additional > 0 {
-            rewrapped.reserve(additional);
-        }
         let mut pruned_rows = 0usize;
-        match wrapped {
+        self.lines = match wrapped {
             WrappedResizeLines::Cached(wrapped) => {
+                let mut rewrapped = std::mem::take(&mut self.lines);
+                rewrapped.clear();
+                let additional = required_capacity.saturating_sub(rewrapped.capacity());
+                if additional > 0 {
+                    rewrapped.reserve(additional);
+                }
                 for lines in wrapped {
                     for mut line in lines {
                         line.update_last_change_seqno(seqno);
                         rewrapped.push_back(line);
                     }
                 }
+                rewrapped
             }
             WrappedResizeLines::Scratch { logical_count } => {
+                let source_lines = std::mem::take(&mut self.lines);
+                let source_capacity = source_lines.capacity();
+                let mut source_iter = source_lines.into_iter().enumerate();
+                let mut next_source = source_iter.next();
+                let mut rewrapped = VecDeque::with_capacity(required_capacity.max(source_capacity));
+
                 for slot in self.rewrap_scratch_slots.iter_mut().take(logical_count) {
-                    let lines = slot
+                    let scratch = slot
                         .take()
                         .expect("missing wrapped line result after planner");
-                    for mut line in lines {
-                        line.update_last_change_seqno(seqno);
-                        rewrapped.push_back(line);
+                    match scratch {
+                        RewrapScratch::PhysicalLine(target_idx) => {
+                            let mut moved_line = None;
+                            while let Some((phys_idx, mut line)) = next_source.take() {
+                                next_source = source_iter.next();
+                                if phys_idx == target_idx {
+                                    line.update_last_change_seqno(seqno);
+                                    moved_line = Some(line);
+                                    break;
+                                }
+                            }
+                            rewrapped.push_back(
+                                moved_line.expect("missing borrowed physical line during rewrap"),
+                            );
+                        }
+                        RewrapScratch::Lines(lines) => {
+                            for mut line in lines {
+                                line.update_last_change_seqno(seqno);
+                                rewrapped.push_back(line);
+                            }
+                        }
                     }
                 }
+                rewrapped
             }
-        }
-        self.lines = rewrapped;
+        };
 
         // If we resized narrower and generated additional lines,
         // we may need to scroll the lines to make room.  However,
@@ -3543,6 +3689,62 @@ mod tests {
 
         assert_eq!(cached_cursor, direct_cursor);
         assert_eq!(cached_lines, direct_lines);
+    }
+
+    #[test]
+    fn resize_reflow_moves_unwrapped_physical_lines_without_clone() {
+        let attrs = CellAttributes::blank();
+        let mut screen = test_screen(4, 6, 96);
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("aa", &attrs, 0, None),
+            Line::from_text("abcdef", &attrs, 0, None),
+            Line::from_text("zz", &attrs, 0, None),
+            Line::new(0),
+        ]);
+
+        let logical_lines = screen.rebuild_logical_lines_from_physical(2);
+        assert!(matches!(
+            logical_lines[0],
+            LogicalLineForResize::PhysicalLine(0)
+        ));
+        assert!(matches!(
+            logical_lines[1],
+            LogicalLineForResize::PhysicalLine(1)
+        ));
+        assert!(matches!(
+            logical_lines[2],
+            LogicalLineForResize::PhysicalLine(2)
+        ));
+
+        screen.wrap_logical_lines_for_resize(&logical_lines, 4, 2, None);
+        assert!(matches!(
+            screen.rewrap_scratch_slots[0],
+            Some(RewrapScratch::PhysicalLine(0))
+        ));
+        assert!(matches!(
+            screen.rewrap_scratch_slots[1],
+            Some(RewrapScratch::Lines(_))
+        ));
+        assert!(matches!(
+            screen.rewrap_scratch_slots[2],
+            Some(RewrapScratch::PhysicalLine(2))
+        ));
+
+        screen.resize(test_size(4, 4, 96), test_cursor(0, 0, 1), 2, false);
+
+        let moved_aa = screen
+            .lines
+            .iter()
+            .find(|line| line.as_str() == "aa")
+            .expect("aa line should survive resize");
+        let moved_zz = screen
+            .lines
+            .iter()
+            .find(|line| line.as_str() == "zz")
+            .expect("zz line should survive resize");
+
+        assert_eq!(moved_aa.current_seqno(), 2);
+        assert_eq!(moved_zz.current_seqno(), 2);
     }
 
     #[test]
