@@ -1203,8 +1203,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         ));
 
         let commit_inputs =
-            self.executor
-                .execute_steps(contract, self.config.fail_step.as_deref(), now_ms);
+            if self.config.kill_switch != MissionKillSwitchLevel::Off || self.config.paused {
+                Vec::new()
+            } else {
+                self.executor
+                    .execute_steps(contract, self.config.fail_step.as_deref(), now_ms)
+            };
 
         let report = execute_commit_phase(
             contract,
@@ -1750,6 +1754,37 @@ mod tests {
         }
     }
 
+    struct CommitDispatchPanicExecutor;
+
+    impl StepExecutor for CommitDispatchPanicExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            _now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            crate::plan::tx_prepare_gate_inputs_allow_all(contract)
+        }
+
+        fn execute_steps(
+            &self,
+            _contract: &MissionTxContract,
+            _fail_step: Option<&str>,
+            _now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            panic!("commit executor must not dispatch under kill switch or pause")
+        }
+
+        fn execute_compensations(
+            &self,
+            _contract: &MissionTxContract,
+            _commit_report: &TxCommitReport,
+            _fail_for_step: Option<&str>,
+            _now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            Vec::new()
+        }
+    }
+
     #[test]
     fn execute_happy_path_single_step() {
         let mut contract = make_test_contract(1);
@@ -1862,6 +1897,45 @@ mod tests {
 
         assert!(!result.prepare_report.outcome.commit_eligible());
         assert!(result.commit_report.is_none());
+    }
+
+    #[test]
+    fn commit_safety_blocks_do_not_dispatch_steps() {
+        let mut safe_mode_contract = make_test_contract(2);
+        let safe_mode_engine = TxExecutionEngine::new(
+            CommitDispatchPanicExecutor,
+            TxExecutionConfig {
+                kill_switch: MissionKillSwitchLevel::SafeMode,
+                ..TxExecutionConfig::default()
+            },
+        );
+        let safe_mode = safe_mode_engine
+            .execute(&mut safe_mode_contract, 5000)
+            .unwrap();
+        let safe_mode_commit = safe_mode.commit_report.expect("commit report");
+        assert_eq!(
+            safe_mode_commit.outcome,
+            crate::plan::TxCommitOutcome::KillSwitchBlocked
+        );
+        assert_eq!(safe_mode_commit.committed_count, 0);
+        assert_eq!(safe_mode_commit.skipped_count, 2);
+
+        let mut paused_contract = make_test_contract(2);
+        let paused_engine = TxExecutionEngine::new(
+            CommitDispatchPanicExecutor,
+            TxExecutionConfig {
+                paused: true,
+                ..TxExecutionConfig::default()
+            },
+        );
+        let paused = paused_engine.execute(&mut paused_contract, 5000).unwrap();
+        let paused_commit = paused.commit_report.expect("commit report");
+        assert_eq!(
+            paused_commit.outcome,
+            crate::plan::TxCommitOutcome::PauseSuspended
+        );
+        assert_eq!(paused_commit.committed_count, 0);
+        assert_eq!(paused_commit.skipped_count, 2);
     }
 
     #[test]
