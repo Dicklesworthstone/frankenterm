@@ -569,7 +569,12 @@ impl SchemaEvolutionRegistry {
     pub fn all_fields_for(&self, version: &SchemaVersion) -> Vec<&SchemaFieldDef> {
         self.fields
             .iter()
-            .filter(|f| f.introduced_in.is_at_or_before(version))
+            .filter(|f| {
+                f.introduced_in.is_at_or_before(version)
+                    && f.deprecated_in
+                        .as_ref()
+                        .is_none_or(|deprecated| !deprecated.is_at_or_before(version))
+            })
             .collect()
     }
 
@@ -1226,6 +1231,39 @@ mod tests {
             .collect();
 
         assert_eq!(fields, vec!["legacy_minor_field", "current_major_field"]);
+    }
+
+    #[test]
+    fn connector_event_model_all_fields_excludes_deprecated_fields() {
+        let registry = SchemaEvolutionRegistry {
+            current_version: SchemaVersion::new(1, 2),
+            fields: vec![
+                SchemaFieldDef {
+                    name: "retired_field".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    introduced_in: SchemaVersion::new(1, 0),
+                    deprecated_in: Some(SchemaVersion::new(1, 1)),
+                    description: "field retired before the queried version".to_string(),
+                },
+                SchemaFieldDef {
+                    name: "active_field".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    introduced_in: SchemaVersion::new(1, 1),
+                    deprecated_in: None,
+                    description: "field active at the queried version".to_string(),
+                },
+            ],
+        };
+
+        let fields: Vec<_> = registry
+            .all_fields_for(&SchemaVersion::new(1, 2))
+            .into_iter()
+            .map(|field| field.name.as_str())
+            .collect();
+
+        assert_eq!(fields, vec!["active_field"]);
     }
 
     // ---- Indexing contract ----
