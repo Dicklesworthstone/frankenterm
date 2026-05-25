@@ -104,6 +104,7 @@ const COMPRESSED_MASK: u64 = 1 << 63;
 /// Maximum allowed PDU payload size (256 MB). Prevents allocation bombs from
 /// malformed or malicious length fields.
 const MAX_PDU_SIZE: usize = 256 * 1024 * 1024;
+const PAYLOAD_READ_CHUNK: usize = 64 * 1024;
 
 fn encode_raw_as_vec(
     ident: u64,
@@ -288,20 +289,68 @@ fn buffered_frame_len(buffer: &[u8]) -> anyhow::Result<Option<usize>> {
     Ok(Some(total_len))
 }
 
-fn allocate_pdu_buffer(
+fn reserve_next_payload_chunk(
+    data: &mut Vec<u8>,
+    data_len: usize,
+    len: u64,
+    serial: u64,
+    ident: u64,
+) -> anyhow::Result<(usize, usize)> {
+    let start = data.len();
+    let chunk_len = data_len.saturating_sub(start).min(PAYLOAD_READ_CHUNK);
+    let end = start
+        .checked_add(chunk_len)
+        .context("payload chunk length overflow")?;
+    data.try_reserve_exact(chunk_len).with_context(|| {
+        format!(
+            "allocating next {} bytes for PDU payload of length {} \
+            with frame length {} serial={} ident={}",
+            chunk_len, data_len, len, serial, ident
+        )
+    })?;
+    data.resize(end, 0);
+    Ok((start, end))
+}
+
+fn read_payload_chunked<R: std::io::Read>(
+    r: &mut R,
     data_len: usize,
     len: u64,
     serial: u64,
     ident: u64,
 ) -> anyhow::Result<Vec<u8>> {
     let mut data = Vec::new();
-    data.try_reserve_exact(data_len).with_context(|| {
-        format!(
-            "allocating {} bytes for PDU of length {} with serial={} ident={}",
-            data_len, len, serial, ident
-        )
-    })?;
-    data.resize(data_len, 0);
+    while data.len() < data_len {
+        let (start, end) = reserve_next_payload_chunk(&mut data, data_len, len, serial, ident)?;
+        r.read_exact(&mut data[start..end]).with_context(|| {
+            format!(
+                "reading bytes {}..{} of {} for PDU of length {} \
+                with serial={} ident={}",
+                start, end, data_len, len, serial, ident
+            )
+        })?;
+    }
+    Ok(data)
+}
+
+async fn read_payload_chunked_async<R: Unpin + AsyncRead + std::fmt::Debug>(
+    r: &mut R,
+    data_len: usize,
+    len: u64,
+    serial: u64,
+    ident: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    while data.len() < data_len {
+        let (start, end) = reserve_next_payload_chunk(&mut data, data_len, len, serial, ident)?;
+        r.read_exact(&mut data[start..end]).await.with_context(|| {
+            format!(
+                "decode_raw_async failed to read bytes {}..{} of {} \
+                for PDU of length {} with serial={} ident={}",
+                start, end, data_len, len, serial, ident
+            )
+        })?;
+    }
     Ok(data)
 }
 
@@ -391,14 +440,7 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         metrics::histogram!("pdu.decode.size").record(data_len as f64);
     }
 
-    let mut data = allocate_pdu_buffer(data_len, len, serial, ident)?;
-    r.read_exact(&mut data).await.with_context(|| {
-        format!(
-            "decode_raw_async failed to read {} bytes of data \
-            for PDU of length {} with serial={} ident={}",
-            data_len, len, serial, ident
-        )
-    })?;
+    let data = read_payload_chunked_async(r, data_len, len, serial, ident).await?;
     Ok(Decoded {
         ident,
         serial,
@@ -436,13 +478,7 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
         metrics::histogram!("pdu.decode.size").record(data_len as f64);
     }
 
-    let mut data = allocate_pdu_buffer(data_len, len, serial, ident)?;
-    r.read_exact(&mut data).with_context(|| {
-        format!(
-            "reading {} bytes of data for PDU of length {} with serial={} ident={}",
-            data_len, len, serial, ident
-        )
-    })?;
+    let data = read_payload_chunked(&mut r, data_len, len, serial, ident)?;
     Ok(Decoded {
         ident,
         serial,
@@ -2660,6 +2696,51 @@ mod test {
         assert!(
             err.to_string().contains("does not fit in usize"),
             "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_incomplete_max_size_frame_reads_payload_in_chunks() {
+        use std::io::{Cursor, Read};
+        use std::sync::{Arc, Mutex};
+
+        struct PrefixThenEof {
+            prefix: Cursor<Vec<u8>>,
+            max_requested: Arc<Mutex<usize>>,
+        }
+
+        impl Read for PrefixThenEof {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let mut max_requested = self.max_requested.lock().expect("lock max request");
+                *max_requested = (*max_requested).max(buf.len());
+                drop(max_requested);
+                self.prefix.read(buf)
+            }
+        }
+
+        let mut header = Vec::new();
+        leb128::write::unsigned(&mut header, MAX_PDU_SIZE as u64).unwrap();
+        leb128::write::unsigned(&mut header, 1).unwrap();
+        leb128::write::unsigned(&mut header, 1).unwrap();
+
+        let max_requested = Arc::new(Mutex::new(0usize));
+        let reader = PrefixThenEof {
+            prefix: Cursor::new(header),
+            max_requested: Arc::clone(&max_requested),
+        };
+
+        let err = Pdu::decode(reader).expect_err("incomplete max-size frame must fail");
+        assert!(
+            !err.to_string().is_empty(),
+            "incomplete max-size frame should surface a typed error"
+        );
+
+        let observed = *max_requested.lock().expect("lock max request");
+        assert!(
+            observed <= PAYLOAD_READ_CHUNK,
+            "decoder requested a {} byte payload read; expected chunked reads no larger than {}",
+            observed,
+            PAYLOAD_READ_CHUNK
         );
     }
 
