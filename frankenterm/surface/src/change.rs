@@ -5,7 +5,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_cell::color::ColorAttribute;
 #[cfg(feature = "use_image")]
 pub use frankenterm_cell::image::{ImageData, TextureCoordinate};
-use frankenterm_cell::{unicode_column_width, AttributeChange, CellAttributes};
+use frankenterm_cell::{AttributeChange, CellAttributes, unicode_column_width};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 
@@ -254,7 +254,7 @@ impl ChangeSequence {
             | Change::ClearToEndOfScreen(_) => {}
             Change::Text(t) => {
                 for g in Graphemes::new(t.as_str()) {
-                    if self.cursor_x == self.screen_cols {
+                    if self.screen_cols > 0 && self.cursor_x >= self.screen_cols {
                         self.cursor_y = self.cursor_y.saturating_add(1);
                         self.cursor_x = 0;
                     }
@@ -267,7 +267,17 @@ impl ChangeSequence {
                         self.cursor_x = 0;
                     } else {
                         let len = unicode_column_width(g, None);
+                        if self.screen_cols > 0
+                            && self.cursor_x > 0
+                            && self.cursor_x.saturating_add(len) > self.screen_cols
+                        {
+                            self.cursor_y = self.cursor_y.saturating_add(1);
+                            self.cursor_x = 0;
+                        }
                         self.cursor_x = self.cursor_x.saturating_add(len);
+                        if self.screen_cols > 0 {
+                            self.cursor_x = self.cursor_x.min(self.screen_cols);
+                        }
                     }
                 }
                 self.update_render_height();
@@ -529,6 +539,22 @@ mod test {
         let mut cs = ChangeSequence::new(24, 4);
         cs.add("abcde");
         // 'a','b','c','d' fills row, 'e' wraps to next row
+        assert_eq!(cs.current_cursor_position(), (1, 1));
+    }
+
+    #[test]
+    fn change_sequence_wide_grapheme_wraps_before_overflowing_width() {
+        let mut cs = ChangeSequence::new(24, 4);
+        cs.add("abc表x");
+        // '表' is two cells wide and cannot straddle the final column.
+        assert_eq!(cs.current_cursor_position(), (3, 1));
+    }
+
+    #[test]
+    fn change_sequence_overwide_grapheme_does_not_escape_screen_width() {
+        let mut cs = ChangeSequence::new(24, 1);
+        cs.add("表a");
+        // The overwide grapheme occupies the only column; the next glyph wraps.
         assert_eq!(cs.current_cursor_position(), (1, 1));
     }
 
