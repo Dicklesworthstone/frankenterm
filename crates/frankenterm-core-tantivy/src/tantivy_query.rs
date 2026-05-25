@@ -408,24 +408,29 @@ pub enum SortField {
 
 /// Tie-breaking key per schema spec:
 /// `occurred_at_ms DESC → sequence DESC → log_offset DESC`.
+///
+/// Descending order is expressed with [`std::cmp::Reverse`] on each field
+/// (the derived `Ord` compares fields lexicographically ascending, so a
+/// `Reverse` wrapper flips each to descending). This is exact across the full
+/// domain of every field. The previous approach negated each field with
+/// `wrapping_neg` after clamping the `u64` columns into `i64`, which had two
+/// correctness defects: `occurred_at_ms == i64::MIN` mis-sorted (its
+/// `wrapping_neg` is itself `i64::MIN`), and any two `sequence`/`log_offset`
+/// values above `i64::MAX` collapsed to the same clamped key — losing the
+/// ordering across part of the `u64` range these columns actually span.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TieBreakKey {
-    /// Negated for descending sort (larger timestamp = smaller key).
-    neg_occurred_at_ms: i64,
-    neg_sequence: i64,
-    neg_log_offset: i64,
+    occurred_at_ms: std::cmp::Reverse<i64>,
+    sequence: std::cmp::Reverse<u64>,
+    log_offset: std::cmp::Reverse<u64>,
 }
 
 impl TieBreakKey {
     pub fn from_doc(doc: &IndexDocumentFields) -> Self {
         Self {
-            neg_occurred_at_ms: doc.occurred_at_ms.wrapping_neg(),
-            neg_sequence: i64::try_from(doc.sequence)
-                .unwrap_or(i64::MAX)
-                .wrapping_neg(),
-            neg_log_offset: i64::try_from(doc.log_offset)
-                .unwrap_or(i64::MAX)
-                .wrapping_neg(),
+            occurred_at_ms: std::cmp::Reverse(doc.occurred_at_ms),
+            sequence: std::cmp::Reverse(doc.sequence),
+            log_offset: std::cmp::Reverse(doc.log_offset),
         }
     }
 }
@@ -558,13 +563,9 @@ impl PaginationCursor {
 
     fn tie_break_key(&self) -> TieBreakKey {
         TieBreakKey {
-            neg_occurred_at_ms: self.occurred_at_ms.wrapping_neg(),
-            neg_sequence: i64::try_from(self.sequence)
-                .unwrap_or(i64::MAX)
-                .wrapping_neg(),
-            neg_log_offset: i64::try_from(self.log_offset)
-                .unwrap_or(i64::MAX)
-                .wrapping_neg(),
+            occurred_at_ms: std::cmp::Reverse(self.occurred_at_ms),
+            sequence: std::cmp::Reverse(self.sequence),
+            log_offset: std::cmp::Reverse(self.log_offset),
         }
     }
 }
@@ -1653,6 +1654,70 @@ mod tests {
     }
 
     // =========================================================================
+    // Tie-break key ordering (regression: full i64/u64 domain)
+    // =========================================================================
+
+    /// `TieBreakKey` must realise `occurred_at_ms DESC → sequence DESC →
+    /// log_offset DESC` exactly across the full domain of every field. The
+    /// previous wrapping_neg + i64-clamp implementation broke at two points
+    /// this test pins.
+    #[test]
+    fn tie_break_key_orders_descending_across_full_domain() {
+        use std::cmp::Ordering;
+        let mut a = make_doc(1, "x", 1);
+        let mut b = make_doc(1, "x", 1);
+
+        // (1) Larger occurred_at_ms sorts first (DESC => Ordering::Less).
+        a.occurred_at_ms = 200;
+        b.occurred_at_ms = 100;
+        assert_eq!(
+            TieBreakKey::from_doc(&a).cmp(&TieBreakKey::from_doc(&b)),
+            Ordering::Less,
+            "larger occurred_at_ms must sort first"
+        );
+
+        // (2) i64 floor: i64::MIN+1 (larger) must precede i64::MIN. The old
+        // wrapping_neg(i64::MIN) == i64::MIN mis-ordered exactly this pair.
+        a.occurred_at_ms = i64::MIN + 1;
+        b.occurred_at_ms = i64::MIN;
+        assert_eq!(
+            TieBreakKey::from_doc(&a).cmp(&TieBreakKey::from_doc(&b)),
+            Ordering::Less,
+            "i64::MIN+1 must sort before i64::MIN (DESC)"
+        );
+
+        // (3) sequence DESC above i64::MAX. The old code clamped both to
+        // i64::MAX, collapsing distinct sequences into a spurious tie.
+        a.occurred_at_ms = 100;
+        b.occurred_at_ms = 100;
+        a.sequence = u64::MAX;
+        b.sequence = u64::MAX - 1;
+        assert_eq!(
+            TieBreakKey::from_doc(&a).cmp(&TieBreakKey::from_doc(&b)),
+            Ordering::Less,
+            "larger sequence above i64::MAX must sort first, not tie"
+        );
+
+        // (4) log_offset DESC above i64::MAX (same clamp defect).
+        a.sequence = 5;
+        b.sequence = 5;
+        a.log_offset = u64::MAX;
+        b.log_offset = u64::MAX - 1;
+        assert_eq!(
+            TieBreakKey::from_doc(&a).cmp(&TieBreakKey::from_doc(&b)),
+            Ordering::Less,
+            "larger log_offset above i64::MAX must sort first, not tie"
+        );
+
+        // (5) Fully equal keys compare Equal.
+        let c = make_doc(1, "x", 7);
+        assert_eq!(
+            TieBreakKey::from_doc(&c).cmp(&TieBreakKey::from_doc(&c)),
+            Ordering::Equal
+        );
+    }
+
+    // =========================================================================
     // Simple text search
     // =========================================================================
 
@@ -2511,9 +2576,9 @@ mod tests {
     #[test]
     fn tie_break_key_debug_clone() {
         let key = TieBreakKey {
-            neg_occurred_at_ms: -1000,
-            neg_sequence: -5,
-            neg_log_offset: -10,
+            occurred_at_ms: std::cmp::Reverse(1000),
+            sequence: std::cmp::Reverse(5),
+            log_offset: std::cmp::Reverse(10),
         };
         let dbg = format!("{:?}", key);
         assert!(dbg.contains("TieBreakKey"), "got: {}", dbg);
@@ -2523,34 +2588,34 @@ mod tests {
 
     #[test]
     fn tie_break_key_ordering() {
-        // Higher timestamps should sort first (smaller negated value)
+        // Higher timestamps should sort first (Reverse flips to descending).
         let a = TieBreakKey {
-            neg_occurred_at_ms: -2000,
-            neg_sequence: -1,
-            neg_log_offset: -1,
+            occurred_at_ms: std::cmp::Reverse(2000),
+            sequence: std::cmp::Reverse(1),
+            log_offset: std::cmp::Reverse(1),
         };
         let b = TieBreakKey {
-            neg_occurred_at_ms: -1000,
-            neg_sequence: -1,
-            neg_log_offset: -1,
+            occurred_at_ms: std::cmp::Reverse(1000),
+            sequence: std::cmp::Reverse(1),
+            log_offset: std::cmp::Reverse(1),
         };
-        // -2000 < -1000, so a < b, meaning a (ts=2000) sorts before b (ts=1000)
+        // ts=2000 sorts before ts=1000 under descending order
         assert!(a < b);
     }
 
     #[test]
     fn tie_break_key_sequence_tiebreak() {
         let a = TieBreakKey {
-            neg_occurred_at_ms: -1000,
-            neg_sequence: -10,
-            neg_log_offset: -1,
+            occurred_at_ms: std::cmp::Reverse(1000),
+            sequence: std::cmp::Reverse(10),
+            log_offset: std::cmp::Reverse(1),
         };
         let b = TieBreakKey {
-            neg_occurred_at_ms: -1000,
-            neg_sequence: -5,
-            neg_log_offset: -1,
+            occurred_at_ms: std::cmp::Reverse(1000),
+            sequence: std::cmp::Reverse(5),
+            log_offset: std::cmp::Reverse(1),
         };
-        // Same timestamp, seq 10 > seq 5, so -10 < -5, a < b
+        // Same timestamp, seq 10 > seq 5, so a sorts first under descending order
         assert!(a < b);
     }
 
