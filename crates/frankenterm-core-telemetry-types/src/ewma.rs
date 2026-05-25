@@ -89,7 +89,10 @@ impl Ewma {
         if !value.is_finite() {
             return;
         }
-        self.count += 1;
+        // br-ft-pu2mg saturating-counter convention: plateau at u64::MAX rather
+        // than debug-panicking / release-wrapping this long-lived observation
+        // counter on overflow.
+        self.count = self.count.saturating_add(1);
         if !self.initialized {
             self.value = value;
             self.initialized = true;
@@ -312,7 +315,8 @@ impl RateEstimator {
 
     /// Record an event at the given timestamp.
     pub fn tick(&mut self, time_ms: u64) {
-        self.total_events += 1;
+        // br-ft-pu2mg saturating-counter convention (see Ewma::observe).
+        self.total_events = self.total_events.saturating_add(1);
         if let Some(last) = self.last_tick_ms {
             let interval = time_ms.saturating_sub(last) as f64;
             self.interval_ewma.observe(interval, time_ms);
@@ -393,6 +397,19 @@ mod tests {
         assert!(!ewma.is_initialized());
         assert_eq!(ewma.count(), 0);
         assert!(ewma.value().abs() < f64::EPSILON);
+    }
+
+    // br-ft-pu2mg: the observation counter must plateau at u64::MAX rather than
+    // debug-panic / release-wrap on overflow. Seeds the private counter at the
+    // boundary and observes once more. Without saturating_add, `self.count += 1`
+    // overflow-panics in debug.
+    #[test]
+    fn ewma_count_saturates_at_u64_max() {
+        let mut ewma = Ewma::with_half_life_ms(100.0);
+        ewma.observe(1.0, 0);
+        ewma.count = u64::MAX;
+        ewma.observe(2.0, 10);
+        assert_eq!(ewma.count(), u64::MAX, "observation count must saturate, not wrap to 0");
     }
 
     #[test]

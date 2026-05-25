@@ -100,7 +100,7 @@ impl HyperLogLog {
         if rho > self.registers[idx] {
             self.registers[idx] = rho;
         }
-        self.count += 1;
+        self.count = self.count.saturating_add(1); // br-ft-pu2mg: saturating counter
     }
 
     /// Insert a pre-computed hash value directly.
@@ -110,7 +110,7 @@ impl HyperLogLog {
         if rho > self.registers[idx] {
             self.registers[idx] = rho;
         }
-        self.count += 1;
+        self.count = self.count.saturating_add(1); // br-ft-pu2mg: saturating counter
     }
 
     /// Estimate the number of distinct elements.
@@ -217,7 +217,7 @@ impl HyperLogLog {
                 self.registers[i] = other.registers[i];
             }
         }
-        self.count += other.count;
+        self.count = self.count.saturating_add(other.count); // br-ft-pu2mg: saturating counter
         Ok(())
     }
 
