@@ -1170,17 +1170,14 @@ impl ToolHandler for WaCassSearchTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: CassSearchParams = match serde_json::from_value(arguments) {
-            Ok(p) => p,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Invalid params: {err}"),
-                    Some("Expected object with query (required) and optional limit/offset/agent/workspace/days/fields/max_tokens/timeout_secs".to_string()),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
+        let params: CassSearchParams = match parse_mcp_tool_params(
+            "wa.cass_search",
+            arguments,
+            "Expected object with query (required) and optional limit/offset/agent/workspace/days/fields/max_tokens/timeout_secs",
+            start,
+        ) {
+            Ok(params) => params,
+            Err(response) => return response,
         };
 
         if params.query.trim().is_empty() {
@@ -1236,7 +1233,7 @@ impl ToolHandler for WaCassSearchTool {
                 None => {
                     let envelope = McpEnvelope::<()>::error(
                         MCP_ERR_INVALID_ARGS,
-                        format!("Invalid agent: {agent_str}"),
+                        format!("Invalid agent: {}", redact_mcp_output_secrets(agent_str)),
                         Some(
                             "Supported: codex, claude_code, gemini, cursor, aider, chatgpt"
                                 .to_string(),
@@ -8956,6 +8953,74 @@ exit 17",
                 expected_name
             );
         }
+    }
+
+    #[test]
+    fn cass_search_malformed_args_redacts_serde_error_value() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let envelope = parse_json_content(
+            WaCassSearchTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "query": "agent history",
+                        "limit": secret,
+                    }),
+                )
+                .expect("cass_search bad-arg call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(
+            envelope["hint"],
+            "Expected object with query (required) and optional limit/offset/agent/workspace/days/fields/max_tokens/timeout_secs"
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "malformed wa.cass_search args leaked the caller-supplied secret"
+        );
+    }
+
+    #[test]
+    fn cass_search_unknown_agent_redacts_argument_value() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let envelope = parse_json_content(
+            WaCassSearchTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "query": "agent history",
+                        "agent": secret,
+                    }),
+                )
+                .expect("cass_search unknown-agent call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "unknown wa.cass_search agent leaked the caller-supplied secret"
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("[REDACTED]")
+        );
     }
 
     // -- ft-tzwuw: cass tools must reject timeout_secs=0 before --
