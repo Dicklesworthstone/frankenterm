@@ -1,9 +1,9 @@
 use crate::screen::Screens;
 use crate::{Appearance, Connection, GeometryOrigin, RequestedWindowGeometry, ResolvedGeometry};
-use anyhow::Result as Fallible;
 use anyhow::anyhow;
-use config::DimensionContext;
+use anyhow::Result as Fallible;
 use config::keyassignment::KeyAssignment;
+use config::DimensionContext;
 use promise::{Future, Promise};
 use std::cell::RefCell;
 use std::fmt::Display;
@@ -48,6 +48,42 @@ pub(crate) fn fail_window_op_for_destroyed_window<T>(
 
 pub fn shutdown() {
     CONN.with(|m| drop(m.borrow_mut().take()));
+}
+
+fn pixels_to_usize_saturating(pixels: f32) -> usize {
+    if pixels.is_nan() || pixels <= 0.0 {
+        0
+    } else if pixels >= usize::MAX as f32 {
+        usize::MAX
+    } else {
+        pixels as usize
+    }
+}
+
+fn pixels_to_i32_saturating(pixels: f32) -> i32 {
+    if pixels.is_nan() {
+        0
+    } else if pixels <= i32::MIN as f32 {
+        i32::MIN
+    } else if pixels >= i32::MAX as f32 {
+        i32::MAX
+    } else {
+        pixels as i32
+    }
+}
+
+fn screen_origin_to_i32_saturating(origin: isize) -> i32 {
+    if origin <= i32::MIN as isize {
+        i32::MIN
+    } else if origin >= i32::MAX as isize {
+        i32::MAX
+    } else {
+        origin as i32
+    }
+}
+
+fn resolved_axis_position(offset_pixels: f32, origin: isize) -> i32 {
+    pixels_to_i32_saturating(offset_pixels).saturating_add(screen_origin_to_i32_saturating(origin))
 }
 
 #[derive(Debug)]
@@ -149,14 +185,14 @@ pub trait ConnectionOps {
             pixel_max: bounds.height() as f32,
             pixel_cell: bounds.height() as f32,
         };
-        let width = geometry.width.evaluate_as_pixels(width_context) as usize;
-        let height = geometry.height.evaluate_as_pixels(height_context) as usize;
+        let width = pixels_to_usize_saturating(geometry.width.evaluate_as_pixels(width_context));
+        let height = pixels_to_usize_saturating(geometry.height.evaluate_as_pixels(height_context));
         let x = geometry
             .x
-            .map(|x| x.evaluate_as_pixels(width_context) as i32 + bounds.origin.x as i32);
+            .map(|x| resolved_axis_position(x.evaluate_as_pixels(width_context), bounds.origin.x));
         let y = geometry
             .y
-            .map(|y| y.evaluate_as_pixels(height_context) as i32 + bounds.origin.y as i32);
+            .map(|y| resolved_axis_position(y.evaluate_as_pixels(height_context), bounds.origin.y));
 
         ResolvedGeometry {
             x,
@@ -170,8 +206,8 @@ pub trait ConnectionOps {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationEvent, ConnectionOps, EVENT_HANDLER, Fallible, RequestedWindowGeometry,
         fail_window_op_for_destroyed_window, new_window_op_promise, nop_event_handler,
+        ApplicationEvent, ConnectionOps, Fallible, RequestedWindowGeometry, EVENT_HANDLER,
     };
     use crate::screen::{ScreenInfo, Screens};
     use config::{Dimension, GeometryOrigin};
@@ -335,6 +371,40 @@ mod tests {
         assert_eq!(resolved.y, None);
         assert_eq!(resolved.width, 32767);
         assert_eq!(resolved.height, 600);
+    }
+
+    #[test]
+    fn resolve_geometry_saturates_unbounded_offsets_and_sizes() {
+        let main = screen_info(
+            "main",
+            i32::MAX as isize - 10,
+            i32::MIN as isize + 10,
+            100,
+            100,
+        );
+        let screens = Screens {
+            main: main.clone(),
+            active: main,
+            by_name: HashMap::new(),
+            virtual_rect: euclid::rect(0, 0, 100, 100),
+        };
+        let conn = GeometryConnection {
+            screens: Some(screens),
+            dpi: 96.0,
+        };
+
+        let resolved = conn.resolve_geometry(RequestedWindowGeometry {
+            width: Dimension::Pixels(f32::INFINITY),
+            height: Dimension::Pixels(f32::NEG_INFINITY),
+            x: Some(Dimension::Pixels(f32::INFINITY)),
+            y: Some(Dimension::Pixels(f32::NEG_INFINITY)),
+            origin: GeometryOrigin::MainScreen,
+        });
+
+        assert_eq!(resolved.width, usize::MAX);
+        assert_eq!(resolved.height, 0);
+        assert_eq!(resolved.x, Some(i32::MAX));
+        assert_eq!(resolved.y, Some(i32::MIN));
     }
 
     #[test]

@@ -375,6 +375,20 @@ pub fn read_linear_records(path: &Path) -> Result<Vec<(RecordKind, Vec<u8>)>, Mm
             source,
         })?;
     let header = ScrollbackHeader::decode(&header_bytes)?;
+    // The header's write_cursor/capacity are themselves on-disk values that may
+    // be corrupt or stale — this recovery path exists precisely because a crash
+    // can leave a header whose cursor was bumped before the payload flushed. So
+    // bound every payload allocation by the *actual* file length, never by the
+    // header alone: without this, `record_len` (an on-disk u32) drives
+    // `vec![0u8; record_len]` and a corrupt small file claiming a multi-GB
+    // record would reserve ~4 GB before `read_exact` fails.
+    let file_len = file
+        .metadata()
+        .map_err(|source| MmapScrollbackError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
     let mut cursor = 0u64;
     let mut records = Vec::new();
 
@@ -396,6 +410,14 @@ pub fn read_linear_records(path: &Path) -> Result<Vec<(RecordKind, Vec<u8>)>, Mm
         let record = RecordHeader::decode(&record_bytes)?;
         let payload_end = cursor + RECORD_HEADER_SIZE as u64 + u64::from(record.record_len);
         if payload_end > header.write_cursor_bytes {
+            break;
+        }
+        // Never allocate for a payload that cannot physically fit in the file.
+        // The payload occupies `[HEADER_SIZE + cursor + RECORD_HEADER_SIZE,
+        // HEADER_SIZE + payload_end)`; if those bytes are not actually present
+        // (truncated tail / corrupt oversized header) stop salvaging here rather
+        // than reserving record_len bytes for data that isn't on disk.
+        if (HEADER_SIZE as u64).saturating_add(payload_end) > file_len {
             break;
         }
         let mut payload = vec![0u8; record.record_len as usize];
@@ -583,6 +605,114 @@ mod tests {
     fn test_dir(name: &str) -> PathBuf {
         let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("ft-z4u60-{name}-{}-{id}", std::process::id()))
+    }
+
+    /// Regression: a corrupt/oversized header must not drive an unbounded
+    /// payload allocation. We hand-craft a 264-byte file whose header claims a
+    /// ~5 GB write cursor and whose single record header claims a u32::MAX
+    /// payload that is not on disk. Before the file-length guard,
+    /// `read_linear_records` reserved `record_len` (~4 GB) via `vec![0u8; ..]`
+    /// before `read_exact` could fail. The test completing (rather than
+    /// OOM-aborting) is the assertion that the allocation is bounded; we also
+    /// assert recovery salvages zero records and does not error.
+    #[test]
+    fn read_linear_records_corrupt_header_does_not_overallocate() {
+        use crate::scrollback_mmap_format::{FormatVersion, HeaderFlags};
+
+        let dir = test_dir("corrupt-overalloc");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("corrupt.bin");
+
+        let inflated = 5_000_000_000u64; // > u32::MAX, larger than any real body
+        let header = ScrollbackHeader {
+            version: FormatVersion::V1,
+            flags: HeaderFlags::from_bits(0),
+            capacity_bytes: inflated,
+            write_cursor_bytes: inflated,
+            pane_uuid: [0u8; 32],
+            created_at_epoch_ms: 0,
+            last_msync_at_epoch_ms: 0,
+            redactions_applied: 0,
+            total_bytes_written: 0,
+        };
+
+        let mut file_bytes = header.encode().to_vec();
+        // A single record header claiming the maximum possible payload, with no
+        // payload bytes following it.
+        let record = RecordHeader {
+            record_len: u32::MAX,
+            record_kind: RecordKind::Text,
+        };
+        file_bytes.extend_from_slice(&record.encode());
+        assert_eq!(file_bytes.len(), HEADER_SIZE + RECORD_HEADER_SIZE);
+
+        std::fs::write(&path, &file_bytes).expect("write corrupt file");
+
+        let records = read_linear_records(&path)
+            .expect("corrupt-but-parseable header should salvage, not error");
+        assert!(
+            records.is_empty(),
+            "no payload bytes are present, so nothing is salvageable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second record whose declared length is included in the header's write
+    /// cursor (so the existing `payload_end > write_cursor` check passes) but
+    /// whose payload bytes were never flushed (torn write) is stopped at the
+    /// file-length guard; the first, fully-written record is still salvaged.
+    #[test]
+    fn read_linear_records_truncated_tail_salvages_prefix() {
+        use crate::scrollback_mmap_format::{FormatVersion, HeaderFlags};
+
+        let dir = test_dir("truncated-tail");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("torn.bin");
+
+        let p1 = b"keep-me\n";
+        let rec1 = RecordHeader {
+            record_len: u32::try_from(p1.len()).unwrap(),
+            record_kind: RecordKind::Text,
+        };
+        let r2_len: u32 = 1_000_000; // claimed-but-absent payload
+        let rec2 = RecordHeader {
+            record_len: r2_len,
+            record_kind: RecordKind::Osc,
+        };
+
+        // The header's cursor accounts for BOTH records' headers + payloads,
+        // exactly as it would after the writer bumped the cursor but crashed
+        // before the second payload reached disk.
+        let cursor = RECORD_HEADER_SIZE as u64
+            + p1.len() as u64
+            + RECORD_HEADER_SIZE as u64
+            + u64::from(r2_len);
+        let header = ScrollbackHeader {
+            version: FormatVersion::V1,
+            flags: HeaderFlags::from_bits(0),
+            capacity_bytes: cursor,
+            write_cursor_bytes: cursor,
+            pane_uuid: [0u8; 32],
+            created_at_epoch_ms: 0,
+            last_msync_at_epoch_ms: 0,
+            redactions_applied: 0,
+            total_bytes_written: cursor,
+        };
+
+        // Physical file: header + rec1 header + rec1 payload + rec2 header, then
+        // truncated (no rec2 payload on disk).
+        let mut bytes = header.encode().to_vec();
+        bytes.extend_from_slice(&rec1.encode());
+        bytes.extend_from_slice(p1);
+        bytes.extend_from_slice(&rec2.encode());
+        std::fs::write(&path, &bytes).expect("write torn file");
+
+        let records = read_linear_records(&path).expect("salvage prefix");
+        assert_eq!(records.len(), 1, "only the fully-written record is salvageable");
+        assert_eq!(records[0], (RecordKind::Text, p1.to_vec()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
