@@ -6310,12 +6310,19 @@ mod tests {
         // is_duplicate_delta_event calls must observe saturation
         // and bump the counter exactly once per call.
         //
-        // DEFAULT_CAPACITY=2000; threshold 0.95 → ~1900 distinct keys
-        // before saturation is observed. Use 2200 distinct events to
-        // guarantee post-saturation observations.
+        // DEFAULT_CAPACITY=2000 is the REQUESTED size, but
+        // CuckooFilter::with_capacity rounds the bucket count to a power of two
+        // with ~5% headroom: num_buckets = next_pow2(ceil(2000/4/0.95)) =
+        // next_pow2(527) = 1024, so the ACTUAL capacity is 1024 buckets × 4
+        // slots = 4096. Saturation (load_factor >= 0.95) is therefore observed
+        // near 0.95 × 4096 ≈ 3892 distinct keys, NOT ~1900. (The previous 2200
+        // only reached load_factor ≈ 0.54 and never tripped the counter — this
+        // test was failing.) Publish 5000 distinct events to drive well past
+        // 4096; the surplus also exercises the NewButFull insert-failure path,
+        // guaranteeing post-saturation observations.
         let bus = EventBus::new(8);
         let _sub = bus.subscribe();
-        for seq in 0..2200 {
+        for seq in 0..5000 {
             let _ = bus.publish(Event::SegmentCaptured {
                 pane_id: 1,
                 seq,
