@@ -41,6 +41,7 @@ use anyhow::Error;
 use downcast_rs::{Downcast, impl_downcast};
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::io::Result as IoResult;
 #[cfg(windows)]
 use std::os::windows::prelude::{AsRawHandle, RawHandle};

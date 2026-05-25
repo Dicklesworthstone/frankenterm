@@ -13,6 +13,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 
 fn wrapped_relative_coordinate(current: usize, delta: isize, extent: usize) -> usize {
     if extent == 0 {
@@ -278,7 +279,7 @@ impl ChangeSequence {
             Change::CursorPosition { x, y } => {
                 self.cursor_x = match x {
                     Position::Relative(x) => {
-                        wrapped_relative_coordinate(self.cursor_x, x, self.screen_cols)
+                        wrapped_relative_coordinate(self.cursor_x, *x, self.screen_cols)
                     }
                     Position::Absolute(x) => {
                         if self.screen_cols == 0 {
@@ -288,13 +289,13 @@ impl ChangeSequence {
                         }
                     }
                     Position::EndRelative(x) => {
-                        wrapped_end_relative_coordinate(self.screen_cols, x)
+                        wrapped_end_relative_coordinate(self.screen_cols, *x)
                     }
                 };
 
                 self.cursor_y = match y {
                     Position::Relative(y) => {
-                        wrapped_relative_coordinate(self.cursor_y as usize, y, self.screen_rows)
+                        wrapped_relative_coordinate(self.cursor_y as usize, *y, self.screen_rows)
                             as isize
                     }
                     Position::Absolute(y) => {
@@ -305,7 +306,7 @@ impl ChangeSequence {
                         }
                     }
                     Position::EndRelative(y) => {
-                        wrapped_end_relative_coordinate(self.screen_rows, y) as isize
+                        wrapped_end_relative_coordinate(self.screen_rows, *y) as isize
                     }
                 };
                 self.update_render_height();

@@ -8,6 +8,7 @@ use crate::escape::{Action, CSI};
 use crate::keymap::{Found, KeyMap};
 use crate::readbuf::ReadBuffer;
 use frankenterm_input_types::{ansi_us_unshift_fallback, ctrl_mapping};
+use std::convert::TryFrom;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;

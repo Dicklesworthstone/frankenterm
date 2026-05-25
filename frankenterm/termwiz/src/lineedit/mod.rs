@@ -37,6 +37,8 @@
 //! Ctrl-W        | Delete word leading up to cursor
 //! Alt-b, Alt-Left | Move the cursor backwards one word
 //! Alt-f, Alt-Right | Move the cursor forwards one word
+use std::convert::TryFrom;
+
 use crate::caps::{Capabilities, ProbeHints};
 use crate::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 use crate::surface::change::ChangeSequence;

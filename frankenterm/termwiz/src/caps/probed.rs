@@ -3,6 +3,7 @@ use crate::escape::parser::Parser;
 use crate::escape::{Action, CSI, DeviceControlMode, Esc, EscCode};
 use crate::terminal::ScreenSize;
 use crate::{Result, bail};
+use std::convert::TryFrom;
 use std::io::{Read, Write};
 
 const TMUX_BEGIN: &str = "\u{1b}Ptmux;\u{1b}";

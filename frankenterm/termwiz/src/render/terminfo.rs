@@ -13,6 +13,7 @@ use crate::escape::{Esc, OneBased};
 use crate::image::{ImageData, ImageDataType, TextureCoordinate};
 use crate::render::RenderTty;
 use crate::surface::{Change, CursorShape, CursorVisibility, LineAttribute, Position};
+use std::convert::TryFrom;
 use finl_unicode::grapheme_clusters::Graphemes;
 #[cfg(feature = "use_image")]
 use image::codecs::gif::GifEncoder;
