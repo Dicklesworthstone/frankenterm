@@ -15,11 +15,15 @@
 use std::time::Duration;
 
 use frankenterm_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
+use frankenterm_core::connector_governor::{
+    ConnectorGovernor, ConnectorGovernorConfig, GovernorReason, GovernorVerdict, TokenBucketConfig,
+};
 use frankenterm_core::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
 use frankenterm_core::connector_reliability::{
     ConnectorCircuitConfig, ConnectorErrorKind, ConnectorReliabilityConfig,
     ConnectorReliabilityController, DeadLetterQueueConfig,
 };
+use frankenterm_core::error::RuntimeOperationSource;
 use frankenterm_core::retry::{RetryPolicy, with_retry_and_circuit_cx};
 use frankenterm_core::{Error, Result};
 
@@ -241,6 +245,147 @@ fn connector_circuit_breaker_cancellation_is_not_failure() {
         assert_eq!(telemetry.trips_total, 0);
         assert_eq!(telemetry.successes_recorded, 0);
     });
+}
+
+#[test]
+fn connector_reliability_conformance_circuit_telemetry_snapshot_cancellation() {
+    run_async_test(async {
+        let cx = frankenterm_core::cx::for_request();
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(1),
+        };
+        let mut circuit = CircuitBreaker::with_name(
+            "connector-telemetry-cancel",
+            CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)),
+        );
+
+        let top_level_cancel: Result<()> =
+            with_retry_and_circuit_cx(&cx, &policy, &mut circuit, || async {
+                Err(Error::Cancelled("caller dropped connector request".into()))
+            })
+            .await;
+        assert!(matches!(top_level_cancel, Err(Error::Cancelled(_))));
+
+        let typed_cancel: Result<()> =
+            with_retry_and_circuit_cx(&cx, &policy, &mut circuit, || async {
+                Err(Error::RuntimeOperation {
+                    operation: "connector_dispatch",
+                    source: RuntimeOperationSource::Cancelled("routing budget exhausted".into()),
+                })
+            })
+            .await;
+        assert!(matches!(
+            typed_cancel,
+            Err(Error::RuntimeOperation {
+                source: RuntimeOperationSource::Cancelled(_),
+                ..
+            })
+        ));
+
+        let status_after_cancellations = circuit.status();
+        assert_eq!(status_after_cancellations.state, CircuitStateKind::Closed);
+        assert_eq!(status_after_cancellations.consecutive_failures, 0);
+
+        let telemetry_after_cancellations = circuit.telemetry().snapshot();
+        assert_eq!(telemetry_after_cancellations.failures_recorded, 0);
+        assert_eq!(telemetry_after_cancellations.trips_total, 0);
+        assert_eq!(telemetry_after_cancellations.successes_recorded, 0);
+        assert_eq!(telemetry_after_cancellations.resets_total, 0);
+        assert_eq!(telemetry_after_cancellations.half_open_probes, 0);
+        assert_eq!(telemetry_after_cancellations.requests_rejected, 0);
+
+        let backend_failure: Result<()> =
+            with_retry_and_circuit_cx(&cx, &policy, &mut circuit, || async {
+                Err(Error::Policy("connector backend denied request".into()))
+            })
+            .await;
+        assert!(matches!(backend_failure, Err(Error::Policy(_))));
+
+        let status_after_failure = circuit.status();
+        assert_eq!(status_after_failure.state, CircuitStateKind::Open);
+        assert_eq!(status_after_failure.consecutive_failures, 1);
+
+        let telemetry_after_failure = circuit.telemetry().snapshot();
+        assert_eq!(telemetry_after_failure.failures_recorded, 1);
+        assert_eq!(telemetry_after_failure.trips_total, 1);
+        assert_eq!(telemetry_after_failure.successes_recorded, 0);
+        assert_eq!(telemetry_after_failure.resets_total, 0);
+        assert_eq!(telemetry_after_failure.half_open_probes, 0);
+        assert_eq!(telemetry_after_failure.requests_rejected, 0);
+    });
+}
+
+#[test]
+fn connector_reliability_conformance_governor_snapshot() {
+    let mut config = ConnectorGovernorConfig::default();
+    config.default_rate_limit = TokenBucketConfig {
+        capacity: 1,
+        refill_rate: 1,
+        refill_interval_ms: 1_000,
+    };
+    config.global_rate_limit = TokenBucketConfig {
+        capacity: 10,
+        refill_rate: 10,
+        refill_interval_ms: 1_000,
+    };
+    let mut governor = ConnectorGovernor::new(config);
+    let action = make_action(ConnectorActionKind::Notify, "governor-snapshot");
+
+    let first = governor.evaluate(&action, 1_000);
+    assert_eq!(first.verdict, GovernorVerdict::Allow);
+    assert_eq!(first.reason, GovernorReason::Clear);
+    assert_eq!(first.connector_id, "test-slack");
+    assert_eq!(first.action_kind, "notify");
+
+    let second = governor.evaluate(&action, 1_000);
+    assert_eq!(second.verdict, GovernorVerdict::Throttle);
+    assert_eq!(second.reason, GovernorReason::ConnectorRateLimit);
+
+    let rate_limited_snapshot = governor.snapshot(1_000);
+    assert_eq!(rate_limited_snapshot.telemetry.evaluations, 2);
+    assert_eq!(rate_limited_snapshot.telemetry.allows, 1);
+    assert_eq!(rate_limited_snapshot.telemetry.throttles, 1);
+    assert_eq!(rate_limited_snapshot.telemetry.rejections, 0);
+    assert_eq!(rate_limited_snapshot.global_quota.used, 1);
+    assert_eq!(rate_limited_snapshot.queue.current_depth, 0);
+    assert_eq!(rate_limited_snapshot.queue.total_rejected, 0);
+
+    let connector_snapshot = rate_limited_snapshot
+        .connectors
+        .iter()
+        .find(|snapshot| snapshot.connector_id == "test-slack")
+        .expect("connector snapshot should exist after first decision");
+    assert_eq!(connector_snapshot.quota.used, 1);
+    assert_eq!(connector_snapshot.quota.total_lifetime, 1);
+    assert_eq!(connector_snapshot.cost.window_cost_cents, 1);
+    assert_eq!(connector_snapshot.cost.total_lifetime_cents, 1);
+    assert_eq!(connector_snapshot.consecutive_failures, 0);
+    assert!(!connector_snapshot.backoff_active);
+
+    governor.record_outcome("test-slack", false, 1_100);
+    let backoff_snapshot = governor.snapshot(1_100);
+    let connector_snapshot = backoff_snapshot
+        .connectors
+        .iter()
+        .find(|snapshot| snapshot.connector_id == "test-slack")
+        .expect("connector snapshot should retain failure state");
+    assert_eq!(connector_snapshot.consecutive_failures, 1);
+    assert!(connector_snapshot.backoff_active);
+    assert!(connector_snapshot.backoff_remaining_ms > 0);
+
+    let during_backoff = governor.evaluate(&action, 1_100);
+    assert_eq!(during_backoff.verdict, GovernorVerdict::Throttle);
+    assert_eq!(during_backoff.reason, GovernorReason::AdaptiveBackoff);
+
+    let final_snapshot = governor.snapshot(1_100);
+    assert_eq!(final_snapshot.telemetry.evaluations, 3);
+    assert_eq!(final_snapshot.telemetry.allows, 1);
+    assert_eq!(final_snapshot.telemetry.throttles, 2);
+    assert_eq!(final_snapshot.telemetry.rejections, 0);
 }
 
 /// DLQ replay plan batches entries for retry, and successful replays
