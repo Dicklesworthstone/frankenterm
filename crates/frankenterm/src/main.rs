@@ -6336,10 +6336,12 @@ impl<T> RobotResponse<T> {
         hint: Option<String>,
         elapsed_ms: u64,
     ) -> Self {
+        let msg = msg.into();
+        let hint = hint.map(|hint| redact_for_output(&hint));
         Self {
             ok: false,
             data: None,
-            error: Some(msg.into()),
+            error: Some(redact_for_output(&msg)),
             error_code: Some(code.to_string()),
             hint,
             elapsed_ms,
@@ -58308,6 +58310,33 @@ recorder_backend = "frankensqlite"
         assert!(
             json.contains("[REDACTED]"),
             "expected redaction marker in robot pane text results"
+        );
+    }
+
+    #[test]
+    fn robot_error_response_redacts_error_and_hint_payloads() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let response = RobotResponse::<serde_json::Value>::error_with_code(
+            "robot.invalid_args",
+            format!("invalid request body contains {secret}"),
+            Some(format!("retry without {secret}")),
+            7,
+        );
+
+        let json = serde_json::to_string(&response).expect("serialize robot error response");
+        assert!(
+            !json.contains(&secret),
+            "raw secret leaked in robot error response"
+        );
+        assert!(
+            json.contains("[REDACTED]"),
+            "expected redaction marker in robot error response"
         );
     }
 
