@@ -27,8 +27,16 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) OUTPUT_MODE="json"; shift ;;
     --strict) STRICT=1; shift ;;
-    --registry) REGISTRY="$2"; shift 2 ;;
-    --fixtures) FIXTURES="$2"; shift 2 ;;
+    --registry)
+      [[ $# -ge 2 ]] || { echo "missing value for --registry" >&2; usage >&2; exit 2; }
+      REGISTRY="$2"
+      shift 2
+      ;;
+    --fixtures)
+      [[ $# -ge 2 ]] || { echo "missing value for --fixtures" >&2; usage >&2; exit 2; }
+      FIXTURES="$2"
+      shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac

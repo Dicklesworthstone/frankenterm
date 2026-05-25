@@ -17,6 +17,32 @@ command -v ruby >/dev/null 2>&1 || { echo "ruby required" >&2; exit 2; }
 jq empty "${REGISTRY}" "${SCHEMA}" "${FIXTURES}"
 bash -n "${SUT}"
 
+set +e
+missing_registry_output="$("${SUT}" --registry 2>&1)"
+missing_registry_rc=$?
+missing_fixtures_output="$("${SUT}" --fixtures 2>&1)"
+missing_fixtures_rc=$?
+set -e
+
+[[ "${missing_registry_rc}" -eq 2 ]] || {
+  echo "expected --registry without a value to exit 2, got ${missing_registry_rc}" >&2
+  exit 1
+}
+[[ "${missing_registry_output}" == *"missing value for --registry"* ]] || {
+  echo "missing --registry value did not emit a stable error" >&2
+  printf '%s\n' "${missing_registry_output}" >&2
+  exit 1
+}
+[[ "${missing_fixtures_rc}" -eq 2 ]] || {
+  echo "expected --fixtures without a value to exit 2, got ${missing_fixtures_rc}" >&2
+  exit 1
+}
+[[ "${missing_fixtures_output}" == *"missing value for --fixtures"* ]] || {
+  echo "missing --fixtures value did not emit a stable error" >&2
+  printf '%s\n' "${missing_fixtures_output}" >&2
+  exit 1
+}
+
 json_output="$("${SUT}" --json --strict)"
 
 claim_count="$(printf '%s' "${json_output}" | jq -r '.summary.claim_count')"
