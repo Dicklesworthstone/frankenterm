@@ -130,6 +130,28 @@ impl RolloutConfig {
     }
 }
 
+fn rate_reaches_threshold(rate: f64, threshold: f64) -> bool {
+    if !rate.is_finite() || !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return true;
+    }
+    rate >= threshold
+}
+
+fn rate_exceeds_threshold(rate: f64, threshold: f64) -> bool {
+    if !rate.is_finite() || !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return true;
+    }
+    rate > threshold
+}
+
+fn duration_exceeds_multiplier(actual_ms: u64, budget_ms: u64, multiplier: f64) -> bool {
+    if !multiplier.is_finite() || multiplier <= 0.0 {
+        return true;
+    }
+    let ratio = actual_ms as f64 / budget_ms as f64;
+    !ratio.is_finite() || ratio > multiplier
+}
+
 // ── Enforcement Decision ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,9 +265,9 @@ pub fn calculate_flaky_rate(
         flaky_runs as f64 / total_runs as f64
     };
 
-    let alert_level = if flaky_rate >= config.flaky_rate_critical {
+    let alert_level = if rate_reaches_threshold(flaky_rate, config.flaky_rate_critical) {
         AlertLevel::Critical
-    } else if flaky_rate >= config.flaky_rate_warning {
+    } else if rate_reaches_threshold(flaky_rate, config.flaky_rate_warning) {
         AlertLevel::Warning
     } else {
         AlertLevel::Normal
@@ -277,7 +299,7 @@ pub fn evaluate_rollback_triggers(
 ) -> RollbackTrigger {
     let mut reasons = Vec::new();
 
-    if flaky_metrics.flaky_rate > config.flaky_rate_critical {
+    if rate_exceeds_threshold(flaky_metrics.flaky_rate, config.flaky_rate_critical) {
         reasons.push(format!(
             "Flaky rate {:.1}% exceeds critical threshold {:.1}%",
             flaky_metrics.flaky_rate * 100.0,
@@ -288,7 +310,7 @@ pub fn evaluate_rollback_triggers(
     for (gate, (actual, budget)) in gate_durations {
         if *budget > 0 {
             let ratio = *actual as f64 / *budget as f64;
-            if ratio > config.duration_rollback_multiplier {
+            if duration_exceeds_multiplier(*actual, *budget, config.duration_rollback_multiplier) {
                 reasons.push(format!(
                     "Gate {} duration {}ms exceeds {}x budget {}ms (ratio: {:.1}x)",
                     gate, actual, config.duration_rollback_multiplier, budget, ratio
@@ -685,6 +707,29 @@ mod tests {
         assert_eq!(metrics.alert_level, AlertLevel::Normal);
     }
 
+    #[test]
+    fn flaky_rate_invalid_critical_threshold_alerts_critical() {
+        let config = RolloutConfig {
+            flaky_rate_critical: f64::NAN,
+            ..Default::default()
+        };
+        let metrics = calculate_flaky_rate(100, 0, &config, vec![]);
+
+        assert_eq!(metrics.alert_level, AlertLevel::Critical);
+    }
+
+    #[test]
+    fn flaky_rate_invalid_warning_threshold_alerts_warning() {
+        let config = RolloutConfig {
+            flaky_rate_warning: f64::INFINITY,
+            flaky_rate_critical: 1.0,
+            ..Default::default()
+        };
+        let metrics = calculate_flaky_rate(100, 0, &config, vec![]);
+
+        assert_eq!(metrics.alert_level, AlertLevel::Warning);
+    }
+
     // ── Rollback Triggers ────────────────────────────────────────────────
 
     #[test]
@@ -727,6 +772,36 @@ mod tests {
         let trigger = evaluate_rollback_triggers(&flaky, &durations, &config);
         assert!(trigger.triggered);
         assert_eq!(trigger.reasons.len(), 2);
+    }
+
+    #[test]
+    fn rollback_invalid_flaky_metric_triggers() {
+        let config = RolloutConfig::default();
+        let flaky = FlakyRateMetrics {
+            total_runs: 100,
+            flaky_runs: 0,
+            flaky_rate: f64::NAN,
+            alert_level: AlertLevel::Normal,
+            flaky_tests: vec![],
+        };
+        let trigger = evaluate_rollback_triggers(&flaky, &BTreeMap::new(), &config);
+
+        assert!(trigger.triggered);
+        assert!(trigger.reasons[0].contains("Flaky rate"));
+    }
+
+    #[test]
+    fn rollback_invalid_duration_multiplier_triggers() {
+        let config = RolloutConfig {
+            duration_rollback_multiplier: f64::NAN,
+            ..Default::default()
+        };
+        let flaky = calculate_flaky_rate(100, 0, &config, vec![]);
+        let durations = BTreeMap::from([("smoke".into(), (0u64, 30u64))]);
+        let trigger = evaluate_rollback_triggers(&flaky, &durations, &config);
+
+        assert!(trigger.triggered);
+        assert!(trigger.reasons[0].contains("duration"));
     }
 
     // ── Rollback Drill ───────────────────────────────────────────────────
