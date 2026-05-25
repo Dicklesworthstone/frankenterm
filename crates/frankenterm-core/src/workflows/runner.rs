@@ -110,6 +110,16 @@ fn invalid_jump_target_reason(step: usize, step_count: usize) -> Option<String> 
     }
 }
 
+fn invalid_resume_step_reason(step: usize, step_count: usize) -> Option<String> {
+    if step <= step_count {
+        None
+    } else {
+        Some(format!(
+            "resume step {step} is outside workflow resume range 0..={step_count}"
+        ))
+    }
+}
+
 async fn wait_external_signal_maybe_cx(
     cx: Option<&crate::cx::Cx>,
     registry: &ExternalSignalRegistry,
@@ -821,6 +831,56 @@ impl WorkflowRunner {
                 fetch_workflow_start_action_id(&self.storage, execution_id).await
             }
         };
+
+        if let Some(reason) = invalid_resume_step_reason(start_step, step_count) {
+            tracing::error!(
+                execution_id,
+                start_step,
+                step_count,
+                "Workflow resume step is outside the executable step range"
+            );
+            if let Err(e) = self
+                .fail_execution_maybe_cx(cx, execution_id, &reason)
+                .await
+            {
+                tracing::warn!(
+                    execution_id,
+                    error = %e,
+                    "Failed to fail execution after invalid resume step"
+                );
+            }
+            if let Err(e) = self
+                .mark_trigger_event_handled_maybe_cx(cx, execution_id, "aborted")
+                .await
+            {
+                tracing::warn!(
+                    execution_id,
+                    error = %e,
+                    "Failed to mark trigger event handled after invalid resume step"
+                );
+            }
+            record_workflow_terminal_action_maybe_cx(
+                cx,
+                &self.storage,
+                &workflow_name,
+                execution_id,
+                pane_id,
+                "workflow_aborted",
+                "aborted",
+                Some(&reason),
+                Some(start_step),
+                None,
+                start_action_id,
+            )
+            .await;
+
+            return WorkflowExecutionResult::Aborted {
+                execution_id: execution_id.to_string(),
+                reason,
+                step_index: start_step,
+                elapsed_ms: elapsed_ms(start_time),
+            };
+        }
 
         // Create workflow context with injector for policy-gated actions.
         // Use prompt() capabilities (alt_screen: Some(false)) as the baseline —
@@ -3846,6 +3906,20 @@ mod tests {
         let beyond_end = invalid_jump_target_reason(99, 3).expect("beyond step_count is invalid");
         assert!(beyond_end.contains("jump target 99"));
         assert!(beyond_end.contains("0..3"));
+    }
+
+    #[test]
+    fn resume_step_allows_exact_completion_boundary() {
+        assert!(invalid_resume_step_reason(0, 0).is_none());
+        assert!(invalid_resume_step_reason(3, 3).is_none());
+    }
+
+    #[test]
+    fn resume_step_beyond_completion_boundary_is_invalid() {
+        let reason =
+            invalid_resume_step_reason(4, 3).expect("resume beyond step_count is invalid");
+        assert!(reason.contains("resume step 4"));
+        assert!(reason.contains("0..=3"));
     }
 
     // -------------------------------------------------------------------------
