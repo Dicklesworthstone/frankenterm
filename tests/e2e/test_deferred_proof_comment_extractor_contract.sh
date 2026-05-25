@@ -96,6 +96,21 @@ EXPECTED_INVALID = %w[
   raw-pane-text-stored
   unknown-expected-state
 ].freeze
+PATH_NEGATIVES = [
+  nil,
+  "",
+  "/tmp/owned.rs",
+  "./crates/frankenterm-core/src/lib.rs",
+  "../crates/frankenterm-core/src/lib.rs",
+  "crates/frankenterm-core/src//lib.rs",
+  "crates/frankenterm-core/src/../lib.rs",
+  "crates/frankenterm-core/src/./lib.rs",
+  "crates/frankenterm-core/src/",
+  "crates/frankenterm-core/src/.",
+  "crates/frankenterm-core/src/..",
+  "crates/frankenterm-core/.git/config",
+  "crates\\frankenterm-core\\src\\lib.rs"
+].freeze
 
 def fail!(message)
   warn "deferred proof comment extractor contract: #{message}"
@@ -119,6 +134,18 @@ end
 def split_list(value)
   value.to_s.split(",").map(&:strip).reject(&:empty?)
 end
+
+def safe_path?(path)
+  return false unless path.is_a?(String) && !path.empty?
+  return false if path.start_with?("/", "./", "../") || path.include?("\\")
+
+  path.split("/", -1).none? { |part| part.empty? || part == "." || part == ".." || part == ".git" }
+end
+
+PATH_NEGATIVES.each do |path|
+  fail!("safe_path? accepted unsafe path #{path.inspect}") if safe_path?(path)
+end
+fail!("safe_path? rejected known-good repo path") unless safe_path?("crates/frankenterm-core/src/lib.rs")
 
 def footer_fields(text)
   fields = {}
@@ -424,6 +451,12 @@ emitted.each do |entry|
   receipt = entry.fetch("receipt")
   fail!("#{entry.fetch("record_id")} missing receipt") unless receipt
   fail!("#{entry.fetch("record_id")} receipt contract drifted") unless receipt.fetch("contract_id") == RECEIPT_CONTRACT_ID
+  receipt.dig("paths", "owned_paths").each do |path|
+    fail!("#{entry.fetch("record_id")} unsafe owned path #{path.inspect}") unless safe_path?(path)
+  end
+  receipt.dig("paths", "dirty_paths_at_capture").each do |path|
+    fail!("#{entry.fetch("record_id")} unsafe dirty path #{path.inspect}") unless safe_path?(path)
+  end
   if entry.fetch("record_id") == "selected-worker-topology-preflight-closeout"
     fail!("topology preflight closeout must stay wait_rch") unless receipt.dig("eligibility", "state") == "wait_rch"
     fail!("topology preflight closeout must keep coarse blocked projection") unless receipt.dig("coordination", "rch_admission_state") == "blocked_worker_pressure"
