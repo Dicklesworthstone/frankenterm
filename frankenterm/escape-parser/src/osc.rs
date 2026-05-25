@@ -1260,12 +1260,22 @@ impl ITermDimension {
             ITermDimension::Automatic => None,
             ITermDimension::Cells(n) => Some(((*n).max(0) as usize).saturating_mul(cell_size)),
             ITermDimension::Pixels(n) => Some((*n).max(0) as usize),
-            ITermDimension::Percent(n) => Some(
-                (((*n).max(0).min(100) as f32 / 100.0) * num_cells as f32 * cell_size as f32)
-                    as usize,
-            ),
+            ITermDimension::Percent(n) => Some(percent_of_pixel_span(
+                (*n).clamp(0, 100) as usize,
+                num_cells,
+                cell_size,
+            )),
         }
     }
+}
+
+fn percent_of_pixel_span(percent: usize, num_cells: usize, cell_size: usize) -> usize {
+    let total_pixels = num_cells.saturating_mul(cell_size);
+    let base = total_pixels / 100;
+    let remainder = total_pixels % 100;
+
+    base.saturating_mul(percent)
+        .saturating_add(remainder.saturating_mul(percent) / 100)
 }
 
 impl ITermProprietary {
@@ -2512,6 +2522,15 @@ mod test {
     fn iterm_dimension_to_pixels_percent() {
         // 50% of 80 cells * 10px per cell = 400
         assert_eq!(ITermDimension::Percent(50).to_pixels(10, 80), Some(400));
+    }
+
+    #[test]
+    fn iterm_dimension_to_pixels_percent_uses_exact_integer_math() {
+        assert_eq!(ITermDimension::Percent(33).to_pixels(3, 101), Some(99));
+        assert_eq!(
+            ITermDimension::Percent(50).to_pixels(usize::MAX, 1),
+            Some(usize::MAX / 2)
+        );
     }
 
     #[test]
