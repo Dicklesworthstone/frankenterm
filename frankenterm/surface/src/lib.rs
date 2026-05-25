@@ -863,13 +863,14 @@ impl Surface {
         other_y: usize,
     ) -> Vec<DirtyRect> {
         let mut rects: Vec<DirtyRect> = Vec::new();
+        let y_end = y.saturating_add(height);
 
         for ((row_num, line), other_line) in self
             .lines
             .iter()
             .enumerate()
             .skip(y)
-            .take_while(|(row_num, _)| *row_num < y + height)
+            .take_while(|(row_num, _)| *row_num < y_end)
             .zip(other.lines.iter().skip(other_y))
         {
             let spans = diff_line_spans(line, other_line, x, width, other_x);
@@ -924,9 +925,9 @@ impl Surface {
                 continue;
             }
             let start_tx = rect.x / tile_width;
-            let end_tx = (rect.x + rect.width - 1) / tile_width;
+            let end_tx = rect.x.saturating_add(rect.width.saturating_sub(1)) / tile_width;
             let start_ty = rect.y / tile_height;
-            let end_ty = (rect.y + rect.height - 1) / tile_height;
+            let end_ty = rect.y.saturating_add(rect.height.saturating_sub(1)) / tile_height;
             for ty in start_ty..=end_ty {
                 for tx in start_tx..=end_tx {
                     touched_tiles.insert((tx, ty));
@@ -936,8 +937,8 @@ impl Surface {
 
         let mut tiles = Vec::with_capacity(touched_tiles.len());
         for (tx, ty) in touched_tiles {
-            let tile_x = tx * tile_width;
-            let tile_y = ty * tile_height;
+            let tile_x = tx.saturating_mul(tile_width);
+            let tile_y = ty.saturating_mul(tile_height);
             if tile_x >= self.width || tile_y >= self.height {
                 continue;
             }
@@ -1086,15 +1087,17 @@ fn diff_line(
     width: usize,
     other_x: usize,
 ) {
+    let x_end = x.saturating_add(width);
+    let other_x_end = other_x.saturating_add(width);
     let mut cells = line
         .visible_cells()
         .skip_while(|cell| cell.cell_index() < x)
-        .take_while(|cell| cell.cell_index() < x + width)
+        .take_while(|cell| cell.cell_index() < x_end)
         .peekable();
     let other_cells = other_line
         .visible_cells()
         .skip_while(|cell| cell.cell_index() < other_x)
-        .take_while(|cell| cell.cell_index() < other_x + width);
+        .take_while(|cell| cell.cell_index() < other_x_end);
 
     for other_cell in other_cells {
         let rel_x = other_cell.cell_index() - other_x;
@@ -1119,10 +1122,11 @@ fn diff_line(
         // If we find a cell in the equivalent position, diff against it. If not, we know
         // there is a multi-cell grapheme in `line` that partially overlaps `other_cell`,
         // so we have to overwrite anyway.
+        let col_num = x.saturating_add(rel_x);
         if let Some(comparison_cell) = comparison_cell {
-            diff_state.diff_cells(x + rel_x, row_num, comparison_cell, other_cell);
+            diff_state.diff_cells(col_num, row_num, comparison_cell, other_cell);
         } else {
-            diff_state.set_cell(x + rel_x, row_num, other_cell);
+            diff_state.set_cell(col_num, row_num, other_cell);
         }
     }
 }
@@ -1135,15 +1139,17 @@ fn diff_line_spans(
     width: usize,
     other_x: usize,
 ) -> Vec<core::ops::Range<usize>> {
+    let x_end = x.saturating_add(width);
+    let other_x_end = other_x.saturating_add(width);
     let mut cells = line
         .visible_cells()
         .skip_while(|cell| cell.cell_index() < x)
-        .take_while(|cell| cell.cell_index() < x + width)
+        .take_while(|cell| cell.cell_index() < x_end)
         .peekable();
     let other_cells = other_line
         .visible_cells()
         .skip_while(|cell| cell.cell_index() < other_x)
-        .take_while(|cell| cell.cell_index() < other_x + width);
+        .take_while(|cell| cell.cell_index() < other_x_end);
 
     let mut spans: Vec<core::ops::Range<usize>> = Vec::new();
 
@@ -1168,8 +1174,8 @@ fn diff_line_spans(
         };
 
         if changed {
-            let start = x + rel_x;
-            let end = min(start + other_cell.width().max(1), x + width);
+            let start = x.saturating_add(rel_x);
+            let end = min(start.saturating_add(other_cell.width().max(1)), x_end);
             if end > start {
                 if let Some(last) = spans.last_mut() {
                     if start <= last.end {
@@ -1815,6 +1821,34 @@ mod test {
     }
 
     #[test]
+    fn diff_line_spans_saturates_horizontal_region_end() {
+        let line = Line::from_text("ab", &CellAttributes::default(), SEQ_ZERO, None);
+
+        assert!(diff_line_spans(&line, &line, 1, usize::MAX, 1).is_empty());
+    }
+
+    #[test]
+    fn dirty_rects_region_saturates_vertical_region_end() {
+        let left = Surface::new(2, 2);
+        let mut right = Surface::new(2, 2);
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        right.add_change("x");
+
+        assert_eq!(
+            left.dirty_rects_region(0, 1, 2, usize::MAX, &right, 0, 1),
+            vec![DirtyRect {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: 1,
+            }]
+        );
+    }
+
+    #[test]
     fn dirty_tiles_dedup_and_clip_edges() {
         let left = Surface::new(10, 6);
         let mut right = Surface::new(10, 6);
@@ -1846,6 +1880,27 @@ mod test {
                     height: 3,
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn dirty_tiles_region_saturates_vertical_region_end() {
+        let left = Surface::new(2, 2);
+        let mut right = Surface::new(2, 2);
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        right.add_change("x");
+
+        assert_eq!(
+            left.dirty_tiles_region(0, 1, 2, usize::MAX, &right, 0, 1, 1, 1),
+            vec![DirtyRect {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: 1,
+            }]
         );
     }
 
