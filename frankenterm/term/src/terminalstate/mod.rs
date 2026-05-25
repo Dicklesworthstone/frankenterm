@@ -2510,7 +2510,7 @@ impl TerminalState {
             }
             */
 
-            self.left_and_right_margins = left..right + 1;
+            self.left_and_right_margins = left..next_col_saturating(right);
 
             // DECSLRM moves the cursor to column 1, line 1 of the page.
             self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
@@ -2527,14 +2527,13 @@ impl TerminalState {
         match cursor {
             Cursor::SetTopAndBottomMargins { top, bottom } => {
                 let rows = self.screen().physical_rows;
-                let top = i64::from(top.as_zero_based()).min(rows as i64 - 1).max(0);
-                let bottom = i64::from(bottom.as_zero_based())
-                    .min(rows as i64 - 1)
-                    .max(0);
+                let last_row = last_row_for_height(rows);
+                let top = i64::from(top.as_zero_based()).min(last_row).max(0);
+                let bottom = i64::from(bottom.as_zero_based()).min(last_row).max(0);
                 if top >= bottom {
                     return;
                 }
-                self.top_and_bottom_margins = top..bottom + 1;
+                self.top_and_bottom_margins = top..next_row_saturating(bottom);
                 self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
                 log::debug!(
                     "SetTopAndBottomMargins {:?} (and move cursor to top left: {:?})",
