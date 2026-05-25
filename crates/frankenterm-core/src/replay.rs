@@ -33,6 +33,17 @@ const KEYFRAME_INTERVAL: usize = 50;
 /// any realistic recording (typical sessions are single-digit MB).
 pub const MAX_RECORDING_BYTES: u64 = 256 * 1024 * 1024;
 
+fn checked_recording_len(operation: &'static str, source_label: &str, len: u64) -> Result<()> {
+    if len > MAX_RECORDING_BYTES {
+        return Err(replay_backend_error(
+            operation,
+            format!("{source_label} {len} bytes exceeds max {MAX_RECORDING_BYTES} bytes"),
+        ));
+    }
+
+    Ok(())
+}
+
 fn replay_backend_error(operation: &'static str, source: impl std::fmt::Display) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation,
@@ -138,16 +149,7 @@ impl Recording {
     /// to block repo-clone OOM attacks via hostile `.war` payloads.
     pub fn load(path: &Path) -> Result<Self> {
         let meta = std::fs::metadata(path)?;
-        if meta.len() > MAX_RECORDING_BYTES {
-            return Err(replay_backend_error(
-                "replay.load",
-                format!(
-                    "recording file {} bytes exceeds max {} bytes",
-                    meta.len(),
-                    MAX_RECORDING_BYTES
-                ),
-            ));
-        }
+        checked_recording_len("replay.load", "recording file", meta.len())?;
         let mut file = std::fs::File::open(path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
@@ -156,6 +158,9 @@ impl Recording {
 
     /// Parse a recording from raw bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        checked_recording_len("replay.from_bytes", "recording buffer", len)?;
+
         let mut frames = Vec::new();
         let mut offset = 0;
 
@@ -2073,6 +2078,21 @@ mod tests {
         assert!(
             msg.contains("exceeds max"),
             "oversize load should reject before read, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn recording_from_bytes_uses_same_oversize_cap_as_file_load() {
+        let err = checked_recording_len(
+            "replay.from_bytes",
+            "recording buffer",
+            MAX_RECORDING_BYTES + 1,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("recording buffer") && msg.contains("exceeds max"),
+            "oversize buffer should reject before parse, got: {msg}"
         );
     }
 
