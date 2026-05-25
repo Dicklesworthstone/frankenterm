@@ -214,6 +214,64 @@ fn intervals_touch(left_end: i64, right_start: i64) -> bool {
 mod tests {
     use super::*;
 
+    /// Exhaustive metamorphic check of the core guarantee: for the exact
+    /// interval backend, `could_have_match` must agree EXACTLY with brute-force
+    /// interval intersection — in particular it must NEVER produce a false
+    /// negative (which would make SQLite skip a table that actually has
+    /// matching rows). Sweeps every recorded-range / query-range combination
+    /// over a small integer domain that includes negatives and boundary-
+    /// touching cases.
+    #[test]
+    fn could_have_match_is_exact_vs_brute_force() {
+        const LO: i64 = -3;
+        const HI: i64 = 9;
+
+        // Deterministic LCG so the trial set is reproducible.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+
+        for _trial in 0..400 {
+            let mut filter = StorageRangeFilter::new("events");
+            // Ground truth: the set of integer points covered by recorded ranges.
+            let mut covered = std::collections::BTreeSet::new();
+
+            let num_ranges = (next().rem_euclid(4)) + 0; // 0..=3 ranges
+            for _ in 0..num_ranges {
+                let a = LO + next().rem_euclid(HI - LO + 1);
+                let b = LO + next().rem_euclid(HI - LO + 1);
+                let (s, e) = if a <= b { (a, b) } else { (b, a) };
+                filter.record_range(s, e);
+                for p in s..=e {
+                    covered.insert(p);
+                }
+            }
+
+            // Check every query range in the domain (both orientations, since
+            // could_have_match normalizes its bounds).
+            for low in LO..=HI {
+                for high in low..=HI {
+                    let truth = (low..=high).any(|p| covered.contains(&p));
+                    let got = filter.could_have_match(low, high);
+                    assert_eq!(
+                        got, truth,
+                        "could_have_match({low}, {high}) = {got} but brute-force = {truth}; \
+                         recorded ranges = {:?}",
+                        filter.ranges().collect::<Vec<_>>()
+                    );
+                    // Reversed bounds must give the same answer (normalize).
+                    assert_eq!(
+                        filter.could_have_match(high, low),
+                        got,
+                        "could_have_match must be bound-order invariant"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn empty_filter_rejects_every_range() {
         let filter = StorageRangeFilter::new("events");
