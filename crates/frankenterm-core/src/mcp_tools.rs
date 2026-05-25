@@ -989,17 +989,14 @@ impl ToolHandler for WaRulesListTool {
         let params: RulesListParams = if arguments.is_null() {
             RulesListParams::default()
         } else {
-            match serde_json::from_value(arguments) {
+            match parse_mcp_tool_params(
+                "wa.rules_list",
+                arguments,
+                "Expected object with optional agent_type, verbose",
+                start,
+            ) {
                 Ok(p) => p,
-                Err(err) => {
-                    let envelope = McpEnvelope::<()>::error(
-                        MCP_ERR_INVALID_ARGS,
-                        format!("Invalid params: {err}"),
-                        Some("Expected object with optional agent_type, verbose".to_string()),
-                        elapsed_ms(start),
-                    );
-                    return envelope_to_content(envelope);
-                }
+                Err(response) => return response,
             }
         };
 
@@ -1012,7 +1009,7 @@ impl ToolHandler for WaRulesListTool {
                 _ => {
                     let envelope = McpEnvelope::<()>::error(
                         MCP_ERR_INVALID_ARGS,
-                        format!("Unknown agent_type: {s}"),
+                        format!("Unknown agent_type: {}", redact_mcp_output_secrets(s)),
                         Some("Valid types: codex, claude_code, gemini, wezterm".to_string()),
                         elapsed_ms(start),
                     );
@@ -8277,6 +8274,74 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("execution_id, pane_id, or active=true")
+        );
+    }
+
+    #[test]
+    fn rules_list_malformed_args_redacts_serde_error_value() {
+        let tool = WaRulesListTool;
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "agent_type": "codex",
+                    "verbose": secret,
+                }),
+            )
+            .expect("rules_list bad-arg call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(
+            envelope["hint"],
+            "Expected object with optional agent_type, verbose"
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "malformed wa.rules_list args leaked the caller-supplied secret"
+        );
+    }
+
+    #[test]
+    fn rules_list_unknown_agent_type_redacts_argument_value() {
+        let tool = WaRulesListTool;
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "agent_type": secret,
+                    "verbose": false,
+                }),
+            )
+            .expect("rules_list unknown-agent call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "unknown wa.rules_list agent_type leaked the caller-supplied secret"
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("[REDACTED]")
         );
     }
 
