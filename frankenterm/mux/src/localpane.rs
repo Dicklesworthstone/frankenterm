@@ -299,6 +299,10 @@ fn next_search_grapheme_idx(last_grapheme_idx: usize) -> usize {
     last_grapheme_idx.saturating_add(1)
 }
 
+fn next_resize_retry_attempt(attempt: usize) -> usize {
+    attempt.saturating_add(1)
+}
+
 fn retry_with_backoff<T, E, F>(
     policy: ResizeRetryPolicy,
     mut op: F,
@@ -320,7 +324,7 @@ where
                 let backoff = retry_backoff_for_attempt(policy, attempt);
                 stats.backoff_elapsed = stats.backoff_elapsed.saturating_add(backoff);
                 std::thread::sleep(backoff);
-                attempt += 1;
+                attempt = next_resize_retry_attempt(attempt);
             }
         }
     }
@@ -2151,6 +2155,12 @@ mod tests {
     fn search_end_grapheme_index_saturates() {
         assert_eq!(next_search_grapheme_idx(0), 1);
         assert_eq!(next_search_grapheme_idx(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn next_resize_retry_attempt_saturates() {
+        assert_eq!(next_resize_retry_attempt(1), 2);
+        assert_eq!(next_resize_retry_attempt(usize::MAX), usize::MAX);
     }
 
     #[test]
