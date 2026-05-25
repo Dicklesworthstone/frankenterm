@@ -51,6 +51,13 @@ impl SchemaVersion {
         self.major == other.major && self.minor >= other.minor
     }
 
+    /// Return true when this version is less than or equal to `other` using
+    /// normal major/minor ordering.
+    #[must_use]
+    pub fn is_at_or_before(&self, other: &Self) -> bool {
+        self.major < other.major || (self.major == other.major && self.minor <= other.minor)
+    }
+
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
@@ -549,12 +556,10 @@ impl SchemaEvolutionRegistry {
             .iter()
             .filter(|f| {
                 f.required
-                    && f.introduced_in.major <= version.major
-                    && f.introduced_in.minor <= version.minor
-                    && f.deprecated_in.as_ref().is_none_or(|d| {
-                        d.major > version.major
-                            || (d.major == version.major && d.minor > version.minor)
-                    })
+                    && f.introduced_in.is_at_or_before(version)
+                    && f.deprecated_in
+                        .as_ref()
+                        .is_none_or(|deprecated| !deprecated.is_at_or_before(version))
             })
             .collect()
     }
@@ -564,9 +569,7 @@ impl SchemaEvolutionRegistry {
     pub fn all_fields_for(&self, version: &SchemaVersion) -> Vec<&SchemaFieldDef> {
         self.fields
             .iter()
-            .filter(|f| {
-                f.introduced_in.major <= version.major && f.introduced_in.minor <= version.minor
-            })
+            .filter(|f| f.introduced_in.is_at_or_before(version))
             .collect()
     }
 
@@ -707,7 +710,7 @@ pub fn check_compatibility(
     CompatibilityReport {
         source: source.clone(),
         target: target.clone(),
-        compatible: missing.is_empty(),
+        compatible: source.is_compatible_with(target) && missing.is_empty(),
         missing_fields: missing,
         deprecated_fields: deprecated,
     }
@@ -1175,6 +1178,54 @@ mod tests {
         let report = check_compatibility(&registry, &v1, &v1);
         assert!(report.compatible);
         assert!(report.missing_fields.is_empty());
+    }
+
+    #[test]
+    fn connector_event_model_compatibility_rejects_major_version_skew() {
+        let registry = SchemaEvolutionRegistry::new();
+        let report = check_compatibility(
+            &registry,
+            &SchemaVersion::new(1, 0),
+            &SchemaVersion::new(2, 0),
+        );
+
+        assert!(
+            !report.compatible,
+            "major-version skew must fail even when required field names overlap"
+        );
+        assert!(report.missing_fields.is_empty());
+    }
+
+    #[test]
+    fn connector_event_model_field_filtering_uses_lexicographic_versions() {
+        let mut registry = SchemaEvolutionRegistry {
+            current_version: SchemaVersion::new(2, 0),
+            fields: Vec::new(),
+        };
+        registry.fields.push(SchemaFieldDef {
+            name: "legacy_minor_field".to_string(),
+            field_type: "string".to_string(),
+            required: true,
+            introduced_in: SchemaVersion::new(1, 5),
+            deprecated_in: None,
+            description: "introduced before the next major version".to_string(),
+        });
+        registry.fields.push(SchemaFieldDef {
+            name: "current_major_field".to_string(),
+            field_type: "string".to_string(),
+            required: true,
+            introduced_in: SchemaVersion::new(2, 0),
+            deprecated_in: None,
+            description: "introduced at the current major version".to_string(),
+        });
+
+        let fields: Vec<_> = registry
+            .required_fields_for(&SchemaVersion::new(2, 0))
+            .into_iter()
+            .map(|field| field.name.as_str())
+            .collect();
+
+        assert_eq!(fields, vec!["legacy_minor_field", "current_major_field"]);
     }
 
     // ---- Indexing contract ----
