@@ -858,6 +858,15 @@ fn validate_pane_meta(pane: &PaneMeta, label: &str) -> Result<(), WireProtocolEr
             format!("{label} domain must not be empty"),
         )));
     }
+    if pane
+        .pane_uuid
+        .as_ref()
+        .is_some_and(|pane_uuid| pane_uuid.trim().is_empty())
+    {
+        return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+            format!("{label} pane_uuid must not be empty when present"),
+        )));
+    }
     Ok(())
 }
 
@@ -2143,6 +2152,36 @@ mod tests {
 
             let Err(err) = agg.ingest_envelope(envelope) else {
                 panic!("decoded {label} pane metadata must reject blank domains");
+            };
+            assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+            assert_eq!(agg.total_rejected(), 1);
+            assert_eq!(agg.total_accepted(), 0);
+            assert_eq!(agg.agent_count(), 0);
+        }
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_rejects_blank_pane_meta_uuids() {
+        let standalone = {
+            let mut pane = sample_pane_meta();
+            pane.pane_uuid = Some(String::new());
+            WirePayload::PaneMeta(pane)
+        };
+        let snapshot = {
+            let mut pane = sample_pane_meta();
+            pane.pane_uuid = Some(" \t ".to_string());
+            WirePayload::PanesMeta(PanesMeta {
+                panes: vec![pane],
+                timestamp_ms: 1_700_000_004_004,
+            })
+        };
+
+        for (label, payload) in [("standalone", standalone), ("snapshot", snapshot)] {
+            let mut agg = Aggregator::new(10);
+            let envelope = WireEnvelope::new(1, "agent-valid", payload);
+
+            let Err(err) = agg.ingest_envelope(envelope) else {
+                panic!("decoded {label} pane metadata must reject blank pane UUIDs");
             };
             assert!(matches!(err, WireProtocolError::InvalidJson(_)));
             assert_eq!(agg.total_rejected(), 1);
