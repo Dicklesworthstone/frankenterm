@@ -885,6 +885,13 @@ impl ChannelLagTracker {
     fn register(&self) -> Arc<AtomicU64> {
         let position = Arc::new(AtomicU64::new(self.sent_seq.load(Ordering::Relaxed)));
         if let Ok(mut guard) = self.subscriber_positions.lock() {
+            // Prune positions whose subscriber has been dropped before pushing
+            // the new one. Without this, `subscriber_positions` grows without
+            // bound under subscribe/drop churn whenever lag is never queried —
+            // `queued_len`/`oldest_lag_ms` are the only other places that prune,
+            // and they are caller-driven. This keeps the vec bounded by the
+            // live subscriber count regardless of query cadence.
+            guard.retain(|weak| weak.strong_count() > 0);
             guard.push(Arc::downgrade(&position));
         }
         position
@@ -2370,6 +2377,32 @@ impl NotificationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (unbounded-growth defect): `ChannelLagTracker::register` must
+    /// prune positions for dropped subscribers so `subscriber_positions` stays
+    /// bounded by the live subscriber count even when lag is never queried
+    /// (`queued_len`/`oldest_lag_ms` are the only other places that prune, and
+    /// they are caller-driven). Before the fix the vec grew by one dead `Weak`
+    /// per dropped subscriber, unbounded under churn.
+    #[test]
+    fn lag_tracker_register_prunes_dropped_positions() {
+        let tracker = ChannelLagTracker::default();
+        for _ in 0..100 {
+            let position = tracker.register();
+            drop(position); // subscriber dropped without any intervening lag query
+        }
+        let live = tracker.register();
+        let len = tracker
+            .subscriber_positions
+            .lock()
+            .expect("lag tracker mutex")
+            .len();
+        assert!(
+            len <= 2,
+            "register must prune dropped positions; vec len={len} (expected <= 2)"
+        );
+        drop(live);
+    }
 
     /// Structure-aware fuzz / property coverage for the untrusted user-var
     /// payload decoder (OSC 1337 base64 → UTF-8 → JSON). Crash-discovery
