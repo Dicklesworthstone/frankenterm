@@ -730,6 +730,45 @@ mod tests {
     }
 
     #[test]
+    fn recorder_backpressure_memory_threshold_preempts_hot_capture() {
+        let policy = CaptureTierPolicy::default();
+        let environment = CaptureTierEnvironment {
+            memory_pressure_pct: policy.deferred_memory_pressure_pct,
+            global_capture_backlog_segments: 0,
+            global_index_backlog_segments: 0,
+        };
+        let panes = vec![PaneTierInput {
+            pane_id: 13,
+            bytes_per_sec: policy.hot_bytes_per_sec,
+            idle_ms: 0,
+            capture_backlog_segments: 0,
+            pending_index_segments: 0,
+            retained_bytes: 16 * 1024 * 1024,
+            previous_tier: Some(CaptureIndexTier::Hot),
+        }];
+        let report = evaluate_adaptive_capture_tiers(&policy, &environment, &panes);
+        let decision = &report.decisions[0];
+
+        assert_eq!(decision.tier, CaptureIndexTier::Deferred);
+        assert_eq!(decision.reasons, vec!["memory_pressure".to_string()]);
+        assert_eq!(
+            decision.search_coverage,
+            SearchCoverageDisclosure::DeferredWithGap
+        );
+        let receipt = decision
+            .degraded_fidelity
+            .as_ref()
+            .expect("memory backpressure must emit a degraded-fidelity receipt");
+        assert!(receipt.explicit_gap);
+        assert!(
+            receipt.message.contains("memory=90%"),
+            "receipt should disclose memory pressure: {}",
+            receipt.message
+        );
+        assert!(report.deferred_without_receipts().is_empty());
+    }
+
+    #[test]
     fn deferred_receipts_include_pane_local_backlog_context() {
         let report = golden_report();
         let pane_capture_backlog = report

@@ -873,4 +873,26 @@ proptest! {
         prop_assert!(first.is_dag());
         prop_assert!(second.is_dag());
     }
+
+    #[test]
+    fn replay_decision_graph_determinism_property_same_bytes_yields_identical_graph(
+        specs in arb_decision_event_specs(),
+    ) {
+        let events = events_from_specs(&specs);
+        let bytes = serde_json::to_vec(&events).expect("generated decisions serialize");
+        let decoded_first: Vec<DecisionEvent> =
+            serde_json::from_slice(&bytes).expect("generated decision bytes decode");
+        let decoded_second: Vec<DecisionEvent> =
+            serde_json::from_slice(&bytes).expect("same generated decision bytes decode again");
+
+        let first = DecisionGraph::from_decisions(&decoded_first);
+        let second = DecisionGraph::from_decisions(&decoded_second);
+
+        prop_assert_eq!(first.to_json().as_bytes(), second.to_json().as_bytes());
+        prop_assert_eq!(graph_node_signature(&first), graph_node_signature(&second));
+        prop_assert_eq!(graph_edge_signature(&first), graph_edge_signature(&second));
+        prop_assert!(first.l1_equivalent(&second));
+        prop_assert!(first.is_dag());
+        prop_assert!(second.is_dag());
+    }
 }
