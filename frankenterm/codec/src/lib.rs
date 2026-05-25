@@ -896,24 +896,33 @@ impl Pdu {
     }
 
     pub fn stream_decode(buffer: &mut Vec<u8>) -> anyhow::Result<Option<DecodedPdu>> {
-        let Some(_) = buffered_frame_len(buffer)? else {
+        let Some(frame_len) = buffered_frame_len(buffer)? else {
             return Ok(None);
         };
 
-        let mut cursor = Cursor::new(buffer.as_slice());
-        match Self::decode(&mut cursor) {
+        let mut cursor = Cursor::new(&buffer[..frame_len]);
+        let decoded = match Self::decode(&mut cursor) {
             Ok(decoded) => {
                 let consumed = cursor.position() as usize;
-                let remain = buffer.len() - consumed;
-                buffer.copy_within(consumed.., 0);
-                buffer.truncate(remain);
-                Ok(Some(decoded))
+                if consumed != frame_len {
+                    bail!(
+                        "stream_decode consumed {} bytes from a {} byte PDU frame",
+                        consumed,
+                        frame_len
+                    );
+                }
+                decoded
             }
             Err(err) => {
                 log::error!("not an ioerror in stream_decode: {:?}", err);
-                Err(err)
+                return Err(err);
             }
-        }
+        };
+
+        let remain = buffer.len() - frame_len;
+        buffer.copy_within(frame_len.., 0);
+        buffer.truncate(remain);
+        Ok(Some(decoded))
     }
 
     pub fn try_read_and_decode<R: std::io::Read>(
@@ -2302,6 +2311,34 @@ mod test {
         assert_eq!(
             buffer, original,
             "malformed complete frame must remain available for quarantine"
+        );
+    }
+
+    #[test]
+    fn stream_decode_does_not_read_header_leb128_past_declared_frame() {
+        let mut buffer = Vec::new();
+        // The declared frame body is one byte long and contains only the start
+        // of a multi-byte serial leb128. Bytes after that body are a separate
+        // frame and must not be borrowed to finish this malformed header.
+        leb128::write::unsigned(&mut buffer, 1).unwrap();
+        buffer.push(0x80);
+        Pdu::Ping(Ping {}).encode(&mut buffer, 7).unwrap();
+        let original = buffer.clone();
+
+        let err = Pdu::stream_decode(&mut buffer)
+            .expect_err("malformed first frame must fail inside its declared bounds");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("reading PDU serial") && message.contains("reading leb128"),
+            "stream_decode should report the truncated serial inside the declared frame; got {message:?}",
+        );
+        assert!(
+            !message.contains("sizes don't make sense"),
+            "stream_decode read past the declared frame and misclassified the malformed header: {message:?}",
+        );
+        assert_eq!(
+            buffer, original,
+            "malformed frame must remain available for quarantine"
         );
     }
 
