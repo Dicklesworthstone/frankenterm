@@ -581,7 +581,7 @@ fn list_remote_tools(
     let mut guard = client.lock().map_err(|_| {
         crate::mcp_client::McpClientError::new(
             "mcp_proxy.client_lock_poisoned",
-            format!("server '{server_name}': proxy client lock poisoned"),
+            proxy_client_lock_poisoned_error(server_name),
         )
     })?;
     guard.list_tools()
@@ -816,6 +816,28 @@ fn redact_mcp_proxy_selection_text(text: &str) -> String {
     REDACTOR.redact(text)
 }
 
+fn redacted_mcp_proxy_route_labels(server_name: &str, exposed_name: &str) -> (String, String) {
+    (
+        redact_mcp_proxy_selection_text(server_name),
+        redact_mcp_proxy_selection_text(exposed_name),
+    )
+}
+
+fn proxy_route_preflight_error(route: &str, cx_err: impl std::fmt::Display) -> String {
+    let route = redact_mcp_proxy_selection_text(route);
+    format!("Cx pre-flight checkpoint failed before proxy route '{route}' dispatch: {cx_err}")
+}
+
+fn proxy_route_lock_poisoned_error(route: &str) -> String {
+    let route = redact_mcp_proxy_selection_text(route);
+    format!("proxy route '{route}' failed: remote client lock poisoned")
+}
+
+fn proxy_client_lock_poisoned_error(server_name: &str) -> String {
+    let server_name = redact_mcp_proxy_selection_text(server_name);
+    format!("server '{server_name}': proxy client lock poisoned")
+}
+
 fn sanitize_prefix_segment(name: &str) -> String {
     let mut value = String::with_capacity(name.len());
     for ch in name.trim().chars() {
@@ -868,6 +890,8 @@ impl ToolHandler for RemoteProxyToolHandler {
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
+        let (redacted_server_name, redacted_exposed_name) =
+            redacted_mcp_proxy_route_labels(&self.server_name, &self.exposed_name);
 
         // br-ft-xhj38: pre-flight Cx checkpoint BEFORE acquiring
         // the per-server Mutex. Two reasons:
@@ -902,16 +926,16 @@ impl ToolHandler for RemoteProxyToolHandler {
                 target: LOG_TARGET,
                 event = "mcp_proxy_route_pre_expired",
                 route = "remote",
-                server = %self.server_name,
-                tool = %self.exposed_name,
+                server = %redacted_server_name,
+                tool = %redacted_exposed_name,
                 cx_err = %cx_err,
                 elapsed_ms = start.elapsed().as_millis(),
                 "br-ft-xhj38: proxy call short-circuited before \
                  Mutex acquire because Cx pre-flight checkpoint failed"
             );
-            return Err(McpError::internal_error(format!(
-                "Cx pre-flight checkpoint failed before proxy route '{}' dispatch: {cx_err}",
-                self.exposed_name
+            return Err(McpError::internal_error(proxy_route_preflight_error(
+                &self.exposed_name,
+                &cx_err,
             )));
         }
 
@@ -926,16 +950,13 @@ impl ToolHandler for RemoteProxyToolHandler {
                 target: LOG_TARGET,
                 event = "mcp_proxy_route_lock_poisoned",
                 route = "remote",
-                server = %self.server_name,
-                tool = %self.exposed_name,
+                server = %redacted_server_name,
+                tool = %redacted_exposed_name,
                 elapsed_ms = start.elapsed().as_millis(),
                 "br-ft-wzk10: per-server FtMcpClient Mutex poisoned; \
                  proxy call rejected"
             );
-            McpError::internal_error(format!(
-                "proxy route '{}' failed: remote client lock poisoned",
-                self.exposed_name
-            ))
+            McpError::internal_error(proxy_route_lock_poisoned_error(&self.exposed_name))
         })?;
 
         match guard.call_tool(&self.external_name, arguments) {
@@ -953,8 +974,8 @@ impl ToolHandler for RemoteProxyToolHandler {
                             target: LOG_TARGET,
                             event = "mcp_proxy_route_decode_failed",
                             route = "remote",
-                            server = %self.server_name,
-                            tool = %self.exposed_name,
+                            server = %redacted_server_name,
+                            tool = %redacted_exposed_name,
                             code = err.code,
                             message = %err.message,
                             elapsed_ms = start.elapsed().as_millis(),
@@ -966,8 +987,8 @@ impl ToolHandler for RemoteProxyToolHandler {
                     target: LOG_TARGET,
                     event = "mcp_proxy_route",
                     route = "remote",
-                    server = %self.server_name,
-                    tool = %self.exposed_name,
+                    server = %redacted_server_name,
+                    tool = %redacted_exposed_name,
                     elapsed_ms = start.elapsed().as_millis(),
                     "Executed proxied remote MCP tool"
                 );
@@ -981,8 +1002,8 @@ impl ToolHandler for RemoteProxyToolHandler {
                     target: LOG_TARGET,
                     event = "mcp_proxy_route_failed",
                     route = "remote",
-                    server = %self.server_name,
-                    tool = %self.exposed_name,
+                    server = %redacted_server_name,
+                    tool = %redacted_exposed_name,
                     code = err.code,
                     message = %err.message,
                     elapsed_ms = start.elapsed().as_millis(),
@@ -1247,6 +1268,58 @@ mod tests {
             0,
             "strict mode returns an error instead of recording a soft skip"
         );
+    }
+
+    #[test]
+    fn proxy_route_dispatch_errors_redact_secret_shaped_route() {
+        let secret = "sk-ant-api03-EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+        let exposed_route = format!("remote/private/{secret}");
+
+        let preflight =
+            super::proxy_route_preflight_error(&exposed_route, "deadline budget exhausted");
+        let lock_poisoned = super::proxy_route_lock_poisoned_error(&exposed_route);
+
+        for rendered in [&preflight, &lock_poisoned] {
+            assert!(
+                !rendered.contains(secret),
+                "raw route secret leaked in proxy dispatch error: {rendered}"
+            );
+            assert!(
+                rendered.contains("[REDACTED]"),
+                "expected redaction marker in proxy dispatch error: {rendered}"
+            );
+        }
+        assert!(
+            preflight.contains("deadline budget exhausted"),
+            "preflight errors must retain the non-secret Cx failure detail: {preflight}"
+        );
+    }
+
+    #[test]
+    fn proxy_route_diagnostic_labels_redact_secret_shaped_server_and_tool() {
+        let server_secret = "sk-ant-api03-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        let tool_secret = "sk-ant-api03-GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+        let (server, tool) = super::redacted_mcp_proxy_route_labels(
+            &format!("server-{server_secret}"),
+            &format!("remote/private/{tool_secret}"),
+        );
+        let client_lock =
+            super::proxy_client_lock_poisoned_error(&format!("server-{server_secret}"));
+
+        for rendered in [&server, &tool, &client_lock] {
+            assert!(
+                !rendered.contains(server_secret),
+                "raw server secret leaked in proxy diagnostic: {rendered}"
+            );
+            assert!(
+                !rendered.contains(tool_secret),
+                "raw tool secret leaked in proxy diagnostic: {rendered}"
+            );
+            assert!(
+                rendered.contains("[REDACTED]"),
+                "expected redaction marker in proxy diagnostic: {rendered}"
+            );
+        }
     }
 
     #[test]
