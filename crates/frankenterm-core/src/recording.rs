@@ -502,7 +502,11 @@ impl Recorder {
     /// current state; the caller can call `stop()` again to await
     /// the in-flight worker (see `FrameWriter::has_pending_finalize`).
     pub fn stop(&mut self) -> Result<()> {
-        self.writer.finalize()?;
+        self.stop_with_timeout(DEFAULT_FRAME_WRITER_FINALIZE_TIMEOUT)
+    }
+
+    fn stop_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.writer.finalize_with_timeout(timeout)?;
         self.state = RecorderState::Stopped;
         Ok(())
     }
@@ -550,6 +554,10 @@ impl Recorder {
 
     /// Record a captured output segment as a frame.
     pub fn record_segment(&mut self, segment: &CapturedSegment) -> Result<()> {
+        if !self.is_recording() {
+            return Ok(());
+        }
+
         let is_gap = matches!(segment.kind, CapturedSegmentKind::Gap { .. });
         let payload = segment.content.as_bytes();
         let raw_len = payload.len() as u64;
@@ -696,12 +704,30 @@ impl RecordingManager {
         cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<Option<RecorderStats>> {
+        self.stop_recording_with_cx_and_timeout(cx, pane_id, DEFAULT_FRAME_WRITER_FINALIZE_TIMEOUT)
+            .await
+    }
+
+    async fn stop_recording_with_cx_and_timeout(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        timeout: Duration,
+    ) -> Result<Option<RecorderStats>> {
         let mut guard = self.recorders.lock_with_cx(cx).await;
-        if let Some(mut recorder) = guard.remove(&pane_id) {
-            recorder.stop()?;
-            return Ok(Some(recorder.stats()));
+        if !guard.contains_key(&pane_id) {
+            return Ok(None);
         }
-        Ok(None)
+
+        let stats = {
+            let recorder = guard
+                .get_mut(&pane_id)
+                .expect("recorder existence checked above");
+            recorder.stop_with_timeout(timeout)?;
+            recorder.stats()
+        };
+        guard.remove(&pane_id);
+        Ok(Some(stats))
     }
 
     /// Record a captured output segment (redacted if configured).
@@ -1903,6 +1929,27 @@ mod tests {
     }
 
     #[test]
+    fn recorder_ignores_segment_stats_when_not_recording() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("idle-segment.war");
+        let mut recorder = Recorder::new(1, &path, 10).unwrap();
+        let segment = CapturedSegment {
+            pane_id: 1,
+            seq: 0,
+            content: "dropped before start".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 10,
+        };
+
+        recorder.record_segment(&segment).unwrap();
+
+        let stats = recorder.stats();
+        assert_eq!(stats.frames_written, 0);
+        assert_eq!(stats.bytes_raw, 0);
+        assert_eq!(stats.bytes_written, 0);
+    }
+
+    #[test]
     fn recorder_records_output_frames() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.war");
@@ -2164,6 +2211,86 @@ mod tests {
                 .await
                 .expect("stop_with_cx on unknown pane is infallible");
             assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn recording_manager_stop_timeout_keeps_recorder_for_retry() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("manager-stop-retry.war");
+            let manager = RecordingManager::new(RecordingOptions {
+                flush_threshold: 8,
+                redact_output: false,
+                redact_events: false,
+            });
+            let cx = crate::cx::for_request();
+
+            manager
+                .start_recording_with_cx(&cx, 11, &path, 1_000)
+                .await
+                .expect("start recording");
+            let segment = CapturedSegment {
+                pane_id: 11,
+                seq: 0,
+                content: "buffered".to_string(),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 1_050,
+            };
+            manager
+                .record_segment_with_cx(&cx, &segment)
+                .await
+                .expect("record segment");
+
+            {
+                let mut guard = manager.recorders.lock_with_cx(&cx).await;
+                let recorder = guard.get_mut(&11).expect("active recorder");
+                let first_timeout = recorder
+                    .writer
+                    .finalize_with_timeout_for_test(
+                        Duration::from_millis(1),
+                        Duration::from_secs(1),
+                    )
+                    .expect_err("delayed finalize worker should time out");
+                assert!(
+                    matches!(first_timeout, crate::Error::Io(ref err) if err.kind() == ErrorKind::TimedOut)
+                );
+                assert!(recorder.writer.has_pending_finalize());
+                assert!(!recorder.writer.is_finalized());
+                assert_eq!(recorder.state, RecorderState::Recording);
+            }
+
+            let second_timeout = manager
+                .stop_recording_with_cx_and_timeout(&cx, 11, Duration::from_millis(1))
+                .await
+                .expect_err("manager stop must surface retryable finalize timeout");
+            assert!(
+                matches!(second_timeout, crate::Error::Io(ref err) if err.kind() == ErrorKind::TimedOut)
+            );
+
+            {
+                let guard = manager.recorders.lock_with_cx(&cx).await;
+                let recorder = guard
+                    .get(&11)
+                    .expect("recorder must remain registered after retryable stop timeout");
+                assert_eq!(recorder.state, RecorderState::Recording);
+                assert!(recorder.writer.has_pending_finalize());
+                assert!(!recorder.writer.is_finalized());
+            }
+
+            let stats = manager
+                .stop_recording_with_cx_and_timeout(&cx, 11, Duration::from_secs(2))
+                .await
+                .expect("retry should await pending finalize")
+                .expect("recorder should still be present");
+            assert_eq!(stats.state, RecorderState::Stopped);
+            assert_eq!(stats.frames_written, 1);
+
+            let guard = manager.recorders.lock_with_cx(&cx).await;
+            assert!(
+                !guard.contains_key(&11),
+                "successful stop removes finalized recorder"
+            );
         });
     }
 

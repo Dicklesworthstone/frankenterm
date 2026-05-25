@@ -33,15 +33,38 @@ const KEYFRAME_INTERVAL: usize = 50;
 /// any realistic recording (typical sessions are single-digit MB).
 pub const MAX_RECORDING_BYTES: u64 = 256 * 1024 * 1024;
 
-fn checked_recording_len(operation: &'static str, source_label: &str, len: u64) -> Result<()> {
-    if len > MAX_RECORDING_BYTES {
+fn checked_recording_len_against(
+    operation: &'static str,
+    source_label: &str,
+    len: u64,
+    max_bytes: u64,
+) -> Result<()> {
+    if len > max_bytes {
         return Err(replay_backend_error(
             operation,
-            format!("{source_label} {len} bytes exceeds max {MAX_RECORDING_BYTES} bytes"),
+            format!("{source_label} {len} bytes exceeds max {max_bytes} bytes"),
         ));
     }
 
     Ok(())
+}
+
+fn checked_recording_len(operation: &'static str, source_label: &str, len: u64) -> Result<()> {
+    checked_recording_len_against(operation, source_label, len, MAX_RECORDING_BYTES)
+}
+
+fn read_recording_to_end_bounded<R: Read>(
+    reader: R,
+    max_bytes: u64,
+    operation: &'static str,
+    source_label: &str,
+) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut bounded = reader.take(max_bytes.saturating_add(1));
+    bounded.read_to_end(&mut data)?;
+    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    checked_recording_len_against(operation, source_label, len, max_bytes)?;
+    Ok(data)
 }
 
 fn replay_backend_error(operation: &'static str, source: impl std::fmt::Display) -> crate::Error {
@@ -150,14 +173,18 @@ pub struct Recording {
 impl Recording {
     /// Load a recording from the given `.war` file path.
     ///
-    /// Rejects files larger than [`MAX_RECORDING_BYTES`] before reading
-    /// to block repo-clone OOM attacks via hostile `.war` payloads.
+    /// Rejects files larger than [`MAX_RECORDING_BYTES`] before and during
+    /// reading to block repo-clone OOM attacks via hostile `.war` payloads.
     pub fn load(path: &Path) -> Result<Self> {
         let meta = std::fs::metadata(path)?;
         checked_recording_len("replay.load", "recording file", meta.len())?;
-        let mut file = std::fs::File::open(path)?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
+        let file = std::fs::File::open(path)?;
+        let data = read_recording_to_end_bounded(
+            file,
+            MAX_RECORDING_BYTES,
+            "replay.load",
+            "recording file",
+        )?;
         Self::from_bytes(&data)
     }
 
@@ -1476,6 +1503,23 @@ mod tests {
         let recording = Recording::from_bytes(&[]).unwrap();
         assert!(recording.frames.is_empty());
         assert_eq!(recording.duration_ms, 0);
+    }
+
+    #[test]
+    fn recording_load_reader_rechecks_bound_after_metadata_window() {
+        let bytes = vec![0u8; 17];
+        let err = read_recording_to_end_bounded(
+            std::io::Cursor::new(bytes),
+            16,
+            "replay.load",
+            "recording stream",
+        )
+        .expect_err("reader must reject bytes beyond the replay load cap");
+        let message = err.to_string();
+        assert!(
+            message.contains("recording stream 17 bytes exceeds max 16 bytes"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
