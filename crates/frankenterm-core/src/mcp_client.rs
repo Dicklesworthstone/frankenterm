@@ -65,12 +65,14 @@ impl FtMcpClient {
         let client = OutboundFrameworkClient::connect_stdio(&server, settings)
             .map_err(|err| map_mcp_error(&server.name, err))?;
         let connect_timeout_ms = client.connect_timeout_ms();
+        let log_server = redact_mcp_client_text(&server.name);
+        let log_command = redact_mcp_client_text(&server.command);
 
         tracing::info!(
             target: LOG_TARGET,
             event = "mcp_client_connect",
-            server = %server.name,
-            command = %server.command,
+            server = %log_server,
+            command = %log_command,
             connect_timeout_ms,
             elapsed_ms = start.elapsed().as_millis(),
             "Connected outbound MCP client"
@@ -97,12 +99,13 @@ impl FtMcpClient {
     /// List tools from the connected server.
     pub fn list_tools(&mut self) -> McpClientResult<Vec<McpClientToolDefinition>> {
         let start = Instant::now();
+        let log_server = redact_mcp_client_text(&self.server.name);
         match self.client.list_tool_definitions() {
             Ok(tools) => {
                 tracing::info!(
                     target: LOG_TARGET,
                     event = "mcp_client_list_tools",
-                    server = %self.server.name,
+                    server = %log_server,
                     tool_count = tools.len(),
                     elapsed_ms = start.elapsed().as_millis(),
                     "Listed outbound MCP tools"
@@ -117,7 +120,7 @@ impl FtMcpClient {
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "mcp_client_list_tools_failed",
-                    server = %self.server.name,
+                    server = %log_server,
                     code = mapped.code,
                     message = %mapped.message,
                     "Failed to list outbound MCP tools"
@@ -134,13 +137,15 @@ impl FtMcpClient {
         arguments: serde_json::Value,
     ) -> McpClientResult<Vec<McpClientContentItem>> {
         let start = Instant::now();
+        let log_server = redact_mcp_client_text(&self.server.name);
+        let log_tool = redact_mcp_client_text(name);
         match self.client.call_tool_content(name, arguments) {
             Ok(content) => {
                 tracing::info!(
                     target: LOG_TARGET,
                     event = "mcp_client_call_tool",
-                    server = %self.server.name,
-                    tool = name,
+                    server = %log_server,
+                    tool = %log_tool,
                     content_items = content.len(),
                     elapsed_ms = start.elapsed().as_millis(),
                     "Executed outbound MCP tool"
@@ -155,8 +160,8 @@ impl FtMcpClient {
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "mcp_client_call_tool_failed",
-                    server = %self.server.name,
-                    tool = name,
+                    server = %log_server,
+                    tool = %log_tool,
                     code = mapped.code,
                     message = %mapped.message,
                     "Failed outbound MCP tool execution"
@@ -952,6 +957,64 @@ mod tests {
                     .get("tool")
                     .is_some_and(|value| field_matches(value, "echo"))
         }));
+    }
+
+    #[test]
+    fn outbound_mcp_logs_redact_secret_shaped_server_labels() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("mock_mcp_server.py");
+        std::fs::write(&script_path, mock_server_script()).expect("write mock script");
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let server = ExternalServerConfig {
+            name: secret.to_string(),
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), script_path.display().to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        };
+        let settings = McpClientConfig {
+            enabled: true,
+            timeout_ms: 5_000,
+            ..McpClientConfig::default()
+        };
+
+        let (_guard, events) = install_capture();
+        let mut client =
+            FtMcpClient::connect_external(server, &settings).expect("connect to mock server");
+        client.list_tools().expect("list tools");
+
+        let captured = events.lock().expect("lock logs").clone();
+        assert!(
+            captured.iter().any(|event| {
+                event.target == LOG_TARGET
+                    && event
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| field_matches(value, "mcp_client_connect"))
+                    && event
+                        .fields
+                        .get("server")
+                        .is_some_and(|value| value.contains("[REDACTED]"))
+            }),
+            "expected connect log to carry a redacted server field"
+        );
+        for event in captured.iter().filter(|event| event.target == LOG_TARGET) {
+            for (field, value) in &event.fields {
+                assert!(
+                    !value.contains(secret),
+                    "raw secret leaked in MCP client log field {field}: {value}"
+                );
+            }
+        }
     }
 
     #[test]
