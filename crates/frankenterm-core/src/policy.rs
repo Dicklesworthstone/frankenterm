@@ -1043,7 +1043,16 @@ impl ApprovalTracker {
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: VecDeque::new(),
-            max_entries,
+            // Clamp to >= 1. A zero-capacity tracker would self-evict every
+            // submitted approval on insert (`submit` push_back's then drops the
+            // front when `len > max_entries`, i.e. `1 > 0`), so `approve` could
+            // never find the entry — silently bricking the approval workflow
+            // (every RequireApproval mints an approval that instantly vanishes).
+            // This matches the zero-capacity defense every sibling bounded cache
+            // already carries: the Outbound/Signal/Event deduplicators bypass at
+            // capacity 0, tx_idempotency's DeduplicationCache uses `.max(1)`, and
+            // LruCache asserts `> 0`. ApprovalTracker was the lone unguarded site.
+            max_entries: max_entries.max(1),
             next_id: 1,
         }
     }
@@ -17555,6 +17564,27 @@ mod tests {
         assert_eq!(tracker.len(), 3);
         assert!(tracker.get("appr-1").is_none());
         assert!(tracker.get("appr-4").is_some());
+    }
+
+    #[test]
+    fn approval_tracker_zero_capacity_clamps_and_still_tracks_one() {
+        // Regression: ApprovalTracker::new(0) previously bricked approvals —
+        // submit() push_back's then drops the front when `len > max_entries`
+        // (1 > 0), self-evicting the just-submitted entry, so approve() could
+        // never find it. The constructor now clamps max_entries to >= 1, so at
+        // least the most recent approval survives and is approvable. Mirrors the
+        // zero-capacity defense the deduplicators / tx_idempotency / LruCache
+        // already carry.
+        let mut tracker = ApprovalTracker::new(0);
+        let id = tracker.submit("send_text", "agent-1", "pane-1", "needs review", "rule.x", 100, 0);
+        assert!(
+            tracker.get(&id).is_some(),
+            "a submitted approval must survive insert even at requested capacity 0"
+        );
+        assert!(
+            tracker.approve(&id, "admin", 200),
+            "the surviving approval must be approvable (workflow not bricked)"
+        );
     }
 
     #[test]
