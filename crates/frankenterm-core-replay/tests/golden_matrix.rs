@@ -888,7 +888,9 @@ proptest! {
         let first = DecisionGraph::from_decisions(&decoded_first);
         let second = DecisionGraph::from_decisions(&decoded_second);
 
-        prop_assert_eq!(first.to_json().as_bytes(), second.to_json().as_bytes());
+        let first_json = first.to_json();
+        let second_json = second.to_json();
+        prop_assert_eq!(first_json.as_bytes(), second_json.as_bytes());
         prop_assert_eq!(graph_node_signature(&first), graph_node_signature(&second));
         prop_assert_eq!(graph_edge_signature(&first), graph_edge_signature(&second));
         prop_assert!(first.l1_equivalent(&second));

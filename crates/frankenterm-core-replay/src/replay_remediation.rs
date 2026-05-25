@@ -222,6 +222,28 @@ impl RemediationEngine {
                 });
             }
 
+            RootCause::CausalTopologyChange {
+                rule_id,
+                baseline_parents,
+                candidate_parents,
+            } => {
+                suggestions.push(Suggestion {
+                    action: SuggestionAction::InvestigateUpstream,
+                    target: rule_id.clone(),
+                    rationale: format!(
+                        "Causal parents of rule '{}' changed (baseline {} → candidate {} parents) \
+                         while the decision content stayed stable. Investigate the upstream \
+                         ordering/dependency change; if the new topology is intentional, add an \
+                         expected-divergence annotation.",
+                        rule_id,
+                        baseline_parents.len(),
+                        candidate_parents.len()
+                    ),
+                    confidence: 0.7,
+                    effort_estimate: EffortEstimate::Medium,
+                });
+            }
+
             RootCause::Unknown => {
                 suggestions.push(build_unknown_suggestion(div, &score));
             }
@@ -347,10 +369,12 @@ fn build_unknown_suggestion(div: &Divergence, score: &RiskScore) -> Suggestion {
 mod tests {
     use super::*;
     use crate::replay_decision_diff::{DivergenceNode, DivergenceType, RootCause};
+    use frankenterm_core_replay_types::replay_decision_graph::DecisionType;
 
     fn make_div_node(rule_id: &str, def: &str, out: &str) -> DivergenceNode {
         DivergenceNode {
             node_id: 0,
+            decision_type: DecisionType::NoOp,
             rule_id: rule_id.into(),
             definition_hash: def.into(),
             output_hash: out.into(),

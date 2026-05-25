@@ -429,6 +429,16 @@ fn format_root_cause(div: &Divergence) -> String {
         RootCause::NewDecision { rule_id } => format!("New decision: {}", rule_id),
         RootCause::DroppedDecision { rule_id } => format!("Decision dropped: {}", rule_id),
         RootCause::TimingShift { delta_ms, .. } => format!("Timing shift: {}ms", delta_ms),
+        RootCause::CausalTopologyChange {
+            rule_id,
+            baseline_parents,
+            candidate_parents,
+        } => format!(
+            "Causal topology changed: {} ({} -> {} parents)",
+            rule_id,
+            baseline_parents.len(),
+            candidate_parents.len()
+        ),
         RootCause::Unknown => "Unknown".into(),
     }
 }

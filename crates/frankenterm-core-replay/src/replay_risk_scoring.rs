@@ -553,6 +553,7 @@ mod tests {
     fn make_divergence(dtype: DivergenceType, rule_id: &str, root_cause: RootCause) -> Divergence {
         let node = DivergenceNode {
             node_id: 0,
+            decision_type: DecisionType::NoOp,
             rule_id: rule_id.into(),
             definition_hash: "def".into(),
             output_hash: "out".into(),
@@ -575,6 +576,7 @@ mod tests {
             baseline_node: None,
             candidate_node: Some(DivergenceNode {
                 node_id: 0,
+                decision_type: DecisionType::NoOp,
                 rule_id: rule_id.into(),
                 definition_hash: "def".into(),
                 output_hash: "out".into(),
@@ -593,6 +595,7 @@ mod tests {
             divergence_type: DivergenceType::Removed,
             baseline_node: Some(DivergenceNode {
                 node_id: 0,
+                decision_type: DecisionType::NoOp,
                 rule_id: rule_id.into(),
                 definition_hash: "def".into(),
                 output_hash: "out".into(),
