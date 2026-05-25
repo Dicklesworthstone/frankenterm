@@ -208,6 +208,17 @@ pub enum SynchronizedOutputDrainCause {
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
 
+fn next_subscription_id(counter: &AtomicUsize) -> usize {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return current,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 type MuxSubscriber = dyn Fn(MuxNotification) -> bool + Send + Sync;
 
 #[derive(Default)]
@@ -1059,7 +1070,7 @@ impl Mux {
     where
         F: Fn(MuxNotification) -> bool + 'static + Send + Sync,
     {
-        let sub_id = SUB_ID.fetch_add(1, Ordering::Relaxed);
+        let sub_id = next_subscription_id(&SUB_ID);
         self.subscribers
             .write()
             .insert(sub_id, Arc::new(subscriber));
@@ -2361,6 +2372,14 @@ mod tests {
         mux.notify(MuxNotification::Empty);
         assert_eq!(notifications.load(Ordering::Relaxed), 1);
         assert!(!mux.unsubscribe(sub_id));
+    }
+
+    #[test]
+    fn subscription_id_allocator_saturates_without_wrapping() {
+        let counter = AtomicUsize::new(usize::MAX);
+
+        assert_eq!(next_subscription_id(&counter), usize::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 
     #[test]
