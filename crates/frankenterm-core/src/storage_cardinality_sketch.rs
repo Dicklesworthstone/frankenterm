@@ -39,11 +39,15 @@
 //! - [`StorageDistinctSketchSnapshot`] — serde snapshot for
 //!   inclusion in storage-doctor / runtime-telemetry reports.
 //!
-//! ## What is deferred
+//! ## What ships now / what is deferred
 //!
-//! - Cross-process merge (HyperLogLog has no `merge` method today;
-//!   adding it requires upstream work in
-//!   `frankenterm-core-telemetry-types::hyperloglog`).
+//! - Cross-process / cross-shard merge: AVAILABLE via
+//!   [`StorageDistinctSketch::merge`]. Each counter is unioned
+//!   register-wise through `HyperLogLog::merge`, so two sketches
+//!   built at the same precision combine into one estimating the
+//!   distinct count of the merged observation streams. (This was
+//!   previously deferred on the premise that HyperLogLog had no
+//!   `merge`; that premise is no longer true.)
 //! - Serde of the sketch state (only the summary stats are
 //!   serde-friendly; raw register state can't roundtrip until HLL
 //!   itself derives Serialize/Deserialize).
@@ -161,6 +165,25 @@ impl StorageDistinctSketch {
             memory_bytes: self.memory_bytes() as u64,
         }
     }
+
+    /// Merge another sketch into this one — a cross-process / cross-shard
+    /// union. Each of the three HyperLogLog counters is unioned register-wise,
+    /// so the result estimates the distinct count of the *combined* observation
+    /// streams (e.g. summing per-shard sketches into a fleet-wide estimate).
+    ///
+    /// Both sketches must share the same precision. The constructor fixes all
+    /// three counters to a single precision, so this holds whenever both were
+    /// built with the same [`StorageDistinctSketch::new`] /
+    /// [`StorageDistinctSketch::with_precision`].
+    ///
+    /// # Errors
+    /// Returns `Err` if the two sketches were built with different precisions.
+    pub fn merge(&mut self, other: &Self) -> Result<(), &'static str> {
+        self.panes.merge(&other.panes)?;
+        self.sessions.merge(&other.sessions)?;
+        self.embedders.merge(&other.embedders)?;
+        Ok(())
+    }
 }
 
 /// br-ft-storage-cardinality: serde-friendly snapshot of a
@@ -273,6 +296,55 @@ mod tests {
             err < 0.05,
             "100k cardinality estimate has relative error {err:.4}; must be < 0.05",
         );
+    }
+
+    #[test]
+    fn merge_unions_distinct_streams() {
+        // Two disjoint shards of 5_000 distinct pane_ids each; the merged
+        // sketch must estimate ≈ 10_000 distinct (within HLL error), never
+        // fewer than either shard.
+        let mut a = StorageDistinctSketch::new();
+        let mut b = StorageDistinctSketch::new();
+        for i in 0..5_000u64 {
+            a.record_pane_id(i);
+        }
+        for i in 5_000..10_000u64 {
+            b.record_pane_id(i);
+        }
+        let (ca, cb) = (a.estimated_distinct_panes(), b.estimated_distinct_panes());
+        let mut merged = a.clone();
+        merged.merge(&b).expect("same precision merges");
+        let cm = merged.estimated_distinct_panes();
+        assert!(cm >= ca && cm >= cb, "union {cm} must be >= each shard ({ca}, {cb})");
+        let err = (cm as f64 - 10_000.0).abs() / 10_000.0;
+        assert!(err < 0.05, "merged estimate {cm} should be ≈10_000 (rel err {err:.4})");
+    }
+
+    #[test]
+    fn merge_is_commutative() {
+        let mut a = StorageDistinctSketch::new();
+        let mut b = StorageDistinctSketch::new();
+        for i in 0..2_000u64 {
+            a.record_pane_id(i);
+            a.record_session_id(&format!("s{i}"));
+        }
+        for i in 1_000..3_000u64 {
+            b.record_pane_id(i);
+            b.record_session_id(&format!("s{i}"));
+        }
+        let mut ab = a.clone();
+        ab.merge(&b).unwrap();
+        let mut ba = b.clone();
+        ba.merge(&a).unwrap();
+        assert_eq!(ab.estimated_distinct_panes(), ba.estimated_distinct_panes());
+        assert_eq!(ab.estimated_distinct_sessions(), ba.estimated_distinct_sessions());
+    }
+
+    #[test]
+    fn merge_rejects_precision_mismatch() {
+        let mut a = StorageDistinctSketch::with_precision(14);
+        let b = StorageDistinctSketch::with_precision(12);
+        assert!(a.merge(&b).is_err(), "differing precisions must not silently merge");
     }
 
     #[test]
