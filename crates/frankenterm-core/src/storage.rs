@@ -9290,6 +9290,10 @@ fn record_event_backend(backend: &dyn StorageBackend, event: &StoredEvent) -> Re
             String::new()
         })
     });
+    let dedupe_key = event
+        .dedupe_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty());
 
     let pane_id_i64 = u64_to_i64(event.pane_id, "pane_id")?;
     let row = backend
@@ -9310,7 +9314,7 @@ fn record_event_backend(backend: &dyn StorageBackend, event: &StoredEvent) -> Re
                 ToSqlValue::optional_text(event.matched_text.as_deref()),
                 ToSqlValue::optional_i64(event.segment_id),
                 ToSqlValue::Integer(event.detected_at),
-                ToSqlValue::optional_text(event.dedupe_key.as_deref()),
+                ToSqlValue::optional_text(dedupe_key),
             ],
         )
         .map_err(|err| storage_backend_error("Failed to insert event", err))?
@@ -18751,6 +18755,94 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+#[test]
+fn storage_blank_event_dedupe_key_is_not_identity() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("blank_event_dedupe.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        storage
+            .upsert_pane_with_cx(
+                &cx,
+                PaneRecord {
+                    pane_id: 61,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("blank-dedupe".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let first = StoredEvent {
+            id: 0,
+            pane_id: 61,
+            rule_id: "rule-blank-a".to_string(),
+            agent_type: "unknown".to_string(),
+            event_type: "pattern".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: Some("blank-a".to_string()),
+            segment_id: None,
+            detected_at: 1_700_000_000_000,
+            dedupe_key: Some("   ".to_string()),
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let mut second = first.clone();
+        second.rule_id = "rule-blank-b".to_string();
+        second.matched_text = Some("blank-b".to_string());
+        second.detected_at = 1_700_000_000_001;
+
+        let first_id = storage.record_event_with_cx(&cx, first).await.unwrap();
+        let second_id = storage.record_event_with_cx(&cx, second).await.unwrap();
+        assert_ne!(
+            first_id, second_id,
+            "blank dedupe keys must not collapse unrelated events"
+        );
+
+        let events = storage
+            .get_events_with_cx(
+                &cx,
+                EventQuery {
+                    pane_id: Some(61),
+                    limit: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let blank_key_events = events
+            .iter()
+            .filter(|event| event.rule_id.starts_with("rule-blank-"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(blank_key_events.len(), 2);
+        assert!(
+            blank_key_events
+                .iter()
+                .all(|event| event.dedupe_key.is_none()),
+            "blank dedupe keys should be stored as NULL, not as an identity"
+        );
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
     });
 }
 
