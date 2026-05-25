@@ -3762,6 +3762,43 @@ mod tests {
         assert_eq!(dedup.check("b"), DedupeVerdict::New);
     }
 
+    // Guards the active-hit refresh against an insertion_order/entries
+    // divergence: the refresh is a remove(pos)+push_back pair. If the remove
+    // were ever dropped (push_back only), insertion_order would accumulate
+    // duplicate stale keys, grow past `entries`, and the capacity pop_front
+    // would start evicting LIVE entries. Hammering repeats + novel keys past
+    // capacity pins both invariants: len() never exceeds capacity, and an
+    // always-touched key is never evicted.
+    #[test]
+    fn dedup_insertion_order_stays_bounded_and_recency_correct_under_churn() {
+        let cap = 4;
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), cap);
+
+        for i in 0..cap {
+            assert_eq!(dedup.check(&format!("k{i}")), DedupeVerdict::New);
+        }
+        assert_eq!(dedup.len(), cap);
+
+        // Keep "k0" hot while streaming novel keys that each force an eviction.
+        for j in 0..50 {
+            let hot = dedup.check("k0");
+            let hot_is_dup = matches!(hot, DedupeVerdict::Duplicate { .. });
+            assert!(hot_is_dup, "iteration {j}: hot key must stay Duplicate, got {hot:?}");
+            assert_eq!(dedup.check(&format!("novel{j}")), DedupeVerdict::New);
+            assert_eq!(
+                dedup.len(),
+                cap,
+                "iteration {j}: len must never exceed capacity (insertion_order in lockstep)"
+            );
+        }
+
+        let survived = matches!(dedup.check("k0"), DedupeVerdict::Duplicate { .. });
+        assert!(
+            survived,
+            "an always-touched key must never be evicted across sustained churn"
+        );
+    }
+
     // ---- NotificationCooldown tests ----
 
     #[test]
