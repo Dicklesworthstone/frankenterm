@@ -14,9 +14,11 @@
 //! assert_eq!(resp.data.unwrap().text, "hello");
 //! ```
 
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+
+use serde::de::Error as _;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error_codes::ErrorCategory;
 
@@ -47,28 +49,22 @@ pub mod family_contract {
 ///
 /// Every `ft robot <command> --format json` call returns this envelope.
 /// Use `parse_response` or `RobotResponse::<T>::from_json` for convenience.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct RobotResponse<T> {
     /// `true` when the command succeeded.
     pub ok: bool,
     /// Command-specific payload (present when `ok == true`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
     /// Raw diagnostic payload carried by an `ok=false` envelope's `data`
-    /// field. This is intentionally not serialized by the typed client shape:
-    /// it exists so callers parsing `RobotResponse<T>` can still recover the
-    /// structured error context without forcing that context through the
-    /// success payload type `T`.
-    #[serde(skip)]
+    /// field. The custom serializer writes this back to wire `data` for
+    /// failed envelopes so typed clients can proxy or persist error envelopes
+    /// without dropping structured diagnostic context.
     pub error_data: Option<serde_json::Value>,
     /// Human-readable error message (present when `ok == false`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Machine-readable error code like `"robot.pane_not_found"` (present when `ok == false`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     /// Actionable hint for recovery (present on some errors).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
     /// Wall-clock milliseconds the command took.
     pub elapsed_ms: u64,
@@ -92,8 +88,51 @@ pub struct RobotResponse<T> {
     ///
     /// Defaults to 1 on incoming envelopes that pre-date the
     /// field, preserving wire-compat with pre-fix servers.
-    #[serde(default = "default_robot_response_schema_version")]
     pub schema_version: u32,
+}
+
+impl<T> Serialize for RobotResponse<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let has_wire_data = if self.ok {
+            self.data.is_some()
+        } else {
+            self.error_data.is_some()
+        };
+        let field_count = 5
+            + usize::from(has_wire_data)
+            + usize::from(self.error.is_some())
+            + usize::from(self.error_code.is_some())
+            + usize::from(self.hint.is_some());
+        let mut state = serializer.serialize_struct("RobotResponse", field_count)?;
+        state.serialize_field("ok", &self.ok)?;
+        if self.ok {
+            if let Some(data) = &self.data {
+                state.serialize_field("data", data)?;
+            }
+        } else if let Some(error_data) = &self.error_data {
+            state.serialize_field("data", error_data)?;
+        }
+        if let Some(error) = &self.error {
+            state.serialize_field("error", error)?;
+        }
+        if let Some(error_code) = &self.error_code {
+            state.serialize_field("error_code", error_code)?;
+        }
+        if let Some(hint) = &self.hint {
+            state.serialize_field("hint", hint)?;
+        }
+        state.serialize_field("elapsed_ms", &self.elapsed_ms)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("now", &self.now)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.end()
+    }
 }
 
 impl<'de, T> Deserialize<'de> for RobotResponse<T>
@@ -2919,6 +2958,51 @@ mod tests {
             assert_eq!(err.code.as_deref(), Some("robot.fleet.plan_error"));
             assert_eq!(err.message, "fleet plan failed");
             assert_eq!(err.hint.as_deref(), Some("inspect data.requested"));
+        }
+    }
+
+    #[test]
+    fn error_envelope_diagnostic_data_encode_decode_is_idempotent() {
+        let diagnostic_shapes = [
+            json!({"family": "fleet", "action": "scale", "requested": {"count": 3}}),
+            json!(["fleet", "scale", "diagnostic"]),
+            json!("plain diagnostic text"),
+            json!(42),
+        ];
+
+        for diagnostic_data in diagnostic_shapes {
+            let wire = json!({
+                "ok": false,
+                "data": diagnostic_data,
+                "error": "fleet plan failed",
+                "error_code": "robot.fleet.plan_error",
+                "hint": "inspect data.requested",
+                "elapsed_ms": 13,
+                "version": "0.2.0",
+                "now": 1700000000000u64,
+                "schema_version": RobotResponse::<GetTextData>::SCHEMA_VERSION,
+            });
+
+            let decoded: RobotResponse<GetTextData> = serde_json::from_value(wire).unwrap();
+            let encoded_once = serde_json::to_value(&decoded).unwrap();
+            assert_eq!(
+                encoded_once.get("data"),
+                decoded.error_data.as_ref(),
+                "error diagnostic data must survive typed decode -> encode"
+            );
+
+            let decoded_again: RobotResponse<GetTextData> =
+                serde_json::from_value(encoded_once.clone()).unwrap();
+            let encoded_twice = serde_json::to_value(&decoded_again).unwrap();
+
+            assert_eq!(
+                decoded_again.error_data, decoded.error_data,
+                "error diagnostic data must survive repeated decode cycles"
+            );
+            assert_eq!(
+                encoded_twice, encoded_once,
+                "robot error envelope encode/decode must be idempotent"
+            );
         }
     }
 
