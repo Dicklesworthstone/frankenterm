@@ -12158,6 +12158,10 @@ fn redact_for_output(text: &str) -> String {
     REDACTOR.redact(text)
 }
 
+fn redact_wait_pattern_for_output(pattern: &str) -> String {
+    redact_for_output(pattern)
+}
+
 fn redact_pane_state_fields_for_output(states: &mut [PaneState]) {
     for state in states {
         if let Some(title) = state.title.as_mut() {
@@ -26246,14 +26250,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             use std::fmt::Write as _;
 
                             let redacted_text = redact_for_output(&text);
+                            let redacted_wait_for = wait_for
+                                .as_ref()
+                                .map(|pattern| redact_wait_pattern_for_output(pattern));
                             let mut command = if dry_run {
                                 format!("ft robot send {pane_id} \"{redacted_text}\" --dry-run")
                             } else {
                                 format!("ft robot send {pane_id} \"{redacted_text}\"")
                             };
-                            if let Some(pattern) = &wait_for {
-                                let redacted_pattern = redact_for_output(pattern);
-                                let _ = write!(command, " --wait-for \"{redacted_pattern}\"");
+                            if let Some(pattern) = &redacted_wait_for {
+                                let _ = write!(command, " --wait-for \"{pattern}\"");
                                 if wait_for_regex {
                                     command.push_str(" --wait-for-regex");
                                 }
@@ -26520,9 +26526,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     polls,
                                                 },
                                             ) => {
+                                                let pattern_out = redacted_wait_for
+                                                    .as_deref()
+                                                    .unwrap_or(pattern)
+                                                    .to_string();
                                                 wait_for_data = Some(RobotWaitForData {
                                                     pane_id,
-                                                    pattern: pattern.clone(),
+                                                    pattern: pattern_out,
                                                     matched: true,
                                                     elapsed_ms,
                                                     polls,
@@ -26536,16 +26546,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ..
                                                 },
                                             ) => {
+                                                let pattern_out = redacted_wait_for
+                                                    .as_deref()
+                                                    .unwrap_or(pattern)
+                                                    .to_string();
                                                 wait_for_data = Some(RobotWaitForData {
                                                     pane_id,
-                                                    pattern: pattern.clone(),
+                                                    pattern: pattern_out.clone(),
                                                     matched: false,
                                                     elapsed_ms,
                                                     polls,
                                                     is_regex: wait_for_regex,
                                                 });
                                                 verification_error = Some(format!(
-                                                    "Timeout waiting for pattern '{pattern}'"
+                                                    "Timeout waiting for pattern '{pattern_out}'"
                                                 ));
                                             }
                                             Ok(
@@ -26557,9 +26571,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 // wait_for (ambient) should not return Cancelled;
                                                 // this arm exists only for exhaustiveness after the
                                                 // ft-xbnl0.2.3 WaitResult::Cancelled variant was added.
+                                                let pattern_out = redacted_wait_for
+                                                    .as_deref()
+                                                    .unwrap_or(pattern)
+                                                    .to_string();
                                                 wait_for_data = Some(RobotWaitForData {
                                                     pane_id,
-                                                    pattern: pattern.clone(),
+                                                    pattern: pattern_out,
                                                     matched: false,
                                                     elapsed_ms: 0,
                                                     polls,
@@ -26616,6 +26634,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     return Ok(());
                                 }
                             };
+                            let redacted_pattern = redact_wait_pattern_for_output(&pattern);
 
                             // Create WezTerm client
                             let wezterm = default_wezterm_handle();
@@ -26737,7 +26756,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             tracing::info!(
                                 pane_id,
-                                pattern = %pattern,
+                                pattern = %redacted_pattern,
                                 timeout_secs,
                                 is_regex = regex,
                                 "Starting wait-for"
@@ -26750,7 +26769,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }) => {
                                     let data = RobotWaitForData {
                                         pane_id,
-                                        pattern,
+                                        pattern: redacted_pattern.clone(),
                                         matched: true,
                                         elapsed_ms: elapsed,
                                         polls,
@@ -26767,7 +26786,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let response = RobotResponse::<RobotWaitForData>::error_with_code(
                                         ROBOT_ERR_TIMEOUT,
                                         format!(
-                                            "Timeout waiting for pattern '{pattern}' after {elapsed}ms ({polls} polls)"
+                                            "Timeout waiting for pattern '{redacted_pattern}' after {elapsed}ms ({polls} polls)"
                                         ),
                                         Some("Increase --timeout-secs or check if the pattern is correct".to_string()),
                                         elapsed_ms(start),
@@ -34056,14 +34075,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     redacted_wait_for.clone().unwrap_or_else(|| pattern.clone());
                                 wait_for_data = Some(RobotWaitForData {
                                     pane_id,
-                                    pattern: pattern_out,
+                                    pattern: pattern_out.clone(),
                                     matched: false,
                                     elapsed_ms,
                                     polls,
                                     is_regex: wait_for_regex,
                                 });
                                 verification_error =
-                                    Some(format!("Timeout waiting for pattern '{pattern}'"));
+                                    Some(format!("Timeout waiting for pattern '{pattern_out}'"));
                             }
                             Ok(frankenterm_core::wezterm::WaitResult::Cancelled {
                                 reason,
@@ -58018,6 +58037,27 @@ recorder_backend = "frankensqlite"
         assert!(
             json.contains("[REDACTED]"),
             "expected redaction marker in robot state JSON"
+        );
+    }
+
+    #[test]
+    fn redact_wait_pattern_for_output_scrubs_secret_pattern() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let redacted = redact_wait_pattern_for_output(&format!("ready {secret}"));
+
+        assert!(
+            !redacted.contains(&secret),
+            "raw secret leaked in wait-for pattern output"
+        );
+        assert!(
+            redacted.contains("[REDACTED]"),
+            "expected redaction marker in wait-for pattern output"
         );
     }
 
