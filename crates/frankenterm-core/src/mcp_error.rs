@@ -12,11 +12,11 @@ pub(crate) const MCP_ERR_POLICY: &str = "FT-MCP-0006";
 pub(crate) const MCP_ERR_PANE_NOT_FOUND: &str = "FT-MCP-0007";
 pub(crate) const MCP_ERR_WORKFLOW: &str = "FT-MCP-0008";
 pub(crate) const MCP_ERR_TIMEOUT: &str = "FT-MCP-0009";
-pub(crate) const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0008";
-pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0009";
+pub(crate) const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0011";
+pub(crate) const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
+pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 pub(crate) const MCP_ERR_CASS: &str = "FT-MCP-0014";
 pub(crate) const MCP_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "FT-MCP-0015";
-pub(crate) const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0016";
 pub(crate) const MCP_ERR_INTERNAL: &str = "FT-MCP-9000";
 
 #[derive(Debug)]
@@ -207,6 +207,30 @@ mod tests {
                 code.starts_with("FT-MCP-"),
                 "Code {code} missing FT-MCP- prefix"
             );
+        }
+    }
+
+    #[test]
+    fn error_codes_match_published_schema_assignments() {
+        let assignments = [
+            (MCP_ERR_INVALID_ARGS, "FT-MCP-0001"),
+            (MCP_ERR_CONFIG, "FT-MCP-0003"),
+            (MCP_ERR_WEZTERM, "FT-MCP-0004"),
+            (MCP_ERR_STORAGE, "FT-MCP-0005"),
+            (MCP_ERR_POLICY, "FT-MCP-0006"),
+            (MCP_ERR_PANE_NOT_FOUND, "FT-MCP-0007"),
+            (MCP_ERR_WORKFLOW, "FT-MCP-0008"),
+            (MCP_ERR_TIMEOUT, "FT-MCP-0009"),
+            (MCP_ERR_FTS_QUERY, "FT-MCP-0011"),
+            (MCP_ERR_RESERVATION_CONFLICT, "FT-MCP-0012"),
+            (MCP_ERR_CAUT, "FT-MCP-0013"),
+            (MCP_ERR_CASS, "FT-MCP-0014"),
+            (MCP_ERR_REMOTE_TEXT_UNAVAILABLE, "FT-MCP-0015"),
+            (MCP_ERR_INTERNAL, "FT-MCP-9000"),
+        ];
+
+        for (actual, expected) in assignments {
+            assert_eq!(actual, expected);
         }
     }
 
