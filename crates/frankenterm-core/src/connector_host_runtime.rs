@@ -30,6 +30,14 @@ impl ConnectorProtocolVersion {
             patch,
         }
     }
+
+    /// Return true when `self` is a same-major forward upgrade from `current`.
+    #[must_use]
+    pub const fn is_same_major_upgrade_from(self, current: Self) -> bool {
+        self.major == current.major
+            && (self.minor > current.minor
+                || (self.minor == current.minor && self.patch > current.patch))
+    }
 }
 
 impl Default for ConnectorProtocolVersion {
@@ -780,10 +788,10 @@ impl ConnectorHostRuntime {
         new_version: ConnectorProtocolVersion,
         probe: StartupProbeResult,
     ) -> Result<(), ConnectorHostRuntimeError> {
-        if new_version <= self.config.protocol_version {
+        if !new_version.is_same_major_upgrade_from(self.config.protocol_version) {
             return Err(ConnectorHostRuntimeError::ProtocolUpgradeRejected {
                 reason: format!(
-                    "new version {new_version} must be greater than current {}",
+                    "new version {new_version} must be a same-major forward upgrade from current {}",
                     self.config.protocol_version
                 ),
             });
@@ -1223,6 +1231,33 @@ mod tests {
     }
 
     #[test]
+    fn connector_host_runtime_upgrade_rejects_major_version_skew() {
+        let mut runtime = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
+        runtime.start(100).unwrap();
+
+        let err = runtime
+            .upgrade_and_restart(
+                200,
+                ConnectorProtocolVersion::new(2, 0, 0),
+                StartupProbeResult::healthy(),
+            )
+            .expect_err("breaking major protocol upgrade must require a negotiated cutover");
+
+        assert!(
+            matches!(
+                err,
+                ConnectorHostRuntimeError::ProtocolUpgradeRejected { .. }
+            ),
+            "expected ProtocolUpgradeRejected, got {err:?}"
+        );
+        assert_eq!(
+            runtime.config().protocol_version,
+            ConnectorProtocolVersion::default()
+        );
+        assert_eq!(runtime.state().phase(), ConnectorLifecyclePhase::Running);
+    }
+
+    #[test]
     fn connector_host_runtime_operation_envelope_monotonic_and_versioned() {
         let mut runtime = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
         runtime.start(100).unwrap();
@@ -1515,6 +1550,17 @@ mod tests {
         let v3 = ConnectorProtocolVersion::new(2, 0, 0);
         assert!(v1 < v2);
         assert!(v2 < v3);
+    }
+
+    #[test]
+    fn protocol_version_same_major_upgrade_contract() {
+        let current = ConnectorProtocolVersion::new(1, 1, 3);
+
+        assert!(ConnectorProtocolVersion::new(1, 1, 4).is_same_major_upgrade_from(current));
+        assert!(ConnectorProtocolVersion::new(1, 2, 0).is_same_major_upgrade_from(current));
+        assert!(!ConnectorProtocolVersion::new(1, 1, 3).is_same_major_upgrade_from(current));
+        assert!(!ConnectorProtocolVersion::new(1, 1, 2).is_same_major_upgrade_from(current));
+        assert!(!ConnectorProtocolVersion::new(2, 0, 0).is_same_major_upgrade_from(current));
     }
 
     // ========================================================================
