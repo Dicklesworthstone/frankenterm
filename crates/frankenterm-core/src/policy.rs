@@ -13313,6 +13313,89 @@ mod tests {
     }
 
     #[test]
+    fn mutating_and_destructive_actions_are_always_rate_limited() {
+        // Security drift guard: every mutating OR destructive action MUST be
+        // bounded by the rate-limit gate. An action past authorization that is
+        // unbounded lets an attacker (or a runaway agent) issue it without any
+        // throughput cap. The exhaustive `match` below has NO wildcard arm, so
+        // adding a new `ActionKind` variant fails to compile here — forcing the
+        // author to list it in `all` and consciously decide its gating instead
+        // of silently shipping an unbounded action.
+        let all = [
+            ActionKind::SendText,
+            ActionKind::SendCtrlC,
+            ActionKind::SendCtrlD,
+            ActionKind::SendCtrlZ,
+            ActionKind::SendControl,
+            ActionKind::Spawn,
+            ActionKind::Split,
+            ActionKind::Activate,
+            ActionKind::Close,
+            ActionKind::BrowserAuth,
+            ActionKind::WorkflowRun,
+            ActionKind::ReservePane,
+            ActionKind::ReleasePane,
+            ActionKind::ReadOutput,
+            ActionKind::SearchOutput,
+            ActionKind::WriteFile,
+            ActionKind::DeleteFile,
+            ActionKind::ExecCommand,
+            ActionKind::ConnectorNotify,
+            ActionKind::ConnectorTicket,
+            ActionKind::ConnectorTriggerWorkflow,
+            ActionKind::ConnectorAuditLog,
+            ActionKind::ConnectorInvoke,
+            ActionKind::ConnectorCredentialAction,
+        ];
+        assert_eq!(
+            all.len(),
+            24,
+            "ActionKind variant count drifted — update this guard and reconsider gating"
+        );
+        for a in all {
+            // No `_` arm: a new ActionKind variant breaks compilation here.
+            match a {
+                ActionKind::SendText
+                | ActionKind::SendCtrlC
+                | ActionKind::SendCtrlD
+                | ActionKind::SendCtrlZ
+                | ActionKind::SendControl
+                | ActionKind::Spawn
+                | ActionKind::Split
+                | ActionKind::Activate
+                | ActionKind::Close
+                | ActionKind::BrowserAuth
+                | ActionKind::WorkflowRun
+                | ActionKind::ReservePane
+                | ActionKind::ReleasePane
+                | ActionKind::ReadOutput
+                | ActionKind::SearchOutput
+                | ActionKind::WriteFile
+                | ActionKind::DeleteFile
+                | ActionKind::ExecCommand
+                | ActionKind::ConnectorNotify
+                | ActionKind::ConnectorTicket
+                | ActionKind::ConnectorTriggerWorkflow
+                | ActionKind::ConnectorAuditLog
+                | ActionKind::ConnectorInvoke
+                | ActionKind::ConnectorCredentialAction => {}
+            }
+            if a.is_mutating() {
+                assert!(
+                    a.is_rate_limited(),
+                    "mutating action {a:?} is not rate-limited — it would be unbounded"
+                );
+            }
+            if a.is_destructive() {
+                assert!(
+                    a.is_rate_limited(),
+                    "destructive action {a:?} is not rate-limited — it would be unbounded"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn action_kind_is_destructive() {
         assert!(ActionKind::Close.is_destructive());
         assert!(ActionKind::SendCtrlC.is_destructive());
