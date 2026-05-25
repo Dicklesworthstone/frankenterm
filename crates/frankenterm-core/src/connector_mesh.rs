@@ -592,6 +592,7 @@ impl ConnectorMesh {
             .values()
             .filter(|h| {
                 h.can_accept()
+                    && self.zones.get(&h.zone_id).is_some_and(|zone| zone.active)
                     && request
                         .required_capabilities
                         .iter()
@@ -921,6 +922,32 @@ mod tests {
 
         let decision = mesh.route(&req, 1000).unwrap();
         assert_eq!(decision.host_id, "h1"); // fallback to z1
+    }
+
+    #[test]
+    fn route_ignores_inactive_zones() {
+        let mut mesh = default_mesh();
+        mesh.register_zone(make_zone("active")).unwrap();
+        let mut inactive_zone = make_zone("inactive");
+        inactive_zone.active = false;
+        mesh.register_zone(inactive_zone).unwrap();
+
+        let mut active_host = make_host("h-active", "active");
+        active_host.max_connectors = 1;
+        mesh.register_host(active_host).unwrap();
+
+        let mut inactive_host = make_host("h-inactive", "inactive");
+        inactive_host.max_connectors = 100;
+        mesh.register_host(inactive_host).unwrap();
+
+        let decision = mesh.route(&make_request("c1"), 1000).unwrap();
+        assert_eq!(decision.host_id, "h-active");
+        assert_eq!(mesh.get_host("h-active").unwrap().active_connectors, 1);
+        assert_eq!(mesh.get_host("h-inactive").unwrap().active_connectors, 0);
+
+        let err = mesh.route(&make_request("c2"), 1001).unwrap_err();
+        assert!(matches!(err, ConnectorMeshError::RoutingFailed { .. }));
+        assert_eq!(mesh.get_host("h-inactive").unwrap().active_connectors, 0);
     }
 
     #[test]
