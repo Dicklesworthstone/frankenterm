@@ -513,6 +513,25 @@ proptest! {
         }
     }
 
+    /// Gate/locator agreement: `contains_secrets` (the boolean "safe to
+    /// persist?" gate used by downstream callers) must agree exactly with
+    /// `detect` (the span locator). Both walk `SECRET_PATTERNS`, so for any
+    /// input `contains_secrets(t)` iff `detect(t)` is non-empty. Locking this
+    /// equivalence prevents a future refactor from feeding the two methods
+    /// different pattern sets — which would let `contains_secrets` report
+    /// "clean" on text `detect` still flags as secret-bearing (or vice versa),
+    /// a silent gate/scrubber disagreement.
+    #[test]
+    fn contains_secrets_agrees_with_detect(text in mixed_text()) {
+        let r = Redactor::new();
+        prop_assert_eq!(
+            r.contains_secrets(&text),
+            !r.detect(&text).is_empty(),
+            "contains_secrets disagreed with detect for input {:?}",
+            text
+        );
+    }
+
     /// Dedup invariant (br-ft-hkif4): detect() drops lower-priority
     /// overlapping spans, so no two returned spans may overlap. With
     /// the spans sorted by start, that reduces to `prev.end <=
