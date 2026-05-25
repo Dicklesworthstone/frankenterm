@@ -33,7 +33,11 @@ use crate::policy::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{cell::RefCell, collections::HashMap, fmt};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 /// Current schema version for action plans.
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
@@ -3995,6 +3999,28 @@ fn tx_blocked_commit_report(
     }
 }
 
+fn duplicate_commit_input_step_id(commit_inputs: &[TxCommitStepInput]) -> Option<&str> {
+    let mut seen = HashSet::new();
+    for input in commit_inputs {
+        let step_id = input.step_id.0.as_str();
+        if !seen.insert(step_id) {
+            return Some(step_id);
+        }
+    }
+    None
+}
+
+fn duplicate_compensation_input_step_id(comp_inputs: &[TxCompensationStepInput]) -> Option<&str> {
+    let mut seen = HashSet::new();
+    for input in comp_inputs {
+        let step_id = input.for_step_id.0.as_str();
+        if !seen.insert(step_id) {
+            return Some(step_id);
+        }
+    }
+    None
+}
+
 /// Evaluate prepare phase gates and produce a report.
 pub fn evaluate_prepare_phase(
     _tx_id: &TxId,
@@ -4104,6 +4130,12 @@ pub fn execute_commit_phase(
             None,
             "commit_phase->pause_suspended",
             now_ms,
+        ));
+    }
+
+    if let Some(step_id) = duplicate_commit_input_step_id(commit_inputs) {
+        return Err(format!(
+            "duplicate commit input for tx step {step_id}: replay would be order-dependent"
         ));
     }
 
@@ -4261,6 +4293,12 @@ pub fn execute_compensation_phase(
             completed_at_ms: now_ms,
             receipts: Vec::new(),
         });
+    }
+
+    if let Some(step_id) = duplicate_compensation_input_step_id(comp_inputs) {
+        return Err(format!(
+            "duplicate compensation input for tx step {step_id}: replay would be order-dependent"
+        ));
     }
 
     let mut next_seq = tx_last_receipt_seq(&contract.receipts);
@@ -8741,6 +8779,70 @@ mod tests {
         assert_eq!(report.receipts.len(), 3);
         assert!(receipt_seq(&report.receipts[1]) > receipt_seq(&report.receipts[0]));
         assert!(receipt_seq(&report.receipts[2]) > receipt_seq(&report.receipts[1]));
+    }
+
+    #[test]
+    fn tx_phase_reducers_reject_duplicate_step_inputs() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let mut commit_inputs = sample_commit_inputs(None);
+        commit_inputs.insert(
+            1,
+            TxCommitStepInput {
+                step_id: TxStepId("tx-step:1".to_string()),
+                success: false,
+                reason_code: "conflicting_duplicate".to_string(),
+                error_code: Some("FTX_DUPLICATE".to_string()),
+                completed_at_ms: 10_001,
+            },
+        );
+
+        let commit_err = execute_commit_phase(
+            &contract,
+            &commit_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect_err("duplicate commit input must fail closed");
+        assert!(
+            commit_err.contains("duplicate commit input for tx step tx-step:1"),
+            "unexpected commit error: {commit_err}"
+        );
+
+        let commit_report = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let mut comp_inputs = sample_comp_inputs(None);
+        comp_inputs.insert(
+            0,
+            TxCompensationStepInput {
+                for_step_id: TxStepId("tx-step:2".to_string()),
+                success: false,
+                reason_code: "conflicting_duplicate".to_string(),
+                error_code: Some("FTX_DUPLICATE".to_string()),
+                completed_at_ms: 20_001,
+            },
+        );
+
+        let comp_err = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &comp_inputs,
+            20_500,
+        )
+        .expect_err("duplicate compensation input must fail closed");
+        assert!(
+            comp_err.contains("duplicate compensation input for tx step tx-step:2"),
+            "unexpected compensation error: {comp_err}"
+        );
     }
 
     #[test]
