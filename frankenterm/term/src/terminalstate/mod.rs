@@ -110,7 +110,8 @@ impl TabStop {
     }
 
     fn find_next_tab_stop(&self, col: usize) -> Option<usize> {
-        for i in col + 1..self.tabs.len() {
+        let start = col.saturating_add(1).min(self.tabs.len());
+        for i in start..self.tabs.len() {
             if self.tabs[i] {
                 return Some(i);
             }
@@ -3281,6 +3282,12 @@ mod tests {
         let ts = TabStop::new(80, 8);
         // Last tab stop is at 72 (8*9)
         assert_eq!(ts.find_next_tab_stop(72), None);
+    }
+
+    #[test]
+    fn tabstop_find_next_extreme_column_returns_none() {
+        let ts = TabStop::new(80, 8);
+        assert_eq!(ts.find_next_tab_stop(usize::MAX), None);
     }
 
     #[test]
