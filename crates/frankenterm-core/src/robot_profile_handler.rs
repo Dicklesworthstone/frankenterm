@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
-use crate::agent_profiles::{AgentProfile, ProfileValidationError};
+use crate::agent_profiles::{
+    AgentProfile, ENV_KEY_MAX_LEN, ENV_MAX_COUNT, ENV_VALUE_MAX_LEN, ProfileValidationError,
+};
 use crate::fleet_mutation::{
     FleetMutationAction, FleetMutationExecutionError, FleetMutationExecutor, FleetMutationLedger,
     FleetMutationPlan, FleetMutationPlanError, FleetMutationPolicyDecision, FleetMutationReceipt,
@@ -712,14 +714,45 @@ fn parse_env_overrides(params: &Value) -> Result<HashMap<String, String>, Profil
     let object = value.as_object().ok_or_else(|| {
         ProfileHandlerError::BadParams("`env_overrides` must be an object".to_string())
     })?;
+    if object.len() > ENV_MAX_COUNT {
+        return Err(ProfileHandlerError::BadParams(format!(
+            "`env_overrides` has {} entries; maximum is {ENV_MAX_COUNT}",
+            object.len()
+        )));
+    }
     let mut env = HashMap::with_capacity(object.len());
     for (key, value) in object {
+        if key.len() > ENV_KEY_MAX_LEN {
+            return Err(ProfileHandlerError::BadParams(format!(
+                "`env_overrides.{}` key is too long: {} bytes; maximum is {ENV_KEY_MAX_LEN}",
+                env_override_key_preview(key),
+                key.len()
+            )));
+        }
         let value = value.as_str().ok_or_else(|| {
-            ProfileHandlerError::BadParams(format!("`env_overrides.{key}` must be a string value"))
+            ProfileHandlerError::BadParams(format!(
+                "`env_overrides.{}` must be a string value",
+                env_override_key_preview(key)
+            ))
         })?;
+        if value.len() > ENV_VALUE_MAX_LEN {
+            return Err(ProfileHandlerError::BadParams(format!(
+                "`env_overrides.{}` value is too long: {} bytes; maximum is {ENV_VALUE_MAX_LEN}",
+                env_override_key_preview(key),
+                value.len()
+            )));
+        }
         env.insert(key.clone(), value.to_string());
     }
     Ok(env)
+}
+
+fn env_override_key_preview(key: &str) -> String {
+    let mut preview: String = key.chars().take(32).collect();
+    if key.chars().nth(32).is_some() {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn profile_apply_spawn_specs<S: BuildHasher>(
@@ -1449,6 +1482,59 @@ mod tests {
 
         assert_eq!(err.error_code(), "robot.profile.bad_params");
         assert!(err.to_string().contains("`dry_run` must be a boolean"));
+        assert!(executor.spawned.is_empty());
+    }
+
+    #[test]
+    fn live_apply_rejects_too_many_env_overrides_before_spawn() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+        let mut env_overrides = serde_json::Map::new();
+        for index in 0..=ENV_MAX_COUNT {
+            env_overrides.insert(format!("KEY_{index}"), json!("value"));
+        }
+        let mut params = json!({ "name": "ready", "dry_run": false });
+        params["env_overrides"] = Value::Object(env_overrides);
+
+        let err =
+            handle_profile_apply_with_executor(&params, &conn, &mut executor, 1_700_000_000_000)
+                .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.bad_params");
+        assert!(
+            err.to_string()
+                .contains(&format!("maximum is {ENV_MAX_COUNT}"))
+        );
+        assert!(executor.spawned.is_empty());
+    }
+
+    #[test]
+    fn live_apply_rejects_oversized_env_override_value_before_spawn() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+
+        let err = handle_profile_apply_with_executor(
+            &json!({
+                "name": "ready",
+                "dry_run": false,
+                "env_overrides": {
+                    "LARGE_VALUE": "x".repeat(ENV_VALUE_MAX_LEN + 1)
+                }
+            }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.bad_params");
+        assert!(err.to_string().contains("value is too long"));
+        assert!(
+            err.to_string()
+                .contains(&format!("maximum is {ENV_VALUE_MAX_LEN}"))
+        );
         assert!(executor.spawned.is_empty());
     }
 
