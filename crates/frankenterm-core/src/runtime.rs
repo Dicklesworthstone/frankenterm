@@ -4174,10 +4174,20 @@ fn classify_backpressure_tier(
         write_depth as f64 / write_capacity as f64
     };
 
-    // Match BackpressureManager::classify saturation semantics.
-    let capture_saturated =
-        capture_capacity > 0 && capture_depth >= capture_capacity.saturating_sub(5);
-    let write_saturated = write_capacity > 0 && write_depth >= write_capacity.saturating_sub(100);
+    // Match BackpressureManager::classify saturation semantics. The absolute
+    // "within N slots of full" guard is only meaningful once the queue is
+    // already highly filled; otherwise tiny capacities trip `saturating_sub`
+    // (e.g. write_capacity=1 → saturating_sub(100)=0 → write_depth>=0 is always
+    // true) and classify an EMPTY queue as BLACK. Require a high fill ratio
+    // before the absolute margin can escalate to BLACK — this mirrors the
+    // resource-types manager's ft-5 fix that the runtime copy had missed
+    // (regression: classify_backpressure_tier_matches_manager_semantics).
+    let capture_saturated = capture_capacity > 0
+        && (capture_ratio >= 0.995
+            || (capture_ratio >= 0.95 && capture_depth >= capture_capacity.saturating_sub(5)));
+    let write_saturated = write_capacity > 0
+        && (write_ratio >= 0.995
+            || (write_ratio >= 0.95 && write_depth >= write_capacity.saturating_sub(100)));
 
     let tier = if capture_saturated || write_saturated {
         "BLACK"
