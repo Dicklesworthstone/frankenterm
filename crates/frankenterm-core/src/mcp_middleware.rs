@@ -310,7 +310,26 @@ fn classify_audited_tool_result(
 ) -> (bool, Option<String>) {
     if tool_name.starts_with("remote/") {
         return match result {
-            Ok(_) => (true, None),
+            Ok(contents) => {
+                let parsed: Option<serde_json::Value> = contents.first().and_then(|c| match c {
+                    Content::Text { text } => serde_json::from_str::<serde_json::Value>(text).ok(),
+                    _ => None,
+                });
+                match parsed
+                    .as_ref()
+                    .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
+                {
+                    Some(false) => {
+                        let code = parsed.and_then(|v| {
+                            v.get("error_code")
+                                .and_then(|c| c.as_str())
+                                .map(String::from)
+                        });
+                        (false, code)
+                    }
+                    _ => (true, None),
+                }
+            }
             Err(_) => (false, Some("MCP_INTERNAL".to_string())),
         };
     }
@@ -795,6 +814,19 @@ mod tests {
         assert_eq!(
             classify_audited_tool_result("remote/mock/echo", &result),
             (true, None)
+        );
+    }
+
+    #[test]
+    fn classify_audited_remote_proxy_tool_decodes_ft_error_envelope() {
+        let result = Ok(ok_text(serde_json::json!({
+            "ok": false,
+            "error_code": "robot.policy_denied",
+            "error": "denied"
+        })));
+        assert_eq!(
+            classify_audited_tool_result("remote/mock/search", &result),
+            (false, Some("robot.policy_denied".to_string()))
         );
     }
 
