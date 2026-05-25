@@ -18,11 +18,16 @@ pub(super) enum McpOutputFormat {
     Toon,
 }
 
+pub(super) const MCP_OUTPUT_FORMAT_MAX_BYTES: usize = 16;
+
 pub(super) fn parse_mcp_output_format(raw: &str) -> Option<McpOutputFormat> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "json" => Some(McpOutputFormat::Json),
-        "toon" => Some(McpOutputFormat::Toon),
-        _ => None,
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("json") {
+        Some(McpOutputFormat::Json)
+    } else if trimmed.eq_ignore_ascii_case("toon") {
+        Some(McpOutputFormat::Toon)
+    } else {
+        None
     }
 }
 
@@ -41,8 +46,15 @@ pub(super) fn extract_mcp_output_format(
         return Err("Invalid format: expected string 'json' or 'toon'".to_string());
     };
 
+    let raw_len = raw_format.len();
+    if raw_len > MCP_OUTPUT_FORMAT_MAX_BYTES {
+        return Err(format!(
+            "Invalid format: value is {raw_len} bytes; max allowed is {MCP_OUTPUT_FORMAT_MAX_BYTES}"
+        ));
+    }
+
     parse_mcp_output_format(raw_format)
-        .ok_or_else(|| format!("Invalid format '{raw_format}': expected one of ['json', 'toon']"))
+        .ok_or_else(|| "Invalid format: expected one of ['json', 'toon']".to_string())
 }
 
 pub(super) fn augment_tool_schema_with_format(input_schema: &mut serde_json::Value) {
@@ -66,6 +78,7 @@ pub(super) fn augment_tool_schema_with_format(input_schema: &mut serde_json::Val
             serde_json::json!({
                 "type": "string",
                 "enum": ["json", "toon"],
+                "maxLength": MCP_OUTPUT_FORMAT_MAX_BYTES,
                 "description": "Optional output format override for this call"
             })
         });
@@ -298,9 +311,9 @@ fn classify_audited_tool_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditedToolHandler, McpOutputFormat, augment_tool_schema_with_format,
-        classify_audited_tool_result, classify_tool_result, encode_mcp_contents,
-        extract_mcp_output_format, parse_mcp_output_format,
+        AuditedToolHandler, MCP_OUTPUT_FORMAT_MAX_BYTES, McpOutputFormat,
+        augment_tool_schema_with_format, classify_audited_tool_result, classify_tool_result,
+        encode_mcp_contents, extract_mcp_output_format, parse_mcp_output_format,
     };
     use crate::mcp_framework::{
         FrameworkContent as Content, FrameworkMcpContext as McpContext,
@@ -397,7 +410,22 @@ mod tests {
         let mut args = serde_json::json!({"format": "xml"});
         let result = extract_mcp_output_format(&mut args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("xml"));
+        let err = result.unwrap_err();
+        assert!(err.contains("expected one of"));
+        assert!(!err.contains("xml"));
+    }
+
+    #[test]
+    fn extract_format_oversized_string_returns_bounded_redacted_error() {
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
+        let oversized = format!("{secret}{}", "x".repeat(MCP_OUTPUT_FORMAT_MAX_BYTES + 1));
+        let mut args = serde_json::json!({"format": oversized});
+
+        let err = extract_mcp_output_format(&mut args).unwrap_err();
+
+        assert!(err.contains("max allowed"));
+        assert!(!err.contains(secret));
+        assert!(args.get("format").is_none());
     }
 
     #[test]
@@ -442,6 +470,10 @@ mod tests {
             .get("format")
             .expect("format property should exist");
         assert_eq!(format_prop.get("type").unwrap().as_str(), Some("string"));
+        assert_eq!(
+            format_prop.get("maxLength").unwrap().as_u64(),
+            Some(MCP_OUTPUT_FORMAT_MAX_BYTES as u64)
+        );
         let enum_values = format_prop.get("enum").unwrap().as_array().unwrap();
         assert!(enum_values.contains(&serde_json::json!("json")));
         assert!(enum_values.contains(&serde_json::json!("toon")));
