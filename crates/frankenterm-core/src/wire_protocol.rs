@@ -852,6 +852,15 @@ pub fn validate_sender_identity_with_limits(
     Ok(())
 }
 
+fn validate_pane_meta(pane: &PaneMeta, label: &str) -> Result<(), WireProtocolError> {
+    if pane.domain.trim().is_empty() {
+        return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+            format!("{label} domain must not be empty"),
+        )));
+    }
+    Ok(())
+}
+
 fn validate_envelope_protocol_with_limits(
     envelope: &WireEnvelope,
     limits: WireProtocolLimits,
@@ -877,6 +886,9 @@ fn validate_envelope_protocol_with_limits(
         });
     }
     validate_sender_identity_with_limits(&envelope.sender, limits)?;
+    if let WirePayload::PaneMeta(pane) = &envelope.payload {
+        validate_pane_meta(pane, "PaneMeta")?;
+    }
     if let WirePayload::PaneDelta(delta) = &envelope.payload {
         if delta.content_len != delta.content.len() {
             return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
@@ -912,6 +924,7 @@ fn validate_envelope_protocol_with_limits(
         let mut route_keys = std::collections::HashSet::with_capacity(panes_meta.panes.len());
         let mut pane_uuids = std::collections::HashSet::with_capacity(panes_meta.panes.len());
         for pane in &panes_meta.panes {
+            validate_pane_meta(pane, "PanesMeta pane")?;
             let route_key = (pane.domain.as_str(), pane.pane_id);
             if !route_keys.insert(route_key) {
                 return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
@@ -2106,6 +2119,36 @@ mod tests {
         assert_eq!(agg.total_rejected(), 5);
         assert_eq!(agg.total_accepted(), 0);
         assert_eq!(agg.agent_count(), 0);
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_rejects_blank_pane_meta_domains() {
+        let standalone = {
+            let mut pane = sample_pane_meta();
+            pane.domain.clear();
+            WirePayload::PaneMeta(pane)
+        };
+        let snapshot = {
+            let mut pane = sample_pane_meta();
+            pane.domain = " \t ".to_string();
+            WirePayload::PanesMeta(PanesMeta {
+                panes: vec![pane],
+                timestamp_ms: 1_700_000_004_003,
+            })
+        };
+
+        for (label, payload) in [("standalone", standalone), ("snapshot", snapshot)] {
+            let mut agg = Aggregator::new(10);
+            let envelope = WireEnvelope::new(1, "agent-valid", payload);
+
+            let Err(err) = agg.ingest_envelope(envelope) else {
+                panic!("decoded {label} pane metadata must reject blank domains");
+            };
+            assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+            assert_eq!(agg.total_rejected(), 1);
+            assert_eq!(agg.total_accepted(), 0);
+            assert_eq!(agg.agent_count(), 0);
+        }
     }
 
     #[test]
