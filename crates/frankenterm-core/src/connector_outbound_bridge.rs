@@ -611,6 +611,10 @@ impl OutboundDeduplicator {
     /// If new, records it and returns `true`.
     /// If duplicate, returns `false`.
     pub fn check_and_record(&mut self, correlation_id: &str, now_ms: u64) -> bool {
+        if correlation_id.trim().is_empty() {
+            return true;
+        }
+
         // [ft-zu8g3] Zero-capacity short-circuit. Without this guard,
         // the `len >= 0` check below evaluates as always-true and the
         // cache degrades to a 1-slot replacer (pop_front on empty is
@@ -1568,6 +1572,16 @@ mod tests {
     }
 
     #[test]
+    fn connector_outbound_bridge_dedup_ignores_blank_correlation_id() {
+        let mut dedup = OutboundDeduplicator::new(100, Duration::from_secs(300));
+
+        assert!(dedup.check_and_record("   ", 1000));
+        assert!(dedup.check_and_record("   ", 1500));
+        assert_eq!(dedup.len(), 0);
+        assert!(dedup.is_empty());
+    }
+
+    #[test]
     fn connector_outbound_bridge_dedup_ttl_expiry() {
         let mut dedup = OutboundDeduplicator::new(100, Duration::from_secs(10));
         assert!(dedup.check_and_record("abc", 1000));
@@ -1856,6 +1870,31 @@ mod tests {
         assert!(!r1.deduplicated);
         let r2 = bridge.process_event(&event).unwrap();
         assert!(!r2.deduplicated);
+        assert_eq!(bridge.pending_action_count(), 2);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_no_dedup_with_blank_correlation_id() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom).with_correlation_id("   ");
+
+        let r1 = bridge.process_event(&event).unwrap();
+        let r2 = bridge.process_event(&event).unwrap();
+
+        assert!(!r1.deduplicated);
+        assert!(!r2.deduplicated);
+        assert_eq!(r1.actions_dispatched.len(), 1);
+        assert_eq!(r2.actions_dispatched.len(), 1);
+        assert_eq!(bridge.telemetry().events_deduplicated, 0);
         assert_eq!(bridge.pending_action_count(), 2);
     }
 
