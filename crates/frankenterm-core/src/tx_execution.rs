@@ -961,37 +961,38 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         )?;
 
         // Phase 3: Compensate (if needed)
-        let compensation_report = if commit_report.has_failures() && self.config.auto_compensate {
-            contract.lifecycle_state = MissionTxState::Compensating;
-            ledger
-                .transition_phase(TxPhase::Compensating)
-                .map_err(|e| TxExecutionError::PhaseTransition(e.to_string()))?;
+        let compensation_report =
+            if Self::should_run_compensation(&commit_report, self.config.auto_compensate) {
+                contract.lifecycle_state = MissionTxState::Compensating;
+                ledger
+                    .transition_phase(TxPhase::Compensating)
+                    .map_err(|e| TxExecutionError::PhaseTransition(e.to_string()))?;
 
-            let comp = self.run_compensation_phase(
-                contract,
-                &commit_report,
-                &execution_id,
-                &mut events,
-                &mut decision_path,
-                now_ms,
-            )?;
+                let comp = self.run_compensation_phase(
+                    contract,
+                    &commit_report,
+                    &execution_id,
+                    &mut events,
+                    &mut decision_path,
+                    now_ms,
+                )?;
 
-            let comp_state = comp.outcome.target_tx_state();
-            contract.lifecycle_state = comp_state;
+                let comp_state = comp.outcome.target_tx_state();
+                contract.lifecycle_state = comp_state;
 
-            self.record_compensation_results_to_ledger(
-                contract,
-                &comp,
-                &execution_id,
-                &mut ledger,
-                &mut events,
-                now_ms,
-            )?;
+                self.record_compensation_results_to_ledger(
+                    contract,
+                    &comp,
+                    &execution_id,
+                    &mut ledger,
+                    &mut events,
+                    now_ms,
+                )?;
 
-            Some(comp)
-        } else {
-            None
-        };
+                Some(comp)
+            } else {
+                None
+            };
 
         // Determine final outcome
         let (final_state, outcome) = Self::determine_final_outcome(
@@ -1454,6 +1455,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         (current_state, TxOutcome::Failed)
     }
 
+    fn should_run_compensation(commit_report: &TxCommitReport, auto_compensate: bool) -> bool {
+        auto_compensate
+            && commit_report.has_failures()
+            && !matches!(commit_report.outcome, TxCommitOutcome::KillSwitchBlocked)
+    }
+
     fn make_event(
         &self,
         kind: TxEventKind,
@@ -1781,7 +1788,7 @@ mod tests {
             _fail_for_step: Option<&str>,
             _now_ms: i64,
         ) -> Vec<TxCompensationStepInput> {
-            Vec::new()
+            panic!("compensation executor must not dispatch under kill switch or pause")
         }
     }
 
@@ -1919,6 +1926,9 @@ mod tests {
         );
         assert_eq!(safe_mode_commit.committed_count, 0);
         assert_eq!(safe_mode_commit.skipped_count, 2);
+        assert!(safe_mode.compensation_report.is_none());
+        assert_eq!(safe_mode.final_state, MissionTxState::Failed);
+        assert_eq!(safe_mode.outcome, TxOutcome::Failed);
 
         let mut paused_contract = make_test_contract(2);
         let paused_engine = TxExecutionEngine::new(
@@ -1936,6 +1946,9 @@ mod tests {
         );
         assert_eq!(paused_commit.committed_count, 0);
         assert_eq!(paused_commit.skipped_count, 2);
+        assert!(paused.compensation_report.is_none());
+        assert_eq!(paused.final_state, MissionTxState::Committing);
+        assert_eq!(paused.outcome, TxOutcome::Pending);
     }
 
     #[test]
