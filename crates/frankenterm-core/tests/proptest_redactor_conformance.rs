@@ -230,6 +230,61 @@ fn each_known_format_detect_reports_a_span() {
     }
 }
 
+/// Maximal contiguous `[A-Za-z0-9]` runs of at least `min_len` chars. These
+/// runs are the high-entropy *body* of a credential; structural delimiters
+/// (`-----BEGIN ...`, `postgresql://`, `=`, `-`, whitespace) are intentionally
+/// excluded so PEM/URL markers never produce a false positive.
+fn alnum_body_runs(s: &str, min_len: usize) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_alnum = b.is_ascii_alphanumeric();
+        match (is_alnum, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s0)) => {
+                if i - s0 >= min_len {
+                    runs.push(&s[s0..i]);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s0) = start {
+        if bytes.len() - s0 >= min_len {
+            runs.push(&s[s0..]);
+        }
+    }
+    runs
+}
+
+/// Stronger than `each_known_format_redacts_to_marker`, which only checks the
+/// *whole* sample is absent. A reluctant-body catalog regex (`[\s\S]+?`) or a
+/// prefix-only matcher can under-match and leave a trailing run of secret bytes
+/// — a partial-credential disclosure that the full-string and contains_secrets
+/// checks both miss (contains_secrets only re-runs the catalog, which a leaked
+/// fragment no longer trips). Assert no maximal 12+ char alphanumeric run of any
+/// catalog sample's body survives redaction, with the secret framed by neutral
+/// padding so the assertion can only fire on a genuine leak. (Mirrors the ARS
+/// findings_never_leak_partial_secret guard for the redactor's read path.)
+#[test]
+fn each_known_format_no_partial_body_leak() {
+    let r = Redactor::new();
+    const MIN_RUN: usize = 12;
+    for (name, sample) in ALL_KNOWN_FORMATS {
+        let envelope = format!("LEFTPAD_SENTINEL {sample} RIGHTPAD_SENTINEL");
+        let out = r.redact(&envelope);
+        for run in alnum_body_runs(sample, MIN_RUN) {
+            assert!(
+                !out.contains(run),
+                "catalog format `{name}` leaked secret-body run {run:?} \
+                 through redact: out={out:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn every_catalog_pattern_has_smoke_coverage() {
     // Drift guard: every live pattern in `secret_pattern_names()`
