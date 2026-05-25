@@ -587,7 +587,7 @@ impl TerminfoRenderer {
         let screen_cols = cols.max(1);
 
         for grapheme in Graphemes::new(text) {
-            if cursor_x == screen_cols {
+            if cursor_x >= screen_cols {
                 cursor_y = cursor_y.saturating_add(1);
                 cursor_x = 0;
             }
@@ -604,8 +604,12 @@ impl TerminfoRenderer {
                     cursor_x = 0;
                 }
                 _ => {
-                    cursor_x =
-                        cursor_x.saturating_add(crate::cell::unicode_column_width(grapheme, None));
+                    let len = crate::cell::unicode_column_width(grapheme, None);
+                    if cursor_x > 0 && cursor_x.saturating_add(len) > screen_cols {
+                        cursor_y = cursor_y.saturating_add(1);
+                        cursor_x = 0;
+                    }
+                    cursor_x = cursor_x.saturating_add(len).min(screen_cols);
                 }
             }
         }
@@ -1834,6 +1838,22 @@ mod test {
         );
 
         assert_eq!(renderer.cursor_position, Some((1, 2)));
+    }
+
+    #[test]
+    fn update_cursor_position_for_text_wraps_wide_grapheme_before_overflow() {
+        let mut renderer = TerminfoRenderer::new(xterm_terminfo());
+
+        renderer.update_cursor_position_for_text("abc表x", 4);
+        assert_eq!(renderer.cursor_position, Some((3, 1)));
+    }
+
+    #[test]
+    fn update_cursor_position_for_text_clamps_overwide_grapheme() {
+        let mut renderer = TerminfoRenderer::new(xterm_terminfo());
+
+        renderer.update_cursor_position_for_text("表a", 1);
+        assert_eq!(renderer.cursor_position, Some((1, 1)));
     }
 
     #[test]
