@@ -9,14 +9,14 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::plan::ActionPlan;
 use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
-use frankenterm_core::storage::{PaneRecord, StorageHandle, now_ms};
+use frankenterm_core::storage::{ExportQuery, PaneRecord, StorageHandle, now_ms};
 use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
 use frankenterm_core::workflows::{
     BoxFuture, CxPolicyInjector, PaneWorkflowLockManager, StepResult, WaitCondition, Workflow,
@@ -122,6 +122,7 @@ struct ScriptedWorkflow {
     invalid_plan: bool,
     attempts: Arc<AtomicUsize>,
     cleanups: Arc<AtomicUsize>,
+    context_observations: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl ScriptedWorkflow {
@@ -134,6 +135,7 @@ impl ScriptedWorkflow {
             invalid_plan: false,
             attempts: Arc::new(AtomicUsize::new(0)),
             cleanups: Arc::new(AtomicUsize::new(0)),
+            context_observations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -150,6 +152,13 @@ impl ScriptedWorkflow {
     fn with_invalid_plan(mut self) -> Self {
         self.invalid_plan = true;
         self
+    }
+
+    fn context_observations(&self) -> Vec<serde_json::Value> {
+        self.context_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -175,13 +184,29 @@ impl Workflow for ScriptedWorkflow {
 
     fn execute_step(
         &self,
-        _ctx: &mut WorkflowContext,
+        ctx: &mut WorkflowContext,
         step_idx: usize,
     ) -> BoxFuture<'_, StepResult> {
         let attempts = Arc::clone(&self.attempts);
         let results = Arc::clone(&self.results);
+        let context_observations = Arc::clone(&self.context_observations);
+        let observation = serde_json::json!({
+            "pane_id": ctx.pane_id(),
+            "execution_id": ctx.execution_id(),
+            "has_injector": ctx.has_injector(),
+            "trigger": ctx.trigger().cloned(),
+            "pane_meta": {
+                "domain": ctx.pane_meta().domain.clone(),
+                "title": ctx.pane_meta().title.clone(),
+                "cwd": ctx.pane_meta().cwd.clone(),
+            },
+        });
         Box::pin(async move {
             attempts.fetch_add(1, Ordering::SeqCst);
+            context_observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(observation);
             results
                 .get(step_idx)
                 .or_else(|| results.last())
@@ -365,6 +390,164 @@ fn workflow_runner_claim_handshake_conformance() {
         );
         assert_pane_unlocked(&lock_manager, "start_concurrency_limit");
         assert_eq!(lock_manager.active_count(), 1);
+    });
+}
+
+#[test]
+fn workflow_runner_trigger_policy_refusal_is_fail_closed_conformance() {
+    let fixture = RuntimeFixture::current_thread();
+    fixture.block_on(async {
+        let (runner, storage, lock_manager) = build_runner(
+            "trigger_policy_refusal",
+            WorkflowRunnerConfig::default(),
+            true,
+        )
+        .await;
+        let workflow = Arc::new(
+            ScriptedWorkflow::new(
+                "high_trust_release_workflow",
+                vec![StepResult::done_empty()],
+            )
+            .with_trigger_policy(WorkflowTriggerPolicy::allowlist([OTHER_PANE_ID])),
+        );
+        runner.register_workflow(Arc::clone(&workflow) as Arc<dyn Workflow>);
+
+        let before_health = lock_manager.health();
+        let start = runner
+            .handle_detection(PANE_ID, &detection(RULE_ID), None)
+            .await;
+
+        assert!(
+            matches!(
+                start,
+                WorkflowStartResult::SourcePaneNotTrusted {
+                    source_pane_id: PANE_ID,
+                    ref workflow_name,
+                    ref rule_id,
+                } if workflow_name == "high_trust_release_workflow" && rule_id == RULE_ID
+            ),
+            "low-trust source pane must not fire a high-trust allowlisted workflow: {start:?}"
+        );
+        assert!(
+            start.is_source_pane_not_trusted(),
+            "refused trigger should expose the source-pane trust predicate"
+        );
+        assert_pane_unlocked(&lock_manager, "trigger_policy_refusal_source");
+        assert!(
+            lock_manager.is_locked(OTHER_PANE_ID).is_none(),
+            "refused trigger must not lock the trusted/high-trust pane"
+        );
+        let after_health = lock_manager.health();
+        assert_eq!(
+            before_health.acquisitions_total, after_health.acquisitions_total,
+            "source-pane refusal must happen before lock acquisition"
+        );
+        assert_eq!(
+            workflow.attempts.load(Ordering::SeqCst),
+            0,
+            "refused trigger must not execute workflow steps"
+        );
+        assert!(
+            workflow.context_observations().is_empty(),
+            "refused trigger must not construct or expose WorkflowContext"
+        );
+        assert!(
+            storage
+                .find_incomplete_workflows()
+                .await
+                .unwrap()
+                .is_empty(),
+            "refused trigger must not persist a resumable execution"
+        );
+        assert!(
+            storage
+                .export_workflows(ExportQuery::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "refused trigger must not persist any workflow execution row"
+        );
+    });
+}
+
+#[test]
+fn workflow_runner_allowed_trigger_carries_context_and_releases_lock_conformance() {
+    let fixture = RuntimeFixture::current_thread();
+    fixture.block_on(async {
+        let (runner, storage, lock_manager) = build_runner(
+            "allowed_trigger_context",
+            WorkflowRunnerConfig::default(),
+            true,
+        )
+        .await;
+        let workflow = Arc::new(
+            ScriptedWorkflow::new(
+                "allowed_source_context",
+                vec![StepResult::done(serde_json::json!({"accepted": true}))],
+            )
+            .with_trigger_policy(WorkflowTriggerPolicy::allowlist([PANE_ID])),
+        );
+        let (execution_id, start) = start_workflow(&runner, Arc::clone(&workflow)).await;
+        assert!(
+            start.is_started(),
+            "allowlisted source pane should start workflow: {start:?}"
+        );
+
+        let persisted = storage
+            .get_workflow(&execution_id)
+            .await
+            .expect("query persisted workflow")
+            .expect("started workflow should be persisted");
+        let persisted_context = persisted
+            .context
+            .as_ref()
+            .expect("started workflow should persist trigger context");
+        assert_eq!(persisted_context["source_pane_id"], PANE_ID);
+        assert_eq!(persisted_context["rule_id"], RULE_ID);
+        assert_eq!(persisted_context["detection"]["rule_id"], RULE_ID);
+        assert_eq!(
+            persisted_context["matched_text"],
+            "workflow runner lock conformance"
+        );
+        assert!(
+            lock_manager.is_locked(PANE_ID).is_some(),
+            "started workflow should hold lock until run_workflow handoff"
+        );
+
+        let result = runner
+            .run_workflow(PANE_ID, workflow.clone(), &execution_id, 0)
+            .await;
+        assert!(
+            matches!(result, WorkflowExecutionResult::Completed { .. }),
+            "allowlisted workflow should complete: {result:?}"
+        );
+        assert_pane_unlocked(&lock_manager, "allowed_trigger_context");
+
+        let observations = workflow.context_observations();
+        assert_eq!(
+            observations.len(),
+            1,
+            "workflow should observe exactly one execution context"
+        );
+        let observed = &observations[0];
+        assert_eq!(observed["pane_id"], PANE_ID);
+        assert_eq!(observed["execution_id"], execution_id);
+        assert_eq!(observed["has_injector"], true);
+        assert_eq!(observed["trigger"]["source_pane_id"], PANE_ID);
+        assert_eq!(observed["trigger"]["rule_id"], RULE_ID);
+        assert_eq!(
+            observed["trigger"]["detection"]["matched_text"],
+            "workflow runner lock conformance"
+        );
+        assert_eq!(observed["pane_meta"]["domain"], "local");
+        assert_eq!(
+            observed["pane_meta"]["title"],
+            format!("workflow-lock-conformance-{PANE_ID}")
+        );
+        assert_eq!(
+            observed["pane_meta"]["cwd"],
+            "/tmp/frankenterm-workflow-lock-conformance"
+        );
     });
 }
 
