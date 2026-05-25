@@ -1136,6 +1136,18 @@ fn plan_candidate_step(
     if proof_blocked {
         push_unique(&mut reason_codes, "rch.proof_substrate_blocked");
     }
+    match candidate.capacity_posture {
+        MissionObjectiveCapacityPosture::Admit => {}
+        MissionObjectiveCapacityPosture::Defer => {
+            push_unique(&mut reason_codes, "capacity.defer");
+        }
+        MissionObjectiveCapacityPosture::Pause => {
+            push_unique(&mut reason_codes, "capacity.pause");
+        }
+        MissionObjectiveCapacityPosture::Unknown => {
+            push_unique(&mut reason_codes, "capacity.unknown");
+        }
+    }
 
     let status = candidate_status(
         candidate,
@@ -1762,11 +1774,15 @@ fn capacity_admission_artifact(
     plan: &MissionObjectivePlan,
     steps: &[MissionObjectivePlanStep],
 ) -> MissionObjectiveCapacityAdmissionArtifact {
+    let has_actionable_step = steps
+        .iter()
+        .any(|step| step.status == MissionObjectivePlanStatus::Actionable);
     let action = match plan.plan_status {
         MissionObjectivePlanStatus::Actionable
         | MissionObjectivePlanStatus::PlanningOnly
-        | MissionObjectivePlanStatus::NoReadyWork
-        | MissionObjectivePlanStatus::Degraded => "admit",
+        | MissionObjectivePlanStatus::NoReadyWork => "admit",
+        MissionObjectivePlanStatus::Degraded if has_actionable_step => "admit",
+        MissionObjectivePlanStatus::Degraded => "defer",
         MissionObjectivePlanStatus::WaitingOwner
         | MissionObjectivePlanStatus::WaitingExternal
         | MissionObjectivePlanStatus::DirtyOverlap
@@ -2254,6 +2270,36 @@ mod tests {
         let step = &plan.plan_steps[0];
         assert_eq!(step.action_kind, MissionObjectiveActionKind::WaitExternal);
         assert_eq!(step.risk_level, MissionObjectiveRiskLevel::High);
+    }
+
+    #[test]
+    fn capacity_unknown_defers_admission_artifact_instead_of_admitting() {
+        let plan = plan_mission_objective(
+            &input_with_sources().with_candidate(
+                MissionObjectiveCandidateWork::new(
+                    "capacity-unknown",
+                    MissionObjectiveCandidateReadiness::ReadyBead,
+                )
+                .target_bead_id("ft-capacity")
+                .capacity_posture(MissionObjectiveCapacityPosture::Unknown),
+            ),
+        );
+
+        assert_eq!(plan.plan_status, MissionObjectivePlanStatus::Degraded);
+        let step = &plan.plan_steps[0];
+        assert_eq!(step.status, MissionObjectivePlanStatus::Degraded);
+        assert_eq!(step.action_kind, MissionObjectiveActionKind::PlanningOnly);
+        assert!(
+            plan.reason_codes
+                .iter()
+                .any(|code| code == "capacity.unknown")
+        );
+
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            value["capacity_admission"]["action"],
+            serde_json::json!("defer")
+        );
     }
 
     #[test]

@@ -1712,8 +1712,8 @@ impl std::error::Error for TxExecutionError {}
 mod tests {
     use super::*;
     use crate::plan::{
-        MissionActorRole, MissionTxContract, MissionTxState, StepAction, TxId, TxIntent, TxOutcome,
-        TxPlan as ContractTxPlan, TxPlanId, TxStep, TxStepId,
+        MissionActorRole, MissionTxContract, MissionTxState, StepAction, TxCompensation, TxId,
+        TxIntent, TxOutcome, TxPlan as ContractTxPlan, TxPlanId, TxStep, TxStepId,
     };
     use crate::tx_idempotency::{IdempotencyPolicy, IdempotencyStore, StepOutcome};
     use crate::tx_plan_compiler::StepRisk;
@@ -1978,6 +1978,85 @@ mod tests {
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
         let err = engine.execute(&mut contract, 5000).unwrap_err();
         assert!(matches!(err, TxExecutionError::InvalidContract(_)));
+    }
+
+    #[test]
+    fn execute_rejects_ambiguous_tx_contract_topology() {
+        fn invalid_contract_message(err: TxExecutionError) -> String {
+            match err {
+                TxExecutionError::InvalidContract(message) => message,
+                other => panic!("expected invalid contract, got {other:?}"),
+            }
+        }
+
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+
+        let mut duplicate_step_id = make_test_contract(2);
+        duplicate_step_id.plan.steps[1].step_id = duplicate_step_id.plan.steps[0].step_id.clone();
+        let err = engine.execute(&mut duplicate_step_id, 5000).unwrap_err();
+        assert!(
+            invalid_contract_message(err).contains("duplicate step_id step-0"),
+            "duplicate step ids must fail before commit dispatch"
+        );
+
+        let mut duplicate_ordinal = make_test_contract(2);
+        duplicate_ordinal.plan.steps[1].ordinal = duplicate_ordinal.plan.steps[0].ordinal;
+        assert!(
+            duplicate_ordinal
+                .validate()
+                .unwrap_err()
+                .contains("duplicate step ordinal 0"),
+            "duplicate ordinals make replay order ambiguous"
+        );
+
+        let mut mismatched_tx = make_test_contract(1);
+        mismatched_tx.plan.tx_id = TxId("tx-other".to_string());
+        assert!(
+            mismatched_tx
+                .validate()
+                .unwrap_err()
+                .contains("does not match plan tx_id tx-other"),
+            "intent and plan tx ids must identify the same transaction"
+        );
+
+        let mut unknown_compensation = make_test_contract(1);
+        unknown_compensation
+            .plan
+            .compensations
+            .push(TxCompensation {
+                for_step_id: TxStepId("missing-step".to_string()),
+                action: unknown_compensation.plan.steps[0].action.clone(),
+            });
+        assert!(
+            unknown_compensation
+                .validate()
+                .unwrap_err()
+                .contains("unknown step_id missing-step"),
+            "compensations must target a concrete committed step"
+        );
+
+        let mut duplicate_compensation = make_test_contract(1);
+        duplicate_compensation
+            .plan
+            .compensations
+            .push(TxCompensation {
+                for_step_id: duplicate_compensation.plan.steps[0].step_id.clone(),
+                action: duplicate_compensation.plan.steps[0].action.clone(),
+            });
+        duplicate_compensation
+            .plan
+            .compensations
+            .push(TxCompensation {
+                for_step_id: duplicate_compensation.plan.steps[0].step_id.clone(),
+                action: duplicate_compensation.plan.steps[0].action.clone(),
+            });
+        assert!(
+            duplicate_compensation
+                .validate()
+                .unwrap_err()
+                .contains("duplicate compensation for step_id step-0"),
+            "duplicate compensation actions would make rollback dispatch ambiguous"
+        );
     }
 
     #[test]

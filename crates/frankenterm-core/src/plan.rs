@@ -2956,9 +2956,54 @@ pub struct MissionTxContract {
 impl MissionTxContract {
     /// Validate contract consistency.
     pub fn validate(&self) -> Result<(), String> {
+        if self.intent.tx_id != self.plan.tx_id {
+            return Err(format!(
+                "Transaction intent tx_id {} does not match plan tx_id {}",
+                self.intent.tx_id.0, self.plan.tx_id.0
+            ));
+        }
+
         if self.plan.steps.is_empty() {
             return Err("Transaction plan has no steps".to_string());
         }
+
+        let mut step_ids = HashSet::new();
+        let mut ordinals = HashSet::new();
+        for step in &self.plan.steps {
+            if step.step_id.0.is_empty() {
+                return Err("Transaction plan has a step with an empty step_id".to_string());
+            }
+            if !step_ids.insert(step.step_id.0.as_str()) {
+                return Err(format!(
+                    "Transaction plan has duplicate step_id {}",
+                    step.step_id.0
+                ));
+            }
+            if !ordinals.insert(step.ordinal) {
+                return Err(format!(
+                    "Transaction plan has duplicate step ordinal {}",
+                    step.ordinal
+                ));
+            }
+        }
+
+        let mut compensation_step_ids = HashSet::new();
+        for compensation in &self.plan.compensations {
+            let for_step_id = compensation.for_step_id.0.as_str();
+            if !step_ids.contains(for_step_id) {
+                return Err(format!(
+                    "Transaction compensation references unknown step_id {}",
+                    compensation.for_step_id.0
+                ));
+            }
+            if !compensation_step_ids.insert(for_step_id) {
+                return Err(format!(
+                    "Transaction plan has duplicate compensation for step_id {}",
+                    compensation.for_step_id.0
+                ));
+            }
+        }
+
         Ok(())
     }
 }
