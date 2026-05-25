@@ -85,6 +85,18 @@ DECISIONS = %w[
   reject_non_remote_command
   request_triage
 ].freeze
+TARGET_DIR_NEGATIVES = [
+  "",
+  "/tmp",
+  "/tmp/",
+  "/tmp/ft-",
+  "/tmp/ft bad",
+  "/tmp/ft-replay/child",
+  "/tmp/../ft-replay",
+  "/var/tmp/ft-replay",
+  "tmp/ft-replay",
+  "/tmp/.git/ft-replay"
+].freeze
 
 def fail!(message)
   warn "deferred proof replay harness contract: #{message}"
@@ -110,6 +122,15 @@ def env_value(command, name)
   nil
 end
 
+def safe_target_dir?(target)
+  target.is_a?(String) && target.match?(%r{\A/tmp/ft-[A-Za-z0-9._-]+\z})
+end
+
+TARGET_DIR_NEGATIVES.each do |target|
+  fail!("safe_target_dir? accepted unsafe target #{target.inspect}") if safe_target_dir?(target)
+end
+fail!("safe_target_dir? rejected known-good target") unless safe_target_dir?("/tmp/ft-rdy1-recorder")
+
 # A remote-only command shape: argv must be `rch ... --no-self-healing ... exec
 # -- ...`, the RCH_REQUIRE_REMOTE and RCH_NO_SELF_HEALING env flags must both be
 # "1" (otherwise a local fallback is reachable and it is not remote-only proof),
@@ -126,6 +147,7 @@ def remote_only_command?(command)
 
   target = command["target_dir"]
   return true if target.nil?
+  return false unless safe_target_dir?(target)
 
   argv.include?("CARGO_TARGET_DIR=#{target}")
 end
@@ -276,6 +298,7 @@ def assert_fail_closed!(record, schema, where)
   fail!("#{where}: unknown decision #{record["decision"]}") unless DECISIONS.include?(record["decision"])
   fail!("#{where}: dry_run must be true") unless record["dry_run"] == true
   fail!("#{where}: remote_exit_status must be null") unless record["remote_exit_status"].nil?
+  fail!("#{where}: unsafe target_dir #{record["target_dir"].inspect}") if record["target_dir"] && !safe_target_dir?(record["target_dir"])
   if record["replay_allowed_now"] && record["decision"] != "run_static_now"
     fail!("#{where}: only run_static_now may be replay_allowed_now")
   end
