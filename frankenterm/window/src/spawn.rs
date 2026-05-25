@@ -50,6 +50,10 @@ pub(crate) struct SpawnQueue {
 fn schedule_with_pri(runnable: Runnable, high_pri: bool) {
     SPAWN_QUEUE.spawn_impl(
         Box::new(move || {
+            // Mark the duration of this task so promise::spawn::block_on
+            // can detect a would-be self-deadlock on the main thread and
+            // panic with a clear message instead of beach-balling.
+            let _dispatch_scope = promise::spawn::enter_main_thread_dispatch_scope();
             runnable.run();
         }),
         high_pri,
@@ -237,6 +241,32 @@ impl SpawnQueue {
         _: CFRunLoopActivity,
         _: *mut std::ffi::c_void,
     ) {
+        // Re-entry guard. The observer is registered for
+        // kCFRunLoopAllActivities, so if a task currently being
+        // dispatched pumps the run loop synchronously (Cocoa nested
+        // event loops, modal panels, anything that calls
+        // CFRunLoopRunInMode), this callback can fire again *while we
+        // are still inside the previous task*. Popping another task in
+        // that state creates nested execution and has historically been
+        // a deadlock vector. Skip the re-entry; the work will be picked
+        // up the next time the run loop drains cleanly. queue_wakeup is
+        // already idempotent so no signal is lost.
+        thread_local! {
+            static IN_TRIGGER: std::cell::Cell<bool> =
+                const { std::cell::Cell::new(false) };
+        }
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                IN_TRIGGER.with(|f| f.set(false));
+            }
+        }
+
+        if IN_TRIGGER.with(|f| f.replace(true)) {
+            return;
+        }
+        let _guard = ClearOnDrop;
+
         if SPAWN_QUEUE.run() {
             Self::queue_wakeup();
         }

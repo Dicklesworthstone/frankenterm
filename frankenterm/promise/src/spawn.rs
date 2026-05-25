@@ -43,6 +43,76 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+// === Main-thread dispatch detection ===
+//
+// SpawnQueue dispatchers wrap each popped main-thread task in
+// `enter_main_thread_dispatch_scope`. `block_on` queries the flag and
+// refuses to run when doing so would self-deadlock the main thread
+// (the run loop cannot pump while the dispatcher is blocked here).
+thread_local! {
+    static IN_MAIN_THREAD_DISPATCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard returned by [`enter_main_thread_dispatch_scope`]. While
+/// held, [`is_in_main_thread_dispatch`] returns `true` on this thread.
+///
+/// The guard remembers the flag's previous value and restores it on
+/// drop, so nested scopes compose correctly: dropping the inner scope
+/// does not exit the outer scope's invariant. `!Send` so the guard
+/// cannot escape the thread whose flag it owns.
+#[must_use = "the dispatch scope ends when this guard is dropped"]
+pub struct MainThreadDispatchScope {
+    prev: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for MainThreadDispatchScope {
+    fn drop(&mut self) {
+        IN_MAIN_THREAD_DISPATCH.with(|f| f.set(self.prev));
+    }
+}
+
+/// Mark this thread as actively running a task popped from the
+/// main-thread spawn queue. Returns a guard whose drop restores the
+/// previous flag value (so nested scopes are safe even though, in
+/// current practice, dispatchers don't nest — re-entry of the CFRunLoop
+/// observer is filtered separately in `frankenterm/window/src/spawn.rs`).
+pub fn enter_main_thread_dispatch_scope() -> MainThreadDispatchScope {
+    let prev = IN_MAIN_THREAD_DISPATCH.with(|f| f.replace(true));
+    MainThreadDispatchScope {
+        prev,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// True iff this thread is currently inside a task popped from the
+/// main-thread spawn queue.
+pub fn is_in_main_thread_dispatch() -> bool {
+    IN_MAIN_THREAD_DISPATCH.with(|f| f.get())
+}
+
+/// Assert that we are NOT inside a main-thread dispatch. Used by
+/// `block_on` to refuse self-deadlock.
+#[inline]
+fn assert_not_in_main_thread_dispatch() {
+    if is_in_main_thread_dispatch() {
+        block_on_main_thread_panic();
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn block_on_main_thread_panic() -> ! {
+    panic!(
+        "promise::spawn::block_on called while running a task on the \
+         main-thread spawn queue: this would deadlock the GUI (the main \
+         thread cannot pump its event loop while blocked here). Use an \
+         async `.await` path, or hand the blocking work off via \
+         `spawn_into_new_thread`."
+    );
+}
+
 fn schedule_runnable(runnable: Runnable, high_pri: bool) {
     let func = {
         let guard = if high_pri {
@@ -228,11 +298,20 @@ pub async fn sleep(duration: std::time::Duration) {
 }
 
 /// Block the current thread until the passed future completes.
+///
+/// Panics if called from a task running on the main-thread spawn queue
+/// (see [`is_in_main_thread_dispatch`]): blocking the dispatcher
+/// deadlocks the GUI because the run loop can't pump while we're parked
+/// here.
 #[cfg(not(feature = "async-asupersync"))]
-pub use async_io::block_on;
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    assert_not_in_main_thread_dispatch();
+    async_io::block_on(future)
+}
 
 #[cfg(feature = "async-asupersync")]
 pub fn block_on<F: Future>(future: F) -> F::Output {
+    assert_not_in_main_thread_dispatch();
     ASUPERSYNC_RUNTIME.block_on(future)
 }
 
@@ -923,5 +1002,79 @@ mod tests {
             step3
         });
         assert_eq!(result, 9); // (1 + 2) * 3
+    }
+
+    // ── main-thread dispatch scope guard ────────────────────
+
+    // These tests run on their own threads (cargo test default) so the
+    // thread-local flag is isolated from any concurrent test.
+
+    #[test]
+    fn dispatch_scope_default_false() {
+        assert!(!is_in_main_thread_dispatch());
+    }
+
+    #[test]
+    fn dispatch_scope_sets_and_clears() {
+        assert!(!is_in_main_thread_dispatch());
+        {
+            let _scope = enter_main_thread_dispatch_scope();
+            assert!(is_in_main_thread_dispatch());
+        }
+        assert!(
+            !is_in_main_thread_dispatch(),
+            "flag must be cleared when the guard drops"
+        );
+    }
+
+    #[test]
+    fn dispatch_scope_save_restore_across_nesting() {
+        // Save/restore semantics: inner drop must not exit the outer
+        // scope's invariant. This is the bug fix added on 2026-05-24
+        // after the cmd+N deadlock review.
+        assert!(!is_in_main_thread_dispatch());
+        {
+            let _outer = enter_main_thread_dispatch_scope();
+            assert!(is_in_main_thread_dispatch());
+            {
+                let _inner = enter_main_thread_dispatch_scope();
+                assert!(is_in_main_thread_dispatch());
+            }
+            assert!(
+                is_in_main_thread_dispatch(),
+                "outer scope must survive inner guard drop"
+            );
+        }
+        assert!(!is_in_main_thread_dispatch());
+    }
+
+    #[test]
+    fn block_on_panics_when_called_inside_dispatch_scope() {
+        // The thread-local flag is per-test-thread so this is safe to
+        // run in parallel with other tests.
+        assert!(!is_in_main_thread_dispatch());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = enter_main_thread_dispatch_scope();
+            // Should panic before ever evaluating the future.
+            let _ = block_on(async { 42 });
+        }));
+        assert!(
+            result.is_err(),
+            "block_on must panic when called inside a main-thread dispatch scope"
+        );
+        // The catch_unwind unwound past the scope's drop, which must
+        // have cleared the flag.
+        assert!(
+            !is_in_main_thread_dispatch(),
+            "flag must be cleared on unwind through the guard"
+        );
+    }
+
+    #[test]
+    fn block_on_works_outside_dispatch_scope() {
+        // Sanity: outside the scope, block_on still works.
+        assert!(!is_in_main_thread_dispatch());
+        let result = block_on(async { 7 });
+        assert_eq!(result, 7);
     }
 }

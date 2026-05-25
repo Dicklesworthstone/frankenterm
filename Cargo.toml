@@ -582,7 +582,8 @@ opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
-strip = true        # Remove debug symbols
+strip = false       # Keep debug symbols so `sample` / lldb resolve frames
+debug = true        # Full debuginfo — turn back to `false` or `"line-tables-only"` once the deadlock root cause is identified
 
 # Provide git-based versions of crates that upstream repos (fastmcp_rust, fastapi_rust)
 # reference as path deps pointing outside their own repo (../asupersync, ../rich_rust).
