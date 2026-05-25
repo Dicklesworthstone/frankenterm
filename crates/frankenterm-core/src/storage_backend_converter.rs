@@ -402,6 +402,102 @@ mod tests {
         }
     }
 
+    /// Source with a BLOB column carrying non-UTF-8 bytes and SQL NULL cells.
+    fn blob_and_null_source() -> RusqliteBackend {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE b (id INTEGER PRIMARY KEY, payload BLOB, note TEXT); \
+                 INSERT INTO b VALUES (1, X'00FF0142', 'has-blob'); \
+                 INSERT INTO b VALUES (2, NULL, NULL);",
+            )
+            .unwrap();
+        backend
+    }
+
+    /// ft-rus6z regression: copy_table must preserve raw BLOB bytes (not the
+    /// `<blob:N bytes>` TEXT placeholder) and SQL NULL (not empty TEXT). Reads
+    /// the destination back through the typed cell pipeline to prove the
+    /// storage class survived the round trip.
+    #[test]
+    fn copy_table_preserves_blob_and_null_fidelity() {
+        let source = blob_and_null_source();
+        let dest = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        dest.execute_batch("CREATE TABLE b (id INTEGER PRIMARY KEY, payload BLOB, note TEXT);")
+            .unwrap();
+
+        let n = copy_table(&source, &dest, "b").unwrap();
+        assert_eq!(n, 2);
+
+        let rows = dest
+            .query_map_cells("SELECT id, payload, note FROM b ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Blob bytes preserved exactly (the old string pipeline destroyed these).
+        assert_eq!(rows[0][1], SqlCell::Blob(vec![0x00, 0xFF, 0x01, 0x42]));
+        assert_eq!(rows[0][2], SqlCell::Text("has-blob".to_string()));
+        // NULL preserved as NULL, not coerced to empty TEXT.
+        assert_eq!(rows[1][1], SqlCell::Null);
+        assert_eq!(rows[1][2], SqlCell::Null);
+    }
+
+    /// ft-rus6z regression: verify_equivalence must detect two blobs of the
+    /// SAME length but DIFFERENT bytes as divergent. The old string pipeline
+    /// stringified both to `<blob:4 bytes>` and silently passed verification.
+    #[test]
+    fn verify_equivalence_detects_blob_byte_difference() {
+        let source = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE b (id INTEGER PRIMARY KEY, payload BLOB); \
+                 INSERT INTO b VALUES (1, X'DEADBEEF');",
+            )
+            .unwrap();
+        let dest = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        dest.execute_batch(
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, payload BLOB); \
+             INSERT INTO b VALUES (1, X'DEADBEE0');",
+        )
+        .unwrap();
+
+        let err = verify_equivalence(&source, &dest, &["b"]).unwrap_err();
+        match err {
+            BackendError::Query(msg) => assert!(
+                msg.contains("row 0 column 1"),
+                "same-length-different-bytes blobs must diverge at the payload cell, got: {msg}"
+            ),
+            other => panic!("expected Query divergence, got {other:?}"),
+        }
+    }
+
+    /// ft-rus6z regression: verify_equivalence must distinguish SQL NULL from
+    /// empty TEXT (the old pipeline compared both as `""`).
+    #[test]
+    fn verify_equivalence_detects_null_versus_empty_text() {
+        let source = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE b (id INTEGER PRIMARY KEY, payload BLOB); \
+                 INSERT INTO b VALUES (1, NULL);",
+            )
+            .unwrap();
+        let dest = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        dest.execute_batch(
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, payload BLOB); \
+             INSERT INTO b VALUES (1, '');",
+        )
+        .unwrap();
+
+        let err = verify_equivalence(&source, &dest, &["b"]).unwrap_err();
+        match err {
+            BackendError::Query(msg) => assert!(
+                msg.contains("row 0 column 1"),
+                "NULL vs empty TEXT must diverge at the payload cell, got: {msg}"
+            ),
+            other => panic!("expected Query divergence, got {other:?}"),
+        }
+    }
+
     #[test]
     fn copy_table_rejects_unsafe_identifier() {
         let source = populated_source();
