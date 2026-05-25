@@ -127,7 +127,7 @@ pub struct RejectedEdge {
 }
 
 /// br-ft-6gf4j: a planner assignment that was dropped before step
-/// construction because its `bead_id` was empty or duplicated an
+/// construction because its `bead_id` was malformed or duplicated an
 /// earlier assignment's bead_id in the same compile call. Without
 /// this rejection the duplicate would collapse into a single TxStep
 /// (since step ids are derived as `step-{bead_id}` and the
@@ -144,6 +144,12 @@ impl RejectedAssignment {
     /// Reason text for an empty `bead_id`. Stable string so audit
     /// pipelines can pattern-match.
     pub const REASON_EMPTY_BEAD_ID: &'static str = "bead_id is empty";
+
+    /// Reason text for a `bead_id` that only becomes valid after
+    /// trimming. Hidden boundary whitespace would create a visually
+    /// ambiguous step id and can also bypass dependency matching.
+    pub const REASON_NON_CANONICAL_BEAD_ID: &'static str =
+        "bead_id has leading or trailing whitespace";
 
     /// Reason prefix for a duplicate `bead_id`. Full reason text
     /// is `"{REASON_DUPLICATE_BEAD_ID_PREFIX}{prior_index}"` so
@@ -207,6 +213,12 @@ impl Default for CompilerConfig {
 pub enum TxPlanCompileError {
     /// A `PlannerAssignment` had an empty `bead_id`.
     EmptyBeadId { assignment_index: usize },
+    /// A `PlannerAssignment` had a syntactically invalid `bead_id`.
+    InvalidBeadId {
+        assignment_index: usize,
+        bead_id: String,
+        reason: String,
+    },
     /// Two or more `PlannerAssignment`s shared the same `bead_id`.
     /// All step ids derive from the bead id (`step-{bead_id}`),
     /// so duplicates collapse into one DAG node.
@@ -224,6 +236,15 @@ impl std::fmt::Display for TxPlanCompileError {
                 f,
                 "tx plan assignment at index {assignment_index} has empty bead_id"
             ),
+            Self::InvalidBeadId {
+                assignment_index,
+                bead_id,
+                reason,
+            } => write!(
+                f,
+                "tx plan assignment at index {assignment_index} has invalid bead_id {bead_id:?}: \
+                 {reason}"
+            ),
             Self::DuplicateBeadId {
                 bead_id,
                 first_index,
@@ -240,7 +261,7 @@ impl std::fmt::Display for TxPlanCompileError {
 impl std::error::Error for TxPlanCompileError {}
 
 /// br-ft-6gf4j strict variant: validates `bead_id`
-/// uniqueness + non-emptiness BEFORE compilation; returns
+/// uniqueness + canonical non-emptiness BEFORE compilation; returns
 /// [`TxPlanCompileError`] on the first violation. Two
 /// assignments with the same `bead_id` would derive the same
 /// `step-{bead_id}` id and collapse into one DAG node —
@@ -260,10 +281,20 @@ pub fn compile_tx_plan_strict(
     let mut seen_bead_ids: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::with_capacity(assignments.len());
     for (idx, assignment) in assignments.iter().enumerate() {
-        if assignment.bead_id.is_empty() {
-            return Err(TxPlanCompileError::EmptyBeadId {
-                assignment_index: idx,
-            });
+        match validate_assignment_bead_id(&assignment.bead_id) {
+            Ok(()) => {}
+            Err(RejectionKind::Empty) => {
+                return Err(TxPlanCompileError::EmptyBeadId {
+                    assignment_index: idx,
+                });
+            }
+            Err(RejectionKind::Invalid(reason)) => {
+                return Err(TxPlanCompileError::InvalidBeadId {
+                    assignment_index: idx,
+                    bead_id: assignment.bead_id.clone(),
+                    reason: reason.to_string(),
+                });
+            }
         }
         if let Some(&first_index) = seen_bead_ids.get(assignment.bead_id.as_str()) {
             return Err(TxPlanCompileError::DuplicateBeadId {
@@ -280,7 +311,7 @@ pub fn compile_tx_plan_strict(
 /// Compile planner assignments into a transaction plan
 /// (lenient default).
 ///
-/// br-ft-6gf4j: invalid bead_ids (empty / duplicate) are
+/// br-ft-6gf4j: invalid bead_ids (empty / noncanonical / duplicate) are
 /// recorded in `TxPlan::rejected_assignments` and excluded
 /// from the compiled DAG. Callers that want fail-fast
 /// validation use [`compile_tx_plan_strict`].
@@ -300,13 +331,16 @@ pub fn compile_tx_plan(
     let mut first_seen: HashMap<&str, usize> = HashMap::new();
     for (idx, assignment) in assignments.iter().enumerate() {
         let bead_id = assignment.bead_id.as_str();
-        if bead_id.is_empty() {
-            rejected_assignments.push(RejectedAssignment {
-                bead_id: assignment.bead_id.clone(),
-                agent_id: assignment.agent_id.clone(),
-                reason: RejectedAssignment::REASON_EMPTY_BEAD_ID.to_string(),
-            });
-            continue;
+        match validate_assignment_bead_id(bead_id) {
+            Ok(()) => {}
+            Err(reason) => {
+                rejected_assignments.push(RejectedAssignment {
+                    bead_id: assignment.bead_id.clone(),
+                    agent_id: assignment.agent_id.clone(),
+                    reason: reason.as_rejected_assignment_reason().to_string(),
+                });
+                continue;
+            }
         }
         if let Some(prior_idx) = first_seen.get(bead_id) {
             rejected_assignments.push(RejectedAssignment {
@@ -339,13 +373,20 @@ pub fn compile_tx_plan(
         // Build dependencies: only include deps that are also in this plan.
         let mut depends_on = Vec::new();
         for dep_id in &assignment.dependency_bead_ids {
-            if assigned_beads.contains(dep_id.as_str()) {
-                depends_on.push(format!("step-{}", dep_id));
+            let dep_bead_id = dep_id.trim();
+            if dep_bead_id.is_empty() {
+                rejected_edges.push(RejectedEdge {
+                    from_step: "step-".to_string(),
+                    to_step: step_id.clone(),
+                    reason: "Dependency bead_id is empty".to_string(),
+                });
+            } else if assigned_beads.contains(dep_bead_id) {
+                depends_on.push(format!("step-{}", dep_bead_id));
             } else {
                 rejected_edges.push(RejectedEdge {
-                    from_step: format!("step-{}", dep_id),
+                    from_step: format!("step-{}", dep_bead_id),
                     to_step: step_id.clone(),
-                    reason: format!("Dependency {} not in this plan", dep_id),
+                    reason: format!("Dependency {} not in this plan", dep_bead_id),
                 });
             }
         }
@@ -433,6 +474,34 @@ pub fn compile_tx_plan(
         rejected_edges,
         rejected_assignments,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectionKind {
+    Empty,
+    Invalid(&'static str),
+}
+
+impl RejectionKind {
+    fn as_rejected_assignment_reason(self) -> &'static str {
+        match self {
+            Self::Empty => RejectedAssignment::REASON_EMPTY_BEAD_ID,
+            Self::Invalid(reason) => reason,
+        }
+    }
+}
+
+fn validate_assignment_bead_id(bead_id: &str) -> Result<(), RejectionKind> {
+    let trimmed = bead_id.trim();
+    if trimmed.is_empty() {
+        return Err(RejectionKind::Empty);
+    }
+    if trimmed != bead_id {
+        return Err(RejectionKind::Invalid(
+            RejectedAssignment::REASON_NON_CANONICAL_BEAD_ID,
+        ));
+    }
+    Ok(())
 }
 
 /// Classify risk based on tags and score.
@@ -954,6 +1023,27 @@ mod tests {
         assert_eq!(plan.steps[0].depends_on.len(), 0);
     }
 
+    #[test]
+    fn compile_dependency_ids_are_trimmed_before_lookup() {
+        let assignments = vec![
+            assignment("b1", "a1", 0.9),
+            assignment_with_deps("b2", "a1", 0.9, &[" b1 "]),
+        ];
+        let plan = compile_tx_plan("p1", &assignments, &CompilerConfig::default());
+
+        let step_b2 = plan
+            .steps
+            .iter()
+            .find(|step| step.id == "step-b2")
+            .expect("b2 step is compiled");
+        assert_eq!(step_b2.depends_on, vec!["step-b1"]);
+        assert!(
+            plan.rejected_edges.is_empty(),
+            "whitespace-padded in-plan dependencies must not be dropped as external edges"
+        );
+        assert_eq!(plan.execution_order, vec!["step-b1", "step-b2"]);
+    }
+
     proptest! {
         #[test]
         fn cyclic_assignments_emit_rejected_cycle_edges(cycle_len in 1usize..8) {
@@ -1463,6 +1553,44 @@ mod tests {
                 assert_eq!(duplicate_index, 2);
             }
             other => panic!("expected DuplicateBeadId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_tx_plan_rejects_noncanonical_assignment_bead_ids() {
+        let assignments = vec![make_assignment(" b0 ")];
+        let plan = compile_tx_plan("p", &assignments, &CompilerConfig::default());
+        assert!(plan.steps.is_empty());
+        assert_eq!(plan.rejected_assignments.len(), 1);
+        assert_eq!(
+            plan.rejected_assignments[0].reason,
+            RejectedAssignment::REASON_NON_CANONICAL_BEAD_ID
+        );
+
+        let strict_result = compile_tx_plan_strict("p", &assignments, &CompilerConfig::default());
+        match strict_result {
+            Err(TxPlanCompileError::InvalidBeadId {
+                assignment_index,
+                bead_id,
+                reason,
+            }) => {
+                assert_eq!(assignment_index, 0);
+                assert_eq!(bead_id, " b0 ");
+                assert_eq!(reason, RejectedAssignment::REASON_NON_CANONICAL_BEAD_ID);
+            }
+            other => panic!("expected InvalidBeadId for noncanonical bead_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_tx_plan_strict_rejects_whitespace_only_bead_id() {
+        let assignments = vec![make_assignment("   ")];
+        let result = compile_tx_plan_strict("p", &assignments, &CompilerConfig::default());
+        match result {
+            Err(TxPlanCompileError::EmptyBeadId { assignment_index }) => {
+                assert_eq!(assignment_index, 0);
+            }
+            other => panic!("expected EmptyBeadId for whitespace-only bead_id, got {other:?}"),
         }
     }
 
