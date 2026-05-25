@@ -1217,6 +1217,12 @@ impl Mux {
         }
     }
 
+    fn discard_high_rate_alert_state(&self, pane_id: PaneId) {
+        self.last_high_rate_alert
+            .lock()
+            .retain(|(alert_pane_id, _), _| *alert_pane_id != pane_id);
+    }
+
     fn flush_pending_pane_output_notifications(&self) {
         loop {
             let pane_ids = {
@@ -1390,6 +1396,7 @@ impl Mux {
 
     fn remove_pane_internal(&self, pane_id: PaneId) {
         log::debug!("removing pane {}", pane_id);
+        self.discard_high_rate_alert_state(pane_id);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);
@@ -2471,6 +2478,42 @@ mod tests {
             notifications.load(Ordering::Relaxed),
             3,
             "same-pane same-kind alert should dispatch again after the dedupe window",
+        );
+    }
+
+    #[test]
+    fn remove_pane_discards_high_rate_alert_state() {
+        let mux = Mux::new(None);
+        mux.notify(MuxNotification::Alert {
+            pane_id: 7,
+            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(42)),
+        });
+        mux.notify(MuxNotification::Alert {
+            pane_id: 7,
+            alert: frankenterm_term::Alert::CurrentWorkingDirectoryChanged,
+        });
+        mux.notify(MuxNotification::Alert {
+            pane_id: 8,
+            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(64)),
+        });
+
+        {
+            let last = mux.last_high_rate_alert.lock();
+            assert!(last.contains_key(&(7, HighRateAlertKind::Progress)));
+            assert!(last.contains_key(&(7, HighRateAlertKind::CurrentWorkingDirectoryChanged)));
+            assert!(last.contains_key(&(8, HighRateAlertKind::Progress)));
+        }
+
+        mux.remove_pane(7);
+
+        let last = mux.last_high_rate_alert.lock();
+        assert!(
+            !last.keys().any(|(pane_id, _)| *pane_id == 7),
+            "remove_pane must not leave high-rate alert dedupe entries for a dead pane",
+        );
+        assert!(
+            last.contains_key(&(8, HighRateAlertKind::Progress)),
+            "tearing down one pane must not clear dedupe state for unrelated live panes",
         );
     }
 
