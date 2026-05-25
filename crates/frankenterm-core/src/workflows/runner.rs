@@ -95,7 +95,7 @@ fn cap_wait_by_workflow_deadline(
     let Some(deadline) =
         workflow_started_at.checked_add(Duration::from_millis(workflow_total_deadline_ms))
     else {
-        return requested;
+        return Duration::ZERO;
     };
     requested.min(deadline.saturating_duration_since(Instant::now()))
 }
@@ -4183,6 +4183,18 @@ mod tests {
             assert_eq!(
                 cap_wait_by_workflow_deadline(requested, started_at, 1_000),
                 Duration::ZERO
+            );
+        }
+
+        #[test]
+        fn workflow_deadline_cap_fails_closed_when_deadline_overflows() {
+            let requested = Duration::from_secs(60);
+            let started_at = Instant::now();
+
+            assert_eq!(
+                cap_wait_by_workflow_deadline(requested, started_at, u64::MAX),
+                Duration::ZERO,
+                "overflowing workflow_total_deadline_ms must not disable the wait cap"
             );
         }
 
