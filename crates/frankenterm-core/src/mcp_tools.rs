@@ -2720,17 +2720,14 @@ impl ToolHandler for WaEventsTool {
         let params: EventsParams = if arguments.is_null() {
             EventsParams::default()
         } else {
-            match serde_json::from_value(arguments) {
+            match parse_mcp_tool_params(
+                "wa.events",
+                arguments,
+                "Expected object with optional limit, pane, rule_id, event_type, triage_state, label, unhandled, since",
+                start,
+            ) {
                 Ok(p) => p,
-                Err(err) => {
-                    let envelope = McpEnvelope::<()>::error(
-                        MCP_ERR_INVALID_ARGS,
-                        format!("Invalid params: {err}"),
-                        Some("Expected object with optional limit, pane, rule_id, event_type, triage_state, label, unhandled, since".to_string()),
-                        elapsed_ms(start),
-                    );
-                    return envelope_to_content(envelope);
-                }
+                Err(response) => return response,
             }
         };
 
@@ -9281,6 +9278,39 @@ exit 17",
         assert!(
             !envelope.to_string().contains("sk-ant-api03-"),
             "malformed wa.state args leaked the caller-supplied secret"
+        );
+    }
+
+    #[test]
+    fn wa_events_malformed_args_redacts_serde_error_value() {
+        let tool = WaEventsTool::new(db_path());
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "limit": secret,
+                    "event_type": "state_change",
+                }),
+            )
+            .expect("wa.events bad-arg call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(
+            envelope["hint"],
+            "Expected object with optional limit, pane, rule_id, event_type, triage_state, label, unhandled, since"
+        );
+        assert!(
+            !envelope.to_string().contains("sk-ant-api03-"),
+            "malformed wa.events args leaked the caller-supplied secret"
         );
     }
 
