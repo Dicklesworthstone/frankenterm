@@ -842,9 +842,9 @@ impl Display for Mode {
             Mode::SetMode(mode) => emit_mode!("h", mode),
             Mode::ResetMode(mode) => emit_mode!("l", mode),
             Mode::QueryMode(TerminalMode::Code(mode)) => {
-                write!(f, "?{}$p", mode.to_u16().ok_or_else(|| FmtError)?)
+                write!(f, "{}$p", mode.to_u16().ok_or_else(|| FmtError)?)
             }
-            Mode::QueryMode(TerminalMode::Unspecified(mode)) => write!(f, "?{}$p", mode),
+            Mode::QueryMode(TerminalMode::Unspecified(mode)) => write!(f, "{}$p", mode),
             Mode::XtermKeyMode { resource, value } => {
                 write!(
                     f,
@@ -3340,6 +3340,27 @@ mod test {
                 TerminalModeCode::BiDirectionalSupportMode
             )))]
         );
+    }
+
+    #[test]
+    fn decrqm_ansi_query_mode_formats_without_dec_private_prefix() {
+        let query = vec![CSI::Mode(Mode::QueryMode(TerminalMode::Code(
+            TerminalModeCode::Insert,
+        )))];
+        assert_eq!(encode(&query), "\x1b[4$p");
+
+        let parsed: Vec<_> =
+            CSI::parse(&[CsiParam::Integer(4), CsiParam::P(b'$')], false, 'p').collect();
+        assert_eq!(parsed, query);
+        assert_eq!(encode(&parsed), "\x1b[4$p");
+    }
+
+    #[test]
+    fn decrqm_dec_private_query_mode_keeps_dec_private_prefix() {
+        let query = vec![CSI::Mode(Mode::QueryDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )))];
+        assert_eq!(encode(&query), "\x1b[?25$p");
     }
 
     #[test]
