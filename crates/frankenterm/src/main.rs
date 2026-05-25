@@ -20606,6 +20606,27 @@ fn distributed_validate_handshake_agent_id(
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_validate_handshake_session_id(
+    session_id: Option<&str>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
+) -> Result<Option<String>, frankenterm_core::distributed::DistributedSecurityError> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed);
+    }
+
+    let max_session_id_len = wire_limits.max_sender_id_len.saturating_add(64);
+    if trimmed.len() > max_session_id_len || trimmed.chars().any(char::is_control) {
+        return Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+#[cfg(feature = "distributed")]
 const DISTRIBUTED_MESSAGE_TOO_LARGE_IO_ERROR_MARKER: &str = "distributed_message_too_large";
 
 #[cfg(feature = "distributed")]
@@ -21523,6 +21544,16 @@ async fn distributed_handle_connection<S>(
                 return;
             }
         };
+    let validated_session_id = match distributed_validate_handshake_session_id(
+        handshake.session_id.as_deref(),
+        wire_limits,
+    ) {
+        Ok(session_id) => session_id,
+        Err(err) => {
+            distributed_publish_security_error(&mut reader, err).await;
+            return;
+        }
+    };
 
     if !allow_agent_ids.is_empty() {
         let Some(agent_id) = normalized_handshake_agent.as_deref() else {
@@ -21556,7 +21587,7 @@ async fn distributed_handle_connection<S>(
     distributed_publish_handshake_ok(&mut reader).await;
 
     let session_id = distributed_resolve_session_id(
-        handshake.session_id.as_deref(),
+        validated_session_id.as_deref(),
         normalized_handshake_agent.as_deref(),
         peer_addr,
     );
@@ -61756,6 +61787,36 @@ recorder_backend = "frankensqlite"
             distributed_validate_handshake_agent_id(Some(&too_long), limits),
             Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed),
             "oversized handshake agent_id must fail closed before acknowledgement",
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_validate_handshake_session_id_rejects_blank_and_unbounded_ids() {
+        let limits = default_wire_limits();
+
+        assert_eq!(
+            distributed_validate_handshake_session_id(None, limits),
+            Ok(None)
+        );
+        assert_eq!(
+            distributed_validate_handshake_session_id(Some(" session:case "), limits),
+            Ok(Some("session:case".to_string()))
+        );
+
+        for session_id in ["", " \t ", "session\u{0}bad", "session\u{1f}bad"] {
+            assert_eq!(
+                distributed_validate_handshake_session_id(Some(session_id), limits),
+                Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed),
+                "present-but-invalid handshake session_id must fail closed: {session_id:?}",
+            );
+        }
+
+        let too_long = "s".repeat(limits.max_sender_id_len.saturating_add(65));
+        assert_eq!(
+            distributed_validate_handshake_session_id(Some(&too_long), limits),
+            Err(frankenterm_core::distributed::DistributedSecurityError::AuthFailed),
+            "oversized handshake session_id must fail closed before replay-state allocation",
         );
     }
 
