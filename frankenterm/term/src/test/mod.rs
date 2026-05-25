@@ -10,9 +10,9 @@ mod csi;
 use crate::color::ColorPalette;
 use crate::screen::{ResizeReadabilityGatePolicy, ResizeWrapPolicy};
 use frankenterm_escape_parser::csi::{Edit, EraseInDisplay, EraseInLine};
-use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
+use frankenterm_escape_parser::{CSI, OneBased, OperatingSystemCommand};
 use frankenterm_surface::line::MonospaceKpCostModel;
-use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
+use frankenterm_surface::{CursorShape, CursorVisibility, SEQ_ZERO, SequenceNo};
 use k9::assert_equal as assert_eq;
 use std::sync::{Arc, Mutex};
 
@@ -1489,6 +1489,35 @@ fn test_scroll_margins() {
     term.cup(0, 1);
     term.print("W\n");
     assert_all_contents(&term, file!(), line!(), &["1", "2", "z", "a", "W", "", ""]);
+}
+
+#[test]
+fn saturating_cursor_counts_clamp_to_screen_edges() {
+    let mut term = TestTerm::new(3, 4, 0);
+
+    term.print(format!("{}{}C", CSI, u32::MAX));
+    term.assert_cursor_pos(3, 0, Some("CUF clamps at the last column"), None);
+
+    term.print(format!("{}100D", CSI));
+    term.assert_cursor_pos(0, 0, Some("CUB clamps at the first column"), None);
+
+    term.print(format!("{}{}B", CSI, u32::MAX));
+    term.assert_cursor_pos(0, 2, Some("CUD clamps at the last row"), None);
+
+    term.print(format!("{}{}A", CSI, u32::MAX));
+    term.assert_cursor_pos(0, 0, Some("CUU clamps at the first row"), None);
+}
+
+#[test]
+fn saturating_left_right_margins_clamp_extreme_right_edge() {
+    let mut term = TestTerm::new(3, 5, 0);
+    term.set_mode("?69", true);
+
+    term.print(format!("{}2;{}s", CSI, u32::MAX));
+    term.assert_cursor_pos(1, 0, Some("DECSLRM moves to the clamped left margin"), None);
+
+    term.print(format!("{}{}C", CSI, u32::MAX));
+    term.assert_cursor_pos(4, 0, Some("CUF clamps at the clamped right margin"), None);
 }
 
 #[test]

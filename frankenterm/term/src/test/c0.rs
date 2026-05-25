@@ -48,3 +48,22 @@ fn test_tab() {
     term.print("\t");
     term.assert_cursor_pos(24, 0, None, None);
 }
+
+#[test]
+fn saturating_tab_stops_respect_clamped_left_right_margins() {
+    let mut term = TestTerm::new(3, 6, 0);
+    term.set_mode("?69", true);
+    term.set_left_and_right_margins(1, 4);
+    term.cup(1, 0);
+
+    term.print("\t");
+    term.assert_cursor_pos(
+        4,
+        0,
+        Some("HT clamps to the right margin when the next tab stop is outside"),
+        None,
+    );
+
+    term.print("\t");
+    term.assert_cursor_pos(4, 0, Some("HT remains pinned at the right margin"), None);
+}

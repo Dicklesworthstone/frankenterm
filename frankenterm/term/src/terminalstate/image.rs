@@ -679,6 +679,27 @@ mod tests {
         assert_eq!(remaining_rows_from_cursor(24, i64::MAX), 0);
     }
 
+    #[test]
+    fn iterm_explicit_cell_dimensions_reject_extreme_spans_without_overflow() {
+        let mut terminal = test_terminal_state();
+
+        for (axis, columns, rows) in [
+            (IMAGE_CELL_SPAN_COLUMNS, Some(usize::MAX), Some(1)),
+            (IMAGE_CELL_SPAN_ROWS, Some(1), Some(usize::MAX)),
+        ] {
+            let mut params = test_image_attach_params();
+            params.style = ImageAttachStyle::Iterm;
+            params.columns = columns;
+            params.rows = rows;
+
+            let err = terminal.assign_image_to_cells(params).unwrap_err();
+            assert!(
+                err.to_string().contains(axis),
+                "expected {axis} in overflow-safe rejection, got {err}"
+            );
+        }
+    }
+
     // ── check_image_dimensions ─────────────────────────────
 
     #[test]
