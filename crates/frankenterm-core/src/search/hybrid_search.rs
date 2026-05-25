@@ -331,23 +331,33 @@ pub fn kendall_tau(ranking_a: &[u64], ranking_b: &[u64]) -> f32 {
         return 0.0;
     }
 
-    // Build rank maps
-    let rank_a: HashMap<u64, usize> = ranking_a
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, i))
-        .collect();
-    let rank_b: HashMap<u64, usize> = ranking_b
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, i))
-        .collect();
+    // Build rank maps from the *first* occurrence of each id, assigning dense
+    // 0-based ranks over the distinct ids in encounter order. A ranking is
+    // logically a permutation; if a caller passes a list with duplicate ids,
+    // collapsing to the last occurrence (the old `.collect()` behavior) made the
+    // result depend on argument order — `kendall_tau(a, b) != kendall_tau(b, a)`
+    // — which is mathematically impossible for a correlation coefficient. First-
+    // occurrence dense ranks are stable and identical for duplicate-free input,
+    // so well-formed rankings are unaffected.
+    fn first_occurrence_ranks(ranking: &[u64]) -> HashMap<u64, usize> {
+        let mut ranks: HashMap<u64, usize> = HashMap::with_capacity(ranking.len());
+        for &id in ranking {
+            let next = ranks.len();
+            ranks.entry(id).or_insert(next);
+        }
+        ranks
+    }
+    let rank_a = first_occurrence_ranks(ranking_a);
+    let rank_b = first_occurrence_ranks(ranking_b);
 
-    // Only consider items present in both
+    // Consider each id present in both, exactly once, in a's first-occurrence
+    // order. Deduping here keeps `common` a true set so the pairwise
+    // concordant/discordant count is symmetric in the two arguments.
+    let mut seen: HashSet<u64> = HashSet::with_capacity(rank_a.len());
     let common: Vec<u64> = ranking_a
         .iter()
         .copied()
-        .filter(|id| rank_b.contains_key(id))
+        .filter(|id| rank_b.contains_key(id) && seen.insert(*id))
         .collect();
 
     let n = common.len();
