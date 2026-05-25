@@ -1952,6 +1952,56 @@ mod tests {
         );
     }
 
+    // Cache-warm equivalence (ft-uroqc warm-rasterize lever). `warm_up_glyphs`
+    // routes every glyph through the SAME `cached_glyph` path a paint uses (same
+    // BorrowedGlyphKey, including `metric: CellMetricKey`), so a warmed glyph is
+    // byte-identical to what lazy rasterization would produce. We prove the
+    // behavioral consequence: after warming, an immediate re-warm of the
+    // identical plan resolves EVERY previously-resolved glyph as a cache hit
+    // (zero new rasterizations) and adds no atlas — i.e. warmed entries satisfy
+    // subsequent identical lookups exactly as a lazily-populated cache would,
+    // with no rebuild. This is the isomorphism guarantee of the apply_scale_change
+    // warm-up: it changes only WHEN glyphs rasterize, never the pixels.
+    //
+    // Run verification deferred: the frankenterm-gui cfg(test) build is blocked
+    // by the mcp_middleware issue p4 is fixing; re-run after that lands.
+    #[test]
+    fn warm_up_glyphs_is_idempotent_and_cache_hit_equivalent() {
+        let (mut cache, metrics) = test_glyph_cache_with_atlas_size(1024);
+        let plan = GlyphCache::default_warmup_plan();
+        // Generous budget: the test must warm the full set, not time-slice it.
+        let budget = Duration::from_secs(30);
+
+        let first = cache.warm_up_glyphs(&plan, &metrics, budget);
+        assert!(
+            !first.budget_exhausted,
+            "test budget must cover the full warm-up"
+        );
+        assert!(
+            first.warmed_glyphs > 0,
+            "first warm-up must rasterize at least the ASCII printable set"
+        );
+        let resolved_first = first.warmed_glyphs + first.cache_hits;
+        let atlas_count_after_first = cache.tier_swap_doctor_report().aggregate.atlas_count;
+
+        // Re-warm the identical plan: every previously-resolved glyph is now a
+        // cache hit, nothing is re-rasterized, and the atlas does not grow.
+        let second = cache.warm_up_glyphs(&plan, &metrics, budget);
+        assert_eq!(
+            second.warmed_glyphs, 0,
+            "re-warming must add no new glyphs (warmed entries are reused, not re-rasterized)"
+        );
+        assert_eq!(
+            second.cache_hits, resolved_first,
+            "every previously-resolved glyph must resolve as a cache hit on re-warm"
+        );
+        assert_eq!(
+            cache.tier_swap_doctor_report().aggregate.atlas_count,
+            atlas_count_after_first,
+            "re-warming an already-warm cache must not grow or rebuild the atlas"
+        );
+    }
+
     fn texture_rect_tuple(rect: TextureRect) -> (f32, f32, f32, f32) {
         (
             rect.min_x(),

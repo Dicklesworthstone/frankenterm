@@ -7,6 +7,16 @@ use mux::Mux;
 use std::rc::Rc;
 use wezterm_term::TerminalSize;
 
+/// Synchronous glyph warm-up budget applied on a font scale change (ft-uroqc).
+/// Scale changes are rare, user-initiated events (zoom / DPI change), so a
+/// one-frame (60fps) bound keeps the change responsive while pre-rasterizing the
+/// common ASCII/Latin set at the new `CellMetricKey`. The value is a perf knob,
+/// not a correctness parameter — warm-up is idempotent and any unwarmed glyph
+/// still rasterizes lazily on first paint exactly as before. Tunable once the
+/// renderer_slo bench unblocks (mcp_middleware cfg(test) fix, p4).
+const SCALE_CHANGE_GLYPH_WARMUP_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(16);
+
 #[derive(Debug, Clone, Copy)]
 pub struct RowsAndCols {
     pub rows: usize,
@@ -122,6 +132,25 @@ impl super::TermWindow {
         match RenderMetrics::new(&self.fonts) {
             Ok(metrics) => {
                 self.render_metrics = metrics;
+                // ft-uroqc: warm-rasterize the common ASCII/Latin glyph set at
+                // the NEW CellMetricKey so the first paint after a scale change
+                // finds them already in the atlas instead of synchronously
+                // rasterizing mid-paint. Routes through the same `cached_glyph`
+                // path the paint uses (keyed by the same BorrowedGlyphKey,
+                // including `metric: CellMetricKey`), so the cached glyphs are
+                // byte-identical to lazy rasterization — only WHEN they
+                // rasterize changes. Bounded by SCALE_CHANGE_GLYPH_WARMUP_BUDGET;
+                // fail-safe (logs + returns stats if the font cannot resolve);
+                // no-op when render_state is absent (headless / pre-init).
+                if let Some(render_state) = self.render_state.as_ref() {
+                    let _warm = render_state
+                        .glyph_cache
+                        .borrow_mut()
+                        .warm_up_default_glyphs(
+                            &self.render_metrics,
+                            SCALE_CHANGE_GLYPH_WARMUP_BUDGET,
+                        );
+                }
             }
             Err(err) => {
                 log::error!(
