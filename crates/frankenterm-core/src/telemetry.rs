@@ -395,7 +395,11 @@ impl Histogram {
         if !value.is_finite() {
             return;
         }
-        self.total_count += 1;
+        // br-ft-pu2mg saturating-counter convention: plateau at u64::MAX rather
+        // than debug-panicking / release-wrapping. A wrap-to-0 here is not just
+        // a wrong count: mean() returns None when total_count == 0, so a wrapped
+        // counter would spuriously report "no data" despite a populated sketch.
+        self.total_count = self.total_count.saturating_add(1);
         self.total_sum += value;
         if value < self.min {
             self.min = value;
@@ -629,7 +633,11 @@ impl TDigestHistogram {
         if !value.is_finite() {
             return;
         }
-        self.total_count += 1;
+        // br-ft-pu2mg saturating-counter convention: plateau at u64::MAX rather
+        // than debug-panicking / release-wrapping. A wrap-to-0 here is not just
+        // a wrong count: mean() returns None when total_count == 0, so a wrapped
+        // counter would spuriously report "no data" despite a populated sketch.
+        self.total_count = self.total_count.saturating_add(1);
         self.total_sum += value;
         self.digest.insert(value);
     }
@@ -1636,6 +1644,25 @@ impl std::fmt::Debug for TelemetryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // br-ft-pu2mg: Histogram's running count must plateau at u64::MAX, not
+    // debug-panic / release-wrap. A wrap to 0 is not just a wrong count — mean()
+    // returns None at count==0, so it would spuriously report "no data" for a
+    // populated sketch. Seeds the private counter at the boundary, records once
+    // more, and asserts the count saturates and mean() still reports data.
+    // Pre-fix the second record() overflow-panics in debug.
+    #[test]
+    fn histogram_total_count_saturates_at_u64_max() {
+        let mut h = Histogram::new("t", 8);
+        h.record(10.0);
+        h.total_count = u64::MAX;
+        h.record(20.0);
+        assert_eq!(h.total_count, u64::MAX, "count must saturate, not wrap to 0");
+        assert!(
+            h.mean().is_some(),
+            "a saturated count must not make mean() spuriously report empty"
+        );
+    }
 
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
     /// `TelemetryCollector::run_cx` path exits cleanly under seed-locked
