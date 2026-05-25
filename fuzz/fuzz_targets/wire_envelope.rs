@@ -30,6 +30,10 @@
 //! - **Sequence**: drive a single Aggregator through up to N
 //!   raw-bytes ingests, letting libFuzzer minimize toward inputs
 //!   that hit the eviction + duplicate-seq + future-clock branches.
+//! - **DifferentialSequence**: generate versioned wire envelopes,
+//!   serialize them through the production codec, decode them back, and
+//!   compare Aggregator behavior against a small reference model for
+//!   version rejection, per-agent dedup, and stale-session pruning.
 //!
 //! ## Not fuzzed here
 //!
@@ -39,8 +43,13 @@
 //! - The serialization side (`to_json`) — already round-tripped in
 //!   `proptest_wire_protocol.rs`.
 
+use std::collections::BTreeMap;
+
 use arbitrary::Arbitrary;
-use frankenterm_core::wire_protocol::{Aggregator, WireEnvelope, WireProtocolLimits};
+use frankenterm_core::wire_protocol::{
+    Aggregator, GapNotice, IngestResult, PROTOCOL_VERSION, PaneDelta, PaneMeta, PanesMeta,
+    WireEnvelope, WirePayload, WireProtocolLimits, validate_sender_identity_with_limits,
+};
 use libfuzzer_sys::fuzz_target;
 
 // Match the production wire-protocol caps so the harness reflects
@@ -63,6 +72,49 @@ enum FuzzInput<'a> {
         ingests: Vec<&'a [u8]>,
         check_stats: bool,
     },
+    /// Structure-aware differential harness for the versioned JSON
+    /// codec plus Aggregator state machine.
+    DifferentialSequence {
+        max_agents_choice: u8,
+        stale_after_choice: u8,
+        commands: Vec<StructuredEnvelope>,
+    },
+}
+
+#[derive(Arbitrary, Debug)]
+struct StructuredEnvelope {
+    sender_choice: u8,
+    seq: u64,
+    version_delta: u8,
+    payload_kind: u8,
+    payload_seq: u16,
+    received_at_ms: i16,
+    sent_at_ms: i16,
+    make_payload_invalid: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelOutcome {
+    Accepted,
+    Duplicate,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ModelSession {
+    last_seq: u64,
+    messages_received: u64,
+    last_seen_ms: i64,
+}
+
+#[derive(Debug)]
+struct ReferenceAggregator {
+    sessions: BTreeMap<String, ModelSession>,
+    max_agents: usize,
+    stale_after_ms: i64,
+    accepted: u64,
+    rejected: u64,
+    limits: WireProtocolLimits,
 }
 
 fn parse_only(bytes: &[u8], limits: WireProtocolLimits) {
@@ -79,6 +131,217 @@ fn parse_and_ingest(bytes: &[u8], agg: &mut Aggregator) {
     }
     // Contract 1: ingest is from_json + state machine; must not panic.
     let _ = agg.ingest(bytes);
+}
+
+fn sender_for_choice(choice: u8) -> String {
+    match choice % 6 {
+        0 => "agent-a".to_string(),
+        1 => "agent-b".to_string(),
+        2 => "agent-c".to_string(),
+        3 => "agent:bad".to_string(),
+        4 => " ".to_string(),
+        _ => "agent.long".to_string(),
+    }
+}
+
+fn valid_sender_choices() -> [&'static str; 4] {
+    ["agent-a", "agent-b", "agent-c", "agent.long"]
+}
+
+fn payload_for_command(command: &StructuredEnvelope) -> WirePayload {
+    let pane_id = u64::from(command.payload_seq % 8);
+    let payload_seq = u64::from(command.payload_seq);
+    match command.payload_kind % 4 {
+        0 => {
+            let content = format!("fuzz-delta-{payload_seq}");
+            let content_len = if command.make_payload_invalid {
+                content.len().saturating_add(1)
+            } else {
+                content.len()
+            };
+            WirePayload::PaneDelta(PaneDelta {
+                pane_id,
+                seq: payload_seq,
+                content,
+                content_len,
+                captured_at_ms: i64::from(command.sent_at_ms),
+            })
+        }
+        1 => {
+            let seq_before = payload_seq;
+            let seq_after = if command.make_payload_invalid {
+                seq_before
+            } else {
+                seq_before.saturating_add(1)
+            };
+            WirePayload::Gap(GapNotice {
+                pane_id,
+                seq_before,
+                seq_after,
+                reason: "fuzz-gap".to_string(),
+                detected_at_ms: i64::from(command.sent_at_ms),
+            })
+        }
+        2 => WirePayload::PaneMeta(PaneMeta {
+            pane_id,
+            pane_uuid: Some(format!("pane-{pane_id}")),
+            domain: "local".to_string(),
+            title: Some("fuzz-pane".to_string()),
+            cwd: Some("/tmp/fuzz".to_string()),
+            rows: Some(24),
+            cols: Some(80),
+            observed: true,
+            timestamp_ms: i64::from(command.sent_at_ms),
+        }),
+        _ => WirePayload::PanesMeta(PanesMeta {
+            panes: vec![PaneMeta {
+                pane_id,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                title: None,
+                cwd: None,
+                rows: Some(24),
+                cols: Some(80),
+                observed: true,
+                timestamp_ms: i64::from(command.sent_at_ms),
+            }],
+            timestamp_ms: i64::from(command.sent_at_ms),
+        }),
+    }
+}
+
+fn envelope_for_command(command: &StructuredEnvelope) -> WireEnvelope {
+    WireEnvelope {
+        version: PROTOCOL_VERSION.saturating_add(u32::from(command.version_delta % 2)),
+        seq: command.seq,
+        sender: sender_for_choice(command.sender_choice),
+        sent_at_ms: i64::from(command.sent_at_ms),
+        payload: payload_for_command(command),
+    }
+}
+
+fn payload_is_valid(payload: &WirePayload) -> bool {
+    match payload {
+        WirePayload::PaneDelta(delta) => delta.content_len == delta.content.len(),
+        WirePayload::Gap(gap) => gap.seq_after > gap.seq_before,
+        WirePayload::PaneMeta(_) | WirePayload::Detection(_) | WirePayload::PanesMeta(_) => true,
+    }
+}
+
+fn actual_outcome(result: Result<IngestResult, impl core::fmt::Debug>) -> ModelOutcome {
+    match result {
+        Ok(IngestResult::Accepted(_)) => ModelOutcome::Accepted,
+        Ok(IngestResult::Duplicate { .. }) => ModelOutcome::Duplicate,
+        Err(_) => ModelOutcome::Rejected,
+    }
+}
+
+impl ReferenceAggregator {
+    fn new(max_agents: usize, stale_after_ms: i64, limits: WireProtocolLimits) -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            max_agents,
+            stale_after_ms,
+            accepted: 0,
+            rejected: 0,
+            limits,
+        }
+    }
+
+    fn prune_stale(&mut self, now_ms: i64) {
+        if self.stale_after_ms <= 0 {
+            return;
+        }
+        self.sessions
+            .retain(|_, session| now_ms.saturating_sub(session.last_seen_ms) < self.stale_after_ms);
+    }
+
+    fn ingest(&mut self, envelope: &WireEnvelope, received_at_ms: i64) -> ModelOutcome {
+        if envelope.version != PROTOCOL_VERSION
+            || envelope.seq == u64::MAX
+            || validate_sender_identity_with_limits(&envelope.sender, self.limits).is_err()
+            || !payload_is_valid(&envelope.payload)
+        {
+            self.rejected = self.rejected.saturating_add(1);
+            return ModelOutcome::Rejected;
+        }
+
+        let is_new = !self.sessions.contains_key(&envelope.sender);
+        if is_new && self.sessions.len() >= self.max_agents {
+            self.prune_stale(received_at_ms);
+        }
+        if is_new && self.sessions.len() >= self.max_agents {
+            self.rejected = self.rejected.saturating_add(1);
+            return ModelOutcome::Rejected;
+        }
+
+        let session = self
+            .sessions
+            .entry(envelope.sender.clone())
+            .or_insert(ModelSession {
+                last_seq: 0,
+                messages_received: 0,
+                last_seen_ms: 0,
+            });
+        if session.messages_received > 0 && envelope.seq <= session.last_seq {
+            session.last_seen_ms = session.last_seen_ms.max(received_at_ms);
+            return ModelOutcome::Duplicate;
+        }
+
+        session.last_seq = envelope.seq;
+        session.messages_received = session.messages_received.saturating_add(1);
+        session.last_seen_ms = session.last_seen_ms.max(received_at_ms);
+        self.accepted = self.accepted.saturating_add(1);
+        ModelOutcome::Accepted
+    }
+
+    fn agent_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    fn last_seq(&self, sender: &str) -> Option<u64> {
+        self.sessions.get(sender).map(|session| session.last_seq)
+    }
+}
+
+fn differential_sequence(
+    max_agents_choice: u8,
+    stale_after_choice: u8,
+    commands: Vec<StructuredEnvelope>,
+) {
+    let limits = WireProtocolLimits::default();
+    let max_agents = (usize::from(max_agents_choice) % MAX_AGENTS).max(1);
+    let stale_after_ms = i64::from(stale_after_choice % 16) * 10;
+    let mut actual = Aggregator::with_limits_and_stale_after(max_agents, limits, stale_after_ms);
+    let mut reference = ReferenceAggregator::new(max_agents, stale_after_ms, limits);
+
+    for command in commands.into_iter().take(MAX_SEQUENCE_LEN) {
+        let envelope = envelope_for_command(&command);
+        let bytes = envelope
+            .to_json()
+            .expect("structured envelope must serialize");
+        let decoded = WireEnvelope::from_json_with_limits(&bytes, limits);
+        let received_at_ms = i64::from(command.received_at_ms);
+        let actual_result =
+            decoded.and_then(|decoded| actual.ingest_envelope_at(decoded, received_at_ms));
+        let actual_outcome = actual_outcome(actual_result);
+        let expected_outcome = reference.ingest(&envelope, received_at_ms);
+
+        assert_eq!(
+            actual_outcome, expected_outcome,
+            "Aggregator diverged from reference model for envelope {envelope:?}"
+        );
+        assert_eq!(actual.agent_count(), reference.agent_count());
+        assert_eq!(actual.total_accepted(), reference.accepted);
+        assert_eq!(actual.total_rejected(), reference.rejected);
+        for sender in valid_sender_choices() {
+            assert_eq!(
+                actual.agent_last_seq(sender),
+                reference.last_seq(sender),
+                "last_seq diverged for sender {sender}"
+            );
+        }
+    }
 }
 
 fuzz_target!(|input: FuzzInput| {
@@ -115,5 +378,10 @@ fuzz_target!(|input: FuzzInput| {
                 let _ = agg.total_rejected();
             }
         }
+        FuzzInput::DifferentialSequence {
+            max_agents_choice,
+            stale_after_choice,
+            commands,
+        } => differential_sequence(max_agents_choice, stale_after_choice, commands),
     }
 });

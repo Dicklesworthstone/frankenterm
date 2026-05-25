@@ -96,6 +96,14 @@ fn assert_golden_bytes(relative_path: &str, actual: &[u8]) {
     }
 }
 
+const WIRE_PROTOCOL_GOLDENS: &[&str] = &[
+    "wire_protocol/envelope_pane_meta.json",
+    "wire_protocol/envelope_pane_delta.json",
+    "wire_protocol/envelope_gap.json",
+    "wire_protocol/envelope_detection.json",
+    "wire_protocol/envelope_panes_meta.json",
+];
+
 /// Build a canonical (constant-valued) [`PaneMeta`] used as a fixture in
 /// multiple envelope goldens.
 fn canonical_pane_meta() -> PaneMeta {
@@ -319,4 +327,39 @@ fn protocol_version_is_pinned() {
          value AND regenerate every tests/golden/wire_protocol/*.json \
          golden (UPDATE_GOLDENS=1)."
     );
+}
+
+#[test]
+fn wire_protocol_golden_fixtures_conform_to_versioned_codec() {
+    for relative_path in WIRE_PROTOCOL_GOLDENS {
+        let path = golden_dir().join(relative_path);
+        let bytes = fs::read(&path).unwrap_or_else(|err| {
+            panic!(
+                "wire-protocol conformance fixture missing: {}\ncaused by: {err}",
+                path.display()
+            )
+        });
+        let envelope = WireEnvelope::from_json(&bytes).unwrap_or_else(|err| {
+            panic!(
+                "wire-protocol fixture {} failed to decode through the production codec: {err}",
+                path.display()
+            )
+        });
+        assert_eq!(
+            envelope.version,
+            PROTOCOL_VERSION,
+            "wire-protocol fixture {} must remain on the pinned protocol version",
+            path.display()
+        );
+
+        let encoded = envelope
+            .to_json()
+            .unwrap_or_else(|err| panic!("failed to re-encode {}: {err}", path.display()));
+        assert_eq!(
+            bytes,
+            encoded,
+            "wire-protocol fixture {} must round-trip byte-identically through decode/encode",
+            path.display()
+        );
+    }
 }
