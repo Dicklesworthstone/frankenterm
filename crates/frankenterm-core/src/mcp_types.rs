@@ -3,6 +3,7 @@
 //! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
 
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 use crate::config::PaneFilterConfig;
 use crate::policy::{InjectionResult, PaneCapabilities};
@@ -11,6 +12,12 @@ use crate::storage::PaneRecord;
 use crate::wezterm::PaneInfo;
 
 pub(super) const MCP_VERSION: &str = "v1";
+
+fn redact_mcp_envelope_text(text: &str) -> String {
+    static REDACTOR: LazyLock<crate::redactor::Redactor> =
+        LazyLock::new(crate::redactor::Redactor::new);
+    REDACTOR.redact(text)
+}
 
 pub(super) fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -818,10 +825,12 @@ impl<T> McpEnvelope<T> {
         hint: Option<String>,
         elapsed_ms: u64,
     ) -> Self {
+        let msg = redact_mcp_envelope_text(&msg.into());
+        let hint = hint.map(|hint| redact_mcp_envelope_text(&hint));
         Self {
             ok: false,
             data: None,
-            error: Some(msg.into()),
+            error: Some(msg),
             error_code: Some(code.to_string()),
             hint,
             elapsed_ms,
@@ -1165,6 +1174,32 @@ mod tests {
         let envelope = McpEnvelope::<()>::error("FT-MCP-0005", "storage error", None, 0);
         assert!(!envelope.ok);
         assert!(envelope.hint.is_none());
+    }
+
+    #[test]
+    fn envelope_error_redacts_message_and_hint_secrets() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let envelope = McpEnvelope::<()>::error(
+            "FT-MCP-0001",
+            format!("Invalid params: invalid type: string \"{secret}\""),
+            Some(format!("Remove {secret} from the malformed field")),
+            0,
+        );
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(
+            !json.contains(&secret),
+            "MCP error envelope leaked caller-supplied secret"
+        );
+        assert!(
+            json.contains("[REDACTED]"),
+            "MCP error envelope should preserve a redaction marker"
+        );
     }
 
     #[test]
