@@ -790,6 +790,50 @@ fn aggregator_stale_session_pruning_uses_local_receive_clock_conformance() {
     assert_eq!(agg.total_rejected(), 1);
 }
 
+#[test]
+fn distributed_pruning_dedup_conformance() {
+    let mut agg = Aggregator::with_stale_after(2, 50);
+
+    assert!(matches!(
+        agg.ingest_envelope_at(gap_envelope(5, "agent-a"), 100)
+            .unwrap(),
+        IngestResult::Accepted(_)
+    ));
+    assert!(matches!(
+        agg.ingest_envelope_at(gap_envelope(5, "agent-b"), 120)
+            .unwrap(),
+        IngestResult::Accepted(_)
+    ));
+
+    let duplicate = agg
+        .ingest_envelope_at(gap_envelope(4, "agent-a"), 160)
+        .unwrap();
+    assert!(matches!(
+        duplicate,
+        IngestResult::Duplicate { ref sender, seq }
+            if sender == "agent-a" && seq == 4
+    ));
+    assert_eq!(agg.agent_last_seq("agent-a"), Some(5));
+    assert_eq!(agg.agent_last_seq("agent-b"), Some(5));
+
+    let blocked = agg
+        .ingest_envelope_at(gap_envelope(1, "agent-c"), 169)
+        .expect_err("duplicate receipt refreshed agent-a, and agent-b is still fresh");
+    assert!(matches!(blocked, WireProtocolError::TooManyAgents { .. }));
+
+    assert!(matches!(
+        agg.ingest_envelope_at(gap_envelope(1, "agent-c"), 190)
+            .unwrap(),
+        IngestResult::Accepted(_)
+    ));
+    assert_eq!(agg.agent_count(), 2);
+    assert_eq!(agg.agent_last_seq("agent-a"), Some(5));
+    assert_eq!(agg.agent_last_seq("agent-b"), None);
+    assert_eq!(agg.agent_last_seq("agent-c"), Some(1));
+    assert_eq!(agg.total_accepted(), 3);
+    assert_eq!(agg.total_rejected(), 1);
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
