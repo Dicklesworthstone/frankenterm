@@ -17,7 +17,7 @@ use crate::mcp_framework::{
 };
 
 use crate::context_horizon::predict_context_horizon_from_sqlite;
-use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_STORAGE};
+use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_STORAGE};
 use crate::proof_lane::{
     ProofHistoryArtifactInput, ProofHistoryIndex, ProofHistoryQuery, ProofReleaseScoreboard,
     ProofState,
@@ -45,13 +45,20 @@ const PROOF_HISTORY_RESOURCE_URI: &str = "wa://proof-history";
 const PROOF_HISTORY_RELEASE_BLOCKING_URI: &str = "wa://proof-history/release-blocking";
 
 fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
-    let text = contents
-        .into_iter()
-        .find_map(|content| match content {
-            Content::Text { text } => Some(text),
-            _ => None,
-        })
-        .ok_or_else(|| McpError::internal_error("Tool output missing text payload"))?;
+    let Some(text) = contents.into_iter().find_map(|content| match content {
+        Content::Text { text } => Some(text),
+        _ => None,
+    }) else {
+        return envelope_as_resource(
+            uri,
+            McpEnvelope::<()>::error(
+                MCP_ERR_INTERNAL,
+                "Tool output missing text payload",
+                Some("Expected MCP tool wrapper to return text JSON content.".to_string()),
+                0,
+            ),
+        );
+    };
 
     Ok(vec![ResourceContent {
         uri: uri.to_string(),
@@ -1581,9 +1588,30 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_as_resource_empty_returns_error() {
-        let result = tool_output_as_resource("wa://test", vec![]);
-        assert!(result.is_err());
+    fn tool_output_as_resource_missing_text_returns_error_envelope() {
+        let contents = vec![Content::Image {
+            data: "sk-ant-api03-resource-secret".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let result = tool_output_as_resource("wa://test", contents)
+            .expect("missing text payload should return an FT-MCP resource envelope");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, "wa://test");
+        assert_eq!(result[0].mime_type.as_deref(), Some("application/json"));
+        let payload: serde_json::Value =
+            serde_json::from_str(result[0].text.as_ref().expect("resource text"))
+                .expect("error envelope JSON");
+        assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["error_code"], crate::mcp_error::MCP_ERR_INTERNAL);
+        assert_eq!(
+            payload["error"].as_str(),
+            Some("Tool output missing text payload")
+        );
+        assert!(
+            !payload.to_string().contains("sk-ant-api03-"),
+            "non-text MCP resource payload leaked through error envelope"
+        );
     }
 
     // ========================================================================
