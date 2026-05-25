@@ -1839,6 +1839,55 @@ mod tests {
     }
 
     #[test]
+    fn resolve_resume_step_prefers_persisted_wait_for_progress() {
+        let record = crate::storage::WorkflowRecord {
+            id: "wf-wait-progress".to_string(),
+            workflow_name: "wait_progress".to_string(),
+            pane_id: 7,
+            trigger_event_id: None,
+            current_step: 4,
+            status: "running".to_string(),
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at: 1_000,
+            updated_at: 2_000,
+            completed_at: None,
+        };
+        let mut wait_log = make_step_log(3, "wait_for");
+        wait_log.id = 12;
+
+        assert_eq!(resolve_resume_step(&record, &[wait_log]), 4);
+    }
+
+    #[test]
+    fn resolve_resume_step_reexecutes_wait_for_when_still_waiting() {
+        let record = crate::storage::WorkflowRecord {
+            id: "wf-wait-still-waiting".to_string(),
+            workflow_name: "wait_progress".to_string(),
+            pane_id: 7,
+            trigger_event_id: None,
+            current_step: 4,
+            status: "waiting".to_string(),
+            wait_condition: Some(serde_json::json!({
+                "type": "sleep",
+                "duration_ms": 1
+            })),
+            context: None,
+            result: None,
+            error: None,
+            started_at: 1_000,
+            updated_at: 2_000,
+            completed_at: None,
+        };
+        let mut wait_log = make_step_log(3, "wait_for");
+        wait_log.id = 12;
+
+        assert_eq!(resolve_resume_step(&record, &[wait_log]), 3);
+    }
+
+    #[test]
     fn workflow_engine_resume_skips_failed_execution() {
         let (_dir, db_path) = temp_db_path();
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
