@@ -978,22 +978,24 @@ impl ResumeContext {
             .filter(|r| matches!(r.outcome, StepOutcome::Compensated { .. }))
             .map(|r| r.idem_key.step_id().to_string())
             .collect();
-        let remaining = plan
-            .steps
-            .iter()
-            .filter(|step| {
-                (!policy.skip_completed_on_resume || !completed.contains(&step.id))
-                    && !failed.contains(&step.id)
-                    && !compensated.contains(&step.id)
-            })
-            .map(|step| step.id.clone())
-            .collect::<Vec<_>>();
+        let remaining = if failed.is_empty() {
+            plan.steps
+                .iter()
+                .filter(|step| {
+                    (!policy.skip_completed_on_resume || !completed.contains(&step.id))
+                        && !compensated.contains(&step.id)
+                })
+                .map(|step| step.id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         let recommendation = if policy.require_chain_integrity && !verification.chain_intact {
             ResumeRecommendation::RestartFresh
         } else if ledger.phase().is_terminal() {
             ResumeRecommendation::AlreadyComplete
-        } else if !failed.is_empty() && ledger.phase() == TxPhase::Compensating {
+        } else if !failed.is_empty() {
             ResumeRecommendation::CompensateAndAbort
         } else if remaining.is_empty() && failed.is_empty() {
             ResumeRecommendation::AlreadyComplete
@@ -2444,12 +2446,137 @@ mod tests {
             .unwrap();
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
-        assert_eq!(
-            ctx.recommendation,
-            ResumeRecommendation::ContinueFromCheckpoint
-        );
+        assert_eq!(ctx.recommendation, ResumeRecommendation::CompensateAndAbort);
         assert!(ctx.remaining_steps.is_empty());
         assert_eq!(ctx.failed_steps, vec![plan.steps[0].id.clone()]);
+    }
+
+    #[test]
+    fn resume_context_replay_determinism_conformance_matrix() {
+        #[derive(Debug, Clone, Copy)]
+        enum OutcomeSpec {
+            Success,
+            Failed,
+            Skipped(&'static str),
+        }
+
+        #[derive(Debug)]
+        struct Case {
+            name: &'static str,
+            outcomes: &'static [OutcomeSpec],
+            expected_recommendation: ResumeRecommendation,
+            expected_remaining: usize,
+            expected_completed: usize,
+            expected_failed: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "partial_commit_failure_compensates_and_aborts",
+                outcomes: &[
+                    OutcomeSpec::Success,
+                    OutcomeSpec::Failed,
+                    OutcomeSpec::Skipped("commit_skipped_after_failure"),
+                ],
+                expected_recommendation: ResumeRecommendation::CompensateAndAbort,
+                expected_remaining: 0,
+                expected_completed: 1,
+                expected_failed: 1,
+            },
+            Case {
+                name: "pause_suspended_skips_remain_replayable",
+                outcomes: &[
+                    OutcomeSpec::Skipped("pause_suspended"),
+                    OutcomeSpec::Skipped("pause_suspended"),
+                    OutcomeSpec::Skipped("pause_suspended"),
+                ],
+                expected_recommendation: ResumeRecommendation::ContinueFromCheckpoint,
+                expected_remaining: 3,
+                expected_completed: 0,
+                expected_failed: 0,
+            },
+            Case {
+                name: "all_success_nonterminal_is_already_complete",
+                outcomes: &[
+                    OutcomeSpec::Success,
+                    OutcomeSpec::Success,
+                    OutcomeSpec::Success,
+                ],
+                expected_recommendation: ResumeRecommendation::AlreadyComplete,
+                expected_remaining: 0,
+                expected_completed: 3,
+                expected_failed: 0,
+            },
+        ];
+
+        for case in cases {
+            let plan = make_plan(case.outcomes.len());
+            let mut ledger = TxExecutionLedger::new("exec-1", "test-plan", plan.plan_hash);
+            ledger.transition_phase(TxPhase::Preparing).unwrap();
+            ledger.transition_phase(TxPhase::Committing).unwrap();
+
+            for (index, outcome) in case.outcomes.iter().copied().enumerate() {
+                let step = &plan.steps[index];
+                let outcome = match outcome {
+                    OutcomeSpec::Success => StepOutcome::Success {
+                        result: Some(case.name.to_string()),
+                    },
+                    OutcomeSpec::Failed => StepOutcome::Failed {
+                        error_code: "FTX3999".to_string(),
+                        error_message: "commit failed".to_string(),
+                        compensated: false,
+                    },
+                    OutcomeSpec::Skipped(reason) => StepOutcome::Skipped {
+                        reason: reason.to_string(),
+                    },
+                };
+
+                ledger
+                    .append(
+                        make_key("test-plan", &step.id),
+                        outcome,
+                        StepRisk::Low,
+                        "agent-a",
+                        1000 + u64::try_from(index).unwrap(),
+                    )
+                    .unwrap();
+            }
+
+            let replayed: TxExecutionLedger =
+                serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
+            let ctx = ResumeContext::from_ledger(&ledger, &plan);
+            let replayed_ctx = ResumeContext::from_ledger(&replayed, &plan);
+
+            assert_eq!(
+                serde_json::to_value(&ctx).unwrap(),
+                serde_json::to_value(&replayed_ctx).unwrap(),
+                "{}: resume context must be deterministic after ledger replay",
+                case.name
+            );
+            assert_eq!(
+                ctx.recommendation, case.expected_recommendation,
+                "{}: recommendation",
+                case.name
+            );
+            assert_eq!(
+                ctx.remaining_steps.len(),
+                case.expected_remaining,
+                "{}: remaining steps",
+                case.name
+            );
+            assert_eq!(
+                ctx.completed_steps.len(),
+                case.expected_completed,
+                "{}: completed steps",
+                case.name
+            );
+            assert_eq!(
+                ctx.failed_steps.len(),
+                case.expected_failed,
+                "{}: failed steps",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -3301,15 +3428,13 @@ mod tests {
             )
             .unwrap();
 
-        // Resume context: should continue.
+        // Resume context: recorded commit failures must compensate and abort,
+        // even if the crash happened before the phase transition was persisted.
         let ctx = store.resume_context("exec-1", &plan).unwrap();
-        assert_eq!(
-            ctx.recommendation,
-            ResumeRecommendation::ContinueFromCheckpoint
-        );
+        assert_eq!(ctx.recommendation, ResumeRecommendation::CompensateAndAbort);
         assert_eq!(ctx.completed_steps.len(), 1);
         assert_eq!(ctx.failed_steps.len(), 1);
-        assert_eq!(ctx.remaining_steps.len(), 1);
+        assert!(ctx.remaining_steps.is_empty());
     }
 
     #[test]
