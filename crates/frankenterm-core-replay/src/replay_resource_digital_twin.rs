@@ -122,6 +122,9 @@ impl PredictedLatencyStage {
         let Some(ratio) = ratio else {
             return (Self::Unknown, DecisionProvenance::Unknown);
         };
+        if !ratio.is_finite() {
+            return (Self::Shed, DecisionProvenance::Estimated);
+        }
         if ratio >= 2.0 {
             (Self::Shed, DecisionProvenance::Estimated)
         } else if ratio >= 1.35 {
@@ -1958,6 +1961,16 @@ author = "test"
 
     fn empty_package() -> ResourceControlOverridePackage {
         override_package("")
+    }
+
+    #[test]
+    fn non_finite_latency_ratios_shed() {
+        for ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let (stage, provenance) = PredictedLatencyStage::from_ratio(Some(ratio));
+
+            assert_eq!(stage, PredictedLatencyStage::Shed);
+            assert_eq!(provenance, DecisionProvenance::Estimated);
+        }
     }
 
     fn admission_step(
