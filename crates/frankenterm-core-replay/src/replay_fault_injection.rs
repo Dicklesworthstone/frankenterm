@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const MAX_DUPLICATE_COUNT: usize = 1_024;
+
 // ============================================================================
 // Seeded PRNG — SplitMix64 (no external deps)
 // ============================================================================
@@ -227,10 +229,17 @@ impl FaultSpec {
                         return Err(format!("fault {index} reorder window_size must be > 0"));
                     }
                 }
+                FaultType::Duplicate { count, .. } => {
+                    if *count == 0 || *count > MAX_DUPLICATE_COUNT {
+                        return Err(format!(
+                            "fault {index} duplicate count must be between 1 and {MAX_DUPLICATE_COUNT}"
+                        ));
+                    }
+                }
                 FaultType::Corrupt {
                     field, mutation, ..
                 } => validate_corrupt(index, field, mutation)?,
-                FaultType::Delay { .. } | FaultType::Duplicate { .. } => {}
+                FaultType::Delay { .. } => {}
             }
         }
 
@@ -849,6 +858,39 @@ pane_id = "p1"
 "#;
         let spec = FaultSpec::from_toml(toml).unwrap();
         assert_eq!(spec.faults[0].type_name(), "duplicate");
+    }
+
+    #[test]
+    fn parse_rejects_zero_duplicate_count() {
+        let toml = r#"
+name = "bad-dup-zero"
+seed = 1
+
+[[faults]]
+type = "duplicate"
+count = 0
+[faults.filter]
+"#;
+        let err = FaultSpec::from_toml(toml).unwrap_err();
+        assert!(err.contains("duplicate count"));
+    }
+
+    #[test]
+    fn parse_rejects_excessive_duplicate_count() {
+        let count = MAX_DUPLICATE_COUNT + 1;
+        let toml = format!(
+            r#"
+name = "bad-dup-large"
+seed = 1
+
+[[faults]]
+type = "duplicate"
+count = {count}
+[faults.filter]
+"#
+        );
+        let err = FaultSpec::from_toml(&toml).unwrap_err();
+        assert!(err.contains("duplicate count"));
     }
 
     #[test]
