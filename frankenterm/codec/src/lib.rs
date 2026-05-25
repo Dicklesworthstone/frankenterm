@@ -896,9 +896,9 @@ impl Pdu {
     }
 
     pub fn stream_decode(buffer: &mut Vec<u8>) -> anyhow::Result<Option<DecodedPdu>> {
-        if buffered_frame_len(buffer)?.is_none() {
+        let Some(_) = buffered_frame_len(buffer)? else {
             return Ok(None);
-        }
+        };
 
         let mut cursor = Cursor::new(buffer.as_slice());
         match Self::decode(&mut cursor) {
@@ -917,14 +917,6 @@ impl Pdu {
                 Ok(Some(decoded))
             }
             Err(err) => {
-                if let Some(ioerr) = err.root_cause().downcast_ref::<std::io::Error>() {
-                    match ioerr.kind() {
-                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::WouldBlock => {
-                            return Ok(None);
-                        }
-                        _ => {}
-                    }
-                }
                 log::error!("not an ioerror in stream_decode: {:?}", err);
                 Err(err)
             }
@@ -2293,6 +2285,31 @@ mod test {
         assert!(result.is_none());
         // Buffer should be preserved for future reads
         assert_eq!(buffer, vec![2u8]);
+    }
+
+    #[test]
+    fn stream_decode_rejects_complete_frame_with_truncated_inner_body() {
+        let mut buffer = Vec::new();
+        // tagged_len counts the complete outer frame: serial + ident + one
+        // payload byte. The payload byte starts an ErrorResponse string body
+        // that advertises five bytes, so the outer frame is complete but the
+        // inner varbincode body is malformed.
+        leb128::write::unsigned(&mut buffer, 3).unwrap();
+        leb128::write::unsigned(&mut buffer, 1).unwrap();
+        leb128::write::unsigned(&mut buffer, 0).unwrap();
+        buffer.push(5);
+        let original = buffer.clone();
+
+        let err = Pdu::stream_decode(&mut buffer)
+            .expect_err("complete malformed frame must not be treated as partial");
+        assert!(
+            !format!("{err:#}").is_empty(),
+            "malformed complete frame should return a useful error"
+        );
+        assert_eq!(
+            buffer, original,
+            "malformed complete frame must remain available for quarantine"
+        );
     }
 
     #[test]
