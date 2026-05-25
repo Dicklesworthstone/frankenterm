@@ -424,8 +424,11 @@ impl Surface {
     fn clear_eos(&mut self, color: ColorAttribute) {
         self.attributes = CellAttributes::default().set_background(color).clone();
         let cleared = Cell::new(' ', self.attributes.clone());
-        self.lines[self.ypos].fill_range(self.xpos..self.width, &cleared, self.seqno);
-        for line in &mut self.lines.iter_mut().skip(self.ypos + 1) {
+        let Some(line) = self.lines.get_mut(self.ypos) else {
+            return;
+        };
+        line.fill_range(self.xpos..self.width, &cleared, self.seqno);
+        for line in &mut self.lines.iter_mut().skip(self.ypos.saturating_add(1)) {
             line.fill_range(0..self.width, &cleared, self.seqno);
         }
     }
@@ -433,10 +436,15 @@ impl Surface {
     fn clear_eol(&mut self, color: ColorAttribute) {
         self.attributes = CellAttributes::default().set_background(color).clone();
         let cleared = Cell::new(' ', self.attributes.clone());
-        self.lines[self.ypos].fill_range(self.xpos..self.width, &cleared, self.seqno);
+        if let Some(line) = self.lines.get_mut(self.ypos) {
+            line.fill_range(self.xpos..self.width, &cleared, self.seqno);
+        }
     }
 
     fn scroll_screen_up(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
         self.lines.remove(0);
         self.lines.push(Line::with_width(self.width, self.seqno));
     }
@@ -478,20 +486,27 @@ impl Surface {
     }
 
     fn line_attribute(&mut self, attr: &LineAttribute) {
-        let line = &mut self.lines[self.ypos];
-        match attr {
-            LineAttribute::DoubleHeightTopHalfLine => line.set_double_height_top(self.seqno),
-            LineAttribute::DoubleHeightBottomHalfLine => line.set_double_height_bottom(self.seqno),
-            LineAttribute::DoubleWidthLine => line.set_double_width(self.seqno),
-            LineAttribute::SingleWidthLine => line.set_single_width(self.seqno),
+        if let Some(line) = self.lines.get_mut(self.ypos) {
+            match attr {
+                LineAttribute::DoubleHeightTopHalfLine => line.set_double_height_top(self.seqno),
+                LineAttribute::DoubleHeightBottomHalfLine => {
+                    line.set_double_height_bottom(self.seqno);
+                }
+                LineAttribute::DoubleWidthLine => line.set_double_width(self.seqno),
+                LineAttribute::SingleWidthLine => line.set_single_width(self.seqno),
+            }
         }
     }
 
     fn print_text(&mut self, text: &str) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+
         for g in Graphemes::new(text) {
             if g == "\r\n" {
                 self.xpos = 0;
-                let new_y = self.ypos + 1;
+                let new_y = self.ypos.saturating_add(1);
                 if new_y >= self.height {
                     self.scroll_screen_up();
                 } else {
@@ -506,7 +521,7 @@ impl Surface {
             }
 
             if g == "\n" {
-                let new_y = self.ypos + 1;
+                let new_y = self.ypos.saturating_add(1);
                 if new_y >= self.height {
                     self.scroll_screen_up();
                 } else {
@@ -516,7 +531,7 @@ impl Surface {
             }
 
             if self.xpos >= self.width {
-                let new_y = self.ypos + 1;
+                let new_y = self.ypos.saturating_add(1);
                 if new_y >= self.height {
                     self.scroll_screen_up();
                 } else {
@@ -538,7 +553,7 @@ impl Surface {
             // Increment the position now; we'll defer processing
             // wrapping until the next printed character, otherwise
             // we'll eagerly scroll when we reach the right margin.
-            self.xpos += width;
+            self.xpos = self.xpos.saturating_add(width);
         }
     }
 
@@ -2148,6 +2163,26 @@ mod test {
         assert_eq!(s.screen_chars_to_string(), "A\u{200b}B \n");
     }
 
+    #[test]
+    fn zero_sized_surface_text_is_noop() {
+        let mut s = Surface::new(0, 0);
+        s.add_change("x\r\ny");
+        assert_eq!(s.dimensions(), (0, 0));
+        assert_eq!(s.cursor_position(), (0, 0));
+        assert_eq!(s.screen_chars_to_string(), "");
+    }
+
+    #[test]
+    fn zero_height_surface_clear_and_line_attributes_are_noops() {
+        let mut s = Surface::new(2, 0);
+        s.add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+        s.add_change(Change::ClearToEndOfScreen(ColorAttribute::Default));
+        s.add_change(Change::LineAttribute(LineAttribute::DoubleWidthLine));
+        assert_eq!(s.dimensions(), (2, 0));
+        assert_eq!(s.cursor_position(), (0, 0));
+        assert_eq!(s.screen_chars_to_string(), "");
+    }
+
     #[cfg(feature = "use_image")]
     #[test]
     fn images() {
@@ -2773,11 +2808,9 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::Title("myterm".to_string()));
         let (_seq, changes) = s.get_changes(0);
-        assert!(
-            changes
-                .iter()
-                .any(|c| matches!(c, Change::Title(t) if t == "myterm"))
-        );
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::Title(t) if t == "myterm")));
     }
 
     // === repaint includes cursor shape ===
@@ -2787,11 +2820,9 @@ mod test {
         let mut s = Surface::new(3, 1);
         s.add_change(Change::CursorShape(CursorShape::SteadyUnderline));
         let (_seq, changes) = s.get_changes(0);
-        assert!(
-            changes
-                .iter()
-                .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline)))
-        );
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline))));
     }
 
     // === hidden cursor not shown in repaint ===
