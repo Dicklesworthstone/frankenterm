@@ -521,7 +521,17 @@ pub fn is_safe_repo_relative_path(path: &str) -> bool {
     }
 
     path.split('/').all(|segment| {
-        !segment.is_empty() && segment != "." && segment != ".." && segment != ".git"
+        // `.git` is rejected case-INSENSITIVELY: the primary target platform
+        // (macOS, default APFS/HFS+) is case-insensitive, so `.GIT` / `.Git` /
+        // `.giT` all resolve to the same `.git` directory and would otherwise
+        // bypass this guard and let a "repo-relative" path reach the git dir.
+        // Git itself reject .git case-insensitively for the same reason. Only
+        // the exact `.git` dir is blocked — `.gitignore` / `.gitattributes`
+        // stay allowed (eq_ignore_ascii_case matches the whole segment).
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && !segment.eq_ignore_ascii_case(".git")
     })
 }
 
@@ -565,6 +575,39 @@ mod tests {
         assert!(is_safe_repo_relative_path(
             "fixtures/mission-twin/snapshot/valid/healthy.json"
         ));
+    }
+
+    // Fail-open guard: `.git` must be rejected case-insensitively. The target
+    // platform (macOS) uses a case-insensitive filesystem by default, so `.GIT`
+    // and friends resolve to the real `.git` dir; a case-sensitive check would
+    // let them through. Legitimate dotfiles like `.gitignore` must still pass.
+    #[test]
+    fn safe_repo_relative_path_rejects_git_dir_case_insensitively() {
+        for path in [
+            "fixtures/.GIT/config",
+            "fixtures/.Git/hooks/pre-commit",
+            "fixtures/.giT/index",
+            ".GIT/config",
+            "a/b/.GIT",
+        ] {
+            assert!(
+                !is_safe_repo_relative_path(path),
+                "case variant of .git must be rejected: {path}"
+            );
+        }
+
+        // Exact-only: `.git`-prefixed dotfiles are legitimate and must pass.
+        for path in [
+            "fixtures/.gitignore",
+            "fixtures/.gitattributes",
+            ".gitignore",
+            "fixtures/.GITIGNORE",
+        ] {
+            assert!(
+                is_safe_repo_relative_path(path),
+                ".git-prefixed dotfile must remain allowed: {path}"
+            );
+        }
     }
 
     #[test]
