@@ -52,6 +52,11 @@ fn golden_path() -> PathBuf {
         .join("../../tests/golden/replay/cross_arch_decision_matrix.json")
 }
 
+fn decision_graph_roundtrip_golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/replay/decision_graph_roundtrip.v1.json")
+}
+
 fn representative_events(target_triple: &str) -> Vec<DecisionEvent> {
     let mut events = vec![
         decision(
@@ -248,6 +253,11 @@ fn read_golden() -> String {
     fs::read_to_string(golden_path()).expect("golden matrix fixture is checked in")
 }
 
+fn read_decision_graph_roundtrip_golden() -> String {
+    fs::read_to_string(decision_graph_roundtrip_golden_path())
+        .expect("decision graph round-trip fixture is checked in")
+}
+
 #[test]
 fn golden_matrix_replay_output_is_byte_identical_across_arches() {
     if let Ok(ci_target) = std::env::var("FT_REPLAY_GOLDEN_MATRIX_TARGET") {
@@ -264,4 +274,51 @@ fn golden_matrix_replay_output_is_byte_identical_across_arches() {
     }
 
     assert_eq!(read_golden(), actual, "golden fixture drifted: {path:?}");
+}
+
+#[test]
+fn decision_graph_json_roundtrip_matches_golden_artifact() {
+    let graph = DecisionGraph::from_decisions(&representative_events(TARGETS[0]));
+    let actual = graph.to_json() + "\n";
+    let path = decision_graph_roundtrip_golden_path();
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        fs::write(&path, &actual).expect("decision graph golden fixture can be updated");
+    }
+
+    assert_eq!(
+        read_decision_graph_roundtrip_golden(),
+        actual,
+        "decision graph golden fixture drifted: {path:?}"
+    );
+
+    let restored = DecisionGraph::from_json(&actual).expect("golden graph JSON round-trips");
+    assert!(graph.l1_equivalent(&restored));
+    assert_eq!(restored.node_count(), 5);
+    assert_eq!(restored.edge_count(), 6);
+    assert!(restored.is_dag());
+    assert_eq!(
+        restored
+            .roots()
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect::<Vec<_>>(),
+        vec![0, 3]
+    );
+    assert_eq!(
+        restored
+            .causal_chain(4)
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        restored
+            .effects(0)
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 4]
+    );
+    assert_eq!(restored.to_json() + "\n", actual);
 }
