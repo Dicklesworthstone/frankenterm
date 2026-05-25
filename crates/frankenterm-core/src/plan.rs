@@ -4764,8 +4764,22 @@ impl Mission {
         let from = self.lifecycle_state;
         // Resume restores the pre-pause state from the checkpoint.
         let to = if let Some(cp) = &self.pause_resume_state.current_checkpoint {
+            if self.lifecycle_state != MissionLifecycleState::Paused {
+                return Err(MissionLifecycleError::InvalidTransition {
+                    from: self.lifecycle_state,
+                    transition: MissionLifecycleTransitionKind::ResumeRequested,
+                });
+            }
+            cp.paused_from_state
+                .apply_transition(MissionLifecycleTransitionKind::ExecutionBlocked)?;
             cp.paused_from_state
         } else {
+            if self.lifecycle_state == MissionLifecycleState::Paused {
+                return Err(MissionLifecycleError::InvalidTransition {
+                    from: self.lifecycle_state,
+                    transition: MissionLifecycleTransitionKind::ResumeRequested,
+                });
+            }
             // No checkpoint = use standard Unblock transition as fallback
             self.lifecycle_state
                 .apply_transition(MissionLifecycleTransitionKind::RetryResumed)?

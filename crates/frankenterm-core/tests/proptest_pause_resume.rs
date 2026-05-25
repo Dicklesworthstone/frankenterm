@@ -56,6 +56,33 @@ fn arb_terminal_state() -> impl Strategy<Value = MissionLifecycleState> {
     ]
 }
 
+fn arb_not_paused_state() -> impl Strategy<Value = MissionLifecycleState> {
+    prop_oneof![
+        Just(MissionLifecycleState::Planning),
+        Just(MissionLifecycleState::Planned),
+        Just(MissionLifecycleState::Dispatching),
+        Just(MissionLifecycleState::AwaitingApproval),
+        Just(MissionLifecycleState::Running),
+        Just(MissionLifecycleState::Executing),
+        Just(MissionLifecycleState::RetryPending),
+        Just(MissionLifecycleState::Blocked),
+        Just(MissionLifecycleState::Completed),
+        Just(MissionLifecycleState::Failed),
+        Just(MissionLifecycleState::Cancelled),
+    ]
+}
+
+fn arb_non_pausable_resume_origin() -> impl Strategy<Value = MissionLifecycleState> {
+    prop_oneof![
+        Just(MissionLifecycleState::Planning),
+        Just(MissionLifecycleState::Planned),
+        Just(MissionLifecycleState::Paused),
+        Just(MissionLifecycleState::Completed),
+        Just(MissionLifecycleState::Failed),
+        Just(MissionLifecycleState::Cancelled),
+    ]
+}
+
 fn arb_non_empty_string() -> impl Strategy<Value = String> {
     "[a-z][a-z0-9_]{0,15}".prop_map(|s| s)
 }
@@ -184,6 +211,64 @@ proptest! {
 
         mission.resume_mission("op", "test", resume_ts, None).unwrap();
         prop_assert_eq!(mission.lifecycle_state, state);
+    }
+
+    #[test]
+    fn resume_rejects_stale_checkpoint_when_not_paused(
+        state in arb_not_paused_state(),
+    ) {
+        let mut mission = make_mission(state, 0);
+        mission.pause_resume_state.current_checkpoint = Some(MissionCheckpoint {
+            checkpoint_id: "cp-stale".into(),
+            paused_from_state: MissionLifecycleState::Running,
+            paused_by: "op".into(),
+            reason_code: "stale_checkpoint".into(),
+            paused_at_ms: 2_000,
+            resumed_at_ms: None,
+            resumed_by: None,
+            assignment_entries: Vec::new(),
+            correlation_id: None,
+        });
+
+        let result = mission.resume_mission("op", "resume", 3_000, None);
+        prop_assert!(result.is_err());
+        prop_assert_eq!(mission.lifecycle_state, state);
+        prop_assert!(mission.pause_resume_state.current_checkpoint.is_some());
+        prop_assert_eq!(mission.pause_resume_state.total_resume_count, 0);
+    }
+
+    #[test]
+    fn resume_rejects_non_pausable_checkpoint_origin(
+        origin in arb_non_pausable_resume_origin(),
+    ) {
+        let mut mission = make_mission(MissionLifecycleState::Paused, 0);
+        mission.pause_resume_state.current_checkpoint = Some(MissionCheckpoint {
+            checkpoint_id: "cp-invalid-origin".into(),
+            paused_from_state: origin,
+            paused_by: "op".into(),
+            reason_code: "invalid_origin".into(),
+            paused_at_ms: 2_000,
+            resumed_at_ms: None,
+            resumed_by: None,
+            assignment_entries: Vec::new(),
+            correlation_id: None,
+        });
+
+        let result = mission.resume_mission("op", "resume", 3_000, None);
+        prop_assert!(result.is_err());
+        prop_assert_eq!(mission.lifecycle_state, MissionLifecycleState::Paused);
+        prop_assert!(mission.pause_resume_state.current_checkpoint.is_some());
+        prop_assert_eq!(mission.pause_resume_state.total_resume_count, 0);
+    }
+
+    #[test]
+    fn resume_rejects_paused_state_without_checkpoint(_case in 0u8..1) {
+        let mut mission = make_mission(MissionLifecycleState::Paused, 0);
+
+        let result = mission.resume_mission("op", "resume", 3_000, None);
+        prop_assert!(result.is_err());
+        prop_assert_eq!(mission.lifecycle_state, MissionLifecycleState::Paused);
+        prop_assert_eq!(mission.pause_resume_state.total_resume_count, 0);
     }
 
     #[test]
