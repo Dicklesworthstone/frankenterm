@@ -437,11 +437,20 @@ pub fn compile_tx_plan(
 
 /// Classify risk based on tags and score.
 fn classify_risk(tags: &[String], score: f64) -> StepRisk {
-    if tags.iter().any(|t| t == "critical" || t == "destructive") {
-        return StepRisk::Critical;
-    }
-    if tags.iter().any(|t| t == "risky" || t == "unsafe") {
-        return StepRisk::High;
+    for tag in tags {
+        let normalized = tag.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "critical" | "destructive" => return StepRisk::Critical,
+            "risky"
+            | "unsafe"
+            | "high-risk"
+            | "danger"
+            | "dangerous"
+            | "approval"
+            | "requires-approval"
+            | "requires-operator-approval" => return StepRisk::High,
+            _ => {}
+        }
     }
     if score < 0.3 {
         return StepRisk::High;
@@ -1049,6 +1058,28 @@ mod tests {
         let plan = compile_tx_plan("p1", &assignments, &config);
         assert_eq!(plan.steps[0].risk, StepRisk::High);
         assert!(!plan.steps[0].compensations.is_empty());
+    }
+
+    #[test]
+    fn compile_mission_risk_label_variants_auto_compensate() {
+        for tag in [
+            "high-risk",
+            "high_risk",
+            "danger",
+            "dangerous",
+            "approval",
+            "requires-approval",
+            "requires-operator-approval",
+            "RISKY",
+        ] {
+            let assignments = vec![assignment_with_tags("b1", "a1", 0.9, &[tag])];
+            let plan = compile_tx_plan("p1", &assignments, &CompilerConfig::default());
+            assert_eq!(plan.steps[0].risk, StepRisk::High, "tag={tag}");
+            assert!(
+                !plan.steps[0].compensations.is_empty(),
+                "mission risky label {tag:?} must get automatic compensation"
+            );
+        }
     }
 
     #[test]
