@@ -906,6 +906,22 @@ impl CommandGuard {
         self.policy.pane_overrides.insert(pane_id, config);
     }
 
+    /// Drop all per-pane guard state for the given pane.
+    ///
+    /// Both `policy.pane_overrides` (set explicitly) and the lazy
+    /// `pane_allowlists` regex cache (populated on `evaluate`) are keyed by
+    /// `pane_id` and are otherwise long-lived, so without this hook a
+    /// high-churn fleet accumulates one stale entry per closed pane forever.
+    /// Callers should invoke this from their `PaneDestroyed` teardown, mirroring
+    /// `RateLimiter::remove_pane` (ft-yjt9e) and the agent-correlator /
+    /// bayesian-ledger per-pane cleanups. Returns `true` if any per-pane state
+    /// was actually removed.
+    pub fn remove_pane(&mut self, pane_id: u64) -> bool {
+        let had_override = self.policy.pane_overrides.remove(&pane_id).is_some();
+        let had_allowlist = self.pane_allowlists.remove(&pane_id).is_some();
+        had_override || had_allowlist
+    }
+
     /// List available security pack IDs.
     #[must_use]
     pub fn available_packs() -> Vec<&'static str> {
@@ -2170,5 +2186,47 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: CommandGuardTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn command_guard_remove_pane_drops_per_pane_state() {
+        // Regression for the per-pane-map leak class (mirrors
+        // RateLimiter::remove_pane / ft-yjt9e). Both pane_overrides and the lazy
+        // pane_allowlists regex cache are pane_id-keyed and long-lived;
+        // remove_pane must evict both so a closed pane leaves no residual entry
+        // under fleet churn.
+        let mut guard = CommandGuard::new(GuardPolicy::default());
+        let pane = 42u64;
+        guard.set_pane_config(
+            pane,
+            PaneGuardConfig {
+                allowlist_patterns: vec!["^ls".to_string()],
+                ..PaneGuardConfig::default()
+            },
+        );
+        // Evaluate to lazily populate the pane_allowlists regex cache.
+        let _ = guard.evaluate("ls -la", pane);
+        assert!(guard.policy.pane_overrides.contains_key(&pane));
+        assert!(
+            guard.pane_allowlists.contains_key(&pane),
+            "evaluate should have populated the lazy allowlist cache"
+        );
+
+        assert!(
+            guard.remove_pane(pane),
+            "remove_pane should report that per-pane state was removed"
+        );
+        assert!(
+            !guard.policy.pane_overrides.contains_key(&pane),
+            "pane_overrides entry leaked after remove_pane"
+        );
+        assert!(
+            !guard.pane_allowlists.contains_key(&pane),
+            "pane_allowlists cache entry leaked after remove_pane"
+        );
+        assert!(
+            !guard.remove_pane(pane),
+            "second remove_pane for the same pane must be a no-op"
+        );
     }
 }
