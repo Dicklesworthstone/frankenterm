@@ -2842,6 +2842,65 @@ mod tests {
         });
     }
 
+    /// Forensic conservation invariant (br-ft-2z16v / br-ft-8cyii) across a
+    /// MIXED workload that exercises all three terminal outcomes in one bus:
+    ///   events_published == events_delivered
+    ///                       + events_dropped_no_subscribers
+    ///                       + events_dropped_dedup
+    /// The neighboring inline tests each assert a single outcome in isolation;
+    /// none publishes a stream spanning delivered + deduped + no-subscriber and
+    /// checks the sum closes. A regression in any one of the three counter-bump
+    /// sites in `publish` would leave the equation unbalanced — this pins it.
+    #[test]
+    fn metrics_conservation_holds_across_mixed_outcomes() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            // Only a delta subscriber exists: `all_sender` and `signal_sender`
+            // have zero receivers for the duration of the test.
+            let mut delta_sub = bus.subscribe_deltas();
+
+            // (1) DELIVERED: a delta event reaches the delta subscriber.
+            let delivered = bus.publish(Event::SegmentCaptured {
+                pane_id: 5,
+                seq: 1,
+                content_len: 10,
+            });
+            assert_eq!(delivered, 1, "first delta is delivered to the subscriber");
+
+            // (2) DEDUP DROP: the identical delta (same dedup key
+            // `segment:5:1:10`) is rejected by the cuckoo gate before any send.
+            let deduped = bus.publish(Event::SegmentCaptured {
+                pane_id: 5,
+                seq: 1,
+                content_len: 10,
+            });
+            assert_eq!(deduped, 0, "duplicate delta is dropped by the dedup gate");
+
+            // (3) NO-SUBSCRIBER DROP: a signal event has no matching subscriber.
+            let unrouted = bus.publish(Event::PaneDisappeared { pane_id: 7 });
+            assert_eq!(unrouted, 0, "signal event with no subscriber is dropped");
+
+            let m = bus.metrics().snapshot();
+            assert_eq!(m.events_published, 3, "every publish call counts as published");
+            assert_eq!(m.events_delivered, 1);
+            assert_eq!(m.events_dropped_dedup, 1);
+            assert_eq!(m.events_dropped_no_subscribers, 1);
+
+            // The closed forensic invariant in event-units.
+            assert_eq!(
+                m.events_published,
+                m.events_delivered
+                    + m.events_dropped_no_subscribers
+                    + m.events_dropped_dedup,
+                "conservation: published must equal delivered + no_subscriber + dedup drops"
+            );
+
+            // Drain the one delivered event so the subscriber isn't seen as lagged.
+            let event = delta_sub.recv().await.unwrap();
+            assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, seq: 1, .. }));
+        });
+    }
+
     #[test]
     fn delta_event_bus_cuckoo_dedup_suppresses_duplicate_delta_events() {
         run_async_test(async {
