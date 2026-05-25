@@ -1064,6 +1064,13 @@ impl Mux {
 
     pub fn unregister_client(&self, client_id: &ClientId) {
         self.clients.write().remove(client_id);
+        let mut identity = self.identity.write();
+        if identity
+            .as_ref()
+            .is_some_and(|ident| ident.as_ref() == client_id)
+        {
+            *identity = None;
+        }
     }
 
     pub fn subscribe<F>(&self, subscriber: F) -> usize
@@ -2554,6 +2561,30 @@ mod tests {
             clients[unrelated_client.as_ref()].focused_pane_id,
             Some(8),
             "removing one pane must not clear client focus for unrelated panes",
+        );
+    }
+
+    #[test]
+    fn unregister_client_discards_removed_active_identity() {
+        let mux = Mux::new(None);
+        let removed_client = Arc::new(ClientId::new());
+        let retained_client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&removed_client));
+        mux.register_client(Arc::clone(&retained_client));
+
+        mux.replace_identity(Some(Arc::clone(&retained_client)));
+        mux.unregister_client(&removed_client);
+        assert_eq!(
+            mux.active_identity().as_deref(),
+            Some(retained_client.as_ref()),
+            "unregistering one client must not clear an unrelated active identity",
+        );
+
+        mux.unregister_client(&retained_client);
+        assert_eq!(
+            mux.active_identity(),
+            None,
+            "unregister_client must not leave a dead client id as the active identity",
         );
     }
 
