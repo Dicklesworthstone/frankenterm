@@ -1497,6 +1497,51 @@ mod tests {
         assert_eq!(bucket.available(4000), 5);
     }
 
+    /// Exactness regression: refill advances `last_refill_ms` by whole intervals
+    /// only, preserving the sub-interval remainder. A naive refill that reset
+    /// `last_refill_ms = now_ms` whenever it added tokens would discard that
+    /// remainder and under-deliver tokens for off-boundary call patterns.
+    #[test]
+    fn token_bucket_refill_preserves_sub_interval_remainder() {
+        let config = TokenBucketConfig {
+            capacity: 1000,
+            refill_rate: 10,
+            refill_interval_ms: 1000,
+        };
+        let mut bucket = TokenBucket::with_initial(config, 0, 0);
+
+        // First refill observed off-boundary at t=1900: exactly one whole
+        // interval elapsed (floor(1900/1000) = 1), so +10. The correct impl
+        // sets last_refill_ms to 1000 (the interval boundary), keeping the
+        // 900ms remainder; a `last_refill = now` impl would move it to 1900.
+        assert_eq!(bucket.available(1900), 10, "one full interval => +10");
+
+        // By t=2100, total elapsed spans two interval boundaries (1000, 2000),
+        // i.e. floor(2100/1000) = 2 intervals => 20 tokens. A refill that lost
+        // the 900ms remainder at t=1900 would see only 200ms since its last
+        // refill and still report 10 — this assertion fails under that bug.
+        assert_eq!(
+            bucket.available(2100),
+            20,
+            "second interval boundary crossed; remainder must not be lost"
+        );
+
+        // Token conservation over an arbitrary long off-boundary jump: total
+        // tokens added equals floor(total_elapsed / interval) * rate (capacity
+        // is large enough not to clamp here).
+        let mut fresh = TokenBucket::with_initial(
+            TokenBucketConfig {
+                capacity: 10_000,
+                refill_rate: 7,
+                refill_interval_ms: 250,
+            },
+            0,
+            0,
+        );
+        // t = 9_999 ms => floor(9999/250) = 39 intervals => 39*7 = 273 tokens.
+        assert_eq!(fresh.available(9_999), 39 * 7, "token count must equal whole-interval refills");
+    }
+
     #[test]
     fn token_bucket_consume_n() {
         let config = TokenBucketConfig {
