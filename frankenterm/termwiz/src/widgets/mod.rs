@@ -354,6 +354,7 @@ impl<'widget> Ui<'widget> {
     }
 
     pub fn add<W: Widget + 'widget>(&mut self, parent: Option<WidgetId>, w: W) -> WidgetId {
+        let parent = parent.filter(|parent| self.graph.children.contains_key(parent));
         let id = self.graph.add(parent);
 
         self.render.insert(
@@ -1347,6 +1348,23 @@ mod test {
         })));
 
         ui.process_event_queue().unwrap();
+        assert_eq!(ui.focused, Some(root));
+    }
+
+    #[test]
+    fn add_child_with_foreign_parent_does_not_panic_or_retain_orphan() {
+        let mut ui = Ui::new();
+        let root = ui.set_root(PaintCell);
+
+        let orphan = ui.add_child(WidgetId::new(), PaintCell);
+        assert!(ui.render.contains_key(&orphan));
+        assert!(!ui.graph.parent.contains_key(&orphan));
+        assert_eq!(ui.focused, Some(root));
+
+        let mut surface = Surface::new(2, 1);
+        ui.render_to_screen(&mut surface).unwrap();
+
+        assert!(!ui.render.contains_key(&orphan));
         assert_eq!(ui.focused, Some(root));
     }
 
