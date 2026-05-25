@@ -103,10 +103,53 @@ pub enum SpeedArg {
     /// As fast as possible.
     Instant,
     /// Custom multiplier.
-    Custom(f64),
+    Custom(SpeedMultiplier),
+}
+
+/// Positive finite playback multiplier for custom replay speeds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct SpeedMultiplier(f64);
+
+impl SpeedMultiplier {
+    /// Create a custom speed multiplier.
+    pub fn new(multiplier: f64) -> Result<Self, String> {
+        if multiplier.is_finite() && multiplier > 0.0 {
+            Ok(Self(multiplier))
+        } else {
+            Err(format!(
+                "custom speed multiplier must be positive and finite, got {multiplier}"
+            ))
+        }
+    }
+
+    /// Return the raw multiplier value.
+    #[must_use]
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for SpeedMultiplier {
+    type Error = String;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<SpeedMultiplier> for f64 {
+    fn from(value: SpeedMultiplier) -> Self {
+        value.get()
+    }
 }
 
 impl SpeedArg {
+    /// Create a validated custom speed argument.
+    pub fn custom(multiplier: f64) -> Result<Self, String> {
+        SpeedMultiplier::new(multiplier).map(Self::Custom)
+    }
+
     /// Get the speed multiplier.
     #[must_use]
     pub fn multiplier(self) -> f64 {
@@ -114,7 +157,7 @@ impl SpeedArg {
             Self::Normal => 1.0,
             Self::Double => 2.0,
             Self::Instant => f64::INFINITY,
-            Self::Custom(m) => m,
+            Self::Custom(m) => m.get(),
         }
     }
 
@@ -124,11 +167,14 @@ impl SpeedArg {
             "1x" | "1" | "normal" => Ok(Self::Normal),
             "2x" | "2" | "double" => Ok(Self::Double),
             "instant" | "inf" => Ok(Self::Instant),
-            other => other
-                .trim_end_matches('x')
-                .parse::<f64>()
-                .map(Self::Custom)
-                .map_err(|_| format!("invalid speed: {}", other)),
+            other => {
+                let multiplier = other
+                    .trim_end_matches('x')
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid speed: {other}"))?;
+                Self::custom(multiplier)
+                    .map_err(|reason| format!("invalid speed: {other}: {reason}"))
+            }
         }
     }
 }
@@ -477,11 +523,8 @@ mod tests {
     #[test]
     fn speed_parse_custom() {
         let s = SpeedArg::from_str_arg("4x").unwrap();
-        if let SpeedArg::Custom(m) = s {
-            assert!((m - 4.0).abs() < f64::EPSILON);
-        } else {
-            panic!("expected Custom");
-        }
+        assert!(matches!(s, SpeedArg::Custom(_)));
+        assert!((s.multiplier() - 4.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -490,11 +533,21 @@ mod tests {
     }
 
     #[test]
+    fn speed_parse_rejects_non_positive_and_non_finite_custom() {
+        for value in ["0", "0x", "-1", "-2x", "NaN", "nan", "+inf", "infinity"] {
+            assert!(
+                SpeedArg::from_str_arg(value).is_err(),
+                "custom speed must reject {value}"
+            );
+        }
+    }
+
+    #[test]
     fn speed_multiplier() {
         assert!((SpeedArg::Normal.multiplier() - 1.0).abs() < f64::EPSILON);
         assert!((SpeedArg::Double.multiplier() - 2.0).abs() < f64::EPSILON);
         assert!(SpeedArg::Instant.multiplier().is_infinite());
-        assert!((SpeedArg::Custom(3.5).multiplier() - 3.5).abs() < f64::EPSILON);
+        assert!((SpeedArg::custom(3.5).unwrap().multiplier() - 3.5).abs() < f64::EPSILON);
     }
 
     // ── EquivalenceLevelArg ───────────────────────────────────────────
@@ -762,10 +815,20 @@ mod tests {
             SpeedArg::Normal,
             SpeedArg::Double,
             SpeedArg::Instant,
-            SpeedArg::Custom(3.5),
+            SpeedArg::custom(3.5).unwrap(),
         ] {
             let json = serde_json::to_string(sa).unwrap();
             let _restored: SpeedArg = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn speed_arg_serde_rejects_invalid_custom_multiplier() {
+        for json in [r#"{"Custom":0.0}"#, r#"{"Custom":-1.0}"#] {
+            assert!(
+                serde_json::from_str::<SpeedArg>(json).is_err(),
+                "invalid custom speed JSON must be rejected: {json}"
+            );
         }
     }
 

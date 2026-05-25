@@ -40,9 +40,9 @@ fn arb_speed_arg() -> impl Strategy<Value = SpeedArg> {
         Just(SpeedArg::Normal),
         Just(SpeedArg::Double),
         Just(SpeedArg::Instant),
-        (0.0f64..100.0f64)
+        (0.000_001f64..100.0f64)
             .prop_filter("finite custom speed", |v| v.is_finite())
-            .prop_map(SpeedArg::Custom),
+            .prop_map(|multiplier| SpeedArg::custom(multiplier).unwrap()),
     ]
 }
 
@@ -176,7 +176,9 @@ proptest! {
         let json = serde_json::to_string(&speed).unwrap();
         let back: SpeedArg = serde_json::from_str(&json).unwrap();
         match (speed, back) {
-            (SpeedArg::Custom(a), SpeedArg::Custom(b)) => prop_assert!((a - b).abs() < 1e-10),
+            (SpeedArg::Custom(a), SpeedArg::Custom(b)) => {
+                prop_assert!((a.get() - b.get()).abs() < 1e-10);
+            }
             (lhs, rhs) => prop_assert_eq!(lhs, rhs),
         }
     }
@@ -187,11 +189,13 @@ proptest! {
             SpeedArg::Normal => "1x".to_string(),
             SpeedArg::Double => "2x".to_string(),
             SpeedArg::Instant => "instant".to_string(),
-            SpeedArg::Custom(multiplier) => format!("{multiplier}x"),
+            SpeedArg::Custom(multiplier) => format!("{}x", multiplier.get()),
         };
         let parsed = SpeedArg::from_str_arg(&text).unwrap();
         match (speed, parsed) {
-            (SpeedArg::Custom(a), SpeedArg::Custom(b)) => prop_assert!((a - b).abs() < 1e-10),
+            (SpeedArg::Custom(a), SpeedArg::Custom(b)) => {
+                prop_assert!((a.get() - b.get()).abs() < 1e-10);
+            }
             (lhs, rhs) => prop_assert_eq!(lhs, rhs),
         }
     }
