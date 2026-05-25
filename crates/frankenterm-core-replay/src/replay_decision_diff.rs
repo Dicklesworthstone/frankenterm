@@ -25,7 +25,7 @@ pub enum DivergenceType {
     Added,
     /// Decision exists in baseline but not in candidate.
     Removed,
-    /// Same position but different output_hash.
+    /// Same matched decision slot but different decision content.
     Modified,
     /// Same decision but shifted in time (within tolerance).
     Shifted,
@@ -77,7 +77,7 @@ pub enum RootCause {
 pub enum EquivalenceLevel {
     /// L0: Same event structure (types and counts match).
     L0,
-    /// L1: Same decisions (output_hash matches, ignoring timing).
+    /// L1: Same decisions (definition/input/output match, ignoring timing).
     L1,
     /// L2: Exact match (including timing).
     L2,
@@ -253,11 +253,11 @@ impl DecisionDiff {
             if let Some(cand_node) = cand_exact.get(exact_key) {
                 // Exact match on key.
                 matched_cand.insert(exact_key.clone());
-                if node.output_hash == cand_node.output_hash {
+                if node.l1_equivalent(cand_node) {
                     // Unchanged.
                     unchanged += 1;
                 } else {
-                    // Modified: same position, different output.
+                    // Modified: same position, different decision content.
                     let root_cause = if config.attribute_root_causes {
                         attribute_modified(node, cand_node)
                     } else {
@@ -810,7 +810,7 @@ fn best_relaxed_match<'a>(
     matched_cand: &BTreeSet<ExactKey>,
     baseline: &DecisionNode,
     config: &DiffConfig,
-    require_same_output: bool,
+    require_same_decision: bool,
 ) -> Option<&'a (ExactKey, &'a DecisionNode)> {
     candidates
         .iter()
@@ -819,7 +819,7 @@ fn best_relaxed_match<'a>(
             delta > 0
                 && delta <= config.time_tolerance_ms
                 && !matched_cand.contains(cand_key)
-                && (!require_same_output || candidate.output_hash == baseline.output_hash)
+                && (!require_same_decision || same_decision_ignoring_timing(baseline, candidate))
         })
         .min_by_key(|(cand_key, candidate)| {
             (
@@ -827,6 +827,15 @@ fn best_relaxed_match<'a>(
                 cand_key.clone(),
             )
         })
+}
+
+fn same_decision_ignoring_timing(baseline: &DecisionNode, candidate: &DecisionNode) -> bool {
+    baseline.decision_type == candidate.decision_type
+        && baseline.rule_id == candidate.rule_id
+        && baseline.definition_hash == candidate.definition_hash
+        && baseline.input_hash == candidate.input_hash
+        && baseline.output_hash == candidate.output_hash
+        && baseline.pane_id == candidate.pane_id
 }
 
 /// Attribute root cause for a Modified divergence.
@@ -1214,6 +1223,44 @@ mod tests {
     }
 
     #[test]
+    fn shifted_with_definition_change_same_output_is_modified_not_l1_equivalent() {
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def_v1",
+            "out_stable",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            150,
+            1,
+            "def_v2",
+            "out_stable",
+        )];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.shifted, 0);
+        assert_eq!(diff.summary.modified, 1);
+        assert_eq!(diff.summary.added, 0);
+        assert_eq!(diff.summary.removed, 0);
+        assert!(diff.is_equivalent(EquivalenceLevel::L0));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+        assert_eq!(
+            diff.divergences[0].divergence_type,
+            DivergenceType::Modified
+        );
+        assert!(matches!(
+            &diff.divergences[0].root_cause,
+            RootCause::RuleDefinitionChange { rule_id, .. } if rule_id == "r1"
+        ));
+    }
+
+    #[test]
     fn shifted_prefers_same_output_before_nearer_changed_output() {
         let base_events = vec![make_event(
             DecisionType::PatternMatch,
@@ -1287,6 +1334,42 @@ mod tests {
         assert!(is_def_change);
     }
 
+    #[test]
+    fn same_output_definition_change_is_modified() {
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def_v1",
+            "out_stable",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def_v2",
+            "out_stable",
+        )];
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.unchanged, 0);
+        assert_eq!(diff.summary.modified, 1);
+        assert!(diff.is_equivalent(EquivalenceLevel::L0));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+        assert_eq!(
+            diff.divergences[0].divergence_type,
+            DivergenceType::Modified
+        );
+        assert!(matches!(
+            &diff.divergences[0].root_cause,
+            RootCause::RuleDefinitionChange { rule_id, .. } if rule_id == "r1"
+        ));
+    }
+
     // ── Root cause: input divergence ────────────────────────────────────
 
     #[test]
@@ -1317,6 +1400,43 @@ mod tests {
             RootCause::InputDivergence { .. }
         );
         assert!(is_input_div);
+    }
+
+    #[test]
+    fn same_output_input_change_is_modified() {
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out_stable",
+        )];
+        let mut cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out_stable",
+        )];
+        cand_events[0].input_hash = "in_different".into();
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.unchanged, 0);
+        assert_eq!(diff.summary.modified, 1);
+        assert!(diff.is_equivalent(EquivalenceLevel::L0));
+        assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+        assert_eq!(
+            diff.divergences[0].divergence_type,
+            DivergenceType::Modified
+        );
+        assert!(matches!(
+            &diff.divergences[0].root_cause,
+            RootCause::InputDivergence { .. }
+        ));
     }
 
     // ── is_equivalent levels ───────────────────────────────────────────
