@@ -389,6 +389,7 @@ proptest! {
         let resp = RobotResponse {
             ok: true,
             data: Some(data),
+            error_data: None,
             error: None,
             error_code: None,
             hint: None,
@@ -415,6 +416,7 @@ proptest! {
         let resp = RobotResponse {
             ok: true,
             data: Some(data),
+            error_data: None,
             error: None,
             error_code: None,
             hint: None,
@@ -437,6 +439,7 @@ proptest! {
         let resp: RobotResponse<GetTextData> = RobotResponse {
             ok: false,
             data: None,
+            error_data: None,
             error: Some(msg.clone()),
             error_code: code,
             hint: None,
@@ -456,6 +459,7 @@ proptest! {
         let resp: RobotResponse<GetTextData> = RobotResponse {
             ok: true,
             data: None,
+            error_data: None,
             error: None,
             error_code: None,
             hint: None,
@@ -477,6 +481,7 @@ proptest! {
         let resp: RobotResponse<GetTextData> = RobotResponse {
             ok: false,
             data: None,
+            error_data: None,
             error: Some("test".to_string()),
             error_code: Some(code_str),
             hint: None,

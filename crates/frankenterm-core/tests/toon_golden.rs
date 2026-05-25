@@ -44,6 +44,7 @@ fn robot_success<T: Serialize>(data: T, elapsed_ms: u64, now: u64) -> RobotRespo
     RobotResponse {
         ok: true,
         data: Some(data),
+        error_data: None,
         error: None,
         error_code: None,
         hint: None,

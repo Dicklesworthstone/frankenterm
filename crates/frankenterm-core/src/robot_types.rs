@@ -14,7 +14,8 @@
 //! assert_eq!(resp.data.unwrap().text, "hello");
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
 use crate::error_codes::ErrorCategory;
@@ -46,14 +47,20 @@ pub mod family_contract {
 ///
 /// Every `ft robot <command> --format json` call returns this envelope.
 /// Use `parse_response` or `RobotResponse::<T>::from_json` for convenience.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(deserialize = "T: serde::de::DeserializeOwned"))]
+#[derive(Debug, Clone, Serialize)]
 pub struct RobotResponse<T> {
     /// `true` when the command succeeded.
     pub ok: bool,
     /// Command-specific payload (present when `ok == true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
+    /// Raw diagnostic payload carried by an `ok=false` envelope's `data`
+    /// field. This is intentionally not serialized by the typed client shape:
+    /// it exists so callers parsing `RobotResponse<T>` can still recover the
+    /// structured error context without forcing that context through the
+    /// success payload type `T`.
+    #[serde(skip)]
+    pub error_data: Option<serde_json::Value>,
     /// Human-readable error message (present when `ok == false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -89,6 +96,58 @@ pub struct RobotResponse<T> {
     pub schema_version: u32,
 }
 
+impl<'de, T> Deserialize<'de> for RobotResponse<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireRobotResponse {
+            ok: bool,
+            #[serde(default)]
+            data: Option<serde_json::Value>,
+            #[serde(default)]
+            error: Option<String>,
+            #[serde(default)]
+            error_code: Option<String>,
+            #[serde(default)]
+            hint: Option<String>,
+            elapsed_ms: u64,
+            version: String,
+            now: u64,
+            #[serde(default = "default_robot_response_schema_version")]
+            schema_version: u32,
+        }
+
+        let wire = WireRobotResponse::deserialize(deserializer)?;
+        let (data, error_data) = if wire.ok {
+            let data = match wire.data {
+                Some(value) => Some(T::deserialize(value).map_err(D::Error::custom)?),
+                None => None,
+            };
+            (data, None)
+        } else {
+            (None, wire.data)
+        };
+
+        Ok(Self {
+            ok: wire.ok,
+            data,
+            error_data,
+            error: wire.error,
+            error_code: wire.error_code,
+            hint: wire.hint,
+            elapsed_ms: wire.elapsed_ms,
+            version: wire.version,
+            now: wire.now,
+            schema_version: wire.schema_version,
+        })
+    }
+}
+
 /// Initial schema version for [`RobotResponse`]. Bump
 /// `RobotResponse::SCHEMA_VERSION` and `default_robot_response_schema_version`
 /// in lockstep when the envelope shape changes (br-ft-fpcvz).
@@ -117,6 +176,7 @@ impl<T> RobotResponse<T> {
         Self {
             ok: true,
             data: Some(data),
+            error_data: None,
             error: None,
             error_code: None,
             hint: None,
@@ -2759,7 +2819,10 @@ pub fn parse_response<T: serde::de::DeserializeOwned>(
 }
 
 /// Parse a raw JSON string into a `RobotResponse<serde_json::Value>` for
-/// untyped access when the data type is not known at compile time.
+/// untyped success-payload access when the data type is not known at compile
+/// time. For `ok=false` envelopes, diagnostic `data` is exposed through
+/// [`RobotResponse::error_data`] so typed clients do not have to deserialize
+/// arbitrary error context as the success payload.
 pub fn parse_response_untyped(
     json: &str,
 ) -> Result<RobotResponse<serde_json::Value>, serde_json::Error> {
@@ -2811,9 +2874,71 @@ mod tests {
         let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
         assert!(!resp.ok);
         assert!(resp.data.is_none());
+        assert!(resp.error_data.is_none());
         assert_eq!(resp.error.as_deref(), Some("pane 42 not found"));
         assert_eq!(resp.error_code.as_deref(), Some("robot.pane_not_found"));
         assert_eq!(resp.hint.as_deref(), Some("check ft list-panes"));
+    }
+
+    #[test]
+    fn error_envelope_diagnostic_data_shape_does_not_block_typed_decode() {
+        let diagnostic_shapes = [
+            json!({"family": "fleet", "action": "scale", "requested": {"count": 3}}),
+            json!(["fleet", "scale", "diagnostic"]),
+            json!("plain diagnostic text"),
+            json!(42),
+        ];
+
+        for diagnostic_data in diagnostic_shapes {
+            let json = json!({
+                "ok": false,
+                "data": diagnostic_data,
+                "error": "fleet plan failed",
+                "error_code": "robot.fleet.plan_error",
+                "hint": "inspect data.requested",
+                "elapsed_ms": 13,
+                "version": "0.2.0",
+                "now": 1700000000000u64,
+                "schema_version": RobotResponse::<GetTextData>::SCHEMA_VERSION,
+            });
+
+            let resp: RobotResponse<GetTextData> = serde_json::from_value(json)
+                .expect("typed clients must decode error envelopes regardless of data shape");
+            assert!(!resp.ok);
+            assert!(
+                resp.data.is_none(),
+                "error diagnostic data must not be coerced into the success payload"
+            );
+            assert!(
+                resp.error_data.is_some(),
+                "diagnostic data should remain available to typed clients"
+            );
+            let err = resp
+                .into_result()
+                .expect_err("ok=false must become RobotError");
+            assert_eq!(err.code.as_deref(), Some("robot.fleet.plan_error"));
+            assert_eq!(err.message, "fleet plan failed");
+            assert_eq!(err.hint.as_deref(), Some("inspect data.requested"));
+        }
+    }
+
+    #[test]
+    fn success_envelope_still_requires_typed_data_shape() {
+        let json = json!({
+            "ok": true,
+            "data": {"family": "fleet", "action": "scale"},
+            "elapsed_ms": 13,
+            "version": "0.2.0",
+            "now": 1700000000000u64,
+            "schema_version": RobotResponse::<GetTextData>::SCHEMA_VERSION,
+        });
+
+        let err = serde_json::from_value::<RobotResponse<GetTextData>>(json)
+            .expect_err("ok=true data must still deserialize as the requested success payload");
+        assert!(
+            err.to_string().contains("pane_id"),
+            "expected missing GetTextData field error, got {err}"
+        );
     }
 
     #[test]
@@ -4219,6 +4344,7 @@ mod tests {
                 truncated: false,
                 truncation_info: None,
             }),
+            error_data: None,
             error: None,
             error_code: None,
             hint: None,
@@ -4357,6 +4483,7 @@ mod tests {
         let resp: RobotResponse<GetTextData> = RobotResponse {
             ok: false,
             data: None,
+            error_data: None,
             error: Some("pane missing".to_string()),
             error_code: Some("robot.pane_not_found".to_string()),
             hint: None,
