@@ -198,11 +198,17 @@ pub struct UIItem {
 
 impl UIItem {
     pub fn hit_test(&self, x: isize, y: isize) -> bool {
-        x >= self.x as isize
-            && x <= (self.x + self.width) as isize
-            && y >= self.y as isize
-            && y <= (self.y + self.height) as isize
+        let left = usize_to_isize_saturating(self.x);
+        let top = usize_to_isize_saturating(self.y);
+        let right = usize_to_isize_saturating(self.x.saturating_add(self.width));
+        let bottom = usize_to_isize_saturating(self.y.saturating_add(self.height));
+
+        x >= left && x < right && y >= top && y < bottom
     }
+}
+
+fn usize_to_isize_saturating(value: usize) -> isize {
+    isize::try_from(value).unwrap_or(isize::MAX)
 }
 
 #[derive(Clone, Default)]
@@ -6029,10 +6035,11 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncOutputDoctorSnapshot, WebGpuSurfaceErrorAction, a11y_op_kind_from_frame_budget_op,
-        base_policy_for_frame_budget_state, classify_webgpu_surface_error,
-        default_frame_budget_cost_ns, evaluate_frame_budget_reduce_motion_gate, frame_budget,
-        mark_cursor_rows_dirty, mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
+        SyncOutputDoctorSnapshot, UIItem, UIItemType, WebGpuSurfaceErrorAction,
+        a11y_op_kind_from_frame_budget_op, base_policy_for_frame_budget_state,
+        classify_webgpu_surface_error, default_frame_budget_cost_ns,
+        evaluate_frame_budget_reduce_motion_gate, frame_budget, mark_cursor_rows_dirty,
+        mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
         pane_health_snapshot_from_watchdoged_health, poll_terminal_state_buffer_health_snapshots,
         record_drained_frame_budget_ops, record_frame_budget_execution_outstanding,
         record_sync_output_mux_event, reduce_motion_state_from_preference, render,
@@ -6040,6 +6047,45 @@ mod tests {
         should_run_frame_budget_decision, should_skip_clean_line, terminal_pane_id_to_u64,
         terminal_u16_from_stable_delta, terminal_u16_from_usize,
     };
+
+    #[test]
+    fn ui_item_hit_test_uses_half_open_extents() {
+        let item = UIItem {
+            x: 10,
+            y: 20,
+            width: 3,
+            height: 2,
+            item_type: UIItemType::AboveScrollThumb,
+        };
+
+        assert!(item.hit_test(10, 20));
+        assert!(item.hit_test(12, 21));
+        assert!(!item.hit_test(13, 21));
+        assert!(!item.hit_test(12, 22));
+        assert!(!item.hit_test(9, 20));
+        assert!(!item.hit_test(10, 19));
+    }
+
+    #[test]
+    fn ui_item_hit_test_zero_extent_items_are_not_clickable() {
+        let zero_width = UIItem {
+            x: 10,
+            y: 20,
+            width: 0,
+            height: 2,
+            item_type: UIItemType::AboveScrollThumb,
+        };
+        let zero_height = UIItem {
+            x: 10,
+            y: 20,
+            width: 2,
+            height: 0,
+            item_type: UIItemType::AboveScrollThumb,
+        };
+
+        assert!(!zero_width.hit_test(10, 20));
+        assert!(!zero_height.hit_test(10, 20));
+    }
 
     /// ft-camu6: stable→visible translation marks the right rows.
     #[test]
