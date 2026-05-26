@@ -13,11 +13,21 @@ async-io = { workspace = true, optional = true }
 asupersync = { workspace = true, optional = true }
 futures.workspace = true
 
-[target.'cfg(not(any(windows, target_os="macos")))'.dependencies]
-openssl.workspace = true
+# OpenSSL vendoring is centralized here — ssh/, frankenterm-core, and frankenterm
+# pull OpenSSL transitively through async_ossl (see the "centralize" note in
+# frankenterm/ssh/Cargo.toml), so this is the single source of truth.
+#
+# ft-x1klc: vendoring on Windows builds openssl-src (OpenSSL compiled from
+# source), which fails on windows runners in the build script (perl
+# Locale::Maketext::Simple). Windows now uses the system OpenSSL (non-vendored),
+# matching Linux. macOS keeps vendored (its system OpenSSL is awkward to link);
+# Linux keeps system OpenSSL. Mac/Linux behavior is unchanged — only Windows
+# moves from vendored to system.
+[target.'cfg(target_os = "macos")'.dependencies]
+openssl = { workspace = true, features = ["vendored"] }
 
-[target.'cfg(any(windows, target_os="macos"))'.dependencies]
-openssl = { workspace = true, features=["vendored"] }
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+openssl.workspace = true
 
 [features]
 default = ["async-asupersync"]
