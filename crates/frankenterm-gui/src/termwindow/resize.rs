@@ -14,8 +14,7 @@ use wezterm_term::TerminalSize;
 /// not a correctness parameter — warm-up is idempotent and any unwarmed glyph
 /// still rasterizes lazily on first paint exactly as before. Tunable once the
 /// renderer_slo bench unblocks (mcp_middleware cfg(test) fix, p4).
-const SCALE_CHANGE_GLYPH_WARMUP_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(16);
+const SCALE_CHANGE_GLYPH_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RowsAndCols {
@@ -132,6 +131,16 @@ impl super::TermWindow {
         match RenderMetrics::new(&self.fonts) {
             Ok(metrics) => {
                 self.render_metrics = metrics;
+                // Invalidate the shape cache: shaped runs cache per-glyph
+                // `x_advance` (kerning) + cluster metrics computed against the
+                // PRIOR `render_metrics` cell size. Without bumping the
+                // generation, the next paint reuses those stale advances and
+                // draws old-scale kerning/leading into the new cells — the
+                // "absurd kerning/leading on Cmd +/-" bug. Config changes
+                // already bump this (mod.rs); scale changes must too. Bump only
+                // in the Ok arm: on metric failure we roll back below, so the
+                // old cache stays consistent with the old metrics.
+                self.shape_generation += 1;
                 // ft-uroqc: warm-rasterize the common ASCII/Latin glyph set at
                 // the NEW CellMetricKey so the first paint after a scale change
                 // finds them already in the atlas instead of synchronously
