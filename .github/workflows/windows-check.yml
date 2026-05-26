@@ -67,19 +67,15 @@ jobs:
           cargo --version >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Default features: the parity target. NOT yet required: it currently fails
-      # at a *dependency build-script* layer, not in our source — several crates
-      # enable openssl's `vendored` feature unconditionally (async_ossl, frankenterm,
-      # frankenterm-core, ssh), so openssl-src tries to compile OpenSSL from source
-      # on windows-latest, whose Strawberry-Perl lacks Locale::Maketext::Simple and
-      # aborts ./Configure. Tracked by ft-azsnz follow-up (target-gate `vendored` off
-      # Windows / use schannel|vcpkg, or provision a working perl+openssl in CI).
-      # The unix-coupling-lint job above is the day-one required guard against the
-      # *source-level* regression this job was meant to catch; keep this informational
-      # (continue-on-error) until the openssl dependency seam is resolved, then flip.
+      # Default features: the parity target, and now a REQUIRED gate. As of ft-x1klc
+      # (async_ossl openssl `vendored` target-gated off Windows — Windows uses system
+      # OpenSSL, mac+linux keep vendored unchanged) this compiles green for
+      # x86_64-pc-windows-msvc, confirmed by a completed run. Removing continue-on-error
+      # locks in the additive, no-Mac/Linux-regression Windows-compat invariant: a
+      # change that reintroduces an unconditional Unix coupling or otherwise breaks the
+      # Windows build now fails CI. Keep it additive (#[cfg(windows)] seams).
       - name: cargo check --workspace (default features)
         id: check_default
-        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
