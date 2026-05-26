@@ -5,6 +5,7 @@
 //!
 //! - **Linux**: reads `/proc/pressure/memory` (PSI avg10) and `/proc/meminfo`
 //! - **macOS**: reads memory stats via `vm_stat` and `sysctl`
+//! - **Windows**: reads physical memory totals through `sysinfo`
 //! - **Other**: returns `Green` (no monitoring available)
 
 use std::sync::Arc;
@@ -1507,10 +1508,31 @@ fn read_memory_info() -> (u64, u64) {
     {
         read_macos_memory()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        read_windows_memory()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         (0, 0)
     }
+}
+
+/// Windows: total + available physical memory via `sysinfo` (safe; zero unsafe,
+/// see docs/proposals/windows-unsafe-policy.md). sysinfo reports BYTES; the
+/// `(total, available)` contract here is KiB to match `read_linux_meminfo` and
+/// `read_macos_memory`, so convert. `available_memory()` is sysinfo's
+/// reclaimable-memory estimate, the closest analogue to Linux `MemAvailable`.
+#[cfg(windows)]
+fn read_windows_memory() -> (u64, u64) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    memory_bytes_to_kib(sys.total_memory(), sys.available_memory())
+}
+
+#[cfg(any(windows, test))]
+fn memory_bytes_to_kib(total_bytes: u64, available_bytes: u64) -> (u64, u64) {
+    (total_bytes / 1024, available_bytes / 1024)
 }
 
 // =============================================================================
@@ -2310,11 +2332,17 @@ Call graph:
     #[test]
     fn read_memory_info_returns_values() {
         let (total, available) = read_memory_info();
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
             assert!(total > 0);
             assert!(available > 0);
             assert!(available <= total);
         }
+    }
+
+    #[test]
+    fn ft_d61gw_windows_memory_bytes_convert_to_kib_contract() {
+        assert_eq!(memory_bytes_to_kib(4096, 2048), (4, 2));
+        assert_eq!(memory_bytes_to_kib(1025, 1024), (1, 1));
     }
 
     // -----------------------------------------------------------------------

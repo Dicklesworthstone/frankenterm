@@ -163,7 +163,7 @@ roaring = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 frankenterm-uds = { workspace = true, features = ["async-asupersync"] }
-sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
+sysinfo = { version = "0.36.1", default-features = false, features = ["system", "disk"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -7,6 +7,7 @@
 //!   pressure stall information.
 //! - **macOS**: reads 1-minute load average via `sysctl` and normalizes
 //!   by CPU count (no PSI equivalent, no unsafe FFI required).
+//! - **Windows**: reads global CPU usage through `sysinfo`.
 //! - **Other**: returns `Green` (no monitoring available).
 
 use std::sync::Arc;
@@ -178,6 +179,13 @@ pub struct CpuPressureMonitor {
     ncpu: u32,
     /// Operational telemetry counters.
     telemetry: CpuPressureTelemetry,
+    /// Windows: persisted `sysinfo::System` for delta-based CPU usage. sysinfo
+    /// computes utilization as the delta since the previous `refresh_cpu_usage`,
+    /// so the instance must survive across samples. Safe; zero unsafe (see
+    /// docs/proposals/windows-unsafe-policy.md). Unix reads pressure from /proc
+    /// PSI (Linux) or load average (macOS) and needs no held state.
+    #[cfg(windows)]
+    cpu_system: std::sync::Mutex<sysinfo::System>,
 }
 
 impl CpuPressureMonitor {
@@ -188,6 +196,14 @@ impl CpuPressureMonitor {
             latest_tier: Arc::new(AtomicU64::new(0)),
             ncpu: detect_ncpu(),
             telemetry: CpuPressureTelemetry::default(),
+            #[cfg(windows)]
+            cpu_system: {
+                let mut sys = sysinfo::System::new();
+                // Establish the baseline; the first sample therefore reads ~0
+                // (same gentle-start shape as the previous P1 stub).
+                sys.refresh_cpu_usage();
+                std::sync::Mutex::new(sys)
+            },
         }
     }
 
@@ -332,6 +348,7 @@ impl CpuPressureMonitor {
     ///
     /// - **Linux**: PSI avg10 from `/proc/pressure/cpu`
     /// - **macOS**: 1-min load average normalized by CPU count (× 100)
+    /// - **Windows**: sysinfo global CPU usage percentage
     /// - **Other**: always 0.0
     fn read_cpu_pressure(&self) -> f64 {
         #[cfg(target_os = "linux")]
@@ -345,11 +362,35 @@ impl CpuPressureMonitor {
             // Normalize: load_avg / ncpu * 100 → percentage-like metric
             (load / self.ncpu.max(1) as f64) * 100.0
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            let _ = self.ncpu; // already per-core-averaged below
+            // sysinfo `global_cpu_usage()` is a 0–100 percentage averaged across
+            // logical CPUs — the same percentage-like scale the macOS/Linux
+            // branches produce. The refresh computes the delta since the
+            // previous refresh (i.e. over the inter-sample interval).
+            match self.cpu_system.lock() {
+                Ok(mut sys) => {
+                    sys.refresh_cpu_usage();
+                    normalize_sysinfo_cpu_usage(sys.global_cpu_usage())
+                }
+                Err(_) => 0.0,
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = self.ncpu; // suppress unused warning
             0.0
         }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_sysinfo_cpu_usage(usage: f32) -> f64 {
+    if usage.is_finite() {
+        f64::from(usage.clamp(0.0, 100.0))
+    } else {
+        0.0
     }
 }
 
@@ -433,7 +474,11 @@ fn detect_ncpu() -> u32 {
             .unwrap_or(1)
             .max(1)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        (sysinfo::System::new_all().cpus().len() as u32).max(1)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         1
     }
@@ -598,6 +643,14 @@ mod tests {
     fn detect_ncpu_returns_positive() {
         let n = detect_ncpu();
         assert!(n >= 1, "should detect at least 1 CPU");
+    }
+
+    #[test]
+    fn ft_d61gw_sysinfo_cpu_usage_is_finite_percent() {
+        assert!((normalize_sysinfo_cpu_usage(42.5) - 42.5).abs() < f64::EPSILON);
+        assert!((normalize_sysinfo_cpu_usage(-1.0) - 0.0).abs() < f64::EPSILON);
+        assert!((normalize_sysinfo_cpu_usage(101.0) - 100.0).abs() < f64::EPSILON);
+        assert!((normalize_sysinfo_cpu_usage(f32::NAN) - 0.0).abs() < f64::EPSILON);
     }
 
     // -----------------------------------------------------------------------

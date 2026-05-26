@@ -4,6 +4,7 @@
 //! correction term, and classifies pressure into four tiers.
 
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -513,6 +514,9 @@ impl DiskPressureMonitor {
     /// Take a disk-space sample.
     #[must_use]
     pub fn sample(&self) -> DiskSample {
+        #[cfg(windows)]
+        let disk_space = read_windows_disk_space(&self.config.root_path);
+        #[cfg(not(windows))]
         let disk_space = read_disk_space_statvfs(&self.config.root_path)
             .or_else(|| read_disk_space_df(&self.config.root_path));
 
@@ -709,12 +713,98 @@ fn read_disk_space_statvfs(path: &Path) -> Option<(u64, u64)> {
     Some((available_bytes.min(total_bytes), total_bytes))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn read_disk_space_statvfs(path: &Path) -> Option<(u64, u64)> {
     let _ = path;
     None
 }
 
+/// Windows: `(available_bytes, total_bytes)` for the volume containing `path`,
+/// via `sysinfo` (safe; zero unsafe, see docs/proposals/windows-unsafe-policy.md).
+/// Picks the disk whose mount point is the longest prefix of `path` (e.g.
+/// `C:\` for `C:\Users\...`), mirroring the statvfs `(available.min(total),
+/// total)` contract. If `path` is the default `/` or otherwise cannot be
+/// matched to a mount point, returns the first usable disk instead of falling
+/// back to an unavailable Unix `df` command on Windows.
+#[cfg(windows)]
+fn read_windows_disk_space(path: &Path) -> Option<(u64, u64)> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    select_disk_space_for_path(
+        path,
+        disks.list().iter().map(|disk| DiskSpaceCandidate {
+            mount_point: disk.mount_point().to_path_buf(),
+            available_bytes: disk.available_space(),
+            total_bytes: disk.total_space(),
+        }),
+    )
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone)]
+struct DiskSpaceCandidate {
+    mount_point: PathBuf,
+    available_bytes: u64,
+    total_bytes: u64,
+}
+
+#[cfg(any(windows, test))]
+fn select_disk_space_for_path(
+    path: &Path,
+    candidates: impl IntoIterator<Item = DiskSpaceCandidate>,
+) -> Option<(u64, u64)> {
+    let mut first_usable = None;
+    let mut best_match: Option<(usize, u64, u64)> = None;
+
+    for candidate in candidates {
+        if candidate.total_bytes == 0 {
+            continue;
+        }
+
+        let available = candidate.available_bytes.min(candidate.total_bytes);
+        first_usable.get_or_insert((available, candidate.total_bytes));
+
+        if disk_path_has_mount_prefix(path, &candidate.mount_point) {
+            let mount_len = candidate.mount_point.as_os_str().len();
+            if best_match.is_none_or(|(best_len, _, _)| mount_len > best_len) {
+                best_match = Some((mount_len, available, candidate.total_bytes));
+            }
+        }
+    }
+
+    best_match
+        .map(|(_, available, total)| (available, total))
+        .or(first_usable)
+}
+
+#[cfg(any(windows, test))]
+fn disk_path_has_mount_prefix(path: &Path, mount: &Path) -> bool {
+    if path.starts_with(mount) {
+        return true;
+    }
+
+    let path = normalize_mount_prefix(path);
+    let mount = normalize_mount_prefix(mount);
+    if mount.is_empty() || !path.starts_with(&mount) {
+        return false;
+    }
+
+    path.len() == mount.len()
+        || mount.ends_with('\\')
+        || path
+            .as_bytes()
+            .get(mount.len())
+            .is_some_and(|byte| *byte == b'\\')
+}
+
+#[cfg(any(windows, test))]
+fn normalize_mount_prefix(path: &Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+#[cfg(not(windows))]
 fn read_disk_space_df(path: &Path) -> Option<(u64, u64)> {
     let path_str = path.to_str()?;
     let output = Command::new("df").args(["-k", path_str]).output().ok()?;
@@ -725,6 +815,7 @@ fn read_disk_space_df(path: &Path) -> Option<(u64, u64)> {
     parse_df_output_kib(&stdout)
 }
 
+#[cfg(not(windows))]
 fn parse_df_output_kib(output: &str) -> Option<(u64, u64)> {
     output
         .lines()
@@ -734,6 +825,7 @@ fn parse_df_output_kib(output: &str) -> Option<(u64, u64)> {
         .last()
 }
 
+#[cfg(not(windows))]
 fn parse_df_data_line(line: &str) -> Option<(u64, u64)> {
     let cols: Vec<&str> = line.split_whitespace().collect();
     let usage_idx = cols.iter().position(|col| col.ends_with('%'))?;
@@ -754,8 +846,10 @@ fn parse_df_data_line(line: &str) -> Option<(u64, u64)> {
 mod tests {
     use super::{
         DiskPressureConfig, DiskPressureMonitor, DiskPressureTier, DiskSample, EwmaEstimator,
-        PidController, PressureThresholds, classify_tier, parse_df_data_line, parse_df_output_kib,
+        PidController, PressureThresholds, classify_tier,
     };
+    #[cfg(not(windows))]
+    use super::{parse_df_data_line, parse_df_output_kib};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -817,6 +911,7 @@ mod tests {
         assert_eq!(classify_tier(0.9, thresholds), DiskPressureTier::Black);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parse_df_line_linux_style() {
         let line = "/dev/disk3s1 100000 70000 30000 70% /";
@@ -825,12 +920,55 @@ mod tests {
         assert_eq!(parsed.0, 30_000 * 1024);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parse_df_line_macos_style_with_inode_columns() {
         let line = "/dev/disk3s1 245113536 194608736 49714792 80% 853965 49602192 2% /";
         let parsed = parse_df_data_line(line).expect("expected parse success");
         assert_eq!(parsed.1, 245_113_536 * 1024);
         assert_eq!(parsed.0, 49_714_792 * 1024);
+    }
+
+    #[test]
+    fn ft_d61gw_windows_disk_selection_prefers_longest_mount_prefix() {
+        let selected = super::select_disk_space_for_path(
+            PathBuf::from(r"C:\Users\ft").as_path(),
+            [
+                super::DiskSpaceCandidate {
+                    mount_point: PathBuf::from(r"C:\"),
+                    available_bytes: 90,
+                    total_bytes: 100,
+                },
+                super::DiskSpaceCandidate {
+                    mount_point: PathBuf::from(r"C:\Users\"),
+                    available_bytes: 80,
+                    total_bytes: 100,
+                },
+            ],
+        );
+
+        assert_eq!(selected, Some((80, 100)));
+    }
+
+    #[test]
+    fn ft_d61gw_windows_disk_selection_falls_back_to_first_usable_disk() {
+        let selected = super::select_disk_space_for_path(
+            PathBuf::from("/").as_path(),
+            [
+                super::DiskSpaceCandidate {
+                    mount_point: PathBuf::from(r"C:\"),
+                    available_bytes: 120,
+                    total_bytes: 100,
+                },
+                super::DiskSpaceCandidate {
+                    mount_point: PathBuf::from(r"D:\"),
+                    available_bytes: 40,
+                    total_bytes: 100,
+                },
+            ],
+        );
+
+        assert_eq!(selected, Some((100, 100)));
     }
 
     #[test]
@@ -1150,7 +1288,10 @@ mod tests {
         let (available, total, usage) = derive_disk_sample_fields(None);
         assert_eq!(available, 0);
         assert_eq!(total, 0);
-        assert!(usage.is_nan(), "I/O failure must encode NaN usage, got {usage}");
+        assert!(
+            usage.is_nan(),
+            "I/O failure must encode NaN usage, got {usage}"
+        );
     }
 
     /// [ft-j4fnv] A healthy reading still derives a finite, clamped usage
@@ -1161,11 +1302,17 @@ mod tests {
         let (available, total, usage) = derive_disk_sample_fields(Some((250, 1000)));
         assert_eq!(available, 250);
         assert_eq!(total, 1000);
-        assert!((usage - 0.75).abs() < 1e-9, "expected 0.75 usage, got {usage}");
+        assert!(
+            (usage - 0.75).abs() < 1e-9,
+            "expected 0.75 usage, got {usage}"
+        );
 
         // available > total (hostile reader) clamps to 0.0, not negative.
         let (_, _, over) = derive_disk_sample_fields(Some((2000, 1000)));
-        assert_eq!(over, 0.0, "available>total must clamp usage to 0.0, got {over}");
+        assert_eq!(
+            over, 0.0,
+            "available>total must clamp usage to 0.0, got {over}"
+        );
     }
 
     /// [ft-j4fnv] End-to-end: a zero-total sample routed through
