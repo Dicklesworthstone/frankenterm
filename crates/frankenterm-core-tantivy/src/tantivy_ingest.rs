@@ -948,6 +948,13 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         Self { config, writer }
     }
 
+    fn delete_existing_event_for_replay(&mut self, event_id: &str) -> Result<(), IndexerError> {
+        if self.config.dedup_on_replay {
+            self.writer.delete_by_event_id(event_id)?;
+        }
+        Ok(())
+    }
+
     /// Run the indexer: read checkpoint, scan log, index events, commit checkpoints.
     ///
     /// Processes batches until EOF or `max_batches` is reached.
@@ -1030,13 +1037,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
                 // Map event to document
                 let doc = map_event_to_document(&record.event, record.offset.ordinal);
 
-                // Dedup: delete existing doc with same event_id before re-adding
-                if self.config.dedup_on_replay
-                    && self.writer.delete_by_event_id(&doc.event_id).is_err()
-                {
-                    // Deletion failure on a non-existent doc is fine; only
-                    // propagate genuine failures on commit.
-                }
+                // Dedup: delete existing doc with same event_id before re-adding.
+                self.delete_existing_event_for_replay(&doc.event_id)?;
 
                 match self.writer.add_document(&doc) {
                     Ok(()) => result.events_indexed += 1,
@@ -1163,11 +1165,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
                 let doc = map_event_to_document(&record.event, record.offset.ordinal);
 
-                if self.config.dedup_on_replay
-                    && self.writer.delete_by_event_id(&doc.event_id).is_err()
-                {
-                    // ignore missing-doc deletion failures
-                }
+                self.delete_existing_event_for_replay(&doc.event_id)?;
 
                 match self.writer.add_document(&doc) {
                     Ok(()) => result.events_indexed += 1,
@@ -1287,9 +1285,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
                 let doc = map_event_to_document(&record.event, record.offset.ordinal);
 
-                if self.config.dedup_on_replay {
-                    let _ = self.writer.delete_by_event_id(&doc.event_id);
-                }
+                self.delete_existing_event_for_replay(&doc.event_id)?;
 
                 match self.writer.add_document(&doc) {
                     Ok(()) => result.events_indexed += 1,
@@ -1430,9 +1426,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
                 let doc = map_event_to_document(&record.event, record.offset.ordinal);
 
-                if self.config.dedup_on_replay {
-                    let _ = self.writer.delete_by_event_id(&doc.event_id);
-                }
+                self.delete_existing_event_for_replay(&doc.event_id)?;
 
                 match self.writer.add_document(&doc) {
                     Ok(()) => result.events_indexed += 1,
@@ -1790,6 +1784,7 @@ mod tests {
         deleted_ids: Vec<String>,
         commits: u64,
         reject_event_ids: Vec<String>,
+        fail_delete_ids: Vec<String>,
         fail_commit: bool,
     }
 
@@ -1800,6 +1795,7 @@ mod tests {
                 deleted_ids: Vec::new(),
                 commits: 0,
                 reject_event_ids: Vec::new(),
+                fail_delete_ids: Vec::new(),
                 fail_commit: false,
             }
         }
@@ -1835,6 +1831,11 @@ mod tests {
         }
 
         fn delete_by_event_id(&mut self, event_id: &str) -> Result<(), IndexWriteError> {
+            if self.fail_delete_ids.iter().any(|id| id == event_id) {
+                return Err(IndexWriteError::Transient {
+                    reason: "test delete failure".to_string(),
+                });
+            }
             self.deleted_ids.push(event_id.to_string());
             Ok(())
         }
@@ -2388,6 +2389,33 @@ mod tests {
             assert_eq!(indexer.writer().deleted_ids.len(), 2);
             assert!(indexer.writer().deleted_ids.contains(&"dup-1".to_string()));
             assert!(indexer.writer().deleted_ids.contains(&"dup-2".to_string()));
+        });
+    }
+
+    #[test]
+    fn indexer_dedup_delete_failure_propagates() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+            populate_log(&storage, vec![sample_event("dup-fail", 1, 0, "text")]).await;
+
+            let icfg = IndexerConfig {
+                dedup_on_replay: true,
+                ..test_indexer_config(dir.path())
+            };
+            let mut writer = MockIndexWriter::new();
+            writer.fail_delete_ids = vec!["dup-fail".to_string()];
+            let mut indexer = IncrementalIndexer::new(icfg, writer);
+
+            let err = indexer.run(&storage).await.unwrap_err();
+            assert!(matches!(
+                err,
+                IndexerError::IndexWrite(IndexWriteError::Transient { .. })
+            ));
+            assert!(indexer.writer().written_docs().is_empty());
+            assert_eq!(indexer.writer().commits, 0);
         });
     }
 
