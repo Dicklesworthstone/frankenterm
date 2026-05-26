@@ -146,11 +146,27 @@ pub struct DiskPressureConfig {
     pub thresholds: PressureThresholds,
 }
 
+/// Default disk-pressure sampling root. Unix keeps `/` (root filesystem,
+/// behavior unchanged); Windows uses the OS temp dir, which lives on the system
+/// drive, so the longest-prefix volume match in `read_windows_disk_space`
+/// resolves to that drive. (`/` matches no Windows volume mount point and would
+/// otherwise leave Windows disk pressure permanently Green.) ft-plp3c.
+fn default_disk_root_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::temp_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/")
+    }
+}
+
 impl Default for DiskPressureConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            root_path: PathBuf::from("/"),
+            root_path: default_disk_root_path(),
             poll_interval_ms: 5_000,
             ewma_alpha: 0.30,
             pid_kp: 0.60,

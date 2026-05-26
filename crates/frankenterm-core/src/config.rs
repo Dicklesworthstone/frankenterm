@@ -3030,11 +3030,30 @@ pub struct NativeEventsConfig {
     pub socket_path: String,
 }
 
+/// Default native-events socket path. Unix keeps the historical
+/// `/tmp/ft/events.sock` literal (behavior unchanged); Windows derives a
+/// portable path under the OS temp dir (`%TEMP%\ft\events.sock`) since `/tmp`
+/// is not a valid Windows location. ft-plp3c path-portability.
+fn default_native_events_socket_path() -> String {
+    #[cfg(windows)]
+    {
+        std::env::temp_dir()
+            .join("ft")
+            .join("events.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        "/tmp/ft/events.sock".to_string()
+    }
+}
+
 impl Default for NativeEventsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            socket_path: "/tmp/ft/events.sock".to_string(),
+            socket_path: default_native_events_socket_path(),
         }
     }
 }
