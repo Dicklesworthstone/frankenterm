@@ -449,7 +449,7 @@ impl PlaybackSpeed {
 
     /// Create a custom speed multiplier. Must be > 0.
     pub fn new(speed: f32) -> Result<Self> {
-        if speed <= 0.0 {
+        if speed.is_nan() || speed <= 0.0 {
             return Err(replay_backend_error(
                 "replay.playback_speed",
                 "playback speed must be > 0",
@@ -1723,6 +1723,7 @@ mod tests {
     fn playback_speed_validation() {
         assert!(PlaybackSpeed::new(0.0).is_err());
         assert!(PlaybackSpeed::new(-1.0).is_err());
+        assert!(PlaybackSpeed::new(f32::NAN).is_err());
         assert!(PlaybackSpeed::new(0.1).is_ok());
     }
 
@@ -2639,6 +2640,7 @@ mod tests {
     fn playback_speed_new_zero_errors() {
         assert!(PlaybackSpeed::new(0.0).is_err());
         assert!(PlaybackSpeed::new(-1.0).is_err());
+        assert!(PlaybackSpeed::new(f32::NAN).is_err());
     }
 
     #[test]
