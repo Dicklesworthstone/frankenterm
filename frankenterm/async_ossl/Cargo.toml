@@ -19,14 +19,15 @@ futures.workspace = true
 #
 # ft-x1klc: vendoring on Windows builds openssl-src (OpenSSL compiled from
 # source), which fails on windows runners in the build script (perl
-# Locale::Maketext::Simple). Windows now uses the system OpenSSL (non-vendored),
-# matching Linux. macOS keeps vendored (its system OpenSSL is awkward to link);
-# Linux keeps system OpenSSL. Mac/Linux behavior is unchanged — only Windows
-# moves from vendored to system.
-[target.'cfg(target_os = "macos")'.dependencies]
+# Locale::Maketext::Simple). ONLY Windows changes — it drops vendored and uses
+# the system/SDK OpenSSL. macOS AND Linux keep `vendored` exactly as before
+# (the prior dependency was unconditionally vendored on every target), so there
+# is zero Mac/Linux behavior change — the gate is `not(windows)` precisely to
+# preserve the existing vendored build on both Unix platforms.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { workspace = true, features = ["vendored"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 openssl.workspace = true
 
 [features]
