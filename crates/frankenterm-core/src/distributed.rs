@@ -642,23 +642,47 @@ fn ip_from_octets(bytes: &[u8]) -> Option<IpAddr> {
 }
 
 #[cfg(feature = "distributed")]
-fn extract_client_identities(cert: &CertificateDer<'_>) -> Result<Vec<String>, rustls::Error> {
+#[derive(Debug, Default)]
+struct ClientCertIdentities {
+    subject_alt_names: Vec<String>,
+    common_names: Vec<String>,
+    subject_alt_name_present: bool,
+}
+
+#[cfg(feature = "distributed")]
+impl ClientCertIdentities {
+    fn allowlist_candidates(&self) -> &[String] {
+        if self.subject_alt_name_present {
+            &self.subject_alt_names
+        } else {
+            &self.common_names
+        }
+    }
+}
+
+#[cfg(feature = "distributed")]
+fn extract_client_identities(
+    cert: &CertificateDer<'_>,
+) -> Result<ClientCertIdentities, rustls::Error> {
     let (_, parsed) = X509Certificate::from_der(cert.as_ref())
         .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
-    let mut identities = Vec::new();
+    let mut identities = ClientCertIdentities::default();
 
     let san = parsed
         .subject_alternative_name()
         .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
     if let Some(san) = san {
+        identities.subject_alt_name_present = true;
         for name in &san.value.general_names {
             match name {
-                GeneralName::DNSName(dns) => identities.push(dns.to_string()),
-                GeneralName::RFC822Name(email) => identities.push(email.to_string()),
-                GeneralName::URI(uri) => identities.push(uri.to_string()),
+                GeneralName::DNSName(dns) => identities.subject_alt_names.push(dns.to_string()),
+                GeneralName::RFC822Name(email) => {
+                    identities.subject_alt_names.push(email.to_string());
+                }
+                GeneralName::URI(uri) => identities.subject_alt_names.push(uri.to_string()),
                 GeneralName::IPAddress(bytes) => {
                     if let Some(ip) = ip_from_octets(bytes) {
-                        identities.push(ip.to_string());
+                        identities.subject_alt_names.push(ip.to_string());
                     }
                 }
                 _ => {}
@@ -668,11 +692,22 @@ fn extract_client_identities(cert: &CertificateDer<'_>) -> Result<Vec<String>, r
 
     for cn in parsed.subject().iter_common_name() {
         if let Ok(cn) = cn.as_str() {
-            identities.push(cn.to_string());
+            identities.common_names.push(cn.to_string());
         }
     }
 
     Ok(identities)
+}
+
+#[cfg(feature = "distributed")]
+fn identities_match_allowlist(
+    identities: &ClientCertIdentities,
+    allowlist: &HashSet<String>,
+) -> bool {
+    identities
+        .allowlist_candidates()
+        .iter()
+        .any(|identity| allowlist.contains(&normalize_identity(identity)))
 }
 
 #[cfg(feature = "distributed")]
@@ -690,9 +725,7 @@ impl AllowlistedClientVerifier {
 
     fn matches_allowlist(&self, cert: &CertificateDer<'_>) -> Result<bool, rustls::Error> {
         let identities = extract_client_identities(cert)?;
-        Ok(identities
-            .iter()
-            .any(|identity| self.allowlist.contains(&normalize_identity(identity))))
+        Ok(identities_match_allowlist(&identities, &self.allowlist))
     }
 }
 
@@ -1543,6 +1576,32 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     #[cfg(feature = "distributed")]
+    fn identity_cert_der(common_name: &str, subject_alt_names: &[&str]) -> CertificateDer<'static> {
+        let mut params = rcgen::CertificateParams::new(
+            subject_alt_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        );
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        rcgen::Certificate::from_params(params)
+            .expect("identity cert")
+            .serialize_der()
+            .expect("identity cert der")
+            .into()
+    }
+
+    #[cfg(feature = "distributed")]
+    fn cert_matches_agent_allowlist(cert: &CertificateDer<'_>, entries: &[&str]) -> bool {
+        let entries: Vec<String> = entries.iter().map(|entry| (*entry).to_string()).collect();
+        let allowlist = build_allowlist(&entries);
+        let identities = extract_client_identities(cert).expect("parse identity cert");
+        identities_match_allowlist(&identities, &allowlist)
+    }
+
+    #[cfg(feature = "distributed")]
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -1565,6 +1624,29 @@ KBAhs4snj5QspGFqkazmIw==
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn mtls_allowlist_prefers_subject_alt_name_over_common_name() {
+        let san_match = identity_cert_der("wrong-cn", &["allowed-agent"]);
+        assert!(
+            cert_matches_agent_allowlist(&san_match, &["allowed-agent"]),
+            "SAN identity must satisfy the mTLS allowlist"
+        );
+
+        let cn_match_with_nonmatching_san =
+            identity_cert_der("allowed-agent", &["different-agent"]);
+        assert!(
+            !cert_matches_agent_allowlist(&cn_match_with_nonmatching_san, &["allowed-agent"]),
+            "CN must not satisfy the allowlist when a non-matching SAN is present"
+        );
+
+        let san_absent = identity_cert_der("legacy-agent", &[]);
+        assert!(
+            cert_matches_agent_allowlist(&san_absent, &["legacy-agent"]),
+            "CN fallback remains available only when the certificate has no SAN"
+        );
     }
 
     #[cfg(feature = "distributed")]
@@ -3005,6 +3087,57 @@ KBAhs4snj5QspGFqkazmIw==
                 None
             )
             .is_err()
+        );
+    }
+
+    // Fail-open regression (whitespace variant of ft-en66h): a whitespace-only
+    // EXPECTED token must also fail closed. `"   ".is_empty()` is FALSE, so an
+    // is_empty()-only guard would let `constant_time_eq("   ", "   ")`
+    // authenticate; validate_token's `trim().is_empty()` guard closes that. A
+    // blank token can arrive from an env var or token file that resolves to
+    // whitespace, or a misconfigured inline value.
+    #[test]
+    fn validate_token_rejects_whitespace_expected_secret() {
+        for blank in ["   ", "\t", "\n", " \t\r\n "] {
+            // Whitespace expected + same presented must NOT authenticate.
+            assert!(
+                validate_token(DistributedAuthMode::Token, Some(blank), Some(blank), None).is_err(),
+                "whitespace-only expected secret {blank:?} must never authenticate"
+            );
+            // Whitespace expected vs any presented also fails.
+            assert!(
+                validate_token(
+                    DistributedAuthMode::Token,
+                    Some(blank),
+                    Some("anything"),
+                    None
+                )
+                .is_err(),
+                "whitespace expected {blank:?} must fail against any presented token"
+            );
+        }
+        // Symmetric: a whitespace-only PRESENTED token cannot authenticate
+        // against a real configured secret.
+        assert!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("s3cret"),
+                Some("   "),
+                None
+            )
+            .is_err(),
+            "whitespace presented secret must fail against a real expected secret"
+        );
+        // Sanity: a real non-blank secret still authenticates (guard does not
+        // over-reject).
+        assert!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("s3cret"),
+                Some("s3cret"),
+                None
+            )
+            .is_ok()
         );
     }
 
