@@ -954,14 +954,14 @@ impl CommandBuilder {
 
 #[cfg(windows)]
 impl CommandBuilder {
-    fn search_path(&self, exe: &OsStr) -> OsString {
+    fn search_path_existing(&self, exe: &OsStr) -> Option<OsString> {
         if let Some(path) = self.get_env("PATH") {
             let extensions = self.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
             for path in std::env::split_paths(&path) {
                 // Check for exactly the user's string in this path dir
                 let candidate = path.join(exe);
                 if candidate.exists() {
-                    return candidate.into_os_string();
+                    return Some(candidate.into_os_string());
                 }
 
                 // otherwise try tacking on some extensions.
@@ -975,13 +975,36 @@ impl CommandBuilder {
                     };
                     let path = path.join(exe).with_extension(ext);
                     if path.exists() {
-                        return path.into_os_string();
+                        return Some(path.into_os_string());
                     }
                 }
             }
         }
 
-        exe.to_owned()
+        None
+    }
+
+    fn search_path(&self, exe: &OsStr) -> OsString {
+        self.search_path_existing(exe)
+            .unwrap_or_else(|| exe.to_owned())
+    }
+
+    fn platform_shell(&self) -> OsString {
+        if let Some(shell) = self.get_env("SHELL") {
+            if Path::new(shell).exists() || self.search_path_existing(shell).is_some() {
+                return shell.into();
+            }
+        }
+
+        for candidate in [OsStr::new("pwsh.exe"), OsStr::new("pwsh")] {
+            if let Some(shell) = self.search_path_existing(candidate) {
+                return shell;
+            }
+        }
+
+        self.get_env("ComSpec")
+            .unwrap_or(OsStr::new("cmd.exe"))
+            .into()
     }
 
     pub(crate) fn current_directory(&self) -> Option<Vec<u16>> {
@@ -1035,10 +1058,7 @@ impl CommandBuilder {
     }
 
     pub fn get_shell(&self) -> String {
-        let exe: OsString = self
-            .get_env("ComSpec")
-            .unwrap_or(OsStr::new("cmd.exe"))
-            .into();
+        let exe = self.platform_shell();
         exe.into_string()
             .unwrap_or_else(|_| "%CompSpec%".to_string())
     }
@@ -1047,9 +1067,7 @@ impl CommandBuilder {
         let mut cmdline = Vec::<u16>::new();
 
         let exe: OsString = if self.is_default_prog() {
-            self.get_env("ComSpec")
-                .unwrap_or(OsStr::new("cmd.exe"))
-                .into()
+            self.platform_shell()
         } else {
             self.search_path(&self.args[0])
         };

@@ -1,15 +1,56 @@
-#![cfg(unix)]
 use anyhow::Context;
+use std::ffi::OsString;
+use std::process::{Command, Stdio};
+
+#[cfg(unix)]
 use libc::pid_t;
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 
+pub fn spawn_daemonized_copy(
+    args: Vec<OsString>,
+    config: &config::ConfigHandle,
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new(
+        std::env::current_exe().context("resolving current executable for daemonize")?,
+    );
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(config.daemon_options.open_stdout()?);
+    cmd.stderr(config.daemon_options.open_stderr()?);
+    configure_spawned_daemon_command(&mut cmd);
+
+    let _child = cmd
+        .spawn()
+        .context("spawning daemonized mux server child")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_spawned_daemon_command(_cmd: &mut Command) {}
+
+#[cfg(windows)]
+fn configure_spawned_daemon_command(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    cmd.creation_flags(winapi::um::winbase::DETACHED_PROCESS);
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
 enum Fork {
     #[allow(dead_code)]
     Child(pid_t),
     Parent(pid_t),
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 #[allow(unsafe_code)]
 fn fork() -> anyhow::Result<Fork> {
     // SAFETY: `fork` is invoked before the daemonized child starts worker
@@ -30,6 +71,8 @@ fn fork() -> anyhow::Result<Fork> {
     }
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 #[allow(unsafe_code)]
 fn setsid() -> anyhow::Result<()> {
     // SAFETY: Called only in the first daemon child after fork and before the
@@ -44,6 +87,8 @@ fn setsid() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 #[allow(unsafe_code)]
 fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File> {
     let pid_file = config.daemon_options.pid_file();
@@ -78,6 +123,8 @@ fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File>
     Ok(file)
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 #[allow(unsafe_code)]
 fn wait_for_intermediate_child(pid: pid_t) -> ! {
     let mut status: libc::c_int = 0;
@@ -108,6 +155,8 @@ fn wait_for_intermediate_child(pid: pid_t) -> ! {
     std::process::exit(1);
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 #[allow(unsafe_code)]
 fn current_pid() -> pid_t {
     // SAFETY: `getpid` takes no pointers and cannot violate Rust aliasing or
@@ -115,6 +164,8 @@ fn current_pid() -> pid_t {
     unsafe { libc::getpid() }
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 #[allow(unsafe_code)]
 fn redirect_standard_streams(
     devnull: &std::fs::File,
@@ -129,6 +180,8 @@ fn redirect_standard_streams(
     unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) };
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 pub fn daemonize(config: &config::ConfigHandle) -> anyhow::Result<Option<RawFd>> {
     let pid_file = if !config::running_under_wsl() {
         // pid file locking is only partly functional when running under
@@ -190,6 +243,8 @@ pub fn daemonize(config: &config::ConfigHandle) -> anyhow::Result<Option<RawFd>>
     Ok(pid_file_fd)
 }
 
+#[cfg(unix)]
+#[allow(dead_code)]
 #[allow(unsafe_code)]
 pub fn set_cloexec(fd: RawFd, enable: bool) {
     // SAFETY: `fd` is expected to be an open file descriptor supplied by the

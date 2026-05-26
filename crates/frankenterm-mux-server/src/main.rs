@@ -9,7 +9,6 @@ use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::{OsStr, OsString};
-use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,7 +209,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     if opts.daemonize {
-        spawn_daemonized_copy(&opts, &config)?;
+        daemonize::spawn_daemonized_copy(daemonized_child_args(&opts), &config)?;
         return Ok(());
     }
 
@@ -358,6 +357,7 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
     std::process::exit(1);
 }
 
+mod daemonize;
 mod ossl;
 
 fn set_mux_socket_environment(config: &config::ConfigHandle) {
@@ -425,30 +425,6 @@ pub fn spawn_listener(
         ossl::spawn_tls_listener(tls_server, dispatch_config)?;
     }
 
-    Ok(())
-}
-
-fn spawn_daemonized_copy(opts: &Opt, config: &config::ConfigHandle) -> anyhow::Result<()> {
-    let mut cmd = Command::new(
-        std::env::current_exe().context("resolving current executable for daemonize")?,
-    );
-    for arg in daemonized_child_args(opts) {
-        cmd.arg(arg);
-    }
-
-    cmd.stdin(Stdio::null());
-    cmd.stdout(config.daemon_options.open_stdout()?);
-    cmd.stderr(config.daemon_options.open_stderr()?);
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(winapi::um::winbase::DETACHED_PROCESS);
-    }
-
-    let _child = cmd
-        .spawn()
-        .context("spawning daemonized mux server child")?;
     Ok(())
 }
 

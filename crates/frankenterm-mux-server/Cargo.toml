@@ -38,7 +38,7 @@ wezterm-gui-subcommands.workspace = true
 wezterm-term.workspace = true
 
 [target."cfg(windows)".dependencies]
-winapi = { workspace=true, features = [ "winuser" ]}
+winapi = { workspace=true, features = [ "winbase", "winuser" ]}
 
 # Deny unsafe by default. Narrow exceptions live on audited helper functions in
 # src/main.rs and src/daemonize.rs so future unsafe expansion is visible.
