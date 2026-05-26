@@ -56,7 +56,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: windows-check
+          # ft-x1klc: bumped windows-check -> windows-check-v2 to bust the stale
+          # cache that masked the openssl-sys build-script failure (a cached
+          # openssl-sys artifact made a clean failure look green). Never trust a
+          # lone green for a `-sys` crate behind a warm cache.
+          key: windows-check-v2
+
+      # ft-x1klc: with openssl's `vendored` feature gated OFF on Windows (Mac stays
+      # vendored, Linux stays system), openssl-sys must find a *system* OpenSSL.
+      # windows-latest ships vcpkg at $VCPKG_INSTALLATION_ROOT but does NOT pre-build
+      # openssl, so provision it here and point openssl-sys at it via OPENSSL_DIR.
+      # Triplet x64-windows-static-md = static OpenSSL libs against the dynamic CRT
+      # (-md), which matches the default Rust MSVC runtime; OPENSSL_STATIC=1 tells
+      # openssl-sys to link those static libs. Exported to $GITHUB_ENV so both the
+      # default- and no-default-features cargo checks below inherit it.
+      - name: Provision OpenSSL (vcpkg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static-md
+          OPENSSL_ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
+          echo "OPENSSL_DIR=$OPENSSL_ROOT" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+          echo "Provisioned OpenSSL at $OPENSSL_ROOT"
+          ls -la "$OPENSSL_ROOT/lib" || true
 
       - name: Environment info
         shell: bash
@@ -67,17 +90,14 @@ jobs:
           cargo --version >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Default features: the parity target. STILL INFORMATIONAL (continue-on-error).
-      # ft-x1klc target-gated openssl's `vendored` feature off Windows, but Windows then
-      # falls back to *system* OpenSSL — and openssl-sys cannot find one on windows-latest
-      # (no OPENSSL_DIR, no vcpkg/choco install), failing the build script with "Could not
-      # find directory of OpenSSL installation". A single earlier run reported success, but
-      # that was a Swatinem cache artifact (cached openssl-sys masked the build-script run);
-      # a clean run fails. Real fix options (ft-x1klc reopened): (a) provision OpenSSL on the
-      # runner (vcpkg/choco install + OPENSSL_DIR), (b) switch the Windows TLS path to rustls
-      # (no system openssl), or (c) feature-gate the openssl/SSH crates out of the default
-      # Windows build. Re-require (remove continue-on-error) only after a CLEAN (cache-busted
-      # or repeated) green run — do not trust a lone green for a `-sys` crate.
+      # Default features: the parity target. STILL INFORMATIONAL (continue-on-error)
+      # until a CLEAN (cache-busted) green is confirmed; the operator re-requires it
+      # (removes continue-on-error) only after that — do not trust a lone green for a
+      # `-sys` crate. ft-x1klc gated openssl's `vendored` feature off Windows, so this
+      # depends on the "Provision OpenSSL (vcpkg)" step above exporting OPENSSL_DIR /
+      # OPENSSL_STATIC. If vcpkg's openssl build proves too slow/flaky here, the
+      # documented fallbacks are (b) move the Windows TLS path to rustls (no system
+      # openssl) or (c) feature-gate the openssl/SSH crates out of the default Windows build.
       - name: cargo check --workspace (default features)
         id: check_default
         continue-on-error: true
