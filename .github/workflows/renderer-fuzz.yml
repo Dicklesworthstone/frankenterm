@@ -57,7 +57,7 @@ jobs:
     name: Validate renderer fuzz lane
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -106,7 +106,7 @@ jobs:
         # 8 fixed seeds + 1 date-derived random.
         seed_label: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.seed_override != '') && format('[{0}]', toJSON(inputs.seed_override)) || '["a5a5a5a5","deadbeef","cafebabe","feedface","12345678","87654321","0badc0de","f00dface","random"]') }}
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -243,7 +243,7 @@ jobs:
     if: ${{ always() && !cancelled() && needs.fuzz.result != 'skipped' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: runs-aggregate
       - name: Post next-day summary
