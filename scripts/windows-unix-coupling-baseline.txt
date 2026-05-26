@@ -1,0 +1,50 @@
+# ft-51fde windows unix-coupling baseline — content-keyed ratchet.
+# Regenerate with: BLESS=1 scripts/check_windows_unix_coupling.sh
+# Each line: <path>\t<trimmed source line>. Removing entries is always safe;
+# adding entries means you accepted a NEW ungated coupling — justify it in the commit.
+Cargo.toml	DEP nix = "0.29"
+Cargo.toml	DEP passfd = "0.1.6"
+Cargo.toml	DEP signal-hook = "0.3"
+Cargo.toml	DEP termios = "0.3"
+crates/frankenterm-core/Cargo.toml	DEP nix = { workspace = true, optional = true, features = ["fs"] }
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link_path).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
+crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
+crates/frankenterm-core/src/vendored/mux_client.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+crates/frankenterm-core/src/vendored/mux_client.rs	use std::os::unix::fs::FileTypeExt;
+crates/frankenterm-core/src/workflows/coordination.rs	std::os::unix::fs::symlink(&linked_dir_target, root.path().join("linked_dir")).unwrap();
+crates/frankenterm-core/src/workflows/descriptors.rs	std::os::unix::fs::symlink(&target, root.path().join("linked.yaml")).unwrap();
+crates/frankenterm-core/tests/frankensqlite_gate_tests.rs	use std::os::unix::fs::PermissionsExt;
+crates/frankenterm-gui/src/native_bridge.rs	use std::os::unix::net::UnixStream;
+crates/frankenterm-mux-server-impl/src/dispatch.rs	let (left, mut right) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+frankenterm/client/src/discovery.rs	std::os::unix::fs::symlink(path, &name)
+frankenterm/escape-parser/Cargo.toml	DEP nix = { workspace=true, optional=true, features=["mman", "fs"] }
+frankenterm/filedescriptor/src/unix.rs	fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for FileDescriptor {
+frankenterm/filedescriptor/src/unix.rs	impl std::os::fd::AsFd for OwnedHandle {
+frankenterm/filedescriptor/src/unix.rs	unsafe { std::os::fd::BorrowedFd::borrow_raw(self.handle) }
+frankenterm/filedescriptor/src/unix.rs	use std::os::unix::prelude::*;
+frankenterm/mux/Cargo.toml	DEP nix = {workspace=true, features=["term"]}
+frankenterm/procinfo/src/macos.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
+frankenterm/pty/Cargo.toml	DEP nix = {workspace=true, features=["term", "fs"]}
+frankenterm/pty/src/cmdbuilder.rs	use std::os::unix::process::CommandExt;
+frankenterm/pty/src/unix.rs	pub use std::os::unix::io::RawFd;
+frankenterm/pty/src/unix.rs	use std::os::fd::AsFd;
+frankenterm/pty/src/unix.rs	use std::os::unix::ffi::OsStrExt;
+frankenterm/pty/src/unix.rs	use std::os::unix::io::{AsRawFd, FromRawFd};
+frankenterm/pty/src/unix.rs	use std::os::unix::process::CommandExt;
+frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::OsStringExt;
+frankenterm/pty/tests/proptest_cmdbuilder_serde.rs	use std::os::unix::ffi::{OsStrExt, OsStringExt};
+frankenterm/termwiz/src/render/terminfo.rs	use std::os::fd::FromRawFd;
+frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::io::AsRawFd;
+frankenterm/termwiz/src/terminal/unix.rs	use std::os::unix::net::UnixStream;
+frankenterm/window/src/os/wayland/connection.rs	use std::os::fd::AsRawFd;
+frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+frankenterm/window/src/os/wayland/copy_and_paste.rs	use std::os::fd::{AsRawFd, RawFd};
+frankenterm/window/src/os/wayland/window.rs	use std::os::fd::AsRawFd;
+frankenterm/window/src/os/wayland/window.rs	use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+frankenterm/window/src/os/x11/connection.rs	use std::os::unix::io::AsRawFd;
+frankenterm/window/src/os/x11/keyboard.rs	use std::os::unix::ffi::OsStrExt;
+frankenterm/window/src/spawn.rs	pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {

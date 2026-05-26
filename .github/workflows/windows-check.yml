@@ -27,6 +27,22 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # ft-51fde — fast, build-free static guard: fail on NEW unconditional Unix
+  # couplings (std::os::unix / std::os::fd, or unix-only crate deps) outside
+  # #[cfg(unix)] gates. Complements the cargo-check job below (the authoritative
+  # compile gate) by catching the common mistake without a full Windows toolchain
+  # build, and by covering #[cfg(test)] code that `cargo check` does not typecheck
+  # on Windows. This job builds nothing, so it is required from day one.
+  unix-coupling-lint:
+    name: unix-coupling ratchet (ft-51fde)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: No new unconditional Unix couplings
+        shell: bash
+        run: scripts/check_windows_unix_coupling.sh
+
   windows-check:
     name: cargo check (x86_64-pc-windows-msvc)
     runs-on: windows-latest
