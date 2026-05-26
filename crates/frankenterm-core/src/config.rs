@@ -824,12 +824,26 @@ impl Default for GeneralConfig {
 }
 
 fn default_data_dir() -> String {
-    // XDG on Linux, ~/Library/Application Support on macOS
+    // XDG on Linux, ~/Library/Application Support on macOS, %APPDATA%\ft on
+    // Windows. Unix (Linux + macOS) behavior is unchanged — only the previously
+    // unix-only `~/.local/share/ft` fallthrough is split so Windows no longer
+    // lands data under a bogus `C:\Users\X\.local\share\ft`. ft-plp3c.
     #[cfg(target_os = "macos")]
     {
         "~/Library/Application Support/ft".to_string()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Roaming app data (%APPDATA%) via the cross-platform `dirs` crate,
+        // matching how `dirs_config_path` resolves the config dir. Absolute, so
+        // `expand_tilde` leaves it untouched. Falls back to a relative dir if
+        // the OS can't supply a data dir (parity with other dir resolvers).
+        dirs::data_dir()
+            .map(|d| d.join("ft"))
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "ft-data".to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "~/.local/share/ft".to_string()
     }
