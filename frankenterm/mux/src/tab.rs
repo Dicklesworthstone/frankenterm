@@ -2300,7 +2300,7 @@ impl TabInner {
         if self.floating_focus == Some(pane_id) {
             self.floating_focus = None;
         }
-        self.constraint_overrides.remove(&pane_id);
+        self.discard_removed_pane_state(pane_id);
         self.advise_focus_change(prior);
         Some(removed.pane)
     }
@@ -2352,7 +2352,7 @@ impl TabInner {
             }
         });
         for pane_id in removed_ids {
-            self.constraint_overrides.remove(&pane_id);
+            self.discard_removed_pane_state(pane_id);
         }
         if let Some(pane_id) = self.floating_focus {
             if !self
@@ -2362,6 +2362,63 @@ impl TabInner {
             {
                 self.floating_focus = None;
             }
+        }
+        removed
+    }
+
+    fn discard_removed_pane_state(&mut self, pane_id: PaneId) {
+        self.constraint_overrides.remove(&pane_id);
+        self.collapsed_panes.remove(&pane_id);
+    }
+
+    fn remove_stacked_pane(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
+        let mut removed = None;
+        let mut empty_slot = None;
+        for (slot_index, stack) in &mut self.pane_stacks {
+            if let Some(pane) = stack.remove(pane_id) {
+                if stack.is_empty() {
+                    empty_slot = Some(*slot_index);
+                }
+                removed = Some(pane);
+                break;
+            }
+        }
+        if let Some(slot_index) = empty_slot {
+            self.pane_stacks.remove(&slot_index);
+        }
+        if removed.is_some() {
+            self.discard_removed_pane_state(pane_id);
+        }
+        removed
+    }
+
+    fn remove_stacked_panes_if<F>(&mut self, predicate: F) -> Vec<Arc<dyn Pane>>
+    where
+        F: Fn(&Arc<dyn Pane>) -> bool,
+    {
+        let mut removed = Vec::new();
+        let mut empty_slots = Vec::new();
+        for (slot_index, stack) in &mut self.pane_stacks {
+            let pane_ids = stack
+                .panes()
+                .iter()
+                .filter(|pane| predicate(pane))
+                .map(|pane| pane.pane_id())
+                .collect::<Vec<_>>();
+            for pane_id in pane_ids {
+                if let Some(pane) = stack.remove(pane_id) {
+                    removed.push(pane);
+                }
+            }
+            if stack.is_empty() {
+                empty_slots.push(*slot_index);
+            }
+        }
+        for slot_index in empty_slots {
+            self.pane_stacks.remove(&slot_index);
+        }
+        for pane in &removed {
+            self.discard_removed_pane_state(pane.pane_id());
         }
         removed
     }
@@ -3461,17 +3518,18 @@ impl TabInner {
 
     fn prune_dead_panes(&mut self) -> bool {
         let mux = Mux::try_get();
+        let should_prune = |pane: &Arc<dyn Pane>| {
+            let in_mux = mux
+                .as_ref()
+                .map(|mux| mux.get_pane(pane.pane_id()).is_some())
+                .unwrap_or(true);
+            let dead = pane.is_dead();
+            dead || !in_mux
+        };
         let dead_floating: Vec<PaneId> = self
             .floating_panes
             .iter()
-            .filter(|floating| {
-                let in_mux = mux
-                    .as_ref()
-                    .map(|mux| mux.get_pane(floating.pane.pane_id()).is_some())
-                    .unwrap_or(true);
-                let dead = floating.pane.is_dead();
-                dead || !in_mux
-            })
+            .filter(|floating| should_prune(&floating.pane))
             .map(|floating| floating.pane.pane_id())
             .collect();
 
@@ -3479,6 +3537,7 @@ impl TabInner {
             let _ = self.remove_floating_pane(*pane_id);
         }
 
+        let removed_stacked = self.remove_stacked_panes_if(should_prune);
         let removed_tree = !self
             .remove_pane_if(
                 |_, pane| {
@@ -3502,7 +3561,7 @@ impl TabInner {
                 true,
             )
             .is_empty();
-        !dead_floating.is_empty() || removed_tree
+        !dead_floating.is_empty() || !removed_stacked.is_empty() || removed_tree
     }
 
     fn kill_pane(&mut self, pane_id: PaneId) -> bool {
@@ -3527,8 +3586,13 @@ impl TabInner {
 
     fn kill_panes_in_domain(&mut self, domain: DomainId) -> bool {
         let removed_floating = self.remove_floating_panes_in_domain(domain);
-        if !removed_floating.is_empty() {
-            let ids: Vec<PaneId> = removed_floating.iter().map(|pane| pane.pane_id()).collect();
+        let removed_stacked = self.remove_stacked_panes_if(|pane| pane.domain_id() == domain);
+        if !removed_floating.is_empty() || !removed_stacked.is_empty() {
+            let ids: Vec<PaneId> = removed_floating
+                .iter()
+                .chain(removed_stacked.iter())
+                .map(|pane| pane.pane_id())
+                .collect();
             if promise::spawn::is_scheduler_configured() {
                 promise::spawn::spawn_into_main_thread(async move {
                     if let Some(mux) = Mux::try_get() {
@@ -3541,7 +3605,7 @@ impl TabInner {
             }
         }
         let removed_tree = self.remove_pane_if(|_, pane| pane.domain_id() == domain, true);
-        !removed_floating.is_empty() || !removed_tree.is_empty()
+        !removed_floating.is_empty() || !removed_stacked.is_empty() || !removed_tree.is_empty()
     }
 
     fn remove_pane(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
@@ -3549,7 +3613,10 @@ impl TabInner {
             return Some(pane);
         }
         let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id, false);
-        panes.into_iter().next()
+        panes
+            .into_iter()
+            .next()
+            .or_else(|| self.remove_stacked_pane(pane_id))
     }
 
     fn remove_pane_if<F>(&mut self, f: F, kill: bool) -> Vec<Arc<dyn Pane>>
@@ -3672,8 +3739,8 @@ impl TabInner {
         }
         for pane in &dead_panes {
             let pid = pane.pane_id();
-            self.constraint_overrides.remove(&pid);
-            self.collapsed_panes.remove(&pid);
+            self.discard_removed_pane_state(pid);
+            self.remove_stacked_pane(pid);
         }
         dead_panes
     }
@@ -7710,6 +7777,49 @@ mod test {
             stacked_panes.len(),
             3,
             "Last slot stack should hold the visible pane + 2 overflow panes"
+        );
+    }
+
+    #[test]
+    fn remove_pane_prunes_hidden_layout_stack_member() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(6);
+        tab.set_layout_cycle(default_cycle());
+        tab.swap_to_layout_index(0);
+
+        let tree_ids: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|positioned| positioned.pane.pane_id())
+            .collect();
+        let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
+        let hidden_id = *stacked_ids
+            .difference(&tree_ids)
+            .next()
+            .expect("grid-4 overflow should leave at least one hidden stacked pane");
+
+        let removed = tab
+            .remove_pane(hidden_id)
+            .expect("hidden stacked pane should be removable");
+        assert_eq!(removed.pane_id(), hidden_id);
+        assert!(
+            !tab.all_stacked_pane_ids().contains(&hidden_id),
+            "remove_pane must not leave hidden stacked pane state behind",
+        );
+
+        tab.swap_to_next_layout();
+        let tree_ids_after: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|positioned| positioned.pane.pane_id())
+            .collect();
+        let stacked_ids_after: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
+        let all_after: HashSet<PaneId> =
+            tree_ids_after.union(&stacked_ids_after).copied().collect();
+        assert!(
+            !all_after.contains(&hidden_id),
+            "layout swaps must not resurrect a pane removed from a hidden stack",
         );
     }
 

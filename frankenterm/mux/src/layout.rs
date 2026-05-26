@@ -196,7 +196,11 @@ impl PaneStack {
     pub fn remove(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
         let pos = self.panes.iter().position(|p| p.pane_id() == pane_id)?;
         let pane = self.panes.remove(pos);
-        if self.active_index >= self.panes.len() && !self.panes.is_empty() {
+        if self.panes.is_empty() {
+            self.active_index = 0;
+        } else if pos < self.active_index {
+            self.active_index -= 1;
+        } else if self.active_index >= self.panes.len() {
             self.active_index = self.panes.len() - 1;
         }
         Some(pane)
