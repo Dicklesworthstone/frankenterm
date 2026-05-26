@@ -110,7 +110,7 @@ default-members = [
 # - optional frontends (mcp/web/tui/browser) are feature-gated
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Dicklesworthstone"]
@@ -582,8 +582,8 @@ opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
-strip = false       # Keep debug symbols so `sample` / lldb resolve frames
-debug = true        # Full debuginfo — turn back to `false` or `"line-tables-only"` once the deadlock root cause is identified
+strip = true        # Remove debug symbols (size-optimized CLI release; deadlock guards landed in 9fba0d14b/f17d35c72)
+debug = false       # No debuginfo in release artifacts
 
 # Provide git-based versions of crates that upstream repos (fastmcp_rust, fastapi_rust)
 # reference as path deps pointing outside their own repo (../asupersync, ../rich_rust).
