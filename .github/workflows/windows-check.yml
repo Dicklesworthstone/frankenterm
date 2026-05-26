@@ -67,15 +67,20 @@ jobs:
           cargo --version >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Default features: the parity target, and now a REQUIRED gate. As of ft-x1klc
-      # (async_ossl openssl `vendored` target-gated off Windows — Windows uses system
-      # OpenSSL, mac+linux keep vendored unchanged) this compiles green for
-      # x86_64-pc-windows-msvc, confirmed by a completed run. Removing continue-on-error
-      # locks in the additive, no-Mac/Linux-regression Windows-compat invariant: a
-      # change that reintroduces an unconditional Unix coupling or otherwise breaks the
-      # Windows build now fails CI. Keep it additive (#[cfg(windows)] seams).
+      # Default features: the parity target. STILL INFORMATIONAL (continue-on-error).
+      # ft-x1klc target-gated openssl's `vendored` feature off Windows, but Windows then
+      # falls back to *system* OpenSSL — and openssl-sys cannot find one on windows-latest
+      # (no OPENSSL_DIR, no vcpkg/choco install), failing the build script with "Could not
+      # find directory of OpenSSL installation". A single earlier run reported success, but
+      # that was a Swatinem cache artifact (cached openssl-sys masked the build-script run);
+      # a clean run fails. Real fix options (ft-x1klc reopened): (a) provision OpenSSL on the
+      # runner (vcpkg/choco install + OPENSSL_DIR), (b) switch the Windows TLS path to rustls
+      # (no system openssl), or (c) feature-gate the openssl/SSH crates out of the default
+      # Windows build. Re-require (remove continue-on-error) only after a CLEAN (cache-busted
+      # or repeated) green run — do not trust a lone green for a `-sys` crate.
       - name: cargo check --workspace (default features)
         id: check_default
+        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
