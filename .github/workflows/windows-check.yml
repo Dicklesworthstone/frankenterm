@@ -1,0 +1,100 @@
+name: Windows Check
+
+# [win-compat][P0] (ft-f2gx8): proof-of-feasibility + standing regression guard
+# for Windows support. Build-only `cargo check` against x86_64-pc-windows-msvc;
+# no Windows runtime is exercised here. Starts as continue-on-error (informational)
+# while the tree is driven green under ft-5fmt3; flip `continue-on-error` to false
+# (make it required) once it passes, to lock in the additive, no-Mac/Linux-regression
+# Windows-compat invariant.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows-check:
+    name: cargo check (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check
+
+      - name: Environment info
+        shell: bash
+        run: |
+          echo "## Windows Check environment" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          rustc --version --verbose >> "$GITHUB_STEP_SUMMARY"
+          cargo --version >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # Default features first: this is the parity target. Until ft-5fmt3 lands
+      # the platform seams + #[cfg(windows)] stubs this is expected to fail and
+      # the log is the worklist of remaining Unix couplings.
+      - name: cargo check --workspace (default features)
+        id: check_default
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target/ci-logs
+          cargo check --workspace --target x86_64-pc-windows-msvc 2>&1 \
+            | tee target/ci-logs/windows-check-default.log
+
+      # Minimal feature set is the most likely to compile first; tracks the
+      # "compiles with --no-default-features" milestone from the feasibility study.
+      - name: cargo check --workspace --no-default-features
+        id: check_minimal
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target/ci-logs
+          cargo check --workspace --no-default-features --target x86_64-pc-windows-msvc 2>&1 \
+            | tee target/ci-logs/windows-check-minimal.log
+
+      - name: Summarize remaining Windows blockers
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Windows cargo check — remaining blockers"
+            echo "default-features: ${{ steps.check_default.outcome }}"
+            echo "no-default-features: ${{ steps.check_minimal.outcome }}"
+            echo ""
+            echo "### Distinct error[E] lines (default features)"
+            echo '```'
+            grep -hoE 'error\[E[0-9]+\]' target/ci-logs/windows-check-default.log 2>/dev/null | sort | uniq -c | sort -rn | head -40 || echo "(none / log missing)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Windows check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-check-logs
+          path: target/ci-logs/windows-check-*.log
+          if-no-files-found: ignore
