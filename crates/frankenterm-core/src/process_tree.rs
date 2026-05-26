@@ -242,7 +242,16 @@ fn collect_names(node: &ProcessNode, names: &mut Vec<String>) {
 ///
 /// Returns `None` if the process doesn't exist or tree capture fails.
 pub fn capture_tree(root_pid: u32, config: &ProcessTreeConfig) -> Option<ProcessTree> {
-    let root = capture_node(root_pid, 0, config.max_depth)?;
+    let mut provider = PlatformProcessSnapshotProvider::new();
+    capture_tree_with_provider(root_pid, config, &mut provider)
+}
+
+fn capture_tree_with_provider(
+    root_pid: u32,
+    config: &ProcessTreeConfig,
+    provider: &mut impl ProcessSnapshotProvider,
+) -> Option<ProcessTree> {
+    let root = capture_node(root_pid, 0, config.max_depth, provider)?;
     let mut total_processes = 0;
     let mut total_rss_kb = 0;
     count_tree(&root, &mut total_processes, &mut total_rss_kb);
@@ -262,13 +271,19 @@ fn count_tree(node: &ProcessNode, count: &mut usize, rss: &mut u64) {
     }
 }
 
-fn capture_node(pid: u32, depth: u32, max_depth: u32) -> Option<ProcessNode> {
-    let info = read_process_info(pid)?;
+fn capture_node(
+    pid: u32,
+    depth: u32,
+    max_depth: u32,
+    provider: &mut impl ProcessSnapshotProvider,
+) -> Option<ProcessNode> {
+    let info = provider.read_process_info(pid)?;
 
     let children = if depth < max_depth {
-        find_children(pid)
+        provider
+            .find_children(pid)
             .into_iter()
-            .filter_map(|child_pid| capture_node(child_pid, depth + 1, max_depth))
+            .filter_map(|child_pid| capture_node(child_pid, depth + 1, max_depth, provider))
             .collect()
     } else {
         Vec::new()
@@ -295,12 +310,50 @@ struct RawProcessInfo {
     rss_kb: u64,
 }
 
+trait ProcessSnapshotProvider {
+    fn read_process_info(&mut self, pid: u32) -> Option<RawProcessInfo>;
+
+    fn find_children(&mut self, pid: u32) -> Vec<u32>;
+}
+
+struct PlatformProcessSnapshotProvider {
+    #[cfg(windows)]
+    system: sysinfo::System,
+}
+
+impl PlatformProcessSnapshotProvider {
+    #[cfg(not(windows))]
+    fn new() -> Self {
+        Self {}
+    }
+
+    #[cfg(windows)]
+    fn new() -> Self {
+        let mut system = sysinfo::System::new_all();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        Self { system }
+    }
+}
+
+impl ProcessSnapshotProvider for PlatformProcessSnapshotProvider {
+    fn read_process_info(&mut self, pid: u32) -> Option<RawProcessInfo> {
+        read_process_info(self, pid)
+    }
+
+    fn find_children(&mut self, pid: u32) -> Vec<u32> {
+        find_children(self, pid)
+    }
+}
+
 // =============================================================================
 // Linux: /proc filesystem
 // =============================================================================
 
 #[cfg(target_os = "linux")]
-fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
+fn read_process_info(
+    _provider: &PlatformProcessSnapshotProvider,
+    pid: u32,
+) -> Option<RawProcessInfo> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
@@ -365,7 +418,7 @@ fn parse_linux_state(s: &str) -> ProcessState {
 }
 
 #[cfg(target_os = "linux")]
-fn find_children(pid: u32) -> Vec<u32> {
+fn find_children(_provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<u32> {
     // Read /proc/<pid>/task/<pid>/children if available (kernel 3.5+).
     let children_path = format!("/proc/{pid}/task/{pid}/children");
     if let Ok(contents) = std::fs::read_to_string(&children_path) {
@@ -416,7 +469,10 @@ fn scan_children_from_proc(ppid: u32) -> Vec<u32> {
 // =============================================================================
 
 #[cfg(target_os = "macos")]
-fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
+fn read_process_info(
+    _provider: &PlatformProcessSnapshotProvider,
+    pid: u32,
+) -> Option<RawProcessInfo> {
     // Use `ps` to get process info in a single call.
     // Format: pid ppid state rss comm (args...)
     let output = std::process::Command::new("ps")
@@ -488,7 +544,7 @@ fn read_macos_argv(pid: u32) -> Vec<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn find_children(pid: u32) -> Vec<u32> {
+fn find_children(_provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<u32> {
     // Use pgrep to find child processes.
     let output = std::process::Command::new("pgrep")
         .args(["-P", &pid.to_string()])
@@ -512,16 +568,69 @@ fn find_children(pid: u32) -> Vec<u32> {
 }
 
 // =============================================================================
+// Windows: sysinfo
+// =============================================================================
+
+#[cfg(windows)]
+fn read_process_info(
+    provider: &PlatformProcessSnapshotProvider,
+    pid: u32,
+) -> Option<RawProcessInfo> {
+    let process = provider.system.process(sysinfo::Pid::from_u32(pid))?;
+    let argv = process
+        .cmd()
+        .iter()
+        .take(8)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    Some(RawProcessInfo {
+        pid,
+        ppid: process.parent().map_or(0, sysinfo::Pid::as_u32),
+        name: process.name().to_string_lossy().into_owned(),
+        argv,
+        state: process_state_from_sysinfo(process.status()),
+        rss_kb: process.memory() / 1024,
+    })
+}
+
+#[cfg(windows)]
+fn find_children(provider: &PlatformProcessSnapshotProvider, pid: u32) -> Vec<u32> {
+    provider
+        .system
+        .processes()
+        .iter()
+        .filter_map(|(child_pid, process)| {
+            (process.parent().map(sysinfo::Pid::as_u32) == Some(pid)).then(|| child_pid.as_u32())
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn process_state_from_sysinfo(status: sysinfo::ProcessStatus) -> ProcessState {
+    match status {
+        sysinfo::ProcessStatus::Run => ProcessState::Running,
+        sysinfo::ProcessStatus::Sleep | sysinfo::ProcessStatus::Idle => ProcessState::Sleeping,
+        sysinfo::ProcessStatus::UninterruptibleDiskSleep => ProcessState::DiskSleep,
+        sysinfo::ProcessStatus::Stop | sysinfo::ProcessStatus::Tracing => ProcessState::Stopped,
+        sysinfo::ProcessStatus::Zombie => ProcessState::Zombie,
+        _ => ProcessState::Unknown,
+    }
+}
+
+// =============================================================================
 // Other platforms: stub
 // =============================================================================
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_process_info(_pid: u32) -> Option<RawProcessInfo> {
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn read_process_info(
+    _provider: &PlatformProcessSnapshotProvider,
+    _pid: u32,
+) -> Option<RawProcessInfo> {
     None
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn find_children(_pid: u32) -> Vec<u32> {
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn find_children(_provider: &PlatformProcessSnapshotProvider, _pid: u32) -> Vec<u32> {
     Vec::new()
 }
 
@@ -572,6 +681,7 @@ impl ProcessNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn sample_tree() -> ProcessTree {
         ProcessTree {
@@ -621,6 +731,33 @@ mod tests {
             },
             total_processes: 5,
             total_rss_kb: 408000,
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeProcessSnapshotProvider {
+        infos: HashMap<u32, RawProcessInfo>,
+        children: HashMap<u32, Vec<u32>>,
+    }
+
+    impl ProcessSnapshotProvider for FakeProcessSnapshotProvider {
+        fn read_process_info(&mut self, pid: u32) -> Option<RawProcessInfo> {
+            self.infos.remove(&pid)
+        }
+
+        fn find_children(&mut self, pid: u32) -> Vec<u32> {
+            self.children.get(&pid).cloned().unwrap_or_default()
+        }
+    }
+
+    fn fake_info(pid: u32, ppid: u32, name: &str, rss_kb: u64) -> RawProcessInfo {
+        RawProcessInfo {
+            pid,
+            ppid,
+            name: name.to_string(),
+            argv: vec![name.to_string()],
+            state: ProcessState::Running,
+            rss_kb,
         }
     }
 
@@ -864,6 +1001,36 @@ mod tests {
         count_tree(&tree.root, &mut count, &mut rss);
         assert_eq!(count, 5);
         assert_eq!(rss, 408000);
+    }
+
+    #[test]
+    fn capture_tree_uses_process_snapshot_provider_seam() {
+        let mut provider = FakeProcessSnapshotProvider::default();
+        provider.infos.insert(10, fake_info(10, 1, "pwsh", 4));
+        provider.infos.insert(11, fake_info(11, 10, "codex", 8));
+        provider.infos.insert(12, fake_info(12, 11, "rustc", 16));
+        provider.children.insert(10, vec![11]);
+        provider.children.insert(11, vec![12]);
+
+        let tree = capture_tree_with_provider(
+            10,
+            &ProcessTreeConfig {
+                max_depth: 1,
+                ..Default::default()
+            },
+            &mut provider,
+        )
+        .expect("fake provider should expose root process");
+
+        assert_eq!(tree.root.pid, 10);
+        assert_eq!(tree.root.children.len(), 1);
+        assert_eq!(tree.root.children[0].pid, 11);
+        assert!(
+            tree.root.children[0].children.is_empty(),
+            "max_depth should be enforced by the provider-independent tree walk",
+        );
+        assert_eq!(tree.total_processes, 2);
+        assert_eq!(tree.total_rss_kb, 12);
     }
 
     #[test]

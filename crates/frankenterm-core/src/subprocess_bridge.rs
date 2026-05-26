@@ -98,22 +98,14 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
             cmd.env(k, v);
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        crate::runtime_async::process::configure_process_group(&mut cmd)
+            .map_err(|err| BridgeError::ExitCode(-1, err.to_string()))?;
 
         let mut child = cmd.spawn().map_err(|err| self.map_spawn_error(err))?;
         let started = Instant::now();
 
         let kill_process_group = |child_id: u32| {
-            #[cfg(unix)]
-            {
-                let _ = crate::runtime_async::process::send_unix_signal_to_process_group(
-                    child_id, "KILL",
-                );
-            }
+            let _ = crate::runtime_async::process::send_signal_to_process_group(child_id, "KILL");
         };
 
         let stdout_stream = match child.stdout.take() {

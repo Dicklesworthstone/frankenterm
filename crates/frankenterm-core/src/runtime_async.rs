@@ -1445,6 +1445,17 @@ pub mod process {
         enabled: bool,
     }
 
+    struct PlatformProcessControl;
+
+    trait ProcessControl {
+        fn configure_process_group(cmd: &mut std::process::Command) -> std::io::Result<()>;
+        fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus>;
+        fn send_signal_to_process_group(
+            process_group_id: u32,
+            signal: &str,
+        ) -> std::io::Result<ExitStatus>;
+    }
+
     #[cfg(unix)]
     pub(crate) fn unix_kill_command() -> &'static str {
         UNIX_KILL_COMMANDS
@@ -1478,13 +1489,143 @@ pub mod process {
     }
 
     #[cfg(unix)]
-    pub fn send_unix_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
-        validate_unix_signal_target(pid)?;
-        validate_unix_signal_name(signal)?;
+    impl ProcessControl for PlatformProcessControl {
+        fn configure_process_group(cmd: &mut std::process::Command) -> std::io::Result<()> {
+            use std::os::unix::process::CommandExt;
 
-        std::process::Command::new(unix_kill_command())
-            .args(["-s", signal, &pid.to_string()])
-            .status()
+            cmd.process_group(0);
+            Ok(())
+        }
+
+        fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
+            validate_unix_signal_target(pid)?;
+            validate_unix_signal_name(signal)?;
+
+            std::process::Command::new(unix_kill_command())
+                .args(["-s", signal, &pid.to_string()])
+                .status()
+        }
+
+        fn send_signal_to_process_group(
+            process_group_id: u32,
+            signal: &str,
+        ) -> std::io::Result<ExitStatus> {
+            validate_unix_signal_target(i64::from(process_group_id))?;
+            validate_unix_signal_name(signal)?;
+
+            std::process::Command::new(unix_kill_command())
+                .args(["-s", signal, &format!("-{process_group_id}")])
+                .status()
+        }
+    }
+
+    #[cfg(windows)]
+    impl ProcessControl for PlatformProcessControl {
+        fn configure_process_group(_cmd: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
+            let pid = validate_windows_signal_target(pid)?;
+            run_taskkill(pid, windows_taskkill_force(signal)?)
+        }
+
+        fn send_signal_to_process_group(
+            process_group_id: u32,
+            signal: &str,
+        ) -> std::io::Result<ExitStatus> {
+            validate_windows_signal_target(i64::from(process_group_id))?;
+            run_taskkill(process_group_id, windows_taskkill_force(signal)?)
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    impl ProcessControl for PlatformProcessControl {
+        fn configure_process_group(_cmd: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn send_signal_to_pid(_pid: i64, _signal: &str) -> std::io::Result<ExitStatus> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "process signaling is unsupported on this platform",
+            ))
+        }
+
+        fn send_signal_to_process_group(
+            _process_group_id: u32,
+            _signal: &str,
+        ) -> std::io::Result<ExitStatus> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "process-tree signaling is unsupported on this platform",
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_signal_target(pid: i64) -> std::io::Result<u32> {
+        u32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("signal target pid must be a positive Windows process id, got {pid}"),
+                )
+            })
+    }
+
+    #[cfg(windows)]
+    fn windows_taskkill_force(signal: &str) -> std::io::Result<bool> {
+        if signal.is_empty() || !signal.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid Windows termination signal: {signal:?}"),
+            ));
+        }
+
+        let upper = signal.to_ascii_uppercase();
+        let normalized = upper.strip_prefix("SIG").unwrap_or(&upper);
+        match normalized {
+            "TERM" => Ok(false),
+            "KILL" => Ok(true),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsupported Windows termination signal: {signal:?}"),
+            )),
+        }
+    }
+
+    #[cfg(windows)]
+    fn run_taskkill(pid: u32, force: bool) -> std::io::Result<ExitStatus> {
+        let pid_arg = pid.to_string();
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid_arg, "/T"]);
+        if force {
+            cmd.arg("/F");
+        }
+        cmd.status()
+    }
+
+    pub(crate) fn configure_process_group(cmd: &mut std::process::Command) -> std::io::Result<()> {
+        PlatformProcessControl::configure_process_group(cmd)
+    }
+
+    pub fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
+        PlatformProcessControl::send_signal_to_pid(pid, signal)
+    }
+
+    pub fn send_signal_to_process_group(
+        process_group_id: u32,
+        signal: &str,
+    ) -> std::io::Result<ExitStatus> {
+        PlatformProcessControl::send_signal_to_process_group(process_group_id, signal)
+    }
+
+    #[cfg(unix)]
+    pub fn send_unix_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
+        send_signal_to_pid(pid, signal)
     }
 
     #[cfg(unix)]
@@ -1492,12 +1633,7 @@ pub mod process {
         process_group_id: u32,
         signal: &str,
     ) -> std::io::Result<ExitStatus> {
-        validate_unix_signal_target(i64::from(process_group_id))?;
-        validate_unix_signal_name(signal)?;
-
-        std::process::Command::new(unix_kill_command())
-            .args(["-s", signal, &format!("-{process_group_id}")])
-            .status()
+        send_signal_to_process_group(process_group_id, signal)
     }
 
     impl KillOnDropGuard {
@@ -1719,11 +1855,7 @@ pub mod process {
             cmd.env(k, v);
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        configure_process_group(&mut cmd)?;
 
         let mut child = cmd.spawn()?;
         let stdout = match child.stdout.take() {
@@ -1816,19 +1948,37 @@ pub mod process {
     }
 
     fn terminate_child_process(child: &mut std::process::Child) {
-        #[cfg(unix)]
-        {
-            let _ = send_unix_signal_to_process_group(child.id(), "KILL");
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                .status();
-        }
-
+        let _ = send_signal_to_process_group(child.id(), "KILL");
         let _ = child.kill();
+    }
+
+    #[cfg(all(test, windows))]
+    mod windows_process_control_tests {
+        use super::*;
+
+        #[test]
+        fn windows_taskkill_force_maps_term_and_kill() {
+            assert!(!windows_taskkill_force("TERM").unwrap());
+            assert!(!windows_taskkill_force("SIGTERM").unwrap());
+            assert!(!windows_taskkill_force("sigterm").unwrap());
+            assert!(windows_taskkill_force("KILL").unwrap());
+            assert!(windows_taskkill_force("SIGKILL").unwrap());
+            assert!(windows_taskkill_force("sigkill").unwrap());
+        }
+
+        #[test]
+        fn windows_taskkill_force_rejects_unknown_or_shell_like_signals() {
+            assert!(windows_taskkill_force("HUP").is_err());
+            assert!(windows_taskkill_force("TERM;cmd").is_err());
+        }
+
+        #[test]
+        fn windows_signal_target_must_be_positive_process_id() {
+            assert!(validate_windows_signal_target(1).is_ok());
+            assert!(validate_windows_signal_target(0).is_err());
+            assert!(validate_windows_signal_target(-1).is_err());
+            assert!(validate_windows_signal_target(i64::from(u32::MAX) + 1).is_err());
+        }
     }
 
     #[cfg(test)]
