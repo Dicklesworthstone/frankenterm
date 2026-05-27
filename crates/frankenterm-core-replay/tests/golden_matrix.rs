@@ -670,7 +670,10 @@ fn forensics_diff_conformance_classifies_policy_causal_chain() {
     assert!(!diff.is_equivalent(EquivalenceLevel::L2));
 
     let first = &diff.divergences[0];
-    assert_eq!(first.position, 1);
+    // position is a dense canonical rank since 01f2a5325 (normalize_divergence_positions):
+    // the policy Modified divergence (ts 1010) sorts first, ranking 0 — not its original
+    // baseline sequence index (1).
+    assert_eq!(first.position, 0);
     assert_eq!(first.divergence_type, DivergenceType::Modified);
     assert_eq!(first.root_cause, RootCause::Unknown);
     assert_eq!(
@@ -702,7 +705,7 @@ fn forensics_diff_conformance_classifies_policy_causal_chain() {
         .first_divergence
         .as_ref()
         .expect("mission diff reports the first divergence");
-    assert_eq!(first_mission.position, 1);
+    assert_eq!(first_mission.position, 0);
     assert_eq!(
         first_mission.category,
         MissionCausalityCategory::PolicyDecision
@@ -711,7 +714,7 @@ fn forensics_diff_conformance_classifies_policy_causal_chain() {
     assert_eq!(
         first_mission.evidence_refs,
         vec![
-            "divergence_position:1",
+            "divergence_position:0",
             "divergence_type:Modified",
             "root_cause:unknown",
             "baseline_node:1",
@@ -822,7 +825,7 @@ fn forensics_diff_conformance_preserves_timing_equivalence_levels() {
             .expect("timing diff has a first divergence")
             .evidence_refs,
         vec![
-            "divergence_position:1",
+            "divergence_position:0",
             "divergence_type:Shifted",
             "root_cause:timing_shift",
             "baseline_node:1",
