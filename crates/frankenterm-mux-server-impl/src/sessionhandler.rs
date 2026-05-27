@@ -421,18 +421,6 @@ impl SessionHandler {
             send_response(f());
         }
 
-        fn respond_if_mux_unavailable<SND>(send_response: &SND) -> bool
-        where
-            SND: Fn(anyhow::Result<Pdu>),
-        {
-            if let Err(err) = session_mux() {
-                send_response(Err(err));
-                true
-            } else {
-                false
-            }
-        }
-
         fn pane_exists_now(pane_id: PaneId) -> anyhow::Result<bool> {
             let mux = session_mux()?;
             Ok(mux.get_pane(pane_id).is_some())
