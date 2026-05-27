@@ -8,7 +8,7 @@
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
-use frankenterm_core::config::{DistributedAuthMode, DistributedConfig};
+use frankenterm_core::config::{DistributedAuthMode, DistributedConfig, DistributedTlsConfig};
 use frankenterm_core::distributed::build_tls_bundle;
 use frankenterm_core::runtime_async::task;
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
@@ -85,19 +85,23 @@ fn tls_bundle(mtls: bool) -> (TlsAcceptor, TlsConnector) {
     Box::leak(Box::new(cert_file));
     Box::leak(Box::new(key_file));
 
-    let mut cfg = DistributedConfig::default();
-    cfg.enabled = true;
-    cfg.auth_mode = if mtls {
+    let auth_mode = if mtls {
         DistributedAuthMode::Mtls
     } else {
         DistributedAuthMode::Token
     };
-    cfg.tls.enabled = true;
-    cfg.tls.cert_path = Some(cert_path);
-    cfg.tls.key_path = Some(key_path);
-    if mtls {
-        cfg.tls.client_ca_path = Some(ca_path.clone());
-    }
+    let cfg = DistributedConfig {
+        enabled: true,
+        auth_mode,
+        tls: DistributedTlsConfig {
+            enabled: true,
+            cert_path: Some(cert_path),
+            key_path: Some(key_path),
+            client_ca_path: mtls.then(|| ca_path.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let bundle = build_tls_bundle(&cfg, Some(std::path::Path::new(&ca_path))).expect("tls bundle");
     (
