@@ -750,8 +750,10 @@ proptest! {
         prop_assert!(result.contains(&event_id.to_string()));
         prop_assert!(result.contains("codex"));
         prop_assert!(result.contains(&rule_id));
-        prop_assert!(!result.contains('{'));
-        prop_assert!(!result.contains('}'));
+        let opening_brace = char::from(b'{');
+        let closing_brace = char::from(b'}');
+        prop_assert!(!result.contains(opening_brace));
+        prop_assert!(!result.contains(closing_brace));
     }
 }
 
@@ -840,11 +842,12 @@ proptest! {
                 Some("ft workflow preview usage-limit")
             );
         } else {
-            prop_assert_eq!(pack.rules[0].workflow, None);
-            prop_assert_eq!(pack.rules[0].preview_command, None);
+            prop_assert!(pack.rules[0].workflow.is_none());
+            prop_assert!(pack.rules[0].preview_command.is_none());
         }
+        let manual_fix = pack.rules[0].get_manual_fix(9, None);
         prop_assert_eq!(
-            pack.rules[0].get_manual_fix(9, None).as_deref(),
+            manual_fix.as_deref(),
             Some("Recover pane 9")
         );
     }

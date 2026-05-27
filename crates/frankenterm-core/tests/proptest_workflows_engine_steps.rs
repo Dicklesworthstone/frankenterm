@@ -459,7 +459,7 @@ proptest! {
                 matcher: actual_matcher,
             } => {
                 prop_assert_eq!(pane_id, None);
-                prop_assert_eq!(actual_matcher, matcher);
+                prop_assert_eq!(&actual_matcher, &matcher);
             }
             other => prop_assert!(false, "Expected TextMatch variant, got {other:?}"),
         }
@@ -472,7 +472,7 @@ proptest! {
                 matcher: actual_matcher,
             } => {
                 prop_assert_eq!(actual_pane_id, Some(pane_id));
-                prop_assert_eq!(actual_matcher, matcher);
+                prop_assert_eq!(&actual_matcher, &matcher);
             }
             other => prop_assert!(false, "Expected TextMatch variant, got {other:?}"),
         }

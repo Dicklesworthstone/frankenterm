@@ -99,8 +99,8 @@ proptest! {
             locked_since_ms,
         } = conflict
         {
-            prop_assert_eq!(held_by_workflow, workflow_name);
-            prop_assert_eq!(held_by_execution, execution_id);
+            prop_assert_eq!(held_by_workflow.as_str(), workflow_name.as_str());
+            prop_assert_eq!(held_by_execution.as_str(), execution_id.as_str());
             prop_assert!(locked_since_ms > 0);
         } else {
             prop_assert!(false, "second acquisition should report the existing holder");
@@ -108,8 +108,8 @@ proptest! {
 
         let lock = manager.is_locked(pane_id).expect("original lock should remain held");
         let health = manager.health();
-        prop_assert_eq!(lock.workflow_name, workflow_name);
-        prop_assert_eq!(lock.execution_id, execution_id);
+        prop_assert_eq!(lock.workflow_name.as_str(), workflow_name.as_str());
+        prop_assert_eq!(lock.execution_id.as_str(), execution_id.as_str());
         prop_assert_eq!(health.acquisitions_total, 1);
         prop_assert_eq!(health.pane_already_locked_total, 1);
         prop_assert_eq!(health.active_locks, 1);
@@ -235,8 +235,8 @@ proptest! {
         for wrong_execution_id in &wrong_execution_ids {
             prop_assert!(!manager.release(pane_id, wrong_execution_id));
             let lock = manager.is_locked(pane_id).expect("lock should remain held");
-            prop_assert_eq!(lock.workflow_name, workflow_name);
-            prop_assert_eq!(lock.execution_id, execution_id);
+            prop_assert_eq!(lock.workflow_name.as_str(), workflow_name.as_str());
+            prop_assert_eq!(lock.execution_id.as_str(), execution_id.as_str());
             prop_assert_eq!(manager.active_count(), 1);
         }
 
@@ -345,8 +345,8 @@ proptest! {
         let lock = manager
             .is_locked(pane_id)
             .expect("defused guard leaves lock held for downstream handoff");
-        prop_assert_eq!(lock.workflow_name, workflow_name);
-        prop_assert_eq!(lock.execution_id, execution_id);
+        prop_assert_eq!(lock.workflow_name.as_str(), workflow_name.as_str());
+        prop_assert_eq!(lock.execution_id.as_str(), execution_id.as_str());
 
         prop_assert!(!manager.release(pane_id, &wrong_execution_id));
         prop_assert_eq!(manager.active_count(), 1);
