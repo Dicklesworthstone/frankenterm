@@ -246,7 +246,7 @@ impl AsRawSocket for UnixStream {
 }
 #[cfg(windows)]
 impl AsSocket for UnixStream {
-    fn as_socket(&self) -> BorrowedSocket {
+    fn as_socket(&self) -> BorrowedSocket<'_> {
         self.inner.as_socket()
     }
 }

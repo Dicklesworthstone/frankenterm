@@ -33,7 +33,7 @@ impl Snapshot {
         }
     }
 
-    pub fn iter(&self) -> ProcIter {
+    pub fn iter(&self) -> ProcIter<'_> {
         ProcIter {
             snapshot: &self,
             first: true,
