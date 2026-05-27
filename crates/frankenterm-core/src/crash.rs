@@ -2383,6 +2383,8 @@ fn skipped_source(
     }
 }
 
+// Degraded incident sources preserve the failed source metadata as an audit row.
+#[allow(clippy::too_many_arguments)]
 fn degraded_source(
     name: &str,
     status: IncidentSourceStatus,
@@ -2421,6 +2423,8 @@ struct IncidentJsonSourceMeta<'a> {
     started: Instant,
 }
 
+// Incident JSON sources keep payload, path, timing, and status fields explicit.
+#[allow(clippy::too_many_arguments)]
 fn write_incident_json_source(
     meta: IncidentJsonSourceMeta<'_>,
     payload: &serde_json::Value,
@@ -2464,6 +2468,8 @@ fn write_incident_json_source(
     })
 }
 
+// Swarm incident capture assembles each evidence source from shared bundle context.
+#[allow(clippy::too_many_arguments)]
 fn add_swarm_incident_sources(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -2557,6 +2563,8 @@ fn add_swarm_incident_sources(
     Ok(())
 }
 
+// Robot state evidence needs bundle context, policy, and runtime metadata together.
+#[allow(clippy::too_many_arguments)]
 fn add_robot_state_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -2636,6 +2644,8 @@ fn add_robot_state_source(
     Ok(())
 }
 
+// Pane text summaries keep redaction, limits, and bundle metadata explicit.
+#[allow(clippy::too_many_arguments)]
 fn add_pane_text_summaries_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -2811,6 +2821,8 @@ fn add_pane_text_summaries_source(
     Ok(())
 }
 
+// Tailer health evidence carries source, policy, and capture-window context.
+#[allow(clippy::too_many_arguments)]
 fn add_tailer_capture_health_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -2868,6 +2880,8 @@ fn add_tailer_capture_health_source(
     Ok(())
 }
 
+// Resource pressure evidence preserves the telemetry snapshot and bundle context.
+#[allow(clippy::too_many_arguments)]
 fn add_resource_pressure_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -2923,6 +2937,8 @@ fn add_resource_pressure_source(
     Ok(())
 }
 
+// RCH proof evidence keeps command, policy, and bundle metadata in one source builder.
+#[allow(clippy::too_many_arguments)]
 fn add_proof_rch_evidence_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -3109,6 +3125,8 @@ fn proof_rch_reason_category(reason_code: &str) -> &'static str {
     }
 }
 
+// Beads coordination evidence keeps repository, command, and bundle context explicit.
+#[allow(clippy::too_many_arguments)]
 fn add_beads_coordination_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -3252,6 +3270,8 @@ fn bead_snapshot_row(value: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+// Git dirty-tree evidence preserves repository, command, and bundle context together.
+#[allow(clippy::too_many_arguments)]
 fn add_git_dirty_tree_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
@@ -3445,6 +3465,8 @@ fn dirty_tree_risk_category(path: &str) -> Option<&'static str> {
     }
 }
 
+// Agent Mail evidence keeps service, command, and bundle context in one audit builder.
+#[allow(clippy::too_many_arguments)]
 fn add_agent_mail_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
