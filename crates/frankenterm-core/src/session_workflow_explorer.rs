@@ -684,6 +684,8 @@ impl SessionWorkflowExplorer {
     }
 
     /// Convenience: ingest a workflow step event.
+    // Workflow explorer ingestion mirrors the workflow step envelope fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn ingest_workflow_step(
         &mut self,
         execution_id: &str,

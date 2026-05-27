@@ -3407,6 +3407,8 @@ impl ObservationRuntime {
 }
 
 #[cfg(feature = "native-wezterm")]
+// Native event handling keeps runtime subsystems explicit at the mux boundary.
+#[allow(clippy::too_many_arguments)]
 async fn handle_native_event(
     runtime_cx: &RuntimeLoopCx,
     event: NativeEvent,

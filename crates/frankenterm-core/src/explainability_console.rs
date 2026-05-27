@@ -977,6 +977,8 @@ impl ExplainabilityConsole {
     }
 
     /// Ingest a trace built from a policy decision log entry.
+    // Policy decision traces preserve the original audit envelope fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn ingest_policy_decision(
         &mut self,
         action: ActionKind,

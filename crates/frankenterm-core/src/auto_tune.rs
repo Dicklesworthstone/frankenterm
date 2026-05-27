@@ -2822,6 +2822,8 @@ impl TuningDecisionRecord {
         }
     }
 
+    // Candidate snapshots mirror the optimizer's atomic decision row.
+    #[allow(clippy::too_many_arguments)]
     fn from_candidate(
         timestamp_ms: u64,
         profile: impl Into<String>,

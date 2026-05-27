@@ -1504,6 +1504,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             && !matches!(commit_report.outcome, TxCommitOutcome::KillSwitchBlocked)
     }
 
+    // Tx events are emitted from ledger state with all event dimensions explicit.
+    #[allow(clippy::too_many_arguments)]
     fn make_event(
         &self,
         kind: TxEventKind,

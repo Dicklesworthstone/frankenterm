@@ -7771,6 +7771,8 @@ pub struct SwarmCapacityAdmissionAuditRecord {
 }
 
 impl SwarmCapacityAdmissionAuditRecord {
+    // Admission audit records are a direct projection of the capacity decision inputs.
+    #[allow(clippy::too_many_arguments)]
     fn from_decision(
         request: &SwarmCapacityAdmissionRequest,
         certificate_status: SwarmCapacityCertificateStatus,
@@ -8971,6 +8973,8 @@ fn swarm_resource_cockpit_run_identity(
     }
 }
 
+// Resource cockpit domains summarize independent pressure dimensions in one row.
+#[allow(clippy::too_many_arguments)]
 fn swarm_resource_cockpit_domains(
     summary: &SwarmCapacityOperatorSummary,
     memory_pressure: Option<FleetPressureTier>,

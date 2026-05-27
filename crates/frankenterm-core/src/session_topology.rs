@@ -1640,6 +1640,8 @@ impl LifecycleRegistry {
         })
     }
 
+    // Rejection logs preserve the transition request and every operator-facing reason dimension.
+    #[allow(clippy::too_many_arguments)]
     fn log_rejection(
         &mut self,
         request: &LifecycleTransitionRequest,

@@ -1245,6 +1245,8 @@ fn classify_cargo_command(cargo_subcommand: Option<&str>) -> String {
     .to_string()
 }
 
+// Cargo admission explanations mirror the analyzed scheduler inputs.
+#[allow(clippy::too_many_arguments)]
 fn cargo_analysis_explanation(
     explicit_jobs: Option<u32>,
     effective_jobs: u32,

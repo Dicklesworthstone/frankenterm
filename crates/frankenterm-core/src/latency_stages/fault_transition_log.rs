@@ -92,6 +92,8 @@ impl InstrumentedFaultManager {
     }
 
     /// Emit a transition log entry.
+    // Fault transition rows keep the transition dimensions explicit for audit readability.
+    #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
         domain: FaultDomain,

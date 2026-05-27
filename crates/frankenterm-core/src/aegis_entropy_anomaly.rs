@@ -200,6 +200,8 @@ impl EProcess {
     /// Update the e-process with a new entropy observation.
     ///
     /// Returns the current e-value after the update.
+    // AEGIS update records a cohesive telemetry sample; splitting fields would obscure call sites.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         entropy: f64,

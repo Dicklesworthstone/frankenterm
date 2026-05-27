@@ -535,6 +535,8 @@ pub fn swarm_failure_conformance_scenarios() -> Vec<SwarmFailureConformanceScena
     ]
 }
 
+// Live scenario skips keep the scenario metadata and blocker evidence together.
+#[allow(clippy::too_many_arguments)]
 fn skipped_live_scenario(
     failure_mode: SwarmFailureMode,
     scenario_id: &str,

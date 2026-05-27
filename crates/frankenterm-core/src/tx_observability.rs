@@ -780,6 +780,8 @@ fn retain_observability_events(
 }
 
 /// Build a forensic bundle from a plan, ledger, and optional events/resume context.
+// Forensic bundles intentionally keep the plan, ledger, and optional evidence inputs separate.
+#[allow(clippy::too_many_arguments)]
 pub fn build_forensic_bundle(
     plan: &TxPlan,
     ledger: &TxExecutionLedger,

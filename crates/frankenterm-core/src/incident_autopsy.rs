@@ -697,6 +697,8 @@ impl IncidentAutopsyCompiler {
         hypotheses
     }
 
+    // Report rendering needs the manifest plus each optional evidence section as a single frame.
+    #[allow(clippy::too_many_arguments)]
     fn render_report(
         &self,
         manifest: &IncidentAutopsyManifest,

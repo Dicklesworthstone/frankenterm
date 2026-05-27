@@ -209,6 +209,8 @@ impl SessionDnaBuilder {
     /// - `ansi_density`: Fraction of ANSI escape bytes.
     /// - `elapsed_s`: Time since last capture (seconds).
     /// - `timestamp_s`: Current time (seconds since epoch).
+    // Session DNA output samples keep their feature vector explicit for statistical updates.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_output(
         &mut self,
         lines: u64,

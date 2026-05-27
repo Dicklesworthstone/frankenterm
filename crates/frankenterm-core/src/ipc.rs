@@ -1242,6 +1242,8 @@ impl IpcServer {
 
     /// ft-xbnl0.2.3 Cx-first sibling of
     /// [`run_with_registry_auth_rpc_and_search_config`].
+    // IPC bootstrap keeps the registry, auth, RPC, and search knobs explicit at the boundary.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_registry_auth_rpc_and_search_config_with_cx(
         self,
         cx: &crate::cx::Cx,

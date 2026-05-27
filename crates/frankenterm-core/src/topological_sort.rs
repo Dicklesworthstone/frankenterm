@@ -225,6 +225,8 @@ pub fn tarjan_scc(g: &DiGraph) -> Vec<Vec<usize>> {
     let mut lowlinks = vec![0usize; n];
     let mut result = Vec::new();
 
+    // Tarjan state is intentionally threaded as explicit mutable slices.
+    #[allow(clippy::too_many_arguments)]
     fn strongconnect(
         u: usize,
         g: &DiGraph,

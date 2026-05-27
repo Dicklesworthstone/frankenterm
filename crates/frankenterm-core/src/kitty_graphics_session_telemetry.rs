@@ -308,6 +308,8 @@ impl KittySessionAggregator {
     /// per-format histogram + byte counters + decode-time
     /// accumulator, then buffers the
     /// [`StructuredLogRow::ImageAdmitted`] row.
+    // Kitty graphics admission telemetry records one cohesive image admission event.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_admitted(
         &mut self,
         ts_ms: u64,
