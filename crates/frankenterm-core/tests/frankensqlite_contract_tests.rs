@@ -804,6 +804,7 @@ fn test_frankensqlite_bootstrap_returns_unavailable() {
     let config = RecorderStorageConfig {
         backend: RecorderBackendKind::FrankenSqlite,
         append_log: test_config(dir.path()),
+        ..RecorderStorageConfig::default()
     };
     let err = bootstrap_recorder_storage(config).unwrap_err();
     assert!(matches!(
