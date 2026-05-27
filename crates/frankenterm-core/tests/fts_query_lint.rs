@@ -67,13 +67,19 @@ fn unbalanced_quotes_are_flagged() {
 #[test]
 fn unmatched_closing_paren_is_flagged() {
     let c = codes("foo)");
-    assert!(c.contains(&"unmatched_paren_close".to_string()), "got {c:?}");
+    assert!(
+        c.contains(&"unmatched_paren_close".to_string()),
+        "got {c:?}"
+    );
 }
 
 #[test]
 fn unbalanced_open_paren_is_warned() {
     let c = codes("(foo");
-    assert!(c.contains(&"unbalanced_parentheses".to_string()), "got {c:?}");
+    assert!(
+        c.contains(&"unbalanced_parentheses".to_string()),
+        "got {c:?}"
+    );
 }
 
 #[test]

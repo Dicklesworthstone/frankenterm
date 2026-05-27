@@ -233,9 +233,10 @@ impl TextMatch {
                 }
                 let regex = compile_text_match_regex(pattern)
                     .map_err(|e| crate::error::PatternError::InvalidRegex(e.to_string()))?;
-                if regex.is_match("").map_err(|e| {
-                    crate::error::PatternError::InvalidRegex(e.to_string())
-                })? {
+                if regex
+                    .is_match("")
+                    .map_err(|e| crate::error::PatternError::InvalidRegex(e.to_string()))?
+                {
                     return Err(crate::error::PatternError::InvalidRegex(
                         "text match regex cannot match empty input".to_string(),
                     )

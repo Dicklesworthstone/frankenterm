@@ -196,7 +196,7 @@ fn every_valid_fixture_is_accepted_by_pattern_library() {
             vec![pack],
             &user_pack_names,
         )
-            .unwrap_or_else(|err| panic!("fixture {} failed validation: {err}", path.display()));
+        .unwrap_or_else(|err| panic!("fixture {} failed validation: {err}", path.display()));
     }
 }
 

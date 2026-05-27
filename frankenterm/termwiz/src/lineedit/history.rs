@@ -70,7 +70,11 @@ impl SearchDirection {
             Self::Backwards => idx.overflowing_sub(1),
             Self::Forwards => idx.overflowing_add(1),
         };
-        if overflow { None } else { Some(next) }
+        if overflow {
+            None
+        } else {
+            Some(next)
+        }
     }
 }
 
@@ -302,10 +306,9 @@ mod tests {
         hist.add("hello");
         hist.add("world");
 
-        assert!(
-            hist.search(1, SearchStyle::Substring, SearchDirection::Backwards, "xyz")
-                .is_none()
-        );
+        assert!(hist
+            .search(1, SearchStyle::Substring, SearchDirection::Backwards, "xyz")
+            .is_none());
     }
 
     #[test]
@@ -327,10 +330,9 @@ mod tests {
         let mut hist = BasicHistory::default();
         hist.add("hello");
 
-        assert!(
-            hist.search(5, SearchStyle::Substring, SearchDirection::Forwards, "hel")
-                .is_none()
-        );
+        assert!(hist
+            .search(5, SearchStyle::Substring, SearchDirection::Forwards, "hel")
+            .is_none());
     }
 
     // ── SearchResult ────────────────────────────────────────

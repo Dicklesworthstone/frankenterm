@@ -1341,9 +1341,9 @@ mod tests {
         let secret = "sk-abc1234567890abcdef1234567890abcdef12345678";
         let body = &secret[3..]; // bytes after the matched `sk-` prefix
         for cmd_text in [
-            secret.to_string(),                      // at start: no leading context
-            format!("export KEY={secret}"),          // embedded
-            format!("token: {secret} trailing ok"),  // trailing context present
+            secret.to_string(),                     // at start: no leading context
+            format!("export KEY={secret}"),         // embedded
+            format!("token: {secret} trailing ok"), // trailing context present
         ] {
             let cmds = vec![make_cmd(0, &cmd_text, Some(0))];
             let verdict = scanner.scan_commands(&cmds);

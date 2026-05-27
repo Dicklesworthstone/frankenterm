@@ -675,7 +675,7 @@ mod tests {
         let mut p: Promise<i32> = Promise::new();
         let fut = p.get_future().unwrap();
         drop(fut); // drop future before resolving
-        // Promise can still be resolved without panic
+                   // Promise can still be resolved without panic
         assert!(p.ok(42));
     }
 
@@ -744,8 +744,8 @@ mod tests {
 
     #[test]
     fn waker_replaced_on_each_pending_poll() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         // Track how many times the waker is woken
         let wake_count = Arc::new(AtomicUsize::new(0));
@@ -874,8 +874,8 @@ mod tests {
 
     #[test]
     fn promise_ok_wakes_stored_waker() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         let woken = Arc::new(AtomicBool::new(false));
         let woken_clone = Arc::clone(&woken);
@@ -909,8 +909,8 @@ mod tests {
 
     #[test]
     fn promise_err_wakes_stored_waker() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         let woken = Arc::new(AtomicBool::new(false));
         let woken_clone = Arc::clone(&woken);

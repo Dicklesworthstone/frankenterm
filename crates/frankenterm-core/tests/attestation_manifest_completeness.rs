@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use proptest::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const MANIFEST_REL_PATH: &str = "docs/attestations/manifest.json";
 const ISSUES_REL_PATH: &str = ".beads/issues.jsonl";

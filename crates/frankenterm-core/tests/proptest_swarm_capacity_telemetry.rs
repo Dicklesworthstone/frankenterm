@@ -210,15 +210,28 @@ fn capacity_certificate_is_deterministic() {
     let mut telemetry = SwarmCapacityTelemetry::with_defaults();
     // Populate with a couple of finite outcomes so derived fields are well
     // defined (and finite, avoiding non-finite serialization).
-    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
-    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    telemetry.record_outcome(
+        SwarmCapacityStage::IngestCapture,
+        SwarmCapacityOutcome::Completed,
+        5.0,
+        10,
+    );
+    telemetry.record_outcome(
+        SwarmCapacityStage::StorageWrite,
+        SwarmCapacityOutcome::Completed,
+        7.5,
+        20,
+    );
     let snapshot = telemetry.snapshot();
 
     let c1 = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
     let c2 = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
     let j1 = serde_json::to_string(&c1).expect("certificate serializes");
     let j2 = serde_json::to_string(&c2).expect("certificate serializes");
-    assert_eq!(j1, j2, "capacity_certificate must be deterministic for a fixed snapshot + config");
+    assert_eq!(
+        j1, j2,
+        "capacity_certificate must be deterministic for a fixed snapshot + config"
+    );
 }
 
 /// The regression gate must not false-positive: a capacity certificate
@@ -228,8 +241,18 @@ fn capacity_certificate_is_deterministic() {
 #[test]
 fn regression_gate_does_not_flag_certificate_against_itself() {
     let mut telemetry = SwarmCapacityTelemetry::with_defaults();
-    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
-    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    telemetry.record_outcome(
+        SwarmCapacityStage::IngestCapture,
+        SwarmCapacityOutcome::Completed,
+        5.0,
+        10,
+    );
+    telemetry.record_outcome(
+        SwarmCapacityStage::StorageWrite,
+        SwarmCapacityOutcome::Completed,
+        7.5,
+        20,
+    );
     let snapshot = telemetry.snapshot();
     let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
 
@@ -252,8 +275,18 @@ fn regression_gate_does_not_flag_certificate_against_itself() {
 #[test]
 fn tail_risk_report_does_not_violate_certificate_against_itself() {
     let mut telemetry = SwarmCapacityTelemetry::with_defaults();
-    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
-    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    telemetry.record_outcome(
+        SwarmCapacityStage::IngestCapture,
+        SwarmCapacityOutcome::Completed,
+        5.0,
+        10,
+    );
+    telemetry.record_outcome(
+        SwarmCapacityStage::StorageWrite,
+        SwarmCapacityOutcome::Completed,
+        7.5,
+        20,
+    );
     let snapshot = telemetry.snapshot();
     let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
 
@@ -273,8 +306,18 @@ fn tail_risk_report_does_not_violate_certificate_against_itself() {
 #[test]
 fn drift_detector_observe_is_deterministic_and_probability_bounded() {
     let mut telemetry = SwarmCapacityTelemetry::with_defaults();
-    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
-    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    telemetry.record_outcome(
+        SwarmCapacityStage::IngestCapture,
+        SwarmCapacityOutcome::Completed,
+        5.0,
+        10,
+    );
+    telemetry.record_outcome(
+        SwarmCapacityStage::StorageWrite,
+        SwarmCapacityOutcome::Completed,
+        7.5,
+        20,
+    );
     let snapshot = telemetry.snapshot();
     let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
     let report = cert.tail_risk_report(&cert, SwarmTailRiskMonitorConfig::default());
@@ -304,8 +347,18 @@ fn drift_detector_observe_is_deterministic_and_probability_bounded() {
 #[test]
 fn drift_detector_no_false_positive_on_stable_real_certificate() {
     let mut telemetry = SwarmCapacityTelemetry::with_defaults();
-    telemetry.record_outcome(SwarmCapacityStage::IngestCapture, SwarmCapacityOutcome::Completed, 5.0, 10);
-    telemetry.record_outcome(SwarmCapacityStage::StorageWrite, SwarmCapacityOutcome::Completed, 7.5, 20);
+    telemetry.record_outcome(
+        SwarmCapacityStage::IngestCapture,
+        SwarmCapacityOutcome::Completed,
+        5.0,
+        10,
+    );
+    telemetry.record_outcome(
+        SwarmCapacityStage::StorageWrite,
+        SwarmCapacityOutcome::Completed,
+        7.5,
+        20,
+    );
     let snapshot = telemetry.snapshot();
     let cert = snapshot.capacity_certificate(SwarmCapacityCertificateConfig::default());
     let report = cert.tail_risk_report(&cert, SwarmTailRiskMonitorConfig::default());

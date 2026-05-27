@@ -229,7 +229,9 @@ mod tests {
         // Deterministic LCG so the trial set is reproducible.
         let mut state: u64 = 0x9E3779B97F4A7C15;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as i64
         };
 
@@ -256,7 +258,8 @@ mod tests {
                     let truth = (low..=high).any(|p| covered.contains(&p));
                     let got = filter.could_have_match(low, high);
                     assert_eq!(
-                        got, truth,
+                        got,
+                        truth,
                         "could_have_match({low}, {high}) = {got} but brute-force = {truth}; \
                          recorded ranges = {:?}",
                         filter.ranges().collect::<Vec<_>>()

@@ -601,7 +601,8 @@ impl BocpdManager {
         let result = pane.observe(features);
         if result.is_some() {
             self.total_change_points = self.total_change_points.saturating_add(1);
-            self.telemetry.change_points_detected = self.telemetry.change_points_detected.saturating_add(1);
+            self.telemetry.change_points_detected =
+                self.telemetry.change_points_detected.saturating_add(1);
         }
         result
     }
@@ -623,7 +624,8 @@ impl BocpdManager {
         let result = pane.observe_text_chunk(text, elapsed);
         if result.is_some() {
             self.total_change_points = self.total_change_points.saturating_add(1);
-            self.telemetry.change_points_detected = self.telemetry.change_points_detected.saturating_add(1);
+            self.telemetry.change_points_detected =
+                self.telemetry.change_points_detected.saturating_add(1);
         }
         result
     }

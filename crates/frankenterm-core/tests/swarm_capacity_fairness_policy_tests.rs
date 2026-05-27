@@ -18,9 +18,12 @@ fn fairness_policy_table_covers_each_work_class_once() {
         SwarmCapacityWorkClass::ALL.len(),
         "policy table must have one row per work class"
     );
-    let classes: HashSet<SwarmCapacityWorkClass> =
-        table.iter().map(|row| row.work_class).collect();
-    assert_eq!(classes.len(), table.len(), "each work class must appear exactly once");
+    let classes: HashSet<SwarmCapacityWorkClass> = table.iter().map(|row| row.work_class).collect();
+    assert_eq!(
+        classes.len(),
+        table.len(),
+        "each work class must appear exactly once"
+    );
 }
 
 #[test]
@@ -34,7 +37,8 @@ fn fairness_policy_minimum_service_is_bounded_and_not_overcommitted() {
         assert!(
             row.minimum_service_per_1000 <= 1000,
             "minimum_service_per_1000 must be <= 1000 for {:?}, got {}",
-            row.work_class, row.minimum_service_per_1000
+            row.work_class,
+            row.minimum_service_per_1000
         );
         // Every class must retain at least one eligible pressure action.
         assert!(

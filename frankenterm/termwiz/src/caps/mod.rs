@@ -54,7 +54,7 @@
 //! implements some heuristics (a fancy word for guessing) to compute
 //! the terminal capabilities, but also offers a `ProbeHints`
 //! that can be used by the embedding application to override those choices.
-use crate::{Result, builder};
+use crate::{builder, Result};
 use std::env::var;
 use terminfo::{self, capability as cap};
 

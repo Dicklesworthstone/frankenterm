@@ -1,23 +1,23 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
-use anyhow::{Context, anyhow, bail};
-use asupersync::Cx;
+use anyhow::{anyhow, bail, Context};
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
-use async_channel::{Receiver, Sender, bounded, unbounded};
+use asupersync::Cx;
+use async_channel::{bounded, unbounded, Receiver, Sender};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
+use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
-use futures::future::{Either, select};
+use futures::future::{select, Either};
 use futures::pin_mut;
-use mux::Mux;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
+use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
@@ -586,9 +586,7 @@ pub fn unix_connect_with_retry(
                         // Windows, so the `as _` cast bridges them.
                         use filedescriptor::IntoRawSocketDescriptor;
                         use std::os::windows::io::FromRawSocket;
-                        return Ok(UnixStream::from_raw_socket(
-                            a.into_socket_descriptor() as _,
-                        ));
+                        return Ok(UnixStream::from_raw_socket(a.into_socket_descriptor() as _));
                     }
                 }
             }

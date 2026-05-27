@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jsonschema::{Draft, Validator};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -541,49 +541,43 @@ fn bundle_schema_rejects_blank_generator_version() {
 fn bundle_schema_rejects_blank_artifact_and_deferred_slot_descriptions() {
     let validator = bundle_validator();
     for (surface, bundle) in [
-        (
-            "artifacts[].description",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["artifacts"] = json!([
-                    {
-                        "category": "perf/headline-claims",
-                        "path": "docs/perf/headline-claims.json",
-                        "media_type": "application/json",
-                        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
-                        "size_bytes": 1,
-                        "produced_by_bead": "ft-e87u6.2",
-                        "description": " \t"
-                    }
-                ]);
-                bundle
-            },
-        ),
-        (
-            "deferred_slots[].description",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["deferred_slots"] = json!([
-                    {
-                        "category": "perf/headline-claims",
-                        "media_type": "application/json",
-                        "produced_by_bead": "ft-e87u6.2",
-                        "deferred_to_bead": "ft-e87u6.9",
-                        "deferred_reason": "synthetic deferred slot",
-                        "description": "\n"
-                    }
-                ]);
-                bundle
-            },
-        ),
+        ("artifacts[].description", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["artifacts"] = json!([
+                {
+                    "category": "perf/headline-claims",
+                    "path": "docs/perf/headline-claims.json",
+                    "media_type": "application/json",
+                    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "size_bytes": 1,
+                    "produced_by_bead": "ft-e87u6.2",
+                    "description": " \t"
+                }
+            ]);
+            bundle
+        }),
+        ("deferred_slots[].description", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["deferred_slots"] = json!([
+                {
+                    "category": "perf/headline-claims",
+                    "media_type": "application/json",
+                    "produced_by_bead": "ft-e87u6.2",
+                    "deferred_to_bead": "ft-e87u6.9",
+                    "deferred_reason": "synthetic deferred slot",
+                    "description": "\n"
+                }
+            ]);
+            bundle
+        }),
     ] {
         assert!(
             !validate(&validator, &bundle).is_empty(),
@@ -676,76 +670,64 @@ fn bundle_schema_rejects_unsafe_reference_paths() {
 fn bundle_schema_rejects_blank_repo_relative_paths() {
     let validator = bundle_validator();
     for (surface, bundle) in [
-        (
-            "artifacts[].path",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["artifacts"] = json!([
-                    {
-                        "category": "perf/headline-claims",
-                        "path": " \t",
-                        "media_type": "application/json",
-                        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
-                        "size_bytes": 1,
-                        "produced_by_bead": "ft-e87u6.2",
-                        "description": "synthetic blank path regression"
-                    }
-                ]);
-                bundle
-            },
-        ),
-        (
-            "taxonomy_path",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["taxonomy_coverage"]["taxonomy_path"] = json!(" \t");
-                bundle
-            },
-        ),
-        (
-            "source_artifact_path",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["confidence_summary"]["records"][0]["source_artifact_path"] = json!("\n");
-                bundle
-            },
-        ),
-        (
-            "retraction_path",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["retractions"] = json!([
-                    {
-                        "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
-                        "affected_slot": "perf/headline-claims",
-                        "retracted_at": "2026-05-12T00:00:00Z",
-                        "retracted_by_release": "0.2.1",
-                        "retraction_rationale": "synthetic blank path regression",
-                        "retraction_path": " \t",
-                        "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
-                        "size_bytes": 1,
-                        "corrected_claim_value": null
-                    }
-                ]);
-                bundle
-            },
-        ),
+        ("artifacts[].path", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["artifacts"] = json!([
+                {
+                    "category": "perf/headline-claims",
+                    "path": " \t",
+                    "media_type": "application/json",
+                    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "size_bytes": 1,
+                    "produced_by_bead": "ft-e87u6.2",
+                    "description": "synthetic blank path regression"
+                }
+            ]);
+            bundle
+        }),
+        ("taxonomy_path", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["taxonomy_coverage"]["taxonomy_path"] = json!(" \t");
+            bundle
+        }),
+        ("source_artifact_path", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["confidence_summary"]["records"][0]["source_artifact_path"] = json!("\n");
+            bundle
+        }),
+        ("retraction_path", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["retractions"] = json!([
+                {
+                    "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                    "affected_slot": "perf/headline-claims",
+                    "retracted_at": "2026-05-12T00:00:00Z",
+                    "retracted_by_release": "0.2.1",
+                    "retraction_rationale": "synthetic blank path regression",
+                    "retraction_path": " \t",
+                    "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                    "size_bytes": 1,
+                    "corrected_claim_value": null
+                }
+            ]);
+            bundle
+        }),
         (
             "sigstore_bundle.path",
             base_bundle(json!({
@@ -819,54 +801,48 @@ fn bundle_schema_rejects_invalid_retraction_conflict_paths() {
 fn bundle_schema_rejects_blank_retraction_summary_metadata() {
     let validator = bundle_validator();
     for (surface, bundle) in [
-        (
-            "retracted_by_release",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["retractions"] = json!([
-                    {
-                        "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
-                        "affected_slot": "perf/headline-claims",
-                        "retracted_at": "2026-05-12T00:00:00Z",
-                        "retracted_by_release": " \t",
-                        "retraction_rationale": "synthetic blank release regression",
-                        "retraction_path": "docs/attestations/retractions/synthetic.json",
-                        "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
-                        "size_bytes": 1,
-                        "corrected_claim_value": null
-                    }
-                ]);
-                bundle
-            },
-        ),
-        (
-            "retraction_rationale",
-            {
-                let mut bundle = base_bundle(json!({
-                    "method": "unsigned",
-                    "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-                    "reason": "dev bundle tracked by ft-e87u6.2"
-                }));
-                bundle["retractions"] = json!([
-                    {
-                        "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
-                        "affected_slot": "perf/headline-claims",
-                        "retracted_at": "2026-05-12T00:00:00Z",
-                        "retracted_by_release": "0.2.1",
-                        "retraction_rationale": "\n",
-                        "retraction_path": "docs/attestations/retractions/synthetic.json",
-                        "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
-                        "size_bytes": 1,
-                        "corrected_claim_value": null
-                    }
-                ]);
-                bundle
-            },
-        ),
+        ("retracted_by_release", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["retractions"] = json!([
+                {
+                    "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                    "affected_slot": "perf/headline-claims",
+                    "retracted_at": "2026-05-12T00:00:00Z",
+                    "retracted_by_release": " \t",
+                    "retraction_rationale": "synthetic blank release regression",
+                    "retraction_path": "docs/attestations/retractions/synthetic.json",
+                    "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                    "size_bytes": 1,
+                    "corrected_claim_value": null
+                }
+            ]);
+            bundle
+        }),
+        ("retraction_rationale", {
+            let mut bundle = base_bundle(json!({
+                "method": "unsigned",
+                "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "reason": "dev bundle tracked by ft-e87u6.2"
+            }));
+            bundle["retractions"] = json!([
+                {
+                    "original_bundle_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                    "affected_slot": "perf/headline-claims",
+                    "retracted_at": "2026-05-12T00:00:00Z",
+                    "retracted_by_release": "0.2.1",
+                    "retraction_rationale": "\n",
+                    "retraction_path": "docs/attestations/retractions/synthetic.json",
+                    "retraction_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                    "size_bytes": 1,
+                    "corrected_claim_value": null
+                }
+            ]);
+            bundle
+        }),
     ] {
         assert!(
             !validate(&validator, &bundle).is_empty(),
@@ -918,7 +894,10 @@ fn bundle_schema_rejects_empty_required_summary_arrays() {
 
     for (surface, mut bundle) in [
         ("confidence_summary.records", valid.clone()),
-        ("confidence_summary.best_confidence_by_category", valid.clone()),
+        (
+            "confidence_summary.best_confidence_by_category",
+            valid.clone(),
+        ),
         ("taxonomy_coverage.category_counts", valid),
     ] {
         match surface {

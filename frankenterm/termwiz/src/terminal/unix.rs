@@ -1,29 +1,29 @@
 use crate::render::RenderTty;
 use crate::terminal::ProbeCapabilities;
-use crate::{Context, Result, bail};
-use filedescriptor::{FileDescriptor, POLLIN, poll, pollfd};
+use crate::{bail, Context, Result};
+use filedescriptor::{poll, pollfd, FileDescriptor, POLLIN};
 use libc::{self, winsize};
 use signal_hook::{self, SigId};
 use std::collections::VecDeque;
 use std::error::Error as _;
 use std::fs::OpenOptions;
-use std::io::{Error as IoError, ErrorKind, Read, Write, stdin, stdout};
+use std::io::{stdin, stdout, Error as IoError, ErrorKind, Read, Write};
 use std::mem;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use termios::{
-    TCIFLUSH, TCIOFLUSH, TCOFLUSH, TCSADRAIN, TCSAFLUSH, TCSANOW, Termios, cfmakeraw, tcdrain,
-    tcflush, tcsetattr,
+    cfmakeraw, tcdrain, tcflush, tcsetattr, Termios, TCIFLUSH, TCIOFLUSH, TCOFLUSH, TCSADRAIN,
+    TCSAFLUSH, TCSANOW,
 };
 
 use crate::caps::Capabilities;
-use crate::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode, XtermKeyModifierResource};
+use crate::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, XtermKeyModifierResource, CSI};
 use crate::input::{InputEvent, InputParser};
 use crate::render::terminfo::TerminfoRenderer;
 use crate::surface::Change;
-use crate::terminal::{Blocking, ScreenSize, Terminal, cast};
+use crate::terminal::{cast, Blocking, ScreenSize, Terminal};
 
 const BUF_SIZE: usize = 4096;
 

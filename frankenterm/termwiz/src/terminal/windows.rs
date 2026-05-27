@@ -1,13 +1,13 @@
-use crate::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode};
+use crate::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
 use crate::istty::IsTty;
 use crate::terminal::ProbeCapabilities;
-use crate::{Result, bail, ensure, format_err};
+use crate::{bail, ensure, format_err, Result};
 use filedescriptor::{FileDescriptor, OwnedHandle};
 use std::cmp::{max, min};
-use std::convert::TryFrom;
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::fs::OpenOptions;
-use std::io::{Error as IoError, Read, Result as IoResult, Write, stdin, stdout};
+use std::io::{stdin, stdout, Error as IoError, Read, Result as IoResult, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,25 +18,25 @@ use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::synchapi::{CreateEventW, SetEvent, WaitForMultipleObjects};
 use winapi::um::winbase::{INFINITE, WAIT_FAILED, WAIT_OBJECT_0};
 use winapi::um::wincon::{
+    CreateConsoleScreenBuffer, FillConsoleOutputAttribute, FillConsoleOutputCharacterW,
+    GetConsoleScreenBufferInfo, ReadConsoleOutputW, ScrollConsoleScreenBufferW,
+    SetConsoleActiveScreenBuffer, SetConsoleCP, SetConsoleCursorPosition, SetConsoleOutputCP,
+    SetConsoleScreenBufferSize, SetConsoleTextAttribute, SetConsoleWindowInfo, WriteConsoleOutputW,
     CHAR_INFO, CONSOLE_SCREEN_BUFFER_INFO, CONSOLE_TEXTMODE_BUFFER, COORD,
-    CreateConsoleScreenBuffer, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
-    ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, FillConsoleOutputAttribute,
-    FillConsoleOutputCharacterW, GetConsoleScreenBufferInfo, INPUT_RECORD, ReadConsoleOutputW,
-    SMALL_RECT, ScrollConsoleScreenBufferW, SetConsoleActiveScreenBuffer, SetConsoleCP,
-    SetConsoleCursorPosition, SetConsoleOutputCP, SetConsoleScreenBufferSize,
-    SetConsoleTextAttribute, SetConsoleWindowInfo, WriteConsoleOutputW,
+    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+    ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    ENABLE_WINDOW_INPUT, INPUT_RECORD, SMALL_RECT,
 };
 use winapi::um::winnls::CP_UTF8;
 use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
 
 use crate::caps::Capabilities;
 use crate::input::{InputEvent, InputParser};
-use crate::render::RenderTty;
 use crate::render::terminfo::TerminfoRenderer;
 use crate::render::windows::WindowsConsoleRenderer;
+use crate::render::RenderTty;
 use crate::surface::Change;
-use crate::terminal::{ScreenSize, Terminal, cast};
+use crate::terminal::{cast, ScreenSize, Terminal};
 
 const BUF_SIZE: usize = 128;
 const MAX_FINITE_WAIT_MS: u32 = INFINITE - 1;

@@ -1,7 +1,7 @@
-use crate::TerminalState;
 use crate::terminalstate::image::*;
-use ::image::ImageFormat;
+use crate::TerminalState;
 use ::image::imageops::FilterType;
+use ::image::ImageFormat;
 use frankenterm_cell::image::ImageDataType;
 use frankenterm_escape_parser::osc::ITermFileData;
 use log::error;

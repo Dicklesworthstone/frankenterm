@@ -627,7 +627,11 @@ mod tests {
         h1.merge(&h2);
         assert_eq!(h1.count(), u64::MAX, "merged count must saturate, not wrap");
         let bucket_total: u64 = h1.bucket_details().iter().map(|d| d.count).sum();
-        assert_eq!(bucket_total, u64::MAX, "merged bucket count must saturate, not wrap");
+        assert_eq!(
+            bucket_total,
+            u64::MAX,
+            "merged bucket count must saturate, not wrap"
+        );
     }
 
     #[test]

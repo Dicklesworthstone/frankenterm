@@ -18,14 +18,14 @@ fn arb_unicode_char() -> impl Strategy<Value = char> {
         Just(' '),
         Just('9'),
         Just('_'),
-        Just('é'),  // 2-byte
-        Just('ñ'),  // 2-byte
-        Just('Ω'),  // 2-byte
-        Just('日'), // 3-byte
-        Just('本'), // 3-byte
-        Just('語'), // 3-byte
-        Just('🦀'), // 4-byte
-        Just('🎉'), // 4-byte
+        Just('é'),        // 2-byte
+        Just('ñ'),        // 2-byte
+        Just('Ω'),        // 2-byte
+        Just('日'),       // 3-byte
+        Just('本'),       // 3-byte
+        Just('語'),       // 3-byte
+        Just('🦀'),       // 4-byte
+        Just('🎉'),       // 4-byte
         Just('\u{0301}'), // combining acute accent
     ]
 }

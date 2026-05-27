@@ -66,7 +66,11 @@ fn controller_mode_as_str_labels_are_unique() {
     let mut sorted = labels.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), labels.len(), "controller mode labels must be unique");
+    assert_eq!(
+        sorted.len(),
+        labels.len(),
+        "controller mode labels must be unique"
+    );
 }
 
 #[test]
@@ -75,5 +79,9 @@ fn decision_action_as_str_labels_are_unique() {
     let mut sorted = labels.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), labels.len(), "decision action labels must be unique");
+    assert_eq!(
+        sorted.len(),
+        labels.len(),
+        "decision action labels must be unique"
+    );
 }

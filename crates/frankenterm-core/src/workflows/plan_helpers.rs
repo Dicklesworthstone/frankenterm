@@ -195,9 +195,9 @@ mod tests {
     use super::*;
     // `run_async_test` calls `runtime.block_on(..)`; `block_on` is provided by
     // the `CompatRuntime` trait, which must be in scope at the call site.
-    use crate::runtime_async::CompatRuntime;
     #[allow(unused_imports)]
     use crate::patterns::Detection;
+    use crate::runtime_async::CompatRuntime;
 
     fn run_async_test<F>(future: F)
     where

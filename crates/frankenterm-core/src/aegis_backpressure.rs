@@ -165,7 +165,10 @@ pub struct GaussianPosterior {
 impl GaussianPosterior {
     /// Create a new Gaussian posterior with initial mean and variance.
     pub fn new(mean: f64, variance: f64) -> Self {
-        assert!(mean.is_finite() && variance.is_finite(), "mean and variance must be finite");
+        assert!(
+            mean.is_finite() && variance.is_finite(),
+            "mean and variance must be finite"
+        );
         Self {
             mean,
             variance: variance.max(1e-12),
@@ -489,7 +492,8 @@ impl PacBayesBackpressure {
         self.telemetry.observations = self.telemetry.observations.saturating_add(1);
         if obs.frame_dropped {
             self.global_frame_drops = self.global_frame_drops.saturating_add(1);
-            self.telemetry.frame_drops_observed = self.telemetry.frame_drops_observed.saturating_add(1);
+            self.telemetry.frame_drops_observed =
+                self.telemetry.frame_drops_observed.saturating_add(1);
         }
 
         // Update posterior: the "observation" is the queue ratio at which
@@ -502,12 +506,14 @@ impl PacBayesBackpressure {
             if obs.frame_dropped {
                 // Frame drop → threshold should be lower (throttle earlier)
                 state.posterior.update(obs.fill_ratio, obs_variance);
-                self.telemetry.posterior_updates = self.telemetry.posterior_updates.saturating_add(1);
+                self.telemetry.posterior_updates =
+                    self.telemetry.posterior_updates.saturating_add(1);
             } else if state.smoothed_ratio > state.posterior.mean {
                 // No drop but high load → threshold can be slightly higher
                 let relaxed = obs.fill_ratio * 1.1;
                 state.posterior.update(relaxed, obs_variance * 4.0);
-                self.telemetry.posterior_updates = self.telemetry.posterior_updates.saturating_add(1);
+                self.telemetry.posterior_updates =
+                    self.telemetry.posterior_updates.saturating_add(1);
             }
         }
 
@@ -525,7 +531,8 @@ impl PacBayesBackpressure {
                     // Reduce severity proportionally to external-cause confidence
                     severity *= 1.0 - ext_prob;
                     starvation_guard_active = true;
-                    self.telemetry.starvation_guards = self.telemetry.starvation_guards.saturating_add(1);
+                    self.telemetry.starvation_guards =
+                        self.telemetry.starvation_guards.saturating_add(1);
                 }
             }
         }
@@ -552,7 +559,8 @@ impl PacBayesBackpressure {
 
         state.throttled = severity > 0.01;
         if state.throttled {
-            self.telemetry.throttle_activations = self.telemetry.throttle_activations.saturating_add(1);
+            self.telemetry.throttle_activations =
+                self.telemetry.throttle_activations.saturating_add(1);
         }
 
         actions

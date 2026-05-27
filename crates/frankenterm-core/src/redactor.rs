@@ -1425,7 +1425,10 @@ mod tests {
         let whole = format!("env AWS_ACCESS_KEY_ID={secret} done");
         let batch = Redactor::new();
         let expected = batch.redact(&whole);
-        assert!(!expected.contains(secret), "batch redaction must scrub the secret");
+        assert!(
+            !expected.contains(secret),
+            "batch redaction must scrub the secret"
+        );
 
         let mut any_piecewise_leak = false;
         for split in 1..whole.len() {
@@ -1518,7 +1521,10 @@ mod tests {
                 );
 
                 let rendered = String::from_utf8(out).unwrap_or_else(|_| {
-                    panic!("vector {} split={split}: non-UTF8 stream output", vector.name)
+                    panic!(
+                        "vector {} split={split}: non-UTF8 stream output",
+                        vector.name
+                    )
                 });
                 for em in &vector.expected_matches {
                     let secret = &vector.input[em.start as usize..em.end as usize];

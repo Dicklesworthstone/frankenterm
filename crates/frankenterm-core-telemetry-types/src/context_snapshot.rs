@@ -917,9 +917,14 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(snap.snapshot_id, u64::MAX, "the boundary snapshot takes id u64::MAX");
         assert_eq!(
-            mgr.next_snapshot_id, u64::MAX,
+            snap.snapshot_id,
+            u64::MAX,
+            "the boundary snapshot takes id u64::MAX"
+        );
+        assert_eq!(
+            mgr.next_snapshot_id,
+            u64::MAX,
             "id generator must saturate at u64::MAX, not wrap to 0"
         );
     }

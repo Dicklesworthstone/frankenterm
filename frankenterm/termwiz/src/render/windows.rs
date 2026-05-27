@@ -1,11 +1,11 @@
 //! A Renderer for windows consoles
 
-use crate::Result;
 use crate::caps::{Capabilities, ColorLevel};
 use crate::cell::{AttributeChange, CellAttributes, Underline};
 use crate::color::{AnsiColor, ColorAttribute};
 use crate::surface::{Change, Position};
 use crate::terminal::windows::ConsoleOutputHandle;
+use crate::Result;
 use num_traits::FromPrimitive;
 use std::convert::TryFrom;
 use std::io::Write;

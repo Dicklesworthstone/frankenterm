@@ -1,7 +1,7 @@
 use crate::color::{LinearRgba, SrgbaPixel};
 use crate::{Point, Rect, Size};
 use anyhow::{anyhow, ensure};
-use downcast_rs::{Downcast, impl_downcast};
+use downcast_rs::{impl_downcast, Downcast};
 use glium::texture::SrgbTexture2d;
 use std::cell::RefCell;
 
@@ -689,8 +689,8 @@ impl Texture2d for ImageTexture {
 #[cfg(test)]
 mod tests {
     use super::{
-        BitmapImage, Image, ImageTexture, Texture2d, unsupported_texture_readback_error,
-        validate_texture_readback_request,
+        unsupported_texture_readback_error, validate_texture_readback_request, BitmapImage, Image,
+        ImageTexture, Texture2d,
     };
     use crate::{Point, Rect, Size};
 
@@ -781,28 +781,22 @@ mod tests {
     #[test]
     fn readonly_bitmap_mut_helpers_panic_before_mut_ptr_access() {
         let mut bytes = ReadOnlyBitmap { pixel: [0; 4] };
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = bytes.pixel_data_slice_mut();
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = bytes.pixel_data_slice_mut();
+        }))
+        .is_err());
 
         let mut pixels = ReadOnlyBitmap { pixel: [0; 4] };
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = pixels.pixels_mut();
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pixels.pixels_mut();
+        }))
+        .is_err());
 
         let mut one_pixel = ReadOnlyBitmap { pixel: [0; 4] };
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = one_pixel.pixel_mut(0, 0);
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = one_pixel.pixel_mut(0, 0);
+        }))
+        .is_err());
     }
 
     #[test]

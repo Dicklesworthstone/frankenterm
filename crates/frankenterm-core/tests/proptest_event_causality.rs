@@ -22,7 +22,8 @@ use frankenterm_core::events::{
 /// Vector clock over a small node alphabet so clocks overlap and the
 /// happens-before relations are actually exercised (not all Concurrent).
 fn arb_vector_clock() -> impl Strategy<Value = VectorClock> {
-    prop::collection::btree_map("[a-c]", 0_u64..20, 0..5).prop_map(|entries| VectorClock { entries })
+    prop::collection::btree_map("[a-c]", 0_u64..20, 0..5)
+        .prop_map(|entries| VectorClock { entries })
 }
 
 fn arb_hlc() -> impl Strategy<Value = HybridLogicalStamp> {

@@ -760,10 +760,10 @@ mod tests {
     /// the records present — i.e. the cap never under-allocates a valid file.
     #[test]
     fn from_bytes_well_formed_large_count_round_trips() {
-        let records: Vec<(u64, Vec<f32>)> =
-            (0..1000u64).map(|i| (i, vec![i as f32, 0.0, 0.0, 0.0])).collect();
-        let refs: Vec<(u64, &[f32])> =
-            records.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let records: Vec<(u64, Vec<f32>)> = (0..1000u64)
+            .map(|i| (i, vec![i as f32, 0.0, 0.0, 0.0]))
+            .collect();
+        let refs: Vec<(u64, &[f32])> = records.iter().map(|(id, v)| (*id, v.as_slice())).collect();
         let data = write_ftvi_vec(4, &refs).unwrap();
         let idx = FtviIndex::from_bytes(&data).unwrap();
         assert_eq!(idx.len(), 1000);

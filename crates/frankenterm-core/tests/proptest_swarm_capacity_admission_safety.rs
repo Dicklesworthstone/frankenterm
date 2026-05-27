@@ -12,10 +12,10 @@
 use proptest::prelude::*;
 
 use frankenterm_core::runtime_telemetry::{
-    plan_swarm_capacity_workload_admission, HealthTier, SwarmCapacityAdmissionAction,
-    SwarmCapacityAgentWorkloadClass, SwarmCapacityWorkloadAdmissionInput,
-    SwarmCapacityWorkloadAdmissionSignal, SwarmCapacityWorkloadEvidenceState,
-    SwarmCapacityWorkloadSignalKind,
+    HealthTier, SwarmCapacityAdmissionAction, SwarmCapacityAgentWorkloadClass,
+    SwarmCapacityWorkloadAdmissionInput, SwarmCapacityWorkloadAdmissionSignal,
+    SwarmCapacityWorkloadEvidenceState, SwarmCapacityWorkloadSignalKind,
+    plan_swarm_capacity_workload_admission,
 };
 
 fn arb_evidence() -> impl Strategy<Value = SwarmCapacityWorkloadEvidenceState> {

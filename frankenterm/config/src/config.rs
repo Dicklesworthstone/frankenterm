@@ -1330,9 +1330,7 @@ impl Config {
                 if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
                     if let Some(contents_dir) = exe_dir.parent() {
                         let resources = contents_dir.join("Resources");
-                        paths.push(PathPossibility::optional(
-                            resources.join("frankenterm.lua"),
-                        ));
+                        paths.push(PathPossibility::optional(resources.join("frankenterm.lua")));
                         paths.push(PathPossibility::optional(resources.join("wezterm.lua")));
                     }
                 }

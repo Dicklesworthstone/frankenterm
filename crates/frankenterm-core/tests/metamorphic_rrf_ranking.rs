@@ -27,10 +27,7 @@ const EPS: f32 = 1e-6;
 /// contract), ids drawn from a small range so the two lanes overlap often, and
 /// scores are finite (RRF ignores them, but transforms must stay well-defined).
 fn arb_lane() -> impl Strategy<Value = Vec<(u64, f32)>> {
-    prop::collection::vec(
-        (0u64..12, (-1.0e3f32..1.0e3f32)),
-        0..14,
-    )
+    prop::collection::vec((0u64..12, (-1.0e3f32..1.0e3f32)), 0..14)
 }
 
 fn ordered_pairs(fused: &[FusedResult]) -> Vec<(u64, f32)> {
@@ -227,7 +224,11 @@ fn mutant_score_dependent_rrf(lex: &[(u64, f32)], sem: &[(u64, f32)], _k: u32) -
         *acc.entry(id).or_insert(0.0) += s;
     }
     let mut v: Vec<(u64, f32)> = acc.into_iter().collect();
-    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    v.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     v
 }
 
@@ -245,7 +246,11 @@ fn mutant_inverted_rank_rrf(lex: &[(u64, f32)], sem: &[(u64, f32)], k: u32) -> V
         *acc.entry(id).or_insert(0.0) += (k as f32 + rank as f32 + 1.0) * 0.001;
     }
     let mut v: Vec<(u64, f32)> = acc.into_iter().collect();
-    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    v.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     v
 }
 
@@ -268,7 +273,10 @@ fn validate_mr1_catches_score_dependence() {
     let remap = vec![(1u64, 9.0f32), (2, 0.0)]; // invert score relationship
     let correct_remap = rrf_fuse(&remap, &sem, 60);
     assert_eq!(
-        ordered_pairs(&correct).iter().map(|p| p.0).collect::<Vec<_>>(),
+        ordered_pairs(&correct)
+            .iter()
+            .map(|p| p.0)
+            .collect::<Vec<_>>(),
         correct_remap.iter().map(|r| r.id).collect::<Vec<_>>(),
         "correct RRF is score-magnitude independent"
     );
@@ -309,7 +317,10 @@ fn validate_mr5_catches_inverted_rank_formula() {
     let after = rrf_fuse(&lex2, &sem, 60);
     let cb = before.iter().find(|r| r.id == 20).unwrap().score;
     let ca = after.iter().find(|r| r.id == 20).unwrap().score;
-    assert!(ca + EPS >= cb, "sanity: correct RRF score non-decreasing on promotion");
+    assert!(
+        ca + EPS >= cb,
+        "sanity: correct RRF score non-decreasing on promotion"
+    );
 
     // Mutant (inverted formula): promotion DECREASES the score — MR5 catches it.
     let mb = mutant_inverted_rank_rrf(&lex, &sem, 60)

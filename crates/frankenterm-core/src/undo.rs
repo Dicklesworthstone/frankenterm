@@ -419,7 +419,9 @@ impl UndoExecutor {
                         return Ok(UndoExecutionResult::failed(
                             action.id,
                             undo.undo_strategy.clone(),
-                            format!("Workflow {execution_id} aborted but audit update failed: {err}"),
+                            format!(
+                                "Workflow {execution_id} aborted but audit update failed: {err}"
+                            ),
                             undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                             Some(execution_id),
                             action.pane_id,
@@ -505,7 +507,9 @@ impl UndoExecutor {
                         return Ok(UndoExecutionResult::failed(
                             action.id,
                             undo.undo_strategy.clone(),
-                            format!("Workflow {execution_id} aborted but audit update failed: {err}"),
+                            format!(
+                                "Workflow {execution_id} aborted but audit update failed: {err}"
+                            ),
                             undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                             Some(execution_id),
                             action.pane_id,

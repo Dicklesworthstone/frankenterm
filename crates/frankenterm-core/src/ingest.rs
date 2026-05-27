@@ -1071,7 +1071,7 @@ impl PaneRegistry {
                     let is_observed = new_observation.is_observed();
 
                     entry.update_info(pane);
-                    
+
                     if entry.observation != new_observation {
                         entry.observation = new_observation;
                         entry.decision_at = epoch_ms();

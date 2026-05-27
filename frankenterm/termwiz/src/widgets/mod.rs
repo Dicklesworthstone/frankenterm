@@ -1,12 +1,12 @@
 // Ideally this would be scoped to WidgetId, but I can't seem to find the
 // right place for it to take effect
 #![allow(clippy::new_without_default)]
-use crate::Result;
 use crate::color::ColorAttribute;
 use crate::input::InputEvent;
 use crate::surface::{
     Change, CursorShape, CursorVisibility, DirtyRect, Position, SequenceNo, Surface,
 };
+use crate::Result;
 use fnv::FnvHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;

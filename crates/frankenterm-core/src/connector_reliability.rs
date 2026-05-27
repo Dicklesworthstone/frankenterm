@@ -1081,8 +1081,16 @@ mod tests {
             crate::circuit_breaker::CircuitStateKind::Closed
         );
         for i in 0..3 {
-            assert!(controller.allow_operation(), "ops allowed while closed (i={i})");
-            controller.record_failure(&action, "weird upstream glitch", ConnectorErrorKind::Unknown, 1000 + i);
+            assert!(
+                controller.allow_operation(),
+                "ops allowed while closed (i={i})"
+            );
+            controller.record_failure(
+                &action,
+                "weird upstream glitch",
+                ConnectorErrorKind::Unknown,
+                1000 + i,
+            );
         }
         assert_eq!(
             controller.circuit_status().state,
@@ -1116,7 +1124,12 @@ mod tests {
         // breaker, so we drive the DLQ to shed_threshold while the circuit stays
         // Closed — isolating the shedding path from circuit rejection.
         for i in 0..3 {
-            ctrl.record_failure(&action, "rate limited", ConnectorErrorKind::RateLimited, 1000 + i);
+            ctrl.record_failure(
+                &action,
+                "rate limited",
+                ConnectorErrorKind::RateLimited,
+                1000 + i,
+            );
         }
         assert_eq!(ctrl.dlq().depth(), 3, "three retryable failures enqueued");
         assert!(ctrl.is_shedding(), "DLQ at shed_threshold");
@@ -1134,7 +1147,10 @@ mod tests {
         let ids: Vec<u64> = ctrl.dlq().pending_entries().iter().map(|e| e.id).collect();
         ctrl.dlq_mut().remove(ids[0]);
         assert!(!ctrl.is_shedding(), "DLQ drained below threshold");
-        assert!(ctrl.allow_operation(), "operations resume once the DLQ recovers");
+        assert!(
+            ctrl.allow_operation(),
+            "operations resume once the DLQ recovers"
+        );
     }
 
     // ---- Dead-letter queue ----

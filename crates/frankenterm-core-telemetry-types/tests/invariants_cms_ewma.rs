@@ -70,7 +70,10 @@ fn cms_estimate_is_monotonic() {
         cms.add(&key, 1);
         let now = cms.estimate(&key);
         let prev = prev_for_key.get(&key).copied().unwrap_or(0);
-        assert!(now >= prev, "CMS estimate for {key} decreased: {prev} -> {now}");
+        assert!(
+            now >= prev,
+            "CMS estimate for {key} decreased: {prev} -> {now}"
+        );
         prev_for_key.insert(key, now);
     }
 }
@@ -120,8 +123,16 @@ fn cms_merge_is_commutative_and_never_underestimates() {
     let mut ba = b.clone();
     ba.merge(&a).unwrap();
     for (&k, &t) in &truth {
-        assert_eq!(ab.estimate(&k), ba.estimate(&k), "merge must be commutative");
-        assert!(ab.estimate(&k) >= t, "merged CMS underestimated {k}: {} < {t}", ab.estimate(&k));
+        assert_eq!(
+            ab.estimate(&k),
+            ba.estimate(&k),
+            "merge must be commutative"
+        );
+        assert!(
+            ab.estimate(&k) >= t,
+            "merged CMS underestimated {k}: {} < {t}",
+            ab.estimate(&k)
+        );
     }
 }
 
@@ -132,7 +143,10 @@ fn cms_degenerate_dimensions_do_not_panic() {
     let mut cms = CountMinSketch::with_dimensions(0, 0);
     cms.increment(&"x");
     assert!(cms.estimate(&"x") >= 1);
-    assert!(cms.width() >= 1, "width must be clamped above zero to avoid % by 0");
+    assert!(
+        cms.width() >= 1,
+        "width must be clamped above zero to avoid % by 0"
+    );
 }
 
 // ===========================================================================
@@ -169,7 +183,11 @@ fn ewma_constant_input_converges_to_constant() {
     for i in 0..1000u64 {
         ewma.observe(42.5, i * 50);
     }
-    assert!((ewma.value() - 42.5).abs() < 1e-6, "constant input must converge: {}", ewma.value());
+    assert!(
+        (ewma.value() - 42.5).abs() < 1e-6,
+        "constant input must converge: {}",
+        ewma.value()
+    );
 }
 
 /// Time moving backwards must not panic and must not push the estimate outside
@@ -181,7 +199,10 @@ fn ewma_backwards_time_stays_bounded() {
     ewma.observe(20.0, 50); // time goes backwards
     ewma.observe(30.0, 0);
     let v = ewma.value();
-    assert!((10.0..=30.0).contains(&v), "EWMA escaped [10,30] under backwards time: {v}");
+    assert!(
+        (10.0..=30.0).contains(&v),
+        "EWMA escaped [10,30] under backwards time: {v}"
+    );
 }
 
 /// Non-finite observations are dropped (never poison the running value).
@@ -192,6 +213,12 @@ fn ewma_drops_non_finite() {
     ewma.observe(f64::NAN, 10);
     ewma.observe(f64::INFINITY, 20);
     let v = ewma.value();
-    assert!(v.is_finite(), "EWMA value poisoned by non-finite input: {v}");
-    assert!((v - 5.0).abs() < 1e-9, "non-finite inputs must not move the value: {v}");
+    assert!(
+        v.is_finite(),
+        "EWMA value poisoned by non-finite input: {v}"
+    );
+    assert!(
+        (v - 5.0).abs() < 1e-9,
+        "non-finite inputs must not move the value: {v}"
+    );
 }

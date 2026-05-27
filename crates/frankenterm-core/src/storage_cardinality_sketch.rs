@@ -315,9 +315,15 @@ mod tests {
         let mut merged = a.clone();
         merged.merge(&b).expect("same precision merges");
         let cm = merged.estimated_distinct_panes();
-        assert!(cm >= ca && cm >= cb, "union {cm} must be >= each shard ({ca}, {cb})");
+        assert!(
+            cm >= ca && cm >= cb,
+            "union {cm} must be >= each shard ({ca}, {cb})"
+        );
         let err = (cm as f64 - 10_000.0).abs() / 10_000.0;
-        assert!(err < 0.05, "merged estimate {cm} should be ≈10_000 (rel err {err:.4})");
+        assert!(
+            err < 0.05,
+            "merged estimate {cm} should be ≈10_000 (rel err {err:.4})"
+        );
     }
 
     #[test]
@@ -337,14 +343,20 @@ mod tests {
         let mut ba = b.clone();
         ba.merge(&a).unwrap();
         assert_eq!(ab.estimated_distinct_panes(), ba.estimated_distinct_panes());
-        assert_eq!(ab.estimated_distinct_sessions(), ba.estimated_distinct_sessions());
+        assert_eq!(
+            ab.estimated_distinct_sessions(),
+            ba.estimated_distinct_sessions()
+        );
     }
 
     #[test]
     fn merge_rejects_precision_mismatch() {
         let mut a = StorageDistinctSketch::with_precision(14);
         let b = StorageDistinctSketch::with_precision(12);
-        assert!(a.merge(&b).is_err(), "differing precisions must not silently merge");
+        assert!(
+            a.merge(&b).is_err(),
+            "differing precisions must not silently merge"
+        );
     }
 
     #[test]

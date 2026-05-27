@@ -1,9 +1,8 @@
 //! Rendering of Changes using terminfo
-use crate::Result;
 use crate::caps::{Capabilities, ColorLevel};
 use crate::cell::{AttributeChange, Blink, CellAttributes, Intensity, Underline};
 use crate::color::{ColorAttribute, ColorSpec};
-use crate::escape::csi::{CSI, Cursor, Edit, EraseInDisplay, EraseInLine, Sgr};
+use crate::escape::csi::{Cursor, Edit, EraseInDisplay, EraseInLine, Sgr, CSI};
 use crate::escape::esc::EscCode;
 use crate::escape::osc::OperatingSystemCommand;
 #[cfg(feature = "use_image")]
@@ -13,6 +12,7 @@ use crate::escape::{Esc, OneBased};
 use crate::image::{ImageData, ImageDataType, TextureCoordinate};
 use crate::render::RenderTty;
 use crate::surface::{Change, CursorShape, CursorVisibility, LineAttribute, Position};
+use crate::Result;
 use finl_unicode::grapheme_clusters::Graphemes;
 #[cfg(feature = "use_image")]
 use image::codecs::gif::GifEncoder;
@@ -25,7 +25,7 @@ use image::{
 };
 use std::convert::TryFrom;
 use std::io::Write;
-use terminfo::{Capability as TermInfoCapability, capability as cap};
+use terminfo::{capability as cap, Capability as TermInfoCapability};
 
 const SPACE_CHUNK_SIZE: usize = 4096;
 const SPACE_CHUNK: [u8; SPACE_CHUNK_SIZE] = [b' '; SPACE_CHUNK_SIZE];
@@ -1055,7 +1055,7 @@ mod test {
     use crate::escape::{Action, ControlCode, Esc, EscCode};
     use crate::input::InputEvent;
     use crate::terminal::unix::{Purge, SetAttributeWhen, UnixTerminal, UnixTty};
-    use crate::terminal::{ScreenSize, Terminal, TerminalWaker, cast};
+    use crate::terminal::{cast, ScreenSize, Terminal, TerminalWaker};
     #[cfg(feature = "use_image")]
     use crate::{image::ImageData, surface::Image};
     #[cfg(feature = "use_image")]
@@ -1066,8 +1066,8 @@ mod test {
     use std::mem;
     use std::os::fd::FromRawFd;
     use std::sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     };
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1447,15 +1447,14 @@ mod test {
         let parsed = out.parse();
         match parsed.as_slice() {
             [Action::OperatingSystemCommand(osc)]
-            | [
-                Action::OperatingSystemCommand(osc),
-                Action::Esc(Esc::Code(EscCode::StringTerminator)),
-            ] => match osc.as_ref() {
-                OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file)) => {
-                    (**file).clone()
+            | [Action::OperatingSystemCommand(osc), Action::Esc(Esc::Code(EscCode::StringTerminator))] => {
+                match osc.as_ref() {
+                    OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file)) => {
+                        (**file).clone()
+                    }
+                    other => panic!("expected iTerm file OSC, got {:?}", other),
                 }
-                other => panic!("expected iTerm file OSC, got {:?}", other),
-            },
+            }
             other => panic!("expected a single OSC action, got {:?}", other),
         }
     }

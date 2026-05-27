@@ -1483,9 +1483,10 @@ fn default_next_safe_action(
     state: DiskGuardProbeState,
 ) -> &'static str {
     match (probe_id, state) {
-        (DiskGuardProbeId::SystemDataVolume | DiskGuardProbeId::PrivateTmp, DiskGuardProbeState::Pass) => {
-            "Proceed within normal proof and edit policy."
-        }
+        (
+            DiskGuardProbeId::SystemDataVolume | DiskGuardProbeId::PrivateTmp,
+            DiskGuardProbeState::Pass,
+        ) => "Proceed within normal proof and edit policy.",
         (DiskGuardProbeId::SystemDataVolume | DiskGuardProbeId::PrivateTmp, _) => {
             "Use external scratch artifacts or obtain explicit operator cleanup approval before write-heavy work."
         }
@@ -1495,9 +1496,10 @@ fn default_next_safe_action(
         (DiskGuardProbeId::RepoWriteProbe, _) => {
             "Do not apply patches in the shared checkout until the write probe recovers."
         }
-        (DiskGuardProbeId::BeadsDbWriteability | DiskGuardProbeId::BeadsJsonlExportability, DiskGuardProbeState::Pass) => {
-            "Use normal Beads coordination."
-        }
+        (
+            DiskGuardProbeId::BeadsDbWriteability | DiskGuardProbeId::BeadsJsonlExportability,
+            DiskGuardProbeState::Pass,
+        ) => "Use normal Beads coordination.",
         (DiskGuardProbeId::BeadsDbWriteability | DiskGuardProbeId::BeadsJsonlExportability, _) => {
             "Record handoff externally until Beads writeability recovers."
         }

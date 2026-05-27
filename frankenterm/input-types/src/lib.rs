@@ -2263,7 +2263,11 @@ pub fn ansi_us_unshift_fallback(c: char) -> char {
         '?' => '/',
         c => {
             let s: Vec<char> = c.to_lowercase().collect();
-            if s.len() == 1 { s[0] } else { c }
+            if s.len() == 1 {
+                s[0]
+            } else {
+                c
+            }
         }
     }
 }

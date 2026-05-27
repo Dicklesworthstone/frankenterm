@@ -1,5 +1,5 @@
 use super::{Metadata, SessionRequest, SessionSender, SftpChannelResult, SftpRequest};
-use crate::runtime::channel::{Sender, bounded};
+use crate::runtime::channel::{bounded, Sender};
 use camino::Utf8PathBuf;
 use std::fmt;
 

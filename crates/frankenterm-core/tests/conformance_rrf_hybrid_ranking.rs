@@ -232,8 +232,7 @@ fn weighted_rrf_matches_reference_via_service() {
                 }
 
                 // Same id set as the reference.
-                let got_ids: std::collections::BTreeSet<u64> =
-                    got.iter().map(|h| h.id).collect();
+                let got_ids: std::collections::BTreeSet<u64> = got.iter().map(|h| h.id).collect();
                 let exp_ids: std::collections::BTreeSet<u64> =
                     expected.iter().map(|h| h.id).collect();
                 assert_eq!(
@@ -257,7 +256,10 @@ fn rrf_preserves_full_union_of_ids() {
         want.extend(sem.iter().map(|&(id, _)| id));
         let got: std::collections::BTreeSet<u64> =
             rrf_fuse(&lex, &sem, 60).iter().map(|h| h.id).collect();
-        assert_eq!(got, want, "{label}: fused output must be exactly the id union");
+        assert_eq!(
+            got, want,
+            "{label}: fused output must be exactly the id union"
+        );
     }
 }
 
@@ -268,8 +270,8 @@ fn rrf_output_is_sorted_descending_with_id_tiebreak() {
             let fused = rrf_fuse(&lex, &sem, k);
             for w in fused.windows(2) {
                 let (a, b) = (&w[0], &w[1]);
-                let ordered = a.score > b.score
-                    || ((a.score - b.score).abs() <= EPS && a.id < b.id);
+                let ordered =
+                    a.score > b.score || ((a.score - b.score).abs() <= EPS && a.id < b.id);
                 assert!(
                     ordered,
                     "{label} (k={k}): ordering violated between id {} ({}) and id {} ({})",
@@ -341,7 +343,10 @@ fn rrf_larger_k_compresses_score_gaps() {
         r_small > r_large,
         "larger k must compress gaps: ratio(1)={r_small} should exceed ratio(1000)={r_large}"
     );
-    assert!((r_small - 1.5).abs() < 1e-4, "k=1 ratio should be 1.5, got {r_small}");
+    assert!(
+        (r_small - 1.5).abs() < 1e-4,
+        "k=1 ratio should be 1.5, got {r_small}"
+    );
 }
 
 #[test]
@@ -360,13 +365,25 @@ fn rrf_zero_weight_lane_stamps_rank_but_adds_no_score() {
 
     // id 10 is lexical-only with zero lexical weight => score 0 but rank stamped.
     let h10 = by_id[&10];
-    assert_eq!(h10.lexical_rank, Some(0), "rank must be stamped even at weight 0");
-    assert!(h10.score.abs() <= EPS, "zero-weight-only doc must score 0, got {}", h10.score);
+    assert_eq!(
+        h10.lexical_rank,
+        Some(0),
+        "rank must be stamped even at weight 0"
+    );
+    assert!(
+        h10.score.abs() <= EPS,
+        "zero-weight-only doc must score 0, got {}",
+        h10.score
+    );
 
     // id 11 is in both lanes: only the semantic contribution counts.
     let h11 = by_id[&11];
     let want11 = 1.0 / (60.0 + 0.0 + 1.0); // semantic rank 0
-    assert!((h11.score - want11).abs() <= EPS, "id 11 score {} != {want11}", h11.score);
+    assert!(
+        (h11.score - want11).abs() <= EPS,
+        "id 11 score {} != {want11}",
+        h11.score
+    );
 }
 
 // =============================================================================
@@ -384,7 +401,10 @@ fn lexical_mode_is_exact_passthrough() {
         assert_eq!(h.id, id);
         assert!((h.score - score).abs() <= EPS);
         assert_eq!(h.lexical_rank, Some(rank));
-        assert_eq!(h.semantic_rank, None, "lexical mode must ignore semantic lane");
+        assert_eq!(
+            h.semantic_rank, None,
+            "lexical mode must ignore semantic lane"
+        );
     }
 }
 
@@ -399,7 +419,10 @@ fn semantic_mode_is_exact_passthrough() {
         assert_eq!(h.id, id);
         assert!((h.score - score).abs() <= EPS);
         assert_eq!(h.semantic_rank, Some(rank));
-        assert_eq!(h.lexical_rank, None, "semantic mode must ignore lexical lane");
+        assert_eq!(
+            h.lexical_rank, None,
+            "semantic mode must ignore lexical lane"
+        );
     }
 }
 
@@ -407,14 +430,19 @@ fn semantic_mode_is_exact_passthrough() {
 fn top_k_truncation_keeps_highest_ranked_prefix() {
     let lex: Vec<(u64, f32)> = (0..20u64).map(|i| (i, 20.0 - i as f32)).collect();
     let sem: Vec<(u64, f32)> = (10..30u64).map(|i| (i, 1.0 - i as f32 / 100.0)).collect();
-    let svc = HybridSearchService::new().with_mode(SearchMode::Hybrid).with_rrf_k(60);
+    let svc = HybridSearchService::new()
+        .with_mode(SearchMode::Hybrid)
+        .with_rrf_k(60);
     // Backend-agnostic: top_k must be a prefix of the service's own full ranking.
     let full = svc.fuse(&lex, &sem, usize::MAX);
     let truncated = svc.fuse(&lex, &sem, 5);
     assert_eq!(truncated.len(), 5, "top_k must bound result count");
     let full_ids: Vec<u64> = full.iter().take(5).map(|h| h.id).collect();
     let trunc_ids: Vec<u64> = truncated.iter().map(|h| h.id).collect();
-    assert_eq!(trunc_ids, full_ids, "top_k prefix must match full ranking prefix");
+    assert_eq!(
+        trunc_ids, full_ids,
+        "top_k prefix must match full ranking prefix"
+    );
 }
 
 // =============================================================================
@@ -442,7 +470,10 @@ fn blend_two_tier_scales_by_alpha_and_dedups() {
     let by_id: BTreeMap<u64, f32> = out.iter().map(|h| (h.id, h.score)).collect();
     assert!((by_id[&1] - 1.0 * alpha).abs() <= EPS);
     assert!((by_id[&2] - 0.8 * alpha).abs() <= EPS);
-    assert!((by_id[&3] - 0.6 * alpha).abs() <= EPS, "dup id keeps tier1 (alpha-scaled) score");
+    assert!(
+        (by_id[&3] - 0.6 * alpha).abs() <= EPS,
+        "dup id keeps tier1 (alpha-scaled) score"
+    );
     assert!((by_id[&4] - 0.7 * (1.0 - alpha)).abs() <= EPS);
     assert!((by_id[&5] - 0.5 * (1.0 - alpha)).abs() <= EPS);
 
@@ -472,14 +503,26 @@ fn blend_alpha_is_clamped_to_unit_interval() {
     // alpha > 1 clamps to 1.0 -> tier1 unscaled, tier2 * 0.
     let (out, _) = blend_two_tier(&tier1, &tier2, 10, 5.0);
     let by_id: BTreeMap<u64, f32> = out.iter().map(|h| (h.id, h.score)).collect();
-    assert!((by_id[&1] - 1.0).abs() <= EPS, "alpha clamped to 1: tier1 unscaled");
-    assert!(by_id[&2].abs() <= EPS, "alpha clamped to 1: tier2 scaled by 0");
+    assert!(
+        (by_id[&1] - 1.0).abs() <= EPS,
+        "alpha clamped to 1: tier1 unscaled"
+    );
+    assert!(
+        by_id[&2].abs() <= EPS,
+        "alpha clamped to 1: tier2 scaled by 0"
+    );
 
     // alpha < 0 clamps to 0.0 -> tier1 * 0, tier2 unscaled.
     let (out2, _) = blend_two_tier(&tier1, &tier2, 10, -3.0);
     let by_id2: BTreeMap<u64, f32> = out2.iter().map(|h| (h.id, h.score)).collect();
-    assert!(by_id2[&1].abs() <= EPS, "alpha clamped to 0: tier1 scaled by 0");
-    assert!((by_id2[&2] - 1.0).abs() <= EPS, "alpha clamped to 0: tier2 unscaled");
+    assert!(
+        by_id2[&1].abs() <= EPS,
+        "alpha clamped to 0: tier1 scaled by 0"
+    );
+    assert!(
+        (by_id2[&2] - 1.0).abs() <= EPS,
+        "alpha clamped to 0: tier2 unscaled"
+    );
 }
 
 #[test]
@@ -510,7 +553,11 @@ fn reference_kendall(a: &[u64], b: &[u64]) -> f32 {
     }
     let rank_a: BTreeMap<u64, usize> = a.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     let rank_b: BTreeMap<u64, usize> = b.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    let common: Vec<u64> = a.iter().copied().filter(|id| rank_b.contains_key(id)).collect();
+    let common: Vec<u64> = a
+        .iter()
+        .copied()
+        .filter(|id| rank_b.contains_key(id))
+        .collect();
     let n = common.len();
     if n < 2 {
         return 0.0;
@@ -553,13 +600,20 @@ fn kendall_tau_single_swap_value() {
     let a = vec![1u64, 2, 3, 4];
     let b = vec![2u64, 1, 3, 4];
     let tau = kendall_tau(&a, &b);
-    assert!((tau - (4.0 / 6.0)).abs() <= EPS, "single adjacent swap tau should be ~0.6667, got {tau}");
+    assert!(
+        (tau - (4.0 / 6.0)).abs() <= EPS,
+        "single adjacent swap tau should be ~0.6667, got {tau}"
+    );
 }
 
 #[test]
 fn kendall_tau_empty_and_singleton_are_zero() {
     assert_eq!(kendall_tau(&[], &[]), 0.0);
-    assert_eq!(kendall_tau(&[1], &[1]), 0.0, "fewer than 2 common items => 0");
+    assert_eq!(
+        kendall_tau(&[1], &[1]),
+        0.0,
+        "fewer than 2 common items => 0"
+    );
     assert_eq!(kendall_tau(&[1, 2, 3], &[]), 0.0);
     assert_eq!(kendall_tau(&[1], &[2]), 0.0, "no common items => 0");
 }

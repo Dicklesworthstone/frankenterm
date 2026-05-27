@@ -1,6 +1,6 @@
-use crate::TerminalState;
 use crate::input::*;
 use crate::terminalstate::MouseEncoding;
+use crate::TerminalState;
 use anyhow::bail;
 use std::convert::TryFrom;
 use std::io::Write;

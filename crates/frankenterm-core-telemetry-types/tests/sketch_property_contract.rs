@@ -34,7 +34,10 @@ fn percentile_is_monotonic_nondecreasing_in_p() {
         let q = h
             .percentile(p)
             .expect("a populated histogram yields a percentile for every valid p");
-        assert!(q.is_finite() && q > 0.0, "percentile({p}) = {q} must be finite/positive");
+        assert!(
+            q.is_finite() && q > 0.0,
+            "percentile({p}) = {q} must be finite/positive"
+        );
         assert!(
             q >= prev,
             "percentile must be non-decreasing in p: percentile({p}) = {q} < previous {prev}"
@@ -50,7 +53,10 @@ fn percentile_is_none_only_when_empty() {
     let mut h = ExpHistogram::power_of_two(20);
     assert_eq!(h.percentile(0.5), None, "empty histogram has no percentile");
     h.record(42.0);
-    assert!(h.percentile(0.5).is_some(), "a populated histogram yields a percentile");
+    assert!(
+        h.percentile(0.5).is_some(),
+        "a populated histogram yields a percentile"
+    );
 }
 
 /// `count()` is monotone non-decreasing under `record` and exactly counts the
@@ -63,10 +69,17 @@ fn count_is_monotonic_and_exact_under_record() {
     for v in 1..=200u32 {
         h.record(f64::from(v));
         let now = h.count();
-        assert!(now >= prev, "count must be non-decreasing under record ({now} < {prev})");
+        assert!(
+            now >= prev,
+            "count must be non-decreasing under record ({now} < {prev})"
+        );
         prev = now;
     }
-    assert_eq!(h.count(), 200, "count must equal the number of recorded values");
+    assert_eq!(
+        h.count(),
+        200,
+        "count must equal the number of recorded values"
+    );
 }
 
 /// `merge` is additive in count and never decreases the receiver's count.
@@ -82,7 +95,10 @@ fn merge_is_additive_in_count() {
     }
     let (count_a, count_b) = (a.count(), b.count());
     a.merge(&b);
-    assert!(a.count() >= count_a, "merge must not decrease the receiver's count");
+    assert!(
+        a.count() >= count_a,
+        "merge must not decrease the receiver's count"
+    );
     assert_eq!(
         a.count(),
         count_a + count_b,
@@ -134,7 +150,10 @@ fn ewma_ignores_non_finite_observations() {
     assert_eq!(e.value(), baseline, "a +inf observation must be ignored");
     e.observe(f64::NEG_INFINITY, 75);
     assert_eq!(e.value(), baseline, "a -inf observation must be ignored");
-    assert!(e.value().is_finite(), "value stays finite after non-finite inputs");
+    assert!(
+        e.value().is_finite(),
+        "value stays finite after non-finite inputs"
+    );
 
     // A finite observation after the skipped ones still updates normally.
     e.observe(20.0, 100);

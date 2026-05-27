@@ -1559,7 +1559,10 @@ mod tests {
         let err = broker
             .request_lease("conn-1", "cred-1", scope(), 1000)
             .unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::MaxLeasesExceeded { .. }));
+        assert!(matches!(
+            err,
+            CredentialBrokerError::MaxLeasesExceeded { .. }
+        ));
 
         // After all five leases expire, a new request MUST succeed — the sweep
         // frees the capacity. Pre-fix this returned MaxLeasesExceeded forever.

@@ -321,7 +321,7 @@ fn clean_device_url(raw: &str) -> String {
     raw.trim_end_matches(|ch: char| {
         matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
     })
-        .to_string()
+    .to_string()
 }
 
 /// Parse device code from pane tail text.
@@ -342,7 +342,9 @@ pub fn parse_device_code(tail: &str) -> Result<DeviceCode, DeviceCodeParseError>
         .map(|m| m.as_str().to_uppercase());
 
     // Try to find the URL (optional)
-    let url = DEVICE_URL_RE.find(tail).map(|m| clean_device_url(m.as_str()));
+    let url = DEVICE_URL_RE
+        .find(tail)
+        .map(|m| clean_device_url(m.as_str()));
 
     match code {
         Some(code) => Ok(DeviceCode { code, url }),

@@ -3,9 +3,9 @@ use crate::filewrap::FileWrap;
 use crate::sftp::types::{Metadata, OpenOptions, RenameOptions};
 use crate::sftp::{SftpChannelError, SftpChannelResult};
 use camino::{Utf8Path, Utf8PathBuf};
+use std::convert::TryInto;
 #[cfg(feature = "libssh-rs")]
 use std::io;
-use std::convert::TryInto;
 
 pub(crate) enum SftpWrap {
     #[cfg(feature = "ssh2")]

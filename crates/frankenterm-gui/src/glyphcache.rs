@@ -2055,11 +2055,7 @@ mod tests {
             evicted, populated,
             "all current-scale entries are stale relative to a different metric"
         );
-        assert_eq!(
-            cache.glyph_cache.len(),
-            0,
-            "stale entries must be dropped"
-        );
+        assert_eq!(cache.glyph_cache.len(), 0, "stale entries must be dropped");
     }
 
     fn texture_rect_tuple(rect: TextureRect) -> (f32, f32, f32, f32) {

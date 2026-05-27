@@ -60,7 +60,10 @@ fn timeout_with_cx_errors_when_future_exceeds_deadline() {
             7usize
         },
     ));
-    assert!(result.is_err(), "future exceeding the deadline must time out");
+    assert!(
+        result.is_err(),
+        "future exceeding the deadline must time out"
+    );
 }
 
 /// Documented contract (ft-xbnl0.2.4): `timeout_with_cx` does NOT check
@@ -116,7 +119,10 @@ fn sleep_with_cx_completes_on_live_cx() {
     let runtime = current_thread_runtime();
     let cx = for_testing();
     let result = runtime.block_on(runtime_async::sleep_with_cx(&cx, Duration::from_millis(5)));
-    assert!(result.is_ok(), "a short sleep on a live cx must complete Ok");
+    assert!(
+        result.is_ok(),
+        "a short sleep on a live cx must complete Ok"
+    );
 }
 
 // =============================================================================
@@ -139,7 +145,10 @@ fn timeout_with_cx_success_region_monotone_in_deadline() {
             1usize
         },
     ));
-    assert!(tight.is_err(), "30ms future under a 5ms deadline must time out");
+    assert!(
+        tight.is_err(),
+        "30ms future under a 5ms deadline must time out"
+    );
 
     let generous: Result<usize, String> = runtime.block_on(runtime_async::timeout_with_cx(
         &for_testing(),
@@ -187,7 +196,10 @@ fn checkpoint_observes_cancel_equivalently_before_poll_and_mid_flight() {
     let before = for_testing();
     before.cancel_with(CancelKind::User, Some("p2 cancel-before-poll"));
     let observed_before = runtime.block_on(async move { before.checkpoint().is_err() });
-    assert!(observed_before, "a pre-cancelled cx must fail its first checkpoint");
+    assert!(
+        observed_before,
+        "a pre-cancelled cx must fail its first checkpoint"
+    );
 
     // Cancel-mid-flight: first checkpoint passes, then cancel, then the next
     // checkpoint observes it — the same Err outcome as cancel-before-poll.
@@ -198,7 +210,10 @@ fn checkpoint_observes_cancel_equivalently_before_poll_and_mid_flight() {
         let post = during.checkpoint().is_err();
         (pre, post)
     });
-    assert!(pre_cancel_ok, "a live cx must pass a checkpoint before cancellation");
+    assert!(
+        pre_cancel_ok,
+        "a live cx must pass a checkpoint before cancellation"
+    );
     assert!(
         post_cancel_err,
         "a checkpoint after mid-flight cancel must observe it, like cancel-before-poll"

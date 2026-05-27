@@ -98,7 +98,10 @@ fn vector_clock_merge_is_commutative() {
     let mut ba = b.clone();
     ba.merge(&a);
 
-    assert_eq!(ab, ba, "merge must be commutative on the resulting frontier");
+    assert_eq!(
+        ab, ba,
+        "merge must be commutative on the resulting frontier"
+    );
 }
 
 /// `relation_to` is reflexive: a clock is Equal to itself.
@@ -108,7 +111,10 @@ fn vector_clock_relation_is_reflexive() {
     a.increment("n1");
     a.increment("n2");
     assert_eq!(a.relation_to(&a), CausalRelation::Equal);
-    assert_eq!(VectorClock::new().relation_to(&VectorClock::new()), CausalRelation::Equal);
+    assert_eq!(
+        VectorClock::new().relation_to(&VectorClock::new()),
+        CausalRelation::Equal
+    );
 }
 
 /// `relation_to` is antisymmetric: Before one way implies After the other, and
@@ -141,7 +147,10 @@ fn vector_clock_increment_is_strictly_monotone() {
     let mut prev = 0u64;
     for _ in 0..50 {
         let now = a.increment("n1");
-        assert!(now > prev, "increment must strictly increase ({now} <= {prev})");
+        assert!(
+            now > prev,
+            "increment must strictly increase ({now} <= {prev})"
+        );
         prev = now;
     }
     assert_eq!(a.get("n1"), prev, "get must reflect the latest increment");

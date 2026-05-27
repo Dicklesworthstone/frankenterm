@@ -8,8 +8,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::fleet_memory_controller::FleetPressureTier;
 use frankenterm_core::runtime_telemetry::{
-    plan_swarm_capacity_resource_budget, SwarmCapacityAgentWorkloadClass,
-    SwarmCapacityBudgetWorkloadMixRow, SwarmCapacityHardwareFingerprint,
+    SwarmCapacityAgentWorkloadClass, SwarmCapacityBudgetWorkloadMixRow,
+    SwarmCapacityHardwareFingerprint, plan_swarm_capacity_resource_budget,
 };
 
 fn arb_class() -> impl Strategy<Value = SwarmCapacityAgentWorkloadClass> {

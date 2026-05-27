@@ -1142,13 +1142,25 @@ impl PaneFilterRule {
             return Err(format!("Rule '{}' has no matchers", self.id));
         }
 
-        if self.domain.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        if self
+            .domain
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
             return Err(format!("Rule '{}' has an empty domain matcher", self.id));
         }
-        if self.title.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        if self
+            .title
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
             return Err(format!("Rule '{}' has an empty title matcher", self.id));
         }
-        if self.cwd.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        if self
+            .cwd
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
             return Err(format!("Rule '{}' has an empty cwd matcher", self.id));
         }
 
@@ -6052,18 +6064,24 @@ max_sender_id_len = 0
         assert!(no_matchers.validate().is_err());
 
         // Empty matcher values
-        assert!(PaneFilterRule::new("empty_domain")
-            .with_domain(" ")
-            .validate()
-            .is_err());
-        assert!(PaneFilterRule::new("empty_title")
-            .with_title("\t")
-            .validate()
-            .is_err());
-        assert!(PaneFilterRule::new("empty_cwd")
-            .with_cwd("\n")
-            .validate()
-            .is_err());
+        assert!(
+            PaneFilterRule::new("empty_domain")
+                .with_domain(" ")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            PaneFilterRule::new("empty_title")
+                .with_title("\t")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            PaneFilterRule::new("empty_cwd")
+                .with_cwd("\n")
+                .validate()
+                .is_err()
+        );
 
         // Invalid regex
         let invalid_regex = PaneFilterRule::new("test").with_title("re:[invalid(regex");

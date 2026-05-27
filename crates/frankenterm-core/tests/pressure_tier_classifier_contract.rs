@@ -49,23 +49,41 @@ fn pressure_tier_normal_when_within_budget() {
 
 #[test]
 fn pressure_tier_elevated_up_to_5pct_overage() {
-    assert_eq!(hot(1_000, 1_040).pressure_tier(), FleetPressureTier::Elevated);
+    assert_eq!(
+        hot(1_000, 1_040).pressure_tier(),
+        FleetPressureTier::Elevated
+    );
     // Exactly 5% overage (over% == 500) is the inclusive upper edge of Elevated.
-    assert_eq!(hot(1_000, 1_050).pressure_tier(), FleetPressureTier::Elevated);
+    assert_eq!(
+        hot(1_000, 1_050).pressure_tier(),
+        FleetPressureTier::Elevated
+    );
 }
 
 #[test]
 fn pressure_tier_critical_between_5pct_and_25pct() {
-    assert_eq!(hot(1_000, 1_100).pressure_tier(), FleetPressureTier::Critical);
+    assert_eq!(
+        hot(1_000, 1_100).pressure_tier(),
+        FleetPressureTier::Critical
+    );
     // Exactly 25% overage (over% == 2500) is the inclusive upper edge of Critical.
-    assert_eq!(hot(1_000, 1_250).pressure_tier(), FleetPressureTier::Critical);
+    assert_eq!(
+        hot(1_000, 1_250).pressure_tier(),
+        FleetPressureTier::Critical
+    );
 }
 
 #[test]
 fn pressure_tier_emergency_above_25pct() {
     // over% = 2501 (> 2500) — first step past the Critical ceiling.
-    assert_eq!(hot(10_000, 12_501).pressure_tier(), FleetPressureTier::Emergency);
-    assert_eq!(hot(1_000, 2_000).pressure_tier(), FleetPressureTier::Emergency);
+    assert_eq!(
+        hot(10_000, 12_501).pressure_tier(),
+        FleetPressureTier::Emergency
+    );
+    assert_eq!(
+        hot(1_000, 2_000).pressure_tier(),
+        FleetPressureTier::Emergency
+    );
 }
 
 #[test]

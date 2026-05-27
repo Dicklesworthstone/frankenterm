@@ -10,9 +10,9 @@ mod csi;
 use crate::color::ColorPalette;
 use crate::screen::{ResizeReadabilityGatePolicy, ResizeWrapPolicy};
 use frankenterm_escape_parser::csi::{Edit, EraseInDisplay, EraseInLine};
-use frankenterm_escape_parser::{CSI, OneBased, OperatingSystemCommand};
+use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use frankenterm_surface::line::MonospaceKpCostModel;
-use frankenterm_surface::{CursorShape, CursorVisibility, SEQ_ZERO, SequenceNo};
+use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
 use k9::assert_equal as assert_eq;
 use std::sync::{Arc, Mutex};
 

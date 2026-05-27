@@ -685,7 +685,9 @@ pub(crate) mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "gated_write_stdout called while output is suppressed — this would corrupt the TUI")]
+    #[should_panic(
+        expected = "gated_write_stdout called while output is suppressed — this would corrupt the TUI"
+    )]
     fn gated_write_stdout_panics_in_debug_when_active() {
         let _lock = lock_gate();
         set_phase(GatePhase::Active);
@@ -696,7 +698,9 @@ pub(crate) mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "gated_write_stderr called while output is suppressed — this would corrupt the TUI")]
+    #[should_panic(
+        expected = "gated_write_stderr called while output is suppressed — this would corrupt the TUI"
+    )]
     fn gated_write_stderr_panics_in_debug_when_active() {
         let _lock = lock_gate();
         set_phase(GatePhase::Active);

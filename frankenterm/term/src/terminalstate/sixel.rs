@@ -1,6 +1,6 @@
-use crate::TerminalState;
 use crate::terminalstate::image::*;
-use crate::terminalstate::{ImageAttachParams, default_color_map};
+use crate::terminalstate::{default_color_map, ImageAttachParams};
+use crate::TerminalState;
 use ::image::RgbaImage;
 use frankenterm_cell::color::RgbColor;
 use frankenterm_cell::image::ImageDataType;

@@ -754,8 +754,11 @@ mod tests {
             };
             let c = PriorityClassifier::new(config);
             c.register_pane(1); // must not panic
-            assert_eq!(c.tracked_pane_count(), 1,
-                "register_pane must succeed for rate_half_life_secs={bad}");
+            assert_eq!(
+                c.tracked_pane_count(),
+                1,
+                "register_pane must succeed for rate_half_life_secs={bad}"
+            );
         }
     }
 

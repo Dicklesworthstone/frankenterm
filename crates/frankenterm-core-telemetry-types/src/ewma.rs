@@ -409,7 +409,11 @@ mod tests {
         ewma.observe(1.0, 0);
         ewma.count = u64::MAX;
         ewma.observe(2.0, 10);
-        assert_eq!(ewma.count(), u64::MAX, "observation count must saturate, not wrap to 0");
+        assert_eq!(
+            ewma.count(),
+            u64::MAX,
+            "observation count must saturate, not wrap to 0"
+        );
     }
 
     #[test]

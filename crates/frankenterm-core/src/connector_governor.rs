@@ -1539,7 +1539,11 @@ mod tests {
             0,
         );
         // t = 9_999 ms => floor(9999/250) = 39 intervals => 39*7 = 273 tokens.
-        assert_eq!(fresh.available(9_999), 39 * 7, "token count must equal whole-interval refills");
+        assert_eq!(
+            fresh.available(9_999),
+            39 * 7,
+            "token count must equal whole-interval refills"
+        );
     }
 
     #[test]

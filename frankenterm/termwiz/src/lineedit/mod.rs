@@ -43,8 +43,8 @@ use crate::caps::{Capabilities, ProbeHints};
 use crate::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 use crate::surface::change::ChangeSequence;
 use crate::surface::{Change, Position};
-use crate::terminal::{Terminal, new_terminal};
-use crate::{Result, bail, ensure};
+use crate::terminal::{new_terminal, Terminal};
+use crate::{bail, ensure, Result};
 
 mod actions;
 mod buffer;

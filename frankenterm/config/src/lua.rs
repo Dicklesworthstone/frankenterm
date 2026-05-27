@@ -403,10 +403,7 @@ end
         // to invoke the callback. The wezterm.time alias below is the
         // back-compat surface for upstream configs.
         let time_mod = get_or_create_sub_module(&lua, "time")?;
-        time_mod.set(
-            "call_after",
-            lua.create_function(lua_time_call_after)?,
-        )?;
+        time_mod.set("call_after", lua.create_function(lua_time_call_after)?)?;
         time_mod.set("now", lua.create_function(lua_time_now)?)?;
 
         wezterm_mod.set(
@@ -434,9 +431,7 @@ end
         // without edits. Both `package.loaded.wezterm` and
         // `package.loaded.frankenterm` resolve to the same Lua table, so a
         // setting reached via either name reaches the same place.
-        let loaded_table: Table = package
-            .get("loaded")
-            .context("get package.loaded")?;
+        let loaded_table: Table = package.get("loaded").context("get package.loaded")?;
         loaded_table
             .set("frankenterm", wezterm_mod.clone())
             .context("set package.loaded.frankenterm = wezterm_mod")?;

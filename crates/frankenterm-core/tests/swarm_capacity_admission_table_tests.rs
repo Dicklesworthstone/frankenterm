@@ -7,9 +7,9 @@
 use std::collections::HashSet;
 
 use frankenterm_core::runtime_telemetry::{
+    SwarmCapacityAdmissionAction, SwarmCapacityAgentWorkloadClass,
     swarm_capacity_resource_budget_dry_run_examples,
     swarm_capacity_workload_admission_dry_run_examples, swarm_capacity_workload_admission_table,
-    SwarmCapacityAdmissionAction, SwarmCapacityAgentWorkloadClass,
 };
 
 #[test]
@@ -22,7 +22,11 @@ fn workload_admission_table_covers_each_class_exactly_once() {
     );
     let classes: HashSet<SwarmCapacityAgentWorkloadClass> =
         table.iter().map(|row| row.workload_class).collect();
-    assert_eq!(classes.len(), table.len(), "each workload class must appear exactly once");
+    assert_eq!(
+        classes.len(),
+        table.len(),
+        "each workload class must appear exactly once"
+    );
 }
 
 #[test]
@@ -57,7 +61,10 @@ fn workload_admission_table_reason_codes_are_well_formed() {
     for row in swarm_capacity_workload_admission_table() {
         assert_eq!(
             row.reason_codes,
-            vec![format!("capacity.workload.class.{}", row.workload_class.as_str())],
+            vec![format!(
+                "capacity.workload.class.{}",
+                row.workload_class.as_str()
+            )],
             "reason code must follow capacity.workload.class.<name> for {:?}",
             row.workload_class
         );
@@ -80,11 +87,23 @@ fn workload_admission_dry_run_plan_is_safe_and_private() {
 
         // Planning surface: dry-run only, no side effects, no raw pane content.
         assert!(plan.dry_run, "dry-run example plan must set dry_run");
-        assert!(!plan.side_effects_executed, "planning must never execute side effects");
-        assert!(!plan.raw_pane_content_stored, "planning must never store raw pane content");
+        assert!(
+            !plan.side_effects_executed,
+            "planning must never execute side effects"
+        );
+        assert!(
+            !plan.raw_pane_content_stored,
+            "planning must never store raw pane content"
+        );
         // The supplied timestamp is echoed unchanged.
-        assert_eq!(plan.generated_at_ms, ts, "generated_at_ms must echo the input");
-        assert!(!plan.decisions.is_empty(), "dry-run examples must produce decisions");
+        assert_eq!(
+            plan.generated_at_ms, ts,
+            "generated_at_ms must echo the input"
+        );
+        assert!(
+            !plan.decisions.is_empty(),
+            "dry-run examples must produce decisions"
+        );
 
         for decision in &plan.decisions {
             assert!(
@@ -95,7 +114,9 @@ fn workload_admission_dry_run_plan_is_safe_and_private() {
             assert!(
                 decision.admitted_units <= decision.requested_units,
                 "admitted_units {} must not exceed requested_units {} (id={})",
-                decision.admitted_units, decision.requested_units, decision.stable_id
+                decision.admitted_units,
+                decision.requested_units,
+                decision.stable_id
             );
         }
     }
@@ -114,9 +135,16 @@ fn workload_admission_dry_run_plan_is_deterministic() {
 fn resource_budget_dry_run_plans_are_safe() {
     for ts in [0_u64, 1, 1_700_000_000_000, u64::MAX] {
         let plans = swarm_capacity_resource_budget_dry_run_examples(ts);
-        assert!(!plans.is_empty(), "resource-budget dry-run must produce example plans");
+        assert!(
+            !plans.is_empty(),
+            "resource-budget dry-run must produce example plans"
+        );
         for plan in &plans {
-            assert!(plan.dry_run, "resource-budget plan must set dry_run (id={})", plan.contract_id);
+            assert!(
+                plan.dry_run,
+                "resource-budget plan must set dry_run (id={})",
+                plan.contract_id
+            );
             assert!(
                 !plan.side_effects_executed,
                 "resource-budget planning must not execute side effects (id={})",
@@ -124,7 +152,8 @@ fn resource_budget_dry_run_plans_are_safe() {
             );
             assert_eq!(
                 plan.generated_at_ms, ts,
-                "generated_at_ms must echo the input (id={})", plan.contract_id
+                "generated_at_ms must echo the input (id={})",
+                plan.contract_id
             );
         }
     }

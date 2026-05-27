@@ -929,21 +929,21 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-            let mock = crate::wezterm::MockWezterm::new();
-            mock.add_default_pane(50).await;
-            let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
-            let injector = make_injector_from_handle(handle);
-            let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 50, PaneCapabilities::prompt(), "cx-cancel-1")
-                    .with_injector(injector);
-            let cx = crate::cx::for_testing();
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("pre-cancel context test"),
-            );
-            
-            let _res = ctx.send_text_with_cx(&cx, "should not run").await;
-        });
+                let mock = crate::wezterm::MockWezterm::new();
+                mock.add_default_pane(50).await;
+                let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
+                let injector = make_injector_from_handle(handle);
+                let storage = make_storage();
+                let mut ctx =
+                    WorkflowContext::new(storage, 50, PaneCapabilities::prompt(), "cx-cancel-1")
+                        .with_injector(injector);
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("pre-cancel context test"),
+                );
+
+                let _res = ctx.send_text_with_cx(&cx, "should not run").await;
+            });
     }
 }

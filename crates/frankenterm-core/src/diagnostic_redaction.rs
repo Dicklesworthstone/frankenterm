@@ -1022,9 +1022,11 @@ mod tests {
 
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.policy_name, "default");
-        assert!(report
-            .always_redact_keys
-            .contains(&"error_message".to_string()));
+        assert!(
+            report
+                .always_redact_keys
+                .contains(&"error_message".to_string())
+        );
         assert!(report.always_safe_keys.contains(&"queue_depth".to_string()));
     }
 

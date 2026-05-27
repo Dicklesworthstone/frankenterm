@@ -1657,7 +1657,11 @@ mod tests {
         h.record(10.0);
         h.total_count = u64::MAX;
         h.record(20.0);
-        assert_eq!(h.total_count, u64::MAX, "count must saturate, not wrap to 0");
+        assert_eq!(
+            h.total_count,
+            u64::MAX,
+            "count must saturate, not wrap to 0"
+        );
         assert!(
             h.mean().is_some(),
             "a saturated count must not make mean() spuriously report empty"

@@ -1,8 +1,8 @@
 use crate::escape::csi::{Device, Window};
 use crate::escape::parser::Parser;
-use crate::escape::{Action, CSI, DeviceControlMode, Esc, EscCode};
+use crate::escape::{Action, DeviceControlMode, Esc, EscCode, CSI};
 use crate::terminal::ScreenSize;
-use crate::{Result, bail};
+use crate::{bail, Result};
 use std::convert::TryFrom;
 use std::io::{Read, Write};
 

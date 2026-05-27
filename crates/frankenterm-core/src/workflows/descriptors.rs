@@ -482,7 +482,11 @@ fn validate_step_description(
         | DescriptorStep::Conditional { description, .. }
         | DescriptorStep::Loop { description, .. } => description.as_deref(),
     };
-    validate_optional_text_len("Descriptor step description", description, limits.max_text_len)
+    validate_optional_text_len(
+        "Descriptor step description",
+        description,
+        limits.max_text_len,
+    )
 }
 
 /// Matchers in descriptors (substring or regex).

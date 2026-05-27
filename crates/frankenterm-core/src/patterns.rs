@@ -676,16 +676,8 @@ impl RuleDef {
         validate_optional_rule_text(&self.id, "remediation", self.remediation.as_deref())?;
         validate_optional_rule_text(&self.id, "workflow", self.workflow.as_deref())?;
         validate_optional_rule_text(&self.id, "manual_fix", self.manual_fix.as_deref())?;
-        validate_optional_rule_text(
-            &self.id,
-            "preview_command",
-            self.preview_command.as_deref(),
-        )?;
-        validate_optional_rule_text(
-            &self.id,
-            "learn_more_url",
-            self.learn_more_url.as_deref(),
-        )?;
+        validate_optional_rule_text(&self.id, "preview_command", self.preview_command.as_deref())?;
+        validate_optional_rule_text(&self.id, "learn_more_url", self.learn_more_url.as_deref())?;
         if self
             .workflow
             .as_deref()
@@ -1043,23 +1035,25 @@ fn validate_pack_identity(name: &str, version: &str) -> Result<()> {
         );
     }
     if name.split(':').any(|segment| segment.trim().is_empty()) {
-        return Err(
-            PatternError::InvalidRule("pack name cannot contain empty segments".to_string()).into(),
-        );
+        return Err(PatternError::InvalidRule(
+            "pack name cannot contain empty segments".to_string(),
+        )
+        .into());
     }
     if version.trim().is_empty() {
         return Err(PatternError::InvalidRule("pack version cannot be empty".to_string()).into());
     }
     if version.chars().any(char::is_whitespace) {
-        return Err(
-            PatternError::InvalidRule("pack version cannot contain whitespace".to_string()).into(),
-        );
+        return Err(PatternError::InvalidRule(
+            "pack version cannot contain whitespace".to_string(),
+        )
+        .into());
     }
     if version.split('.').any(|segment| segment.trim().is_empty()) {
-        return Err(
-            PatternError::InvalidRule("pack version cannot contain empty segments".to_string())
-                .into(),
-        );
+        return Err(PatternError::InvalidRule(
+            "pack version cannot contain empty segments".to_string(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -1270,7 +1264,12 @@ fn validate_supply_chain_attestation(
         "compatibility_target",
         &supply_chain.compatibility_target,
     );
-    push_blank_attestation_issue(issues, "rollout", "rollout.stage", &supply_chain.rollout.stage);
+    push_blank_attestation_issue(
+        issues,
+        "rollout",
+        "rollout.stage",
+        &supply_chain.rollout.stage,
+    );
 
     for (fixture, expected_hash) in &supply_chain.fixture_hashes {
         push_blank_attestation_issue(issues, "fixture_hash", "fixture_hashes key", fixture);
@@ -2026,7 +2025,10 @@ fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
     for entry in sorted {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
-            tracing::warn!("Skipping user pack with unreadable file type: {}", path.display());
+            tracing::warn!(
+                "Skipping user pack with unreadable file type: {}",
+                path.display()
+            );
             continue;
         };
         // Use non-following metadata for directory discovery so symlinked pack
@@ -4686,7 +4688,9 @@ rules:
         pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
 
         let mut policy = PatternPackVerificationPolicy::default();
-        policy.fixture_hashes.insert(" \t ".to_string(), " \t ".to_string());
+        policy
+            .fixture_hashes
+            .insert(" \t ".to_string(), " \t ".to_string());
         let report = verify_pattern_pack_supply_chain(&pack, &policy);
 
         assert!(!report.verified);

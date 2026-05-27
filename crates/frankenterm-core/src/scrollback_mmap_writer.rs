@@ -709,7 +709,11 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write torn file");
 
         let records = read_linear_records(&path).expect("salvage prefix");
-        assert_eq!(records.len(), 1, "only the fully-written record is salvageable");
+        assert_eq!(
+            records.len(),
+            1,
+            "only the fully-written record is salvageable"
+        );
         assert_eq!(records[0], (RecordKind::Text, p1.to_vec()));
 
         let _ = std::fs::remove_dir_all(&dir);
