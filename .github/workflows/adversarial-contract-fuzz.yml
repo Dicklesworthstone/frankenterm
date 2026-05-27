@@ -38,7 +38,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          cargo +stable install cargo-fuzz --locked
       - name: Build target
         run: cargo fuzz build ${{ matrix.target }}
       - name: Run target for 30 minutes
@@ -72,7 +74,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          cargo +stable install cargo-fuzz --locked
       - name: Build target
         run: cargo fuzz build ${{ matrix.target }}
       - name: Run target for 24 hours
