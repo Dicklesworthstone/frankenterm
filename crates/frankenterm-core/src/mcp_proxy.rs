@@ -1663,8 +1663,10 @@ mod tests {
         // tools with missing/malformed annotation metadata. The
         // operator can't consent to admit unsafe metadata they
         // can't see.
-        let mut settings = McpClientConfig::default();
-        settings.proxy_allow_mutating_tools = true;
+        let settings = McpClientConfig {
+            proxy_allow_mutating_tools: true,
+            ..Default::default()
+        };
 
         let tools = vec![
             // Explicit destructive: admitted under the opt-in.
@@ -1716,8 +1718,10 @@ mod tests {
         // a tool with annotations=None must remain blocked. The
         // operator cannot consent to admit unsafe metadata they
         // can't see.
-        let mut settings = McpClientConfig::default();
-        settings.proxy_allow_mutating_tools = true;
+        let settings = McpClientConfig {
+            proxy_allow_mutating_tools: true,
+            ..Default::default()
+        };
 
         let tools = vec![McpClientToolDefinition {
             name: "no_annotations".to_string(),
@@ -1742,8 +1746,10 @@ mod tests {
         // br-ft-gmt1c: a tool with annotations that are not a JSON
         // object (e.g. an array, a string, a number) must remain
         // blocked even when the operator opted into mutating tools.
-        let mut settings = McpClientConfig::default();
-        settings.proxy_allow_mutating_tools = true;
+        let settings = McpClientConfig {
+            proxy_allow_mutating_tools: true,
+            ..Default::default()
+        };
 
         let tools = vec![McpClientToolDefinition {
             name: "weird_shape".to_string(),
@@ -1927,7 +1933,6 @@ mod tests {
             };
 
             let mut settings = McpClientConfig::default();
-            settings.proxy_allow_mutating_tools = false;
             let filtered = locked_filter_remote_tools(&settings, vec![safe.clone(), destructive.clone()]);
             prop_assert_eq!(filtered.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec![safe_name.as_str()]);
 
@@ -1970,7 +1975,6 @@ mod tests {
             };
 
             let mut settings = McpClientConfig::default();
-            settings.proxy_allow_mutating_tools = false;
             prop_assert!(locked_filter_remote_tools(&settings, vec![tool.clone()]).is_empty());
 
             settings.proxy_allow_mutating_tools = true;

@@ -697,8 +697,10 @@ mod tests {
         #[test]
         fn run_orphan_reaper_with_cx_interval_zero_disables() {
             run_lab(0x0_1FEA_BED5_0606, || async move {
-                let mut config = CliConfig::default();
-                config.orphan_reap_interval_seconds = 0;
+                let config = CliConfig {
+                    orphan_reap_interval_seconds: 0,
+                    ..Default::default()
+                };
                 let shutdown = Arc::new(AtomicBool::new(false));
                 let cx = crate::cx::for_request();
 

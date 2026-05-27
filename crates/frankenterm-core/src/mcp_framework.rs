@@ -324,8 +324,10 @@ mod tests {
     /// the platform's temp_dir so the same code works on any target.
     #[test]
     fn ft_zfbqo_unconfigured_loader_returns_empty_on_any_platform() {
-        let mut settings = McpClientConfig::default();
-        settings.include_default_paths = false;
+        let mut settings = McpClientConfig {
+            include_default_paths: false,
+            ..Default::default()
+        };
         settings.discovery_paths.clear();
 
         let discovered = discover_server_configs(&settings);

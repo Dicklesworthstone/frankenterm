@@ -360,8 +360,10 @@ mod tests {
     #[test]
     fn search_config_models_dir_reaches_fastembed_loader_config_ft_jl09u() {
         let custom_models_dir = PathBuf::from("/tmp/ft-jl09u-custom-models");
-        let mut search_config = SearchConfig::default();
-        search_config.models_dir = custom_models_dir.to_string_lossy().into_owned();
+        let search_config = SearchConfig {
+            models_dir: custom_models_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
 
         let worker = EmbedWorker::with_search_config(5, &search_config);
         assert_eq!(

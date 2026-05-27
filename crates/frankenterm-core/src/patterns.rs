@@ -6489,8 +6489,10 @@ rules:
         )]);
 
         let mut ctx = DetectionContext::new();
-        let mut opts = TraceOptions::default();
-        opts.include_non_matches = true;
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..Default::default()
+        };
 
         let (detections, traces) =
             engine.detect_with_context_and_trace("limit xx", &mut ctx, &opts);
@@ -6514,8 +6516,10 @@ rules:
         let engine = engine_with_rules(vec![rule_with_anchor("codex.anchor", "hello", None)]);
 
         let mut ctx = DetectionContext::new();
-        let mut opts = TraceOptions::default();
-        opts.include_non_matches = true;
+        let opts = TraceOptions {
+            include_non_matches: true,
+            ..Default::default()
+        };
 
         let (detections1, traces1) = engine.detect_with_context_and_trace("hello", &mut ctx, &opts);
         assert_eq!(detections1.len(), 1);
@@ -6563,10 +6567,12 @@ rules:
         )]);
 
         let mut ctx = DetectionContext::new();
-        let mut opts = TraceOptions::default();
-        opts.include_non_matches = true;
-        opts.max_excerpt_bytes = 1024;
-        opts.max_capture_bytes = 1024;
+        let opts = TraceOptions {
+            include_non_matches: true,
+            max_excerpt_bytes: 1024,
+            max_capture_bytes: 1024,
+            ..Default::default()
+        };
 
         let text = format!("Key: {secret}");
         let (_detections, traces) = engine.detect_with_context_and_trace(&text, &mut ctx, &opts);
