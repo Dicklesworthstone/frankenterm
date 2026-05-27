@@ -576,9 +576,11 @@ proptest! {
         max_cost in 100u64..10_000,
         window_ms in 1000u64..10_000,
     ) {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = max_cost;
-        config.window_ms = window_ms;
+        let config = CostBudgetConfig {
+            max_cost_cents: max_cost,
+            window_ms,
+            ..CostBudgetConfig::default()
+        };
         let mut cb = CostBudget::new(config);
 
         // Record some actions at time 0
@@ -599,8 +601,10 @@ proptest! {
         max_cost in 10u64..10_000,
         n_actions in 0usize..20,
     ) {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = max_cost;
+        let config = CostBudgetConfig {
+            max_cost_cents: max_cost,
+            ..CostBudgetConfig::default()
+        };
         let mut cb = CostBudget::new(config);
         for i in 0..n_actions {
             cb.record(&ConnectorActionKind::AuditLog, i as u64 * 100);

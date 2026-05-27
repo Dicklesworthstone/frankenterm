@@ -824,11 +824,8 @@ proptest! {
         }
         let within = 50_000 + cooldown / 2;
         let decision = scheduler.evaluate(&mut queue, within);
-        match decision {
-            SchedulerDecision::ScaleUp { .. } => {
-                panic!("should not scale up within cooldown window");
-            }
-            _ => {} // Noop or other decisions are fine
+        if let SchedulerDecision::ScaleUp { .. } = decision {
+            panic!("should not scale up within cooldown window");
         }
     }
 }
