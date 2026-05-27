@@ -79,6 +79,8 @@ fn make_payload(stream_kind: StreamKind, text: &str, salt: u8) -> RecorderEventP
     }
 }
 
+// Replay event fixtures keep pane, timing, stream, and payload dimensions explicit.
+#[allow(clippy::too_many_arguments)]
 fn make_event(
     pane_id: u64,
     sequence: u64,

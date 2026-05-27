@@ -423,12 +423,13 @@ fn temp_db() -> (tempfile::TempDir, String) {
 }
 
 fn test_config() -> frankenterm_core::runtime::RuntimeConfig {
-    let mut config = frankenterm_core::runtime::RuntimeConfig::default();
-    config.discovery_interval = Duration::from_millis(10);
-    config.capture_interval = Duration::from_millis(10);
-    config.min_capture_interval = Duration::from_millis(5);
-    config.channel_buffer = 64;
-    config
+    frankenterm_core::runtime::RuntimeConfig {
+        discovery_interval: Duration::from_millis(10),
+        capture_interval: Duration::from_millis(10),
+        min_capture_interval: Duration::from_millis(5),
+        channel_buffer: 64,
+        ..Default::default()
+    }
 }
 
 async fn make_mock_handle(
