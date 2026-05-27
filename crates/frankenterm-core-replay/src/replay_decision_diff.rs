@@ -950,7 +950,14 @@ fn causal_parent_signature(graph: &DecisionGraph, node_id: u64) -> Vec<String> {
     let mut parents = graph
         .edges()
         .iter()
-        .filter(|edge| edge.to_node == node_id)
+        // Causal topology means true data/control dependencies (TriggeredBy,
+        // OverriddenBy) — not PrecededBy, which is an auto-generated temporal
+        // "previous decision at this pane" edge. Including PrecededBy would make a
+        // timing-shifted node's parentage differ purely because its neighbours
+        // moved, defeating same-decision shift detection (e.g.
+        // shifted_prefers_same_output_before_nearer_changed_output) and reporting
+        // spurious CausalTopologyChange. e0582cf3e's intent was triggered_by/override.
+        .filter(|edge| edge.to_node == node_id && edge.edge_type != EdgeType::PrecededBy)
         .filter_map(|edge| {
             graph.get_node(edge.from_node).map(|parent| {
                 format!(
@@ -1039,7 +1046,12 @@ mod tests {
         def_hash: &str,
         output_hash: &str,
     ) -> DecisionEvent {
-        let input = format!("rule={rule_id};ts={timestamp_ms};pane={pane_id}");
+        // Input identity must be timing-independent: a pure timing shift keeps the
+        // same input. Since 74af0c03f tightened shifted-matching to require equal
+        // input_hash, embedding timestamp_ms here would make timing-only shifts look
+        // like input changes (→ Modified instead of Shifted). Derive input from the
+        // decision's identity only.
+        let input = format!("rule={rule_id};pane={pane_id}");
         DecisionEvent::new(
             decision_type,
             pane_id,
@@ -1407,7 +1419,9 @@ mod tests {
         assert_eq!(diff.summary.added, 0);
         assert_eq!(diff.summary.removed, 0);
         assert_eq!(diff.divergences.len(), 1);
-        assert_eq!(diff.divergences[0].position, 1);
+        // position is a dense canonical rank since 01f2a5325 (normalize_divergence_positions);
+        // the sole divergence ranks 0, not its original baseline index.
+        assert_eq!(diff.divergences[0].position, 0);
         assert_ne!(
             diff.divergences[0]
                 .baseline_node
@@ -1808,7 +1822,9 @@ mod tests {
         assert!(!diff.is_equivalent(EquivalenceLevel::L2));
 
         let divergence = &diff.divergences[0];
-        assert_eq!(divergence.position, 2);
+        // Dense canonical rank (01f2a5325): the single divergence ranks 0, not its
+        // original baseline sequence index (2).
+        assert_eq!(divergence.position, 0);
         assert_eq!(divergence.divergence_type, DivergenceType::Modified);
         assert!(matches!(
             &divergence.root_cause,
@@ -2113,9 +2129,11 @@ mod tests {
             .first_divergence
             .as_ref()
             .expect("policy divergence is present");
-        assert_eq!(first.position, 1);
+        // Dense canonical rank (01f2a5325): the policy-decision modification sorts
+        // first (ts 200 < the ts-300 removed/added pair) and ranks 0.
+        assert_eq!(first.position, 0);
         assert_eq!(first.category, MissionCausalityCategory::PolicyDecision);
-        assert!(first.explanation.contains("canonical position 1"));
+        assert!(first.explanation.contains("canonical position 0"));
         assert!(
             first
                 .evidence_refs
