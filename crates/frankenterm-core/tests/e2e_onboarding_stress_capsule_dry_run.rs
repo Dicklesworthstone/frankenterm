@@ -267,7 +267,7 @@ fn report_serde_roundtrip_preserves_eligibility_and_failure_classes_ft_1650n_17(
     let json = serde_json::to_string(&report).expect("serialize");
     let back: frankenterm_core::onboarding_stress_capsule::OnboardingReport =
         serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back.eligible_for_high_risk_tasks, false);
+    assert!(!back.eligible_for_high_risk_tasks);
     assert_eq!(
         back.machine_local_failures.len(),
         report.machine_local_failures.len()
