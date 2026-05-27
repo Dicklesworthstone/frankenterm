@@ -862,7 +862,7 @@ fn parse_df_data_line(line: &str) -> Option<(u64, u64)> {
 mod tests {
     use super::{
         DiskPressureConfig, DiskPressureMonitor, DiskPressureTier, DiskSample, EwmaEstimator,
-        PidController, PressureThresholds, classify_tier,
+        PidController, PressureThresholds, classify_tier, derive_disk_sample_fields,
     };
     #[cfg(not(windows))]
     use super::{parse_df_data_line, parse_df_output_kib};
