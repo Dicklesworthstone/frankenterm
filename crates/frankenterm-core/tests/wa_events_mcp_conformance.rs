@@ -231,13 +231,12 @@ fn capture_tool_contract(
         .map(|err| err.to_string())
         .unwrap_or_else(|| panic!("expected {tool_name} boundary-invalid case to fail"));
 
-    let capture = ToolContractCapture {
+    ToolContractCapture {
         tool: tool_name.to_string(),
         input_schema,
         success_envelope,
         boundary_invalid_params_error,
-    };
-    capture
+    }
 }
 
 fn make_pane(pane_id: u64, ts: i64) -> PaneRecord {

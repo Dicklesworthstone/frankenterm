@@ -634,7 +634,7 @@ proptest! {
             4 => WorkItemStatus::Failed,
             _ => WorkItemStatus::Cancelled,
         };
-        let expected = matches!(idx, 3 | 4 | 5);
+        let expected = matches!(idx, 3..=5);
         prop_assert_eq!(status.is_terminal(), expected);
     }
 

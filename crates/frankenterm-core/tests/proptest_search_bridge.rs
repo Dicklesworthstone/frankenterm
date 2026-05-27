@@ -244,7 +244,9 @@ proptest! {
 /// Reimplementation of the private function for testing.
 fn update_best_results(best_results: &mut Vec<ScoredResult>, phase: &SearchPhase) {
     match phase {
-        SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+        SearchPhase::Initial { results, .. }
+        | SearchPhase::Refined { results, .. }
+        | SearchPhase::Reranked { results, .. } => {
             best_results.clone_from(results);
         }
         SearchPhase::RefinementFailed {
@@ -306,6 +308,25 @@ proptest! {
         update_best_results(&mut best, &phase);
         prop_assert_eq!(best.len(), refined.len());
         for (a, b) in best.iter().zip(refined.iter()) {
+            prop_assert_eq!(&a.doc_id, &b.doc_id);
+        }
+    }
+
+    /// Reranked phase replaces best_results entirely.
+    #[test]
+    fn update_reranked_replaces_all(
+        prev in arb_result_vec("prev"),
+        reranked in arb_result_vec("rerank"),
+    ) {
+        let mut best = prev;
+        let phase = SearchPhase::Reranked {
+            results: reranked.clone(),
+            latency: Duration::from_millis(30),
+            metrics: make_phase_metrics(),
+        };
+        update_best_results(&mut best, &phase);
+        prop_assert_eq!(best.len(), reranked.len());
+        for (a, b) in best.iter().zip(reranked.iter()) {
             prop_assert_eq!(&a.doc_id, &b.doc_id);
         }
     }

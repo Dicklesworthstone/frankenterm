@@ -315,7 +315,7 @@ fn every_claim_criterion_group_appears_in_the_named_bench_source() {
             .unwrap_or(&claim.criterion_group);
         let literal_present = src.contains(&claim.criterion_group);
         let head_in_macro =
-            src.contains(&format!("criterion_group!")) && src.contains(head_segment);
+            src.contains(&"criterion_group!".to_string()) && src.contains(head_segment);
         assert!(
             literal_present || head_in_macro,
             "claim `{}` names criterion_group `{}` but neither the literal string nor `criterion_group!(...{head_segment}...)` appears in {}",

@@ -94,7 +94,7 @@ proptest! {
         let lower = p.lower_bound(delta);
         prop_assert!(lower <= p.mean + 1e-9, "lower {} must be <= mean {}", lower, p.mean);
         prop_assert!(upper >= p.mean - 1e-9, "upper {} must be >= mean {}", upper, p.mean);
-        let mid = (upper + lower) / 2.0;
+        let mid = f64::midpoint(upper, lower);
         prop_assert!((mid - p.mean).abs() <= 1e-6 * p.mean.abs().max(1.0),
             "(upper+lower)/2 {} must equal mean {}", mid, p.mean);
     }
@@ -104,7 +104,7 @@ proptest! {
     fn std_dev_is_sqrt_variance(mean in arb_mean(), variance in arb_variance()) {
         let p = GaussianPosterior::new(mean, variance);
         let sd = p.std_dev();
-        prop_assert!((sd * sd - p.variance).abs() <= 1e-9 * p.variance.max(1.0),
+        prop_assert!(sd.mul_add(sd, -p.variance).abs() <= 1e-9 * p.variance.max(1.0),
             "std_dev^2 {} must equal variance {}", sd * sd, p.variance);
     }
 

@@ -825,7 +825,7 @@ fn pane_state_json_roundtrip_with_all_fields() {
     let restored = PaneStateSnapshot::from_json(&json).unwrap();
 
     assert_eq!(restored.pane_id, 7);
-    assert_eq!(restored.terminal.is_alt_screen, true);
+    assert!(restored.terminal.is_alt_screen);
     assert_eq!(restored.terminal.rows, 30);
     assert_eq!(restored.terminal.cols, 120);
     assert_eq!(restored.cwd.as_deref(), Some("/tmp/test"));

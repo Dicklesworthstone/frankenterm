@@ -54,13 +54,12 @@ fn is_supported_rust_file(path: &Path) -> bool {
             if name == "target" {
                 return false;
             }
-            if name == "codegen" {
-                if path
+            if name == "codegen"
+                && path
                     .ancestors()
                     .any(|a| a.file_name().and_then(|s| s.to_str()) == Some("char-props"))
-                {
-                    return false;
-                }
+            {
+                return false;
             }
         }
     }
