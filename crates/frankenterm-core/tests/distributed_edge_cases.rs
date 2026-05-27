@@ -202,8 +202,10 @@ fn validate_token_empty_identity_part_treated_as_no_identity() {
 
 #[test]
 fn configured_token_source_kind_inline() {
-    let mut config = DistributedConfig::default();
-    config.token = Some("abc".to_string());
+    let config = DistributedConfig {
+        token: Some("abc".to_string()),
+        ..DistributedConfig::default()
+    };
     assert_eq!(
         configured_token_source_kind(&config),
         Some(DistributedTokenSourceKind::Inline)
@@ -212,8 +214,10 @@ fn configured_token_source_kind_inline() {
 
 #[test]
 fn configured_token_source_kind_env() {
-    let mut config = DistributedConfig::default();
-    config.token_env = Some("FT_TOKEN".to_string());
+    let config = DistributedConfig {
+        token_env: Some("FT_TOKEN".to_string()),
+        ..DistributedConfig::default()
+    };
     assert_eq!(
         configured_token_source_kind(&config),
         Some(DistributedTokenSourceKind::Env)
@@ -222,8 +226,10 @@ fn configured_token_source_kind_env() {
 
 #[test]
 fn configured_token_source_kind_file() {
-    let mut config = DistributedConfig::default();
-    config.token_path = Some("/path/to/token".to_string());
+    let config = DistributedConfig {
+        token_path: Some("/path/to/token".to_string()),
+        ..DistributedConfig::default()
+    };
     assert_eq!(
         configured_token_source_kind(&config),
         Some(DistributedTokenSourceKind::File)
@@ -238,9 +244,11 @@ fn configured_token_source_kind_none_when_no_sources() {
 
 #[test]
 fn configured_token_source_kind_none_when_multiple_sources() {
-    let mut config = DistributedConfig::default();
-    config.token = Some("inline".to_string());
-    config.token_env = Some("ENV".to_string());
+    let config = DistributedConfig {
+        token: Some("inline".to_string()),
+        token_env: Some("ENV".to_string()),
+        ..DistributedConfig::default()
+    };
     assert_eq!(
         configured_token_source_kind(&config),
         None,
@@ -250,10 +258,12 @@ fn configured_token_source_kind_none_when_multiple_sources() {
 
 #[test]
 fn configured_token_source_kind_ignores_empty_strings() {
-    let mut config = DistributedConfig::default();
-    config.token = Some(String::new());
-    config.token_env = Some("  ".to_string());
-    config.token_path = Some("/valid/path".to_string());
+    let config = DistributedConfig {
+        token: Some(String::new()),
+        token_env: Some("  ".to_string()),
+        token_path: Some("/valid/path".to_string()),
+        ..DistributedConfig::default()
+    };
     assert_eq!(
         configured_token_source_kind(&config),
         Some(DistributedTokenSourceKind::File),
@@ -267,9 +277,11 @@ fn configured_token_source_kind_ignores_empty_strings() {
 
 #[test]
 fn resolve_expected_token_inline() {
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token = Some("my-secret".to_string());
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        token: Some("my-secret".to_string()),
+        ..DistributedConfig::default()
+    };
     let tok = resolve_expected_token(&config).unwrap().unwrap();
     assert_eq!(tok, "my-secret");
 }
@@ -279,9 +291,11 @@ fn resolve_expected_token_from_file() {
     let mut file = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(file.as_file_mut(), b"file-secret").unwrap();
 
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token_path = Some(file.path().display().to_string());
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        token_path: Some(file.path().display().to_string()),
+        ..DistributedConfig::default()
+    };
 
     let tok = resolve_expected_token(&config).unwrap().unwrap();
     assert_eq!(tok, "file-secret");
@@ -292,9 +306,11 @@ fn resolve_expected_token_trims_whitespace() {
     let mut file = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(file.as_file_mut(), b"  secret-with-space  \n").unwrap();
 
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token_path = Some(file.path().display().to_string());
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        token_path: Some(file.path().display().to_string()),
+        ..DistributedConfig::default()
+    };
 
     let tok = resolve_expected_token(&config).unwrap().unwrap();
     assert_eq!(tok, "secret-with-space");
@@ -302,10 +318,12 @@ fn resolve_expected_token_trims_whitespace() {
 
 #[test]
 fn resolve_expected_token_rejects_ambiguous() {
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token = Some("inline".to_string());
-    config.token_env = Some("ENV".to_string());
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        token: Some("inline".to_string()),
+        token_env: Some("ENV".to_string()),
+        ..DistributedConfig::default()
+    };
 
     let err = resolve_expected_token(&config).unwrap_err();
     assert!(matches!(err, DistributedCredentialError::TokenAmbiguous));
@@ -313,8 +331,10 @@ fn resolve_expected_token_rejects_ambiguous() {
 
 #[test]
 fn resolve_expected_token_rejects_missing() {
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        ..DistributedConfig::default()
+    };
     // No token sources configured
 
     let err = resolve_expected_token(&config).unwrap_err();
@@ -326,9 +346,11 @@ fn resolve_expected_token_rejects_empty_file() {
     let file = tempfile::NamedTempFile::new().unwrap();
     // File is empty
 
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token_path = Some(file.path().display().to_string());
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        token_path: Some(file.path().display().to_string()),
+        ..DistributedConfig::default()
+    };
 
     let err = resolve_expected_token(&config).unwrap_err();
     assert!(matches!(err, DistributedCredentialError::TokenEmpty));
@@ -336,9 +358,11 @@ fn resolve_expected_token_rejects_empty_file() {
 
 #[test]
 fn resolve_expected_token_rejects_missing_env_var() {
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token_env = Some("FT_NONEXISTENT_TOKEN_VAR_12345".to_string());
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        token_env: Some("FT_NONEXISTENT_TOKEN_VAR_12345".to_string()),
+        ..DistributedConfig::default()
+    };
 
     let err = resolve_expected_token(&config).unwrap_err();
     assert!(matches!(
@@ -349,9 +373,11 @@ fn resolve_expected_token_rejects_missing_env_var() {
 
 #[test]
 fn resolve_expected_token_rejects_nonexistent_file() {
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token_path = Some("/nonexistent/path/to/token".to_string());
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Token,
+        token_path: Some("/nonexistent/path/to/token".to_string()),
+        ..DistributedConfig::default()
+    };
 
     let err = resolve_expected_token(&config).unwrap_err();
     assert!(matches!(
@@ -362,8 +388,10 @@ fn resolve_expected_token_rejects_nonexistent_file() {
 
 #[test]
 fn resolve_expected_token_skips_when_mode_does_not_require_token() {
-    let mut config = DistributedConfig::default();
-    config.auth_mode = DistributedAuthMode::Mtls;
+    let config = DistributedConfig {
+        auth_mode: DistributedAuthMode::Mtls,
+        ..DistributedConfig::default()
+    };
     // No token configured — should return None
 
     let result = resolve_expected_token(&config).unwrap();
@@ -375,12 +403,13 @@ fn resolve_expected_token_skips_when_mode_does_not_require_token() {
 // =============================================================================
 
 fn make_readiness_config() -> DistributedConfig {
-    let mut config = DistributedConfig::default();
-    config.enabled = true;
-    config.bind_addr = "127.0.0.1:9090".to_string();
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token = Some("test-secret".to_string());
-    config
+    DistributedConfig {
+        enabled: true,
+        bind_addr: "127.0.0.1:9090".to_string(),
+        auth_mode: DistributedAuthMode::Token,
+        token: Some("test-secret".to_string()),
+        ..DistributedConfig::default()
+    }
 }
 
 #[test]

@@ -212,8 +212,10 @@ proptest! {
         max_cost_cents in 10u64..10_000,
         n_actions in 1usize..50,
     ) {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = max_cost_cents;
+        let config = CostBudgetConfig {
+            max_cost_cents,
+            ..CostBudgetConfig::default()
+        };
         let mut cb = CostBudget::new(config);
 
         for i in 0..n_actions {
@@ -227,8 +229,10 @@ proptest! {
     fn cost_budget_exhausted_means_no_remaining(
         max_cost_cents in 1u64..100,
     ) {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = max_cost_cents;
+        let config = CostBudgetConfig {
+            max_cost_cents,
+            ..CostBudgetConfig::default()
+        };
         let mut cb = CostBudget::new(config);
 
         // Record expensive actions until exhausted
@@ -327,11 +331,13 @@ proptest! {
     fn governor_connectors_isolated(
         ids in prop::collection::vec(arb_connector_id(), 2..5),
     ) {
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_rate_limit = TokenBucketConfig {
-            capacity: 3,
-            refill_rate: 0,
-            refill_interval_ms: 1000,
+        let config = ConnectorGovernorConfig {
+            default_rate_limit: TokenBucketConfig {
+                capacity: 3,
+                refill_rate: 0,
+                refill_interval_ms: 1000,
+            },
+            ..ConnectorGovernorConfig::default()
         };
         let mut gov = ConnectorGovernor::new(config);
 
@@ -599,8 +605,10 @@ proptest! {
     fn cost_budget_snapshot_consistent(
         n_actions in 0usize..20,
     ) {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = 100_000;
+        let config = CostBudgetConfig {
+            max_cost_cents: 100_000,
+            ..CostBudgetConfig::default()
+        };
         let mut cb = CostBudget::new(config);
 
         for i in 0..n_actions {
