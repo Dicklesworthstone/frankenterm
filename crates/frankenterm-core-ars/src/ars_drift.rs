@@ -596,7 +596,7 @@ mod tests {
                 alpha,
                 ..Default::default()
             };
-            assert_eq!(config.threshold(), 1.0);
+            assert_eq!(config.threshold().to_bits(), 1.0_f64.to_bits());
         }
     }
 

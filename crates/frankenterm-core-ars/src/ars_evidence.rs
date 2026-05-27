@@ -1465,7 +1465,7 @@ mod tests {
         };
         let json = serde_json::to_string(&cv).unwrap();
         let decoded: ChainVerification = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.is_valid, true);
+        assert!(decoded.is_valid);
         assert_eq!(decoded.entries_checked, 5);
     }
 
