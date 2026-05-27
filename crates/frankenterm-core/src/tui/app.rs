@@ -613,11 +613,9 @@ impl<Q: QueryClient> App<Q> {
             KeyCode::Left | KeyCode::Char('h') => {
                 self.view_state.timeline_scroll = self.view_state.timeline_scroll.saturating_sub(1);
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if timeline_len > 0 {
-                    self.view_state.timeline_scroll =
-                        (self.view_state.timeline_scroll + 1).min(timeline_len.saturating_sub(1));
-                }
+            KeyCode::Right | KeyCode::Char('l') if timeline_len > 0 => {
+                self.view_state.timeline_scroll =
+                    (self.view_state.timeline_scroll + 1).min(timeline_len.saturating_sub(1));
             }
             _ => {}
         }
