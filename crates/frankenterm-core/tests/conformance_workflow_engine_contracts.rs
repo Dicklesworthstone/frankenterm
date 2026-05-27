@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::storage::{PaneRecord, StorageHandle, StoredEvent, now_ms};
-use frankenterm_core::workflows::{ExecutionStatus, StepResult, WaitCondition, WorkflowEngine};
+use frankenterm_core::workflows::{
+    ExecutionStatus, StepResult, WaitCondition, WorkflowEngine, WorkflowStartInput,
+    WorkflowStepLogInput,
+};
 use serde_json::json;
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -139,11 +142,13 @@ fn workflow_engine_start_entrypoints_persist_running_contract() {
             .start_with_id_cx(
                 &cx,
                 &storage,
-                "contract-explicit-cx".to_string(),
-                "contract_start_with_id_cx",
-                13,
-                Some(cx_with_id_event),
-                Some(json!({"path": "cx_with_id"})),
+                WorkflowStartInput {
+                    execution_id: "contract-explicit-cx".to_string(),
+                    workflow_name: "contract_start_with_id_cx".to_string(),
+                    pane_id: 13,
+                    trigger_event_id: Some(cx_with_id_event),
+                    context: Some(json!({"path": "cx_with_id"})),
+                },
             )
             .await
             .expect("cx start_with_id succeeds");
@@ -406,16 +411,28 @@ fn workflow_engine_step_log_resume_contract_matrix() {
                 .start_with_id_cx(
                     &cx,
                     &storage,
-                    execution_id.clone(),
-                    "contract_log",
-                    77,
-                    None,
-                    None,
+                    WorkflowStartInput {
+                        execution_id: execution_id.clone(),
+                        workflow_name: "contract_log".to_string(),
+                        pane_id: 77,
+                        trigger_event_id: None,
+                        context: None,
+                    },
                 )
                 .await
                 .expect("seed workflow");
             engine
-                .log_step_cx(&cx, &storage, &execution_id, 0, name, &result, 1234)
+                .log_step_cx(
+                    &cx,
+                    &storage,
+                    WorkflowStepLogInput {
+                        execution_id: &execution_id,
+                        step_index: 0,
+                        step_name: name,
+                        result: &result,
+                        started_at: 1234,
+                    },
+                )
                 .await
                 .expect("log workflow step");
 

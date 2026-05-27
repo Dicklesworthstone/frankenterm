@@ -8,8 +8,8 @@ use frankenterm_core::fleet_launcher::{
 };
 use frankenterm_core::mission_agent_mail::{
     AckRequirementReport, CoordinationEventKind, CoordinationEventRequest,
-    CoordinationInboxMessage, MissionAgentMailKernel, MissionCoordinationContext,
-    MissionMailTransport,
+    CoordinationInboxMessage, FleetLaunchOutcomeNotice, FleetLaunchProgressNotice,
+    MissionAgentMailKernel, MissionCoordinationContext, MissionMailTransport,
 };
 
 #[derive(Default)]
@@ -211,15 +211,15 @@ fn fleet_launch_emitters_roundtrip_with_fleet_context() {
     );
     assert_eq!(start.delivered.len(), 1);
 
-    let progress = kernel.emit_fleet_launch_progress_update_at(
-        30_100,
-        vec!["Ops".to_string()],
-        &plan,
-        1,
-        2,
-        "corr-fleet-001",
-        Some("scenario-fleet".to_string()),
-    );
+    let progress = kernel.emit_fleet_launch_progress_update_at(FleetLaunchProgressNotice {
+        now_ms: 30_100,
+        recipients: vec!["Ops".to_string()],
+        launch_plan: &plan,
+        phase_index: 1,
+        started_slots: 2,
+        correlation_id: "corr-fleet-001",
+        scenario_id: Some("scenario-fleet".to_string()),
+    });
     assert_eq!(progress.delivered.len(), 1);
 
     let outcome = LaunchOutcome {
@@ -234,16 +234,16 @@ fn fleet_launch_emitters_roundtrip_with_fleet_context() {
         pre_launch_checkpoint: Some(77),
         bootstrap_dispatches: vec![(0, 2)],
     };
-    let finish = kernel.emit_fleet_launch_outcome_notice_at(
-        30_200,
-        vec!["Ops".to_string()],
-        &outcome,
-        "ws-prod",
-        "local",
-        9,
-        "corr-fleet-001",
-        Some("scenario-fleet".to_string()),
-    );
+    let finish = kernel.emit_fleet_launch_outcome_notice_at(FleetLaunchOutcomeNotice {
+        now_ms: 30_200,
+        recipients: vec!["Ops".to_string()],
+        launch_outcome: &outcome,
+        workspace_id: "ws-prod",
+        domain: "local",
+        generation: 9,
+        correlation_id: "corr-fleet-001",
+        scenario_id: Some("scenario-fleet".to_string()),
+    });
     assert_eq!(finish.delivered.len(), 1);
 
     let inbox = kernel.consume_inbox("Ops");
