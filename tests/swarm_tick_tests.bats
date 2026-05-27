@@ -222,7 +222,8 @@ assert_handoff_missing_bead_match() {
 @test "agent-mail fallback fixture: red-mail marker / beads / dirty paths → matches golden" {
     run_agent_mail_fallback_fixture
     assert_match
-    [[ "$(jq -r '.agent_mail.marker' "${TMP_DIR}/actual.json")" == *"retry once, do not repair/restart service"* ]]
+    [[ "$(jq -r '.agent_mail.error_summary' "${TMP_DIR}/actual.json")" == *"single retry"* ]]
+    [[ "$(jq -r '.agent_mail.reason_codes[]' "${TMP_DIR}/actual.json" | tr '\n' ' ')" == *"fallback.beads_only"* ]]
     [[ "$(jq -r '.mode' "${TMP_DIR}/actual.json")" == "agent_mail_unavailable_beads_only" ]]
     [[ "$(jq -r '.git.risk_level' "${TMP_DIR}/actual.json")" == "high" ]]
     [[ "$(jq -r '.git.tracked_dirty_count' "${TMP_DIR}/actual.json")" == "2" ]]

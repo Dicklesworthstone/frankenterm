@@ -1,14 +1,29 @@
 {
   "agent_mail": {
+    "attempt_count": 2,
+    "error_summary": "Agent Mail API stayed unreachable after the single retry; registration/inbox coordination is skipped and Beads-only fallback is active for this session.",
+    "failure_class": "api_unreachable",
     "forbidden_actions": [
-      "am service restart",
-      "am service stop",
-      "am doctor fix",
-      "am doctor repair",
-      "am doctor reconstruct",
-      "kill am/serve-http/mcp-agent-mail"
+      "am_service_restart",
+      "am_service_stop",
+      "am_doctor_fix",
+      "am_doctor_repair",
+      "am_doctor_reconstruct",
+      "kill_agent_mail_process",
+      "destructive_git",
+      "delete_files",
+      "mutate_rch_worker",
+      "cancel_build",
+      "run_local_cargo_as_proof",
+      "reopen_dirty_overlap_without_owner_clear"
     ],
-    "marker": "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+    "inbox_checked": false,
+    "reason_codes": [
+      "agent_mail.unavailable_after_retry",
+      "fallback.beads_only"
+    ],
+    "registered": false,
+    "retry_limit": 1,
     "status": "unavailable"
   },
   "beads": {

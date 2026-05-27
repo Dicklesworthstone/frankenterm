@@ -1,6 +1,6 @@
 Red-mail Beads handoff for ft-u45ni
 
-Agent Mail: unavailable - Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.
+Agent Mail: unavailable - Agent Mail API stayed unreachable after the single retry; registration/inbox coordination is skipped and Beads-only fallback is active for this session.
 Snapshot: 2026-05-06T17:00:00Z session=frankenterm ready_count=2
 
 Active assignees:
