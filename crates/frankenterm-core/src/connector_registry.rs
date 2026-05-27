@@ -1161,8 +1161,10 @@ mod tests {
 
     #[test]
     fn trust_policy_gate_blocks_capability() {
-        let mut policy = TrustPolicy::default();
-        policy.max_allowed_capabilities = vec![ConnectorCapability::ReadState];
+        let policy = TrustPolicy {
+            max_allowed_capabilities: vec![ConnectorCapability::ReadState],
+            ..Default::default()
+        };
         let m = test_manifest("pkg", b"x");
         // m requires Invoke, which is not in max_allowed_capabilities
         let err = policy.gate(&m).unwrap_err();
@@ -1182,8 +1184,10 @@ mod tests {
 
     #[test]
     fn trust_policy_gate_enforces_min_install_level() {
-        let mut policy = TrustPolicy::default();
-        policy.min_install_level = TrustLevel::Trusted;
+        let policy = TrustPolicy {
+            min_install_level: TrustLevel::Trusted,
+            ..Default::default()
+        };
         let m = test_manifest("pkg", b"x"); // signed unknown publisher => Conditional
         let err = policy.gate(&m).unwrap_err();
         assert!(matches!(
@@ -1194,8 +1198,10 @@ mod tests {
 
     #[test]
     fn trust_policy_requires_transparency() {
-        let mut policy = TrustPolicy::default();
-        policy.require_transparency_proof = true;
+        let policy = TrustPolicy {
+            require_transparency_proof: true,
+            ..Default::default()
+        };
         let m = test_manifest("pkg", b"x");
         let err = policy.gate(&m).unwrap_err();
         assert!(matches!(
@@ -1206,8 +1212,10 @@ mod tests {
 
     #[test]
     fn trust_policy_requires_trusted_roots_when_transparency_is_required() {
-        let mut policy = TrustPolicy::default();
-        policy.require_transparency_proof = true;
+        let policy = TrustPolicy {
+            require_transparency_proof: true,
+            ..Default::default()
+        };
         let mut m = test_manifest("pkg", b"x");
         let (_root_hash, token) = make_transparency_token(&m, 7);
         m.transparency_token = Some(token);

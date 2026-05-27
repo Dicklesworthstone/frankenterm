@@ -952,8 +952,10 @@ mod tests {
 
     #[test]
     fn route_zone_affinity_no_fallback() {
-        let mut config = ConnectorMeshConfig::default();
-        config.allow_cross_zone_fallback = false;
+        let config = ConnectorMeshConfig {
+            allow_cross_zone_fallback: false,
+            ..Default::default()
+        };
         let mut mesh = ConnectorMesh::new(config);
         mesh.register_zone(make_zone("z1")).unwrap();
         mesh.register_zone(make_zone("z2")).unwrap();
@@ -1088,8 +1090,10 @@ mod tests {
 
     #[test]
     fn failure_history_bounded() {
-        let mut config = ConnectorMeshConfig::default();
-        config.max_failure_history = 3;
+        let config = ConnectorMeshConfig {
+            max_failure_history: 3,
+            ..Default::default()
+        };
         let mut mesh = ConnectorMesh::new(config);
         for i in 0..5 {
             mesh.record_failure(MeshFailureEvent {
@@ -1433,8 +1437,10 @@ mod tests {
 
     #[test]
     fn routing_history_bounded() {
-        let mut config = ConnectorMeshConfig::default();
-        config.max_routing_history = 3;
+        let config = ConnectorMeshConfig {
+            max_routing_history: 3,
+            ..Default::default()
+        };
         let mut mesh = ConnectorMesh::new(config);
         mesh.register_zone(make_zone("z1")).unwrap();
         mesh.register_host(make_host("h1", "z1")).unwrap();
