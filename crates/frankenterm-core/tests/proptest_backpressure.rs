@@ -401,8 +401,10 @@ proptest! {
     /// evaluate() with disabled config always returns None.
     #[test]
     fn prop_evaluate_disabled_noop(d in arb_queue_depths()) {
-        let mut config = BackpressureConfig::default();
-        config.enabled = false;
+        let config = BackpressureConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let m = BackpressureManager::new(config);
         prop_assert!(m.evaluate(&d).is_none());
         prop_assert_eq!(m.current_tier(), BackpressureTier::Green);
@@ -467,8 +469,10 @@ proptest! {
     fn prop_hysteresis_blocks_downgrade(
         cap in 1000usize..10_000,
     ) {
-        let mut config = BackpressureConfig::default();
-        config.hysteresis_ms = 60_000; // 60s — won't elapse during test
+        let config = BackpressureConfig {
+            hysteresis_ms: 60_000, // 60s — won't elapse during test
+            ..Default::default()
+        };
         let m = BackpressureManager::new(config);
 
         // Upgrade to Red

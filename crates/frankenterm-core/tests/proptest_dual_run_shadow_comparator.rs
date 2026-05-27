@@ -110,6 +110,8 @@ fn make_capture(system: &str, stdout: &str, exit_code: i32, duration_ms: u64) ->
 }
 
 /// Build a DualRunResult for property testing.
+// Dual-run fixtures keep both command captures and priority explicit for case readability.
+#[allow(clippy::too_many_arguments)]
 fn make_dual(
     scenario_id: &str,
     ntm_stdout: &str,
