@@ -90,17 +90,23 @@ jobs:
           cargo --version >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Default features: REQUIRED. Verified green on a CLEAN, cache-busted run
-      # (windows-check-v2) that COMPLETED on the current tree (run on 386db8abb:
-      # default-features=success, no-default-features=success, unix-coupling=success)
-      # AFTER the real default-features blockers were fixed: jemalloc target-gated off
-      # windows-msvc (ft-p9hok, Mac/Linux allocator unchanged), termwiz windows compile
-      # chain (ft-vd0jp + 9e0961489 TryFrom), pty (ft-mxg54). This is trustworthy: the
-      # jemalloc fix changed the dependency graph, so the prior cached failure could not
-      # mask it — the build genuinely compiled the full GUI tree for MSVC. continue-on-error
-      # removed to lock the additive, zero-Mac/Linux-regression Windows compile invariant.
+      # Default features: INFORMATIONAL (continue-on-error) — and staying that way until
+      # the Windows GUI-backend port lands. The default (full-GUI) feature set pulls the
+      # Linux/X11 GUI C-dependency stack (cairo-sys-rs, and transitively pango/gdk/
+      # fontconfig), which cannot build on windows-msvc ("Could not run pkg-config ...
+      # cairo"). These are the same class as the openssl/jemalloc `-sys` blockers but
+      # deeper: a real Windows-GUI port (gate the Linux GUI stack off Windows / wire the
+      # Windows GUI backend) is required, tracked under ft-azsnz P2. A single earlier
+      # 386db8abb "success" was not reproducible (build-order/cache; cairo fails on a
+      # clean traversal). DO NOT require this until a Windows GUI backend exists and a
+      # clean run is green over multiple attempts. The only REQUIRED guard today is the
+      # unix-coupling ratchet (build-free, proven). The --no-default-features check below
+      # (Windows CORE compiles) is the next milestone to promote to required — but only
+      # after it is confirmed green on a clean run (it was skipped while default-features
+      # failed first; this revert lets it actually run again).
       - name: cargo check --workspace (default features)
         id: check_default
+        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
