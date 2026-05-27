@@ -1326,12 +1326,7 @@ impl TantivySearchService {
                         .map(|v| Term::from_field_i64(field, v))
                         .map(std::ops::Bound::Included)
                         .unwrap_or(std::ops::Bound::Unbounded);
-                    let rq = RangeQuery::new_term_bounds(
-                        "occurred_at_ms".to_string(),
-                        tantivy::schema::Type::I64,
-                        &lower,
-                        &upper,
-                    );
+                    let rq = RangeQuery::new(lower, upper);
                     clauses.push((Occur::Must, Box::new(rq) as Box<dyn tantivy::query::Query>));
                 }
                 // Remaining filters applied post-query for simplicity
@@ -1371,7 +1366,7 @@ impl LexicalSearchService for TantivySearchService {
         let top_docs = searcher
             .search(
                 &final_query,
-                &tantivy::collector::TopDocs::with_limit(fetch_limit),
+                &tantivy::collector::TopDocs::with_limit(fetch_limit).order_by_score(),
             )
             .map_err(|e| SearchError::Internal {
                 reason: format!("search failed: {e}"),
@@ -1490,7 +1485,10 @@ impl LexicalSearchService for TantivySearchService {
         let term = tantivy::schema::Term::from_field_text(self.handles.event_id, event_id);
         let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
         let top = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(1))
+            .search(
+                &query,
+                &tantivy::collector::TopDocs::with_limit(1).order_by_score(),
+            )
             .map_err(|e| SearchError::Internal {
                 reason: format!("get_by_event_id failed: {e}"),
             })?;
@@ -1518,7 +1516,10 @@ impl LexicalSearchService for TantivySearchService {
         let term = tantivy::schema::Term::from_field_u64(self.handles.log_offset, log_offset);
         let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
         let top = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(1))
+            .search(
+                &query,
+                &tantivy::collector::TopDocs::with_limit(1).order_by_score(),
+            )
             .map_err(|e| SearchError::Internal {
                 reason: format!("get_by_log_offset failed: {e}"),
             })?;
