@@ -11,12 +11,14 @@ use std::fs::{self, OpenOptions};
 use std::hint::black_box;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankenterm_core::dirty_line_telemetry::{
     DirtyEventSource, DirtyMark, DirtyMarkClassification,
 };
+use frankenterm_term::{ColorPalette, Terminal, TerminalConfiguration, TerminalSize};
 use serde_json::json;
 
 const PANE_COUNT: u32 = 200;
@@ -27,7 +29,21 @@ const MAX_COLS: u32 = 200;
 const FRAMES_PER_GESTURE: u32 = 300;
 const WARMUP_FRAMES: u32 = 12;
 const P99_FRAME_BUDGET_US: u64 = 16_600;
+const FIRST_PAINT_REFLOW_BUDGET_US: u64 = 16_600;
 const EVIDENCE_PATH: &str = "target/criterion/slo-resize_fps.jsonl";
+
+#[derive(Debug)]
+struct ResizeStormTermConfig;
+
+impl TerminalConfiguration for ResizeStormTermConfig {
+    fn scrollback_size(&self) -> usize {
+        4096
+    }
+
+    fn color_palette(&self) -> ColorPalette {
+        ColorPalette::default()
+    }
+}
 
 fn resize_mark(frame: u32, pane_id: u64) -> (DirtyMark, u32) {
     let phase = frame % FRAMES_PER_GESTURE;
@@ -126,7 +142,43 @@ fn append_evidence_row(p50_us: u64, p95_us: u64, p99_us: u64, sample_count: usiz
     println!("[BENCH] resize_fps_evidence={}", path.display());
 }
 
+fn terminal_size(rows: usize, cols: usize) -> TerminalSize {
+    TerminalSize {
+        rows,
+        cols,
+        pixel_width: cols * 8,
+        pixel_height: rows * 16,
+        dpi: 96,
+    }
+}
+
+fn assert_viewport_first_reflow_latency() {
+    let mut term = Terminal::new(
+        terminal_size(24, 160),
+        Arc::new(ResizeStormTermConfig),
+        "frankenterm-resize-storm",
+        env!("CARGO_PKG_VERSION"),
+        Box::new(Vec::new()),
+    );
+    let line = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\
+        abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for idx in 0..512 {
+        term.advance_bytes(format!("{idx:04}:{line}\r\n"));
+    }
+
+    term.resize(terminal_size(24, 80));
+    let first_paint_reflow_us = term.screen().last_viewport_first_reflow_us();
+    assert!(
+        first_paint_reflow_us <= FIRST_PAINT_REFLOW_BUDGET_US,
+        "resize_storm: viewport-first reflow latency exceeded {} us target. first_paint_reflow={} us",
+        FIRST_PAINT_REFLOW_BUDGET_US,
+        first_paint_reflow_us
+    );
+}
+
 fn bench_resize_storm(c: &mut Criterion) {
+    assert_viewport_first_reflow_latency();
+
     let mut group = c.benchmark_group("renderer_slo/resize_fps");
     group.measurement_time(Duration::from_secs(3));
 

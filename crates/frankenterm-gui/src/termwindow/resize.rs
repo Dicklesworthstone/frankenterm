@@ -16,6 +16,10 @@ use wezterm_term::TerminalSize;
 /// renderer_slo bench unblocks (mcp_middleware cfg(test) fix, p4).
 const SCALE_CHANGE_GLYPH_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
 
+fn next_shape_generation_for_scale_change(shape_generation: usize) -> usize {
+    shape_generation.saturating_add(1)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RowsAndCols {
     pub rows: usize,
@@ -140,7 +144,8 @@ impl super::TermWindow {
                 // already bump this (mod.rs); scale changes must too. Bump only
                 // in the Ok arm: on metric failure we roll back below, so the
                 // old cache stays consistent with the old metrics.
-                self.shape_generation += 1;
+                self.shape_generation =
+                    next_shape_generation_for_scale_change(self.shape_generation);
                 // ft-uroqc: warm-rasterize the common ASCII/Latin glyph set at
                 // the NEW CellMetricKey so the first paint after a scale change
                 // finds them already in the atlas instead of synchronously
@@ -637,5 +642,21 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
         context.pixel_cell as usize
     } else {
         config.window_padding.right.evaluate_as_pixels(context) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_shape_generation_for_scale_change;
+
+    #[test]
+    fn scale_change_advances_shape_generation_for_kerning_cache_invalidation() {
+        assert_eq!(next_shape_generation_for_scale_change(0), 1);
+        assert_eq!(next_shape_generation_for_scale_change(41), 42);
+        assert_eq!(
+            next_shape_generation_for_scale_change(usize::MAX),
+            usize::MAX,
+            "generation bump should saturate instead of wrapping cache keys"
+        );
     }
 }

@@ -65,6 +65,7 @@ pub struct Screen {
     rewrap_row_prefix_scratch: Vec<usize>,
     rewrap_width_prefix_scratch: LineWrapWidthPrefixScratch,
     cold_scrollback_worker: ColdScrollbackReflowWorker,
+    last_viewport_first_reflow_us: u64,
     resize_wrap_policy: ResizeWrapPolicy,
     last_resize_wrap_scorecard: Option<ResizeWrapScorecard>,
     last_resize_wrap_gate_payload: Option<String>,
@@ -417,6 +418,10 @@ impl ViewportReflowPlan {
 
 fn ranges_intersect(lhs: &Range<usize>, rhs: &Range<usize>) -> bool {
     lhs.start < rhs.end && rhs.start < lhs.end
+}
+
+fn duration_micros_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -792,6 +797,7 @@ impl Screen {
             rewrap_row_prefix_scratch: Vec::new(),
             rewrap_width_prefix_scratch: LineWrapWidthPrefixScratch::default(),
             cold_scrollback_worker: ColdScrollbackReflowWorker::default(),
+            last_viewport_first_reflow_us: 0,
             resize_wrap_policy: ResizeWrapPolicy::from_terminal_configuration(config.as_ref()),
             last_resize_wrap_scorecard: None,
             last_resize_wrap_gate_payload: None,
@@ -1699,6 +1705,8 @@ impl Screen {
         self.cold_scrollback_worker
             .begin_intent(seqno, cold_backlog_depth);
         let cold_started = Instant::now();
+        let viewport_reflow_started = Instant::now();
+        let mut viewport_ready_recorded = false;
         let mut cold_lines_completed = 0usize;
         let mut cold_batches_completed = 0usize;
 
@@ -1714,6 +1722,12 @@ impl Screen {
                 .saturating_sub(batch.logical_range.start);
             if batch_len == 0 {
                 continue;
+            }
+
+            if batch.priority == ReflowBatchPriority::ColdScrollback && !viewport_ready_recorded {
+                self.last_viewport_first_reflow_us =
+                    duration_micros_u64(viewport_reflow_started.elapsed());
+                viewport_ready_recorded = true;
             }
 
             debug!(
@@ -1796,6 +1810,11 @@ impl Screen {
                 cold_lines_completed = cold_lines_completed.saturating_add(batch_len);
                 cold_batches_completed = cold_batches_completed.saturating_add(1);
             }
+        }
+
+        if !viewport_ready_recorded {
+            self.last_viewport_first_reflow_us =
+                duration_micros_u64(viewport_reflow_started.elapsed());
         }
 
         self.cold_scrollback_worker.finish_intent(
@@ -2209,6 +2228,12 @@ impl Screen {
     /// visible viewport.
     pub fn in_memory_scrollback_rows(&self) -> usize {
         self.lines.len().saturating_sub(self.physical_rows)
+    }
+
+    /// Microseconds spent reflowing viewport and near-viewport batches during
+    /// the most recent resize before cold scrollback convergence began.
+    pub fn last_viewport_first_reflow_us(&self) -> u64 {
+        self.last_viewport_first_reflow_us
     }
 
     /// Returns a stable snapshot of the tiered scrollback state for telemetry,
@@ -3826,6 +3851,101 @@ mod tests {
             ReflowBatchPriority::ColdScrollback
         );
         assert_eq!(plan.batches[2].logical_range, 0..3);
+    }
+
+    #[test]
+    fn viewport_first_reflow_records_ready_before_cold_scrollback_completion() {
+        let mut screen = test_screen(3, 8, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(
+            (0..12)
+                .map(|idx| Line::from_text(&format!("line{idx:02}xx"), &attrs, 0, None))
+                .collect::<Vec<_>>(),
+        );
+        let logical_count = Screen::logical_line_physical_ranges(&screen.lines).len();
+        let plan = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
+        assert!(
+            plan.batches
+                .iter()
+                .any(|batch| batch.priority == ReflowBatchPriority::ColdScrollback),
+            "fixture must include cold scrollback work"
+        );
+
+        let started = Instant::now();
+        let cursor = screen.resize(test_size(3, 4, 96), test_cursor(0, 2, 1), 2, false);
+        let total_us = duration_micros_u64(started.elapsed());
+
+        assert_eq!(cursor.seqno, 2);
+        assert_eq!(screen.cold_scrollback_worker.active_intent(), None);
+        assert!(
+            screen.cold_scrollback_worker.completed_lines_total() > 0,
+            "cold scrollback should still converge before resize returns"
+        );
+        assert!(
+            screen.last_viewport_first_reflow_us() <= total_us,
+            "viewport-first ready marker must precede final cold-scrollback convergence"
+        );
+    }
+
+    #[test]
+    fn viewport_first_reflow_is_isomorphic_to_full_scan() {
+        let mut screen = test_screen(3, 8, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("cold0000", &attrs, 0, None),
+            Line::from_text("cold1111", &attrs, 0, None),
+            Line::from_text("near2222", &attrs, 0, None),
+            Line::from_text("near3333", &attrs, 0, None),
+            Line::from_text("view4444", &attrs, 0, None),
+            Line::from_text("view5555", &attrs, 0, None),
+            Line::from_text("view6666", &attrs, 0, None),
+        ]);
+
+        let logical_lines = screen.rebuild_logical_lines_from_physical(2);
+        let logical_count = logical_lines.len();
+        let viewport_plan = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
+        assert!(viewport_plan
+            .batches
+            .iter()
+            .any(|batch| batch.priority == ReflowBatchPriority::Viewport));
+        assert!(viewport_plan
+            .batches
+            .iter()
+            .any(|batch| batch.priority == ReflowBatchPriority::ColdScrollback));
+
+        let full_scan_plan = ViewportReflowPlan::full_scan(logical_count);
+        let mut viewport_screen = screen.clone();
+        let mut full_scan_screen = screen.clone();
+        viewport_screen.wrap_logical_lines_for_resize(&logical_lines, 4, 2, Some(&viewport_plan));
+        full_scan_screen.wrap_logical_lines_for_resize(&logical_lines, 4, 2, Some(&full_scan_plan));
+
+        let wrapped_snapshot = |screen: &Screen| {
+            screen
+                .rewrap_scratch_slots
+                .iter()
+                .take(logical_count)
+                .map(|slot| {
+                    slot.as_ref()
+                        .expect("missing rewrap scratch slot")
+                        .clone_lines(&screen.lines)
+                        .into_iter()
+                        .map(|line| {
+                            (
+                                line.as_str().to_string(),
+                                line.last_cell_was_wrapped(),
+                                line.current_seqno(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            wrapped_snapshot(&viewport_screen),
+            wrapped_snapshot(&full_scan_screen),
+            "viewport-first reflow must preserve full-scan wrap points, order, and seqno"
+        );
     }
 
     #[test]
