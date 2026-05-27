@@ -9959,6 +9959,8 @@ fn robot_fleet_plan_with_optional_key(
     }
 }
 
+// Robot scale data mirrors the public envelope fields, so keeping arguments explicit aids call-site review.
+#[allow(clippy::too_many_arguments)]
 fn robot_fleet_scale_base_data(
     program: &str,
     program_slug: &str,
@@ -10008,6 +10010,8 @@ fn robot_fleet_scale_base_data(
     })
 }
 
+// Scale planning combines requested state, live inventory, and work-queue context in one cohesive call.
+#[allow(clippy::too_many_arguments)]
 fn robot_fleet_scale_plan(
     program: &str,
     target_count: u32,
@@ -10209,7 +10213,9 @@ fn robot_fleet_scale_plan(
     (data, Some(plan))
 }
 
+// Test executor seam mirrors the scale command inputs plus injected ledger/executor dependencies.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn robot_fleet_scale_data_with_executor<
     E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
 >(
@@ -10853,7 +10859,9 @@ fn robot_fleet_rebalance_plan(
     (data, Some(plan))
 }
 
+// Test executor seam mirrors the rebalance command inputs plus injected ledger/executor dependencies.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn robot_fleet_rebalance_data_with_executor<
     E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
 >(
@@ -12252,6 +12260,8 @@ fn policy_approval_command(decision: &frankenterm_core::policy::PolicyDecision) 
     }
 }
 
+// Audit records intentionally carry the full policy decision context without an intermediate bag type.
+#[allow(clippy::too_many_arguments)]
 async fn record_read_search_policy_audit(
     storage: Option<&frankenterm_core::storage::StorageHandle>,
     actor: frankenterm_core::policy::ActorKind,
@@ -12301,6 +12311,8 @@ async fn record_read_search_policy_audit(
     }
 }
 
+// Read/search authorization needs config, storage, workspace, actor, target, and redacted input in one gate.
+#[allow(clippy::too_many_arguments)]
 async fn authorize_read_or_search_policy(
     config: &frankenterm_core::config::Config,
     storage: Option<&frankenterm_core::storage::StorageHandle>,
@@ -12650,6 +12662,8 @@ fn build_inline_approval_retry_command(command_name: &str, code: &str) -> String
     format!("Retry the original {command_name} command with --approval-code {code}")
 }
 
+// Approval resolution keeps the policy decision, storage, actor, command, and retry inputs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_inline_send_approval(
     decision: frankenterm_core::policy::PolicyDecision,
     storage: &frankenterm_core::storage::StorageHandle,
@@ -12712,6 +12726,8 @@ async fn resolve_inline_send_approval(
     Ok(decision.with_approval(approval))
 }
 
+// Event mutation audit context maps directly to the serialized policy evidence fields.
+#[allow(clippy::too_many_arguments)]
 fn build_event_mutation_decision_context(
     actor_kind: &str,
     interface: &str,
@@ -13127,6 +13143,8 @@ fn build_mux_send_policy_input(
     input
 }
 
+// Dry-run report construction needs target, policy, command, and wait metadata for a single envelope.
+#[allow(clippy::too_many_arguments)]
 fn build_send_dry_run_report(
     command_ctx: &frankenterm_core::dry_run::CommandContext,
     pane_id: u64,
@@ -13290,6 +13308,8 @@ fn build_send_dry_run_report(
     ctx.take_report()
 }
 
+// Prepare-send plans preserve CLI request fields as explicit plan inputs.
+#[allow(clippy::too_many_arguments)]
 fn build_prepare_send_plan(
     workspace_id: &str,
     pane_id: u64,
@@ -15044,13 +15064,12 @@ mod robot_context_backend_tests {
         assert_eq!(horizon["source"].as_str(), Some("robot.context.horizon"));
         assert_eq!(horizon["raw_context_content_stored"].as_bool(), Some(false));
         assert_eq!(horizon["pane_risks"][0]["pane_id"].as_u64(), Some(9));
-        assert_eq!(
+        assert!(
             horizon["pane_risks"][0]["reason_codes"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|reason| reason.as_str() == Some("provider.rate_limit_recent")),
-            true
+                .any(|reason| reason.as_str() == Some("provider.rate_limit_recent"))
         );
         assert!(
             horizon["recommendations"]
@@ -15074,10 +15093,7 @@ mod robot_context_backend_tests {
             decoded["data"]["contract_id"].as_str(),
             Some("ft.context_horizon.v1")
         );
-        assert_eq!(
-            decoded["data"]["pane_risks"][0]["reason_codes"][0].is_string(),
-            true
-        );
+        assert!(decoded["data"]["pane_risks"][0]["reason_codes"][0].is_string());
     }
 
     #[test]
@@ -19920,6 +19936,8 @@ fn write_jsonl<T: serde::Serialize>(path: &Path, rows: &[T]) -> anyhow::Result<(
     Ok(())
 }
 
+// NTM parity shadow execution keeps all operator-provided paths, limits, and intent fields explicit.
+#[allow(clippy::too_many_arguments)]
 async fn run_ntm_parity_shadow(
     workspace_root: &Path,
     config_path: Option<&Path>,
@@ -20324,11 +20342,12 @@ fn recorder_append_log_storage_config(
     layout: &frankenterm_core::config::WorkspaceLayout,
     config: &frankenterm_core::config::Config,
 ) -> frankenterm_core::recorder_storage::AppendLogStorageConfig {
-    let mut append_log = frankenterm_core::recorder_storage::AppendLogStorageConfig::default();
-    append_log.data_path = layout.ft_dir.join("recorder-log").join("events.log");
-    append_log.state_path = layout.ft_dir.join("recorder-log").join("state.json");
-    append_log.queue_capacity = (config.storage.writer_queue_size as usize).max(1);
-    append_log
+    frankenterm_core::recorder_storage::AppendLogStorageConfig {
+        data_path: layout.ft_dir.join("recorder-log").join("events.log"),
+        state_path: layout.ft_dir.join("recorder-log").join("state.json"),
+        queue_capacity: (config.storage.writer_queue_size as usize).max(1),
+        ..Default::default()
+    }
 }
 
 fn recorder_startup_health_failure_reason(
@@ -20950,6 +20969,8 @@ fn distributed_detection_to_stored_event(
 }
 
 #[cfg(feature = "distributed")]
+// Distributed pane persistence mirrors the wire metadata fields that arrive independently.
+#[allow(clippy::too_many_arguments)]
 async fn distributed_upsert_pane(
     storage: &frankenterm_core::storage::StorageHandle,
     pane_id: u64,
@@ -21479,6 +21500,8 @@ async fn distributed_persist_pane_meta(
 }
 
 #[cfg(feature = "distributed")]
+// Listener connection handling threads stream, auth, storage, events, shutdown, and wire limits together.
+#[allow(clippy::too_many_arguments)]
 async fn distributed_handle_connection<S>(
     stream: S,
     peer_addr: std::net::SocketAddr,
@@ -22548,6 +22571,8 @@ async fn distributed_agent_stream_event(
 }
 
 #[cfg(feature = "distributed")]
+// Agent stream sessions keep IO, replay cursors, storage, shutdown, and protocol limits explicit.
+#[allow(clippy::too_many_arguments)]
 async fn distributed_agent_stream_session(
     io: DistributedIoStream,
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
@@ -22858,6 +22883,8 @@ fn distributed_agent_next_reconnect_backoff_ms(
 }
 
 #[cfg(feature = "distributed")]
+// Long-running agent streaming needs connection, config, storage, identity, and auth inputs together.
+#[allow(clippy::too_many_arguments)]
 async fn distributed_agent_stream_forever(
     connect_addr: String,
     distributed_config: frankenterm_core::config::DistributedConfig,
@@ -24437,12 +24464,14 @@ async fn run_saved_search_scheduler(
             }
 
             let since_ms = compute_since_ms(&search);
-            let mut options = SearchOptions::default();
-            options.pane_id = search.pane_id;
-            options.since = since_ms;
-            options.limit = to_usize_limit(search.limit);
-            options.include_snippets = Some(true);
-            options.snippet_max_tokens = Some(64);
+            let options = SearchOptions {
+                pane_id: search.pane_id,
+                since: since_ms,
+                limit: to_usize_limit(search.limit),
+                include_snippets: Some(true),
+                snippet_max_tokens: Some(64),
+                ..Default::default()
+            };
 
             // ft-xbnl0.2.3 tick 245: cx-first storage search.
             let storage_cx = frankenterm_core::cx::Cx::current()
@@ -34330,10 +34359,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 WorkflowCommands::List => {
                     let workflows = enabled_builtin_workflows(&config.workflows);
 
-                    println!(
-                        "{:<30} {:<8} {:<7} {}",
-                        "NAME", "STEPS", "PANE?", "DESCRIPTION"
-                    );
+                    println!("{:<30} {:<8} {:<7} DESCRIPTION", "NAME", "STEPS", "PANE?");
                     for wf in &workflows {
                         let steps = wf.steps();
                         println!(
@@ -38181,8 +38207,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("No undoable actions found.");
                 } else {
                     println!(
-                        "{:<8} {:<14} {:<16} {:<8} {}",
-                        "ID", "STRATEGY", "ACTION", "PANE", "WORKFLOW"
+                        "{:<8} {:<14} {:<16} {:<8} WORKFLOW",
+                        "ID", "STRATEGY", "ACTION", "PANE"
                     );
                     for row in &actions {
                         println!(
@@ -40867,8 +40893,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         println!("No active pane reservations.");
                     } else {
                         println!(
-                            "{:<6} {:<8} {:<12} {:<16} {:<20} {}",
-                            "ID", "PANE", "OWNER_KIND", "OWNER_ID", "REASON", "EXPIRES_IN"
+                            "{:<6} {:<8} {:<12} {:<16} {:<20} EXPIRES_IN",
+                            "ID", "PANE", "OWNER_KIND", "OWNER_ID", "REASON"
                         );
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -41887,8 +41913,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     println!("No active mutes.");
                                 } else {
                                     println!(
-                                        "{:<44}  {:<12}  {:<14}  {}",
-                                        "IDENTITY KEY", "SCOPE", "EXPIRES", "REASON"
+                                        "{:<44}  {:<12}  {:<14}  REASON",
+                                        "IDENTITY KEY", "SCOPE", "EXPIRES"
                                     );
                                     for m in &mutes {
                                         let expires = match m.expires_at {
@@ -44353,8 +44379,8 @@ fn handle_ext_command(
                 }
 
                 println!(
-                    "{:<10} {:<25} {:<10} {:<10} {:<8} {}",
-                    "TYPE", "NAME", "VERSION", "RULES", "ACTIVE", "PATH"
+                    "{:<10} {:<25} {:<10} {:<10} {:<8} PATH",
+                    "TYPE", "NAME", "VERSION", "RULES", "ACTIVE"
                 );
                 for ext in &filtered {
                     let source = match ext.source {
@@ -46519,6 +46545,8 @@ async fn resolve_real_tx_runtime(
     }
 }
 
+// TX execution threads contract state, approval, dry-run, IO, and clock inputs through one executor call.
+#[allow(clippy::too_many_arguments)]
 fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>(
     executor: E,
     contract_path: &Path,
@@ -50004,8 +50032,8 @@ async fn handle_session_command(
 
             // Table header
             println!(
-                "{:<30} {:<12} {:<18} {:>5}  {}",
-                "Session ID", "Created", "Last Checkpoint", "Panes", "Status"
+                "{:<30} {:<12} {:<18} {:>5}  Status",
+                "Session ID", "Created", "Last Checkpoint", "Panes"
             );
             println!("{}", "-".repeat(85));
 
@@ -51811,6 +51839,8 @@ fn print_remote_output(
     println!("  {label}: {redacted}");
 }
 
+// Remote step execution keeps host, command, timing, dry-run, and injected runner fields visible.
+#[allow(clippy::too_many_arguments)]
 fn run_remote_step<F>(
     name: &str,
     host: &str,
@@ -53922,6 +53952,20 @@ mod tests {
     #[cfg(feature = "distributed")]
     fn default_wire_limits() -> frankenterm_core::wire_protocol::WireProtocolLimits {
         frankenterm_core::wire_protocol::WireProtocolLimits::default()
+    }
+
+    #[cfg(feature = "distributed")]
+    fn distributed_token_config(
+        bind_addr: std::net::SocketAddr,
+        token: &str,
+    ) -> frankenterm_core::config::DistributedConfig {
+        frankenterm_core::config::DistributedConfig {
+            enabled: true,
+            bind_addr: bind_addr.to_string(),
+            auth_mode: frankenterm_core::config::DistributedAuthMode::Token,
+            token: Some(token.to_string()),
+            ..Default::default()
+        }
     }
 
     fn run_async_test<F>(future: F)
@@ -60331,11 +60375,7 @@ recorder_backend = "frankensqlite"
         let bind_addr = bind_probe.local_addr().expect("probe listener addr");
         drop(bind_probe);
 
-        let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-        distributed_config.enabled = true;
-        distributed_config.bind_addr = bind_addr.to_string();
-        distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-        distributed_config.token = Some("dist-stream-token".to_string());
+        let distributed_config = distributed_token_config(bind_addr, "dist-stream-token");
 
         let listener_handle = spawn_distributed_listener(
             distributed_config.clone(),
@@ -60514,11 +60554,7 @@ recorder_backend = "frankensqlite"
                 let bind_addr = bind_probe.local_addr().expect("probe listener addr");
                 drop(bind_probe);
 
-                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-                distributed_config.enabled = true;
-                distributed_config.bind_addr = bind_addr.to_string();
-                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-                distributed_config.token = Some("dist-case-token".to_string());
+                let distributed_config = distributed_token_config(bind_addr, "dist-case-token");
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
@@ -60687,11 +60723,8 @@ recorder_backend = "frankensqlite"
                 let bind_addr = bind_probe.local_addr().expect("probe listener addr");
                 drop(bind_probe);
 
-                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-                distributed_config.enabled = true;
-                distributed_config.bind_addr = bind_addr.to_string();
-                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-                distributed_config.token = Some("dist-case-session-token".to_string());
+                let distributed_config =
+                    distributed_token_config(bind_addr, "dist-case-session-token");
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
@@ -60946,11 +60979,8 @@ recorder_backend = "frankensqlite"
                 let bind_addr = bind_probe.local_addr().expect("probe listener addr");
                 drop(bind_probe);
 
-                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-                distributed_config.enabled = true;
-                distributed_config.bind_addr = bind_addr.to_string();
-                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-                distributed_config.token = Some("dist-session-reset-token".to_string());
+                let distributed_config =
+                    distributed_token_config(bind_addr, "dist-session-reset-token");
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
@@ -61199,11 +61229,7 @@ recorder_backend = "frankensqlite"
                 let bind_addr = bind_probe.local_addr().expect("probe listener addr");
                 drop(bind_probe);
 
-                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-                distributed_config.enabled = true;
-                distributed_config.bind_addr = bind_addr.to_string();
-                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-                distributed_config.token = Some("expected-token".to_string());
+                let distributed_config = distributed_token_config(bind_addr, "expected-token");
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
@@ -61319,11 +61345,8 @@ recorder_backend = "frankensqlite"
                 let bind_addr = bind_probe.local_addr().expect("probe listener addr");
                 drop(bind_probe);
 
-                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-                distributed_config.enabled = true;
-                distributed_config.bind_addr = bind_addr.to_string();
-                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-                distributed_config.token = Some("dist-invalid-wire-token".to_string());
+                let distributed_config =
+                    distributed_token_config(bind_addr, "dist-invalid-wire-token");
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
@@ -61502,11 +61525,7 @@ recorder_backend = "frankensqlite"
                 let bind_addr = bind_probe.local_addr().expect("probe listener addr");
                 drop(bind_probe);
 
-                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-                distributed_config.enabled = true;
-                distributed_config.bind_addr = bind_addr.to_string();
-                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-                distributed_config.token = Some("expected-token".to_string());
+                let distributed_config = distributed_token_config(bind_addr, "expected-token");
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
@@ -61621,11 +61640,7 @@ recorder_backend = "frankensqlite"
                 let bind_addr = bind_probe.local_addr().expect("probe listener addr");
                 drop(bind_probe);
 
-                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-                distributed_config.enabled = true;
-                distributed_config.bind_addr = bind_addr.to_string();
-                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-                distributed_config.token = Some("expected-token".to_string());
+                let distributed_config = distributed_token_config(bind_addr, "expected-token");
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
@@ -64499,7 +64514,7 @@ log_level = "debug"
     }
 
     /// Helper: sort triage items the same way the handler does.
-    fn triage_sort(items: &mut Vec<serde_json::Value>) {
+    fn triage_sort(items: &mut [serde_json::Value]) {
         items.sort_by(|a, b| {
             let sa = triage_severity_rank(a["severity"].as_str().unwrap_or("info"));
             let sb = triage_severity_rank(b["severity"].as_str().unwrap_or("info"));
@@ -65014,7 +65029,7 @@ log_level = "debug"
             json["quota_advisory"]["availability"].as_str().unwrap(),
             "available"
         );
-        assert_eq!(json["quota_advisory"]["blocking"].as_bool().unwrap(), false);
+        assert!(!json["quota_advisory"]["blocking"].as_bool().unwrap());
     }
 
     #[test]
@@ -65676,7 +65691,7 @@ log_level = "debug"
 
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["reservation_id"].as_i64().unwrap(), 42);
-        assert_eq!(json["released"].as_bool().unwrap(), true);
+        assert!(json["released"].as_bool().unwrap());
     }
 
     #[test]
@@ -65687,7 +65702,7 @@ log_level = "debug"
         };
 
         let json = serde_json::to_value(&data).unwrap();
-        assert_eq!(json["released"].as_bool().unwrap(), false);
+        assert!(!json["released"].as_bool().unwrap());
     }
 
     #[test]
@@ -70465,10 +70480,7 @@ log_level = "debug"
                 .len(),
             3
         );
-        assert_eq!(
-            roundtripped["data"]["dry_run_plan"]["calendar"][0]["reason_codes"][0].is_string(),
-            true
-        );
+        assert!(roundtripped["data"]["dry_run_plan"]["calendar"][0]["reason_codes"][0].is_string());
     }
 
     #[test]
@@ -70482,7 +70494,7 @@ log_level = "debug"
 
         assert_eq!(report.contract_id, "ft.blocker_radar.v1");
         assert_eq!(report.source, "robot.blocker_radar");
-        assert_eq!(report.raw_pane_content_stored, false);
+        assert!(!report.raw_pane_content_stored);
         assert!(report.unavailable_sources.iter().any(|source| {
             source
                 .reason_codes
