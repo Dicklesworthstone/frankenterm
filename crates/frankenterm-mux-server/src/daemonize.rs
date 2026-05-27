@@ -95,7 +95,7 @@ fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File>
     let pid_file_dir = pid_file
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent?", pid_file.display()))?;
-    std::fs::create_dir_all(&pid_file_dir).with_context(|| {
+    std::fs::create_dir_all(pid_file_dir).with_context(|| {
         format!(
             "while creating directory structure: {}",
             pid_file_dir.display()
@@ -103,6 +103,7 @@ fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File>
     })?;
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&pid_file)
         .with_context(|| format!("opening pid file {}", pid_file.display()))?;
