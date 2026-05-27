@@ -632,9 +632,11 @@ proptest! {
 
 #[test]
 fn constants_are_consistent() {
-    assert!(SEARCH_LIMIT_DEFAULT > 0);
-    assert!(SEARCH_LIMIT_DEFAULT <= SEARCH_LIMIT_MAX);
-    assert!(SEARCH_SNIPPET_MAX_TOKENS > 0);
+    const {
+        assert!(SEARCH_LIMIT_DEFAULT > 0);
+        assert!(SEARCH_LIMIT_DEFAULT <= SEARCH_LIMIT_MAX);
+        assert!(SEARCH_SNIPPET_MAX_TOKENS > 0);
+    }
     assert!(!SEARCH_HIGHLIGHT_PREFIX.is_empty());
     assert!(!SEARCH_HIGHLIGHT_SUFFIX.is_empty());
     assert_ne!(SEARCH_HIGHLIGHT_PREFIX, SEARCH_HIGHLIGHT_SUFFIX);
