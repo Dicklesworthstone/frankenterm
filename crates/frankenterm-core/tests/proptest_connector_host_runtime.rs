@@ -431,36 +431,46 @@ proptest! {
 
 #[test]
 fn config_rejects_empty_host_id() {
-    let mut config = ConnectorHostConfig::default();
-    config.host_id = String::new();
+    let config = ConnectorHostConfig {
+        host_id: String::new(),
+        ..Default::default()
+    };
     assert!(ConnectorHostRuntime::new(config).is_err());
 }
 
 #[test]
 fn config_rejects_whitespace_host_id() {
-    let mut config = ConnectorHostConfig::default();
-    config.host_id = "  ".to_string();
+    let config = ConnectorHostConfig {
+        host_id: "  ".to_string(),
+        ..Default::default()
+    };
     assert!(ConnectorHostRuntime::new(config).is_err());
 }
 
 #[test]
 fn config_rejects_zero_startup_timeout() {
-    let mut config = ConnectorHostConfig::default();
-    config.startup_timeout_ms = 0;
+    let config = ConnectorHostConfig {
+        startup_timeout_ms: 0,
+        ..Default::default()
+    };
     assert!(ConnectorHostRuntime::new(config).is_err());
 }
 
 #[test]
 fn config_rejects_zero_heartbeat_interval() {
-    let mut config = ConnectorHostConfig::default();
-    config.heartbeat_interval_ms = 0;
+    let config = ConnectorHostConfig {
+        heartbeat_interval_ms: 0,
+        ..Default::default()
+    };
     assert!(ConnectorHostRuntime::new(config).is_err());
 }
 
 #[test]
 fn config_rejects_zero_failure_backoff() {
-    let mut config = ConnectorHostConfig::default();
-    config.failure_backoff_ms = 0;
+    let config = ConnectorHostConfig {
+        failure_backoff_ms: 0,
+        ..Default::default()
+    };
     assert!(ConnectorHostRuntime::new(config).is_err());
 }
 

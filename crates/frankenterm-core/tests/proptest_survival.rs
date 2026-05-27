@@ -574,9 +574,11 @@ proptest! {
         warmup in 1usize..100,
         lr in 0.001_f64..1.0,
     ) {
-        let mut cfg = SurvivalConfig::default();
-        cfg.warmup_observations = warmup;
-        cfg.learning_rate = lr;
+        let cfg = SurvivalConfig {
+            warmup_observations: warmup,
+            learning_rate: lr,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: SurvivalConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.warmup_observations, warmup);
