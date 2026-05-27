@@ -1,8 +1,8 @@
 //! IPC module for watcher daemon communication.
 //!
-//! Provides Unix domain socket communication between CLI commands and the
-//! watcher daemon. Used primarily for delivering user-var events from
-//! shell hooks to the running watcher.
+//! Provides local socket communication between CLI commands and the watcher
+//! daemon. Unix uses the existing Unix-domain-socket path; Windows uses the
+//! in-tree `frankenterm-uds` Windows transport.
 //!
 //! # Protocol
 //!
@@ -12,10 +12,10 @@
 
 use crate::runtime_async::RwLock;
 use crate::runtime_async::mpsc;
-#[cfg(unix)]
-use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixListener, UnixStream};
 use frankenterm_alloc::{allocator_backend, jemalloc_enabled, read_allocator_stats};
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, windows))]
+use socket_transport::{AsyncReadExt, AsyncWriteExt, UnixListener, UnixStream};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -33,8 +33,100 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 /// Maximum message size in bytes (128KB).
 /// Overridable via `[tuning.ipc] max_message_size` in ft.toml.
 pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX_MESSAGE_SIZE;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+#[cfg(any(unix, windows))]
+mod socket_transport {
+    #[cfg(unix)]
+    pub use crate::runtime_async::unix::{
+        AsyncReadExt, AsyncWriteExt, UnixListener, UnixStream, bind, buffered, connect, lines,
+        next_line_with_cx,
+    };
+
+    #[cfg(windows)]
+    mod windows {
+        use std::io;
+        use std::path::Path;
+        use std::time::Duration;
+
+        pub use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+        pub use frankenterm_uds::UnixStream;
+
+        pub struct UnixListener {
+            inner: frankenterm_uds::UnixListener,
+        }
+
+        pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
+
+        pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
+            let inner = frankenterm_uds::UnixListener::bind(path)?;
+            inner.set_nonblocking(true)?;
+            Ok(UnixListener { inner })
+        }
+
+        pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+            let stream = UnixStream::connect(path)?;
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        }
+
+        impl UnixListener {
+            pub async fn accept(&self) -> io::Result<(UnixStream, ())> {
+                loop {
+                    match self.inner.accept() {
+                        Ok((stream, _addr)) => {
+                            stream.set_nonblocking(true)?;
+                            return Ok((stream, ()));
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            crate::runtime_async::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+
+        #[must_use]
+        pub fn buffered<T: AsyncRead>(stream: T) -> BufReader<T> {
+            BufReader::new(stream)
+        }
+
+        #[must_use]
+        pub fn lines<T>(reader: BufReader<T>) -> LineReader<T>
+        where
+            T: AsyncRead + Unpin,
+        {
+            asupersync::io::Lines::new(reader)
+        }
+
+        pub async fn next_line_with_cx<T>(
+            cx: &crate::cx::Cx,
+            lines: &mut LineReader<T>,
+        ) -> io::Result<Option<String>>
+        where
+            T: AsyncRead + Unpin,
+        {
+            use asupersync::stream::StreamExt;
+
+            cx.checkpoint().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("next_line cancelled: {err}"),
+                )
+            })?;
+            match lines.next().await {
+                Some(Ok(line)) => Ok(Some(line)),
+                Some(Err(err)) => Err(err),
+                None => Ok(None),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub use windows::*;
+}
 
 /// Resolved IPC runtime limits derived from tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +209,7 @@ enum MpscRecvState<T> {
     Cancelled,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn mpsc_recv_state<T>(rx: &mut mpsc::Receiver<T>) -> MpscRecvState<T> {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     mpsc_recv_state_with_cx(rx, &cx).await
@@ -251,6 +343,14 @@ fn remove_stale_socket_path(socket_path: &Path) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+#[cfg(windows)]
+fn remove_stale_socket_path(socket_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("IPC socket path already exists: {}", socket_path.display()),
+    ))
 }
 
 // NOTE: StatusUpdate types (CursorPosition, PaneDimensions, StatusUpdate, StatusUpdateRateLimiter)
@@ -736,14 +836,14 @@ impl IpcHandlerContext {
 }
 
 /// IPC server that runs in the watcher daemon.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct IpcServer {
     socket_path: PathBuf,
     listener: UnixListener,
     limits: IpcRuntimeLimits,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl IpcServer {
     /// Create and bind a new IPC server with default permissions (0o600).
     ///
@@ -867,7 +967,10 @@ impl IpcServer {
             )
         })?;
 
-        let listener = compat_unix::bind(&socket_path).await?;
+        let listener = socket_transport::bind(&socket_path).await?;
+        #[cfg(windows)]
+        let _ = permissions;
+        #[cfg(unix)]
         if let Some(mode) = permissions {
             let perms = std::fs::Permissions::from_mode(mode);
             std::fs::set_permissions(&socket_path, perms)?;
@@ -1025,6 +1128,7 @@ impl IpcServer {
             }
         }
 
+        #[cfg(any(unix, windows))]
         let _ = std::fs::remove_file(&self.socket_path);
     }
 
@@ -1128,13 +1232,13 @@ impl IpcServer {
     }
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     shutdown_signal_pending_with_cx(shutdown_rx, &cx).await
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn shutdown_signal_pending_with_cx(
     shutdown_rx: &mut mpsc::Receiver<()>,
     cx: &crate::cx::Cx,
@@ -1159,13 +1263,13 @@ async fn shutdown_signal_pending_with_cx(
     }
 }
 
-/// Stub IPC server for non-unix platforms (unix sockets unavailable).
-#[cfg(not(unix))]
+/// Stub IPC server for platforms without the local socket transport.
+#[cfg(not(any(unix, windows)))]
 pub struct IpcServer {
     socket_path: PathBuf,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl IpcServer {
     /// Create and bind a new IPC server.
     ///
@@ -1283,10 +1387,9 @@ async fn handle_client_with_context_with_cx(
     let start = Instant::now();
     let (reader, mut writer) = stream.into_split();
 
-    use crate::runtime_async::unix::AsyncReadExt;
     let bounded_reader = reader.take(IpcRuntimeLimits::message_read_limit_for(max_message_size));
 
-    let mut lines = compat_unix::lines(compat_unix::buffered(bounded_reader));
+    let mut lines = socket_transport::lines(socket_transport::buffered(bounded_reader));
     // Tick 200 (ft-xbnl0.2.3): route the request-line read through
     // next_line_with_cx(&cx, ...) so the pre-read checkpoint honors
     // the caller's explicit cx. Previously used the ambient
@@ -1294,7 +1397,7 @@ async fn handle_client_with_context_with_cx(
     // doesn't observe cx cancellation at the entry checkpoint. A
     // client that hangs without sending a full line would block
     // the handler indefinitely even under an outer cx cancel.
-    let Some(line) = compat_unix::next_line_with_cx(&cx, &mut lines).await? else {
+    let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? else {
         return Ok(());
     };
 
@@ -1331,6 +1434,62 @@ async fn handle_client_with_context_with_cx(
     writer.write_all(response_json.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
+
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn handle_client_with_context_with_cx(
+    cx: crate::cx::Cx,
+    mut stream: UnixStream,
+    ctx: Arc<IpcHandlerContext>,
+    max_message_size: usize,
+) -> std::io::Result<()> {
+    let start = Instant::now();
+
+    let line = {
+        let bounded_reader =
+            (&mut stream).take(IpcRuntimeLimits::message_read_limit_for(max_message_size));
+        let mut lines = socket_transport::lines(socket_transport::buffered(bounded_reader));
+        let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? else {
+            return Ok(());
+        };
+        line
+    };
+
+    if line.len() > max_message_size {
+        let response = IpcResponse::error("message too large");
+        let response_json = serde_json::to_string(&response)
+            .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
+        stream.write_all(response_json.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        return Ok(());
+    }
+
+    let response = match serde_json::from_str::<IpcEnvelope>(&line) {
+        Ok(envelope) => {
+            if let Some(auth) = ctx.auth.as_ref() {
+                if let Err(err) =
+                    auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
+                {
+                    IpcResponse::error(err.message())
+                } else {
+                    handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+                }
+            } else {
+                handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+            }
+        }
+        Err(e) => IpcResponse::error(format!("invalid request: {e}")),
+    };
+
+    let response = response.with_timing(start);
+
+    let response_json = serde_json::to_string(&response)
+        .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
+    stream.write_all(response_json.as_bytes()).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
 
     Ok(())
 }
@@ -1782,11 +1941,22 @@ impl IpcClient {
     /// Check if the watcher socket exists.
     #[must_use]
     pub fn socket_exists(&self) -> bool {
-        self.socket_path.exists()
+        #[cfg(unix)]
+        {
+            self.socket_path.exists()
+        }
+        #[cfg(windows)]
+        {
+            self.socket_path.parent().is_some_and(Path::exists)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.socket_path.exists()
+        }
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl IpcClient {
     /// Send a user-var event to the watcher daemon.
     ///
@@ -2003,6 +2173,7 @@ impl IpcClient {
             message: format!("cancelled pre-start: {err}"),
         })?;
 
+        #[cfg(unix)]
         if !self.socket_path.exists() {
             return Err(UserVarError::WatcherNotRunning {
                 socket_path: self.socket_path.display().to_string(),
@@ -2013,13 +2184,16 @@ impl IpcClient {
             message: format!("cancelled before connect: {err}"),
         })?;
 
-        let stream = compat_unix::connect(&self.socket_path).await.map_err(|e| {
-            UserVarError::IpcSendFailed {
+        let stream = socket_transport::connect(&self.socket_path)
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to connect: {e}"),
-            }
-        })?;
+            })?;
 
+        #[cfg(unix)]
         let (reader, mut writer) = stream.into_split();
+        #[cfg(windows)]
+        let mut stream = stream;
 
         let envelope = IpcEnvelope {
             token: self.auth_token.clone(),
@@ -2035,37 +2209,65 @@ impl IpcClient {
             message: format!("cancelled before write: {err}"),
         })?;
 
-        writer
-            .write_all(request_json.as_bytes())
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to send: {e}"),
-            })?;
-        writer
-            .write_all(b"\n")
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to send newline: {e}"),
-            })?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to flush: {e}"),
-            })?;
+        #[cfg(unix)]
+        {
+            writer
+                .write_all(request_json.as_bytes())
+                .await
+                .map_err(|e| UserVarError::IpcSendFailed {
+                    message: format!("failed to send: {e}"),
+                })?;
+            writer
+                .write_all(b"\n")
+                .await
+                .map_err(|e| UserVarError::IpcSendFailed {
+                    message: format!("failed to send newline: {e}"),
+                })?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| UserVarError::IpcSendFailed {
+                    message: format!("failed to flush: {e}"),
+                })?;
+        }
+
+        #[cfg(windows)]
+        {
+            stream
+                .write_all(request_json.as_bytes())
+                .await
+                .map_err(|e| UserVarError::IpcSendFailed {
+                    message: format!("failed to send: {e}"),
+                })?;
+            stream
+                .write_all(b"\n")
+                .await
+                .map_err(|e| UserVarError::IpcSendFailed {
+                    message: format!("failed to send newline: {e}"),
+                })?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| UserVarError::IpcSendFailed {
+                    message: format!("failed to flush: {e}"),
+                })?;
+        }
 
         cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
             message: format!("cancelled before read: {err}"),
         })?;
 
-        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+        #[cfg(unix)]
+        let mut lines = socket_transport::lines(socket_transport::buffered(reader));
+        #[cfg(windows)]
+        let mut lines = socket_transport::lines(socket_transport::buffered(&mut stream));
         // Tick 201 (ft-xbnl0.2.3): route the response read through
         // next_line_with_cx(cx, ...) so the pre-read checkpoint
         // observes the caller's explicit cx. Previously used ambient
         // next_line — if the server stalled mid-response, the client
         // hung on the read until the stream closed or the server
         // eventually wrote, even when an outer cx-cancel had fired.
-        let line = compat_unix::next_line_with_cx(cx, &mut lines)
+        let line = socket_transport::next_line_with_cx(cx, &mut lines)
             .await
             .map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to read response: {e}"),
@@ -2088,12 +2290,12 @@ impl IpcClient {
     // checkpoint-instrumented, primitive-using path.
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl IpcClient {
-    /// IPC is unix-only; return a clear error on other platforms.
+    /// IPC is unavailable on this platform; return a clear error.
     fn unsupported() -> UserVarError {
         UserVarError::IpcSendFailed {
-            message: "IPC sockets are only supported on unix platforms".to_string(),
+            message: "IPC sockets are not supported on this platform".to_string(),
         }
     }
 
@@ -2182,6 +2384,65 @@ impl IpcClient {
         _request_id: Option<String>,
     ) -> Result<IpcResponse, UserVarError> {
         Err(Self::unsupported())
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod transport_roundtrip_tests {
+    use super::*;
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build runtime for IPC transport tests");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn ipc_platform_transport_ping_roundtrip() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir
+                .path()
+                .join(format!("platform-roundtrip-{}.sock", std::process::id()));
+
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let server_handle = crate::runtime_async::task::spawn(async move {
+                server.run(event_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_async::sleep(Duration::from_millis(25)).await;
+
+            let client = IpcClient::new(&socket_path);
+            let response = client.ping().await.unwrap();
+            assert!(response.ok);
+
+            mpsc_send_value(&shutdown_tx, ()).await.unwrap();
+            let _ = server_handle.await;
+            assert!(
+                !socket_path.exists(),
+                "IPC transport path should be removed after shutdown"
+            );
+        });
     }
 }
 

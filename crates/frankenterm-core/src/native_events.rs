@@ -1,7 +1,9 @@
 //! Native event listener for vendored WezTerm integrations.
 //!
-//! Listens on a Unix domain socket for newline-delimited JSON events emitted by
-//! a vendored WezTerm build (feature-gated on the WezTerm side).
+//! Listens on a local socket for newline-delimited JSON events emitted by a
+//! vendored WezTerm build (feature-gated on the WezTerm side). Unix uses the
+//! existing Unix-domain-socket path; Windows uses the in-tree `frankenterm-uds`
+//! Windows transport.
 
 #![forbid(unsafe_code)]
 
@@ -17,15 +19,111 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_async::mpsc;
 use crate::runtime_async::task::JoinSet;
-use crate::runtime_async::unix::{self as compat_unix, UnixListener, UnixStream};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, windows))]
+use socket_transport::{UnixListener, UnixStream};
 use tracing::{debug, warn};
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(25);
+
+#[cfg(any(unix, windows))]
+mod socket_transport {
+    #[cfg(all(test, unix))]
+    pub use crate::runtime_async::unix::{AsyncWriteExt, connect};
+    #[cfg(unix)]
+    pub use crate::runtime_async::unix::{
+        UnixListener, UnixStream, bind, buffered, lines, next_line_with_cx,
+    };
+
+    #[cfg(windows)]
+    mod windows {
+        use std::io;
+        use std::path::Path;
+        use std::time::Duration;
+
+        #[cfg(test)]
+        pub use asupersync::io::AsyncWriteExt;
+        pub use asupersync::io::{AsyncRead, BufReader};
+        pub use frankenterm_uds::UnixStream;
+
+        pub struct UnixListener {
+            inner: frankenterm_uds::UnixListener,
+        }
+
+        pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
+
+        pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
+            let inner = frankenterm_uds::UnixListener::bind(path)?;
+            inner.set_nonblocking(true)?;
+            Ok(UnixListener { inner })
+        }
+
+        pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+            let stream = UnixStream::connect(path)?;
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        }
+
+        impl UnixListener {
+            pub async fn accept(&self) -> io::Result<(UnixStream, ())> {
+                loop {
+                    match self.inner.accept() {
+                        Ok((stream, _addr)) => {
+                            stream.set_nonblocking(true)?;
+                            return Ok((stream, ()));
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            crate::runtime_async::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+
+        #[must_use]
+        pub fn buffered<T: AsyncRead>(stream: T) -> BufReader<T> {
+            BufReader::new(stream)
+        }
+
+        #[must_use]
+        pub fn lines<T>(reader: BufReader<T>) -> LineReader<T>
+        where
+            T: AsyncRead + Unpin,
+        {
+            asupersync::io::Lines::new(reader)
+        }
+
+        pub async fn next_line_with_cx<T>(
+            cx: &crate::cx::Cx,
+            lines: &mut LineReader<T>,
+        ) -> io::Result<Option<String>>
+        where
+            T: AsyncRead + Unpin,
+        {
+            use asupersync::stream::StreamExt;
+
+            cx.checkpoint().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("next_line cancelled: {err}"),
+                )
+            })?;
+            match lines.next().await {
+                Some(Ok(line)) => Ok(Some(line)),
+                Some(Err(err)) => Err(err),
+                None => Ok(None),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub use windows::*;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventDispatchOutcome {
@@ -146,7 +244,7 @@ pub enum WireEvent {
     },
 }
 
-/// Unix socket server that receives pane events from the frankenterm GUI process.
+/// Local socket server that receives pane events from the frankenterm GUI process.
 pub struct NativeEventListener {
     socket_path: PathBuf,
     listener: UnixListener,
@@ -195,7 +293,7 @@ impl NativeEventListener {
         }
 
         check("before listener bind")?;
-        let listener = compat_unix::bind(&socket_path).await?;
+        let listener = socket_transport::bind(&socket_path).await?;
         Ok(Self {
             socket_path,
             listener,
@@ -335,6 +433,7 @@ impl NativeEventListener {
 
 impl Drop for NativeEventListener {
     fn drop(&mut self) {
+        #[cfg(any(unix, windows))]
         if let Err(err) = std::fs::remove_file(&self.socket_path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 debug!(
@@ -356,7 +455,7 @@ fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventEr
 
     #[cfg(unix)]
     let is_socket = metadata.file_type().is_socket();
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     let is_socket = false;
 
     if !is_socket {
@@ -386,7 +485,7 @@ fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventEr
         Err(err) => Err(NativeEventError::Io(err)),
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         Err(NativeEventError::SocketAlreadyExists(
             socket_path.display().to_string(),
@@ -419,9 +518,9 @@ async fn handle_connection_with_cx(
             format!("native handle_connection cancelled pre-read: {err}"),
         )
     })?;
-    let mut lines = compat_unix::lines(compat_unix::buffered(stream));
+    let mut lines = socket_transport::lines(socket_transport::buffered(stream));
 
-    while let Some(line) = compat_unix::next_line_with_cx(&cx, &mut lines).await? {
+    while let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? {
         if line.len() > MAX_EVENT_LINE_BYTES {
             warn!(len = line.len(), "native event line too large; dropping");
             continue;
@@ -602,11 +701,109 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(unix, windows)))]
+mod transport_roundtrip_tests {
+    use super::socket_transport::{self as event_socket, AsyncWriteExt};
+    use super::*;
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for native event transport tests");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
+    }
+
+    #[test]
+    fn native_event_platform_transport_roundtrip() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join(format!(
+                "native-platform-roundtrip-{}.sock",
+                std::process::id()
+            ));
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind native event listener");
+            let (event_tx, mut event_rx) = mpsc::channel(4);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle =
+                crate::runtime_async::task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+            crate::runtime_async::sleep(Duration::from_millis(25)).await;
+
+            let mut stream = event_socket::connect(socket_path.clone())
+                .await
+                .expect("connect native event transport");
+            let payload = r#"{"type":"pane_output","pane_id":7,"data_b64":"aGV5","ts":42}"#;
+            stream
+                .write_all(format!("{payload}\n").as_bytes())
+                .await
+                .expect("write native event payload");
+            stream.flush().await.expect("flush native event payload");
+            drop(stream);
+
+            let event = crate::runtime_async::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(event) = recv_next(&mut event_rx).await {
+                        break event;
+                    }
+                    crate::runtime_async::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("native event transport roundtrip timed out");
+
+            match event {
+                NativeEvent::PaneOutput {
+                    pane_id,
+                    data,
+                    timestamp_ms,
+                } => {
+                    assert_eq!(pane_id, 7);
+                    assert_eq!(data, b"hey");
+                    assert_eq!(timestamp_ms, 42);
+                }
+                other => panic!("unexpected native event: {other:?}"),
+            }
+
+            shutdown.store(true, Ordering::SeqCst);
+            let result = crate::runtime_async::timeout(Duration::from_secs(2), handle).await;
+            assert!(result.is_ok(), "native event listener did not shut down");
+            assert!(
+                !socket_path.exists(),
+                "native event transport path should be removed after shutdown"
+            );
+        });
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
+    use super::socket_transport::{self as event_socket, AsyncWriteExt};
     use super::*;
     use crate::runtime_async::task;
-    use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::sync::atomic::AtomicBool;
 
@@ -1018,6 +1215,7 @@ mod tests {
                 Ok(_) => {}
                 Err(e) => panic!("bind_with_cx should succeed on fresh cx: {e}"),
             }
+            #[cfg(unix)]
             assert!(socket_path.exists(), "socket should exist after bind");
         });
     }
@@ -1078,7 +1276,7 @@ mod tests {
         run_async_test(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let socket_path = dir.path().join("active.sock");
-            let _active_listener = compat_unix::bind(&socket_path)
+            let _active_listener = event_socket::bind(&socket_path)
                 .await
                 .expect("bind active socket");
 
@@ -1092,6 +1290,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn bind_replaces_stale_socket_path() {
         run_async_test(async {
@@ -1118,6 +1317,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn listener_drop_removes_socket_file() {
         run_async_test(async {
@@ -1209,7 +1409,7 @@ mod tests {
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+            let mut stream = event_socket::connect(socket_path).await.expect("connect");
             let payload = r#"{"type":"pane_output","pane_id":7,"data_b64":"aGV5","ts":42}"#;
             stream
                 .write_all(format!("{payload}\n").as_bytes())
@@ -1250,7 +1450,7 @@ mod tests {
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+            let mut stream = event_socket::connect(socket_path).await.expect("connect");
 
             // Send hello (ignored) + two real events
             let lines = [
@@ -1291,7 +1491,7 @@ mod tests {
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+            let mut stream = event_socket::connect(socket_path).await.expect("connect");
 
             // Send invalid JSON followed by valid event
             let lines = [
@@ -1335,7 +1535,7 @@ mod tests {
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
             // First connection sends one event and disconnects.
-            let mut stream_one = compat_unix::connect(socket_path.clone())
+            let mut stream_one = event_socket::connect(socket_path.clone())
                 .await
                 .expect("connect first stream");
             stream_one
@@ -1355,7 +1555,7 @@ mod tests {
             ));
 
             // Second connection should still be accepted and delivered.
-            let mut stream_two = compat_unix::connect(socket_path)
+            let mut stream_two = event_socket::connect(socket_path)
                 .await
                 .expect("connect second stream");
             stream_two
@@ -1396,7 +1596,7 @@ mod tests {
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+            let mut stream = event_socket::connect(socket_path).await.expect("connect");
             let oversized = "x".repeat(MAX_EVENT_LINE_BYTES + 1);
             stream
                 .write_all(oversized.as_bytes())
@@ -1444,6 +1644,7 @@ mod tests {
             // Listener should exit within a few poll intervals
             let result = crate::runtime_async::timeout(Duration::from_secs(2), handle).await;
             assert!(result.is_ok(), "listener did not shut down in time");
+            #[cfg(unix)]
             assert!(
                 !socket_path.exists(),
                 "socket path should be removed after listener shutdown"
@@ -2184,7 +2385,7 @@ mod tests {
 
             let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+            let mut stream = event_socket::connect(socket_path).await.expect("connect");
 
             // Send 1000 events rapidly (enough to test throughput without being
             // too slow for CI)
