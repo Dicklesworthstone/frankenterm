@@ -18,7 +18,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use frankenterm_core::dirty_line_telemetry::{
     DirtyEventSource, DirtyMark, DirtyMarkClassification,
 };
-use frankenterm_term::{ColorPalette, Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_term::color::ColorPalette;
+use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use serde_json::json;
 
 const PANE_COUNT: u32 = 200;
