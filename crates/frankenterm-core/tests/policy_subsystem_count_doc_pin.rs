@@ -2,7 +2,7 @@
 //! the runtime diagnostics enumeration.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use frankenterm_core::policy::PolicyEngine;
@@ -98,7 +98,7 @@ fn read_readme() -> (PathBuf, String) {
 }
 
 fn validate_policy_subsystem_count(
-    readme_path: &PathBuf,
+    readme_path: &Path,
     readme: &str,
     expected_count: usize,
 ) -> Result<usize, String> {
