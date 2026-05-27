@@ -38,6 +38,11 @@ const TERMINAL_TOKEN_PATTERN: &str = r"[A-Za-z0-9_./:\-]+";
 /// Maximum token length (bytes) for the text tokenizer.
 const MAX_TOKEN_LENGTH: usize = 256;
 
+const _: () = {
+    assert!(MAX_TOKEN_LENGTH > 0);
+    assert!(MAX_TOKEN_LENGTH <= 1024);
+};
+
 // ---------------------------------------------------------------------------
 // LexicalFieldHandles — compile-time-safe field accessors
 // ---------------------------------------------------------------------------
@@ -790,12 +795,6 @@ mod tests {
     fn tokenizer_names_contain_version() {
         assert!(TOKENIZER_TERMINAL_TEXT.contains("v1"));
         assert!(TOKENIZER_TERMINAL_SYMBOLS.contains("v1"));
-    }
-
-    #[test]
-    fn max_token_length_is_reasonable() {
-        assert!(MAX_TOKEN_LENGTH > 0);
-        assert!(MAX_TOKEN_LENGTH <= 1024);
     }
 
     #[test]
