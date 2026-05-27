@@ -1253,10 +1253,9 @@ proptest! {
             in_crash_loop,
             fleet_pressure_tier: fp_tiers[fleet_idx].map(String::from),
             swarm_capacity: None,
-            leak_risk_inventory: {
-                let mut inv = LeakRiskInventorySnapshot::default();
-                inv.storage_lock_contention_events = contention_events;
-                inv
+            leak_risk_inventory: LeakRiskInventorySnapshot {
+                storage_lock_contention_events: contention_events,
+                ..LeakRiskInventorySnapshot::default()
             },
         };
 
