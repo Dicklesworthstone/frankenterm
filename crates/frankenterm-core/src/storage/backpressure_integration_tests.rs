@@ -98,8 +98,10 @@ fn storage_concurrent_writers_dont_deadlock() {
         // Multiple concurrent writers on a small queue should complete
         // without deadlock (writer thread drains fast enough)
         let db_path = temp_db_path();
-        let mut config = StorageConfig::default();
-        config.write_queue_size = 4;
+        let config = StorageConfig {
+            write_queue_size: 4,
+            ..Default::default()
+        };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
         handle
@@ -159,8 +161,10 @@ fn gap_recording_works_under_backpressure() {
     run_async_test(async {
         // Ensure GAP records can be written even when the queue has work pending
         let db_path = temp_db_path();
-        let mut config = StorageConfig::default();
-        config.write_queue_size = 4;
+        let config = StorageConfig {
+            write_queue_size: 4,
+            ..Default::default()
+        };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
         handle

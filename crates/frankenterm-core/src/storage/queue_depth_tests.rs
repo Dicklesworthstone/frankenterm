@@ -40,8 +40,10 @@ fn write_queue_depth_starts_at_zero() {
 fn write_queue_capacity_matches_config() {
     run_async_test(async {
         let db_path = temp_db_path();
-        let mut config = StorageConfig::default();
-        config.write_queue_size = 64;
+        let config = StorageConfig {
+            write_queue_size: 64,
+            ..Default::default()
+        };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
         assert_eq!(handle.write_queue_capacity(), 64);
@@ -74,8 +76,10 @@ fn write_queue_depth_is_bounded() {
 fn write_queue_depth_rises_under_concurrent_writes() {
     run_async_test(async {
         let db_path = temp_db_path();
-        let mut config = StorageConfig::default();
-        config.write_queue_size = 8; // Small queue to observe depth
+        let config = StorageConfig {
+            write_queue_size: 8, // Small queue to observe depth
+            ..Default::default()
+        };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
         // Register a pane first
@@ -136,8 +140,10 @@ fn write_queue_bounded_under_heavy_load() {
     run_async_test(async {
         // Verify the queue never exceeds its configured capacity
         let db_path = temp_db_path();
-        let mut config = StorageConfig::default();
-        config.write_queue_size = 4; // Very small queue
+        let config = StorageConfig {
+            write_queue_size: 4, // Very small queue
+            ..Default::default()
+        };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
         handle

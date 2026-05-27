@@ -533,8 +533,10 @@ fn storage_handle_hybrid_search_uses_semantic_cache_and_invalidation() {
     run_async_test(async {
         let db_path = temp_db_path();
         let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
-        let mut config = SemanticBudgetConfig::default();
-        config.max_semantic_latency_ms = u64::MAX;
+        let config = SemanticBudgetConfig {
+            max_semantic_latency_ms: u64::MAX,
+            ..Default::default()
+        };
         handle.set_semantic_budget_config(config);
 
         handle.upsert_pane(test_pane(1)).await.unwrap();

@@ -329,7 +329,7 @@ mod tests {
             (3, 1_700_000_003_000),
         ] {
             let receipt = ApplyReceipt {
-                content_hash: format!("{}", "a".repeat(63) + &format!("{i}")),
+                content_hash: "a".repeat(63) + &i.to_string(),
                 profile_name: "dev".to_string(),
                 profile_updated_at_ms: 1_700_000_000_000,
                 count: 1,

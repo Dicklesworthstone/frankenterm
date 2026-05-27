@@ -16797,6 +16797,8 @@ fn seed_pane_with_last_seen_backend(
     .unwrap();
 }
 
+// Workflow execution seeding mirrors the storage row under test.
+#[allow(clippy::too_many_arguments)]
 fn seed_workflow_execution_backend(
     backend: &dyn StorageBackend,
     workflow_id: &str,
