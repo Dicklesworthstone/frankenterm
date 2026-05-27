@@ -2647,16 +2647,16 @@ fn command_pattern_is_match(pattern: &str, text: &str) -> bool {
     }
     CMD_REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(re) = cache.get(pattern) {
+        let cache_key = pattern.to_string();
+        if let Some(re) = cache.get(&cache_key) {
             return re.is_match(text);
         }
         match Regex::new(pattern) {
             Ok(re) => {
                 #[cfg(test)]
-                CMD_REGEX_COMPILE_COUNT_FOR_TEST
-                    .with(|c| c.set(c.get().saturating_add(1)));
+                CMD_REGEX_COMPILE_COUNT_FOR_TEST.with(|c| c.set(c.get().saturating_add(1)));
                 let is_match = re.is_match(text);
-                cache.put(pattern.to_string(), re);
+                cache.put(cache_key, re);
                 is_match
             }
             Err(_) => {
