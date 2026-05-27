@@ -2755,7 +2755,11 @@ mod test {
                 let mut max_requested = self.max_requested.lock().expect("lock max request");
                 *max_requested = (*max_requested).max(buf.len());
                 drop(max_requested);
-                self.prefix.read(buf)
+                // Disambiguate: under `--features async-asupersync` the module's
+                // `asupersync::io::AsyncReadExt` is in scope and its blanket `read`
+                // collides with `std::io::Read::read` for `Cursor` (E0034). This is
+                // the sync `impl Read`, so spell out the std trait.
+                std::io::Read::read(&mut self.prefix, buf)
             }
         }
 
