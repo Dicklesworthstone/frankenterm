@@ -239,11 +239,10 @@ impl KeybindingRegistry {
 
         let ids = {
             let lookup = self.lookup_guard();
-            let ids = match lookup.get(&canonical) {
+            match lookup.get(&canonical) {
                 Some(ids) => ids.clone(),
                 None => return Ok(vec![]),
-            };
-            ids
+            }
         };
 
         let handlers: Vec<Arc<KeyHandlerFn>> = {
