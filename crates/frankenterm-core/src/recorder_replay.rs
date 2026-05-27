@@ -2792,19 +2792,34 @@ mod tests {
     /// Confirms NaN + NEG_INFINITY are rejected, INFINITY passes.
     #[test]
     fn replay_config_validate_rejects_nan_and_neg_infinity() {
-        let mut config = ReplayConfig::default();
-        config.speed = f64::NAN;
-        assert!(config.validate().is_err(), "NaN must be rejected");
-        config.speed = f64::NEG_INFINITY;
-        assert!(config.validate().is_err(), "-INFINITY must be rejected");
-        config.speed = f64::INFINITY;
-        assert!(config.validate().is_ok(), "+INFINITY must pass");
-        config.speed = 0.0;
-        assert!(config.validate().is_err(), "0.0 must be rejected");
-        config.speed = -1.0;
-        assert!(config.validate().is_err(), "negative must be rejected");
-        config.speed = 1.0;
-        assert!(config.validate().is_ok(), "positive must pass");
+        let config_with_speed = |speed| ReplayConfig {
+            speed,
+            ..Default::default()
+        };
+        assert!(
+            config_with_speed(f64::NAN).validate().is_err(),
+            "NaN must be rejected"
+        );
+        assert!(
+            config_with_speed(f64::NEG_INFINITY).validate().is_err(),
+            "-INFINITY must be rejected"
+        );
+        assert!(
+            config_with_speed(f64::INFINITY).validate().is_ok(),
+            "+INFINITY must pass"
+        );
+        assert!(
+            config_with_speed(0.0).validate().is_err(),
+            "0.0 must be rejected"
+        );
+        assert!(
+            config_with_speed(-1.0).validate().is_err(),
+            "negative must be rejected"
+        );
+        assert!(
+            config_with_speed(1.0).validate().is_ok(),
+            "positive must pass"
+        );
     }
 
     #[test]

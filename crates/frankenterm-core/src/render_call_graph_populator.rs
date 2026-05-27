@@ -800,8 +800,10 @@ fn alternate_paint_root() {
     let _ = triple_buffer.write();
 }
 ";
-        let mut cfg = PopulatorConfig::default();
-        cfg.render_entry_names = vec!["alternate_paint_root".to_string()];
+        let cfg = PopulatorConfig {
+            render_entry_names: vec!["alternate_paint_root".to_string()],
+            ..Default::default()
+        };
         let out = populate_from_sources(&[("paint.rs".to_string(), src.to_string())], &cfg);
         assert_eq!(out.entry_points.len(), 1);
         assert_eq!(out.entry_points[0].function_name, "alternate_paint_root");

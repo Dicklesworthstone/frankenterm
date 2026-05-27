@@ -569,8 +569,10 @@ fn alt_paint_root() {
 }
 fn paint_impl() { let _ = triple_buffer.read(); }
 ";
-        let mut populator_cfg = PopulatorConfig::default();
-        populator_cfg.render_entry_names = vec!["alt_paint_root".to_string()];
+        let populator_cfg = PopulatorConfig {
+            render_entry_names: vec!["alt_paint_root".to_string()],
+            ..Default::default()
+        };
         let report = run_audit_on_sources(
             &[pair("paint.rs", src)],
             &populator_cfg,

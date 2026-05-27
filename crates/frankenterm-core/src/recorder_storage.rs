@@ -3086,32 +3086,40 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_zero_queue_capacity() {
-        let mut cfg = AppendLogStorageConfig::default();
-        cfg.queue_capacity = 0;
+        let cfg = AppendLogStorageConfig {
+            queue_capacity: 0,
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
     }
 
     #[test]
     fn config_validate_rejects_zero_max_batch_events() {
-        let mut cfg = AppendLogStorageConfig::default();
-        cfg.max_batch_events = 0;
+        let cfg = AppendLogStorageConfig {
+            max_batch_events: 0,
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
     }
 
     #[test]
     fn config_validate_rejects_zero_max_batch_bytes() {
-        let mut cfg = AppendLogStorageConfig::default();
-        cfg.max_batch_bytes = 0;
+        let cfg = AppendLogStorageConfig {
+            max_batch_bytes: 0,
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
     }
 
     #[test]
     fn config_validate_rejects_zero_idempotency_entries() {
-        let mut cfg = AppendLogStorageConfig::default();
-        cfg.max_idempotency_entries = 0;
+        let cfg = AppendLogStorageConfig {
+            max_idempotency_entries: 0,
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
     }

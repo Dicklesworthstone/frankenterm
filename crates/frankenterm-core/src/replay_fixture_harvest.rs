@@ -2925,8 +2925,10 @@ mod tests {
 
     #[test]
     fn redaction_hash_mode_is_deterministic() {
-        let mut harvester = FixtureHarvester::default();
-        harvester.redaction_mode = RedactionMode::Hash;
+        let harvester = FixtureHarvester {
+            redaction_mode: RedactionMode::Hash,
+            ..Default::default()
+        };
         let mut event_a =
             make_ingress_event("ev-1", 1, 0, "token sk-abcdefghijklmnopqrstuvwxyz123456");
         let mut event_b =
@@ -2947,8 +2949,10 @@ mod tests {
 
     #[test]
     fn redaction_drop_mode_clears_content() {
-        let mut harvester = FixtureHarvester::default();
-        harvester.redaction_mode = RedactionMode::Drop;
+        let harvester = FixtureHarvester {
+            redaction_mode: RedactionMode::Drop,
+            ..Default::default()
+        };
         let mut event =
             make_ingress_event("ev-1", 1, 0, "token sk-abcdefghijklmnopqrstuvwxyz123456");
 
@@ -3237,8 +3241,10 @@ mod tests {
 
     #[test]
     fn redaction_hash_mode_scrubs_control_marker_details() {
-        let mut harvester = FixtureHarvester::default();
-        harvester.redaction_mode = RedactionMode::Hash;
+        let harvester = FixtureHarvester {
+            redaction_mode: RedactionMode::Hash,
+            ..Default::default()
+        };
         let mut event = make_decision_event("ev-1", 1, 0);
         if let RecorderEventPayload::ControlMarker { details, .. } = &mut event.payload {
             *details = serde_json::json!({

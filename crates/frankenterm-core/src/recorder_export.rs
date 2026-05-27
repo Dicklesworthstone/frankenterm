@@ -760,8 +760,10 @@ mod tests {
     #[test]
     fn export_with_pane_filter() {
         let exporter = test_exporter(sample_events());
-        let mut req = ExportRequest::default();
-        req.pane_ids = vec![2];
+        let req = ExportRequest {
+            pane_ids: vec![2],
+            ..Default::default()
+        };
 
         let result = exporter.export(&human(), &req, NOW).unwrap();
         assert_eq!(result.event_count, 1); // Only pane 2 event.
@@ -770,8 +772,10 @@ mod tests {
     #[test]
     fn export_with_kind_filter() {
         let exporter = test_exporter(sample_events());
-        let mut req = ExportRequest::default();
-        req.kind_filter = vec![QueryEventKind::LifecycleMarker];
+        let req = ExportRequest {
+            kind_filter: vec![QueryEventKind::LifecycleMarker],
+            ..Default::default()
+        };
 
         // All events are IngressText, so LifecycleMarker filter yields empty.
         let result = exporter.export(&human(), &req, NOW);
@@ -889,8 +893,10 @@ mod tests {
 
     #[test]
     fn required_tier_t3() {
-        let mut req = ExportRequest::default();
-        req.max_sensitivity = Some(SensitivityTier::T3Restricted);
+        let req = ExportRequest {
+            max_sensitivity: Some(SensitivityTier::T3Restricted),
+            ..Default::default()
+        };
         assert_eq!(req.required_tier(), AccessTier::A3PrivilegedRaw);
     }
 

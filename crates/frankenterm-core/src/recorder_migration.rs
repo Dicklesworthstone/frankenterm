@@ -2023,14 +2023,16 @@ mod tests {
 
     #[test]
     fn test_migration_manifest_serialize_roundtrip() {
-        let mut manifest = MigrationManifest::default();
-        manifest.event_count = 42;
-        manifest.first_ordinal = 1;
-        manifest.last_ordinal = 42;
+        let mut manifest = MigrationManifest {
+            event_count: 42,
+            first_ordinal: 1,
+            last_ordinal: 42,
+            export_digest: 0xCAFE,
+            export_count: 42,
+            ..Default::default()
+        };
         manifest.per_pane_counts.insert(1, 20);
         manifest.per_pane_counts.insert(2, 22);
-        manifest.export_digest = 0xCAFE;
-        manifest.export_count = 42;
 
         let json = serde_json::to_string(&manifest).unwrap();
         let restored: MigrationManifest = serde_json::from_str(&json).unwrap();
