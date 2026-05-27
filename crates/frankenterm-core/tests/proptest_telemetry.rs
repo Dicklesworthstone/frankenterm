@@ -925,11 +925,13 @@ proptest! {
         pid in 0_u32..65535,
         per_process_metrics in any::<bool>(),
     ) {
-        let mut config = TelemetryConfig::default();
-        config.buffer_capacity = capacity;
-        config.histogram_buckets = buckets;
-        config.mux_server_pid = pid;
-        config.per_process_metrics = per_process_metrics;
+        let config = TelemetryConfig {
+            buffer_capacity: capacity,
+            histogram_buckets: buckets,
+            mux_server_pid: pid,
+            per_process_metrics,
+            ..TelemetryConfig::default()
+        };
         let json = serde_json::to_string(&config).unwrap();
         let back: TelemetryConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.buffer_capacity, capacity);

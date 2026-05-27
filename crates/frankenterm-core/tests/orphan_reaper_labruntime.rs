@@ -53,8 +53,10 @@ fn reap_orphans_async_zero_max_age() {
 fn run_orphan_reaper_disabled_returns_immediately() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mut config = CliConfig::default();
-        config.orphan_reap_interval_seconds = 0; // disabled
+        let config = CliConfig {
+            orphan_reap_interval_seconds: 0, // disabled
+            ..CliConfig::default()
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Should return immediately when interval is 0
@@ -72,8 +74,10 @@ fn run_orphan_reaper_disabled_returns_immediately() {
 fn run_orphan_reaper_responds_to_shutdown() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mut config = CliConfig::default();
-        config.orphan_reap_interval_seconds = 1; // 1 second interval
+        let config = CliConfig {
+            orphan_reap_interval_seconds: 1, // 1 second interval
+            ..CliConfig::default()
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
