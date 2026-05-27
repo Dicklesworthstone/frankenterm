@@ -993,9 +993,11 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
             }
         });
 
-        let mut config = DirectMuxClientConfig::default();
-        config.socket_path = Some(socket_path);
-        config.read_timeout = Duration::from_millis(25);
+        let config = DirectMuxClientConfig {
+            socket_path: Some(socket_path),
+            read_timeout: Duration::from_millis(25),
+            ..DirectMuxClientConfig::default()
+        };
 
         let mut client = DirectMuxClient::connect_with_cx(&cx, config)
             .await
@@ -1092,10 +1094,12 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
             }
         });
 
-        let mut config = DirectMuxClientConfig::default();
-        config.socket_path = Some(socket_path);
-        config.read_timeout = Duration::from_millis(200);
-        config.write_timeout = Duration::from_millis(5);
+        let config = DirectMuxClientConfig {
+            socket_path: Some(socket_path),
+            read_timeout: Duration::from_millis(200),
+            write_timeout: Duration::from_millis(5),
+            ..DirectMuxClientConfig::default()
+        };
 
         let mut client = DirectMuxClient::connect_with_cx(&cx, config)
             .await
@@ -2442,9 +2446,11 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
             }
         });
 
-        let mut config = DirectMuxClientConfig::default();
-        config.socket_path = Some(socket_path);
-        config.read_timeout = Duration::from_millis(25);
+        let config = DirectMuxClientConfig {
+            socket_path: Some(socket_path),
+            read_timeout: Duration::from_millis(25),
+            ..DirectMuxClientConfig::default()
+        };
 
         let mut client = DirectMuxClient::connect_with_cx(&cx, config)
             .await
@@ -2540,9 +2546,11 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
             }
         });
 
-        let mut config = DirectMuxClientConfig::default();
-        config.socket_path = Some(socket_path);
-        config.read_timeout = Duration::from_millis(25);
+        let config = DirectMuxClientConfig {
+            socket_path: Some(socket_path),
+            read_timeout: Duration::from_millis(25),
+            ..DirectMuxClientConfig::default()
+        };
 
         let mut client = DirectMuxClient::connect_with_cx(&cx, config)
             .await
@@ -2639,9 +2647,11 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
             }
         });
 
-        let mut config = DirectMuxClientConfig::default();
-        config.socket_path = Some(socket_path);
-        config.read_timeout = Duration::from_millis(25);
+        let config = DirectMuxClientConfig {
+            socket_path: Some(socket_path),
+            read_timeout: Duration::from_millis(25),
+            ..DirectMuxClientConfig::default()
+        };
 
         let mut client = DirectMuxClient::connect_with_cx(&cx, config)
             .await

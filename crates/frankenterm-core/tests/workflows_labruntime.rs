@@ -620,8 +620,10 @@ fn handle_process_triage_lifecycle_step0_aborts_on_alt_screen() {
                 .expect("storage"),
         );
 
-        let mut caps = PaneCapabilities::default();
-        caps.alt_screen = Some(true);
+        let caps = PaneCapabilities {
+            alt_screen: Some(true),
+            ..PaneCapabilities::default()
+        };
         let mut ctx = WorkflowContext::new(storage, 7, caps, "exec-triage-alt");
 
         let wf = HandleProcessTriageLifecycle::new();
