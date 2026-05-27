@@ -1,0 +1,59 @@
+# Heavy CI specialized job triage
+
+Date: 2026-05-27
+Task: `#26`
+Status: live triage contract for specialized CI failures
+
+## Purpose
+
+This document separates ordinary fixable failures from CI lanes that need a
+specific host, runtime, or hardware surface. A failed specialized job should
+first be classified here before it is treated as a code defect.
+
+## Fixable specialized jobs
+
+These jobs run on standard GitHub-hosted runners and are expected to be fixed
+in this repository when they fail.
+
+| Job | Runner | Fix posture | Current task #26 disposition |
+| --- | --- | --- | --- |
+| Formal Methods | `ubuntu-latest` | Fix stale tool checksums, spec scripts, or model-test code. | Fixed stale `tla2tools.jar` SHA1 in CI. |
+| Generated Artifacts | `ubuntu-latest` | Fix generated-artifact drift, count drift, or proof coverage regressions. | Fixed runtime-proof coverage drift for IPC/native-event wrappers; `storage.rs::count_events` uses its existing Cx sibling. |
+| Operator Shell Tests | `ubuntu-latest`, `macos-14` | Fix shell portability, fixtures, or stale goldens. | Fixed stale Agent Mail fallback fixture/schema expectations. |
+| Security Audit | `ubuntu-latest` | Fix high/critical advisories by updating or removing vulnerable dependencies; warning-class allowlisted advisories remain audit debt. | Fixed `RUSTSEC-2026-0149` by moving `wasmtime` and `wasmtime-wasi` to `44.0.2`. |
+| Coverage | `ubuntu-latest` | Fix missing CI packages or code-level coverage command breakage. | Fixed missing Cairo/X11/pkg-config packages before `cargo llvm-cov`. |
+| Resize Performance Gates | `ubuntu-latest` plus RCH cargo execution inside the script | Fix compile drift, script errors, missing artifacts, or real threshold regressions when the standard runner and RCH lane are healthy. | Fixed compile drift in the timeline/warning validation lanes and gated the resize benchmark dependencies. |
+
+## Host or hardware specific jobs
+
+These jobs can be red for structural reasons that are not fixable by changing
+ordinary Rust code.
+
+| Job | Required surface | Blocked classification | Action when red |
+| --- | --- | --- | --- |
+| `Test (windows-latest)` | A real GitHub-hosted Windows runner and Windows runtime behavior, not just a local cross-check. | Host/runtime-specific. Cross-compilation can catch `cfg` and metadata errors, but it cannot prove native Windows process, filesystem, path, shell, or named-pipe behavior. | Pull the failed Windows job log. Fix compile/test defects that name repository code. If the failure is runner image drift, Windows-only service behavior, path length, OpenSSL/Perl bootstrap, or another host/runtime facility, document the exact log line and keep it blocked on Windows runner behavior. |
+| `GPU Regression (macOS 15 Metal)` | macOS 15 on Apple Silicon with a Metal adapter. | Hardware-specific reference lane. Linux llvmpipe and local headless checks are diagnostic only and cannot prove the Metal golden path. | Fix harness or fixture defects that reproduce without Metal. If adapter availability, Metal driver behavior, or hosted macOS graphics capability is the cause, retain the uploaded artifacts and classify as hardware/host blocked. |
+| `GPU Regression (Linux llvmpipe)` | Ubuntu 24.04 with Mesa Vulkan software renderer and the `llvmpipe` adapter selected. | Host/runtime-specific software-renderer lane. It is not a substitute for macOS Metal goldens. | Fix package or harness defects when the Mesa stack is installable. If the hosted image cannot provide the expected software adapter or Vulkan ICD, classify as host blocked and cite the adapter/probe log. |
+| `GPU Regression Required` | Aggregates the macOS Metal and Linux llvmpipe results. | Derived gate. It is only actionable through the underlying GPU jobs. | Do not patch this gate directly unless the aggregation logic is wrong. Classify by the failed dependency result. |
+
+## Triage procedure
+
+1. Pull the failed job log with `gh run view --job <job-id> --log-failed`.
+2. Identify the first root-cause failure, not the final aggregate failure.
+3. If the cause is in repository code, workflow configuration, fixtures, or
+   dependency versions, fix it and commit the narrow change.
+4. If the cause requires a specific hosted runner runtime or graphics adapter,
+   record the exact missing surface and leave the job classified as
+   host/hardware blocked.
+5. For aggregate jobs, classify by their failed dependency.
+
+## Current task #26 proof notes
+
+- `cargo check -p frankenterm-core --lib` passed through RCH remote worker
+  `vmi1152480` after the fixable changes.
+- The focused generated-artifact test lane reached RCH remote worker
+  `vmi1153651` but timed out at the RCH SSH command limit. That timeout is
+  proof-lane red, not a local cargo substitute and not evidence of a code
+  failure.
+- Local helper checks used for non-Cargo surfaces: runtime-proof script,
+  operator Bats fixtures, `cargo audit`, `git diff --check`, and `actionlint`.
