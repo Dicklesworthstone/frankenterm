@@ -20,6 +20,7 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::replay_decision_graph::DecisionType;
 use frankenterm_core_replay::replay_decision_diff::{
     Divergence, DivergenceNode, DivergenceType, RootCause,
 };
@@ -50,6 +51,7 @@ fn arb_effort() -> impl Strategy<Value = EffortEstimate> {
 fn make_node(rule_id: &str) -> DivergenceNode {
     DivergenceNode {
         node_id: 0,
+        decision_type: DecisionType::PatternMatch,
         rule_id: rule_id.into(),
         definition_hash: "d".into(),
         output_hash: "o".into(),

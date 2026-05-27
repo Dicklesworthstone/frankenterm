@@ -23,6 +23,7 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::replay_decision_graph::DecisionType;
 use frankenterm_core_replay::replay_decision_diff::{
     Divergence, DivergenceNode, DivergenceType, RootCause,
 };
@@ -66,6 +67,7 @@ fn make_shifted_divergence() -> Divergence {
         divergence_type: DivergenceType::Shifted,
         baseline_node: Some(DivergenceNode {
             node_id: 0,
+            decision_type: DecisionType::PatternMatch,
             rule_id: "r1".into(),
             definition_hash: "d".into(),
             output_hash: "o".into(),
@@ -74,6 +76,7 @@ fn make_shifted_divergence() -> Divergence {
         }),
         candidate_node: Some(DivergenceNode {
             node_id: 0,
+            decision_type: DecisionType::PatternMatch,
             rule_id: "r1".into(),
             definition_hash: "d".into(),
             output_hash: "o".into(),
@@ -296,6 +299,7 @@ proptest! {
             divergence_type: DivergenceType::Modified,
             baseline_node: Some(DivergenceNode {
                 node_id: 0,
+                decision_type: DecisionType::PatternMatch,
                 rule_id: "custom_rule".into(),
                 definition_hash: "d1".into(),
                 output_hash: "o1".into(),
@@ -304,6 +308,7 @@ proptest! {
             }),
             candidate_node: Some(DivergenceNode {
                 node_id: 0,
+                decision_type: DecisionType::PatternMatch,
                 rule_id: "custom_rule".into(),
                 definition_hash: "d2".into(),
                 output_hash: "o2".into(),
@@ -333,6 +338,7 @@ proptest! {
                 baseline_node: None,
                 candidate_node: Some(DivergenceNode {
                     node_id: 1,
+                    decision_type: DecisionType::PatternMatch,
                     rule_id: "rule_a".into(),
                     definition_hash: "d".into(),
                     output_hash: "o".into(),
