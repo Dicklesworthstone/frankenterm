@@ -2604,6 +2604,71 @@ fn record_invalid_regex_compile() {
     POLICY_INVALID_REGEX_COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+// ft-29gys: per-thread count of actual `Regex::new` compiles performed inside
+// `command_pattern_is_match` (cache MISSES). Thread-local to match the
+// thread-local regex cache below, so a test can assert "compiled once, not
+// per-evaluate" without interference from other tests compiling patterns on
+// other worker threads.
+#[cfg(test)]
+thread_local! {
+    static CMD_REGEX_COMPILE_COUNT_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn cmd_regex_compile_count_for_test() -> u64 {
+    CMD_REGEX_COMPILE_COUNT_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cmd_regex_compile_count_for_test() {
+    CMD_REGEX_COMPILE_COUNT_FOR_TEST.with(|c| c.set(0));
+}
+
+/// Compile-once matcher for `CommandPattern` regexes on the policy hot path.
+///
+/// ft-29gys: policy evaluation runs per-action, and the `RulePredicate`
+/// `CommandPattern` arm previously called `Regex::new(pattern)` on *every*
+/// `evaluate()`, recompiling the same operator-authored patterns repeatedly.
+/// A per-thread LRU cache keyed by the pattern string compiles each distinct
+/// pattern at most once per worker thread (bounded to 128 entries so a
+/// pathological rule set can't grow it without bound), then reuses the
+/// compiled `Regex`. Thread-local rather than a shared lock keeps the hot
+/// path contention-free. Both `CommandPattern` matching paths (the flat
+/// `matches_rule` and the composable `RulePredicate::evaluate`) route through
+/// here so they share one cache.
+///
+/// On compile failure the pattern is treated as "no match" and the
+/// br-ft-fp6st invalid-regex counter is bumped (unchanged behavior).
+fn command_pattern_is_match(pattern: &str, text: &str) -> bool {
+    thread_local! {
+        static CMD_REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, Regex>> =
+            std::cell::RefCell::new(crate::lru_cache::LruCache::new(128));
+    }
+    CMD_REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(re) = cache.get(pattern) {
+            return re.is_match(text);
+        }
+        match Regex::new(pattern) {
+            Ok(re) => {
+                #[cfg(test)]
+                CMD_REGEX_COMPILE_COUNT_FOR_TEST
+                    .with(|c| c.set(c.get().saturating_add(1)));
+                let is_match = re.is_match(text);
+                cache.put(pattern.to_string(), re);
+                is_match
+            }
+            Err(_) => {
+                // br-ft-fp6st: malformed regex silently disables the rule;
+                // surface as an observable counter.
+                record_invalid_regex_compile();
+                false
+            }
+        }
+    })
+}
+
 /// Cumulative count of clock-before-UNIX_EPOCH anomalies hit by
 /// policy.rs's audit-timestamp helpers since process load.
 /// Forensic verification: when this is > 0, the audit chain
@@ -4111,36 +4176,15 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
         }
     }
 
-    // Check command patterns (regex) — cached to avoid recompilation on every policy check
+    // Check command patterns (regex) — cached to avoid recompilation on every
+    // policy check (ft-29gys; shared cache via command_pattern_is_match).
     if !match_on.command_patterns.is_empty() {
         match &input.command_text {
             Some(text) => {
-                thread_local! {
-                    static CMD_REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, Regex>> =
-                        std::cell::RefCell::new(crate::lru_cache::LruCache::new(128));
-                }
-                let matches_any = match_on.command_patterns.iter().any(|pattern| {
-                    CMD_REGEX_CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
-                        if let Some(re) = cache.get(pattern) {
-                            return re.is_match(text);
-                        }
-                        match Regex::new(pattern) {
-                            Ok(re) => {
-                                let is_match = re.is_match(text);
-                                cache.put(pattern.clone(), re);
-                                is_match
-                            }
-                            Err(_) => {
-                                // br-ft-fp6st: malformed regex silently
-                                // disables the rule; surface as an
-                                // observable counter.
-                                record_invalid_regex_compile();
-                                false
-                            }
-                        }
-                    })
-                });
+                let matches_any = match_on
+                    .command_patterns
+                    .iter()
+                    .any(|pattern| command_pattern_is_match(pattern, text));
                 if !matches_any {
                     return false;
                 }
@@ -4263,17 +4307,11 @@ impl RulePredicate {
             },
             Self::CommandPattern { patterns } => match &input.command_text {
                 Some(text) => {
+                    // ft-29gys: route through the shared compile-once cache
+                    // instead of Regex::new(p) on every evaluate() (per-action
+                    // hot path).
                     !patterns.is_empty()
-                        && patterns.iter().any(|p| match Regex::new(p) {
-                            Ok(re) => re.is_match(text),
-                            Err(_) => {
-                                // br-ft-fp6st: malformed regex silently
-                                // disables the rule; surface as an
-                                // observable counter.
-                                record_invalid_regex_compile();
-                                false
-                            }
-                        })
+                        && patterns.iter().any(|p| command_pattern_is_match(p, text))
                 }
                 None => false,
             },
@@ -14432,6 +14470,34 @@ mod tests {
         assert!(
             after > before,
             "br-ft-fp6st: RulePredicate path must bump counter; before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn command_pattern_regex_compiled_once_not_per_evaluate_ft_29gys() {
+        // ft-29gys: the CommandPattern arm used to call Regex::new on every
+        // evaluate(). Pin that a single distinct pattern compiles exactly once
+        // across many evaluations (the rest hit the per-thread cache).
+        //
+        // The compile counter and the regex cache are both thread-local, and
+        // tests run on per-test worker threads, so a unique pattern guarantees
+        // a clean first-miss here regardless of what other tests compiled.
+        super::reset_cmd_regex_compile_count_for_test();
+        let predicate = RulePredicate::CommandPattern {
+            patterns: vec![r"ft29gys-compile-once-[0-9]+".to_string()],
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("ft29gys-compile-once-42".to_string());
+
+        for _ in 0..256 {
+            assert!(predicate.evaluate(&input));
+        }
+
+        assert_eq!(
+            super::cmd_regex_compile_count_for_test(),
+            1,
+            "ft-29gys: CommandPattern regex must compile once and be cached, \
+             not recompiled on every evaluate()"
         );
     }
 
