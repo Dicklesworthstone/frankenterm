@@ -712,6 +712,11 @@ path = "tests/proptest_search.rs"
 required-features = ["recorder-lexical"]
 
 [[test]]
+name = "proptest_search_fastembed"
+path = "tests/proptest_search_fastembed.rs"
+required-features = ["semantic-search"]
+
+[[test]]
 name = "proptest_tantivy_ingest"
 path = "tests/proptest_tantivy_ingest.rs"
 required-features = ["recorder-lexical"]
@@ -754,6 +759,16 @@ required-features = ["browser"]
 name = "proptest_web_framework"
 path = "tests/proptest_web_framework.rs"
 required-features = ["web"]
+
+[[test]]
+name = "proptest_web"
+path = "tests/proptest_web.rs"
+required-features = ["web"]
+
+[[test]]
+name = "proptest_wezterm_native"
+path = "tests/proptest_wezterm_native.rs"
+required-features = ["native-wezterm"]
 
 [[test]]
 name = "recorder_recovery_drills"
