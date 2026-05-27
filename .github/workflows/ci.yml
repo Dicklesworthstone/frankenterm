@@ -441,7 +441,7 @@ jobs:
           curl -fsSL \
             -o /tmp/tla2tools.jar \
             https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-          echo "742aaa175541332011ff63c0246d5d759d30a620  /tmp/tla2tools.jar" | sha1sum -c -
+          echo "b1f5c956157889e557e8933f0c85e4698c09f1a8  /tmp/tla2tools.jar" | sha1sum -c -
           java -version
 
       - name: Check formal spec conventions
@@ -1129,6 +1129,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
+      - name: Install Linux workspace build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config jq bc
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
 

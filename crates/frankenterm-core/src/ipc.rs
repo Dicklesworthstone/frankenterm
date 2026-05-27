@@ -66,6 +66,17 @@ mod socket_transport {
         }
 
         pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            connect_with_cx(&cx, path).await
+        }
+
+        pub async fn connect_with_cx<P: AsRef<Path>>(
+            cx: &crate::cx::Cx,
+            path: P,
+        ) -> io::Result<UnixStream> {
+            cx.checkpoint().map_err(|err| {
+                io::Error::new(io::ErrorKind::Interrupted, format!("connect cancelled: {err}"))
+            })?;
             let stream = UnixStream::connect(path)?;
             stream.set_nonblocking(true)?;
             Ok(stream)
@@ -73,14 +84,32 @@ mod socket_transport {
 
         impl UnixListener {
             pub async fn accept(&self) -> io::Result<(UnixStream, ())> {
+                let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                self.accept_with_cx(&cx).await
+            }
+
+            pub async fn accept_with_cx(&self, cx: &crate::cx::Cx) -> io::Result<(UnixStream, ())> {
                 loop {
+                    cx.checkpoint().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            format!("accept cancelled: {err}"),
+                        )
+                    })?;
                     match self.inner.accept() {
                         Ok((stream, _addr)) => {
                             stream.set_nonblocking(true)?;
                             return Ok((stream, ()));
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                            crate::runtime_async::sleep(Duration::from_millis(1)).await;
+                            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(1))
+                                .await
+                                .map_err(|err| {
+                                    io::Error::new(
+                                        io::ErrorKind::Interrupted,
+                                        format!("accept wait cancelled: {err}"),
+                                    )
+                                })?;
                         }
                         Err(err) => return Err(err),
                     }

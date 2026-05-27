@@ -72,6 +72,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # async-await against a runtime primitive lives in the
     # `_with_cx` covered sibling.
     ("ipc.rs", "bind"),
+    ("ipc.rs", "connect"),
+    ("ipc.rs", "accept"),
     ("ipc.rs", "bind_with_permissions"),
     ("ipc.rs", "run"),
     ("ipc.rs", "run_with_registry"),
@@ -378,6 +380,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("storage.rs", "prune_segments_before"),
     ("storage.rs", "retention_cleanup"),
     ("storage.rs", "record_usage_metric"),
+    ("storage.rs", "count_events"),
     ("storage.rs", "record_usage_metrics_batch"),
     ("storage.rs", "purge_usage_metrics"),
     ("storage.rs", "query_usage_metrics"),
@@ -546,6 +549,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("metrics.rs", "start"),
     ("metrics.rs", "wait"),
     ("native_events.rs", "bind"),
+    ("native_events.rs", "connect"),
+    ("native_events.rs", "accept"),
     ("native_events.rs", "run"),
     ("notifications.rs", "handle_detection"),
     ("orphan_reaper.rs", "reap_orphans"),
