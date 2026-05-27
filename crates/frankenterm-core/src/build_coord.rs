@@ -1604,15 +1604,15 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: BuildCoordConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.enabled, false);
+        assert!(!back.enabled);
         assert_eq!(back.wait_timeout, Duration::from_secs(120));
         assert_eq!(back.poll_interval, Duration::from_millis(200));
-        assert_eq!(back.shared_target_dir, false);
+        assert!(!back.shared_target_dir);
         assert_eq!(
             back.target_dir_override,
             Some(PathBuf::from("/custom/target"))
         );
-        assert_eq!(back.auto_sccache, false);
+        assert!(!back.auto_sccache);
         assert_eq!(back.lock_dir_override, Some(PathBuf::from("/custom/locks")));
     }
 
@@ -1631,7 +1631,7 @@ mod tests {
             ..Default::default()
         };
         let config2 = config.clone();
-        assert_eq!(config2.enabled, false);
+        assert!(!config2.enabled);
     }
 
     // ====================================================================

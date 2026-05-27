@@ -2341,23 +2341,25 @@ mod tests {
 
     #[test]
     fn delete_batch_size_is_positive() {
-        assert!(DELETE_BATCH_SIZE > 0);
+        const { assert!(DELETE_BATCH_SIZE > 0) };
     }
 
     #[test]
     fn delete_batch_size_is_reasonable() {
         // Batch size should be large enough to be efficient but not so large
         // as to cause long-running transactions
-        assert!(DELETE_BATCH_SIZE >= 100, "batch too small for efficiency");
-        assert!(DELETE_BATCH_SIZE <= 100_000, "batch too large for safety");
+        const { assert!(DELETE_BATCH_SIZE >= 100, "batch too small for efficiency") };
+        const { assert!(DELETE_BATCH_SIZE <= 100_000, "batch too large for safety") };
     }
 
     #[test]
     fn cleanup_plan_dry_run_field_independent() {
         // dry_run is just a flag -- doesn't affect other fields
-        let mut p = CleanupPlan::default();
-        p.dry_run = true;
-        p.total_deleted = 42;
+        let p = CleanupPlan {
+            dry_run: true,
+            total_deleted: 42,
+            ..Default::default()
+        };
         assert!(p.dry_run);
         assert_eq!(p.total_deleted, 42);
     }

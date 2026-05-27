@@ -801,9 +801,11 @@ mod tests {
 
     #[test]
     fn stats_success_rate_caps_at_100() {
-        let mut s = BlockStats::default();
-        s.blocks_completed_total = 10;
-        s.blocks_succeeded_total = 50;
+        let s = BlockStats {
+            blocks_completed_total: 10,
+            blocks_succeeded_total: 50,
+            ..Default::default()
+        };
         // Defensive: cap at 100 even when synthetic over-count.
         assert_eq!(s.success_rate_pct(), 100);
     }

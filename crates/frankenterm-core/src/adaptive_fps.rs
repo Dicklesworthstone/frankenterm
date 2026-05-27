@@ -442,17 +442,25 @@ mod tests {
 
     #[test]
     fn wake_override_any_active_detects_each() {
-        let mut o = WakeOverride::default();
-        o.active_typing = true;
+        let o = WakeOverride {
+            active_typing: true,
+            ..Default::default()
+        };
         assert!(o.any_active());
-        let mut o = WakeOverride::default();
-        o.bell_received = true;
+        let o = WakeOverride {
+            bell_received: true,
+            ..Default::default()
+        };
         assert!(o.any_active());
-        let mut o = WakeOverride::default();
-        o.live_resize = true;
+        let o = WakeOverride {
+            live_resize: true,
+            ..Default::default()
+        };
         assert!(o.any_active());
-        let mut o = WakeOverride::default();
-        o.a11y_query_in_flight = true;
+        let o = WakeOverride {
+            a11y_query_in_flight: true,
+            ..Default::default()
+        };
         assert!(o.any_active());
     }
 
