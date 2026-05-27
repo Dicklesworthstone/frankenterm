@@ -1116,13 +1116,15 @@ mod tests {
 
     #[test]
     fn governor_telemetry_serde_roundtrip() {
-        let mut telem = GovernorTelemetry::default();
-        telem.evaluations = 10;
-        telem.allowed = 5;
-        telem.throttled = 2;
-        telem.offloaded = 1;
-        telem.blocked = 1;
-        telem.overrides = 1;
+        let telem = GovernorTelemetry {
+            evaluations: 10,
+            allowed: 5,
+            throttled: 2,
+            offloaded: 1,
+            blocked: 1,
+            overrides: 1,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&telem).unwrap();
         let restored: GovernorTelemetry = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.evaluations, 10);

@@ -2023,8 +2023,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_nan_canary_agent_fraction_ft_43wis() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.canary_agent_fraction = f64::NAN;
+        let cfg = CanaryRolloutConfig {
+            canary_agent_fraction: f64::NAN,
+            ..Default::default()
+        };
         let err = cfg.validate().expect_err("NaN must be rejected");
         assert!(matches!(
             err,
@@ -2034,8 +2036,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_negative_canary_agent_fraction_ft_43wis() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.canary_agent_fraction = -0.1;
+        let cfg = CanaryRolloutConfig {
+            canary_agent_fraction: -0.1,
+            ..Default::default()
+        };
         assert!(matches!(
             cfg.validate(),
             Err(CanaryConfigError::InvalidCanaryAgentFraction(_))
@@ -2044,8 +2048,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_canary_agent_fraction_above_one_ft_43wis() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.canary_agent_fraction = 1.5;
+        let cfg = CanaryRolloutConfig {
+            canary_agent_fraction: 1.5,
+            ..Default::default()
+        };
         assert!(matches!(
             cfg.validate(),
             Err(CanaryConfigError::InvalidCanaryAgentFraction(_))
@@ -2054,8 +2060,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_inf_fidelity_threshold_ft_43wis() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.fidelity_threshold = f64::INFINITY;
+        let cfg = CanaryRolloutConfig {
+            fidelity_threshold: f64::INFINITY,
+            ..Default::default()
+        };
         assert!(matches!(
             cfg.validate(),
             Err(CanaryConfigError::InvalidFidelityThreshold(_))
@@ -2064,8 +2072,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_nan_max_conflict_rate_ft_43wis() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.max_conflict_rate = f64::NAN;
+        let cfg = CanaryRolloutConfig {
+            max_conflict_rate: f64::NAN,
+            ..Default::default()
+        };
         assert!(matches!(
             cfg.validate(),
             Err(CanaryConfigError::InvalidMaxConflictRate(_))
@@ -2074,8 +2084,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_max_conflict_rate_above_one_ft_7a9pd() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.max_conflict_rate = 1.000_001;
+        let cfg = CanaryRolloutConfig {
+            max_conflict_rate: 1.000_001,
+            ..Default::default()
+        };
         assert!(matches!(
             cfg.validate(),
             Err(CanaryConfigError::InvalidMaxConflictRate(_))
@@ -2090,8 +2102,10 @@ mod tests {
 
     #[test]
     fn try_new_returns_err_on_invalid_config_ft_43wis() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.fidelity_threshold = f64::NAN;
+        let cfg = CanaryRolloutConfig {
+            fidelity_threshold: f64::NAN,
+            ..Default::default()
+        };
         let err = CanaryRolloutController::try_new(cfg).expect_err("must reject");
         assert!(matches!(
             err,
@@ -2108,8 +2122,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "br-ft-43wis")]
     fn new_panics_on_invalid_config_ft_43wis() {
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.canary_agent_fraction = f64::NAN;
+        let cfg = CanaryRolloutConfig {
+            canary_agent_fraction: f64::NAN,
+            ..Default::default()
+        };
         let _ = CanaryRolloutController::new(cfg);
     }
 
@@ -2166,8 +2182,10 @@ mod tests {
             ],
             threshold in 0.0_f64..=1.0_f64,
         ) {
-            let mut cfg = CanaryRolloutConfig::default();
-            cfg.fidelity_threshold = threshold;
+            let cfg = CanaryRolloutConfig {
+                fidelity_threshold: threshold,
+                ..Default::default()
+            };
             let controller = CanaryRolloutController::new(cfg);
             let mut diff = make_healthy_diff(1);
             diff.fidelity_score = score;
@@ -2203,8 +2221,10 @@ mod tests {
                 1.000_000_1_f64..10_000.0_f64,
             ],
         ) {
-            let mut cfg = CanaryRolloutConfig::default();
-            cfg.max_conflict_rate = max_conflict_rate;
+            let cfg = CanaryRolloutConfig {
+                max_conflict_rate,
+                ..Default::default()
+            };
 
             proptest::prop_assert!(matches!(
                 cfg.validate(),
@@ -2286,8 +2306,10 @@ mod tests {
         // ShadowDispatchLeak is Shadow-specific. In Canary phase,
         // unexpected_executions is flagged via UnexpectedExecutions
         // (the existing reason), not ShadowDispatchLeak.
-        let mut cfg = CanaryRolloutConfig::default();
-        cfg.initial_phase = CanaryPhase::Canary;
+        let cfg = CanaryRolloutConfig {
+            initial_phase: CanaryPhase::Canary,
+            ..Default::default()
+        };
         let controller = CanaryRolloutController::new(cfg);
         let mut diff = make_healthy_diff(1);
         diff.unexpected_executions = vec![unexpected_execution("bead-x", "agent-x")];
