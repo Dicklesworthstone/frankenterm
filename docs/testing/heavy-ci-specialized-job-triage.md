@@ -70,6 +70,14 @@ ordinary Rust code.
   workspace-cycle guard passes in GitHub Actions local-Cargo mode, loom skeleton
   coverage passes, RuntimeProof uncovered remains `0`, and the
   asupersync-test-only guard passes.
+- Follow-up CI run `26507296325` reached the specialized lanes after the
+  Windows OpenSSL bootstrap fix, but was cancelled by both lint jobs failing
+  `cargo fmt --all -- --check` before most heavy jobs could complete. Commit
+  `7562fd93e` applies the clean-tree rustfmt delta from an archive copy of
+  `HEAD` so the formatter gate no longer preempts the heavy-job signal.
+- Formal Methods: run `26507296325` passed the old failing TLA+ install and TLC
+  setup steps before the run was cancelled during the long kill-switch proof.
+  No new formal-methods code defect was visible in that run.
 - Coverage: old run `26488812786`, job `78001994064`, failed before coverage
   measurement because `cairo-sys-rs` could not find `cairo.pc`. The fixable CI
   package gap is closed in `ci.yml` by installing Cairo/X11/pkg-config packages
@@ -86,6 +94,14 @@ ordinary Rust code.
 - Older `Test (windows-latest)` run `26503816816`, job `78050944944`, failed
   before tests because `openssl-sys` could not find `OPENSSL_DIR` or vcpkg
   OpenSSL. `ci.yml` now provisions the same `x64-windows-static-md` OpenSSL
-  triplet already used by `windows-check.yml`.
+  triplet already used by `windows-check.yml`. Run `26507296325` confirmed
+  both Windows OpenSSL provisioning steps succeeded; the native Windows test
+  step was cancelled, so Windows runtime behavior remains host-specific and
+  unproven until a non-cancelled Windows runner completes it.
+- GPU Regression: run `26507296325` passed the Linux `llvmpipe` job. The macOS
+  15 Metal job was cancelled during the harness self-test after lint cancelled
+  the workflow, so the Metal lane remains a hardware-specific runner result,
+  not a repository-code failure.
 - Local helper checks used for non-Cargo surfaces: runtime-proof script,
-  operator Bats fixtures, `cargo audit`, `git diff --check`, and `actionlint`.
+  operator Bats fixtures, `cargo audit`, `git diff --check`, and YAML parsing.
+  `actionlint` was not installed on the local host during this pass.
