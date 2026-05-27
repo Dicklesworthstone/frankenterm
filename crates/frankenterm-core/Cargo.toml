@@ -663,6 +663,7 @@ harness = false
 [[bench]]
 name = "resize_storm"
 harness = false
+required-features = ["frankenterm-deps"]
 
 [[bench]]
 name = "atlas_stability"
