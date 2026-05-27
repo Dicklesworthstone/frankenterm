@@ -199,8 +199,10 @@ proptest! {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
-        let mut config = PipelineConfig::default();
-        config.pause_on_resize_storm = pause_on_storm;
+        let config = PipelineConfig {
+            pause_on_resize_storm: pause_on_storm,
+            ..Default::default()
+        };
         let mut pipeline = ContentIndexingPipeline::new(config, index);
 
         let lines = vec![ScrollbackLine {
@@ -242,8 +244,10 @@ proptest! {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
-        let mut config = PipelineConfig::default();
-        config.max_panes_per_tick = max_panes;
+        let config = PipelineConfig {
+            max_panes_per_tick: max_panes,
+            ..Default::default()
+        };
         let mut pipeline = ContentIndexingPipeline::new(config, index);
 
         let panes: Vec<(u64, Option<String>, Vec<ScrollbackLine>)> = (0..pane_count)
