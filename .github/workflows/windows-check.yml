@@ -90,17 +90,15 @@ jobs:
           cargo --version >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Default features: the parity target. STILL INFORMATIONAL (continue-on-error)
-      # until a CLEAN (cache-busted) green is confirmed; the operator re-requires it
-      # (removes continue-on-error) only after that — do not trust a lone green for a
-      # `-sys` crate. ft-x1klc gated openssl's `vendored` feature off Windows, so this
-      # depends on the "Provision OpenSSL (vcpkg)" step above exporting OPENSSL_DIR /
-      # OPENSSL_STATIC. If vcpkg's openssl build proves too slow/flaky here, the
-      # documented fallbacks are (b) move the Windows TLS path to rustls (no system
-      # openssl) or (c) feature-gate the openssl/SSH crates out of the default Windows build.
+      # Default features: the parity target — now a REQUIRED gate. Confirmed green on a
+      # CLEAN, cache-busted run (key windows-check-v2) with OpenSSL provisioned via the
+      # vcpkg step above (OPENSSL_DIR/OPENSSL_STATIC) after ft-x1klc gated `vendored` off
+      # Windows. This is a genuine clean green (not the earlier cached false-positive), so
+      # continue-on-error is removed to lock in the additive, zero-Mac/Linux-regression
+      # Windows-compat invariant: anything that breaks the Windows build (new ungated Unix
+      # coupling, missing #[cfg(windows)] seam, etc.) now fails CI. Keep changes additive.
       - name: cargo check --workspace (default features)
         id: check_default
-        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
