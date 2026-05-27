@@ -2435,7 +2435,7 @@ fn capture_lag_label(last_capture_ts: Option<i64>) -> (String, CellStyle) {
 /// Responsive pane layout:
 ///   Regular/wide: left list + right detail panel.
 ///   Compact: full-width list with a stacked detail panel below it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct PaneRenderFilters<'a> {
     query: &'a str,
     unhandled_only: bool,
@@ -2445,21 +2445,6 @@ struct PaneRenderFilters<'a> {
     selected_profile: Option<&'a str>,
     active_profile: Option<&'a str>,
     profile_count: usize,
-}
-
-impl Default for PaneRenderFilters<'_> {
-    fn default() -> Self {
-        Self {
-            query: "",
-            unhandled_only: false,
-            bookmarked_only: false,
-            agent_filter: None,
-            domain_filter: None,
-            selected_profile: None,
-            active_profile: None,
-            profile_count: 0,
-        }
-    }
 }
 
 fn render_panes_view(

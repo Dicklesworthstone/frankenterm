@@ -649,10 +649,11 @@ pub struct UnifiedTelemetryRecord {
 /// br-ft-7cqhu: redaction policy applied to top-level identity
 /// fields (`scope_id`, `correlation_id`, embedded record_id
 /// segments) when normalizing into a [`UnifiedTelemetryRecord`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdRedactionPolicy {
     /// Copy raw values from the source event. Legacy default.
+    #[default]
     Passthrough,
     /// Replace each identity field with a deterministic FNV-1a
     /// hash of its original value (formatted as `"hash:<u64-hex>"`).
@@ -660,12 +661,6 @@ pub enum IdRedactionPolicy {
     /// hash); raw user-controlled identifiers do not appear in the
     /// serialized record.
     Hash,
-}
-
-impl Default for IdRedactionPolicy {
-    fn default() -> Self {
-        Self::Passthrough
-    }
 }
 
 /// br-ft-7cqhu: deterministic hash of an identity field. Uses the
@@ -3439,10 +3434,11 @@ pub struct SwarmCapacityStageSnapshot {
 }
 
 /// Workload class attached to a swarm capacity certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwarmCapacityWorkloadClass {
     /// Idle observation loop with little operator traffic.
+    #[default]
     IdleObservation,
     /// Heavy pane capture and delta extraction.
     HeavyCapture,
@@ -3462,12 +3458,6 @@ pub enum SwarmCapacityWorkloadClass {
     BackpressureEscalation,
     /// Capacity-governor decision scenario.
     CapacityGovernor,
-}
-
-impl Default for SwarmCapacityWorkloadClass {
-    fn default() -> Self {
-        Self::IdleObservation
-    }
 }
 
 impl SwarmCapacityWorkloadClass {
@@ -6230,7 +6220,7 @@ pub const SWARM_CAPACITY_WORKLOAD_ADMISSION_CONTRACT_ID: &str =
 pub const SWARM_CAPACITY_WORKLOAD_ADMISSION_SCHEMA_VERSION: u16 = 1;
 
 /// Per-agent workload class used by the high-core swarm capacity planner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwarmCapacityAgentWorkloadClass {
     /// Active coding or implementation work.
@@ -6242,6 +6232,7 @@ pub enum SwarmCapacityAgentWorkloadClass {
     /// Test, fuzz, or verifier execution.
     Testing,
     /// Idle pane or wait-only loop.
+    #[default]
     Idle,
     /// Pane is blocked on external ownership, infra, or a dependency.
     Blocked,
@@ -6251,12 +6242,6 @@ pub enum SwarmCapacityAgentWorkloadClass {
     ContextSaturated,
     /// TUI-heavy or stuck pane that increases render/capture pressure.
     StuckTuiHeavy,
-}
-
-impl Default for SwarmCapacityAgentWorkloadClass {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl SwarmCapacityAgentWorkloadClass {

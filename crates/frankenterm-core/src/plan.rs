@@ -5805,9 +5805,7 @@ pub fn reconstruct_tx_resume_state(
     }
 
     let mut compensated_step_ids = Vec::new();
-    let mut compensation_phase_completed = false;
-
-    if let Some(comp) = comp_report {
+    let compensation_phase_completed = if let Some(comp) = comp_report {
         let committed_step_set = committed_step_ids
             .iter()
             .map(|step_id| step_id.0.as_str())
@@ -5824,9 +5822,10 @@ pub fn reconstruct_tx_resume_state(
             TxCompensationOutcome::NothingToCompensate => committed_step_set.is_empty(),
             TxCompensationOutcome::CompensationFailed => false,
         };
-        compensation_phase_completed =
-            outcome_can_complete && committed_step_set.is_subset(&compensated_step_set);
-    }
+        outcome_can_complete && committed_step_set.is_subset(&compensated_step_set)
+    } else {
+        false
+    };
 
     let pending_step_ids: Vec<TxStepId> = if commit_phase_completed {
         Vec::new()
