@@ -69,8 +69,10 @@ fn backends_under_test() -> Vec<BackendSpec> {
         (
             "rusqlite_memory_wal",
             Box::new(|| {
-                let mut config = OpenConfig::default();
-                config.wal_mode = true;
+                let config = OpenConfig {
+                    wal_mode: true,
+                    ..Default::default()
+                };
                 // Note: ":memory:" disables WAL; use a temp file
                 // so wal_mode actually fires. We can't write to
                 // disk in the bench context cleanly without

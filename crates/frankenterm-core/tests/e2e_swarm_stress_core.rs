@@ -50,6 +50,8 @@ fn stress_config() -> ScrollbackConfig {
     }
 }
 
+// Swarm stress metrics mirror the emitted JSON schema fields one-for-one.
+#[allow(clippy::too_many_arguments)]
 fn emit_swarm_metric(
     test: &str,
     pane_count: usize,
