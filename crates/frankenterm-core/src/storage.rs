@@ -930,6 +930,8 @@ pub struct SessionPaneStateRow {
 pub struct StorageConfig {
     /// Maximum number of pending write commands before backpressure
     pub write_queue_size: usize,
+    /// Maximum number of idle read connections retained per database path.
+    pub read_pool_size: usize,
     /// [ft-wk5fo] Opt out of the synchronous FTS5 triggers.
     ///
     /// When `true`, the three `output_segments_a[iud]` triggers at
@@ -951,6 +953,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             write_queue_size: 1024,
+            read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
         }
     }
@@ -958,16 +961,18 @@ impl Default for StorageConfig {
 
 impl From<&crate::config::StorageConfig> for StorageConfig {
     /// Canonical mapping from the parsed `[storage]` config onto the handle's
-    /// tuning. ft-nveha: previously the `[storage] writer_queue_size` was parsed
-    /// and validated but never reached `StorageHandle` through any single seam —
-    /// callers hand-rolled the field copy (and could silently drop it), so the
-    /// writer channel often used the default capacity. Routing the conversion
-    /// here makes the wiring single-source-of-truth. The config validator already
-    /// enforces `writer_queue_size >= 1`; clamp defensively so a stray 0 can
-    /// never collapse the bounded write channel into a rendezvous.
+    /// tuning. ft-nveha/ft-y76wt: previously the `[storage]`
+    /// `writer_queue_size`/`read_pool_size` values were parsed and
+    /// parsed but never reached `StorageHandle` through any single
+    /// seam — callers hand-rolled field copies and could silently drop
+    /// them. Routing the conversion here makes the wiring
+    /// single-source-of-truth. The config validator already enforces
+    /// `writer_queue_size >= 1`; clamp both knobs defensively so stray
+    /// zeros cannot collapse the writer channel or read-pool retention.
     fn from(app: &crate::config::StorageConfig) -> Self {
         Self {
             write_queue_size: (app.writer_queue_size as usize).max(1),
+            read_pool_size: (app.read_pool_size as usize).max(1),
             // `defer_fts_triggers` is not exposed via `[storage]`; keep default.
             ..StorageConfig::default()
         }
@@ -1201,10 +1206,18 @@ trait StorageBackendProvider: Send + Sync {
     fn provider_name(&self) -> &'static str;
 }
 
-#[derive(Debug, Default)]
-struct RusqliteStorageBackendProvider;
+#[derive(Debug)]
+struct RusqliteStorageBackendProvider {
+    read_pool_size: usize,
+}
 
 impl RusqliteStorageBackendProvider {
+    fn new(read_pool_size: usize) -> Self {
+        Self {
+            read_pool_size: read_pool_size.max(1),
+        }
+    }
+
     fn open_config_for_storage_handle() -> crate::storage_backend_trait::OpenConfig {
         crate::storage_backend_trait::OpenConfig {
             // Preserve the old database-open ordering: WAL mode is
@@ -1212,6 +1225,12 @@ impl RusqliteStorageBackendProvider {
             wal_mode: false,
             ..crate::storage_backend_trait::OpenConfig::default()
         }
+    }
+}
+
+impl Default for RusqliteStorageBackendProvider {
+    fn default() -> Self {
+        Self::new(DEFAULT_READ_POOL_MAX_PER_PATH)
     }
 }
 
@@ -1337,7 +1356,7 @@ impl StorageBackendProvider for RusqliteStorageBackendProvider {
 
     fn lend_read_backend<'a>(&'a self, db_path: &str) -> Result<Box<dyn StorageBackendLoan + 'a>> {
         Ok(Box::new(RusqliteReadBackendLoan {
-            pooled: PooledReadConn::acquire(db_path)?,
+            pooled: PooledReadConn::acquire_with_capacity(db_path, self.read_pool_size)?,
             return_to_pool: false,
         }))
     }
@@ -1384,7 +1403,13 @@ fn storage_backend_provider_registry() -> &'static std::sync::Mutex<
 }
 
 fn default_storage_backend_provider() -> Arc<dyn StorageBackendProvider> {
-    Arc::new(RusqliteStorageBackendProvider)
+    default_storage_backend_provider_with_read_pool_size(DEFAULT_READ_POOL_MAX_PER_PATH)
+}
+
+fn default_storage_backend_provider_with_read_pool_size(
+    read_pool_size: usize,
+) -> Arc<dyn StorageBackendProvider> {
+    Arc::new(RusqliteStorageBackendProvider::new(read_pool_size))
 }
 
 fn register_storage_backend_provider(db_path: &str, provider: &Arc<dyn StorageBackendProvider>) {
@@ -1435,6 +1460,8 @@ pub struct StorageHandle {
     db_path: Arc<String>,
     /// Backend provider that owns writer creation and read-backend lending.
     backend_provider: Arc<dyn StorageBackendProvider>,
+    /// Configured idle read-pool capacity for this handle's default provider.
+    read_pool_size: usize,
     /// Optional mmap mirror directory for segment fast-path reads.
     mmap_mirror_dir: Option<Arc<PathBuf>>,
     /// Writer thread join handle (for shutdown) - shared to allow Clone
@@ -1635,11 +1662,12 @@ impl StorageHandle {
         config: StorageConfig,
         cx: Option<&crate::cx::Cx>,
     ) -> Result<Self> {
+        let read_pool_size = config.read_pool_size.max(1);
         Self::with_config_inner_with_provider(
             db_path,
             config,
             cx,
-            default_storage_backend_provider(),
+            default_storage_backend_provider_with_read_pool_size(read_pool_size),
         )
         .await
     }
@@ -1713,6 +1741,7 @@ impl StorageHandle {
             write_tx,
             db_path: Arc::new(db_path.to_string()),
             backend_provider,
+            read_pool_size: config.read_pool_size.max(1),
             mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
             writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
@@ -3670,6 +3699,14 @@ impl StorageHandle {
     #[must_use]
     pub fn write_queue_capacity(&self) -> usize {
         self.write_tx.max_capacity()
+    }
+
+    /// Maximum idle read connections retained per database path.
+    /// Exposed so callers/tests can confirm the parsed `[storage] read_pool_size`
+    /// reached the handle and default rusqlite provider (ft-y76wt).
+    #[must_use]
+    pub fn read_pool_capacity(&self) -> usize {
+        self.read_pool_size
     }
 
     /// Vacuum the database (explicit)
@@ -10143,7 +10180,8 @@ where
 //
 // `PooledReadConn` is a small LIFO pool keyed by db_path:
 //   - `acquire(db_path)` pops a pre-warmed backend or opens fresh.
-//   - On Drop, the backend returns to the pool (capped at 8 per path)
+//   - On Drop, the backend returns to the pool (capped per path by
+//     `StorageConfig.read_pool_size`)
 //     instead of closing.
 //   - The backend connection's existing schema/PRAGMA state survives the round-trip
 //     (busy_timeout is a connection-scoped PRAGMA).
@@ -10153,7 +10191,7 @@ where
 // `db_path` by clone, not the `StorageHandle` itself. Process-global keeps
 // the migration drop-in.
 
-const READ_POOL_MAX_PER_PATH: usize = 8;
+const DEFAULT_READ_POOL_MAX_PER_PATH: usize = 8;
 
 static READ_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>,
@@ -10641,7 +10679,8 @@ pub(crate) fn reset_pool_lock_poisoned_count_for_test() {
 }
 
 /// Pooled read backend (ft-bhyxz). On Drop returns the backend to
-/// the per-`db_path` LIFO pool (capped at 8) instead of closing it.
+/// the per-`db_path` LIFO pool (capped by the handle/provider
+/// configuration) instead of closing it.
 ///
 /// Use `PooledReadConn::acquire(db_path)` in place of
 /// `open_read_storage_backend(db_path)` inside `spawn_blocking_storage`
@@ -10649,10 +10688,15 @@ pub(crate) fn reset_pool_lock_poisoned_count_for_test() {
 pub(crate) struct PooledReadConn {
     backend: Option<RusqliteBackend>,
     db_path: String,
+    max_pool_size: usize,
 }
 
 impl PooledReadConn {
     pub(crate) fn acquire(db_path: &str) -> Result<Self> {
+        Self::acquire_with_capacity(db_path, DEFAULT_READ_POOL_MAX_PER_PATH)
+    }
+
+    pub(crate) fn acquire_with_capacity(db_path: &str, max_pool_size: usize) -> Result<Self> {
         let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageReadPool, 0);
         let result = (|| {
             use std::sync::atomic::Ordering;
@@ -10693,6 +10737,7 @@ impl PooledReadConn {
             Ok(Self {
                 backend: Some(backend),
                 db_path: db_path.to_string(),
+                max_pool_size: max_pool_size.max(1),
             })
         })();
         timer.finish_result(&result);
@@ -10761,7 +10806,7 @@ impl Drop for PooledReadConn {
             match read_pool().lock() {
                 Ok(mut pool) => {
                     let entry = pool.entry(self.db_path.clone()).or_default();
-                    if entry.len() < READ_POOL_MAX_PER_PATH {
+                    if entry.len() < self.max_pool_size {
                         entry.push(backend);
                         // br-ft-rvt1z: counted only on successful return.
                         POOL_RETURNS.fetch_add(1, Ordering::Relaxed);
@@ -17806,6 +17851,87 @@ fn storage_writer_queue_size_reaches_handle() {
     });
 }
 
+/// ft-y76wt: a custom `[storage] read_pool_size` must actually reach the
+/// constructed `StorageHandle` and its default rusqlite backend provider.
+/// Previously the parsed value had no consumer — the read
+/// pool always retained the compiled-in `DEFAULT_READ_POOL_MAX_PER_PATH`.
+/// Asserts both the `From` mapping and the live handle's read-pool capacity.
+#[test]
+fn storage_read_pool_size_reaches_handle() {
+    // Pure mapping: the From conversion carries read_pool_size through.
+    let app = crate::config::StorageConfig {
+        read_pool_size: 3,
+        ..crate::config::StorageConfig::default()
+    };
+    assert_eq!(
+        StorageConfig::from(&app).read_pool_size,
+        3,
+        "From must carry the parsed read_pool_size through"
+    );
+
+    // A stray 0 must clamp to 1 so the read pool can never stop retaining
+    // connections entirely (mirrors the writer_queue_size >= 1 guard).
+    let zero = crate::config::StorageConfig {
+        read_pool_size: 0,
+        ..crate::config::StorageConfig::default()
+    };
+    assert_eq!(
+        StorageConfig::from(&zero).read_pool_size,
+        1,
+        "a stray read_pool_size=0 must clamp to 1"
+    );
+
+    // End-to-end: the value reaches the live handle and caps retained
+    // default-provider read connections.
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("wa_test_y76wt_rpool.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let cx = crate::cx::for_testing();
+        let app = crate::config::StorageConfig {
+            read_pool_size: 3,
+            ..crate::config::StorageConfig::default()
+        };
+        let storage =
+            StorageHandle::with_config_with_cx(&cx, &db_path_str, StorageConfig::from(&app))
+                .await
+                .unwrap();
+        assert_eq!(
+            storage.read_pool_capacity(),
+            3,
+            "parsed [storage] read_pool_size=3 must reach the handle's read-pool capacity (was: default)"
+        );
+
+        let mut loans = Vec::new();
+        for _ in 0..5 {
+            let mut loan = storage
+                .backend_provider
+                .lend_read_backend(&db_path_str)
+                .expect("lend read backend");
+            loan.mark_successful_use();
+            loans.push(loan);
+        }
+        drop(loans);
+
+        let retained = read_pool()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&db_path_str)
+            .map_or(0, Vec::len);
+        assert_eq!(
+            retained, 3,
+            "read_pool_size=3 must cap retained idle read connections"
+        );
+
+        let _ = read_pool()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&db_path_str);
+        storage.shutdown().await.unwrap();
+    });
+}
+
 /// ft-xbnl0.2.3 Cx-first: `StorageHandle::new_with_cx` must
 /// return a `StorageError::Database` containing "cancelled"
 /// when given a pre-cancelled cx, without creating the DB file
@@ -20918,6 +21044,7 @@ fn storage_handle_writer_queue_processes_all() {
         // Create storage with small queue
         let config = StorageConfig {
             write_queue_size: 4,
+            read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
         };
         let storage = StorageHandle::with_config(&db_path_str, config)

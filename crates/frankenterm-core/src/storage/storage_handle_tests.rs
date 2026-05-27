@@ -1282,6 +1282,7 @@ fn storage_handle_with_small_queue_handles_burst() {
         // Use a small queue to test bounded channel behavior
         let config = StorageConfig {
             write_queue_size: 4,
+            read_pool_size: super::DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
         };
         let handle: StorageHandle = StorageHandle::with_config(&db_path, config).await.unwrap();
@@ -1310,6 +1311,7 @@ fn storage_handle_reopen_preserves_synchronous_fts_indexing() {
         let db_path = temp_db_path();
         let config = StorageConfig {
             write_queue_size: 4,
+            read_pool_size: super::DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
         };
         let fts_trigger_count = |conn: &Connection| -> i64 {
