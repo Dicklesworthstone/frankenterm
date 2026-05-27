@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use super::protocol::{EmbedRequest, EmbedResponse};
+use crate::config::SearchConfig;
 use crate::search::{Embedder, HashEmbedder};
 
 type SharedEmbedder = Arc<dyn Embedder>;
@@ -24,6 +26,7 @@ pub struct EmbedWorker {
     id: u32,
     processed: AtomicU64,
     embedders: Mutex<HashMap<String, SharedEmbedder>>,
+    fastembed_cache_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for EmbedWorker {
@@ -33,6 +36,7 @@ impl fmt::Debug for EmbedWorker {
             .field("id", &self.id)
             .field("processed", &self.processed())
             .field("cached_embedders", &cached_embedders)
+            .field("fastembed_cache_dir", &self.fastembed_cache_dir)
             .finish()
     }
 }
@@ -40,16 +44,33 @@ impl fmt::Debug for EmbedWorker {
 impl EmbedWorker {
     /// Create a new worker with the given ID.
     pub fn new(id: u32) -> Self {
+        Self::with_fastembed_cache_dir(id, None)
+    }
+
+    /// Create a worker using search configuration for model cache placement.
+    #[must_use]
+    pub fn with_search_config(id: u32, search_config: &SearchConfig) -> Self {
+        Self::with_fastembed_cache_dir(id, resolve_models_dir_override(&search_config.models_dir))
+    }
+
+    fn with_fastembed_cache_dir(id: u32, fastembed_cache_dir: Option<PathBuf>) -> Self {
         Self {
             id,
             processed: AtomicU64::new(0),
             embedders: Mutex::new(HashMap::new()),
+            fastembed_cache_dir,
         }
     }
 
     /// Get the worker ID.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Configured FastEmbed cache directory, if one was supplied by search config.
+    #[must_use]
+    pub fn fastembed_cache_dir(&self) -> Option<&Path> {
+        self.fastembed_cache_dir.as_deref()
     }
 
     /// Get the number of processed requests.
@@ -94,7 +115,8 @@ impl EmbedWorker {
             }
         }
 
-        let embedder = build_embedder_from_normalized_selector(&selector)?;
+        let embedder =
+            build_embedder_from_normalized_selector(&selector, self.fastembed_cache_dir())?;
         let mut cache = self.embedders_guard();
         Ok(Arc::clone(
             cache
@@ -113,6 +135,30 @@ impl EmbedWorker {
             }
         }
     }
+
+    #[cfg(all(test, feature = "semantic-search"))]
+    fn fastembed_config_for_selector(
+        &self,
+        selector: &str,
+    ) -> Result<crate::search::fastembed_embedder::FastEmbedConfig, String> {
+        build_fastembed_config(selector, self.fastembed_cache_dir())
+    }
+}
+
+fn resolve_models_dir_override(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "~" {
+        return Some(dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
+    }
+    if let Some(stripped) = trimmed.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return Some(home.join(stripped));
+    }
+    Some(PathBuf::from(trimmed))
 }
 
 /// br-ft-023t1: hard cap on the hash-embedder dimension that
@@ -140,10 +186,13 @@ fn normalize_model_selector(model: Option<&str>) -> Result<String, String> {
 #[cfg(test)]
 fn build_embedder(model: Option<&str>) -> Result<SharedEmbedder, String> {
     let selector = normalize_model_selector(model)?;
-    build_embedder_from_normalized_selector(&selector)
+    build_embedder_from_normalized_selector(&selector, None)
 }
 
-fn build_embedder_from_normalized_selector(selector: &str) -> Result<SharedEmbedder, String> {
+fn build_embedder_from_normalized_selector(
+    selector: &str,
+    fastembed_cache_dir: Option<&Path>,
+) -> Result<SharedEmbedder, String> {
     match selector {
         "fnv1a-hash-128" => Ok(Arc::new(HashEmbedder::default())),
         raw => {
@@ -168,7 +217,7 @@ fn build_embedder_from_normalized_selector(selector: &str) -> Result<SharedEmbed
             #[cfg(feature = "semantic-search")]
             {
                 if raw == "fastembed" || raw.starts_with("fastembed-") {
-                    return build_fastembed_embedder(raw);
+                    return build_fastembed_embedder(raw, fastembed_cache_dir);
                 }
             }
             Err(format!("unsupported embed model: {raw}"))
@@ -178,14 +227,30 @@ fn build_embedder_from_normalized_selector(selector: &str) -> Result<SharedEmbed
 
 /// Build a FastEmbed embedder from a model selector string.
 #[cfg(feature = "semantic-search")]
-fn build_fastembed_embedder(selector: &str) -> Result<SharedEmbedder, String> {
-    use crate::search::fastembed_embedder::{
-        FastEmbedConfig, FastEmbedEmbedder, resolve_fastembed_model_selector,
-    };
+fn build_fastembed_config(
+    selector: &str,
+    fastembed_cache_dir: Option<&Path>,
+) -> Result<crate::search::fastembed_embedder::FastEmbedConfig, String> {
+    use crate::search::fastembed_embedder::{FastEmbedConfig, resolve_fastembed_model_selector};
 
     let model = resolve_fastembed_model_selector(selector)?;
 
-    let config = FastEmbedConfig::default().with_model(model);
+    let mut config = FastEmbedConfig::default().with_model(model);
+    if let Some(cache_dir) = fastembed_cache_dir {
+        config = config.with_cache_dir(cache_dir);
+    }
+    Ok(config)
+}
+
+/// Build a FastEmbed embedder from a model selector string.
+#[cfg(feature = "semantic-search")]
+fn build_fastembed_embedder(
+    selector: &str,
+    fastembed_cache_dir: Option<&Path>,
+) -> Result<SharedEmbedder, String> {
+    use crate::search::fastembed_embedder::FastEmbedEmbedder;
+
+    let config = build_fastembed_config(selector, fastembed_cache_dir)?;
     let emb = FastEmbedEmbedder::try_new(config).map_err(|e| e.to_string())?;
     Ok(Arc::new(emb))
 }
@@ -289,6 +354,25 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("must be > 0"));
         assert_eq!(worker.processed(), 0);
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[test]
+    fn search_config_models_dir_reaches_fastembed_loader_config_ft_jl09u() {
+        let custom_models_dir = PathBuf::from("/tmp/ft-jl09u-custom-models");
+        let mut search_config = SearchConfig::default();
+        search_config.models_dir = custom_models_dir.to_string_lossy().into_owned();
+
+        let worker = EmbedWorker::with_search_config(5, &search_config);
+        assert_eq!(
+            worker.fastembed_cache_dir(),
+            Some(custom_models_dir.as_path())
+        );
+
+        let loader_config = worker
+            .fastembed_config_for_selector("fastembed")
+            .expect("fastembed selector resolves");
+        assert_eq!(loader_config.cache_dir, custom_models_dir);
     }
 
     // ── DarkMill test expansion ──────────────────────────────────────

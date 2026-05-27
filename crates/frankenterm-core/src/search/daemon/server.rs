@@ -2,6 +2,7 @@
 
 use super::protocol::{DaemonRequest, DaemonResponse};
 use super::worker::EmbedWorker;
+use crate::config::SearchConfig;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,10 +16,19 @@ pub struct EmbedServer {
 impl EmbedServer {
     /// Create a new embed server on the given port.
     pub fn new(port: u16) -> Self {
+        Self::with_worker(port, EmbedWorker::new(0))
+    }
+
+    /// Create a new embed server with search model cache configuration.
+    pub fn with_search_config(port: u16, search_config: &SearchConfig) -> Self {
+        Self::with_worker(port, EmbedWorker::with_search_config(0, search_config))
+    }
+
+    fn with_worker(port: u16, worker: EmbedWorker) -> Self {
         Self {
             running: Arc::new(AtomicBool::new(true)),
             port,
-            worker: EmbedWorker::new(0),
+            worker,
         }
     }
 
