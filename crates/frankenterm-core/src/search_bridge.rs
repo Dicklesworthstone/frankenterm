@@ -682,6 +682,7 @@ mod tests {
             SearchPhase::Initial { .. } => "Initial",
             SearchPhase::Refined { .. } => "Refined",
             SearchPhase::RefinementFailed { .. } => "RefinementFailed",
+            SearchPhase::Reranked { .. } => "Reranked",
         }
     }
 
