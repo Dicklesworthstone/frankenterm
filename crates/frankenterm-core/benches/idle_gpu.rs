@@ -65,7 +65,7 @@ fn drive_no_semantic_change_idle() -> IdleGpuEvidence {
     } else {
         post_quiet_paints as f64 * 100.0 / post_quiet_evaluations as f64
     };
-    let within_target = post_quiet_paints <= MAX_POST_QUIET_PAINTS;
+    let within_target = post_quiet_paints == MAX_POST_QUIET_PAINTS;
 
     IdleGpuEvidence {
         health,

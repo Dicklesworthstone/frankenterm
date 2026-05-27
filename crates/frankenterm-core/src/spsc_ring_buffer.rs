@@ -180,10 +180,11 @@ impl<T> SpscProducer<T> {
                 Err(v) => {
                     value = v;
                     let notified = self.shared.not_full.notified();
-                    if self.shared.queue.is_full() && !self.is_closed() {
-                        if !wait_notified_with_cx(cx, notified).await {
-                            return Err(value);
-                        }
+                    if self.shared.queue.is_full()
+                        && !self.is_closed()
+                        && !wait_notified_with_cx(cx, notified).await
+                    {
+                        return Err(value);
                     }
                 }
             }
@@ -287,10 +288,11 @@ impl<T> SpscConsumer<T> {
             }
 
             let notified = self.shared.not_empty.notified();
-            if self.shared.queue.is_empty() && !self.is_closed() {
-                if !wait_notified_with_cx(cx, notified).await {
-                    return None;
-                }
+            if self.shared.queue.is_empty()
+                && !self.is_closed()
+                && !wait_notified_with_cx(cx, notified).await
+            {
+                return None;
             }
         }
     }
@@ -374,10 +376,11 @@ impl<T: Clone> SpmcProducer<T> {
 
             if let Some(full_idx) = self.first_full_queue() {
                 let notified = self.shared.not_full[full_idx].notified();
-                if self.shared.queues[full_idx].is_full() && !self.is_closed() {
-                    if !wait_notified_with_cx(cx, notified).await {
-                        return Err(value);
-                    }
+                if self.shared.queues[full_idx].is_full()
+                    && !self.is_closed()
+                    && !wait_notified_with_cx(cx, notified).await
+                {
+                    return Err(value);
                 }
                 continue;
             }
@@ -521,10 +524,11 @@ impl<T> SpmcConsumer<T> {
             }
 
             let notified = self.shared.not_empty[self.consumer_idx].notified();
-            if self.shared.queues[self.consumer_idx].is_empty() && !self.is_closed() {
-                if !wait_notified_with_cx(cx, notified).await {
-                    return None;
-                }
+            if self.shared.queues[self.consumer_idx].is_empty()
+                && !self.is_closed()
+                && !wait_notified_with_cx(cx, notified).await
+            {
+                return None;
             }
         }
     }

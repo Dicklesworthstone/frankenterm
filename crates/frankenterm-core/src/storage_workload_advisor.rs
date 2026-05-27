@@ -65,7 +65,7 @@ use serde::{Deserialize, Serialize};
 ///   for distinct-pane / distinct-session cardinality estimates.
 /// - Per-table row counts via the StorageBackend trait's
 ///   `count_table` helper.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadProfile {
     /// Total write operations observed during the sampling
     /// window.
@@ -94,24 +94,6 @@ pub struct WorkloadProfile {
     /// Last-known checkpoint lag in bytes (WAL frames not yet
     /// checkpointed).
     pub checkpoint_lag_bytes: u64,
-}
-
-impl Default for WorkloadProfile {
-    fn default() -> Self {
-        Self {
-            total_writes: 0,
-            total_reads: 0,
-            total_searches: 0,
-            fts_enabled: false,
-            tantivy_enabled: false,
-            estimated_distinct_panes: 0,
-            estimated_distinct_sessions: 0,
-            hot_table: None,
-            p99_write_latency_us: 0,
-            p99_read_latency_us: 0,
-            checkpoint_lag_bytes: 0,
-        }
-    }
 }
 
 /// Snapshot of the largest-by-rowcount table at sampling time.

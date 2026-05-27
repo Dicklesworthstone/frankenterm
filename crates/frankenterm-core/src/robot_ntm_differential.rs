@@ -1260,9 +1260,9 @@ exit 7
     #[test]
     fn subprocess_invoker_reports_invalid_json() {
         let (_dir, binary) = fake_ntm(
-            r#"#!/bin/sh
+            r"#!/bin/sh
 printf 'not-json'
-"#,
+",
         );
         let invoker = NtmSubprocessInvoker::new(binary).with_command(
             "profile",

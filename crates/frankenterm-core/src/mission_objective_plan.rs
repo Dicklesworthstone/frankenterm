@@ -12,18 +12,13 @@ pub const MISSION_OBJECTIVE_PLAN_CONTRACT_ID: &str = "ft.mission_objective_plan.
 pub const MISSION_OBJECTIVE_PLAN_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_STALE_AFTER_SECONDS: u64 = 7_200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionObjectiveStrictness {
     Advisory,
+    #[default]
     Normal,
     Strict,
-}
-
-impl Default for MissionObjectiveStrictness {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

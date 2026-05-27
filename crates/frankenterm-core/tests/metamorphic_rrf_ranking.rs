@@ -239,11 +239,13 @@ fn mutant_inverted_rank_rrf(lex: &[(u64, f32)], sem: &[(u64, f32)], k: u32) -> V
     let mut seen = std::collections::HashSet::new();
     for (rank, &(id, _)) in lex.iter().filter(|&&(id, _)| seen.insert(id)).enumerate() {
         // BUG: multiply by rank instead of dividing — later ranks score higher.
-        *acc.entry(id).or_insert(0.0) += (k as f32 + rank as f32 + 1.0) * 0.001;
+        let score = acc.entry(id).or_insert(0.0);
+        *score = (k as f32 + rank as f32 + 1.0).mul_add(0.001, *score);
     }
     seen.clear();
     for (rank, &(id, _)) in sem.iter().filter(|&&(id, _)| seen.insert(id)).enumerate() {
-        *acc.entry(id).or_insert(0.0) += (k as f32 + rank as f32 + 1.0) * 0.001;
+        let score = acc.entry(id).or_insert(0.0);
+        *score = (k as f32 + rank as f32 + 1.0).mul_add(0.001, *score);
     }
     let mut v: Vec<(u64, f32)> = acc.into_iter().collect();
     v.sort_by(|a, b| {

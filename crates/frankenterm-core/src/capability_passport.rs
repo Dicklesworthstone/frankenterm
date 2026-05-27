@@ -101,7 +101,7 @@ impl CapabilityClass {
 /// agent's word; an Observed one is inferred from pane output (could
 /// be coincidence); a Verified one passed a bounded probe; Unknown is
 /// the fail-closed default when a probe times out or errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityVerification {
     /// Agent / operator declared the capability (lowest confidence).
@@ -113,6 +113,7 @@ pub enum CapabilityVerification {
     /// Probe failed, timed out, or produced an indeterminate result.
     /// Fail-closed default — a downstream dispatcher MUST treat this
     /// as "do not assume this capability is present."
+    #[default]
     Unknown,
 }
 
@@ -135,12 +136,6 @@ impl CapabilityVerification {
     #[must_use]
     pub fn is_dispatchable(self) -> bool {
         matches!(self, Self::Verified)
-    }
-}
-
-impl Default for CapabilityVerification {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 

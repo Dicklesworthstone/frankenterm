@@ -317,7 +317,9 @@ proptest! {
             TextMatch::Substring { value: actual_value } => {
                 prop_assert_eq!(actual_value, value);
             }
-            other => prop_assert!(false, "expected Substring, got {other:?}"),
+            other @ TextMatch::Regex { .. } => {
+                prop_assert!(false, "expected Substring, got {other:?}");
+            }
         }
     }
 
@@ -330,7 +332,9 @@ proptest! {
             } => {
                 prop_assert_eq!(actual_pattern, pattern);
             }
-            other => prop_assert!(false, "expected Regex, got {other:?}"),
+            other @ TextMatch::Substring { .. } => {
+                prop_assert!(false, "expected Regex, got {other:?}");
+            }
         }
     }
 

@@ -236,7 +236,7 @@ proptest! {
         suffix_len in 1usize..8,
     ) {
         key.truncate((key.len() / 8) * 8);
-        key.extend(std::iter::repeat(0u8).take(suffix_len));
+        key.extend(std::iter::repeat_n(0u8, suffix_len));
 
         let err = key_to_minhash(&key).unwrap_err();
         prop_assert_eq!(err, FstError::InvalidMinHashKeyLength { len: key.len() });

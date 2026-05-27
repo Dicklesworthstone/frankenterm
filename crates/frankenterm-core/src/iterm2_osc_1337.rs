@@ -380,19 +380,14 @@ impl MultipartFileBuffer {
 /// Per-config policy for `SetProfile` / `SetColors`. Bead
 /// names `osc1337_profile_switch` with values `allow` /
 /// `prompt` / `deny`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileSwitchPolicy {
     Allow,
+    /// Bead: "Default: osc1337_profile_switch = prompt".
+    #[default]
     Prompt,
     Deny,
-}
-
-impl Default for ProfileSwitchPolicy {
-    fn default() -> Self {
-        // Bead: "Default: osc1337_profile_switch = prompt".
-        Self::Prompt
-    }
 }
 
 /// Per-config policy for `File` subcommand with `inline=0`
@@ -402,18 +397,13 @@ impl Default for ProfileSwitchPolicy {
 /// to the user's filesystem under operator-controlled
 /// `name`. We default to `Deny` (strictest) because this
 /// is rarely-needed and high-impact if abused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageDownloadPolicy {
     Allow,
     Prompt,
+    #[default]
     Deny,
-}
-
-impl Default for ImageDownloadPolicy {
-    fn default() -> Self {
-        Self::Deny
-    }
 }
 
 /// Combined policy bundle the integration passes into the

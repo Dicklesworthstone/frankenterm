@@ -1326,7 +1326,8 @@ mod tests {
         // available > total (hostile reader) clamps to 0.0, not negative.
         let (_, _, over) = derive_disk_sample_fields(Some((2000, 1000)));
         assert_eq!(
-            over, 0.0,
+            over.to_bits(),
+            0.0_f64.to_bits(),
             "available>total must clamp usage to 0.0, got {over}"
         );
     }

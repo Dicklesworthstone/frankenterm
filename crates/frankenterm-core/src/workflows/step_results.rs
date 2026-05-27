@@ -190,10 +190,11 @@ const TEXT_MATCH_REGEX_BACKTRACK_LIMIT: usize = 10_000_000;
 
 fn compile_text_match_regex(
     pattern: &str,
-) -> std::result::Result<fancy_regex::Regex, fancy_regex::Error> {
+) -> std::result::Result<fancy_regex::Regex, Box<fancy_regex::Error>> {
     fancy_regex::RegexBuilder::new(pattern)
         .backtrack_limit(TEXT_MATCH_REGEX_BACKTRACK_LIMIT)
         .build()
+        .map_err(Box::new)
 }
 
 impl TextMatch {

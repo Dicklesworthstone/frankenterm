@@ -861,7 +861,7 @@ pub fn extract_ft_block_checked(content: &str) -> Result<Option<String>> {
 
     Ok(Some(
         content[begin_idx..end_idx]
-            .trim_end_matches(|c| c == '\r' || c == '\n')
+            .trim_end_matches(['\r', '\n'])
             .to_string(),
     ))
 }

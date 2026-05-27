@@ -957,11 +957,11 @@ proptest! {
     }
 
     /// zero() is the additive identity-shaped empty budget.
-    #[test]
-    fn quantile_budget_zero_is_empty(_dummy in 0u8..1) {
-        let z = QuantileBudgetMs::zero();
-        prop_assert_eq!(z.p50_ms(), 0.0);
-        prop_assert_eq!(z.p999_ms(), 0.0);
+        #[test]
+        fn quantile_budget_zero_is_empty(_dummy in 0u8..1) {
+            let z = QuantileBudgetMs::zero();
+        prop_assert_eq!(z.p50_ms().to_bits(), 0.0_f64.to_bits());
+        prop_assert_eq!(z.p999_ms().to_bits(), 0.0_f64.to_bits());
         prop_assert!(!z.any_positive());
     }
 }
@@ -1099,8 +1099,8 @@ proptest! {
             prop_assert!((delta.headroom_ms.p999_ms() - exp_headroom).abs() < 1e-9,
                 "headroom must be max(target-observed, 0)");
             // Strict → no borrowing.
-            prop_assert_eq!(delta.borrowed_ms.p50_ms(), 0.0);
-            prop_assert_eq!(delta.borrowed_ms.p999_ms(), 0.0);
+            prop_assert_eq!(delta.borrowed_ms.p50_ms().to_bits(), 0.0_f64.to_bits());
+            prop_assert_eq!(delta.borrowed_ms.p999_ms().to_bits(), 0.0_f64.to_bits());
             // borrowed + residual == overflow (per quantile, always).
             prop_assert!(((delta.borrowed_ms.p99_ms() + delta.residual_overflow_ms.p99_ms())
                 - delta.overflow_ms.p99_ms()).abs() < 1e-9);

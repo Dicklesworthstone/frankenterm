@@ -750,10 +750,10 @@ mod tests {
         }
     }
 
-    fn fake_info(pid: u32, ppid: u32, name: &str, rss_kb: u64) -> RawProcessInfo {
+    fn fake_info(pid: u32, parent_pid: u32, name: &str, rss_kb: u64) -> RawProcessInfo {
         RawProcessInfo {
             pid,
-            ppid,
+            ppid: parent_pid,
             name: name.to_string(),
             argv: vec![name.to_string()],
             state: ProcessState::Running,

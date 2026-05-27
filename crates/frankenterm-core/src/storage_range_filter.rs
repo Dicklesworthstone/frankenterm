@@ -240,7 +240,7 @@ mod tests {
             // Ground truth: the set of integer points covered by recorded ranges.
             let mut covered = std::collections::BTreeSet::new();
 
-            let num_ranges = (next().rem_euclid(4)) + 0; // 0..=3 ranges
+            let num_ranges = next().rem_euclid(4); // 0..=3 ranges
             for _ in 0..num_ranges {
                 let a = LO + next().rem_euclid(HI - LO + 1);
                 let b = LO + next().rem_euclid(HI - LO + 1);
