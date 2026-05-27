@@ -1065,8 +1065,10 @@ mod tests {
     /// Black rather than silently falling through to Green.
     #[test]
     fn classify_returns_black_on_nan_config_threshold() {
-        let mut config = BackpressureConfig::default();
-        config.yellow_capture = f64::NAN;
+        let config = BackpressureConfig {
+            yellow_capture: f64::NAN,
+            ..Default::default()
+        };
         let m = BackpressureManager::new(config);
 
         let depths = QueueDepths {
@@ -1084,8 +1086,10 @@ mod tests {
 
     #[test]
     fn classify_returns_black_on_inf_threshold() {
-        let mut config = BackpressureConfig::default();
-        config.red_capture = f64::INFINITY;
+        let config = BackpressureConfig {
+            red_capture: f64::INFINITY,
+            ..Default::default()
+        };
         let m = BackpressureManager::new(config);
 
         let depths = QueueDepths {
@@ -1108,8 +1112,10 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_nan_threshold() {
-        let mut config = BackpressureConfig::default();
-        config.yellow_capture = f64::NAN;
+        let config = BackpressureConfig {
+            yellow_capture: f64::NAN,
+            ..Default::default()
+        };
         let err = config.validate().expect_err("NaN must be rejected");
         assert!(err.contains("yellow_capture"));
         assert!(err.contains("finite"));
@@ -1117,16 +1123,20 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_inf_threshold() {
-        let mut config = BackpressureConfig::default();
-        config.red_write = f64::INFINITY;
+        let config = BackpressureConfig {
+            red_write: f64::INFINITY,
+            ..Default::default()
+        };
         let err = config.validate().expect_err("infinity must be rejected");
         assert!(err.contains("red_write"));
     }
 
     #[test]
     fn config_validate_rejects_negative_threshold() {
-        let mut config = BackpressureConfig::default();
-        config.skip_detection_ratio = -0.1;
+        let config = BackpressureConfig {
+            skip_detection_ratio: -0.1,
+            ..Default::default()
+        };
         let err = config.validate().expect_err("negative must be rejected");
         assert!(err.contains("skip_detection_ratio"));
         assert!(err.contains("non-negative"));
@@ -1134,9 +1144,11 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_yellow_above_red() {
-        let mut config = BackpressureConfig::default();
-        config.yellow_capture = 0.9;
-        config.red_capture = 0.5; // yellow > red is a misconfiguration
+        let config = BackpressureConfig {
+            yellow_capture: 0.9,
+            red_capture: 0.5, // yellow > red is a misconfiguration
+            ..Default::default()
+        };
         let err = config
             .validate()
             .expect_err("yellow > red must be rejected");
@@ -1146,9 +1158,11 @@ mod tests {
 
     #[test]
     fn config_validate_rejects_yellow_write_above_red_write() {
-        let mut config = BackpressureConfig::default();
-        config.yellow_write = 0.95;
-        config.red_write = 0.7;
+        let config = BackpressureConfig {
+            yellow_write: 0.95,
+            red_write: 0.7,
+            ..Default::default()
+        };
         let err = config.validate().expect_err("yellow_write > red_write");
         assert!(err.contains("yellow_write"));
         assert!(err.contains("red_write"));
@@ -1397,8 +1411,10 @@ mod tests {
 
     #[test]
     fn evaluate_downgrade_blocked_by_hysteresis() {
-        let mut config = BackpressureConfig::default();
-        config.hysteresis_ms = 60_000; // 60 seconds
+        let config = BackpressureConfig {
+            hysteresis_ms: 60_000, // 60 seconds
+            ..Default::default()
+        };
         let m = BackpressureManager::new(config);
 
         // First: upgrade to Red
@@ -1423,8 +1439,10 @@ mod tests {
 
     #[test]
     fn evaluate_disabled_returns_none() {
-        let mut config = BackpressureConfig::default();
-        config.enabled = false;
+        let config = BackpressureConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let m = BackpressureManager::new(config);
 
         let d = depths(1024, 1024, 0, 10_000); // Would be Black
@@ -1801,12 +1819,14 @@ mod tests {
 
     #[test]
     fn config_accessor_methods_reflect_config() {
-        let mut config = BackpressureConfig::default();
-        config.idle_poll_backoff_factor = 4.0;
-        config.skip_detection_ratio = 0.33;
-        config.pause_ratio = 0.75;
-        config.max_buffered_segments = 42;
-        config.recovery_resume_interval_ms = 1234;
+        let config = BackpressureConfig {
+            idle_poll_backoff_factor: 4.0,
+            skip_detection_ratio: 0.33,
+            pause_ratio: 0.75,
+            max_buffered_segments: 42,
+            recovery_resume_interval_ms: 1234,
+            ..Default::default()
+        };
         let m = BackpressureManager::new(config);
 
         assert!((m.idle_poll_backoff_factor() - 4.0).abs() < f64::EPSILON);
