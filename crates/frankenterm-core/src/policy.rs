@@ -15090,10 +15090,12 @@ mod tests {
 
     #[test]
     fn decision_log_from_safety_config_wires_decision_log_settings() {
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.decision_log = crate::policy_decision_log::DecisionLogConfig {
-            max_entries: 5,
-            record_allows: false,
+        let safety = crate::config::SafetyConfig {
+            decision_log: crate::policy_decision_log::DecisionLogConfig {
+                max_entries: 5,
+                record_allows: false,
+            },
+            ..Default::default()
         };
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
@@ -16986,6 +16988,15 @@ mod tests {
         );
     }
 
+    fn safety_with_namespace_isolation(
+        ns_config: crate::namespace_isolation::NamespaceIsolationConfig,
+    ) -> crate::config::SafetyConfig {
+        crate::config::SafetyConfig {
+            namespace_isolation: ns_config,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn authorize_denies_cross_namespace_with_strict_policy() {
         use crate::namespace_isolation::{
@@ -16997,8 +17008,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("team-a").unwrap();
@@ -17035,8 +17045,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::permissive(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("team-a").unwrap();
@@ -17067,8 +17076,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("team-a").unwrap();
@@ -17119,8 +17127,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("org-a").unwrap();
@@ -17152,8 +17159,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("ns-x").unwrap();
@@ -17184,8 +17190,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("tenant-1").unwrap();
@@ -17218,8 +17223,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let ns = TenantNamespace::new("org-alpha").unwrap();
@@ -17251,8 +17255,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("dept-eng").unwrap();
@@ -17284,8 +17287,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let ns = TenantNamespace::new("dept-eng").unwrap();
@@ -17318,8 +17320,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::permissive(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let parent_ns = TenantNamespace::new("org").unwrap();
@@ -17350,8 +17351,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("team-red").unwrap();
@@ -17394,8 +17394,7 @@ mod tests {
                 cross_tenant_policy: CrossTenantPolicy::strict(),
                 ..Default::default()
             };
-            let mut safety = crate::config::SafetyConfig::default();
-            safety.namespace_isolation = ns_config;
+            let safety = safety_with_namespace_isolation(ns_config);
             let mut engine = PolicyEngine::from_safety_config(&safety);
 
             let actor_ns = TenantNamespace::new("isolated-a").unwrap();
@@ -17428,8 +17427,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let actor_ns = TenantNamespace::new("team-x").unwrap();
@@ -17462,8 +17460,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let ns = TenantNamespace::new("team-x").unwrap();
@@ -17527,8 +17524,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let tenant_a = TenantNamespace::new("tenant-alpha").unwrap();
@@ -17662,8 +17658,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let correct_ns = TenantNamespace::new("team-correct").unwrap();
@@ -18292,8 +18287,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         // Allow: same namespace
@@ -18342,8 +18336,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let ns_a = TenantNamespace::new("org-a").unwrap();
@@ -18421,8 +18414,7 @@ mod tests {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = crate::config::SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let ns_legit = TenantNamespace::new("prod-team").unwrap();
