@@ -2915,13 +2915,13 @@ mod tests {
 
     #[test]
     fn render_triage_view_handles_empty_and_populated_state() {
-        let mut state = ViewState::default();
+        let empty_state = ViewState::default();
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
 
-        render_triage_view(&state, area, &mut buf);
+        render_triage_view(&empty_state, area, &mut buf);
 
-        state.triage_items = vec![TriageItemView {
+        let state = view_state!(triage_items: vec![TriageItemView {
             section: "events".to_string(),
             severity: "warning".to_string(),
             title: "test".to_string(),
@@ -2933,7 +2933,7 @@ mod tests {
             event_id: Some(1),
             pane_id: Some(0),
             workflow_id: None,
-        }];
+        }]);
 
         render_triage_view(&state, area, &mut buf);
     }
@@ -2952,16 +2952,25 @@ mod tests {
         }
     }
 
+    macro_rules! view_state {
+        ($($field:ident: $value:expr),+ $(,)?) => {
+            ViewState {
+                $($field: $value,)+
+                ..Default::default()
+            }
+        };
+    }
+
     #[test]
     fn filtered_pane_indices_applies_query_and_toggles() {
-        let mut state = ViewState::default();
-        state.panes = vec![
-            pane(1, "codex-main", Some("codex"), 2, "local"),
-            pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
-            pane(3, "shell", None, 1, "local"),
-        ];
-
-        state.panes_filter_query = "codex".to_string();
+        let mut state = view_state!(
+            panes: vec![
+                pane(1, "codex-main", Some("codex"), 2, "local"),
+                pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
+                pane(3, "shell", None, 1, "local"),
+            ],
+            panes_filter_query: "codex".to_string(),
+        );
         let filtered = filtered_pane_indices(&state);
         assert_eq!(filtered, vec![0]);
 
@@ -2983,11 +2992,12 @@ mod tests {
 
     #[test]
     fn filtered_pane_indices_is_stable_for_large_lists() {
-        let mut state = ViewState::default();
-        state.panes = (0..1000)
-            .map(|id| pane(id, &format!("pane-{id}"), Some("codex"), 0, "local"))
-            .collect();
-        state.panes_filter_query = "pane-9".to_string();
+        let state = view_state!(
+            panes: (0..1000)
+                .map(|id| pane(id, &format!("pane-{id}"), Some("codex"), 0, "local"))
+                .collect(),
+            panes_filter_query: "pane-9".to_string(),
+        );
 
         let filtered = filtered_pane_indices(&state);
         assert!(!filtered.is_empty());
@@ -3015,65 +3025,68 @@ mod tests {
 
     #[test]
     fn filtered_event_indices_returns_all_when_no_filters() {
-        let mut state = ViewState::default();
-        state.events = vec![
+        let state = view_state!(events: vec![
             event(1, 10, "codex.usage_reached", "warning", false),
             event(2, 20, "claude.error", "critical", true),
             event(3, 10, "core.prompt_idle", "info", false),
-        ];
+        ]);
         let filtered = filtered_event_indices(&state);
         assert_eq!(filtered, vec![0, 1, 2]);
     }
 
     #[test]
     fn filtered_event_indices_unhandled_only() {
-        let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "codex.usage_reached", "warning", false),
-            event(2, 20, "claude.error", "critical", true),
-            event(3, 10, "core.prompt_idle", "info", false),
-        ];
-        state.events_unhandled_only = true;
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_unhandled_only: true,
+        );
         let filtered = filtered_event_indices(&state);
         assert_eq!(filtered, vec![0, 2]);
     }
 
     #[test]
     fn filtered_event_indices_pane_filter() {
-        let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "codex.usage_reached", "warning", false),
-            event(2, 20, "claude.error", "critical", true),
-            event(3, 10, "core.prompt_idle", "info", false),
-        ];
-        state.events_pane_filter = "20".to_string();
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_pane_filter: "20".to_string(),
+        );
         let filtered = filtered_event_indices(&state);
         assert_eq!(filtered, vec![1]);
     }
 
     #[test]
     fn filtered_event_indices_rule_filter() {
-        let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "codex.usage_reached", "warning", false),
-            event(2, 20, "claude.error", "critical", true),
-            event(3, 10, "core.prompt_idle", "info", false),
-        ];
-        state.events_pane_filter = "codex".to_string();
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_pane_filter: "codex".to_string(),
+        );
         let filtered = filtered_event_indices(&state);
         assert_eq!(filtered, vec![0]);
     }
 
     #[test]
     fn filtered_event_indices_combined_filters() {
-        let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "codex.usage_reached", "warning", false),
-            event(2, 20, "claude.error", "critical", true),
-            event(3, 10, "core.prompt_idle", "info", false),
-        ];
-        state.events_unhandled_only = true;
-        state.events_pane_filter = "10".to_string();
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+                event(3, 10, "core.prompt_idle", "info", false),
+            ],
+            events_unhandled_only: true,
+            events_pane_filter: "10".to_string(),
+        );
         let filtered = filtered_event_indices(&state);
         assert_eq!(filtered, vec![0, 2]);
     }
@@ -3096,12 +3109,11 @@ mod tests {
 
     #[test]
     fn render_events_view_handles_populated_state() {
-        let mut state = ViewState::default();
-        state.events = vec![
+        let state = view_state!(events: vec![
             event(1, 10, "codex.usage_reached", "warning", false),
             event(2, 20, "claude.error", "critical", true),
             event(3, 10, "core.prompt_idle", "info", false),
-        ];
+        ]);
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_events_view(&state, area, &mut buf);
@@ -3110,12 +3122,13 @@ mod tests {
 
     #[test]
     fn render_events_view_with_selection() {
-        let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "codex.usage_reached", "warning", false),
-            event(2, 20, "claude.error", "critical", true),
-        ];
-        state.events_selected_index = 1;
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+            ],
+            events_selected_index: 1,
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_events_view(&state, area, &mut buf);
@@ -3124,12 +3137,13 @@ mod tests {
 
     #[test]
     fn render_events_view_with_filters_active() {
-        let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "codex.usage_reached", "warning", false),
-            event(2, 20, "claude.error", "critical", true),
-        ];
-        state.events_unhandled_only = true;
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+            ],
+            events_unhandled_only: true,
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_events_view(&state, area, &mut buf);
@@ -3152,12 +3166,13 @@ mod tests {
 
     #[test]
     fn events_selected_index_clamps_to_filtered() {
-        let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "codex.usage_reached", "warning", false),
-            event(2, 20, "claude.error", "critical", true),
-        ];
-        state.events_selected_index = 99; // Beyond range
+        let state = view_state!(
+            events: vec![
+                event(1, 10, "codex.usage_reached", "warning", false),
+                event(2, 20, "claude.error", "critical", true),
+            ],
+            events_selected_index: 99, // Beyond range
+        );
         let filtered = filtered_event_indices(&state);
         let clamped = state
             .events_selected_index
@@ -3197,26 +3212,25 @@ mod tests {
 
     #[test]
     fn filtered_history_indices_without_filters_returns_all() {
-        let mut state = ViewState::default();
-        state.history_entries = vec![
+        let state = view_state!(history_entries: vec![
             history_entry(1, Some(10), None, "send_text", true, false),
             history_entry(2, Some(10), Some("wf-1"), "workflow_step", false, false),
             history_entry(3, Some(20), None, "workflow_completed", false, true),
-        ];
+        ]);
         let filtered = filtered_history_indices(&state);
         assert_eq!(filtered, vec![0, 1, 2]);
     }
 
     #[test]
     fn filtered_history_indices_applies_query_and_undoable_filter() {
-        let mut state = ViewState::default();
-        state.history_entries = vec![
-            history_entry(1, Some(10), None, "send_text", true, false),
-            history_entry(2, Some(10), Some("wf-1"), "workflow_step", false, false),
-            history_entry(3, Some(20), None, "workflow_completed", false, true),
-        ];
-
-        state.history_filter_query = "wf-1".to_string();
+        let mut state = view_state!(
+            history_entries: vec![
+                history_entry(1, Some(10), None, "send_text", true, false),
+                history_entry(2, Some(10), Some("wf-1"), "workflow_step", false, false),
+                history_entry(3, Some(20), None, "workflow_completed", false, true),
+            ],
+            history_filter_query: "wf-1".to_string(),
+        );
         let filtered = filtered_history_indices(&state);
         assert_eq!(filtered, vec![1]);
 
@@ -3228,17 +3242,19 @@ mod tests {
 
     #[test]
     fn render_history_view_handles_empty_and_populated_state() {
-        let mut state = ViewState::default();
+        let empty_state = ViewState::default();
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
-        render_history_view(&state, area, &mut buf);
+        render_history_view(&empty_state, area, &mut buf);
 
-        state.history_entries = vec![
-            history_entry(1, Some(10), Some("wf-1"), "workflow_step", true, false),
-            history_entry(2, Some(10), Some("wf-1"), "workflow_completed", false, true),
-            history_entry(3, Some(20), None, "send_text", false, false),
-        ];
-        state.history_selected_index = 1;
+        let state = view_state!(
+            history_entries: vec![
+                history_entry(1, Some(10), Some("wf-1"), "workflow_step", true, false),
+                history_entry(2, Some(10), Some("wf-1"), "workflow_completed", false, true),
+                history_entry(3, Some(20), None, "send_text", false, false),
+            ],
+            history_selected_index: 1,
+        );
         render_history_view(&state, area, &mut buf);
     }
 
@@ -3266,8 +3282,7 @@ mod tests {
 
     #[test]
     fn render_search_view_empty_with_prior_query() {
-        let mut state = ViewState::default();
-        state.search_last_query = "nonexistent".to_string();
+        let state = view_state!(search_last_query: "nonexistent".to_string());
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
@@ -3276,12 +3291,13 @@ mod tests {
 
     #[test]
     fn render_search_view_with_results() {
-        let mut state = ViewState::default();
-        state.search_last_query = "test".to_string();
-        state.search_results = vec![
-            search_result(10, ">>matched<< text for test", 0.95),
-            search_result(20, "another >>match<< here", 0.75),
-        ];
+        let state = view_state!(
+            search_last_query: "test".to_string(),
+            search_results: vec![
+                search_result(10, ">>matched<< text for test", 0.95),
+                search_result(20, "another >>match<< here", 0.75),
+            ],
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
@@ -3290,13 +3306,14 @@ mod tests {
 
     #[test]
     fn render_search_view_with_selection() {
-        let mut state = ViewState::default();
-        state.search_last_query = "test".to_string();
-        state.search_results = vec![
-            search_result(10, "first result", 0.95),
-            search_result(20, "second result", 0.75),
-        ];
-        state.search_selected_index = 1;
+        let state = view_state!(
+            search_last_query: "test".to_string(),
+            search_results: vec![
+                search_result(10, "first result", 0.95),
+                search_result(20, "second result", 0.75),
+            ],
+            search_selected_index: 1,
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
@@ -3305,8 +3322,7 @@ mod tests {
 
     #[test]
     fn render_search_view_query_with_cursor() {
-        let mut state = ViewState::default();
-        state.search_query = "hello".to_string();
+        let state = view_state!(search_query: "hello".to_string());
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
@@ -3315,12 +3331,13 @@ mod tests {
 
     #[test]
     fn render_search_view_shows_suggestions() {
-        let mut state = ViewState::default();
-        state.search_query = "err".to_string();
-        state.search_suggestions = vec![crate::storage::SearchSuggestion {
-            text: "error".to_string(),
-            description: Some("Common errors".to_string()),
-        }];
+        let state = view_state!(
+            search_query: "err".to_string(),
+            search_suggestions: vec![crate::storage::SearchSuggestion {
+                text: "error".to_string(),
+                description: Some("Common errors".to_string()),
+            }],
+        );
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
@@ -3329,20 +3346,21 @@ mod tests {
 
     #[test]
     fn render_search_view_hides_suggestions_with_results() {
-        let mut state = ViewState::default();
-        state.search_query = "err".to_string();
-        state.search_suggestions = vec![crate::storage::SearchSuggestion {
-            text: "error".to_string(),
-            description: Some("Common errors".to_string()),
-        }];
-        // Add a result — suggestions should be hidden
-        state.search_results = vec![crate::tui::query::SearchResultView {
-            pane_id: 1,
-            timestamp: 1_735_689_600_000,
-            snippet: "some error text".to_string(),
-            rank: 1.0,
-        }];
-        state.search_last_query = "err".to_string();
+        let state = view_state!(
+            search_query: "err".to_string(),
+            search_suggestions: vec![crate::storage::SearchSuggestion {
+                text: "error".to_string(),
+                description: Some("Common errors".to_string()),
+            }],
+            // Add a result — suggestions should be hidden
+            search_results: vec![crate::tui::query::SearchResultView {
+                pane_id: 1,
+                timestamp: 1_735_689_600_000,
+                snippet: "some error text".to_string(),
+                rank: 1.0,
+            }],
+            search_last_query: "err".to_string(),
+        );
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
@@ -3366,14 +3384,15 @@ mod tests {
 
     #[test]
     fn render_search_view_with_progressive_status_metadata() {
-        let mut state = ViewState::default();
-        state.search_query = "panic".to_string();
-        state.search_last_query = "panic".to_string();
-        state.search_phase = SearchProgressPhase::RefinementUnavailable;
-        state.search_fast_only = false;
-        state.search_initial_latency_ms = Some(17);
-        state.search_phase_detail = Some("single-pass backend".to_string());
-        state.search_results = vec![search_result(10, "panic in worker", 0.88)];
+        let state = view_state!(
+            search_query: "panic".to_string(),
+            search_last_query: "panic".to_string(),
+            search_phase: SearchProgressPhase::RefinementUnavailable,
+            search_fast_only: false,
+            search_initial_latency_ms: Some(17),
+            search_phase_detail: Some("single-pass backend".to_string()),
+            search_results: vec![search_result(10, "panic in worker", 0.88)],
+        );
 
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
@@ -3443,8 +3462,7 @@ mod tests {
 
     #[test]
     fn render_home_view_healthy() {
-        let mut state = ViewState::default();
-        state.health = Some(make_health(true, true, true));
+        let state = view_state!(health: Some(make_health(true, true, true)));
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
         render_home_view(&state, area, &mut buf);
@@ -3453,11 +3471,12 @@ mod tests {
 
     #[test]
     fn render_home_view_degraded() {
-        let mut state = ViewState::default();
         let mut health = make_health(true, true, false);
         health.wezterm_circuit.state = CircuitStateKind::HalfOpen;
-        state.health = Some(health);
-        state.events = vec![event(1, 10, "codex.error", "critical", false)];
+        let state = view_state!(
+            health: Some(health),
+            events: vec![event(1, 10, "codex.error", "critical", false)],
+        );
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
         render_home_view(&state, area, &mut buf);
@@ -3475,8 +3494,7 @@ mod tests {
 
     #[test]
     fn render_home_view_with_error_message() {
-        let mut state = ViewState::default();
-        state.health = Some(make_health(true, true, true));
+        let mut state = view_state!(health: Some(make_health(true, true, true)));
         state.set_error("Connection lost");
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
@@ -3548,21 +3566,22 @@ mod tests {
 
     #[test]
     fn render_triage_view_with_workflows() {
-        let mut state = ViewState::default();
-        state.triage_items = vec![TriageItemView {
-            section: "events".to_string(),
-            severity: "warning".to_string(),
-            title: "test event".to_string(),
-            detail: "detail".to_string(),
-            actions: vec![],
-            event_id: Some(1),
-            pane_id: Some(0),
-            workflow_id: None,
-        }];
-        state.workflows = vec![
-            workflow("wf-1", "notify_user", 10, 1, 3, "running"),
-            workflow("wf-2", "restart_agent", 20, 0, 2, "waiting"),
-        ];
+        let state = view_state!(
+            triage_items: vec![TriageItemView {
+                section: "events".to_string(),
+                severity: "warning".to_string(),
+                title: "test event".to_string(),
+                detail: "detail".to_string(),
+                actions: vec![],
+                event_id: Some(1),
+                pane_id: Some(0),
+                workflow_id: None,
+            }],
+            workflows: vec![
+                workflow("wf-1", "notify_user", 10, 1, 3, "running"),
+                workflow("wf-2", "restart_agent", 20, 0, 2, "waiting"),
+            ],
+        );
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -3571,9 +3590,10 @@ mod tests {
 
     #[test]
     fn render_triage_view_with_expanded_workflow() {
-        let mut state = ViewState::default();
-        state.workflows = vec![workflow("wf-1", "notify_user", 10, 2, 4, "running")];
-        state.triage_expanded = Some(0);
+        let state = view_state!(
+            workflows: vec![workflow("wf-1", "notify_user", 10, 2, 4, "running")],
+            triage_expanded: Some(0),
+        );
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -3582,11 +3602,9 @@ mod tests {
 
     #[test]
     fn render_triage_view_with_failed_workflow() {
-        let mut state = ViewState::default();
         let mut wf = workflow("wf-err", "deploy_check", 5, 1, 3, "failed");
         wf.error = Some("Connection refused to remote host".to_string());
-        state.workflows = vec![wf];
-        state.triage_expanded = Some(0);
+        let state = view_state!(workflows: vec![wf], triage_expanded: Some(0));
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -3595,8 +3613,7 @@ mod tests {
 
     #[test]
     fn render_triage_view_no_workflows() {
-        let mut state = ViewState::default();
-        state.triage_items = vec![TriageItemView {
+        let state = view_state!(triage_items: vec![TriageItemView {
             section: "events".to_string(),
             severity: "warning".to_string(),
             title: "test".to_string(),
@@ -3605,7 +3622,7 @@ mod tests {
             event_id: Some(1),
             pane_id: Some(0),
             workflow_id: None,
-        }];
+        }]);
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -3614,8 +3631,9 @@ mod tests {
 
     #[test]
     fn render_triage_view_only_workflows_no_triage() {
-        let mut state = ViewState::default();
-        state.workflows = vec![workflow("wf-1", "notify_user", 10, 1, 3, "running")];
+        let state = view_state!(
+            workflows: vec![workflow("wf-1", "notify_user", 10, 1, 3, "running")]
+        );
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -3724,9 +3742,10 @@ mod tests {
 
     #[test]
     fn render_panes_view_with_selection_out_of_bounds() {
-        let mut state = ViewState::default();
-        state.panes = vec![pane(1, "test", Some("codex"), 0, "local")];
-        state.selected_index = 99; // Way out of bounds
+        let state = view_state!(
+            panes: vec![pane(1, "test", Some("codex"), 0, "local")],
+            selected_index: 99, // Way out of bounds
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_panes_view(&state, area, &mut buf);
@@ -3735,10 +3754,9 @@ mod tests {
 
     #[test]
     fn render_panes_view_alt_screen_pane() {
-        let mut state = ViewState::default();
         let mut p = pane(1, "vim", None, 0, "local");
         p.pane_state = "AltScreen".to_string();
-        state.panes = vec![p];
+        let state = view_state!(panes: vec![p]);
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_panes_view(&state, area, &mut buf);
@@ -3746,15 +3764,16 @@ mod tests {
 
     #[test]
     fn render_panes_view_with_all_filters() {
-        let mut state = ViewState::default();
-        state.panes = vec![
-            pane(1, "codex-main", Some("codex"), 2, "local"),
-            pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
-        ];
-        state.panes_filter_query = "codex".to_string();
-        state.panes_unhandled_only = true;
-        state.panes_agent_filter = Some("codex".to_string());
-        state.panes_domain_filter = Some("local".to_string());
+        let state = view_state!(
+            panes: vec![
+                pane(1, "codex-main", Some("codex"), 2, "local"),
+                pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
+            ],
+            panes_filter_query: "codex".to_string(),
+            panes_unhandled_only: true,
+            panes_agent_filter: Some("codex".to_string()),
+            panes_domain_filter: Some("local".to_string()),
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_panes_view(&state, area, &mut buf);
@@ -3764,10 +3783,11 @@ mod tests {
 
     #[test]
     fn render_events_view_selected_index_beyond_filtered() {
-        let mut state = ViewState::default();
-        state.events = vec![event(1, 10, "rule1", "warning", true)];
-        state.events_unhandled_only = true; // Filters out the only event
-        state.events_selected_index = 5;
+        let state = view_state!(
+            events: vec![event(1, 10, "rule1", "warning", true)],
+            events_unhandled_only: true, // Filters out the only event
+            events_selected_index: 5,
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_events_view(&state, area, &mut buf);
@@ -3778,10 +3798,11 @@ mod tests {
 
     #[test]
     fn render_search_view_selected_beyond_results() {
-        let mut state = ViewState::default();
-        state.search_last_query = "test".to_string();
-        state.search_results = vec![search_result(10, "one result", 0.5)];
-        state.search_selected_index = 99; // Way out of bounds
+        let state = view_state!(
+            search_last_query: "test".to_string(),
+            search_results: vec![search_result(10, "one result", 0.5)],
+            search_selected_index: 99, // Way out of bounds
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
@@ -3844,11 +3865,10 @@ mod tests {
 
     #[test]
     fn render_timeline_view_narrow_stacks_detail_below_list() {
-        let mut state = ViewState::default();
-        state.timeline_rows = vec![
+        let state = view_state!(timeline_rows: vec![
             timeline_row("evt-1", "error", "failover"),
             timeline_row("evt-2", "warning", ""),
-        ];
+        ]);
         let area = Rect::new(0, 0, 80, 22);
         let mut buf = Buffer::empty(area);
         render_timeline_view(&state, area, &mut buf);
@@ -3863,8 +3883,7 @@ mod tests {
 
     #[test]
     fn render_timeline_view_wide_shows_event_details() {
-        let mut state = ViewState::default();
-        state.timeline_rows = vec![timeline_row("evt-1", "error", "failover")];
+        let state = view_state!(timeline_rows: vec![timeline_row("evt-1", "error", "failover")]);
         let area = Rect::new(0, 0, 120, 24);
         let mut buf = Buffer::empty(area);
         render_timeline_view(&state, area, &mut buf);
@@ -3877,13 +3896,14 @@ mod tests {
 
     #[test]
     fn render_timeline_view_respects_scroll_offset() {
-        let mut state = ViewState::default();
-        state.timeline_rows = vec![
-            timeline_row("evt-1", "error", "failover"),
-            timeline_row("evt-2", "warning", ""),
-        ];
-        state.timeline_scroll = 1;
-        state.timeline_selected_index = 1;
+        let state = view_state!(
+            timeline_rows: vec![
+                timeline_row("evt-1", "error", "failover"),
+                timeline_row("evt-2", "warning", ""),
+            ],
+            timeline_scroll: 1,
+            timeline_selected_index: 1,
+        );
         let area = Rect::new(0, 0, 120, 24);
         let mut buf = Buffer::empty(area);
         render_timeline_view(&state, area, &mut buf);
@@ -3897,18 +3917,19 @@ mod tests {
 
     #[test]
     fn render_triage_view_selected_beyond_items() {
-        let mut state = ViewState::default();
-        state.triage_items = vec![TriageItemView {
-            section: "events".to_string(),
-            severity: "error".to_string(),
-            title: "test".to_string(),
-            detail: "detail".to_string(),
-            actions: vec![],
-            event_id: None,
-            pane_id: None,
-            workflow_id: None,
-        }];
-        state.triage_selected_index = 99;
+        let state = view_state!(
+            triage_items: vec![TriageItemView {
+                section: "events".to_string(),
+                severity: "error".to_string(),
+                title: "test".to_string(),
+                detail: "detail".to_string(),
+                actions: vec![],
+                event_id: None,
+                pane_id: None,
+                workflow_id: None,
+            }],
+            triage_selected_index: 99,
+        );
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -3917,8 +3938,7 @@ mod tests {
 
     #[test]
     fn render_triage_view_with_multiple_actions() {
-        let mut state = ViewState::default();
-        state.triage_items = vec![TriageItemView {
+        let state = view_state!(triage_items: vec![TriageItemView {
             section: "events".to_string(),
             severity: "error".to_string(),
             title: "multi-action item".to_string(),
@@ -3940,7 +3960,7 @@ mod tests {
             event_id: Some(42),
             pane_id: Some(10),
             workflow_id: None,
-        }];
+        }]);
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -3950,9 +3970,8 @@ mod tests {
 
     #[test]
     fn render_home_view_zero_panes_and_events() {
-        let mut state = ViewState::default();
         let health = make_health(true, true, true);
-        state.health = Some(health);
+        let mut state = view_state!(health: Some(health));
         // pane_count=3, event_count=10 from make_health defaults; override
         state.health.as_mut().unwrap().pane_count = 0;
         state.health.as_mut().unwrap().event_count = 0;
@@ -3963,8 +3982,7 @@ mod tests {
 
     #[test]
     fn render_home_view_high_event_count() {
-        let mut state = ViewState::default();
-        state.health = Some(make_health(true, true, true));
+        let mut state = view_state!(health: Some(make_health(true, true, true)));
         state.health.as_mut().unwrap().event_count = 500;
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
@@ -3974,10 +3992,9 @@ mod tests {
 
     #[test]
     fn render_home_view_no_capture_timestamp() {
-        let mut state = ViewState::default();
         let mut health = make_health(true, true, true);
         health.last_capture_ts = None;
-        state.health = Some(health);
+        let state = view_state!(health: Some(health));
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
         render_home_view(&state, area, &mut buf);
@@ -3986,11 +4003,10 @@ mod tests {
 
     #[test]
     fn render_home_view_circuit_open_with_cooldown() {
-        let mut state = ViewState::default();
         let mut health = make_health(true, true, true);
         health.wezterm_circuit.state = CircuitStateKind::Open;
         health.wezterm_circuit.cooldown_remaining_ms = Some(5000);
-        state.health = Some(health);
+        let state = view_state!(health: Some(health));
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
         render_home_view(&state, area, &mut buf);
@@ -4075,9 +4091,10 @@ mod tests {
 
     #[test]
     fn render_home_view_with_dashboard() {
-        let mut state = ViewState::default();
-        state.health = Some(make_health(true, true, true));
-        state.dashboard = Some(make_dashboard_state());
+        let state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
         let area = Rect::new(0, 0, 100, 50);
         let mut buf = Buffer::empty(area);
         render_home_view(&state, area, &mut buf);
@@ -4086,9 +4103,10 @@ mod tests {
 
     #[test]
     fn render_home_view_with_dashboard_narrow_terminal() {
-        let mut state = ViewState::default();
-        state.health = Some(make_health(true, true, true));
-        state.dashboard = Some(make_dashboard_state());
+        let state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
         // Narrow terminal: single-column layout for dashboard panels
         let area = Rect::new(0, 0, 50, 40);
         let mut buf = Buffer::empty(area);
@@ -4097,9 +4115,10 @@ mod tests {
 
     #[test]
     fn render_home_view_with_dashboard_tiny_terminal() {
-        let mut state = ViewState::default();
-        state.health = Some(make_health(true, true, true));
-        state.dashboard = Some(make_dashboard_state());
+        let state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
         // Very small terminal: falls back to summary line
         let area = Rect::new(0, 0, 30, 25);
         let mut buf = Buffer::empty(area);
@@ -4138,9 +4157,10 @@ mod tests {
 
     #[test]
     fn render_home_view_dashboard_with_error() {
-        let mut state = ViewState::default();
-        state.health = Some(make_health(true, true, true));
-        state.dashboard = Some(make_dashboard_state());
+        let mut state = view_state!(
+            health: Some(make_health(true, true, true)),
+            dashboard: Some(make_dashboard_state()),
+        );
         state.set_error("Connection lost");
         let area = Rect::new(0, 0, 100, 50);
         let mut buf = Buffer::empty(area);
@@ -4171,36 +4191,37 @@ mod tests {
 
     #[test]
     fn filtered_pane_indices_empty_query_returns_all() {
-        let mut state = ViewState::default();
-        state.panes = vec![
+        let state = view_state!(panes: vec![
             pane(1, "test", None, 0, "local"),
             pane(2, "test2", None, 0, "local"),
-        ];
+        ]);
         let filtered = filtered_pane_indices(&state);
         assert_eq!(filtered, vec![0, 1]);
     }
 
     #[test]
     fn filtered_pane_indices_by_cwd() {
-        let mut state = ViewState::default();
-        state.panes = vec![
-            pane(1, "test", None, 0, "local"),
-            pane(2, "test2", None, 0, "local"),
-        ];
         // cwd is "/tmp/{title}" - filter by test2
-        state.panes_filter_query = "test2".to_string();
+        let state = view_state!(
+            panes: vec![
+                pane(1, "test", None, 0, "local"),
+                pane(2, "test2", None, 0, "local"),
+            ],
+            panes_filter_query: "test2".to_string(),
+        );
         let filtered = filtered_pane_indices(&state);
         assert_eq!(filtered, vec![1]);
     }
 
     #[test]
     fn filtered_pane_indices_domain_ssh() {
-        let mut state = ViewState::default();
-        state.panes = vec![
-            pane(1, "local-shell", None, 0, "local"),
-            pane(2, "remote", None, 0, "ssh:myhost"),
-        ];
-        state.panes_domain_filter = Some("ssh".to_string());
+        let state = view_state!(
+            panes: vec![
+                pane(1, "local-shell", None, 0, "local"),
+                pane(2, "remote", None, 0, "ssh:myhost"),
+            ],
+            panes_domain_filter: Some("ssh".to_string()),
+        );
         let filtered = filtered_pane_indices(&state);
         assert_eq!(filtered, vec![1]);
     }
