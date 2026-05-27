@@ -5,7 +5,7 @@ pub use harfbuzz::*;
 use crate::locator::{FontDataHandle, FontDataSource};
 #[cfg(not(windows))]
 use crate::rasterizer::colr::{ColorLine, ColorStop, DrawOp};
-use anyhow::{ensure, Context, Error};
+use anyhow::{Context, Error, ensure};
 #[cfg(not(windows))]
 use cairo::Extend;
 use memmap2::{Mmap, MmapOptions};

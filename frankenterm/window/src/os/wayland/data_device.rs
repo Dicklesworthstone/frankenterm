@@ -1,16 +1,16 @@
+use smithay_client_toolkit::data_device_manager::WritePipe;
 use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
 use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
 use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
-use smithay_client_toolkit::data_device_manager::WritePipe;
 use smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice;
 use std::sync::MutexGuard;
+use wayland_client::Proxy;
 use wayland_client::protocol::wl_data_device_manager::DndAction;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::Proxy;
 
+use crate::wayland::SurfaceUserData;
 use crate::wayland::drag_and_drop::SurfaceAndOffer;
 use crate::wayland::pointer::{PointerState, PointerUserData};
-use crate::wayland::SurfaceUserData;
 
 use super::copy_and_paste::write_selection_to_pipe;
 use super::drag_and_drop::{DragAndDrop, SurfaceAndPipe};

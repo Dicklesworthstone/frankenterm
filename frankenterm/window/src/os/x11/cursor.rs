@@ -1,17 +1,17 @@
+use crate::MouseCursor;
 use crate::os::x11::xcb_util::*;
 use crate::x11::XConnection;
-use crate::MouseCursor;
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use config::ConfigHandle;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::ffi::OsStr;
-use std::io::prelude::*;
 use std::io::SeekFrom;
+use std::io::prelude::*;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use xcb::x::Cursor;
 use xcb::Xid;
+use xcb::x::Cursor;
 
 // X11 classic Cursor glyphs
 pub const HAND1: u16 = 58;

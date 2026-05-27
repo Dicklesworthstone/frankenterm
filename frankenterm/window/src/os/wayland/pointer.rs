@@ -15,10 +15,10 @@ use wezterm_input_types::MousePress;
 
 use crate::wayland::SurfaceUserData;
 
+use super::WaylandConnection;
 use super::copy_and_paste::CopyAndPaste;
 use super::drag_and_drop::DragAndDrop;
 use super::state::WaylandState;
-use super::WaylandConnection;
 
 impl PointerHandler for WaylandState {
     fn pointer_frame(

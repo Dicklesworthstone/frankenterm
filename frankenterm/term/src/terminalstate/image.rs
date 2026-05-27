@@ -703,7 +703,9 @@ mod tests {
             let err = terminal.assign_image_to_cells(params).unwrap_err();
             assert!(
                 err.to_string().contains(axis),
-                "expected {axis} in overflow-safe rejection, got {err}"
+                "expected {axis} in overflow-safe rejection, got {err}",
+                axis = axis,
+                err = err,
             );
         }
     }

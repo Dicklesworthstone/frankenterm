@@ -28,20 +28,20 @@ use smithay_client_toolkit::reexports::csd_frame::{
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
 use smithay_client_toolkit::seat::pointer::CursorIcon;
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shell::xdg::XdgSurface;
 use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
     WindowHandler,
 };
-use smithay_client_toolkit::shell::xdg::XdgSurface;
-use smithay_client_toolkit::shell::WaylandSurface;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_keyboard::{Event as WlKeyboardEvent, KeyState};
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
-use wayland_egl::{is_available as egl_is_available, WlEglSurface};
+use wayland_egl::{WlEglSurface, is_available as egl_is_available};
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 use wezterm_input_types::{
@@ -80,7 +80,7 @@ impl WaylandDimensions for Dimensions {
     }
 }
 
-use super::copy_and_paste::{set_pipe_nonblocking, CopyAndPaste};
+use super::copy_and_paste::{CopyAndPaste, set_pipe_nonblocking};
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
@@ -1403,7 +1403,9 @@ impl WaylandWindowInner {
                     Ok(KeyState::Pressed) => true,
                     Ok(KeyState::Released) => false,
                     Ok(key_state) => {
-                        log::warn!("Ignoring Wayland keyboard event with unsupported key state {key_state:?}");
+                        log::warn!(
+                            "Ignoring Wayland keyboard event with unsupported key state {key_state:?}"
+                        );
                         return;
                     }
                     Err(raw_state) => {

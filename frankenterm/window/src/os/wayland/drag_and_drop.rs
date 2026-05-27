@@ -1,13 +1,13 @@
-use crate::wayland::read_pipe_with_timeout;
 use crate::ConnectionOps;
+use crate::wayland::read_pipe_with_timeout;
 use smithay_client_toolkit as toolkit;
 use std::path::PathBuf;
-use toolkit::data_device_manager::data_offer::DragOffer;
 use toolkit::data_device_manager::ReadPipe;
+use toolkit::data_device_manager::data_offer::DragOffer;
 use url::Url;
 
-use super::data_device::URI_MIME_TYPE;
 use super::WaylandConnection;
+use super::data_device::URI_MIME_TYPE;
 
 #[derive(Default)]
 pub struct DragAndDrop {

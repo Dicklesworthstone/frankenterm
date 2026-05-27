@@ -263,7 +263,7 @@ pub fn subscribe() {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_appearance_for_state, lock_portal_state, CachedAppearance, State};
+    use super::{CachedAppearance, State, cached_appearance_for_state, lock_portal_state};
     use crate::Appearance;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
