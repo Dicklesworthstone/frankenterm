@@ -19,7 +19,7 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
 
-use frankenterm_core::config::{DistributedAuthMode, DistributedConfig};
+use frankenterm_core::config::{DistributedAuthMode, DistributedConfig, DistributedTlsConfig};
 use frankenterm_core::distributed::build_tls_bundle;
 
 use std::time::Duration;
@@ -50,6 +50,24 @@ fn temp_pem(contents: &str) -> tempfile::NamedTempFile {
     file
 }
 
+fn pem_path(file: &tempfile::NamedTempFile) -> String {
+    file.path().display().to_string()
+}
+
+fn enabled_tls_config(
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    client_ca_path: Option<String>,
+) -> DistributedTlsConfig {
+    DistributedTlsConfig {
+        enabled: true,
+        cert_path,
+        key_path,
+        client_ca_path,
+        ..DistributedTlsConfig::default()
+    }
+}
+
 // ===========================================================================
 // tls_handshake_succeeds
 // ===========================================================================
@@ -63,11 +81,15 @@ fn tls_handshake_succeeds() {
         let server_key = temp_pem(SERVER_KEY);
 
         // Server config: Token mode, no mTLS
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            tls: enabled_tls_config(
+                Some(pem_path(&server_cert)),
+                Some(pem_path(&server_key)),
+                None,
+            ),
+            ..DistributedConfig::default()
+        };
 
         let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
 
@@ -113,25 +135,32 @@ fn mtls_handshake_succeeds() {
         let client_key = temp_pem(CLIENT_KEY);
 
         // Server side: mTLS, server cert/key, client CA for verification
-        let mut srv_cfg = DistributedConfig::default();
-        srv_cfg.enabled = true;
-        srv_cfg.auth_mode = DistributedAuthMode::Mtls;
-        srv_cfg.tls.enabled = true;
-        srv_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
-        srv_cfg.tls.key_path = Some(server_key.path().display().to_string());
-        srv_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
-        srv_cfg.allow_agent_ids = vec!["wa-client".to_string()];
+        let srv_cfg = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Mtls,
+            tls: enabled_tls_config(
+                Some(pem_path(&server_cert)),
+                Some(pem_path(&server_key)),
+                Some(pem_path(&ca_cert)),
+            ),
+            allow_agent_ids: vec!["wa-client".to_string()],
+            ..DistributedConfig::default()
+        };
 
         let server_bundle =
             build_tls_bundle(&srv_cfg, Some(ca_cert.path())).expect("server bundle");
 
         // Client side: mTLS, client cert/key, CA for server verification
-        let mut cli_cfg = DistributedConfig::default();
-        cli_cfg.enabled = true;
-        cli_cfg.auth_mode = DistributedAuthMode::Mtls;
-        cli_cfg.tls.enabled = true;
-        cli_cfg.tls.cert_path = Some(client_cert.path().display().to_string());
-        cli_cfg.tls.key_path = Some(client_key.path().display().to_string());
+        let cli_cfg = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Mtls,
+            tls: enabled_tls_config(
+                Some(pem_path(&client_cert)),
+                Some(pem_path(&client_key)),
+                None,
+            ),
+            ..DistributedConfig::default()
+        };
 
         let client_bundle =
             build_tls_bundle(&cli_cfg, Some(ca_cert.path())).expect("client bundle");
@@ -176,11 +205,15 @@ fn tls_handshake_rejects_untrusted_server() {
         let server_key = temp_pem(SERVER_KEY);
 
         // Server: normal TLS config
-        let mut srv_cfg = DistributedConfig::default();
-        srv_cfg.enabled = true;
-        srv_cfg.tls.enabled = true;
-        srv_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
-        srv_cfg.tls.key_path = Some(server_key.path().display().to_string());
+        let srv_cfg = DistributedConfig {
+            enabled: true,
+            tls: enabled_tls_config(
+                Some(pem_path(&server_cert)),
+                Some(pem_path(&server_key)),
+                None,
+            ),
+            ..DistributedConfig::default()
+        };
 
         let server_bundle =
             build_tls_bundle(&srv_cfg, Some(ca_cert_alt.path())).expect("server bundle");
@@ -235,23 +268,27 @@ fn mtls_handshake_rejects_missing_client_cert() {
         let server_key = temp_pem(SERVER_KEY);
 
         // Server: mTLS required
-        let mut srv_cfg = DistributedConfig::default();
-        srv_cfg.enabled = true;
-        srv_cfg.auth_mode = DistributedAuthMode::Mtls;
-        srv_cfg.tls.enabled = true;
-        srv_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
-        srv_cfg.tls.key_path = Some(server_key.path().display().to_string());
-        srv_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
+        let srv_cfg = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Mtls,
+            tls: enabled_tls_config(
+                Some(pem_path(&server_cert)),
+                Some(pem_path(&server_key)),
+                Some(pem_path(&ca_cert)),
+            ),
+            ..DistributedConfig::default()
+        };
 
         let server_bundle =
             build_tls_bundle(&srv_cfg, Some(ca_cert.path())).expect("server bundle");
 
         // Client: Token mode (no client cert) — server requires mTLS
-        let mut cli_cfg = DistributedConfig::default();
-        cli_cfg.enabled = true;
-        cli_cfg.auth_mode = DistributedAuthMode::Token;
-        cli_cfg.tls.enabled = true;
-        cli_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
+        let cli_cfg = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            tls: enabled_tls_config(Some(pem_path(&server_cert)), None, None),
+            ..DistributedConfig::default()
+        };
 
         let client_bundle =
             build_tls_bundle(&cli_cfg, Some(ca_cert.path())).expect("client bundle");
@@ -304,25 +341,32 @@ fn mtls_handshake_rejects_disallowed_client() {
         let client_key = temp_pem(CLIENT_KEY);
 
         // Server: mTLS with allowlist that excludes the client
-        let mut srv_cfg = DistributedConfig::default();
-        srv_cfg.enabled = true;
-        srv_cfg.auth_mode = DistributedAuthMode::Mtls;
-        srv_cfg.tls.enabled = true;
-        srv_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
-        srv_cfg.tls.key_path = Some(server_key.path().display().to_string());
-        srv_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
-        srv_cfg.allow_agent_ids = vec!["not-allowed".to_string()];
+        let srv_cfg = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Mtls,
+            tls: enabled_tls_config(
+                Some(pem_path(&server_cert)),
+                Some(pem_path(&server_key)),
+                Some(pem_path(&ca_cert)),
+            ),
+            allow_agent_ids: vec!["not-allowed".to_string()],
+            ..DistributedConfig::default()
+        };
 
         let server_bundle =
             build_tls_bundle(&srv_cfg, Some(ca_cert.path())).expect("server bundle");
 
         // Client: mTLS with valid cert but not in server allowlist
-        let mut cli_cfg = DistributedConfig::default();
-        cli_cfg.enabled = true;
-        cli_cfg.auth_mode = DistributedAuthMode::Mtls;
-        cli_cfg.tls.enabled = true;
-        cli_cfg.tls.cert_path = Some(client_cert.path().display().to_string());
-        cli_cfg.tls.key_path = Some(client_key.path().display().to_string());
+        let cli_cfg = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Mtls,
+            tls: enabled_tls_config(
+                Some(pem_path(&client_cert)),
+                Some(pem_path(&client_key)),
+                None,
+            ),
+            ..DistributedConfig::default()
+        };
 
         let client_bundle =
             build_tls_bundle(&cli_cfg, Some(ca_cert.path())).expect("client bundle");
@@ -371,11 +415,15 @@ fn tls_rejects_plaintext_client() {
         let server_cert = temp_pem(SERVER_CERT);
         let server_key = temp_pem(SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            tls: enabled_tls_config(
+                Some(pem_path(&server_cert)),
+                Some(pem_path(&server_key)),
+                None,
+            ),
+            ..DistributedConfig::default()
+        };
 
         let bundle = build_tls_bundle(&config, None).expect("tls bundle");
 
