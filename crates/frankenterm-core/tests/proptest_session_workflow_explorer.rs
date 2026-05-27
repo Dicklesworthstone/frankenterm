@@ -286,6 +286,8 @@ proptest! {
 // TimelineQuery::matches tests
 // =============================================================================
 
+// Timeline event fixtures keep query dimensions explicit for property cases.
+#[allow(clippy::too_many_arguments)]
 fn make_event(
     event_id: u64,
     timestamp_ms: u64,

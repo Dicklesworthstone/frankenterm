@@ -849,7 +849,7 @@ fn ic41_diff_output_equivalence() {
     assert!(robot_json.is_object(), "Robot JSON should be valid object");
 
     // Both should agree on pass/fail
-    assert_eq!(diff_data.passed, true);
+    assert!(diff_data.passed);
     assert_eq!(result.exit_code, ReplayExitCode::Pass);
 }
 
