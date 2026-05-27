@@ -2574,7 +2574,14 @@ fn contract_robot_tx_run_safe_mode_json_envelope() {
 #[test]
 fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
     let (dir, ws) = setup_workspace();
-    write_default_tx_contract(&dir, MissionTxState::Planned);
+    // ft-sjmhw: a `Planned` tx has no applied steps, so the rollback guard in
+    // plan.rs (`rollback requires commit receipts or a committed tx state`)
+    // correctly rejects it -- you cannot compensate steps that never ran. This
+    // test exercises rollback FAILURE + RECOVERY over the 3 committed steps, so
+    // the contract must start `Committed` (the guard then synthesizes commit
+    // receipts for each step). The guard is a real safety invariant and is left
+    // intact; the test's setup state was the bug.
+    write_default_tx_contract(&dir, MissionTxState::Committed);
 
     let fail_payload = run_wa_json(
         &ws,
