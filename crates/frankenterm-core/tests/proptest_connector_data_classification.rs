@@ -833,8 +833,10 @@ proptest! {
             secrets_detected: false,
             classified_at_ms: 1000,
         };
-        let mut policy = ClassificationPolicy::default();
-        policy.allow_prohibited = true;
+        let policy = ClassificationPolicy {
+            allow_prohibited: true,
+            ..Default::default()
+        };
         let decision = classifier.ingestion_decision(&event, &policy);
         // Prohibited + allow_prohibited + requires_redaction → AcceptRedacted
         let is_accept_redacted = matches!(decision, IngestionDecision::AcceptRedacted);
@@ -991,11 +993,13 @@ proptest! {
 
     /// classify_event payload truncation detection increments telemetry.
     #[test]
-    fn classify_event_payload_truncation_detected(_dummy in 0u8..1) {
-        let mut classifier = ConnectorDataClassifier::new(ClassifierConfig::default());
-        let mut policy = ClassificationPolicy::default();
-        policy.max_payload_bytes = 10; // Very small limit
-        classifier.register_policy(policy);
+        fn classify_event_payload_truncation_detected(_dummy in 0u8..1) {
+            let mut classifier = ConnectorDataClassifier::new(ClassifierConfig::default());
+            let policy = ClassificationPolicy {
+                max_payload_bytes: 10, // Very small limit
+                ..Default::default()
+            };
+            classifier.register_policy(policy);
 
         let payload = serde_json::json!({"big_field": "a very long string that exceeds the tiny limit"});
         let event = make_test_event("conn-1", payload);

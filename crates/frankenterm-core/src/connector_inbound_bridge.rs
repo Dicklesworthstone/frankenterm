@@ -1368,10 +1368,12 @@ mod tests {
         let bus = make_bus();
         let mut sub = bus.subscribe_detections();
         let mut bridge = default_bridge(bus);
-        let mut policy = ClassificationPolicy::default();
-        policy.policy_id = "github-emergency".to_string();
-        policy.connector_pattern = "github".to_string();
-        policy.allow_prohibited = true;
+        let policy = ClassificationPolicy {
+            policy_id: "github-emergency".to_string(),
+            connector_pattern: "github".to_string(),
+            allow_prohibited: true,
+            ..Default::default()
+        };
         bridge.register_classification_policy(policy);
 
         let sig = ConnectorSignal::new(

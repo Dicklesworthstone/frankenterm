@@ -1437,16 +1437,20 @@ mod tests {
 
     #[test]
     fn policy_matches_exact() {
-        let mut policy = ClassificationPolicy::default();
-        policy.connector_pattern = "github".to_string();
+        let policy = ClassificationPolicy {
+            connector_pattern: "github".to_string(),
+            ..Default::default()
+        };
         assert!(policy.matches_connector("github"));
         assert!(!policy.matches_connector("gitlab"));
     }
 
     #[test]
     fn policy_matches_prefix_wildcard() {
-        let mut policy = ClassificationPolicy::default();
-        policy.connector_pattern = "github-*".to_string();
+        let policy = ClassificationPolicy {
+            connector_pattern: "github-*".to_string(),
+            ..Default::default()
+        };
         assert!(policy.matches_connector("github-actions"));
         assert!(policy.matches_connector("github-webhooks"));
         assert!(!policy.matches_connector("gitlab"));
@@ -1814,8 +1818,10 @@ mod tests {
             secrets_detected: false,
             classified_at_ms: 0,
         };
-        let mut policy = ClassificationPolicy::default();
-        policy.allow_prohibited = true;
+        let policy = ClassificationPolicy {
+            allow_prohibited: true,
+            ..Default::default()
+        };
         let decision = classifier.ingestion_decision(&classified, &policy);
         // With allow_prohibited, it should accept with redaction (not reject)
         assert_eq!(decision, IngestionDecision::AcceptRedacted);
@@ -2179,9 +2185,11 @@ mod tests {
         classifier.register_policy(ClassificationPolicy::default());
 
         // Register specific policy
-        let mut specific = ClassificationPolicy::default();
-        specific.policy_id = "github-specific".to_string();
-        specific.connector_pattern = "github".to_string();
+        let specific = ClassificationPolicy {
+            policy_id: "github-specific".to_string(),
+            connector_pattern: "github".to_string(),
+            ..Default::default()
+        };
         classifier.register_policy(specific);
 
         // Specific should match first
