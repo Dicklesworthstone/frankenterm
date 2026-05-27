@@ -718,11 +718,13 @@ impl WorkflowRunner {
             .start_with_id_cx(
                 cx,
                 &self.storage,
-                execution_id.clone(),
-                &workflow_name,
-                pane_id,
-                event_id,
-                Some(context),
+                super::engine::WorkflowStartInput {
+                    execution_id: execution_id.clone(),
+                    workflow_name: workflow_name.clone(),
+                    pane_id,
+                    trigger_event_id: event_id,
+                    context: Some(context),
+                },
             )
             .await
         {
@@ -1315,15 +1317,17 @@ impl WorkflowRunner {
             if !matches!(&step_result, StepResult::SendText { .. }) {
                 let step_audit_action_id = record_workflow_step_action(
                     &self.storage,
-                    &workflow_name,
-                    execution_id,
-                    pane_id,
-                    current_step,
-                    step_name,
-                    step_id.clone(),
-                    step_kind.clone(),
-                    result_type,
-                    start_action_id,
+                    WorkflowStepActionInput {
+                        workflow_name: &workflow_name,
+                        execution_id,
+                        pane_id,
+                        step_index: current_step,
+                        step_name,
+                        step_id: step_id.clone(),
+                        step_kind: step_kind.clone(),
+                        result_type,
+                        parent_action_id: start_action_id,
+                    },
                 )
                 .await;
 

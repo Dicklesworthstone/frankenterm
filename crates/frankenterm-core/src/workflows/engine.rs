@@ -65,6 +65,63 @@ pub struct WorkflowEngine {
     max_concurrent: usize,
 }
 
+pub struct WorkflowStartInput {
+    pub execution_id: String,
+    pub workflow_name: String,
+    pub pane_id: u64,
+    pub trigger_event_id: Option<i64>,
+    pub context: Option<serde_json::Value>,
+}
+
+pub struct WorkflowStatusUpdate<'a> {
+    pub execution_id: &'a str,
+    pub status: ExecutionStatus,
+    pub current_step: usize,
+    pub wait_condition: Option<&'a WaitCondition>,
+    pub error: Option<&'a str>,
+}
+
+pub struct WorkflowStepLogInput<'a> {
+    pub execution_id: &'a str,
+    pub step_index: usize,
+    pub step_name: &'a str,
+    pub result: &'a StepResult,
+    pub started_at: i64,
+}
+
+pub(super) struct WorkflowStepActionInput<'a> {
+    pub workflow_name: &'a str,
+    pub execution_id: &'a str,
+    pub pane_id: u64,
+    pub step_index: usize,
+    pub step_name: &'a str,
+    pub step_id: Option<String>,
+    pub step_kind: Option<String>,
+    pub result_type: &'a str,
+    pub parent_action_id: Option<i64>,
+}
+
+struct WorkflowAuditActionInput<'a> {
+    action_kind: &'a str,
+    execution_id: &'a str,
+    pane_id: u64,
+    workflow_name: &'a str,
+    input_summary: Option<String>,
+    result: &'a str,
+    decision_reason: Option<String>,
+}
+
+struct WorkflowAuditDecisionInput<'a> {
+    action_kind: &'a str,
+    execution_id: &'a str,
+    pane_id: u64,
+    workflow_name: &'a str,
+    input_summary: Option<&'a str>,
+    result: &'a str,
+    decision_reason: Option<&'a str>,
+    timestamp_ms: i64,
+}
+
 impl Default for WorkflowEngine {
     fn default() -> Self {
         Self::new(3)
@@ -127,11 +184,13 @@ impl WorkflowEngine {
         self.start_with_id_cx(
             cx,
             storage,
-            execution_id,
-            workflow_name,
-            pane_id,
-            trigger_event_id,
-            context,
+            WorkflowStartInput {
+                execution_id,
+                workflow_name: workflow_name.to_string(),
+                pane_id,
+                trigger_event_id,
+                context,
+            },
         )
         .await
     }
@@ -156,11 +215,13 @@ impl WorkflowEngine {
         self.start_with_id_cx(
             &cx,
             storage,
-            execution_id,
-            workflow_name,
-            pane_id,
-            trigger_event_id,
-            context,
+            WorkflowStartInput {
+                execution_id,
+                workflow_name: workflow_name.to_string(),
+                pane_id,
+                trigger_event_id,
+                context,
+            },
         )
         .await
     }
@@ -174,25 +235,21 @@ impl WorkflowEngine {
         &self,
         cx: &crate::cx::Cx,
         storage: &crate::storage::StorageHandle,
-        execution_id: String,
-        workflow_name: &str,
-        pane_id: u64,
-        trigger_event_id: Option<i64>,
-        context: Option<serde_json::Value>,
+        input: WorkflowStartInput,
     ) -> crate::Result<WorkflowExecution> {
         cx.checkpoint()
             .map_err(|e| workflow_checkpoint_cancelled_error("workflow.start_with_id_cx", e))?;
 
         let now = now_ms();
         let record = crate::storage::WorkflowRecord {
-            id: execution_id.clone(),
-            workflow_name: workflow_name.to_string(),
-            pane_id,
-            trigger_event_id,
+            id: input.execution_id.clone(),
+            workflow_name: input.workflow_name.clone(),
+            pane_id: input.pane_id,
+            trigger_event_id: input.trigger_event_id,
             current_step: 0,
             status: "running".to_string(),
             wait_condition: None,
-            context,
+            context: input.context,
             result: None,
             error: None,
             started_at: now,
@@ -205,9 +262,9 @@ impl WorkflowEngine {
         cx.checkpoint()
             .map_err(|e| workflow_checkpoint_cancelled_error("workflow.start_with_id_cx", e))?;
         Ok(WorkflowExecution {
-            id: execution_id,
-            workflow_name: workflow_name.to_string(),
-            pane_id,
+            id: input.execution_id,
+            workflow_name: input.workflow_name,
+            pane_id: input.pane_id,
             current_step: 0,
             status: ExecutionStatus::Running,
             started_at: now,
@@ -309,25 +366,23 @@ impl WorkflowEngine {
         &self,
         cx: &crate::cx::Cx,
         storage: &crate::storage::StorageHandle,
-        execution_id: &str,
-        status: ExecutionStatus,
-        current_step: usize,
-        wait_condition: Option<&WaitCondition>,
-        error: Option<&str>,
+        input: WorkflowStatusUpdate<'_>,
     ) -> crate::Result<()> {
         cx.checkpoint()
             .map_err(|e| workflow_checkpoint_cancelled_error("workflow.update_status_cx", e))?;
 
         let now = now_ms();
-        let status_str = match status {
+        let status_str = match input.status {
             ExecutionStatus::Running => "running",
             ExecutionStatus::Waiting => "waiting",
             ExecutionStatus::Completed => "completed",
             ExecutionStatus::Aborted => "aborted",
         };
 
-        let Some(existing) = storage.get_workflow_with_cx(cx, execution_id).await? else {
-            return Err(crate::error::WorkflowError::NotFound(execution_id.to_string()).into());
+        let Some(existing) = storage.get_workflow_with_cx(cx, input.execution_id).await? else {
+            return Err(
+                crate::error::WorkflowError::NotFound(input.execution_id.to_string()).into(),
+            );
         };
 
         let record = crate::storage::WorkflowRecord {
@@ -335,9 +390,9 @@ impl WorkflowEngine {
             workflow_name: existing.workflow_name,
             pane_id: existing.pane_id,
             trigger_event_id: existing.trigger_event_id,
-            current_step,
+            current_step: input.current_step,
             status: status_str.to_string(),
-            wait_condition: wait_condition.map(|wc| match serde_json::to_value(wc) {
+            wait_condition: input.wait_condition.map(|wc| match serde_json::to_value(wc) {
                 Ok(v) => v,
                 Err(err) => {
                     // br-ft-zkthg: bump workflows serde-drop counter
@@ -354,11 +409,11 @@ impl WorkflowEngine {
             }),
             context: existing.context,
             result: existing.result,
-            error: error.map(String::from),
+            error: input.error.map(String::from),
             started_at: existing.started_at,
             updated_at: now,
-            completed_at: if status == ExecutionStatus::Completed
-                || status == ExecutionStatus::Aborted
+            completed_at: if input.status == ExecutionStatus::Completed
+                || input.status == ExecutionStatus::Aborted
             {
                 Some(now)
             } else {
@@ -387,11 +442,13 @@ impl WorkflowEngine {
         self.update_status_cx(
             &cx,
             storage,
-            execution_id,
-            status,
-            current_step,
-            wait_condition,
-            error,
+            WorkflowStatusUpdate {
+                execution_id,
+                status,
+                current_step,
+                wait_condition,
+                error,
+            },
         )
         .await
     }
@@ -405,17 +462,13 @@ impl WorkflowEngine {
         &self,
         cx: &crate::cx::Cx,
         storage: &crate::storage::StorageHandle,
-        execution_id: &str,
-        step_index: usize,
-        step_name: &str,
-        result: &StepResult,
-        started_at: i64,
+        input: WorkflowStepLogInput<'_>,
     ) -> crate::Result<()> {
         cx.checkpoint()
             .map_err(|e| workflow_checkpoint_cancelled_error("workflow.log_step_cx", e))?;
 
         let completed_at = now_ms();
-        let result_type = match result {
+        let result_type = match input.result {
             StepResult::Continue => "continue",
             StepResult::Done { .. } => "done",
             StepResult::Abort { .. } => "abort",
@@ -424,21 +477,21 @@ impl WorkflowEngine {
             StepResult::SendText { .. } => "send_text",
             StepResult::JumpTo { .. } => "jump_to",
         };
-        let result_data = serde_json::to_string(result)
+        let result_data = serde_json::to_string(input.result)
             .inspect_err(
                 |e| tracing::warn!(error = %e, "workflow step result serialization failed"),
             )
             .ok();
-        let verification_refs = build_verification_refs(result, None);
-        let error_code = step_error_code_from_result(result);
+        let verification_refs = build_verification_refs(input.result, None);
+        let error_code = step_error_code_from_result(input.result);
 
         let res = storage
             .insert_step_log_with_cx(
                 cx,
-                execution_id,
+                input.execution_id,
                 None,
-                step_index,
-                step_name,
+                input.step_index,
+                input.step_name,
                 None,
                 None,
                 result_type,
@@ -446,7 +499,7 @@ impl WorkflowEngine {
                 None,
                 verification_refs,
                 error_code,
-                started_at,
+                input.started_at,
                 completed_at,
             )
             .await;
@@ -470,11 +523,13 @@ impl WorkflowEngine {
         self.log_step_cx(
             &cx,
             storage,
-            execution_id,
-            step_index,
-            step_name,
-            result,
-            started_at,
+            WorkflowStepLogInput {
+                execution_id,
+                step_index,
+                step_name,
+                result,
+                started_at,
+            },
         )
         .await
     }
@@ -820,45 +875,38 @@ pub(super) fn policy_error_code_from_injection(
 /// return is `None` (same as any storage write failure) so callers
 /// in the startup path degrade gracefully — the workflow continues
 /// without a linked audit id rather than aborting.
-#[allow(clippy::too_many_arguments)]
 async fn record_workflow_action_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
-    action_kind: &str,
-    execution_id: &str,
-    pane_id: u64,
-    workflow_name: &str,
-    input_summary: Option<String>,
-    result: &str,
-    decision_reason: Option<String>,
+    input: WorkflowAuditActionInput<'_>,
 ) -> Option<i64> {
     let timestamp_ms = now_ms();
-    let decision_context = build_workflow_audit_decision_context(
-        action_kind,
-        execution_id,
-        pane_id,
-        workflow_name,
-        input_summary.as_deref(),
-        result,
-        decision_reason.as_deref(),
+    let decision_context = build_workflow_audit_decision_context(WorkflowAuditDecisionInput {
+        action_kind: input.action_kind,
+        execution_id: input.execution_id,
+        pane_id: input.pane_id,
+        workflow_name: input.workflow_name,
+        input_summary: input.input_summary.as_deref(),
+        result: input.result,
+        decision_reason: input.decision_reason.as_deref(),
         timestamp_ms,
-    );
+    });
     let action = crate::storage::AuditActionRecord {
         id: 0,
         ts: timestamp_ms,
         actor_kind: "workflow".to_string(),
-        actor_id: Some(execution_id.to_string()),
+        actor_id: Some(input.execution_id.to_string()),
         correlation_id: None,
-        pane_id: Some(pane_id),
+        pane_id: Some(input.pane_id),
         domain: None,
-        action_kind: action_kind.to_string(),
+        action_kind: input.action_kind.to_string(),
         policy_decision: "allow".to_string(),
-        decision_reason,
+        decision_reason: input.decision_reason,
         rule_id: None,
-        input_summary,
+        input_summary: input.input_summary,
         verification_summary: None,
         decision_context,
-        result: result.to_string(),
+        result: input.result.to_string(),
     };
 
     match storage
@@ -868,8 +916,8 @@ async fn record_workflow_action_with_cx(
         Ok(id) => Some(id),
         Err(e) => {
             tracing::warn!(
-                execution_id,
-                action_kind,
+                execution_id = input.execution_id,
+                action_kind = input.action_kind,
                 error = %e,
                 "Failed to record workflow audit action (cx path)"
             );
@@ -878,27 +926,18 @@ async fn record_workflow_action_with_cx(
     }
 }
 
-fn build_workflow_audit_decision_context(
-    action_kind: &str,
-    execution_id: &str,
-    pane_id: u64,
-    workflow_name: &str,
-    input_summary: Option<&str>,
-    result: &str,
-    decision_reason: Option<&str>,
-    timestamp_ms: i64,
-) -> Option<String> {
+fn build_workflow_audit_decision_context(input: WorkflowAuditDecisionInput<'_>) -> Option<String> {
     let mut context = crate::policy::DecisionContext::new_audit(
-        timestamp_ms,
+        input.timestamp_ms,
         crate::policy::ActionKind::WorkflowRun,
         crate::policy::ActorKind::Workflow,
         crate::policy::PolicySurface::Workflow,
-        Some(pane_id),
+        Some(input.pane_id),
         None,
-        input_summary.map(str::to_string),
-        Some(execution_id.to_string()),
+        input.input_summary.map(str::to_string),
+        Some(input.execution_id.to_string()),
     );
-    let determining_rule = format!("audit.{action_kind}");
+    let determining_rule = format!("audit.{}", input.action_kind);
     context.record_rule(
         &determining_rule,
         true,
@@ -907,15 +946,15 @@ fn build_workflow_audit_decision_context(
     );
     context.set_determining_rule(&determining_rule);
     context.add_evidence("stage", "workflow_audit");
-    context.add_evidence("workflow_action_kind", action_kind);
+    context.add_evidence("workflow_action_kind", input.action_kind);
     context.add_evidence(
         "workflow_surface",
         crate::policy::PolicySurface::Workflow.as_str(),
     );
-    context.add_evidence("workflow_name", workflow_name);
-    context.add_evidence("execution_id", execution_id);
-    context.add_evidence("workflow_result", result);
-    if let Some(decision_reason) = decision_reason {
+    context.add_evidence("workflow_name", input.workflow_name);
+    context.add_evidence("execution_id", input.execution_id);
+    context.add_evidence("workflow_result", input.result);
+    if let Some(decision_reason) = input.decision_reason {
         context.add_evidence("decision_reason", decision_reason);
     }
     serde_json::to_string(&context).ok()
@@ -971,13 +1010,15 @@ pub(super) async fn record_workflow_start_action_with_cx(
     let action_id = record_workflow_action_with_cx(
         cx,
         storage,
-        "workflow_start",
-        execution_id,
-        pane_id,
-        workflow_name,
-        summary,
-        "started",
-        None,
+        WorkflowAuditActionInput {
+            action_kind: "workflow_start",
+            execution_id,
+            pane_id,
+            workflow_name,
+            input_summary: summary,
+            result: "started",
+            decision_reason: None,
+        },
     )
     .await?;
 
@@ -1044,32 +1085,11 @@ pub(super) async fn fetch_workflow_start_action_id_with_cx(
 
 pub(super) async fn record_workflow_step_action(
     storage: &crate::storage::StorageHandle,
-    workflow_name: &str,
-    execution_id: &str,
-    pane_id: u64,
-    step_index: usize,
-    step_name: &str,
-    step_id: Option<String>,
-    step_kind: Option<String>,
-    result_type: &str,
-    parent_action_id: Option<i64>,
+    input: WorkflowStepActionInput<'_>,
 ) -> Option<i64> {
     // ft-dit9w: ergonomic wrapper around `record_workflow_step_action_with_cx`.
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    record_workflow_step_action_with_cx(
-        &cx,
-        storage,
-        workflow_name,
-        execution_id,
-        pane_id,
-        step_index,
-        step_name,
-        step_id,
-        step_kind,
-        result_type,
-        parent_action_id,
-    )
-    .await
+    record_workflow_step_action_with_cx(&cx, storage, input).await
 }
 
 /// ft-dit9w Cx-first sibling of [`record_workflow_step_action`].
@@ -1077,29 +1097,20 @@ pub(super) async fn record_workflow_step_action(
 /// Routes through `record_workflow_action_with_cx` so the audit-action
 /// write threads cx into its inner storage call rather than running
 /// under ambient cx.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn record_workflow_step_action_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
-    workflow_name: &str,
-    execution_id: &str,
-    pane_id: u64,
-    step_index: usize,
-    step_name: &str,
-    step_id: Option<String>,
-    step_kind: Option<String>,
-    result_type: &str,
-    parent_action_id: Option<i64>,
+    input: WorkflowStepActionInput<'_>,
 ) -> Option<i64> {
     let summary = serde_json::json!({
-        "workflow_name": workflow_name,
-        "execution_id": execution_id,
-        "step_index": step_index,
-        "step_name": step_name,
-        "step_id": step_id,
-        "step_kind": step_kind,
-        "result_type": result_type,
-        "parent_action_id": parent_action_id,
+        "workflow_name": input.workflow_name,
+        "execution_id": input.execution_id,
+        "step_index": input.step_index,
+        "step_name": input.step_name,
+        "step_id": input.step_id.as_deref(),
+        "step_kind": input.step_kind.as_deref(),
+        "result_type": input.result_type,
+        "parent_action_id": input.parent_action_id,
     });
     let summary = serde_json::to_string(&summary)
         .inspect_err(|e| tracing::warn!(error = %e, "workflow step summary serialization failed"))
@@ -1107,13 +1118,15 @@ pub(super) async fn record_workflow_step_action_with_cx(
     record_workflow_action_with_cx(
         cx,
         storage,
-        "workflow_step",
-        execution_id,
-        pane_id,
-        workflow_name,
-        summary,
-        result_type,
-        None,
+        WorkflowAuditActionInput {
+            action_kind: "workflow_step",
+            execution_id: input.execution_id,
+            pane_id: input.pane_id,
+            workflow_name: input.workflow_name,
+            input_summary: summary,
+            result: input.result_type,
+            decision_reason: None,
+        },
     )
     .await
 }
@@ -1186,13 +1199,15 @@ pub(super) async fn record_workflow_terminal_action_with_cx(
     let _ = record_workflow_action_with_cx(
         cx,
         storage,
-        action_kind,
-        execution_id,
-        pane_id,
-        workflow_name,
-        summary,
-        result,
-        reason.map(str::to_string),
+        WorkflowAuditActionInput {
+            action_kind,
+            execution_id,
+            pane_id,
+            workflow_name,
+            input_summary: summary,
+            result,
+            decision_reason: reason.map(str::to_string),
+        },
     )
     .await;
 
@@ -1481,16 +1496,16 @@ mod tests {
     #[test]
     fn workflow_audit_decision_context_tracks_workflow_surface_and_metadata() {
         let input_summary = Some("{\"workflow_name\":\"handle_compaction\",\"step_index\":1}");
-        let ctx_json = build_workflow_audit_decision_context(
-            "workflow_step",
-            "wf-123",
-            7,
-            "handle_compaction",
+        let ctx_json = build_workflow_audit_decision_context(WorkflowAuditDecisionInput {
+            action_kind: "workflow_step",
+            execution_id: "wf-123",
+            pane_id: 7,
+            workflow_name: "handle_compaction",
             input_summary,
-            "continue",
-            Some("waiting for verification"),
-            1_234,
-        )
+            result: "continue",
+            decision_reason: Some("waiting for verification"),
+            timestamp_ms: 1_234,
+        })
         .expect("decision context should serialize");
         let ctx: crate::policy::DecisionContext =
             serde_json::from_str(&ctx_json).expect("decision context should parse");
@@ -1549,15 +1564,17 @@ mod tests {
                 .expect("pane upsert should succeed");
             record_workflow_step_action(
                 &storage,
-                "handle_compaction",
-                "wf-456",
-                9,
-                2,
-                "verify_output",
-                Some("step-verify".to_string()),
-                Some("verification".to_string()),
-                "continue",
-                Some(41),
+                WorkflowStepActionInput {
+                    workflow_name: "handle_compaction",
+                    execution_id: "wf-456",
+                    pane_id: 9,
+                    step_index: 2,
+                    step_name: "verify_output",
+                    step_id: Some("step-verify".to_string()),
+                    step_kind: Some("verification".to_string()),
+                    result_type: "continue",
+                    parent_action_id: Some(41),
+                },
             )
             .await;
         });
