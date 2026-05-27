@@ -1741,8 +1741,10 @@ mod tests {
 
     #[test]
     fn cost_budget_tracks_costs() {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = 100;
+        let config = CostBudgetConfig {
+            max_cost_cents: 100,
+            ..Default::default()
+        };
         let mut cb = CostBudget::new(config);
 
         // Notify = 1 cent
@@ -1754,8 +1756,10 @@ mod tests {
 
     #[test]
     fn cost_budget_exhaustion() {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = 10;
+        let config = CostBudgetConfig {
+            max_cost_cents: 10,
+            ..Default::default()
+        };
         let mut cb = CostBudget::new(config);
 
         // TriggerWorkflow = 10 cents each
@@ -1766,9 +1770,11 @@ mod tests {
 
     #[test]
     fn cost_budget_window_expiration() {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = 20;
-        config.window_ms = 5000;
+        let config = CostBudgetConfig {
+            max_cost_cents: 20,
+            window_ms: 5000,
+            ..Default::default()
+        };
         let mut cb = CostBudget::new(config);
 
         cb.record(&ConnectorActionKind::TriggerWorkflow, 1000); // 10 cents at t=1000
@@ -1782,8 +1788,10 @@ mod tests {
 
     #[test]
     fn cost_budget_totals_saturate() {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = u64::MAX;
+        let mut config = CostBudgetConfig {
+            max_cost_cents: u64::MAX,
+            ..Default::default()
+        };
         config.action_costs.insert("notify".into(), u64::MAX);
         let mut cb = CostBudget::new(config);
 
@@ -1797,9 +1805,11 @@ mod tests {
 
     #[test]
     fn cost_budget_warning_threshold() {
-        let mut config = CostBudgetConfig::default();
-        config.max_cost_cents = 100;
-        config.warning_threshold = 0.5;
+        let config = CostBudgetConfig {
+            max_cost_cents: 100,
+            warning_threshold: 0.5,
+            ..Default::default()
+        };
         let mut cb = CostBudget::new(config);
 
         // Record 50 notifies (1 cent each)
@@ -1812,8 +1822,10 @@ mod tests {
     #[test]
     fn cost_budget_invalid_warning_thresholds_warn() {
         for warning_threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
-            let mut config = CostBudgetConfig::default();
-            config.warning_threshold = warning_threshold;
+            let config = CostBudgetConfig {
+                warning_threshold,
+                ..Default::default()
+            };
             let mut cb = CostBudget::new(config);
 
             assert!(
@@ -2000,11 +2012,13 @@ mod tests {
 
     #[test]
     fn governor_per_connector_rate_limit() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_rate_limit = TokenBucketConfig {
-            capacity: 3,
-            refill_rate: 1,
-            refill_interval_ms: 1000,
+        let config = ConnectorGovernorConfig {
+            default_rate_limit: TokenBucketConfig {
+                capacity: 3,
+                refill_rate: 1,
+                refill_interval_ms: 1000,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
         let action = sample_action("slack", ConnectorActionKind::Notify);
@@ -2023,11 +2037,13 @@ mod tests {
 
     #[test]
     fn governor_global_rate_limit() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.global_rate_limit = TokenBucketConfig {
-            capacity: 2,
-            refill_rate: 1,
-            refill_interval_ms: 1000,
+        let config = ConnectorGovernorConfig {
+            global_rate_limit: TokenBucketConfig {
+                capacity: 2,
+                refill_rate: 1,
+                refill_interval_ms: 1000,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
 
@@ -2046,16 +2062,18 @@ mod tests {
 
     #[test]
     fn governor_connector_throttle_does_not_consume_global_rate_capacity() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.global_rate_limit = TokenBucketConfig {
-            capacity: 2,
-            refill_rate: 0,
-            refill_interval_ms: 1000,
-        };
-        config.default_rate_limit = TokenBucketConfig {
-            capacity: 1,
-            refill_rate: 0,
-            refill_interval_ms: 1000,
+        let config = ConnectorGovernorConfig {
+            global_rate_limit: TokenBucketConfig {
+                capacity: 2,
+                refill_rate: 0,
+                refill_interval_ms: 1000,
+            },
+            default_rate_limit: TokenBucketConfig {
+                capacity: 1,
+                refill_rate: 0,
+                refill_interval_ms: 1000,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
 
@@ -2074,11 +2092,13 @@ mod tests {
 
     #[test]
     fn governor_quota_exhaustion_rejects() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_quota = QuotaConfig {
-            max_actions: 2,
-            window_ms: 60_000,
-            warning_threshold: 0.5,
+        let config = ConnectorGovernorConfig {
+            default_quota: QuotaConfig {
+                max_actions: 2,
+                window_ms: 60_000,
+                warning_threshold: 0.5,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
         let action = sample_action("slack", ConnectorActionKind::Notify);
@@ -2093,10 +2113,14 @@ mod tests {
 
     #[test]
     fn governor_cost_budget_rejects() {
-        let mut cost_config = CostBudgetConfig::default();
-        cost_config.max_cost_cents = 5;
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_cost_budget = cost_config;
+        let cost_config = CostBudgetConfig {
+            max_cost_cents: 5,
+            ..Default::default()
+        };
+        let config = ConnectorGovernorConfig {
+            default_cost_budget: cost_config,
+            ..Default::default()
+        };
         let mut gov = ConnectorGovernor::new(config);
 
         // Ticket = 5 cents, fills budget
@@ -2111,10 +2135,14 @@ mod tests {
 
     #[test]
     fn governor_cost_budget_rejects_projected_overrun() {
-        let mut cost_config = CostBudgetConfig::default();
-        cost_config.max_cost_cents = 9;
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_cost_budget = cost_config;
+        let cost_config = CostBudgetConfig {
+            max_cost_cents: 9,
+            ..Default::default()
+        };
+        let config = ConnectorGovernorConfig {
+            default_cost_budget: cost_config,
+            ..Default::default()
+        };
         let mut gov = ConnectorGovernor::new(config);
 
         // Ticket costs 5 cents.
@@ -2129,11 +2157,13 @@ mod tests {
 
     #[test]
     fn governor_backpressure_reject() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.queue_backpressure = QueueBackpressureConfig {
-            max_queue_depth: 100,
-            throttle_threshold: 0.7,
-            reject_threshold: 0.9,
+        let config = ConnectorGovernorConfig {
+            queue_backpressure: QueueBackpressureConfig {
+                max_queue_depth: 100,
+                throttle_threshold: 0.7,
+                reject_threshold: 0.9,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
         gov.update_queue_depth(95);
@@ -2146,11 +2176,13 @@ mod tests {
 
     #[test]
     fn governor_backpressure_throttle() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.queue_backpressure = QueueBackpressureConfig {
-            max_queue_depth: 100,
-            throttle_threshold: 0.7,
-            reject_threshold: 0.9,
+        let config = ConnectorGovernorConfig {
+            queue_backpressure: QueueBackpressureConfig {
+                max_queue_depth: 100,
+                throttle_threshold: 0.7,
+                reject_threshold: 0.9,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
         gov.update_queue_depth(75);
@@ -2190,11 +2222,13 @@ mod tests {
 
     #[test]
     fn governor_different_connectors_independent() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_rate_limit = TokenBucketConfig {
-            capacity: 1,
-            refill_rate: 0,
-            refill_interval_ms: 1000,
+        let config = ConnectorGovernorConfig {
+            default_rate_limit: TokenBucketConfig {
+                capacity: 1,
+                refill_rate: 0,
+                refill_interval_ms: 1000,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
 
@@ -2285,11 +2319,13 @@ mod tests {
 
     #[test]
     fn governor_global_quota_rejects() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.global_quota = QuotaConfig {
-            max_actions: 2,
-            window_ms: 60_000,
-            warning_threshold: 0.5,
+        let config = ConnectorGovernorConfig {
+            global_quota: QuotaConfig {
+                max_actions: 2,
+                window_ms: 60_000,
+                warning_threshold: 0.5,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
         let a1 = sample_action("slack", ConnectorActionKind::Notify);
@@ -2306,16 +2342,18 @@ mod tests {
 
     #[test]
     fn governor_connector_quota_reject_does_not_consume_global_quota() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.global_quota = QuotaConfig {
-            max_actions: 2,
-            window_ms: 60_000,
-            warning_threshold: 0.5,
-        };
-        config.default_quota = QuotaConfig {
-            max_actions: 1,
-            window_ms: 60_000,
-            warning_threshold: 0.5,
+        let config = ConnectorGovernorConfig {
+            global_quota: QuotaConfig {
+                max_actions: 2,
+                window_ms: 60_000,
+                warning_threshold: 0.5,
+            },
+            default_quota: QuotaConfig {
+                max_actions: 1,
+                window_ms: 60_000,
+                warning_threshold: 0.5,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
 
@@ -2333,11 +2371,13 @@ mod tests {
 
     #[test]
     fn governor_snapshot_connector_quota_lifetime_excludes_rejected_attempts() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_quota = QuotaConfig {
-            max_actions: 1,
-            window_ms: 60_000,
-            warning_threshold: 0.5,
+        let config = ConnectorGovernorConfig {
+            default_quota: QuotaConfig {
+                max_actions: 1,
+                window_ms: 60_000,
+                warning_threshold: 0.5,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
         let slack = sample_action("slack", ConnectorActionKind::Notify);
@@ -2375,11 +2415,13 @@ mod tests {
 
     #[test]
     fn governor_stress_rapid_fire_single_connector() {
-        let mut config = ConnectorGovernorConfig::default();
-        config.default_rate_limit = TokenBucketConfig {
-            capacity: 50,
-            refill_rate: 10,
-            refill_interval_ms: 1000,
+        let config = ConnectorGovernorConfig {
+            default_rate_limit: TokenBucketConfig {
+                capacity: 50,
+                refill_rate: 10,
+                refill_interval_ms: 1000,
+            },
+            ..Default::default()
         };
         let mut gov = ConnectorGovernor::new(config);
         let action = sample_action("slack", ConnectorActionKind::Notify);
