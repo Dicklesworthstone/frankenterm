@@ -556,10 +556,12 @@ fn estimate_freshness_lag_ms(
 fn ceil_div(value: u64, divisor: u64) -> u64 {
     if value == 0 {
         0
-    } else if divisor == 0 {
-        u64::MAX
     } else {
-        1 + (value - 1) / divisor
+        value
+            .checked_sub(1)
+            .and_then(|adjusted| adjusted.checked_div(divisor))
+            .and_then(|quotient| quotient.checked_add(1))
+            .unwrap_or(u64::MAX)
     }
 }
 

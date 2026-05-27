@@ -186,6 +186,10 @@ fn representative_events(target_triple: &str) -> Vec<DecisionEvent> {
     events
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "golden matrix helper mirrors DecisionEvent fixture fields"
+)]
 fn decision(
     decision_type: DecisionType,
     pane_id: u64,

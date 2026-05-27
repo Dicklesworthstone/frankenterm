@@ -2344,9 +2344,11 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn reset_to_default_restores_builtin_safe_knob_value() {
-        let mut baseline = ResourceDigitalTwinKnobs::default();
-        baseline.admission_max_pending_items = 20;
-        baseline.autotune_enabled = false;
+        let baseline = ResourceDigitalTwinKnobs {
+            admission_max_pending_items: 20,
+            autotune_enabled: false,
+            ..Default::default()
+        };
         let package = override_package(
             r#"
 [[admission]]

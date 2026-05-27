@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!(p.eta_ms, 0);
 
         p.update(0, 0, 0);
-        assert_eq!(p.progress, 0.0);
+        assert_eq!(p.progress.to_bits(), 0.0_f64.to_bits());
         assert_eq!(p.eta_ms, 0);
     }
 

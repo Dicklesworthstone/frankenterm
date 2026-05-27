@@ -628,9 +628,11 @@ mod tests {
 
     #[test]
     fn classify_metric_warning_threshold_is_exclusive() {
-        let mut budgets = ReplayPerformanceBudgets::default();
-        budgets.warning_regression_fraction = 0.10;
-        budgets.blocking_regression_fraction = 0.25;
+        let budgets = ReplayPerformanceBudgets {
+            warning_regression_fraction: 0.10,
+            blocking_regression_fraction: 0.25,
+            ..Default::default()
+        };
 
         // Use values within budget (lower-is-better, budget=1.0).
         // Regression = (0.88 - 0.80) / 0.80 = 0.10, exactly at threshold.

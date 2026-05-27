@@ -2005,6 +2005,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "golden trace helper mirrors the fixture row columns"
+    )]
     fn golden_admission_step(
         step_id: &str,
         observed_at_ms: u64,
