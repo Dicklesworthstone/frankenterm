@@ -14715,7 +14715,7 @@ mod tests {
         let mon_cfg = SwarmTailRiskMonitorConfig::default();
         let ledger_cfg = SwarmCapacityEvidenceLedgerConfig::default();
         // Fairness disabled: controller_version equals the constant.
-        let fairness = SwarmCapacityFairnessPolicyConfig {
+        let mut fairness = SwarmCapacityFairnessPolicyConfig {
             enabled: false,
             ..Default::default()
         };
