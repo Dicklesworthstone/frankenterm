@@ -17,9 +17,9 @@
 use std::path::PathBuf;
 
 use codec::{
-    CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompressionMode, DecodedPdu, ErrorResponse,
-    GetCodecVersion, GetCodecVersionResponse, GetTlsCreds, ListPanes, Pdu, Ping, Pong,
-    UnitResponse,
+    CompressionMode, DecodedPdu, ErrorResponse, GetCodecVersion, GetCodecVersionResponse,
+    GetTlsCreds, ListPanes, Pdu, Ping, Pong, UnitResponse, CODEC_VERSION,
+    CODEC_VERSION_MIN_SUPPORTED,
 };
 
 // Mirror private constants from `codec::lib`. Kept in lockstep by the

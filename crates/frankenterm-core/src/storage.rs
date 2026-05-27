@@ -10063,7 +10063,11 @@ fn record_policy_denial_audit_backend(
     backend: &dyn StorageBackend,
     record: &PolicyDeniedAuditRecord,
 ) -> Result<i64> {
-    let ts_ms = if record.ts_ms == 0 { now_ms() } else { record.ts_ms };
+    let ts_ms = if record.ts_ms == 0 {
+        now_ms()
+    } else {
+        record.ts_ms
+    };
     let row = backend
         .query_row_typed(
             "INSERT INTO policy_denied_audit

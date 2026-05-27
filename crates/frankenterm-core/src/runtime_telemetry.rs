@@ -6220,7 +6220,9 @@ pub const SWARM_CAPACITY_WORKLOAD_ADMISSION_CONTRACT_ID: &str =
 pub const SWARM_CAPACITY_WORKLOAD_ADMISSION_SCHEMA_VERSION: u16 = 1;
 
 /// Per-agent workload class used by the high-core swarm capacity planner.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SwarmCapacityAgentWorkloadClass {
     /// Active coding or implementation work.

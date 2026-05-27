@@ -672,7 +672,10 @@ mod tests {
         // At the ceiling it must clamp, never wrap to 0 — a wrapped generation
         // would alias an already-issued shape generation and poison the kerning
         // cache rather than invalidating it.
-        assert_eq!(next_shape_generation_for_scale_change(usize::MAX), usize::MAX);
+        assert_eq!(
+            next_shape_generation_for_scale_change(usize::MAX),
+            usize::MAX
+        );
         assert_ne!(next_shape_generation_for_scale_change(usize::MAX), 0);
     }
 }
