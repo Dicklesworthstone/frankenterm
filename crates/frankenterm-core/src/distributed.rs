@@ -1581,7 +1581,7 @@ KBAhs4snj5QspGFqkazmIw==
             subject_alt_names
                 .iter()
                 .map(|name| (*name).to_string())
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         params
             .distinguished_name
