@@ -16,6 +16,14 @@
 use frankenterm_core_telemetry_types::ewma::{Ewma, EwmaWithVariance};
 use frankenterm_core_telemetry_types::exp_histogram::ExpHistogram;
 
+fn assert_f64_bits_eq(actual: f64, expected: f64, context: &str) {
+    assert_eq!(
+        actual.to_bits(),
+        expected.to_bits(),
+        "{context}: actual={actual:?}, expected={expected:?}"
+    );
+}
+
 /// Quantile monotonicity: `percentile(p)` is non-decreasing in `p`. The cdf
 /// walk targets `ceil(p * count)`, which is monotone in `p`, so the returned
 /// bucket bound can only stay equal or grow — a fundamental quantile invariant
@@ -113,7 +121,7 @@ fn merge_is_additive_in_count() {
 fn ewma_monotone_bounded_approach_to_constant() {
     let mut e = Ewma::with_half_life_ms(100.0);
     e.observe(0.0, 0); // initialize at 0
-    assert_eq!(e.value(), 0.0, "first observation seeds the value");
+    assert_f64_bits_eq(e.value(), 0.0, "first observation seeds the value");
 
     let target = 100.0_f64;
     let mut prev = e.value();
@@ -142,14 +150,14 @@ fn ewma_ignores_non_finite_observations() {
     let mut e = Ewma::with_half_life_ms(100.0);
     e.observe(10.0, 0);
     let baseline = e.value();
-    assert_eq!(baseline, 10.0, "first finite observation seeds the value");
+    assert_f64_bits_eq(baseline, 10.0, "first finite observation seeds the value");
 
     e.observe(f64::NAN, 25);
-    assert_eq!(e.value(), baseline, "a NaN observation must be ignored");
+    assert_f64_bits_eq(e.value(), baseline, "a NaN observation must be ignored");
     e.observe(f64::INFINITY, 50);
-    assert_eq!(e.value(), baseline, "a +inf observation must be ignored");
+    assert_f64_bits_eq(e.value(), baseline, "a +inf observation must be ignored");
     e.observe(f64::NEG_INFINITY, 75);
-    assert_eq!(e.value(), baseline, "a -inf observation must be ignored");
+    assert_f64_bits_eq(e.value(), baseline, "a -inf observation must be ignored");
     assert!(
         e.value().is_finite(),
         "value stays finite after non-finite inputs"
@@ -205,8 +213,8 @@ fn ewma_with_variance_ignores_non_finite_observations() {
     assert!(mean_before.is_finite() && var_before.is_finite());
 
     e.observe(f64::NAN, 100);
-    assert_eq!(e.mean(), mean_before, "NaN must not change the mean");
-    assert_eq!(e.variance(), var_before, "NaN must not change the variance");
+    assert_f64_bits_eq(e.mean(), mean_before, "NaN must not change the mean");
+    assert_f64_bits_eq(e.variance(), var_before, "NaN must not change the variance");
 
     e.observe(f64::INFINITY, 150);
     assert!(

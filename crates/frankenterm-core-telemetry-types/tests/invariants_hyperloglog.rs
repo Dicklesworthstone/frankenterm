@@ -152,7 +152,7 @@ fn jaccard_is_within_unit_interval() {
         for trial in 0..60 {
             let na = (rng.next() % 6000) as usize;
             let nb = (rng.next() % 6000) as usize;
-            let overlap = (rng.next() % 2000) as u64;
+            let overlap = rng.next() % 2000;
             let mut a = HyperLogLog::with_precision(p);
             let mut b = HyperLogLog::with_precision(p);
             // Shared prefix so the pair has a non-trivial intersection.
