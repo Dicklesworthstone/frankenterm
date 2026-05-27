@@ -1679,6 +1679,12 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
 
         let max_end = (start + model.lookahead_limit).min(token_count);
 
+        // `end` is a dynamic-programming endpoint, not a bare slice index: it is used
+        // arithmetically (width_between(start, end), `end == token_count`, pushed into
+        // break_offsets) and to index a different region of `best` (read+write of
+        // best[end]) while best[start] is also borrowed. The needless_range_loop
+        // enumerate() rewrite does not apply here.
+        #[allow(clippy::needless_range_loop)]
         for end in (start + 1)..=max_end {
             let line_width = width_prefix.width_between(start, end);
             evaluated_states = evaluated_states.saturating_add(1);
