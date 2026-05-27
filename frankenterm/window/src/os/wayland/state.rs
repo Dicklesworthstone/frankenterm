@@ -184,6 +184,64 @@ fn clear_slot_if_matches<T: Eq>(slot: &mut Option<T>, seat: &T) -> bool {
     }
 }
 
+impl ProvidesRegistryState for WaylandState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry
+    }
+
+    registry_handlers![OutputState, SeatState];
+}
+
+impl ShmHandler for WaylandState {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+impl OutputHandler for WaylandState {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output
+    }
+
+    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
+        log::trace!("new output: OutputHandler");
+    }
+
+    fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
+        log::trace!("update output: OutputHandler");
+    }
+
+    fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
+        log::trace!("output destroyed: OutputHandler");
+    }
+}
+
+delegate_registry!(WaylandState);
+
+delegate_shm!(WaylandState);
+
+delegate_output!(WaylandState);
+delegate_compositor!(WaylandState, surface: [SurfaceData, SurfaceUserData]);
+delegate_subcompositor!(WaylandState);
+
+delegate_seat!(WaylandState);
+
+delegate_data_device!(WaylandState);
+
+delegate_pointer!(WaylandState, pointer: [PointerUserData]);
+
+delegate_xdg_shell!(WaylandState);
+delegate_xdg_window!(WaylandState);
+
+delegate_primary_selection!(WaylandState);
+
+delegate_dispatch!(WaylandState: [ZwpTextInputManagerV3: GlobalData] => TextInputState);
+delegate_dispatch!(WaylandState: [ZwpTextInputV3: TextInputData] => TextInputState);
+
+delegate_dispatch!(WaylandState: [ZwlrOutputManagerV1: GlobalData] => OutputManagerState);
+delegate_dispatch!(WaylandState: [ZwlrOutputHeadV1: OutputManagerData] => OutputManagerState);
+delegate_dispatch!(WaylandState: [ZwlrOutputModeV1: OutputManagerData] => OutputManagerState);
+
 #[cfg(test)]
 mod tests {
     use super::{RemovedSeatCleanup, SeatBindings};
@@ -276,61 +334,3 @@ mod tests {
         );
     }
 }
-
-impl ProvidesRegistryState for WaylandState {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry
-    }
-
-    registry_handlers![OutputState, SeatState];
-}
-
-impl ShmHandler for WaylandState {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
-impl OutputHandler for WaylandState {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output
-    }
-
-    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
-        log::trace!("new output: OutputHandler");
-    }
-
-    fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
-        log::trace!("update output: OutputHandler");
-    }
-
-    fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {
-        log::trace!("output destroyed: OutputHandler");
-    }
-}
-
-delegate_registry!(WaylandState);
-
-delegate_shm!(WaylandState);
-
-delegate_output!(WaylandState);
-delegate_compositor!(WaylandState, surface: [SurfaceData, SurfaceUserData]);
-delegate_subcompositor!(WaylandState);
-
-delegate_seat!(WaylandState);
-
-delegate_data_device!(WaylandState);
-
-delegate_pointer!(WaylandState, pointer: [PointerUserData]);
-
-delegate_xdg_shell!(WaylandState);
-delegate_xdg_window!(WaylandState);
-
-delegate_primary_selection!(WaylandState);
-
-delegate_dispatch!(WaylandState: [ZwpTextInputManagerV3: GlobalData] => TextInputState);
-delegate_dispatch!(WaylandState: [ZwpTextInputV3: TextInputData] => TextInputState);
-
-delegate_dispatch!(WaylandState: [ZwlrOutputManagerV1: GlobalData] => OutputManagerState);
-delegate_dispatch!(WaylandState: [ZwlrOutputHeadV1: OutputManagerData] => OutputManagerState);
-delegate_dispatch!(WaylandState: [ZwlrOutputModeV1: OutputManagerData] => OutputManagerState);

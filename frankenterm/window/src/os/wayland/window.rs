@@ -1551,103 +1551,6 @@ impl WaylandWindowInner {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
-    };
-    use promise::BrokenPromise;
-    use smithay_client_toolkit::data_device_manager::ReadPipe;
-    use std::fs::File;
-    use std::future::Future as StdFuture;
-    use std::io::Write;
-    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-    use std::pin::Pin;
-    use std::task::{Context, Poll, Waker};
-
-    fn pipe_pair() -> (OwnedFd, OwnedFd) {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
-    }
-
-    #[test]
-    fn pending_first_configure_future_resolves_after_notification() {
-        let (promise, mut future) = new_pending_first_configure();
-        let mut pending_first_configure = Some(promise);
-        let waker = Waker::noop().clone();
-        let mut cx = Context::from_waker(&waker);
-
-        assert!(matches!(
-            StdFuture::poll(Pin::new(&mut future), &mut cx),
-            Poll::Pending
-        ));
-
-        resolve_pending_first_configure(&mut pending_first_configure);
-
-        assert!(pending_first_configure.is_none());
-        assert!(matches!(
-            StdFuture::poll(Pin::new(&mut future), &mut cx),
-            Poll::Ready(Ok(()))
-        ));
-    }
-
-    #[test]
-    fn pending_first_configure_resolution_is_idempotent() {
-        let (promise, mut future) = new_pending_first_configure();
-        let mut pending_first_configure = Some(promise);
-        let waker = Waker::noop().clone();
-        let mut cx = Context::from_waker(&waker);
-
-        resolve_pending_first_configure(&mut pending_first_configure);
-        resolve_pending_first_configure(&mut pending_first_configure);
-
-        assert!(pending_first_configure.is_none());
-        assert!(matches!(
-            StdFuture::poll(Pin::new(&mut future), &mut cx),
-            Poll::Ready(Ok(()))
-        ));
-    }
-
-    #[test]
-    fn pending_first_configure_drop_reports_broken_promise() {
-        let (promise, mut future) = new_pending_first_configure();
-        let waker = Waker::noop().clone();
-        let mut cx = Context::from_waker(&waker);
-
-        assert!(matches!(
-            StdFuture::poll(Pin::new(&mut future), &mut cx),
-            Poll::Pending
-        ));
-
-        drop(promise);
-
-        match StdFuture::poll(Pin::new(&mut future), &mut cx) {
-            Poll::Ready(Err(err)) => {
-                assert!(err.downcast_ref::<BrokenPromise>().is_some());
-            }
-            other => panic!("expected Ready(Err(BrokenPromise)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_pipe_with_timeout_reads_large_payload() {
-        let (read_fd, write_fd) = pipe_pair();
-        let payload = vec![b'y'; 128 * 1024];
-        let writer_payload = payload.clone();
-        let writer = std::thread::spawn(move || {
-            let mut file = File::from(write_fd);
-            file.write_all(&writer_payload).unwrap();
-        });
-        let read_pipe = unsafe { ReadPipe::from_raw_fd(read_fd.into_raw_fd()) };
-
-        let text = read_pipe_with_timeout(read_pipe).unwrap();
-
-        writer.join().unwrap();
-        assert_eq!(text.as_bytes(), payload);
-    }
-}
-
 impl WaylandState {
     pub(super) fn window_by_id(&self, window_id: usize) -> Option<Rc<RefCell<WaylandWindowInner>>> {
         self.windows.borrow().get(&window_id).map(Rc::clone)
@@ -1949,5 +1852,102 @@ impl HasWindowHandle for WaylandWindow {
         let inner = handle.borrow();
         let handle = inner.window_handle()?;
         unsafe { Ok(WindowHandle::borrow_raw(handle.as_raw())) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
+    };
+    use promise::BrokenPromise;
+    use smithay_client_toolkit::data_device_manager::ReadPipe;
+    use std::fs::File;
+    use std::future::Future as StdFuture;
+    use std::io::Write;
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn pipe_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn pending_first_configure_future_resolves_after_notification() {
+        let (promise, mut future) = new_pending_first_configure();
+        let mut pending_first_configure = Some(promise);
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Pending
+        ));
+
+        resolve_pending_first_configure(&mut pending_first_configure);
+
+        assert!(pending_first_configure.is_none());
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn pending_first_configure_resolution_is_idempotent() {
+        let (promise, mut future) = new_pending_first_configure();
+        let mut pending_first_configure = Some(promise);
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+
+        resolve_pending_first_configure(&mut pending_first_configure);
+        resolve_pending_first_configure(&mut pending_first_configure);
+
+        assert!(pending_first_configure.is_none());
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn pending_first_configure_drop_reports_broken_promise() {
+        let (promise, mut future) = new_pending_first_configure();
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Pending
+        ));
+
+        drop(promise);
+
+        match StdFuture::poll(Pin::new(&mut future), &mut cx) {
+            Poll::Ready(Err(err)) => {
+                assert!(err.downcast_ref::<BrokenPromise>().is_some());
+            }
+            other => panic!("expected Ready(Err(BrokenPromise)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_pipe_with_timeout_reads_large_payload() {
+        let (read_fd, write_fd) = pipe_pair();
+        let payload = vec![b'y'; 128 * 1024];
+        let writer_payload = payload.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = File::from(write_fd);
+            file.write_all(&writer_payload).unwrap();
+        });
+        let read_pipe = unsafe { ReadPipe::from_raw_fd(read_fd.into_raw_fd()) };
+
+        let text = read_pipe_with_timeout(read_pipe).unwrap();
+
+        writer.join().unwrap();
+        assert_eq!(text.as_bytes(), payload);
     }
 }
