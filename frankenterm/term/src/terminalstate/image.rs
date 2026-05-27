@@ -1,11 +1,11 @@
 use super::usize_to_i64_saturating;
 use crate::{Position, StableRowIndex, TerminalState};
 use anyhow::Context;
-use frankenterm_cell::Cell;
 use frankenterm_cell::image::{ImageCell, ImageDataType};
-use frankenterm_surface::TextureCoordinate;
+use frankenterm_cell::Cell;
 use frankenterm_surface::change::ImageData;
-use humansize::{DECIMAL, SizeFormatter};
+use frankenterm_surface::TextureCoordinate;
+use humansize::{SizeFormatter, DECIMAL};
 use num_traits::{One, Zero};
 use ordered_float::NotNan;
 use std::convert::TryFrom;
@@ -373,7 +373,11 @@ pub(crate) fn dimensions(data: &[u8]) -> anyhow::Result<ImageInfo> {
 
 /// Returns `1` if `b` is true, else `0`,
 fn one_or_zero<T: Zero + One>(b: bool) -> T {
-    if b { T::one() } else { T::zero() }
+    if b {
+        T::one()
+    } else {
+        T::zero()
+    }
 }
 
 fn checked_explicit_cell_span_pixels(
@@ -661,10 +665,14 @@ mod tests {
         assert!(
             checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 9, 2, 5, 2).unwrap()
         );
-        assert!(
-            checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 1, 0, usize::MAX, 2)
-                .is_err()
-        );
+        assert!(checked_padded_image_exceeds_cell_span(
+            IMAGE_CELL_SPAN_COLUMNS,
+            1,
+            0,
+            usize::MAX,
+            2
+        )
+        .is_err());
     }
 
     #[test]
