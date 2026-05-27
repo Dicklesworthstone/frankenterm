@@ -184,9 +184,9 @@ mod tests {
     #[test]
     fn backend_eq_reflexive() {
         let a = TuiBackend::Ratatui;
-        assert!(a == a);
+        assert_eq!(a, a);
         let b = TuiBackend::Ftui;
-        assert!(b == b);
+        assert_eq!(b, b);
     }
 
     #[test]
