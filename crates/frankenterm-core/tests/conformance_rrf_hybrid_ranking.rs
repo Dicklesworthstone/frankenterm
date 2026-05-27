@@ -132,9 +132,14 @@ fn assert_fused_eq(label: &str, got: &[FusedResult], expected: &[FusedResult]) {
     }
 }
 
+/// One ranking lane: `(id, score)` pairs from a single retrieval source.
+type FusionLane = Vec<(u64, f32)>;
+/// A named fusion scenario: `(label, lexical lane, semantic lane)`.
+type FusionScenario = (&'static str, FusionLane, FusionLane);
+
 /// A deterministic battery of fusion scenarios spanning the interesting axes:
 /// full/partial/no overlap, duplicate ids within a lane, single-lane, and empty.
-fn corpus() -> Vec<(&'static str, Vec<(u64, f32)>, Vec<(u64, f32)>)> {
+fn corpus() -> Vec<FusionScenario> {
     vec![
         ("empty", vec![], vec![]),
         ("lexical_only", vec![(1, 9.0), (2, 8.0), (3, 7.0)], vec![]),
@@ -468,14 +473,24 @@ fn blend_two_tier_scales_by_alpha_and_dedups() {
     // Tier1 fully taken first, scaled by alpha; tier2 fills remainder (minus dup
     // id 3) scaled by (1-alpha).
     let by_id: BTreeMap<u64, f32> = out.iter().map(|h| (h.id, h.score)).collect();
-    assert!((by_id[&1] - 1.0 * alpha).abs() <= EPS);
-    assert!((by_id[&2] - 0.8 * alpha).abs() <= EPS);
+    // Expected per-id scores: tier1 ids carry their original weight scaled by
+    // alpha; tier2-only ids are scaled by (1 - alpha). Hoisted into locals so
+    // each assert compares two finite values rather than an inline
+    // `actual - weight * alpha` expression (clippy::suboptimal_flops).
+    let beta = 1.0 - alpha;
+    let expected_1 = alpha; // tier1 top weight is 1.0
+    let expected_2 = 0.8 * alpha;
+    let expected_3 = 0.6 * alpha;
+    let expected_4 = 0.7 * beta;
+    let expected_5 = 0.5 * beta;
+    assert!((by_id[&1] - expected_1).abs() <= EPS);
+    assert!((by_id[&2] - expected_2).abs() <= EPS);
     assert!(
-        (by_id[&3] - 0.6 * alpha).abs() <= EPS,
+        (by_id[&3] - expected_3).abs() <= EPS,
         "dup id keeps tier1 (alpha-scaled) score"
     );
-    assert!((by_id[&4] - 0.7 * (1.0 - alpha)).abs() <= EPS);
-    assert!((by_id[&5] - 0.5 * (1.0 - alpha)).abs() <= EPS);
+    assert!((by_id[&4] - expected_4).abs() <= EPS);
+    assert!((by_id[&5] - expected_5).abs() <= EPS);
 
     // id 3 must appear exactly once (dedup).
     assert_eq!(out.iter().filter(|h| h.id == 3).count(), 1);
@@ -547,38 +562,39 @@ fn blend_rank_correlation_equals_kendall_tau_of_tiers() {
 
 /// Independent O(n^2) Kendall tau over the common-id subset, mirroring the spec
 /// in `hybrid_search::kendall_tau` (concordant - discordant) / (C + D).
-fn reference_kendall(a: &[u64], b: &[u64]) -> f32 {
-    if a.is_empty() || b.is_empty() {
+fn reference_kendall(left: &[u64], right: &[u64]) -> f32 {
+    if left.is_empty() || right.is_empty() {
         return 0.0;
     }
-    let rank_a: BTreeMap<u64, usize> = a.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    let rank_b: BTreeMap<u64, usize> = b.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    let common: Vec<u64> = a
+    let rank_left: BTreeMap<u64, usize> = left.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let rank_right: BTreeMap<u64, usize> =
+        right.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let common: Vec<u64> = left
         .iter()
         .copied()
-        .filter(|id| rank_b.contains_key(id))
+        .filter(|id| rank_right.contains_key(id))
         .collect();
     let n = common.len();
     if n < 2 {
         return 0.0;
     }
-    let (mut c, mut d) = (0i64, 0i64);
+    let (mut concordant, mut discordant) = (0i64, 0i64);
     for i in 0..n {
         for j in (i + 1)..n {
-            let ord_a = rank_a[&common[i]] as i64 - rank_a[&common[j]] as i64;
-            let ord_b = rank_b[&common[i]] as i64 - rank_b[&common[j]] as i64;
-            let prod = ord_a * ord_b;
+            let ord_left = rank_left[&common[i]] as i64 - rank_left[&common[j]] as i64;
+            let ord_right = rank_right[&common[i]] as i64 - rank_right[&common[j]] as i64;
+            let prod = ord_left * ord_right;
             if prod > 0 {
-                c += 1;
+                concordant += 1;
             } else if prod < 0 {
-                d += 1;
+                discordant += 1;
             }
         }
     }
-    if c + d == 0 {
+    if concordant + discordant == 0 {
         return 0.0;
     }
-    (c - d) as f32 / (c + d) as f32
+    (concordant - discordant) as f32 / (concordant + discordant) as f32
 }
 
 #[test]
@@ -608,14 +624,16 @@ fn kendall_tau_single_swap_value() {
 
 #[test]
 fn kendall_tau_empty_and_singleton_are_zero() {
-    assert_eq!(kendall_tau(&[], &[]), 0.0);
-    assert_eq!(
-        kendall_tau(&[1], &[1]),
-        0.0,
+    // Degenerate inputs return an exact 0.0 sentinel; assert against EPS rather
+    // than `==` to stay consistent with the other tau tests and satisfy
+    // clippy::float_cmp.
+    assert!(kendall_tau(&[], &[]).abs() <= EPS);
+    assert!(
+        kendall_tau(&[1], &[1]).abs() <= EPS,
         "fewer than 2 common items => 0"
     );
-    assert_eq!(kendall_tau(&[1, 2, 3], &[]), 0.0);
-    assert_eq!(kendall_tau(&[1], &[2]), 0.0, "no common items => 0");
+    assert!(kendall_tau(&[1, 2, 3], &[]).abs() <= EPS);
+    assert!(kendall_tau(&[1], &[2]).abs() <= EPS, "no common items => 0");
 }
 
 #[test]

@@ -1188,8 +1188,14 @@ proptest! {
         let exact_min = values.iter().copied().fold(f64::INFINITY, f64::min);
         let exact_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let (mn, mx) = h.min_max().unwrap();
-        prop_assert_eq!(mn, exact_min, "wrapper min must be exact");
-        prop_assert_eq!(mx, exact_max, "wrapper max must be exact");
+        // Tracked extremes are stored verbatim (one of the recorded values), so
+        // the match is exact. Assert a zero-tolerance difference rather than `==`
+        // to satisfy clippy::float_cmp while keeping `-0.0 == +0.0` semantics
+        // (abs() >= 0, so `<= 0.0` holds iff the difference is exactly zero).
+        prop_assert!((mn - exact_min).abs() <= 0.0,
+            "wrapper min {} must be exact {}", mn, exact_min);
+        prop_assert!((mx - exact_max).abs() <= 0.0,
+            "wrapper max {} must be exact {}", mx, exact_max);
     }
 
     /// merge_from is count-additive and preserves the exact mean and the
@@ -1218,7 +1224,12 @@ proptest! {
         let exact_min = all.iter().copied().fold(f64::INFINITY, f64::min);
         let exact_max = all.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let (mn, mx) = a.min_max().unwrap();
-        prop_assert_eq!(mn, exact_min, "merged min must be exact");
-        prop_assert_eq!(mx, exact_max, "merged max must be exact");
+        // Exact zero-tolerance check (see note above): merged min/max are the
+        // true tracked extremes, so they match bit-for-bit; `<= 0.0` keeps
+        // clippy::float_cmp quiet without weakening the exactness guarantee.
+        prop_assert!((mn - exact_min).abs() <= 0.0,
+            "merged min {} must be exact {}", mn, exact_min);
+        prop_assert!((mx - exact_max).abs() <= 0.0,
+            "merged max {} must be exact {}", mx, exact_max);
     }
 }
