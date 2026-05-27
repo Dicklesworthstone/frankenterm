@@ -4,6 +4,7 @@ use crate::terminal::ProbeCapabilities;
 use crate::{Result, bail, ensure, format_err};
 use filedescriptor::{FileDescriptor, OwnedHandle};
 use std::cmp::{max, min};
+use std::convert::TryFrom;
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{Error as IoError, Read, Result as IoResult, Write, stdin, stdout};

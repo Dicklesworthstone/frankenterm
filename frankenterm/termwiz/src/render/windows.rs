@@ -7,6 +7,7 @@ use crate::color::{AnsiColor, ColorAttribute};
 use crate::surface::{Change, Position};
 use crate::terminal::windows::ConsoleOutputHandle;
 use num_traits::FromPrimitive;
+use std::convert::TryFrom;
 use std::io::Write;
 use winapi::shared::minwindef::WORD;
 use winapi::um::wincon::{
