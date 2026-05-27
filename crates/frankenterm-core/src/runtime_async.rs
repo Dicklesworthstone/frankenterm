@@ -601,9 +601,9 @@ pub mod broadcast {
         /// two-phase reserve/commit send instead of being pulled from
         /// thread-local state.
         pub fn send_with_cx(&self, cx: &crate::cx::Cx, value: T) -> Result<usize, SendError<T>> {
-            self.inner
-                .send(cx, value)
-                .map_err(|inner::SendError::Closed(v)| SendError(v))
+            self.inner.send(cx, value).map_err(|err| match err {
+                inner::SendError::Closed(v) | inner::SendError::Cancelled(v) => SendError(v),
+            })
         }
 
         /// Creates a new receiver subscribed to this channel.
@@ -767,9 +767,9 @@ pub mod oneshot {
         /// Consumes `self` because oneshot senders fire at most once.
         /// Returns `Err(value)` if the receiver was dropped.
         pub fn send_with_cx(self, cx: &crate::cx::Cx, value: T) -> Result<(), T> {
-            self.inner
-                .send(cx, value)
-                .map_err(|inner::SendError::Disconnected(v)| v)
+            self.inner.send(cx, value).map_err(|err| match err {
+                inner::SendError::Disconnected(v) | inner::SendError::Cancelled(v) => v,
+            })
         }
     }
 }

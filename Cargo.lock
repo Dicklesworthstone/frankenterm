@@ -196,6 +196,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "array-macro"
+version = "2.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "220a2c618ab466efe41d0eace94dfeff1c35e3aa47891bdb95e1c0fefffd3c99"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -345,8 +351,8 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=0f04de1c709064d5e0f7e8721f669f66f787e807#0f04de1c709064d5e0f7e8721f669f66f787e807"
+version = "0.3.2"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
 dependencies = [
  "asupersync-macros",
  "base64 0.22.1",
@@ -354,17 +360,21 @@ dependencies = [
  "crc32fast",
  "crossbeam-deque",
  "crossbeam-queue",
+ "faa_array_queue",
  "franken-decision 0.3.1",
  "franken-evidence 0.3.1",
  "franken-kernel 0.3.1",
  "futures-lite",
  "getrandom 0.4.2",
  "hashbrown 0.17.0",
+ "hex",
+ "hkdf",
  "hmac 0.13.0",
  "js-sys",
  "libc",
  "memchr",
  "nix 0.31.2",
+ "nkeys",
  "parking_lot",
  "pin-project",
  "polling",
@@ -390,13 +400,14 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "windows-sys 0.61.2",
  "x509-parser",
 ]
 
 [[package]]
 name = "asupersync-macros"
 version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=0f04de1c709064d5e0f7e8721f669f66f787e807#0f04de1c709064d5e0f7e8721f669f66f787e807"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -560,7 +571,7 @@ dependencies = [
 name = "async_ossl"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "async-io",
  "futures",
  "openssl",
@@ -1384,7 +1395,7 @@ name = "codec"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "base91",
  "byteorder",
  "chrono",
@@ -1536,6 +1547,12 @@ dependencies = [
  "unicode-width",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "const-oid"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "const-oid"
@@ -2050,6 +2067,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "curve25519-dalek"
+version = "4.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "curve25519-dalek-derive",
+ "digest 0.10.7",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+]
+
+[[package]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "cx_propagation_lint"
 version = "0.1.0"
 dependencies = [
@@ -2177,11 +2220,22 @@ checksum = "5729f5117e208430e437df2f4843f5e5952997175992d1414f94c57d61e270b4"
 
 [[package]]
 name = "der"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+dependencies = [
+ "const-oid 0.9.6",
+ "pem-rfc7468 0.7.0",
+ "zeroize",
+]
+
+[[package]]
+name = "der"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
 dependencies = [
- "pem-rfc7468",
+ "pem-rfc7468 1.0.0",
  "zeroize",
 ]
 
@@ -2319,7 +2373,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4850db49bf08e663084f7fb5c87d202ef91a3907271aff24a94eb97ff039153c"
 dependencies = [
  "block-buffer 0.12.0",
- "const-oid",
+ "const-oid 0.10.2",
  "crypto-common 0.2.1",
  "ctutils",
 ]
@@ -2453,6 +2507,28 @@ dependencies = [
  "serde_derive",
  "winapi",
  "wio",
+]
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "sha2 0.10.9",
+ "signature",
+ "subtle",
 ]
 
 [[package]]
@@ -2675,6 +2751,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "faa_array_queue"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2db1d52f890d54e3faccffedd747caa5280e6a7fa72e3241d8d35e3bd53373e2"
+dependencies = [
+ "array-macro",
+ "peril",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2734,7 +2820,7 @@ name = "fastapi-core"
 version = "0.3.0"
 source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=39ff887fca40763a62233d2e7b83b5b62725b286#39ff887fca40763a62233d2e7b83b5b62725b286"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "fastapi-openapi",
  "fastapi-router",
  "fastapi-types",
@@ -2749,7 +2835,7 @@ name = "fastapi-http"
 version = "0.3.0"
 source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=39ff887fca40763a62233d2e7b83b5b62725b286#39ff887fca40763a62233d2e7b83b5b62725b286"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "fastapi-core",
 ]
 
@@ -3012,6 +3098,12 @@ checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
 ]
+
+[[package]]
+name = "fiat-crypto"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filedescriptor"
@@ -3277,7 +3369,7 @@ dependencies = [
 [[package]]
 name = "franken-decision"
 version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=0f04de1c709064d5e0f7e8721f669f66f787e807#0f04de1c709064d5e0f7e8721f669f66f787e807"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
 dependencies = [
  "franken-evidence 0.3.1",
  "franken-kernel 0.3.1",
@@ -3297,7 +3389,7 @@ dependencies = [
 [[package]]
 name = "franken-evidence"
 version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=0f04de1c709064d5e0f7e8721f669f66f787e807#0f04de1c709064d5e0f7e8721f669f66f787e807"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3315,7 +3407,7 @@ dependencies = [
 [[package]]
 name = "franken-kernel"
 version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=0f04de1c709064d5e0f7e8721f669f66f787e807#0f04de1c709064d5e0f7e8721f669f66f787e807"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
 dependencies = [
  "serde",
 ]
@@ -3325,7 +3417,7 @@ name = "frankensearch"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-fusion",
@@ -3339,7 +3431,7 @@ name = "frankensearch-core"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3354,7 +3446,7 @@ name = "frankensearch-embed"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "dirs",
  "fastembed",
  "frankensearch-core",
@@ -3373,7 +3465,7 @@ version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
  "ahash",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-index",
@@ -3407,7 +3499,7 @@ name = "frankensearch-lexical"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "frankensearch-core",
  "rayon",
  "serde",
@@ -3422,7 +3514,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "chrono",
  "clap",
  "dirs",
@@ -3515,7 +3607,7 @@ name = "frankenterm-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "async-channel",
  "async-trait",
  "async_ossl",
@@ -3574,7 +3666,7 @@ name = "frankenterm-core"
 version = "0.3.0"
 dependencies = [
  "aho-corasick",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "base64 0.22.1",
  "bloomfilter",
  "chacha20poly1305",
@@ -4131,7 +4223,7 @@ name = "frankenterm-mux-server-impl"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "async-channel",
  "async_ossl",
  "base64 0.22.1",
@@ -4202,7 +4294,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_fs",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "async-channel",
  "async_ossl",
  "base64 0.22.1",
@@ -4326,7 +4418,7 @@ dependencies = [
 name = "frankenterm-uds"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "async-io",
  "futures",
  "libc",
@@ -5823,6 +5915,15 @@ dependencies = [
  "thiserror 2.0.18",
  "ureq",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac 0.12.1",
 ]
 
 [[package]]
@@ -7440,6 +7541,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nkeys"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879011babc47a1c7fdf5a935ae3cfe94f34645ca0cac1c7f6424b36fc743d1bf"
+dependencies = [
+ "data-encoding",
+ "ed25519",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "log",
+ "rand 0.8.6",
+ "signatory",
+]
+
+[[package]]
 name = "no-std-compat"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7974,6 +8090,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-thread-local"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd7fc7fa9ea7dc8907f9b10e730106ed0011926e7f5abb382530ac91d1af2b7c"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "os_pipe"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8060,6 +8186,15 @@ dependencies = [
 
 [[package]]
 name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
+
+[[package]]
+name = "pem-rfc7468"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
@@ -8072,6 +8207,15 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "peril"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7282796ee07ffa4fba714b83beee0b334540d23818de49ebfe7b380eaf32089f"
+dependencies = [
+ "os-thread-local",
+]
 
 [[package]]
 name = "pest"
@@ -8206,6 +8350,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkcs8"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
+dependencies = [
+ "der 0.7.10",
+ "spki",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8329,7 +8483,7 @@ name = "portable-pty"
 version = "0.9.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "bitflags 1.3.2",
  "downcast-rs 1.2.1",
  "filedescriptor 0.8.3",
@@ -8492,7 +8646,7 @@ name = "promise"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.1",
+ "asupersync 0.3.2",
  "async-executor",
  "async-io",
  "async-task",
@@ -8523,9 +8677,9 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
 dependencies = [
  "bytes",
  "prost-derive",
@@ -8533,9 +8687,9 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.13.5"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
  "itertools 0.14.0",
@@ -9428,9 +9582,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
+checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
 dependencies = [
  "web-time",
  "zeroize",
@@ -9839,6 +9993,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "signatory"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1e303f8205714074f6068773f0e29527e0453937fe837c9717d066635b65f31"
+dependencies = [
+ "pkcs8",
+ "rand_core 0.6.4",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "digest 0.10.7",
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9991,6 +10167,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eda41003dc44290527a59b13432d4a0379379fa074b70174882adfbdfd917844"
 dependencies = [
  "bitflags 2.11.1",
+]
+
+[[package]]
+name = "spki"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+dependencies = [
+ "base64ct",
+ "der 0.7.10",
 ]
 
 [[package]]
@@ -11413,7 +11599,7 @@ checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64 0.22.1",
  "cookie_store",
- "der",
+ "der 0.8.0",
  "flate2",
  "log",
  "native-tls",
