@@ -380,7 +380,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             WaitCondition::External { key } => {
                 if key.trim().is_empty() {
                     return Ok(WaitConditionResult::Unsupported {
-                        reason: "External signal key cannot be empty".to_string(),
+                        reason: "external signal key cannot be empty".to_string(),
                     });
                 }
 
@@ -2032,7 +2032,7 @@ mod tests {
         // Create a pattern engine with a test rule that matches "ERROR"
         let rule = RuleDef {
             id: "wezterm.error_detect".to_string(),
-            agent_type: AgentType::Unknown,
+            agent_type: AgentType::Wezterm,
             event_type: "error".to_string(),
             severity: Severity::Warning,
             anchors: vec!["ERROR".to_string()],
