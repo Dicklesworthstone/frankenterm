@@ -640,7 +640,11 @@ impl RuntimeLockMemoryTelemetrySnapshot {
     /// it.
     pub fn update_global(snapshot: Self) {
         let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
-        let mut guard = lock.write().unwrap_or_else(|e| e.into_inner());
+        // ft-lo0ip: recover a poisoned lock AND record it (counter + warn) so
+        // the update still lands and the poison is observable, not silent.
+        let mut guard = lock
+            .write()
+            .unwrap_or_else(record_lock_memory_telemetry_poison_and_recover);
         *guard = Some(snapshot);
     }
 
@@ -652,7 +656,11 @@ impl RuntimeLockMemoryTelemetrySnapshot {
     #[must_use]
     pub fn get_global() -> Option<Self> {
         let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
-        let guard = lock.read().unwrap_or_else(|e| e.into_inner());
+        // ft-lo0ip: recover a poisoned lock AND record it so a present snapshot
+        // is returned (not masked as None) and the poison is observable.
+        let guard = lock
+            .read()
+            .unwrap_or_else(record_lock_memory_telemetry_poison_and_recover);
         guard.clone()
     }
 }
@@ -4782,6 +4790,49 @@ fn record_samples_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T 
     poison.into_inner()
 }
 
+// =============================================================================
+// ft-lo0ip: global lock/memory telemetry RwLock poison-recovery counter
+// =============================================================================
+//
+// `RuntimeLockMemoryTelemetrySnapshot::update_global`/`get_global` recover a
+// poisoned `GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY` RwLock via into_inner (so the
+// update lands / the snapshot is returned instead of being dropped), but the
+// recovery was invisible — operators got no signal that the global telemetry
+// lock had been poisoned. Same defect class as ft-ykkig (silent fail-soft
+// recovery): surface it via an observability counter.
+static RUNTIME_LOCK_MEMORY_TELEMETRY_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the current count of recovered global lock/memory telemetry RwLock
+/// poison events. Non-zero means a prior thread panicked while holding the
+/// `GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY` lock; `update_global`/`get_global`
+/// continued (fail-soft) after recovering the guard. [ft-lo0ip]
+#[must_use]
+pub fn runtime_lock_memory_telemetry_poisoned_count() -> u64 {
+    RUNTIME_LOCK_MEMORY_TELEMETRY_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only reset so tests don't observe cross-test pollution of the
+/// process-global counter.
+#[cfg(test)]
+pub fn reset_runtime_lock_memory_telemetry_poisoned_count_for_test() {
+    RUNTIME_LOCK_MEMORY_TELEMETRY_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Recover a poisoned global lock/memory telemetry RwLock guard via
+/// [`std::sync::PoisonError::into_inner`] and bump the observability counter
+/// on recovery. Also emits a `tracing::warn` so the poison shows up in logs,
+/// not just the counter. [ft-lo0ip]
+fn record_lock_memory_telemetry_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    RUNTIME_LOCK_MEMORY_TELEMETRY_POISONED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        target: "ft.runtime.telemetry",
+        event = "runtime_lock_memory_telemetry_lock_poisoned",
+        "global lock/memory telemetry RwLock was poisoned; recovered guard and continued (ft-lo0ip)"
+    );
+    poison.into_inner()
+}
+
 fn record_bounded_sample(samples: &StdMutex<VecDeque<u64>>, value: u64) {
     // br-ft-ykkig: hot path — every latency sample recording.
     let mut guard = samples
@@ -8212,6 +8263,11 @@ mod tests {
         }));
         assert!(poison.is_err());
 
+        // ft-lo0ip: capture the poison counter just before exercising the
+        // recovered paths so the assertion is a delta (robust against other
+        // tests that may touch the now-poisoned process-global lock).
+        let poison_count_before = runtime_lock_memory_telemetry_poisoned_count();
+
         // After poison: update_global must RECOVER and apply the new snapshot
         // (not silently drop it), and get_global must recover and return it.
         let mut snap2 = snap;
@@ -8221,6 +8277,16 @@ mod tests {
             RuntimeLockMemoryTelemetrySnapshot::get_global().map(|s| s.timestamp_ms),
             Some(888_888),
             "update/get must recover from a poisoned lock and not lose the update"
+        );
+
+        // ft-lo0ip: recovery must also be OBSERVABLE — the recovered
+        // update_global + get_global each bump the poison counter (>= +2),
+        // instead of recovering silently.
+        assert!(
+            runtime_lock_memory_telemetry_poisoned_count() >= poison_count_before + 2,
+            "poisoned-lock recovery must bump the observability counter \
+             (before={poison_count_before}, after={})",
+            runtime_lock_memory_telemetry_poisoned_count()
         );
     }
 
