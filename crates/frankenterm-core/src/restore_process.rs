@@ -1506,8 +1506,8 @@ mod tests {
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let cfg2: LaunchConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg2.launch_shells, false);
-        assert_eq!(cfg2.launch_agents, true);
+        assert!(!cfg2.launch_shells);
+        assert!(cfg2.launch_agents);
         assert_eq!(cfg2.launch_delay_ms, 250);
         assert_eq!(
             cfg2.agent_commands.get("claude_code").unwrap(),

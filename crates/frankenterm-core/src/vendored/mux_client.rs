@@ -8056,31 +8056,27 @@ mod tests {
 
             for _ in 0..30 {
                 if a_counts.is_none() {
-                    match timeout(Duration::from_millis(200), sub_a.next()).await {
-                        Ok(Some(PaneDelta::Output {
-                            pane_id,
-                            dirty_range_count,
-                            dirty_row_count,
-                            ..
-                        })) => {
-                            assert_eq!(pane_id, 21, "subscription A should only receive pane 21");
-                            a_counts = Some((dirty_range_count, dirty_row_count));
-                        }
-                        Ok(Some(_) | None) | Err(_) => {}
+                    if let Ok(Some(PaneDelta::Output {
+                        pane_id,
+                        dirty_range_count,
+                        dirty_row_count,
+                        ..
+                    })) = timeout(Duration::from_millis(200), sub_a.next()).await
+                    {
+                        assert_eq!(pane_id, 21, "subscription A should only receive pane 21");
+                        a_counts = Some((dirty_range_count, dirty_row_count));
                     }
                 }
                 if b_counts.is_none() {
-                    match timeout(Duration::from_millis(200), sub_b.next()).await {
-                        Ok(Some(PaneDelta::Output {
-                            pane_id,
-                            dirty_range_count,
-                            dirty_row_count,
-                            ..
-                        })) => {
-                            assert_eq!(pane_id, 22, "subscription B should only receive pane 22");
-                            b_counts = Some((dirty_range_count, dirty_row_count));
-                        }
-                        Ok(Some(_) | None) | Err(_) => {}
+                    if let Ok(Some(PaneDelta::Output {
+                        pane_id,
+                        dirty_range_count,
+                        dirty_row_count,
+                        ..
+                    })) = timeout(Duration::from_millis(200), sub_b.next()).await
+                    {
+                        assert_eq!(pane_id, 22, "subscription B should only receive pane 22");
+                        b_counts = Some((dirty_range_count, dirty_row_count));
                     }
                 }
                 if a_counts.is_some() && b_counts.is_some() {

@@ -1360,7 +1360,7 @@ mod tests {
         assert!(debug_str.contains("true")); // leak_detected
 
         let cloned = result.clone();
-        assert_eq!(cloned.leak_detected, true);
+        assert!(cloned.leak_detected);
         assert_eq!(cloned.audit_count, 5);
     }
 
@@ -1378,7 +1378,7 @@ mod tests {
 
         let cloned = check.clone();
         assert_eq!(cloned.name, "nofile_soft");
-        assert_eq!(cloned.ok, true);
+        assert!(cloned.ok);
     }
 
     #[test]
@@ -1406,7 +1406,7 @@ mod tests {
         assert!(debug_str.contains("false"));
 
         let cloned = validation.clone();
-        assert_eq!(cloned.all_ok, false);
+        assert!(!cloned.all_ok);
         assert_eq!(cloned.checks.len(), 2);
         assert_eq!(cloned.fix_commands.len(), 1);
     }

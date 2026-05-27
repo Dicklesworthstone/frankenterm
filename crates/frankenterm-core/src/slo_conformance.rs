@@ -1064,7 +1064,7 @@ mod tests {
         };
         let json = serde_json::to_string(&eval).unwrap();
         let eval2: SloEvaluation = serde_json::from_str(&json).unwrap();
-        assert_eq!(eval2.conforming, true);
+        assert!(eval2.conforming);
         assert_eq!(eval2.breach_severity, SloSeverity::Warning);
     }
 

@@ -2107,7 +2107,7 @@ mod tests {
             report.evidence_state,
             ContextHorizonEvidenceState::Unavailable
         );
-        assert_eq!(report.raw_context_content_stored, false);
+        assert!(!report.raw_context_content_stored);
         assert_eq!(report.unavailable_domains.len(), 1);
         assert_eq!(
             report.unavailable_domains[0].reason_codes,
@@ -2200,7 +2200,7 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "provider.rate_limit_recent")
         );
-        assert_eq!(report.raw_context_content_stored, false);
+        assert!(!report.raw_context_content_stored);
         assert!(
             report
                 .recommendations

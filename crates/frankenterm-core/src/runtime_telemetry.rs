@@ -15127,7 +15127,7 @@ mod tests {
         let ctx = SwarmCapacityEvidenceContext::redacted_from(raw, |v| v.to_string(), &config);
 
         // Public accessors round-trip the underlying data.
-        assert_eq!(ctx.redacted(), true);
+        assert!(ctx.redacted());
         assert!(
             ctx.fields().len() <= 1,
             "context_fields=1 must cap fields to 1 (got {})",

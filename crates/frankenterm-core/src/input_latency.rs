@@ -737,7 +737,7 @@ mod tests {
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: BudgetCheckResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.passed, true);
+        assert!(back.passed);
         assert_eq!(back.details.len(), 1);
     }
 

@@ -4159,8 +4159,8 @@ mod tests {
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: SessionRestoreConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.auto_restore, true);
-        assert_eq!(parsed.restore_scrollback, true);
+        assert!(parsed.auto_restore);
+        assert!(parsed.restore_scrollback);
         assert_eq!(parsed.restore_max_lines, 10_000);
         assert!(!parsed.process_relaunch.launch_shells);
         assert!(parsed.process_relaunch.launch_agents);
@@ -4191,7 +4191,7 @@ mod tests {
             ..SessionRestoreConfig::default()
         };
         let c = cfg.clone();
-        assert_eq!(c.auto_restore, true);
+        assert!(c.auto_restore);
         assert_eq!(c.restore_max_lines, 100);
         assert_eq!(
             c.process_relaunch.launch_agents,

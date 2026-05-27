@@ -1599,7 +1599,7 @@ mod tests {
         // Mixed operation sequence: draw, poll, suspend/resume cycles
         for i in 0..50u32 {
             match i % 7 {
-                0 | 1 | 2 => {
+                0..=2 => {
                     // Draw
                     session.draw(&mut |_, _| {}).unwrap();
                 }

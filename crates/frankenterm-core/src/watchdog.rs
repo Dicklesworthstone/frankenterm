@@ -1867,7 +1867,7 @@ mod tests {
         let dbg = format!("{:?}", sample);
         assert!(dbg.contains("MuxHealthSample"), "got: {}", dbg);
         let cloned = sample.clone();
-        assert_eq!(cloned.ping_ok, true);
+        assert!(cloned.ping_ok);
     }
 
     #[test]

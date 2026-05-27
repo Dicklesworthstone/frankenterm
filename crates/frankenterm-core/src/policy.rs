@@ -16375,8 +16375,8 @@ mod tests {
         );
         assert_eq!(dash.counters.total_evaluations, 0);
         assert_eq!(dash.counters.total_denials, 0);
-        assert_eq!(dash.counters.kill_switch_active, false);
-        assert_eq!(dash.counters.audit_chain_valid, true);
+        assert!(!dash.counters.kill_switch_active);
+        assert!(dash.counters.audit_chain_valid);
     }
 
     #[test]
