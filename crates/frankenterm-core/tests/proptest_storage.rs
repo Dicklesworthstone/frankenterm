@@ -1202,8 +1202,10 @@ proptest! {
 
     #[test]
     fn prop_classifier_clean_input_no_rollback(stage in arb_migration_stage()) {
-        let mut input = MigrationRollbackClassifierInput::default();
-        input.stage = stage;
+        let input = MigrationRollbackClassifierInput {
+            stage,
+            ..MigrationRollbackClassifierInput::default()
+        };
         // All signals are clean/false
         let decision = classify_migration_rollback_trigger(&input);
         prop_assert!(!decision.should_rollback);
@@ -1214,8 +1216,10 @@ proptest! {
 
     #[test]
     fn prop_classifier_data_loss_triggers_emergency(_dummy in 0..1_u32) {
-        let mut input = MigrationRollbackClassifierInput::default();
-        input.confirmed_canonical_data_loss = true;
+        let input = MigrationRollbackClassifierInput {
+            confirmed_canonical_data_loss: true,
+            ..MigrationRollbackClassifierInput::default()
+        };
         let decision = classify_migration_rollback_trigger(&input);
         prop_assert!(decision.should_rollback);
         let is_emergency = decision.rollback_class == Some(MigrationRollbackClass::DataIntegrityEmergency);
@@ -1226,8 +1230,10 @@ proptest! {
 
     #[test]
     fn prop_classifier_corrupt_import_triggers_immediate(_dummy in 0..1_u32) {
-        let mut input = MigrationRollbackClassifierInput::default();
-        input.corrupt_import = true;
+        let input = MigrationRollbackClassifierInput {
+            corrupt_import: true,
+            ..MigrationRollbackClassifierInput::default()
+        };
         let decision = classify_migration_rollback_trigger(&input);
         prop_assert!(decision.should_rollback);
         let has_trigger = decision.triggers.contains(&MigrationRollbackTrigger::CorruptImport);
@@ -1238,12 +1244,14 @@ proptest! {
     fn prop_classifier_invariant_errors_trigger(
         errors in 1_usize..10,
     ) {
-        let mut input = MigrationRollbackClassifierInput::default();
-        input.invariants = Some(MigrationInvariantSummary {
-            warning_count: 0,
-            error_count: errors,
-            critical_count: 0,
-        });
+        let input = MigrationRollbackClassifierInput {
+            invariants: Some(MigrationInvariantSummary {
+                warning_count: 0,
+                error_count: errors,
+                critical_count: 0,
+            }),
+            ..MigrationRollbackClassifierInput::default()
+        };
         let decision = classify_migration_rollback_trigger(&input);
         prop_assert!(decision.should_rollback);
         let has_trigger = decision.triggers.contains(&MigrationRollbackTrigger::InvariantErrors);
@@ -1626,10 +1634,12 @@ proptest! {
         hits in 0_u64..10_000,
         misses in 0_u64..10_000,
     ) {
-        let mut metrics = SemanticBudgetMetrics::default();
-        metrics.total_semantic_requests = requests;
-        metrics.semantic_cache_hits = hits;
-        metrics.semantic_cache_misses = misses;
+        let metrics = SemanticBudgetMetrics {
+            total_semantic_requests: requests,
+            semantic_cache_hits: hits,
+            semantic_cache_misses: misses,
+            ..SemanticBudgetMetrics::default()
+        };
         let json = serde_json::to_string(&metrics).unwrap();
         let back: SemanticBudgetMetrics = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.total_semantic_requests, requests);
@@ -1984,15 +1994,19 @@ proptest! {
 
     #[test]
     fn prop_execution_state_recorder_writes_blocked(freeze in any::<bool>()) {
-        let mut state = MigrationRollbackExecutionState::default();
-        state.emergency_freeze = freeze;
+        let state = MigrationRollbackExecutionState {
+            emergency_freeze: freeze,
+            ..MigrationRollbackExecutionState::default()
+        };
         prop_assert_eq!(state.recorder_writes_blocked(), freeze);
     }
 
     #[test]
     fn prop_execution_state_manual_reenable(_dummy in 0..1_u8) {
-        let mut state = MigrationRollbackExecutionState::default();
-        state.emergency_freeze = true;
+        let mut state = MigrationRollbackExecutionState {
+            emergency_freeze: true,
+            ..MigrationRollbackExecutionState::default()
+        };
         prop_assert!(state.recorder_writes_blocked());
         state.manual_reenable_recorder_writes();
         prop_assert!(!state.recorder_writes_blocked());

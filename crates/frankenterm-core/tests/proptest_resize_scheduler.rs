@@ -1157,16 +1157,15 @@ fn arb_scheduler_config() -> impl Strategy<Value = ResizeSchedulerConfig> {
         0u32..20,
         0u32..50,
     )
-        .prop_map(|(cp, ed, lf, fbu, ig, ibt, ibu)| {
-            let mut cfg = ResizeSchedulerConfig::default();
-            cfg.control_plane_enabled = cp;
-            cfg.emergency_disable = ed;
-            cfg.legacy_fallback_enabled = lf;
-            cfg.frame_budget_units = fbu;
-            cfg.input_guardrail_enabled = ig;
-            cfg.input_backlog_threshold = ibt;
-            cfg.input_reserve_units = ibu;
-            cfg
+        .prop_map(|(cp, ed, lf, fbu, ig, ibt, ibu)| ResizeSchedulerConfig {
+            control_plane_enabled: cp,
+            emergency_disable: ed,
+            legacy_fallback_enabled: lf,
+            frame_budget_units: fbu,
+            input_guardrail_enabled: ig,
+            input_backlog_threshold: ibt,
+            input_reserve_units: ibu,
+            ..ResizeSchedulerConfig::default()
         })
 }
 
@@ -1205,15 +1204,16 @@ fn arb_resize_metrics() -> impl Strategy<Value = ResizeSchedulerMetrics> {
     )
         .prop_map(
             |(frames, superseded, rejected, forced, over, overload_rej, overload_ev)| {
-                let mut m = ResizeSchedulerMetrics::default();
-                m.frames = frames;
-                m.superseded_intents = superseded;
-                m.rejected_non_monotonic = rejected;
-                m.forced_background_runs = forced;
-                m.over_budget_runs = over;
-                m.overload_rejected = overload_rej;
-                m.overload_evicted = overload_ev;
-                m
+                ResizeSchedulerMetrics {
+                    frames,
+                    superseded_intents: superseded,
+                    rejected_non_monotonic: rejected,
+                    forced_background_runs: forced,
+                    over_budget_runs: over,
+                    overload_rejected: overload_rej,
+                    overload_evicted: overload_ev,
+                    ..ResizeSchedulerMetrics::default()
+                }
             },
         )
 }
