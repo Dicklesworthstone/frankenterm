@@ -3723,6 +3723,8 @@ impl PatternEngine {
         })
     }
 
+    // Match traces intentionally keep pattern, span, policy, and redaction inputs explicit.
+    #[allow(clippy::too_many_arguments)]
     fn build_match_trace(
         text: &str,
         redactor: &Redactor,
@@ -3844,6 +3846,8 @@ impl PatternEngine {
         }
     }
 
+    // Negative match traces mirror the positive trace signature for golden parity.
+    #[allow(clippy::too_many_arguments)]
     fn build_match_trace_no_detection(
         _text: &str,
         _redactor: &Redactor,

@@ -475,6 +475,8 @@ pub(super) fn event_matches_pane(event: &Event, pane_filter: Option<u64>) -> boo
     pane_filter.is_none_or(|pane_id| event.pane_id() == Some(pane_id))
 }
 
+// Segment-frame SSE emission keeps storage, filters, cursor, and backpressure knobs explicit.
+#[allow(clippy::too_many_arguments)]
 async fn emit_new_segment_frames(
     storage: &StorageHandle,
     pane_filter: Option<u64>,
@@ -570,6 +572,8 @@ async fn emit_new_segment_frames(
     DeltaCatchup::Complete
 }
 
+// Segment-frame draining mirrors emission inputs while updating the caller's stream cursor.
+#[allow(clippy::too_many_arguments)]
 async fn drain_new_segment_frames(
     storage: &StorageHandle,
     pane_filter: Option<u64>,

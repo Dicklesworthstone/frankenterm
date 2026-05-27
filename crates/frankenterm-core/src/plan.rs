@@ -4044,6 +4044,8 @@ fn tx_last_receipt_seq(receipts: &[serde_json::Value]) -> u64 {
         .unwrap_or(0)
 }
 
+// Tx receipts keep sequencing, policy, and proof metadata explicit.
+#[allow(clippy::too_many_arguments)]
 fn tx_build_receipt(
     seq: u64,
     phase: &str,

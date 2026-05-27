@@ -2447,6 +2447,8 @@ struct PaneRenderFilters<'a> {
     profile_count: usize,
 }
 
+// Pane rendering keeps frame geometry and focused pane state explicit for layout stability.
+#[allow(clippy::too_many_arguments)]
 fn render_panes_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -3231,6 +3233,8 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
 /// Responsive event layout:
 ///   Regular/wide: left list + right detail panel.
 ///   Compact: full-width list with a stacked detail panel below it.
+// Event rendering keeps geometry, selection, and detail state explicit for responsive layouts.
+#[allow(clippy::too_many_arguments)]
 fn render_events_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -3733,6 +3737,8 @@ fn render_triage_view(
 /// Responsive history layout:
 ///   Regular/wide: left list + right detail panel.
 ///   Compact: full-width list with a stacked detail panel below it.
+// History rendering keeps geometry, filters, and detail state explicit for responsive layouts.
+#[allow(clippy::too_many_arguments)]
 fn render_history_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -3982,6 +3988,8 @@ fn truncate_str(s: &str, max: usize) -> String {
 /// Responsive timeline layout:
 ///   Regular/wide: left list + right detail panel.
 ///   Compact: full-width list with a stacked detail panel below it.
+// Timeline rendering keeps geometry, filters, and focused event state explicit.
+#[allow(clippy::too_many_arguments)]
 fn render_timeline_view(
     frame: &mut ftui::Frame,
     y: u16,
