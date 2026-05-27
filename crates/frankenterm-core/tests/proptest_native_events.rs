@@ -65,6 +65,8 @@ fn pane_output_json(pane_id: u64, data: &[u8], ts: u64) -> String {
     )
 }
 
+// JSON fixture constructor keeps independent pane geometry, cursor, mode, and timestamp knobs.
+#[allow(clippy::too_many_arguments)]
 fn state_change_json(
     pane_id: u64,
     title: &str,

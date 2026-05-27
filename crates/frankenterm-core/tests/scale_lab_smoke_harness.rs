@@ -547,6 +547,8 @@ fn simulated_boundaries() -> Vec<String> {
     ]
 }
 
+// Catalog fixture mirrors the emitted command, timing, counters, inline artifacts, and paths.
+#[allow(clippy::too_many_arguments)]
 fn build_catalog(
     command_line: &str,
     target_dir: &std::path::Path,

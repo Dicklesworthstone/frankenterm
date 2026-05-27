@@ -195,11 +195,13 @@ proptest! {
         max_depth in 1usize..20,
         stale_threshold in 1000i64..120_000,
     ) {
-        let mut config = WatchdogConfig::default();
-        config.default_grace_period_ms = grace;
-        config.finalizer_timeout_ms = timeout;
-        config.max_depth = max_depth;
-        config.stale_created_threshold_ms = stale_threshold;
+        let config = WatchdogConfig {
+            default_grace_period_ms: grace,
+            finalizer_timeout_ms: timeout,
+            max_depth,
+            stale_created_threshold_ms: stale_threshold,
+            ..WatchdogConfig::default()
+        };
 
         let json = serde_json::to_string(&config).unwrap();
         let restored: WatchdogConfig = serde_json::from_str(&json).unwrap();
@@ -296,8 +298,10 @@ proptest! {
         timeout_ms in 1000u64..20_000,
         elapsed_ms in 0i64..40_000,
     ) {
-        let mut config = WatchdogConfig::default();
-        config.finalizer_timeout_ms = timeout_ms;
+        let config = WatchdogConfig {
+            finalizer_timeout_ms: timeout_ms,
+            ..WatchdogConfig::default()
+        };
 
         let mut tree = ScopeTree::new(1000);
         tree.start(&ScopeId::root(), 1000).unwrap();
@@ -332,8 +336,10 @@ proptest! {
         threshold_ms in 5000i64..60_000,
         elapsed_ms in 0i64..120_000,
     ) {
-        let mut config = WatchdogConfig::default();
-        config.stale_created_threshold_ms = threshold_ms;
+        let config = WatchdogConfig {
+            stale_created_threshold_ms: threshold_ms,
+            ..WatchdogConfig::default()
+        };
 
         let mut tree = ScopeTree::new(1000);
         tree.start(&ScopeId::root(), 1000).unwrap();
@@ -365,8 +371,10 @@ proptest! {
         max_depth in 2usize..6,
         actual_depth in 2usize..10,
     ) {
-        let mut config = WatchdogConfig::default();
-        config.max_depth = max_depth;
+        let mut config = WatchdogConfig {
+            max_depth,
+            ..WatchdogConfig::default()
+        };
         // Don't trigger scope leak alerts for daemon tier
         config.tier_scope_limits.insert("daemon".into(), 100);
 
@@ -492,8 +500,10 @@ proptest! {
 
     #[test]
     fn deadlock_detection_respects_config_flag(_dummy in 0u8..1) {
-        let mut config = WatchdogConfig::default();
-        config.detect_deadlocks = false;
+        let config = WatchdogConfig {
+            detect_deadlocks: false,
+            ..WatchdogConfig::default()
+        };
 
         let mut tree = ScopeTree::new(1000);
         tree.start(&ScopeId::root(), 1000).unwrap();
