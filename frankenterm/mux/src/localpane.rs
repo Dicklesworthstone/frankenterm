@@ -2138,21 +2138,36 @@ mod tests {
 
     #[test]
     fn retry_backoff_accounting_saturates_duration_overflow() {
+        // Verify the backoff accounting saturates at `Duration::MAX` rather than
+        // overflow-panicking. This drives `retry_backoff_for_attempt` and the
+        // `saturating_add` accumulation directly (the exact ops `retry_with_backoff`
+        // performs at lib.rs ~324-325) instead of running the real retry loop:
+        // with `base_backoff = Duration::MAX` that loop would `thread::sleep`
+        // `Duration::MAX` between attempts and hang the test forever.
         let policy = ResizeRetryPolicy {
             max_attempts: 3,
             base_backoff: Duration::MAX,
             max_backoff: Duration::MAX,
         };
 
-        // `retry_with_backoff` returns stats on BOTH arms:
-        // `Result<(T, ResizeRetryStats), (E, ResizeRetryStats)>`. The closure is
-        // `|_| Err(())`, so T=() and E=(); the Ok arm must carry ResizeRetryStats too.
-        let result: Result<((), ResizeRetryStats), ((), ResizeRetryStats)> =
-            retry_with_backoff(policy, |_| Err(()));
-        let (_err, stats) = result.expect_err("retry should exhaust attempts");
+        // Per-attempt backoff must saturate at MAX (no overflow in saturating_mul).
+        assert_eq!(retry_backoff_for_attempt(policy, 1), Duration::MAX);
+        assert_eq!(retry_backoff_for_attempt(policy, 2), Duration::MAX);
 
-        assert_eq!(stats.attempts, 3);
-        assert_eq!(stats.backoff_elapsed, Duration::MAX);
+        // The retry loop sleeps (and accounts) the backoff for every attempt except
+        // the last, so accumulate attempts 1..max_attempts and confirm the running
+        // total saturates at MAX instead of panicking.
+        let mut backoff_elapsed = Duration::default();
+        let mut attempts = 0;
+        for attempt in 1..policy.max_attempts {
+            attempts = attempt;
+            backoff_elapsed =
+                backoff_elapsed.saturating_add(retry_backoff_for_attempt(policy, attempt));
+        }
+        // attempts loops over 1,2 (the sleeping attempts); the 3rd is the terminal
+        // failure that `retry_with_backoff` reports without sleeping.
+        assert_eq!(attempts, policy.max_attempts - 1);
+        assert_eq!(backoff_elapsed, Duration::MAX);
     }
 
     #[test]
