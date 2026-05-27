@@ -17,9 +17,9 @@
 use std::path::PathBuf;
 
 use codec::{
-    CompressionMode, DecodedPdu, ErrorResponse, GetCodecVersion, GetCodecVersionResponse,
-    GetTlsCreds, ListPanes, Pdu, Ping, Pong, UnitResponse, CODEC_VERSION,
-    CODEC_VERSION_MIN_SUPPORTED,
+    CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompressionMode, DecodedPdu, ErrorResponse,
+    GetCodecVersion, GetCodecVersionResponse, GetTlsCreds, ListPanes, Pdu, Ping, Pong,
+    UnitResponse,
 };
 
 // Mirror private constants from `codec::lib`. Kept in lockstep by the
@@ -294,18 +294,43 @@ where
         let mut encoded = Vec::new();
         expected
             .encode_with_mode(&mut encoded, serial, mode)
-            .unwrap_or_else(|err| panic!("{label}: encode_with_mode({mode:?}) failed: {err}"));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{label}: encode_with_mode({mode:?}) failed: {err}",
+                    label = label,
+                    mode = mode,
+                    err = err,
+                )
+            });
 
-        let decoded = Pdu::decode(encoded.as_slice())
-            .unwrap_or_else(|err| panic!("{label}: decode after {mode:?} failed: {err}"));
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap_or_else(|err| {
+            panic!(
+                "{label}: decode after {mode:?} failed: {err}",
+                label = label,
+                mode = mode,
+                err = err,
+            )
+        });
         assert_eq!(decoded.serial, serial, "{label}: decoded serial drifted");
         assert_eq!(decoded.pdu, expected, "{label}: decoded PDU drifted");
 
         let mut streaming = encoded.clone();
         streaming.extend_from_slice(b"NEXT");
         let streamed = Pdu::stream_decode(&mut streaming)
-            .unwrap_or_else(|err| panic!("{label}: stream_decode after {mode:?} failed: {err}"))
-            .unwrap_or_else(|| panic!("{label}: stream_decode returned None for complete frame"));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{label}: stream_decode after {mode:?} failed: {err}",
+                    label = label,
+                    mode = mode,
+                    err = err,
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: stream_decode returned None for complete frame",
+                    label = label,
+                )
+            });
         assert_eq!(streamed.serial, serial, "{label}: streamed serial drifted");
         assert_eq!(streamed.pdu, make_pdu(), "{label}: streamed PDU drifted");
         assert_eq!(
@@ -593,10 +618,22 @@ fn conformance_mixed_mux_pdu_roundtrip_preserves_order_under_all_compression_mod
     for (label, serial, mode, pdu) in &cases {
         let mut frame = Vec::new();
         pdu.encode_with_mode(&mut frame, *serial, *mode)
-            .unwrap_or_else(|err| panic!("{label}: encode_with_mode({mode:?}) failed: {err}"));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{label}: encode_with_mode({mode:?}) failed: {err}",
+                    label = label,
+                    mode = mode,
+                    err = err,
+                )
+            });
 
-        let decoded = Pdu::decode(frame.as_slice())
-            .unwrap_or_else(|err| panic!("{label}: direct decode failed: {err}"));
+        let decoded = Pdu::decode(frame.as_slice()).unwrap_or_else(|err| {
+            panic!(
+                "{label}: direct decode failed: {err}",
+                label = label,
+                err = err,
+            )
+        });
         assert_eq!(decoded.serial, *serial, "{label}: direct serial");
         assert_eq!(&decoded.pdu, pdu, "{label}: direct pdu");
 
@@ -605,8 +642,20 @@ fn conformance_mixed_mux_pdu_roundtrip_preserves_order_under_all_compression_mod
 
     for (idx, (label, serial, _mode, pdu)) in cases.iter().enumerate() {
         let decoded = Pdu::stream_decode(&mut stream)
-            .unwrap_or_else(|err| panic!("{label}: stream decode failed: {err}"))
-            .unwrap_or_else(|| panic!("{label}: missing stream frame at index {idx}"));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{label}: stream decode failed: {err}",
+                    label = label,
+                    err = err,
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: missing stream frame at index {idx}",
+                    label = label,
+                    idx = idx,
+                )
+            });
         assert_eq!(decoded.serial, *serial, "{label}: stream serial");
         assert_eq!(&decoded.pdu, pdu, "{label}: stream pdu");
     }
@@ -645,7 +694,13 @@ fn conformance_mux_pdu_roundtrip_decodes_one_byte_chunks_in_order() {
     let mut expected = Vec::new();
     for (serial, mode, pdu) in cases {
         pdu.encode_with_mode(&mut wire, serial, mode)
-            .unwrap_or_else(|err| panic!("encode_with_mode({mode:?}) failed: {err}"));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "encode_with_mode({mode:?}) failed: {err}",
+                    mode = mode,
+                    err = err,
+                )
+            });
         expected.push((serial, pdu));
     }
 
@@ -728,7 +783,8 @@ fn conformance_stream_decode_preserves_malformed_complete_frame() {
         msg.contains("sizes don't make sense")
             || msg.contains("leb128")
             || msg.contains("failed to fill whole buffer"),
-        "expected a malformed-frame rejection error, got: {msg}"
+        "expected a malformed-frame rejection error, got: {msg}",
+        msg = msg,
     );
     assert_eq!(
         wire, original,

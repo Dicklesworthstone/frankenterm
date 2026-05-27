@@ -16,7 +16,7 @@
 // smol Async streams into codec async APIs, mixed graphs must continue to use
 // the smol path until those callers migrate.
 
-use anyhow::{bail, Context as _, Error};
+use anyhow::{Context as _, Error, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
@@ -2067,22 +2067,28 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_true_variants() {
-        assert!(Pdu::WriteToPane(WriteToPane {
-            pane_id: 0,
-            data: vec![]
-        })
-        .is_user_input());
-        assert!(Pdu::SendPaste(SendPaste {
-            pane_id: 0,
-            data: String::new()
-        })
-        .is_user_input());
-        assert!(Pdu::Resize(Resize {
-            containing_tab_id: 0,
-            pane_id: 0,
-            size: TerminalSize::default(),
-        })
-        .is_user_input());
+        assert!(
+            Pdu::WriteToPane(WriteToPane {
+                pane_id: 0,
+                data: vec![]
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::SendPaste(SendPaste {
+                pane_id: 0,
+                data: String::new()
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::Resize(Resize {
+                containing_tab_id: 0,
+                pane_id: 0,
+                size: TerminalSize::default(),
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -2325,10 +2331,12 @@ mod test {
         assert!(
             message.contains("reading PDU serial") && message.contains("reading leb128"),
             "stream_decode should report the truncated serial inside the declared frame; got {message:?}",
+            message = message,
         );
         assert!(
             !message.contains("sizes don't make sense"),
             "stream_decode read past the declared frame and misclassified the malformed header: {message:?}",
+            message = message,
         );
         assert_eq!(
             buffer, original,
@@ -2736,7 +2744,8 @@ mod test {
             .expect_err("wire length wider than usize must fail before truncating");
         assert!(
             err.to_string().contains("does not fit in usize"),
-            "unexpected error message: {err}"
+            "unexpected error message: {err}",
+            err = err,
         );
     }
 
@@ -3130,12 +3139,14 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_set_pane_zoomed() {
-        assert!(Pdu::SetPaneZoomed(SetPaneZoomed {
-            containing_tab_id: 0,
-            pane_id: 0,
-            zoomed: true,
-        })
-        .is_user_input());
+        assert!(
+            Pdu::SetPaneZoomed(SetPaneZoomed {
+                containing_tab_id: 0,
+                pane_id: 0,
+                zoomed: true,
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
