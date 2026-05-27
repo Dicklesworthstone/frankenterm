@@ -6,6 +6,8 @@ use frankenterm_core::swarm_pipeline::{
     PipelineStep, RecoveryPolicy, StepAction, StepStatus,
 };
 
+// Structured log fixture fields mirror the emitted pipeline telemetry envelope.
+#[allow(clippy::too_many_arguments)]
 fn emit_structured_log(
     timestamp: &str,
     scenario_id: &str,

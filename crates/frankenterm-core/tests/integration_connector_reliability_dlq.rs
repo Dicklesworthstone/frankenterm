@@ -321,16 +321,18 @@ fn connector_reliability_conformance_circuit_telemetry_snapshot_cancellation() {
 
 #[test]
 fn connector_reliability_conformance_governor_snapshot() {
-    let mut config = ConnectorGovernorConfig::default();
-    config.default_rate_limit = TokenBucketConfig {
-        capacity: 1,
-        refill_rate: 1,
-        refill_interval_ms: 1_000,
-    };
-    config.global_rate_limit = TokenBucketConfig {
-        capacity: 10,
-        refill_rate: 10,
-        refill_interval_ms: 1_000,
+    let config = ConnectorGovernorConfig {
+        default_rate_limit: TokenBucketConfig {
+            capacity: 1,
+            refill_rate: 1,
+            refill_interval_ms: 1_000,
+        },
+        global_rate_limit: TokenBucketConfig {
+            capacity: 10,
+            refill_rate: 10,
+            refill_interval_ms: 1_000,
+        },
+        ..Default::default()
     };
     let mut governor = ConnectorGovernor::new(config);
     let action = make_action(ConnectorActionKind::Notify, "governor-snapshot");
