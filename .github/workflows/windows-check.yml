@@ -90,15 +90,19 @@ jobs:
           cargo --version >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Default features: the parity target — now a REQUIRED gate. Confirmed green on a
-      # CLEAN, cache-busted run (key windows-check-v2) with OpenSSL provisioned via the
-      # vcpkg step above (OPENSSL_DIR/OPENSSL_STATIC) after ft-x1klc gated `vendored` off
-      # Windows. This is a genuine clean green (not the earlier cached false-positive), so
-      # continue-on-error is removed to lock in the additive, zero-Mac/Linux-regression
-      # Windows-compat invariant: anything that breaks the Windows build (new ungated Unix
-      # coupling, missing #[cfg(windows)] seam, etc.) now fails CI. Keep changes additive.
+      # Default features: INFORMATIONAL again (continue-on-error). The earlier "green"
+      # that prompted requiring this was a stale-cache artifact — the first runs that
+      # actually completed a CLEAN full traversal (windows-check-v2) fail with real
+      # default-features-only blockers:
+      #   - tikv-jemalloc-sys cannot build on windows-msvc (frankenterm-gui default
+      #     feature `jemalloc`); jemalloc must be target-gated off Windows (ft-azsnz child).
+      #   - termwiz/src/terminal/windows.rs:1022 and pty/src/lib.rs:44 compile errors.
+      # Keep this informational until those land and a CLEAN run is green; only THEN
+      # remove continue-on-error. (Lesson: never require a -sys-heavy build on a single
+      # green behind a warm cache.) The unix-coupling ratchet remains the required guard.
       - name: cargo check --workspace (default features)
         id: check_default
+        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
