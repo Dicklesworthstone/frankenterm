@@ -3,9 +3,9 @@ use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, QueueHandle};
 
-use crate::wayland::SurfaceUserData;
 use crate::wayland::keyboard::KeyboardData;
 use crate::wayland::pointer::PointerUserData;
+use crate::wayland::SurfaceUserData;
 
 use super::state::WaylandState;
 

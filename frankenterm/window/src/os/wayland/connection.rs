@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use wayland_client::backend::WaylandError;
@@ -14,12 +14,12 @@ use wayland_client::{Connection as WConnection, EventQueue};
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::SPAWN_QUEUE;
 use crate::{
-    Appearance, Connection, ConnectionOps, ScreenRect,
     connection::{fail_window_op_for_destroyed_window, new_window_op_promise},
+    Appearance, Connection, ConnectionOps, ScreenRect,
 };
 
-use super::WaylandWindowInner;
 use super::state::WaylandState;
+use super::WaylandWindowInner;
 
 pub struct WaylandConnection {
     pub(crate) should_terminate: RefCell<bool>,

@@ -4,8 +4,8 @@ use crate::locator::{FontDataHandle, FontDataSource};
 use crate::parser::ParsedFont;
 #[cfg(not(windows))]
 use crate::rasterizer::colr::DrawOp;
-use anyhow::{Context, anyhow};
-use config::{FreeTypeLoadFlags, FreeTypeLoadTarget, configuration};
+use anyhow::{anyhow, Context};
+use config::{configuration, FreeTypeLoadFlags, FreeTypeLoadTarget};
 pub use freetype::*;
 use memmap2::{Mmap, MmapOptions};
 use rangeset::RangeSet;
@@ -310,7 +310,11 @@ impl Face {
     pub fn get_os2_table(&self) -> Option<&TT_OS2> {
         unsafe {
             let os2: *const TT_OS2 = FT_Get_Sfnt_Table(self.face, FT_Sfnt_Tag::FT_SFNT_OS2) as _;
-            if os2.is_null() { None } else { Some(&*os2) }
+            if os2.is_null() {
+                None
+            } else {
+                Some(&*os2)
+            }
         }
     }
 
@@ -1499,8 +1503,8 @@ pub fn vector_x_y(vector: &FT_Vector) -> (f32, f32) {
 
 #[cfg(not(windows))]
 pub fn composite_mode_to_operator(mode: FT_Composite_Mode) -> cairo::Operator {
-    use FT_Composite_Mode::*;
     use cairo::Operator;
+    use FT_Composite_Mode::*;
     match mode {
         FT_COLR_COMPOSITE_CLEAR => Operator::Clear,
         FT_COLR_COMPOSITE_SRC => Operator::Source,

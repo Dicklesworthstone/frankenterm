@@ -5,17 +5,17 @@
 
 use super::nsstring_to_str;
 use super::window::WindowInner;
-use crate::Appearance;
 use crate::connection::{
-    ConnectionOps, fail_window_op_for_destroyed_window, new_window_op_promise,
+    fail_window_op_for_destroyed_window, new_window_op_promise, ConnectionOps,
 };
 use crate::os::macos::app::create_app_delegate;
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
+use crate::Appearance;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSScreen};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSInteger};
-use objc::runtime::{BOOL, Object, YES};
+use objc::runtime::{Object, BOOL, YES};
 use objc::*;
 use serde::Deserialize;
 use std::cell::RefCell;

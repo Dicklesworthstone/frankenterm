@@ -1,11 +1,11 @@
 use crate::hbwrap::{
-    Font, IS_PNG, PaintOp, hb_color, hb_color_get_alpha, hb_color_get_blue, hb_color_get_green,
-    hb_color_get_red, hb_color_t, hb_paint_composite_mode_t, hb_tag_to_string,
+    hb_color, hb_color_get_alpha, hb_color_get_blue, hb_color_get_green, hb_color_get_red,
+    hb_color_t, hb_paint_composite_mode_t, hb_tag_to_string, Font, PaintOp, IS_PNG,
 };
-use crate::rasterizer::FAKE_ITALIC_SKEW;
 use crate::rasterizer::colr::{
     apply_draw_ops_to_context, paint_linear_gradient, paint_radial_gradient, paint_sweep_gradient,
 };
+use crate::rasterizer::FAKE_ITALIC_SKEW;
 use crate::units::PixelLength;
 use crate::{FontRasterizer, ParsedFont, RasterizedGlyph};
 use cairo::{Content, Context, Format, ImageSurface, Matrix, Operator, RecordingSurface};
@@ -318,7 +318,11 @@ fn demultiply_alpha(alpha: u8, color: u8) -> u8 {
         return 0;
     }
     let v = ((color as u32) * 255) / alpha as u32;
-    if v > 255 { 255 } else { v as u8 }
+    if v > 255 {
+        255
+    } else {
+        v as u8
+    }
 }
 
 #[allow(dead_code)]
@@ -356,9 +360,15 @@ fn rgba_to_argb_and_multiply(data: &mut [u8]) {
 pub fn argb_to_rgba(data: &mut [u8]) {
     for pixel in data.chunks_exact_mut(4) {
         #[cfg(target_endian = "little")]
-        let [b, g, r, a] = *pixel else { unreachable!() };
+        let [b, g, r, a] = *pixel
+        else {
+            unreachable!()
+        };
         #[cfg(target_endian = "big")]
-        let [a, r, g, b] = *pixel else { unreachable!() };
+        let [a, r, g, b] = *pixel
+        else {
+            unreachable!()
+        };
         pixel.copy_from_slice(&[r, g, b, a]);
     }
 }

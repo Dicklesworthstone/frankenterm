@@ -7,8 +7,8 @@ use xkbcommon::xkb::CONTEXT_NO_FLAGS;
 
 use crate::x11::KeyboardWithFallback;
 
-use super::SurfaceUserData;
 use super::state::WaylandState;
+use super::SurfaceUserData;
 
 // We can't use the xkbcommon feature because it is too abstract for us
 impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
