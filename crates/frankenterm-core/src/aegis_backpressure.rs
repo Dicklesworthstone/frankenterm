@@ -185,7 +185,7 @@ impl GaussianPosterior {
         let new_precision = prior_precision + obs_precision;
         self.mean = (prior_precision * self.mean + obs_precision * observation) / new_precision;
         self.variance = 1.0 / new_precision;
-        self.n_observations += 1;
+        self.n_observations = self.n_observations.saturating_add(1);
     }
 
     /// KL divergence KL(self || other) for two Gaussians.
@@ -484,12 +484,12 @@ impl PacBayesBackpressure {
             state.frame_drops += 1;
         }
 
-        self.global_observations += 1;
-        self.global_total_frames += 1;
-        self.telemetry.observations += 1;
+        self.global_observations = self.global_observations.saturating_add(1);
+        self.global_total_frames = self.global_total_frames.saturating_add(1);
+        self.telemetry.observations = self.telemetry.observations.saturating_add(1);
         if obs.frame_dropped {
-            self.global_frame_drops += 1;
-            self.telemetry.frame_drops_observed += 1;
+            self.global_frame_drops = self.global_frame_drops.saturating_add(1);
+            self.telemetry.frame_drops_observed = self.telemetry.frame_drops_observed.saturating_add(1);
         }
 
         // Update posterior: the "observation" is the queue ratio at which
@@ -502,12 +502,12 @@ impl PacBayesBackpressure {
             if obs.frame_dropped {
                 // Frame drop → threshold should be lower (throttle earlier)
                 state.posterior.update(obs.fill_ratio, obs_variance);
-                self.telemetry.posterior_updates += 1;
+                self.telemetry.posterior_updates = self.telemetry.posterior_updates.saturating_add(1);
             } else if state.smoothed_ratio > state.posterior.mean {
                 // No drop but high load → threshold can be slightly higher
                 let relaxed = obs.fill_ratio * 1.1;
                 state.posterior.update(relaxed, obs_variance * 4.0);
-                self.telemetry.posterior_updates += 1;
+                self.telemetry.posterior_updates = self.telemetry.posterior_updates.saturating_add(1);
             }
         }
 
@@ -525,7 +525,7 @@ impl PacBayesBackpressure {
                     // Reduce severity proportionally to external-cause confidence
                     severity *= 1.0 - ext_prob;
                     starvation_guard_active = true;
-                    self.telemetry.starvation_guards += 1;
+                    self.telemetry.starvation_guards = self.telemetry.starvation_guards.saturating_add(1);
                 }
             }
         }
@@ -552,7 +552,7 @@ impl PacBayesBackpressure {
 
         state.throttled = severity > 0.01;
         if state.throttled {
-            self.telemetry.throttle_activations += 1;
+            self.telemetry.throttle_activations = self.telemetry.throttle_activations.saturating_add(1);
         }
 
         actions
@@ -639,7 +639,7 @@ impl PacBayesBackpressure {
     /// Reset a specific pane's state back to prior.
     pub fn reset_pane(&mut self, pane_id: u64) {
         self.panes.remove(&pane_id);
-        self.telemetry.pane_resets += 1;
+        self.telemetry.pane_resets = self.telemetry.pane_resets.saturating_add(1);
     }
 
     /// Reset all state.
@@ -648,7 +648,7 @@ impl PacBayesBackpressure {
         self.global_observations = 0;
         self.global_frame_drops = 0;
         self.global_total_frames = 0;
-        self.telemetry.full_resets += 1;
+        self.telemetry.full_resets = self.telemetry.full_resets.saturating_add(1);
     }
 }
 

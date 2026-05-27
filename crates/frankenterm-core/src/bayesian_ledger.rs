@@ -329,7 +329,7 @@ impl PaneClassifier {
             *lp += ll;
         }
 
-        self.observation_count += 1;
+        self.observation_count = self.observation_count.saturating_add(1);
 
         // Record ledger entry
         let (top_idx, second_idx) = self.top_two_indices();
@@ -448,7 +448,7 @@ impl BayesianClassifier {
 
     /// Update a pane with new evidence.
     pub fn update(&mut self, pane_id: u64, evidence: Evidence) {
-        self.telemetry.updates += 1;
+        self.telemetry.updates = self.telemetry.updates.saturating_add(1);
         // [ft-n4fdx] Reject non-finite Evidence before it poisons the
         // log_posterior. The numeric Evidence variants feed into
         // gaussian_log_likelihoods / time_since_output_log_likelihoods,
@@ -477,9 +477,9 @@ impl BayesianClassifier {
 
     /// Record user feedback (manual override) to update the prior.
     pub fn record_feedback(&mut self, _pane_id: u64, true_state: PaneState) {
-        self.telemetry.feedbacks += 1;
+        self.telemetry.feedbacks = self.telemetry.feedbacks.saturating_add(1);
         self.dirichlet_counts[true_state.index()] += 1.0;
-        self.feedback_count += 1;
+        self.feedback_count = self.feedback_count.saturating_add(1);
 
         // Recompute log-prior from Dirichlet counts
         let total: f64 = self.dirichlet_counts.iter().sum();
@@ -492,7 +492,7 @@ impl BayesianClassifier {
 
     /// Reset a pane's classifier (e.g., after manual override).
     pub fn reset_pane(&mut self, pane_id: u64) {
-        self.telemetry.panes_reset += 1;
+        self.telemetry.panes_reset = self.telemetry.panes_reset.saturating_add(1);
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             *pane = PaneClassifier::new(&self.log_prior);
         }
@@ -500,7 +500,7 @@ impl BayesianClassifier {
 
     /// Remove a pane from tracking.
     pub fn remove_pane(&mut self, pane_id: u64) {
-        self.telemetry.panes_removed += 1;
+        self.telemetry.panes_removed = self.telemetry.panes_removed.saturating_add(1);
         self.panes.remove(&pane_id);
     }
 

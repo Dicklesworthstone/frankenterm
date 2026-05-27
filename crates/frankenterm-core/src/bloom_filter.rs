@@ -139,7 +139,7 @@ impl BloomFilter {
             let bit = idx % 64;
             self.bits[word] |= 1u64 << bit;
         }
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
     }
 
     /// Check if an element is (probably) in the set.
@@ -219,7 +219,7 @@ impl BloomFilter {
             *a |= *b;
         }
         // count is now an upper bound
-        self.count += other.count;
+        self.count = self.count.saturating_add(other.count);
     }
 }
 
@@ -323,7 +323,7 @@ impl CountingBloomFilter {
         for idx in indices {
             self.increment_counter(idx);
         }
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
     }
 
     /// Remove an element.
@@ -479,6 +479,26 @@ pub fn theoretical_fp_rate(num_bits: usize, num_hashes: u32, count: usize) -> f6
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    // br-ft-pu2mg saturating-counter regression (ft-2nf1j): the BloomFilter
+    // insert counter must plateau at usize::MAX rather than panic (debug) or
+    // wrap to 0 (release) on overflow. Seed the counter at the boundary and
+    // insert once more; saturating_add keeps it at MAX. (Pre-fix, the bare
+    // `self.count += 1` panicked here in debug.) Representative of the
+    // suppression/sketch counters converted across bloom_filter, bocpd,
+    // bayesian_ledger, aegis_entropy_anomaly, aegis_backpressure, and
+    // beta_feedback_loop.
+    #[test]
+    fn bloom_filter_count_saturates_at_usize_max() {
+        let mut bf = BloomFilter::with_capacity(8, 0.01);
+        bf.count = usize::MAX;
+        bf.insert(b"one-past-the-max");
+        assert_eq!(
+            bf.count(),
+            usize::MAX,
+            "insert counter must saturate at usize::MAX, not wrap to 0"
+        );
+    }
 
     // -- Sizing helpers ---------------------------------------------------------
 

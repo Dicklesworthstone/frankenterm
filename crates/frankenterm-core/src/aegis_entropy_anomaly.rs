@@ -230,10 +230,10 @@ impl EProcess {
             return self.e_value;
         }
 
-        self.n_observations += 1;
+        self.n_observations = self.n_observations.saturating_add(1);
 
         if is_collapse {
-            self.collapse_streak += 1;
+            self.collapse_streak = self.collapse_streak.saturating_add(1);
             if self.collapse_streak >= min_streak {
                 let lr = likelihood_ratio(
                     entropy,
@@ -327,10 +327,10 @@ impl ErrorDensityTracker {
         }
         self.window[self.cursor] = is_error_hit;
         if is_error_hit {
-            self.hit_count += 1;
+            self.hit_count = self.hit_count.saturating_add(1);
         }
         self.cursor = (self.cursor + 1) % self.window.len();
-        self.total_observations += 1;
+        self.total_observations = self.total_observations.saturating_add(1);
     }
 
     /// Current error density (hits / window_occupied).
@@ -589,7 +589,7 @@ impl EntropyAnomalyDetector {
 
         // 7. Update baseline if entropy is in normal range
         if entropy >= config.baseline_entropy_low && entropy <= config.baseline_entropy_high {
-            self.baseline_n += 1;
+            self.baseline_n = self.baseline_n.saturating_add(1);
             let n = self.baseline_n as f64;
             let delta = entropy - self.baseline_mean;
             self.baseline_mean += delta / n;

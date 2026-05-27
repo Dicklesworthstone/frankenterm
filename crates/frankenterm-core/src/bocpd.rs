@@ -219,7 +219,7 @@ impl BocpdModel {
         if !x.is_finite() {
             return None;
         }
-        self.observation_count += 1;
+        self.observation_count = self.observation_count.saturating_add(1);
         let n = self.run_length_log_probs.len();
 
         // Step 1: Compute predictive log-likelihoods for each run length
@@ -283,7 +283,7 @@ impl BocpdModel {
         if self.observation_count as usize >= self.config.min_observations {
             let change_prob = self.run_length_log_probs[0].exp();
             if change_prob >= self.config.detection_threshold {
-                self.change_point_count += 1;
+                self.change_point_count = self.change_point_count.saturating_add(1);
                 return Some(ChangePoint {
                     observation_index: self.observation_count,
                     posterior_probability: change_prob,
@@ -578,7 +578,7 @@ impl BocpdManager {
 
     /// Register a pane for monitoring.
     pub fn register_pane(&mut self, pane_id: u64) {
-        self.telemetry.panes_registered += 1;
+        self.telemetry.panes_registered = self.telemetry.panes_registered.saturating_add(1);
         self.panes
             .entry(pane_id)
             .or_insert_with(|| PaneBocpd::new(pane_id, self.config.clone()));
@@ -586,13 +586,13 @@ impl BocpdManager {
 
     /// Remove a pane.
     pub fn unregister_pane(&mut self, pane_id: u64) {
-        self.telemetry.panes_unregistered += 1;
+        self.telemetry.panes_unregistered = self.telemetry.panes_unregistered.saturating_add(1);
         self.panes.remove(&pane_id);
     }
 
     /// Feed features for a pane. Returns a change-point event if detected.
     pub fn observe(&mut self, pane_id: u64, features: OutputFeatures) -> Option<PaneChangePoint> {
-        self.telemetry.observations += 1;
+        self.telemetry.observations = self.telemetry.observations.saturating_add(1);
         let pane = self
             .panes
             .entry(pane_id)
@@ -600,8 +600,8 @@ impl BocpdManager {
 
         let result = pane.observe(features);
         if result.is_some() {
-            self.total_change_points += 1;
-            self.telemetry.change_points_detected += 1;
+            self.total_change_points = self.total_change_points.saturating_add(1);
+            self.telemetry.change_points_detected = self.telemetry.change_points_detected.saturating_add(1);
         }
         result
     }
@@ -614,7 +614,7 @@ impl BocpdManager {
         text: &str,
         elapsed: std::time::Duration,
     ) -> Option<PaneChangePoint> {
-        self.telemetry.observations += 1;
+        self.telemetry.observations = self.telemetry.observations.saturating_add(1);
         let pane = self
             .panes
             .entry(pane_id)
@@ -622,8 +622,8 @@ impl BocpdManager {
 
         let result = pane.observe_text_chunk(text, elapsed);
         if result.is_some() {
-            self.total_change_points += 1;
-            self.telemetry.change_points_detected += 1;
+            self.total_change_points = self.total_change_points.saturating_add(1);
+            self.telemetry.change_points_detected = self.telemetry.change_points_detected.saturating_add(1);
         }
         result
     }

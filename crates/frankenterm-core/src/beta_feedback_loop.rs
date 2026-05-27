@@ -568,7 +568,7 @@ impl BetaLoopController {
     /// Evaluate the current stage and produce a promotion decision.
     #[must_use]
     pub fn evaluate(&mut self, now_ms: u64) -> StageEvaluation {
-        self.evaluation_count += 1;
+        self.evaluation_count = self.evaluation_count.saturating_add(1);
         let mut cohort_evals = Vec::new();
         let mut reasons = Vec::new();
         let mut any_rollback = false;
@@ -763,7 +763,7 @@ impl BetaLoopController {
         match self.stage.next() {
             Some(next) => {
                 self.stage = next;
-                self.transition_count += 1;
+                self.transition_count = self.transition_count.saturating_add(1);
                 self.last_decision = None; // Require fresh evaluation before next advance
                 true
             }
@@ -778,7 +778,7 @@ impl BetaLoopController {
         match self.stage.prev() {
             Some(prev) => {
                 self.stage = prev;
-                self.transition_count += 1;
+                self.transition_count = self.transition_count.saturating_add(1);
                 self.last_decision = None; // Require fresh evaluation before next advance
                 true
             }
