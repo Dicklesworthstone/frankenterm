@@ -521,6 +521,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     ///
     /// Replay guarantee: invoking the same range twice with `dedup_on_replay = true`
     /// produces identical index contents for that range.
+    // Reindexing range calls keep storage, source, offsets, and replay knobs explicit.
+    #[allow(clippy::too_many_arguments)]
     pub async fn reindex_range<S: RecorderStorage>(
         &mut self,
         storage: &S,
