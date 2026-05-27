@@ -883,8 +883,10 @@ fn integration_pipeline_max_panes_per_tick() {
     let config = test_config(tmp.path());
     let index = SearchIndex::open(config).unwrap();
 
-    let mut pc = PipelineConfig::default();
-    pc.max_panes_per_tick = 2; // Limit to 2 panes per tick.
+    let pc = PipelineConfig {
+        max_panes_per_tick: 2, // Limit to 2 panes per tick.
+        ..Default::default()
+    };
     let mut pipeline = ContentIndexingPipeline::new(pc, index);
 
     let content: Vec<_> = (0..5)
@@ -910,8 +912,10 @@ fn integration_pipeline_max_lines_per_pane_tick() {
     let config = test_config(tmp.path());
     let index = SearchIndex::open(config).unwrap();
 
-    let mut pc = PipelineConfig::default();
-    pc.max_lines_per_pane_tick = 2; // Limit to 2 lines per pane per tick.
+    let pc = PipelineConfig {
+        max_lines_per_pane_tick: 2, // Limit to 2 lines per pane per tick.
+        ..Default::default()
+    };
     let mut pipeline = ContentIndexingPipeline::new(pc, index);
 
     let content = vec![make_pane_content(

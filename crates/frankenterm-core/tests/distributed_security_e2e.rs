@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
-use frankenterm_core::config::{DistributedAuthMode, DistributedConfig};
+use frankenterm_core::config::{DistributedAuthMode, DistributedConfig, DistributedTlsConfig};
 use frankenterm_core::distributed::{
     DistributedSecurityError, SessionReplayGuard, build_tls_bundle, resolve_expected_token,
     validate_token,
@@ -143,13 +143,18 @@ fn distributed_security_e2e_tls_required_happy_path_with_artifacts() {
         let server_cert = temp_pem(OLD_SERVER_CERT);
         let server_key = temp_pem(OLD_SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("agent-a:token-v1".to_string());
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("agent-a:token-v1".to_string()),
+            tls: DistributedTlsConfig {
+                enabled: true,
+                cert_path: Some(server_cert.path().display().to_string()),
+                key_path: Some(server_key.path().display().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
         let payload = b"secure-path";
@@ -238,12 +243,17 @@ fn distributed_security_e2e_tls_failures_and_plaintext_rejection() {
         let server_cert = temp_pem(OLD_SERVER_CERT);
         let server_key = temp_pem(OLD_SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            tls: DistributedTlsConfig {
+                enabled: true,
+                cert_path: Some(server_cert.path().display().to_string()),
+                key_path: Some(server_key.path().display().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let trusted_bundle = build_tls_bundle(&config, Some(trusted_ca.path())).expect("trusted");
         let untrusted_bundle =
@@ -313,10 +323,12 @@ fn distributed_security_e2e_auth_replay_and_rotation() {
         std::io::Write::write_all(token_file.as_file_mut(), b"agent-a:token-v1")
             .expect("write token v1");
 
-        let mut token_config = DistributedConfig::default();
-        token_config.enabled = true;
-        token_config.auth_mode = DistributedAuthMode::TokenAndMtls;
-        token_config.token_path = Some(token_file.path().display().to_string());
+        let token_config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::TokenAndMtls,
+            token_path: Some(token_file.path().display().to_string()),
+            ..Default::default()
+        };
 
         let token_v1 = resolve_expected_token(&token_config)
             .expect("resolve token v1")
@@ -388,19 +400,29 @@ fn distributed_security_e2e_auth_replay_and_rotation() {
         let new_server_cert = temp_pem(ROTATED_SERVER_CERT);
         let new_server_key = temp_pem(ROTATED_SERVER_KEY);
 
-        let mut old_config = DistributedConfig::default();
-        old_config.enabled = true;
-        old_config.auth_mode = DistributedAuthMode::Token;
-        old_config.tls.enabled = true;
-        old_config.tls.cert_path = Some(old_server_cert.path().display().to_string());
-        old_config.tls.key_path = Some(old_server_key.path().display().to_string());
+        let old_config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            tls: DistributedTlsConfig {
+                enabled: true,
+                cert_path: Some(old_server_cert.path().display().to_string()),
+                key_path: Some(old_server_key.path().display().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let mut new_config = DistributedConfig::default();
-        new_config.enabled = true;
-        new_config.auth_mode = DistributedAuthMode::Token;
-        new_config.tls.enabled = true;
-        new_config.tls.cert_path = Some(new_server_cert.path().display().to_string());
-        new_config.tls.key_path = Some(new_server_key.path().display().to_string());
+        let new_config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            tls: DistributedTlsConfig {
+                enabled: true,
+                cert_path: Some(new_server_cert.path().display().to_string()),
+                key_path: Some(new_server_key.path().display().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let old_bundle = build_tls_bundle(&old_config, Some(old_ca.path())).expect("old bundle");
         let new_bundle = build_tls_bundle(&new_config, Some(new_ca.path())).expect("new bundle");
@@ -452,13 +474,18 @@ fn distributed_security_perf_budgets_within_initial_thresholds() {
         let server_cert = temp_pem(OLD_SERVER_CERT);
         let server_key = temp_pem(OLD_SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("agent-a:token-v1".to_string());
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("agent-a:token-v1".to_string()),
+            tls: DistributedTlsConfig {
+                enabled: true,
+                cert_path: Some(server_cert.path().display().to_string()),
+                key_path: Some(server_key.path().display().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
 

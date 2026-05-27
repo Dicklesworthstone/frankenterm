@@ -486,8 +486,10 @@ proptest! {
         events in proptest::collection::vec(arb_outbound_event(), 1..5),
         rules in proptest::collection::vec(arb_routing_rule(), 1..5),
     ) {
-        let mut config = ConnectorOutboundBridgeConfig::default();
-        config.enforce_sandbox = false; // disable sandbox to avoid blocking
+        let config = ConnectorOutboundBridgeConfig {
+            enforce_sandbox: false, // disable sandbox to avoid blocking
+            ..Default::default()
+        };
         let mut bridge = ConnectorOutboundBridge::new(config);
         for rule in &rules {
             let mut r = rule.clone();
