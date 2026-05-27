@@ -133,29 +133,43 @@ fn serialize_workflow_handler_audit_context(
     }
 }
 
-fn build_session_start_audit_decision_context(
-    execution_id: &str,
+#[derive(Clone, Copy)]
+struct HandlerAuditBase<'a> {
+    execution_id: &'a str,
     pane_id: u64,
-    agent_type: &str,
-    event_type: &str,
-    rule_id: Option<&str>,
-    lookup: &SessionStartCassHintsLookup,
-    input_summary: &str,
-    result: &str,
+    agent_type: &'a str,
+    event_type: &'a str,
+    rule_id: Option<&'a str>,
+    input_summary: &'a str,
+    result: &'a str,
     timestamp_ms: i64,
+}
+
+struct RecoveryPlanAuditContext<'a> {
+    action_kind: &'a str,
+    workflow_name: &'a str,
+    base: HandlerAuditBase<'a>,
+    primary_plan_key: &'a str,
+    secondary_plan_key: &'a str,
+    plan: &'a serde_json::Value,
+}
+
+fn build_session_start_audit_decision_context(
+    base: HandlerAuditBase<'_>,
+    lookup: &SessionStartCassHintsLookup,
 ) -> Option<String> {
     let mut context = new_workflow_handler_audit_context(
         "session_start_context",
         "handle_session_start_context",
-        execution_id,
-        pane_id,
-        Some(input_summary),
-        result,
-        timestamp_ms,
+        base.execution_id,
+        base.pane_id,
+        Some(base.input_summary),
+        base.result,
+        base.timestamp_ms,
     );
-    context.add_evidence("agent_type", agent_type);
-    context.add_evidence("event_type", event_type);
-    add_optional_evidence(&mut context, "trigger_rule_id", rule_id);
+    context.add_evidence("agent_type", base.agent_type);
+    context.add_evidence("event_type", base.event_type);
+    add_optional_evidence(&mut context, "trigger_rule_id", base.rule_id);
     add_optional_evidence(&mut context, "cass_query", lookup.query.as_deref());
     add_repeated_evidence(
         &mut context,
@@ -172,29 +186,22 @@ fn build_session_start_audit_decision_context(
 }
 
 fn build_auth_required_audit_decision_context(
-    execution_id: &str,
-    pane_id: u64,
-    agent_type: &str,
-    event_type: &str,
-    rule_id: Option<&str>,
+    base: HandlerAuditBase<'_>,
     strategy: &AuthRecoveryStrategy,
     cass_lookup: &AuthCassHintsLookup,
-    input_summary: &str,
-    result: &str,
-    timestamp_ms: i64,
 ) -> Option<String> {
     let mut context = new_workflow_handler_audit_context(
         "auth_required",
         "handle_auth_required",
-        execution_id,
-        pane_id,
-        Some(input_summary),
-        result,
-        timestamp_ms,
+        base.execution_id,
+        base.pane_id,
+        Some(base.input_summary),
+        base.result,
+        base.timestamp_ms,
     );
-    context.add_evidence("agent_type", agent_type);
-    context.add_evidence("event_type", event_type);
-    add_optional_evidence(&mut context, "trigger_rule_id", rule_id);
+    context.add_evidence("agent_type", base.agent_type);
+    context.add_evidence("event_type", base.event_type);
+    add_optional_evidence(&mut context, "trigger_rule_id", base.rule_id);
     context.add_evidence("auth_strategy", strategy.label());
     match strategy {
         AuthRecoveryStrategy::DeviceCode { code, url } => {
@@ -225,47 +232,45 @@ fn build_auth_required_audit_decision_context(
 }
 
 fn build_recovery_plan_audit_decision_context(
-    action_kind: &str,
-    workflow_name: &str,
-    execution_id: &str,
-    pane_id: u64,
-    agent_type: &str,
-    event_type: &str,
-    rule_id: Option<&str>,
-    input_summary: &str,
-    result: &str,
-    primary_plan_key: &str,
-    secondary_plan_key: &str,
-    plan: &serde_json::Value,
-    timestamp_ms: i64,
+    input: RecoveryPlanAuditContext<'_>,
 ) -> Option<String> {
     let mut context = new_workflow_handler_audit_context(
-        action_kind,
-        workflow_name,
-        execution_id,
-        pane_id,
-        Some(input_summary),
-        result,
-        timestamp_ms,
+        input.action_kind,
+        input.workflow_name,
+        input.base.execution_id,
+        input.base.pane_id,
+        Some(input.base.input_summary),
+        input.base.result,
+        input.base.timestamp_ms,
     );
-    context.add_evidence("agent_type", agent_type);
-    context.add_evidence("event_type", event_type);
-    add_optional_evidence(&mut context, "trigger_rule_id", rule_id);
+    context.add_evidence("agent_type", input.base.agent_type);
+    context.add_evidence("event_type", input.base.event_type);
+    add_optional_evidence(&mut context, "trigger_rule_id", input.base.rule_id);
     add_optional_evidence(
         &mut context,
-        primary_plan_key,
-        plan.get(primary_plan_key).and_then(|value| value.as_str()),
-    );
-    add_optional_evidence(
-        &mut context,
-        secondary_plan_key,
-        plan.get(secondary_plan_key)
+        input.primary_plan_key,
+        input
+            .plan
+            .get(input.primary_plan_key)
             .and_then(|value| value.as_str()),
     );
-    if let Some(safe_to_send) = plan.get("safe_to_send").and_then(|value| value.as_bool()) {
+    add_optional_evidence(
+        &mut context,
+        input.secondary_plan_key,
+        input
+            .plan
+            .get(input.secondary_plan_key)
+            .and_then(|value| value.as_str()),
+    );
+    if let Some(safe_to_send) = input
+        .plan
+        .get("safe_to_send")
+        .and_then(|value| value.as_bool())
+    {
         context.add_evidence("safe_to_send", safe_to_send.to_string());
     }
-    let next_steps = plan
+    let next_steps = input
+        .plan
         .get("next_steps")
         .and_then(|value| value.as_array())
         .map(|steps| {
@@ -1886,15 +1891,17 @@ impl Workflow for HandleSessionStartContext {
                     let timestamp_ms = now_ms();
                     let input_summary = format!("Session start context injection for {agent_type}");
                     let decision_context = build_session_start_audit_decision_context(
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
+                        HandlerAuditBase {
+                            execution_id: &execution_id,
+                            pane_id,
+                            agent_type,
+                            event_type,
+                            rule_id: rule_id.as_deref(),
+                            input_summary: &input_summary,
+                            result,
+                            timestamp_ms,
+                        },
                         &lookup,
-                        &input_summary,
-                        result,
-                        timestamp_ms,
                     );
 
                     let audit = crate::storage::AuditActionRecord {
@@ -2042,15 +2049,17 @@ impl Workflow for HandleSessionStartContext {
                     let timestamp_ms = now_ms();
                     let input_summary = format!("Session start context injection for {agent_type}");
                     let decision_context = build_session_start_audit_decision_context(
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
+                        HandlerAuditBase {
+                            execution_id: &execution_id,
+                            pane_id,
+                            agent_type,
+                            event_type,
+                            rule_id: rule_id.as_deref(),
+                            input_summary: &input_summary,
+                            result,
+                            timestamp_ms,
+                        },
                         &lookup,
-                        &input_summary,
-                        result,
-                        timestamp_ms,
                     );
 
                     let audit = crate::storage::AuditActionRecord {
@@ -2471,28 +2480,21 @@ impl Default for HandleOnErrorCassSearch {
 }
 
 fn build_on_error_cass_audit_decision_context(
-    execution_id: &str,
-    pane_id: u64,
-    agent_type: &str,
-    event_type: &str,
-    rule_id: Option<&str>,
+    base: HandlerAuditBase<'_>,
     lookup: &OnErrorCassHintsLookup,
-    input_summary: &str,
-    result: &str,
-    timestamp_ms: i64,
 ) -> Option<String> {
     let mut context = new_workflow_handler_audit_context(
         "on_error_cass_search",
         "handle_on_error_cass_search",
-        execution_id,
-        pane_id,
-        Some(input_summary),
-        result,
-        timestamp_ms,
+        base.execution_id,
+        base.pane_id,
+        Some(base.input_summary),
+        base.result,
+        base.timestamp_ms,
     );
-    context.add_evidence("agent_type", agent_type);
-    context.add_evidence("event_type", event_type);
-    add_optional_evidence(&mut context, "trigger_rule_id", rule_id);
+    context.add_evidence("agent_type", base.agent_type);
+    context.add_evidence("event_type", base.event_type);
+    add_optional_evidence(&mut context, "trigger_rule_id", base.rule_id);
     add_optional_evidence(&mut context, "cass_query", lookup.query.as_deref());
     add_repeated_evidence(
         &mut context,
@@ -2639,15 +2641,17 @@ impl Workflow for HandleOnErrorCassSearch {
                     let input_summary =
                         format!("On-error cass search for {agent_type}: {error_preview}");
                     let decision_context = build_on_error_cass_audit_decision_context(
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
+                        HandlerAuditBase {
+                            execution_id: &execution_id,
+                            pane_id,
+                            agent_type,
+                            event_type,
+                            rule_id: rule_id.as_deref(),
+                            input_summary: &input_summary,
+                            result: result_label,
+                            timestamp_ms,
+                        },
                         &lookup,
-                        &input_summary,
-                        result_label,
-                        timestamp_ms,
                     );
 
                     let audit = crate::storage::AuditActionRecord {
@@ -2812,15 +2816,17 @@ impl Workflow for HandleOnErrorCassSearch {
                     let input_summary =
                         format!("On-error cass search for {agent_type}: {error_preview}");
                     let decision_context = build_on_error_cass_audit_decision_context(
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
+                        HandlerAuditBase {
+                            execution_id: &execution_id,
+                            pane_id,
+                            agent_type,
+                            event_type,
+                            rule_id: rule_id.as_deref(),
+                            input_summary: &input_summary,
+                            result: result_label,
+                            timestamp_ms,
+                        },
                         &lookup,
-                        &input_summary,
-                        result_label,
-                        timestamp_ms,
                     );
 
                     let audit = crate::storage::AuditActionRecord {
@@ -3821,16 +3827,18 @@ impl Workflow for HandleAuthRequired {
                     let input_summary =
                         format!("Auth required for {agent_type}: {}", strategy.label());
                     let decision_context = build_auth_required_audit_decision_context(
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
+                        HandlerAuditBase {
+                            execution_id: &execution_id,
+                            pane_id,
+                            agent_type,
+                            event_type,
+                            rule_id: rule_id.as_deref(),
+                            input_summary: &input_summary,
+                            result: "recorded",
+                            timestamp_ms,
+                        },
                         &strategy,
                         &cass_lookup,
-                        &input_summary,
-                        "recorded",
-                        timestamp_ms,
                     );
 
                     // Record the auth event in the audit log
@@ -4009,16 +4017,18 @@ impl Workflow for HandleAuthRequired {
                     let input_summary =
                         format!("Auth required for {agent_type}: {}", strategy.label());
                     let decision_context = build_auth_required_audit_decision_context(
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
+                        HandlerAuditBase {
+                            execution_id: &execution_id,
+                            pane_id,
+                            agent_type,
+                            event_type,
+                            rule_id: rule_id.as_deref(),
+                            input_summary: &input_summary,
+                            result: "recorded",
+                            timestamp_ms,
+                        },
                         &strategy,
                         &cass_lookup,
-                        &input_summary,
-                        "recorded",
-                        timestamp_ms,
                     );
 
                     let audit = crate::storage::AuditActionRecord {
@@ -4336,21 +4346,24 @@ impl Workflow for HandleClaudeCodeLimits {
                         .unwrap_or("unknown");
                     let timestamp_ms = now_ms();
                     let input_summary = format!("Claude Code {limit_type} on pane {pane_id}");
-                    let decision_context = build_recovery_plan_audit_decision_context(
-                        "claude_code_usage_limit",
-                        "handle_claude_code_limits",
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
-                        &input_summary,
-                        "recorded",
-                        "limit_type",
-                        "reset_time",
-                        &plan,
-                        timestamp_ms,
-                    );
+                    let decision_context =
+                        build_recovery_plan_audit_decision_context(RecoveryPlanAuditContext {
+                            action_kind: "claude_code_usage_limit",
+                            workflow_name: "handle_claude_code_limits",
+                            base: HandlerAuditBase {
+                                execution_id: &execution_id,
+                                pane_id,
+                                agent_type,
+                                event_type,
+                                rule_id: rule_id.as_deref(),
+                                input_summary: &input_summary,
+                                result: "recorded",
+                                timestamp_ms,
+                            },
+                            primary_plan_key: "limit_type",
+                            secondary_plan_key: "reset_time",
+                            plan: &plan,
+                        });
 
                     // Record the limit event in the audit log
                     let audit = crate::storage::AuditActionRecord {
@@ -4518,21 +4531,24 @@ impl Workflow for HandleClaudeCodeLimits {
                         .unwrap_or("unknown");
                     let timestamp_ms = now_ms();
                     let input_summary = format!("Claude Code {limit_type} on pane {pane_id}");
-                    let decision_context = build_recovery_plan_audit_decision_context(
-                        "claude_code_usage_limit",
-                        "handle_claude_code_limits",
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
-                        &input_summary,
-                        "recorded",
-                        "limit_type",
-                        "reset_time",
-                        &plan,
-                        timestamp_ms,
-                    );
+                    let decision_context =
+                        build_recovery_plan_audit_decision_context(RecoveryPlanAuditContext {
+                            action_kind: "claude_code_usage_limit",
+                            workflow_name: "handle_claude_code_limits",
+                            base: HandlerAuditBase {
+                                execution_id: &execution_id,
+                                pane_id,
+                                agent_type,
+                                event_type,
+                                rule_id: rule_id.as_deref(),
+                                input_summary: &input_summary,
+                                result: "recorded",
+                                timestamp_ms,
+                            },
+                            primary_plan_key: "limit_type",
+                            secondary_plan_key: "reset_time",
+                            plan: &plan,
+                        });
 
                     let audit = crate::storage::AuditActionRecord {
                         id: 0,
@@ -4818,21 +4834,24 @@ impl Workflow for HandleGeminiQuota {
                         .unwrap_or("unknown");
                     let timestamp_ms = now_ms();
                     let input_summary = format!("Gemini {quota_type} on pane {pane_id}");
-                    let decision_context = build_recovery_plan_audit_decision_context(
-                        "gemini_quota_limit",
-                        "handle_gemini_quota",
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
-                        &input_summary,
-                        "recorded",
-                        "quota_type",
-                        "remaining_pct",
-                        &plan,
-                        timestamp_ms,
-                    );
+                    let decision_context =
+                        build_recovery_plan_audit_decision_context(RecoveryPlanAuditContext {
+                            action_kind: "gemini_quota_limit",
+                            workflow_name: "handle_gemini_quota",
+                            base: HandlerAuditBase {
+                                execution_id: &execution_id,
+                                pane_id,
+                                agent_type,
+                                event_type,
+                                rule_id: rule_id.as_deref(),
+                                input_summary: &input_summary,
+                                result: "recorded",
+                                timestamp_ms,
+                            },
+                            primary_plan_key: "quota_type",
+                            secondary_plan_key: "remaining_pct",
+                            plan: &plan,
+                        });
 
                     let audit = crate::storage::AuditActionRecord {
                         id: 0,
@@ -4999,21 +5018,24 @@ impl Workflow for HandleGeminiQuota {
                         .unwrap_or("unknown");
                     let timestamp_ms = now_ms();
                     let input_summary = format!("Gemini {quota_type} on pane {pane_id}");
-                    let decision_context = build_recovery_plan_audit_decision_context(
-                        "gemini_quota_limit",
-                        "handle_gemini_quota",
-                        &execution_id,
-                        pane_id,
-                        agent_type,
-                        event_type,
-                        rule_id.as_deref(),
-                        &input_summary,
-                        "recorded",
-                        "quota_type",
-                        "remaining_pct",
-                        &plan,
-                        timestamp_ms,
-                    );
+                    let decision_context =
+                        build_recovery_plan_audit_decision_context(RecoveryPlanAuditContext {
+                            action_kind: "gemini_quota_limit",
+                            workflow_name: "handle_gemini_quota",
+                            base: HandlerAuditBase {
+                                execution_id: &execution_id,
+                                pane_id,
+                                agent_type,
+                                event_type,
+                                rule_id: rule_id.as_deref(),
+                                input_summary: &input_summary,
+                                result: "recorded",
+                                timestamp_ms,
+                            },
+                            primary_plan_key: "quota_type",
+                            secondary_plan_key: "remaining_pct",
+                            plan: &plan,
+                        });
 
                     let audit = crate::storage::AuditActionRecord {
                         id: 0,
@@ -6240,15 +6262,17 @@ mod tests {
         };
 
         let context = parse_audit_decision_context(build_session_start_audit_decision_context(
-            "exec-1",
-            42,
-            "claude_code",
-            "session.start",
-            Some("claude_code.banner"),
+            HandlerAuditBase {
+                execution_id: "exec-1",
+                pane_id: 42,
+                agent_type: "claude_code",
+                event_type: "session.start",
+                rule_id: Some("claude_code.banner"),
+                input_summary: "Session start context injection for claude_code",
+                result: "hints_injected",
+                timestamp_ms: 1234,
+            },
             &lookup,
-            "Session start context injection for claude_code",
-            "hints_injected",
-            1234,
         ));
         let evidence = evidence_map(&context);
 
@@ -6295,16 +6319,18 @@ mod tests {
         };
 
         let context = parse_audit_decision_context(build_auth_required_audit_decision_context(
-            "exec-2",
-            7,
-            "claude_code",
-            "auth.device_code",
-            Some("claude_code.auth.device_code"),
+            HandlerAuditBase {
+                execution_id: "exec-2",
+                pane_id: 7,
+                agent_type: "claude_code",
+                event_type: "auth.device_code",
+                rule_id: Some("claude_code.auth.device_code"),
+                input_summary: "Auth required for claude_code: device_code",
+                result: "recorded",
+                timestamp_ms: 5678,
+            },
             &strategy,
             &cass_lookup,
-            "Auth required for claude_code: device_code",
-            "recorded",
-            5678,
         ));
         let evidence = evidence_map(&context);
 
@@ -6339,19 +6365,23 @@ mod tests {
         );
 
         let context = parse_audit_decision_context(build_recovery_plan_audit_decision_context(
-            "claude_code_usage_limit",
-            "handle_claude_code_limits",
-            "exec-3",
-            99,
-            "claude_code",
-            "usage.reached",
-            Some("claude_code.usage.reached"),
-            "Claude Code usage_reached on pane 99",
-            "recorded",
-            "limit_type",
-            "reset_time",
-            &plan,
-            9012,
+            RecoveryPlanAuditContext {
+                action_kind: "claude_code_usage_limit",
+                workflow_name: "handle_claude_code_limits",
+                base: HandlerAuditBase {
+                    execution_id: "exec-3",
+                    pane_id: 99,
+                    agent_type: "claude_code",
+                    event_type: "usage.reached",
+                    rule_id: Some("claude_code.usage.reached"),
+                    input_summary: "Claude Code usage_reached on pane 99",
+                    result: "recorded",
+                    timestamp_ms: 9012,
+                },
+                primary_plan_key: "limit_type",
+                secondary_plan_key: "reset_time",
+                plan: &plan,
+            },
         ));
         let evidence = evidence_map(&context);
 
@@ -6382,19 +6412,23 @@ mod tests {
         let plan = HandleGeminiQuota::build_recovery_plan("quota_warning", Some("12%"), 11);
 
         let context = parse_audit_decision_context(build_recovery_plan_audit_decision_context(
-            "gemini_quota_limit",
-            "handle_gemini_quota",
-            "exec-4",
-            11,
-            "gemini",
-            "usage.warning",
-            Some("gemini.usage.warning"),
-            "Gemini quota_warning on pane 11",
-            "recorded",
-            "quota_type",
-            "remaining_pct",
-            &plan,
-            3456,
+            RecoveryPlanAuditContext {
+                action_kind: "gemini_quota_limit",
+                workflow_name: "handle_gemini_quota",
+                base: HandlerAuditBase {
+                    execution_id: "exec-4",
+                    pane_id: 11,
+                    agent_type: "gemini",
+                    event_type: "usage.warning",
+                    rule_id: Some("gemini.usage.warning"),
+                    input_summary: "Gemini quota_warning on pane 11",
+                    result: "recorded",
+                    timestamp_ms: 3456,
+                },
+                primary_plan_key: "quota_type",
+                secondary_plan_key: "remaining_pct",
+                plan: &plan,
+            },
         ));
         let evidence = evidence_map(&context);
 
@@ -8628,15 +8662,17 @@ mod tests {
         };
 
         let context_json = build_on_error_cass_audit_decision_context(
-            "exec-err-1",
-            55,
-            "claude_code",
-            "error.timeout",
-            Some("claude_code.error.timeout"),
+            HandlerAuditBase {
+                execution_id: "exec-err-1",
+                pane_id: 55,
+                agent_type: "claude_code",
+                event_type: "error.timeout",
+                rule_id: Some("claude_code.error.timeout"),
+                input_summary: "On-error cass search for claude_code: Request timed out after 30s",
+                result: "hints_found",
+                timestamp_ms: 9999,
+            },
             &lookup,
-            "On-error cass search for claude_code: Request timed out after 30s",
-            "hints_found",
-            9999,
         );
 
         assert!(context_json.is_some(), "context serialization must succeed");
