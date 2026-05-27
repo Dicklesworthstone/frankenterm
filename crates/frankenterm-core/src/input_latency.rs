@@ -606,8 +606,10 @@ mod tests {
             collector.record(m);
         }
 
-        let mut budget = InputLatencyBudget::default(); // p50=2000
-        budget.regression_threshold = 1.5; // allow 50% over
+        let budget = InputLatencyBudget {
+            regression_threshold: 1.5, // allow 50% over
+            ..Default::default()
+        };
         let result = evaluate_budget(&collector, &budget);
 
         // 2500 < 2000*1.5=3000, so should pass

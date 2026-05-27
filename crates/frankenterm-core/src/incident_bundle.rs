@@ -827,17 +827,21 @@ mod tests {
 
     #[test]
     fn budget_file_exceeds_total_is_invalid() {
-        let mut budget = PrivacyBudget::default();
-        budget.max_bytes_per_file = budget.max_total_bytes + 1;
+        let budget = PrivacyBudget {
+            max_bytes_per_file: PrivacyBudget::default().max_total_bytes + 1,
+            ..Default::default()
+        };
         let err = budget.validate().unwrap_err();
         assert!(matches!(err, PrivacyBudgetError::FileExceedsTotal { .. }));
     }
 
     #[test]
     fn budget_zero_total_is_invalid() {
-        let mut budget = PrivacyBudget::default();
-        budget.max_total_bytes = 0;
-        budget.max_bytes_per_file = 0;
+        let budget = PrivacyBudget {
+            max_total_bytes: 0,
+            max_bytes_per_file: 0,
+            ..Default::default()
+        };
         let err = budget.validate().unwrap_err();
         assert!(matches!(err, PrivacyBudgetError::ZeroLimit { .. }));
     }
@@ -1089,9 +1093,11 @@ mod tests {
 
     #[test]
     fn privacy_budget_summary_custom() {
-        let mut budget = PrivacyBudget::default();
-        budget.max_total_bytes = 42;
-        budget.max_bytes_per_file = 10;
+        let budget = PrivacyBudget {
+            max_total_bytes: 42,
+            max_bytes_per_file: 10,
+            ..Default::default()
+        };
         let summary = PrivacyBudgetSummary::from(&budget);
         assert_eq!(summary.tier, "custom");
     }

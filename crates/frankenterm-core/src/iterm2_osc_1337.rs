@@ -1195,9 +1195,11 @@ mod tests {
     /// as healthy.
     #[test]
     fn health_is_safe_rejects_pure_rejection_storm() {
-        let mut h = Osc1337Health::default();
-        h.rejected_total = 10; // every command rejected
-        h.commands_total = 0;
+        let h = Osc1337Health {
+            rejected_total: 10, // every command rejected
+            commands_total: 0,
+            ..Default::default()
+        };
         assert!(!h.is_safe(), "100% rejection rate must NOT report healthy");
     }
 

@@ -1126,8 +1126,10 @@ mod tests {
 
     #[test]
     fn install_respects_capacity_limit() {
-        let mut config = LifecycleManagerConfig::default();
-        config.max_managed_connectors = 2;
+        let mut config = LifecycleManagerConfig {
+            max_managed_connectors: 2,
+            ..Default::default()
+        };
         config
             .trust_policy
             .trusted_publishers

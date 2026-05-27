@@ -1726,6 +1726,8 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
 
     /// Helper to create a minimal PaneInfo for testing.
+    // Fixture mirrors PaneInfo identity and geometry fields for readable scenarios.
+    #[allow(clippy::too_many_arguments)]
     fn make_pane(
         pane_id: u64,
         tab_id: u64,

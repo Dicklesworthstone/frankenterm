@@ -1072,6 +1072,8 @@ mod tests {
         input
     }
 
+    // Fixture keeps policy-surface dimensions explicit at each call site.
+    #[allow(clippy::too_many_arguments)]
     fn make_input_full(
         action: ActionKind,
         actor: ActorKind,

@@ -334,6 +334,8 @@ mod tests {
         }
     }
 
+    // Fixture mirrors the measured tuple columns to keep test call sites readable.
+    #[allow(clippy::too_many_arguments)]
     fn point(
         c: u32,
         b: u32,

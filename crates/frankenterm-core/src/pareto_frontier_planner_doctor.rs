@@ -229,6 +229,8 @@ mod tests {
     use super::*;
     use crate::pareto_frontier_planner::plan;
 
+    // Fixture mirrors the planner matrix columns to keep scenario rows readable.
+    #[allow(clippy::too_many_arguments)]
     fn point(
         capture: u32,
         batch: u32,
