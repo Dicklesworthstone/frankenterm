@@ -75,6 +75,8 @@ fn knob(
     }
 }
 
+// Pareto fixture points keep latency, resource, quality, and workload dimensions explicit.
+#[allow(clippy::too_many_arguments)]
 fn point(
     cfg: KnobConfig,
     p50_us: u64,
