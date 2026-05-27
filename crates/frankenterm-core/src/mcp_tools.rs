@@ -7337,7 +7337,8 @@ mod tests {
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
+        merge_distributed_remote_mcp_states, redact_mcp_output_secrets,
+        redact_mcp_pane_state_fields, redact_mcp_wait_pattern_for_output,
         serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
         validate_cass_timeout_secs,
     };
