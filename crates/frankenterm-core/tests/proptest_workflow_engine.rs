@@ -24,9 +24,11 @@ use frankenterm_core::policy::ActionKind;
 #[cfg(feature = "asupersync-runtime")]
 use frankenterm_core::storage::{PaneRecord, StorageHandle, now_ms};
 use frankenterm_core::workflows::{
-    ExecutionStatus, StepResult, WorkflowStepPolicyDecision, WorkflowStepPolicySummary,
-    policy_summary_decision_is_allow, redact_text_for_log,
+    WorkflowStepPolicyDecision, WorkflowStepPolicySummary, policy_summary_decision_is_allow,
+    redact_text_for_log,
 };
+#[cfg(feature = "asupersync-runtime")]
+use frankenterm_core::workflows::{ExecutionStatus, StepResult};
 #[cfg(feature = "asupersync-runtime")]
 use frankenterm_core::workflows::{WaitCondition, WorkflowEngine};
 use proptest::prelude::*;
