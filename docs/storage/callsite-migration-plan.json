@@ -1,6 +1,6 @@
 {
   "bead": "ft-l1jgo",
-  "generated_at_utc": "2026-05-08T23:16:00Z",
+  "generated_at_utc": "2026-05-27T11:27:51Z",
   "migration_priority": [],
   "missing_substrate": [],
   "patterns": [
@@ -127,6 +127,6 @@
   ],
   "schema_version": 1,
   "source": "crates/frankenterm-core/src/storage.rs",
-  "source_line_count": 21566,
+  "source_line_count": 21946,
   "total_callsites": 0
 }

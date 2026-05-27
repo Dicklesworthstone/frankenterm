@@ -18,9 +18,9 @@ in this repository when they fail.
 | Job | Runner | Fix posture | Current task #26 disposition |
 | --- | --- | --- | --- |
 | Formal Methods | `ubuntu-latest` | Fix stale tool checksums, spec scripts, or model-test code. | Fixed stale `tla2tools.jar` SHA1 in CI. |
-| Generated Artifacts | `ubuntu-latest` | Fix generated-artifact drift, count drift, or proof coverage regressions. | Fixed runtime-proof coverage drift for IPC/native-event wrappers; `storage.rs::count_events` uses its existing Cx sibling. |
+| Generated Artifacts | `ubuntu-latest` | Fix generated-artifact drift, count drift, or proof coverage regressions. | Fixed runtime-proof coverage drift for IPC/native-event wrappers; `storage.rs::count_events` uses its existing Cx sibling. Refreshed stale `docs/storage/callsite-migration-plan.json` drift from the storage backend callsite guard. |
 | Operator Shell Tests | `ubuntu-latest`, `macos-14` | Fix shell portability, fixtures, or stale goldens. | Fixed stale Agent Mail fallback fixture/schema expectations. |
-| Security Audit | `ubuntu-latest` | Fix high/critical advisories by updating or removing vulnerable dependencies; warning-class allowlisted advisories remain audit debt. | Fixed `RUSTSEC-2026-0149` by moving `wasmtime` and `wasmtime-wasi` to `44.0.2`. |
+| Security Audit | `ubuntu-latest` | Fix high/critical advisories by updating or removing vulnerable dependencies; warning-class allowlisted advisories remain audit debt. | Fixed `RUSTSEC-2026-0149` by moving `wasmtime` and `wasmtime-wasi` to `44.0.2`; fixed `RUSTSEC-2026-0002` by moving the Tantivy stack off `lru 0.12.5`. |
 | Coverage | `ubuntu-latest` | Fix missing CI packages or code-level coverage command breakage. | Fixed missing Cairo/X11/pkg-config packages before `cargo llvm-cov`. |
 | Resize Performance Gates | `ubuntu-latest` plus RCH cargo execution inside the script | Fix compile drift, script errors, missing artifacts, or real threshold regressions when the standard runner and RCH lane are healthy. | Fixed compile drift in the timeline/warning validation lanes and gated the resize benchmark dependencies. |
 
@@ -70,6 +70,11 @@ ordinary Rust code.
   workspace-cycle guard passes in GitHub Actions local-Cargo mode, loom skeleton
   coverage passes, RuntimeProof uncovered remains `0`, and the
   asupersync-test-only guard passes.
+- Dependabot PR run `26507772159` failed the storage-backend callsite drift
+  guard because `docs/storage/callsite-migration-plan.json` still recorded the
+  old `storage.rs` line count. The generator still reports `0` callsites across
+  `0` patterns; the refreshed plan is metadata-only and
+  `python3 scripts/storage_backend_callsites.py --check` now passes.
 - Follow-up CI run `26507296325` reached the specialized lanes after the
   Windows OpenSSL bootstrap fix, but was cancelled by both lint jobs failing
   `cargo fmt --all -- --check` before most heavy jobs could complete. Commit
@@ -78,6 +83,19 @@ ordinary Rust code.
 - Formal Methods: run `26507296325` passed the old failing TLA+ install and TLC
   setup steps before the run was cancelled during the long kill-switch proof.
   No new formal-methods code defect was visible in that run.
+- Security Audit: old run `26488812786`, job `78001994081`, failed after the
+  Wasmtime fix because `cargo audit` still denied `RUSTSEC-2026-0002` for
+  `lru 0.12.5`, pulled by Tantivy `0.22.1` and `0.25.0`. Updating workspace
+  Tantivy to `0.26.1` and repinning `frankensearch` to upstream
+  `2cad158f4468ece7076e3fe529c8e5c20b2e020e` removes `lru 0.12.5`.
+  `cargo tree -i lru@0.12.5 --locked` reports no matching package, and
+  `cargo audit --no-fetch` now exits successfully with the existing four
+  allowed warnings only. A follow-up RCH compile proof for
+  `cargo check -p frankenterm-core --lib` reached remote worker `vmi1153651`
+  and used the updated `tantivy 0.26.1`, `frankensearch` `2cad158f...`, and
+  `asupersync 0.3.2` graph, but the SSH command hit the 1800s RCH limit
+  (`[RCH-E104]`), so that broad compile proof remains pending a longer remote
+  window.
 - Coverage: old run `26488812786`, job `78001994064`, failed before coverage
   measurement because `cairo-sys-rs` could not find `cairo.pc`. The fixable CI
   package gap is closed in `ci.yml` by installing Cairo/X11/pkg-config packages
