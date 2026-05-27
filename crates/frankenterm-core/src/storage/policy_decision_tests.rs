@@ -1093,7 +1093,10 @@ fn policy_denied_audit_roundtrips_all_fields_and_variants() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(approval_rows, 1, "require_approval row must be queryable on its own");
+    assert_eq!(
+        approval_rows, 1,
+        "require_approval row must be queryable on its own"
+    );
     assert_eq!(
         unsupported_rows, 1,
         "require_approval_unsupported row must be queryable as a distinct class"

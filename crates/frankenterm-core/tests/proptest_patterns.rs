@@ -1466,9 +1466,8 @@ fn verification_report_action_mode_controls_pack_action_surfaces() {
         regex_budget_checked: true,
         issues: Vec::new(),
     };
-    let action_pack =
-        PatternPack::new("verification-mode", "1.0.0", vec![rule.clone()])
-            .enforce_verification_report(&action_report);
+    let action_pack = PatternPack::new("verification-mode", "1.0.0", vec![rule.clone()])
+        .enforce_verification_report(&action_report);
     assert_eq!(
         action_pack.rules[0].workflow.as_deref(),
         Some("usage_limit_response")
@@ -1517,9 +1516,8 @@ fn verification_report_mismatch_or_unverified_action_forces_observe_only() {
         regex_budget_checked: true,
         issues: Vec::new(),
     };
-    let mismatched_pack =
-        PatternPack::new("verification-guard", "1.0.0", vec![rule.clone()])
-            .enforce_verification_report(&mismatched_report);
+    let mismatched_pack = PatternPack::new("verification-guard", "1.0.0", vec![rule.clone()])
+        .enforce_verification_report(&mismatched_report);
     assert_eq!(mismatched_pack.rules[0].workflow, None);
     assert_eq!(mismatched_pack.rules[0].preview_command, None);
     assert_eq!(

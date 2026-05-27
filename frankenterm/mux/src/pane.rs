@@ -6,7 +6,6 @@ use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
 use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
-use std::convert::TryFrom;
 use frankenterm_term::{
     Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
     StableRowIndex, TerminalConfiguration, TerminalSize,
@@ -15,6 +14,7 @@ use parking_lot::MappedMutexGuard;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::ops::Range;
 use std::sync::Arc;
 use termwiz::hyperlink::Rule;

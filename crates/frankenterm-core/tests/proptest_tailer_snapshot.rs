@@ -15,7 +15,10 @@ use frankenterm_core::tailer::{
 };
 
 fn arb_priority_tier() -> impl Strategy<Value = CapturePriorityTier> {
-    prop_oneof![Just(CapturePriorityTier::High), Just(CapturePriorityTier::Low)]
+    prop_oneof![
+        Just(CapturePriorityTier::High),
+        Just(CapturePriorityTier::Low)
+    ]
 }
 
 fn arb_tailer_mode() -> impl Strategy<Value = TailerMode> {

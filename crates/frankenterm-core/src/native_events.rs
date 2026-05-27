@@ -72,7 +72,10 @@ mod socket_transport {
             path: P,
         ) -> io::Result<UnixStream> {
             cx.checkpoint().map_err(|err| {
-                io::Error::new(io::ErrorKind::Interrupted, format!("connect cancelled: {err}"))
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("connect cancelled: {err}"),
+                )
             })?;
             let stream = UnixStream::connect(path)?;
             stream.set_nonblocking(true)?;

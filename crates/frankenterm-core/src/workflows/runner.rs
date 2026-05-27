@@ -9,6 +9,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+const MAX_WORKFLOW_TOTAL_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
+
 fn spawn_runner_child_with_cx<F, Fut>(cx: &crate::cx::Cx, task: F)
 where
     F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
@@ -90,6 +92,9 @@ fn cap_wait_by_workflow_deadline(
 ) -> Duration {
     if workflow_total_deadline_ms == 0 {
         return requested;
+    }
+    if workflow_total_deadline_ms > MAX_WORKFLOW_TOTAL_DEADLINE_MS {
+        return Duration::ZERO;
     }
 
     let Some(deadline) =
@@ -1014,11 +1019,20 @@ impl WorkflowRunner {
             if deadline_ms > 0 {
                 let elapsed_ms =
                     u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if elapsed_ms >= deadline_ms {
-                    let reason = format!(
-                        "run_workflow exceeded overall deadline at step {current_step}: \
-                         elapsed {elapsed_ms}ms >= {deadline_ms}ms (workflow_total_deadline_ms)"
-                    );
+                let invalid_deadline_ms = deadline_ms > MAX_WORKFLOW_TOTAL_DEADLINE_MS;
+                if invalid_deadline_ms || elapsed_ms >= deadline_ms {
+                    let reason = if invalid_deadline_ms {
+                        format!(
+                            "run_workflow invalid overall deadline at step {current_step}: \
+                             workflow_total_deadline_ms {deadline_ms}ms exceeds max \
+                             {MAX_WORKFLOW_TOTAL_DEADLINE_MS}ms"
+                        )
+                    } else {
+                        format!(
+                            "run_workflow exceeded overall deadline at step {current_step}: \
+                             elapsed {elapsed_ms}ms >= {deadline_ms}ms (workflow_total_deadline_ms)"
+                        )
+                    };
                     if let Some(cx) = cx {
                         if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await
                         {

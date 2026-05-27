@@ -271,16 +271,14 @@ impl crate::TermWindow {
                     // next paint cycle render with correctly-sized buffers.
                     let vertex_buf_len = vertices.glium().len();
                     let index_buf_len = vb.indices.glium().len();
-                    let Some(vert_slice) = vertices.glium().slice(0..vertex_count)
-                    else {
+                    let Some(vert_slice) = vertices.glium().slice(0..vertex_count) else {
                         log::warn!(
                             "skipping draw: vertex slice 0..{vertex_count} out of range (buf len {vertex_buf_len})"
                         );
                         vb.next_index();
                         continue;
                     };
-                    let Some(idx_slice) = vb.indices.glium().slice(0..index_count)
-                    else {
+                    let Some(idx_slice) = vb.indices.glium().slice(0..index_count) else {
                         log::warn!(
                             "skipping draw: index slice 0..{index_count} out of range (buf len {index_buf_len})"
                         );
