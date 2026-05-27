@@ -147,7 +147,12 @@ impl OwnedHandle {
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if !ptr::eq(self.handle, INVALID_HANDLE_VALUE) && !self.handle.is_null() {
+        // ft-vd0jp: `self.handle` is `RawHandle` (std `*mut c_void`) while
+        // `INVALID_HANDLE_VALUE` is winapi's `*mut c_void` — distinct `c_void`
+        // types, so `ptr::eq` won't type-check. Compare by address instead;
+        // identical semantics (the sentinel check), winapi-only path so Unix
+        // is unaffected.
+        if self.handle as usize != INVALID_HANDLE_VALUE as usize && !self.handle.is_null() {
             unsafe {
                 if self.is_socket_handle() {
                     closesocket(self.handle as _);
@@ -172,7 +177,8 @@ impl OwnedHandle {
     #[inline]
     pub(crate) fn dup_impl<F: AsRawFileDescriptor>(f: &F, handle_type: HandleType) -> Result<Self> {
         let handle = f.as_raw_file_descriptor();
-        if ptr::eq(handle, INVALID_HANDLE_VALUE) || handle.is_null() {
+        // ft-vd0jp: address compare — see Drop above (distinct c_void types).
+        if handle as usize == INVALID_HANDLE_VALUE as usize || handle.is_null() {
             return Ok(OwnedHandle {
                 handle,
                 handle_type,
