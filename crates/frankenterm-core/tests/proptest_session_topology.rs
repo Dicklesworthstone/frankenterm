@@ -541,6 +541,8 @@ use frankenterm_core::session_topology::match_panes;
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 use std::collections::HashMap;
 
+// PaneInfo fixture exposes independently varied identity, geometry, metadata, and focus.
+#[allow(clippy::too_many_arguments)]
 fn make_pane_info(
     pane_id: u64,
     tab_id: u64,
