@@ -956,6 +956,24 @@ impl Default for StorageConfig {
     }
 }
 
+impl From<&crate::config::StorageConfig> for StorageConfig {
+    /// Canonical mapping from the parsed `[storage]` config onto the handle's
+    /// tuning. ft-nveha: previously the `[storage] writer_queue_size` was parsed
+    /// and validated but never reached `StorageHandle` through any single seam —
+    /// callers hand-rolled the field copy (and could silently drop it), so the
+    /// writer channel often used the default capacity. Routing the conversion
+    /// here makes the wiring single-source-of-truth. The config validator already
+    /// enforces `writer_queue_size >= 1`; clamp defensively so a stray 0 can
+    /// never collapse the bounded write channel into a rendezvous.
+    fn from(app: &crate::config::StorageConfig) -> Self {
+        Self {
+            write_queue_size: (app.writer_queue_size as usize).max(1),
+            // `defer_fts_triggers` is not exposed via `[storage]`; keep default.
+            ..StorageConfig::default()
+        }
+    }
+}
+
 const FT_STORAGE_MMAP_ENABLE_ENV: &str = "FT_STORAGE_MMAP_ENABLE";
 const FT_STORAGE_MMAP_DIR_ENV: &str = "FT_STORAGE_MMAP_DIR";
 
@@ -3647,6 +3665,9 @@ impl StorageHandle {
     }
 
     /// Maximum write queue capacity (from `StorageConfig.write_queue_size`).
+    /// Exposed so callers/tests can confirm the parsed `[storage] writer_queue_size`
+    /// reached the handle (ft-nveha).
+    #[must_use]
     pub fn write_queue_capacity(&self) -> usize {
         self.write_tx.max_capacity()
     }
@@ -17732,6 +17753,51 @@ fn storage_handle_new_with_cx_succeeds_on_fresh_cx() {
             last_decision_at: None,
         };
         storage.upsert_pane(pane).await.unwrap();
+        storage.shutdown().await.unwrap();
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-nveha: a custom `[storage] writer_queue_size` must actually reach the
+/// constructed `StorageHandle`. Previously the parsed value was dropped (no
+/// canonical conversion) and the writer channel used the default capacity.
+/// Asserts both the `From` mapping and the live handle's write-queue capacity.
+#[test]
+fn storage_writer_queue_size_reaches_handle() {
+    // Pure mapping: the From conversion carries writer_queue_size -> write_queue_size.
+    let app = crate::config::StorageConfig {
+        writer_queue_size: 7,
+        ..crate::config::StorageConfig::default()
+    };
+    assert_eq!(
+        StorageConfig::from(&app).write_queue_size,
+        7,
+        "From must carry the parsed writer_queue_size through"
+    );
+
+    // End-to-end: the value reaches the live handle's write-queue capacity.
+    run_storage_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_nveha_qsize_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let cx = crate::cx::for_testing();
+        let app = crate::config::StorageConfig {
+            writer_queue_size: 7,
+            ..crate::config::StorageConfig::default()
+        };
+        let storage =
+            StorageHandle::with_config_with_cx(&cx, &db_path_str, StorageConfig::from(&app))
+                .await
+                .unwrap();
+        assert_eq!(
+            storage.write_queue_capacity(),
+            7,
+            "parsed [storage] writer_queue_size=7 must reach the handle's write-queue capacity (was: default)"
+        );
         storage.shutdown().await.unwrap();
 
         let _ = std::fs::remove_file(&db_path);
