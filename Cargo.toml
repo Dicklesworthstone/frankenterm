@@ -256,7 +256,7 @@ implicit_clone = "allow"
 # Core dependencies
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 serde_json = "1.0.149"
-tantivy = "0.22"
+tantivy = "0.26.1"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 anyhow = "1.0.100"
@@ -563,7 +563,7 @@ fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fasta
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "7086d9646520e8c0d4908a88d0854a7f979f1580", package = "frankensearch", default-features = false, features = ["hybrid"] }
+frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.1.0"
 

@@ -254,6 +254,7 @@ impl LocalToFsRerankerAdapter {
                 doc_id: doc.id.to_string(),
                 score: doc.score,
                 original_rank: rank,
+                raw_logit: None,
             })
             .collect())
     }
@@ -408,11 +409,13 @@ mod tests {
                 doc_id: "3".into(),
                 score: 0.95,
                 original_rank: 2,
+                raw_logit: None,
             },
             RerankScore {
                 doc_id: "1".into(),
                 score: 0.85,
                 original_rank: 0,
+                raw_logit: None,
             },
         ];
         let result = rerank_scores_to_scored_docs(&scores, &originals);
@@ -430,6 +433,7 @@ mod tests {
             doc_id: "999".into(),
             score: 0.5,
             original_rank: 0,
+            raw_logit: None,
         }];
         let result = rerank_scores_to_scored_docs(&scores, &originals);
         assert!(result.is_empty());
@@ -453,6 +457,7 @@ mod tests {
             doc_id: "42".into(),
             score: 0.99,
             original_rank: 0,
+            raw_logit: None,
         }];
         let result = rerank_scores_to_scored_docs(&scores, &originals);
         assert_eq!(result[0].text, "original text content");
@@ -701,16 +706,19 @@ mod tests {
                 doc_id: "3".into(),
                 score: 0.99,
                 original_rank: 2,
+                raw_logit: None,
             },
             RerankScore {
                 doc_id: "1".into(),
                 score: 0.5,
                 original_rank: 0,
+                raw_logit: None,
             },
             RerankScore {
                 doc_id: "2".into(),
                 score: 0.7,
                 original_rank: 1,
+                raw_logit: None,
             },
         ];
         let result = FsToLocalRerankerAdapter::apply_scores(&scores, &originals);
@@ -739,6 +747,7 @@ mod tests {
             doc_id: "42".into(),
             score: 0.9,
             original_rank: 0,
+            raw_logit: None,
         }];
         let result = FsToLocalRerankerAdapter::apply_scores(&scores, &originals);
         assert_eq!(result[0].text, "preserved text");
@@ -759,16 +768,19 @@ mod tests {
                 doc_id: "30".into(),
                 score: 0.99,
                 original_rank: 2,
+                raw_logit: None,
             },
             RerankScore {
                 doc_id: "10".into(),
                 score: 0.88,
                 original_rank: 0,
+                raw_logit: None,
             },
             RerankScore {
                 doc_id: "20".into(),
                 score: 0.77,
                 original_rank: 1,
+                raw_logit: None,
             },
         ];
 
