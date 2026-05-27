@@ -41,6 +41,10 @@ use anyhow::Error;
 use downcast_rs::{Downcast, impl_downcast};
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
+// TryFrom is not in the edition-2018 prelude; its only use is the #[cfg(unix)]
+// `u32_to_pid_t` helper (libc::pid_t::try_from). Gate the import to match, so it
+// is not flagged unused (a hard error under -D warnings) on Windows. Unix unchanged.
+#[cfg(unix)]
 use std::convert::TryFrom;
 use std::io::Result as IoResult;
 #[cfg(windows)]
