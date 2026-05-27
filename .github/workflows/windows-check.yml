@@ -90,19 +90,17 @@ jobs:
           cargo --version >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Default features: INFORMATIONAL again (continue-on-error). The earlier "green"
-      # that prompted requiring this was a stale-cache artifact — the first runs that
-      # actually completed a CLEAN full traversal (windows-check-v2) fail with real
-      # default-features-only blockers:
-      #   - tikv-jemalloc-sys cannot build on windows-msvc (frankenterm-gui default
-      #     feature `jemalloc`); jemalloc must be target-gated off Windows (ft-azsnz child).
-      #   - termwiz/src/terminal/windows.rs:1022 and pty/src/lib.rs:44 compile errors.
-      # Keep this informational until those land and a CLEAN run is green; only THEN
-      # remove continue-on-error. (Lesson: never require a -sys-heavy build on a single
-      # green behind a warm cache.) The unix-coupling ratchet remains the required guard.
+      # Default features: REQUIRED. Verified green on a CLEAN, cache-busted run
+      # (windows-check-v2) that COMPLETED on the current tree (run on 386db8abb:
+      # default-features=success, no-default-features=success, unix-coupling=success)
+      # AFTER the real default-features blockers were fixed: jemalloc target-gated off
+      # windows-msvc (ft-p9hok, Mac/Linux allocator unchanged), termwiz windows compile
+      # chain (ft-vd0jp + 9e0961489 TryFrom), pty (ft-mxg54). This is trustworthy: the
+      # jemalloc fix changed the dependency graph, so the prior cached failure could not
+      # mask it — the build genuinely compiled the full GUI tree for MSVC. continue-on-error
+      # removed to lock the additive, zero-Mac/Linux-regression Windows compile invariant.
       - name: cargo check --workspace (default features)
         id: check_default
-        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
