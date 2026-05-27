@@ -23062,10 +23062,7 @@ async fn run_distributed_agent(
     };
 
     let db_path = layout.db_path.to_string_lossy();
-    let storage_config = frankenterm_core::storage::StorageConfig {
-        write_queue_size: config.storage.writer_queue_size as usize,
-        defer_fts_triggers: false,
-    };
+    let storage_config = frankenterm_core::storage::StorageConfig::from(&config.storage);
     // ft-xbnl0.2.3 tick 299: cx-first distributed agent storage open.
     let storage_open_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -23453,10 +23450,7 @@ async fn run_watcher(
 
     // Create storage handle
     let db_path = layout.db_path.to_string_lossy();
-    let storage_config = frankenterm_core::storage::StorageConfig {
-        write_queue_size: config.storage.writer_queue_size as usize,
-        defer_fts_triggers: false,
-    };
+    let storage_config = frankenterm_core::storage::StorageConfig::from(&config.storage);
     let requested_recorder_backend = config.storage.recorder_backend;
     let recorder_append_log_config = recorder_append_log_storage_config(layout, &config);
     let (recorder_storage, recorder_fallback_reason) = bootstrap_recorder_backend_with_probe(
@@ -23709,10 +23703,8 @@ async fn run_watcher(
     // Set up workflow runner if auto_handle is enabled
     let _workflow_runner_handle = if auto_handle {
         // Create shared storage for workflow runner (recreate config since it doesn't impl Clone)
-        let workflow_storage_config = frankenterm_core::storage::StorageConfig {
-            write_queue_size: config.storage.writer_queue_size as usize,
-            defer_fts_triggers: false,
-        };
+        let workflow_storage_config =
+            frankenterm_core::storage::StorageConfig::from(&config.storage);
         // ft-xbnl0.2.3 tick 299: cx-first workflow storage open.
         let wf_storage_cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);

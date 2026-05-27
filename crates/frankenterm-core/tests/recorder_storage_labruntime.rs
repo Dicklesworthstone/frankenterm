@@ -72,6 +72,7 @@ fn recorder_test_config(path: &Path) -> RecorderStorageConfig {
     RecorderStorageConfig {
         backend: RecorderBackendKind::AppendLog,
         append_log: test_config(path),
+        ..RecorderStorageConfig::default()
     }
 }
 

@@ -742,6 +742,7 @@ fn test_bootstrap_logs_backend_kind() {
     let config = RecorderStorageConfig {
         backend: RecorderBackendKind::AppendLog,
         append_log: test_config(dir.path()),
+        ..RecorderStorageConfig::default()
     };
     let _ = bootstrap_recorder_storage(config);
 
@@ -762,6 +763,7 @@ fn test_bootstrap_logs_data_path() {
     let config = RecorderStorageConfig {
         backend: RecorderBackendKind::AppendLog,
         append_log: test_config(dir.path()),
+        ..RecorderStorageConfig::default()
     };
     let _ = bootstrap_recorder_storage(config);
 
@@ -1027,6 +1029,7 @@ fn test_bootstrap_logs_at_info_level() {
     let config = RecorderStorageConfig {
         backend: RecorderBackendKind::AppendLog,
         append_log: test_config(dir.path()),
+        ..RecorderStorageConfig::default()
     };
     let _ = bootstrap_recorder_storage(config);
 
