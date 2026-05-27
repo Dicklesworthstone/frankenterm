@@ -317,6 +317,8 @@ fn wire_protocol_error_code(error: &WireProtocolError) -> &'static str {
     }
 }
 
+// Receipt fixture varies transport fault metadata, pruning state, and bridge-derived fields.
+#[allow(clippy::too_many_arguments)]
 fn fault_receipt(
     fault: &str,
     sender: &str,

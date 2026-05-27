@@ -285,11 +285,11 @@ proptest! {
     /// evaluate_readiness: ready == (required_pass == required_total).
     #[test]
     fn prop_readiness_ready_consistency(enabled in any::<bool>(), has_token in any::<bool>()) {
-        let mut config = DistributedConfig::default();
-        config.enabled = enabled;
-        if has_token {
-            config.token = Some("test-secret".to_string());
-        }
+        let config = DistributedConfig {
+            enabled,
+            token: has_token.then(|| "test-secret".to_string()),
+            ..DistributedConfig::default()
+        };
         let report = evaluate_readiness(&config);
         prop_assert_eq!(report.ready, report.required_pass == report.required_total);
     }
@@ -297,9 +297,11 @@ proptest! {
     /// evaluate_readiness: required_pass + failed == required_total.
     #[test]
     fn prop_readiness_counts_sum(enabled in any::<bool>()) {
-        let mut config = DistributedConfig::default();
-        config.enabled = enabled;
-        config.token = Some("tok".to_string());
+        let config = DistributedConfig {
+            enabled,
+            token: Some("tok".to_string()),
+            ..DistributedConfig::default()
+        };
         let report = evaluate_readiness(&config);
         let required_fail = report.items.iter().filter(|i| i.required && !i.pass).count();
         prop_assert_eq!(report.required_pass + required_fail, report.required_total);
@@ -310,8 +312,10 @@ proptest! {
     /// evaluate_readiness is deterministic.
     #[test]
     fn prop_readiness_deterministic(enabled in any::<bool>()) {
-        let mut config = DistributedConfig::default();
-        config.enabled = enabled;
+        let config = DistributedConfig {
+            enabled,
+            ..DistributedConfig::default()
+        };
         let r1 = evaluate_readiness(&config);
         let r2 = evaluate_readiness(&config);
         prop_assert_eq!(r1.ready, r2.ready);
@@ -322,8 +326,10 @@ proptest! {
     /// evaluate_readiness: runtime_enabled matches config.enabled.
     #[test]
     fn prop_readiness_runtime_matches_config(enabled in any::<bool>()) {
-        let mut config = DistributedConfig::default();
-        config.enabled = enabled;
+        let config = DistributedConfig {
+            enabled,
+            ..DistributedConfig::default()
+        };
         let report = evaluate_readiness(&config);
         prop_assert_eq!(report.runtime_enabled, enabled);
     }
@@ -331,8 +337,10 @@ proptest! {
     /// evaluate_readiness: all items have non-empty id and category.
     #[test]
     fn prop_readiness_items_nonempty_fields(enabled in any::<bool>()) {
-        let mut config = DistributedConfig::default();
-        config.enabled = enabled;
+        let config = DistributedConfig {
+            enabled,
+            ..DistributedConfig::default()
+        };
         let report = evaluate_readiness(&config);
         for item in &report.items {
             prop_assert!(!item.id.is_empty());
@@ -353,8 +361,10 @@ proptest! {
     /// Single inline token returns Some(Inline).
     #[test]
     fn prop_token_source_inline(token in "[a-z]{4,12}") {
-        let mut config = DistributedConfig::default();
-        config.token = Some(token);
+        let config = DistributedConfig {
+            token: Some(token),
+            ..DistributedConfig::default()
+        };
         prop_assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::Inline)
@@ -364,8 +374,10 @@ proptest! {
     /// Single env token returns Some(Env).
     #[test]
     fn prop_token_source_env(env_var in "[A-Z_]{4,12}") {
-        let mut config = DistributedConfig::default();
-        config.token_env = Some(env_var);
+        let config = DistributedConfig {
+            token_env: Some(env_var),
+            ..DistributedConfig::default()
+        };
         prop_assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::Env)
@@ -375,8 +387,10 @@ proptest! {
     /// Single file path returns Some(File).
     #[test]
     fn prop_token_source_file(path in "/[a-z]{3,10}/[a-z]{3,10}") {
-        let mut config = DistributedConfig::default();
-        config.token_path = Some(path);
+        let config = DistributedConfig {
+            token_path: Some(path),
+            ..DistributedConfig::default()
+        };
         prop_assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::File)
@@ -396,9 +410,11 @@ proptest! {
         token in "[a-z]{4,8}",
         env_var in "[A-Z_]{4,8}",
     ) {
-        let mut config = DistributedConfig::default();
-        config.token = Some(token);
-        config.token_env = Some(env_var);
+        let config = DistributedConfig {
+            token: Some(token),
+            token_env: Some(env_var),
+            ..DistributedConfig::default()
+        };
         prop_assert_eq!(configured_token_source_kind(&config), None);
     }
 }
