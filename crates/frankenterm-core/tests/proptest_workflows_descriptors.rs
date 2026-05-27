@@ -337,30 +337,36 @@ fn descriptor_validation_accepts_nested_unique_step_ids_within_limit() {
 // Structural invariant tests
 // =============================================================================
 
+#[test]
+fn failure_handler_interpolation_replaces_placeholder() {
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(100));
+    runner
+        .run(
+            &(arb_descriptor_failure_handler(), "[a-z_]{3,15}"),
+            |(handler, step_name)| {
+                let result = handler.interpolate_message(&step_name);
+                // If the template contained ${failed_step}, it should be replaced
+                let template = match &handler {
+                    DescriptorFailureHandler::Notify { message }
+                    | DescriptorFailureHandler::Log { message }
+                    | DescriptorFailureHandler::Abort { message } => message,
+                };
+                if template.contains("${failed_step}") {
+                    let has_name = result.contains(&step_name);
+                    prop_assert!(has_name);
+                    let no_placeholder = !result.contains("${failed_step}");
+                    prop_assert!(no_placeholder);
+                } else {
+                    prop_assert_eq!(&result, template);
+                }
+                Ok(())
+            },
+        )
+        .expect("failure handler interpolation property should hold");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
-
-    #[test]
-    fn failure_handler_interpolation_replaces_placeholder(
-        handler in arb_descriptor_failure_handler(),
-        step_name in "[a-z_]{3,15}"
-    ) {
-        let result = handler.interpolate_message(&step_name);
-        // If the template contained ${failed_step}, it should be replaced
-        let template = match &handler {
-            DescriptorFailureHandler::Notify { message }
-            | DescriptorFailureHandler::Log { message }
-            | DescriptorFailureHandler::Abort { message } => message,
-        };
-        if template.contains("${failed_step}") {
-            let has_name = result.contains(&step_name);
-            prop_assert!(has_name);
-            let no_placeholder = !result.contains("${failed_step}");
-            prop_assert!(no_placeholder);
-        } else {
-            prop_assert_eq!(&result, template);
-        }
-    }
 
     #[test]
     fn valid_workflow_descriptor_validates_ok(val in arb_workflow_descriptor()) {
@@ -867,7 +873,7 @@ proptest! {
     }
 
     #[test]
-    fn empty_workflow_description_fails_validation() {
+    fn empty_workflow_description_fails_validation(_ in Just(())) {
         let descriptor = WorkflowDescriptor {
             workflow_schema_version: 1,
             name: "workflow_description_blank".to_string(),
@@ -933,7 +939,7 @@ proptest! {
     }
 
     #[test]
-    fn empty_step_description_fails_validation() {
+    fn empty_step_description_fails_validation(_ in Just(())) {
         let descriptor = WorkflowDescriptor {
             workflow_schema_version: 1,
             name: "step_description_blank".to_string(),
@@ -1099,7 +1105,7 @@ proptest! {
     }
 
     #[test]
-    fn empty_send_text_step_fails_validation() {
+    fn empty_send_text_step_fails_validation(_ in Just(())) {
         let descriptor = WorkflowDescriptor {
             workflow_schema_version: 1,
             name: "send_text_blank".to_string(),
@@ -1185,7 +1191,7 @@ proptest! {
     }
 
     #[test]
-    fn empty_conditional_test_text_fails_validation() {
+    fn empty_conditional_test_text_fails_validation(_ in Just(())) {
         let descriptor = WorkflowDescriptor {
             workflow_schema_version: 1,
             name: "conditional_blank".to_string(),
@@ -1216,7 +1222,7 @@ proptest! {
     }
 
     #[test]
-    fn empty_conditional_then_steps_fails_validation() {
+    fn empty_conditional_then_steps_fails_validation(_ in Just(())) {
         let descriptor = WorkflowDescriptor {
             workflow_schema_version: 1,
             name: "conditional_empty_then".to_string(),
@@ -1650,7 +1656,7 @@ proptest! {
     }
 
     #[test]
-    fn regex_matchers_that_match_empty_input_fail_validation() {
+    fn regex_matchers_that_match_empty_input_fail_validation(_ in Just(())) {
         let descriptor = WorkflowDescriptor {
             workflow_schema_version: 1,
             name: "empty_regex_matcher".to_string(),
