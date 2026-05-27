@@ -1351,9 +1351,11 @@ mod tests {
 
     #[test]
     fn dna_raw_features_time_to_first_error_some() {
-        let mut dna = SessionDna::default();
-        dna.duration_hours = 10.0;
-        dna.time_to_first_error = Some(2.5);
+        let dna = SessionDna {
+            duration_hours: 10.0,
+            time_to_first_error: Some(2.5),
+            ..Default::default()
+        };
         let features = dna.to_raw_features();
         // Feature[15] = time_to_first_error (2.5), not duration_hours (10.0)
         assert!((features[15] - 2.5).abs() < 0.01);
@@ -1361,9 +1363,11 @@ mod tests {
 
     #[test]
     fn dna_raw_features_time_to_first_error_none() {
-        let mut dna = SessionDna::default();
-        dna.duration_hours = 5.0;
-        dna.time_to_first_error = None;
+        let dna = SessionDna {
+            duration_hours: 5.0,
+            time_to_first_error: None,
+            ..Default::default()
+        };
         let features = dna.to_raw_features();
         // Feature[15] = duration_hours (5.0) when no error
         assert!((features[15] - 5.0).abs() < 0.01);

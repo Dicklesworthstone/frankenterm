@@ -5659,11 +5659,13 @@ mod tests {
             let storage = StorageHandle::new(&db_path).await.unwrap();
             let engine = PatternEngine::new();
 
-            let mut config = RuntimeConfig::default();
-            config.discovery_interval = Duration::from_millis(10);
-            config.capture_interval = Duration::from_millis(10);
-            config.min_capture_interval = Duration::from_millis(5);
-            config.channel_buffer = 64;
+            let config = RuntimeConfig {
+                discovery_interval: Duration::from_millis(10),
+                capture_interval: Duration::from_millis(10),
+                min_capture_interval: Duration::from_millis(5),
+                channel_buffer: 64,
+                ..Default::default()
+            };
 
             let mock = crate::wezterm::MockWezterm::new();
             mock.add_default_pane(0).await;
@@ -5736,11 +5738,13 @@ mod tests {
             let storage = StorageHandle::new(&db_path).await.unwrap();
             let engine = PatternEngine::new();
 
-            let mut config = RuntimeConfig::default();
-            config.discovery_interval = Duration::from_millis(10);
-            config.capture_interval = Duration::from_millis(10);
-            config.min_capture_interval = Duration::from_millis(5);
-            config.channel_buffer = 64;
+            let config = RuntimeConfig {
+                discovery_interval: Duration::from_millis(10),
+                capture_interval: Duration::from_millis(10),
+                min_capture_interval: Duration::from_millis(5),
+                channel_buffer: 64,
+                ..Default::default()
+            };
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             let wezterm_handle: WeztermHandle = mock.clone();
@@ -6084,8 +6088,10 @@ mod tests {
 
     #[test]
     fn backpressure_warn_ratio_is_valid() {
-        assert!(BACKPRESSURE_WARN_RATIO > 0.0);
-        assert!(BACKPRESSURE_WARN_RATIO < 1.0);
+        const {
+            assert!(BACKPRESSURE_WARN_RATIO > 0.0);
+            assert!(BACKPRESSURE_WARN_RATIO < 1.0);
+        }
     }
 
     #[test]
@@ -8298,30 +8304,40 @@ mod tests {
 
     #[test]
     fn telemetry_percentile_window_capacity_is_positive() {
-        assert!(TELEMETRY_PERCENTILE_WINDOW_CAPACITY > 0);
+        const {
+            assert!(TELEMETRY_PERCENTILE_WINDOW_CAPACITY > 0);
+        }
     }
 
     #[test]
     fn resize_watchdog_thresholds_are_ordered() {
-        assert!(RESIZE_WATCHDOG_WARNING_THRESHOLD_MS < RESIZE_WATCHDOG_CRITICAL_THRESHOLD_MS);
+        const {
+            assert!(RESIZE_WATCHDOG_WARNING_THRESHOLD_MS < RESIZE_WATCHDOG_CRITICAL_THRESHOLD_MS);
+        }
     }
 
     #[test]
     fn resize_watchdog_critical_stalled_limit_is_positive() {
-        assert!(RESIZE_WATCHDOG_CRITICAL_STALLED_LIMIT > 0);
+        const {
+            assert!(RESIZE_WATCHDOG_CRITICAL_STALLED_LIMIT > 0);
+        }
     }
 
     #[test]
     fn resize_watchdog_sample_limit_is_positive() {
-        assert!(RESIZE_WATCHDOG_SAMPLE_LIMIT > 0);
+        const {
+            assert!(RESIZE_WATCHDOG_SAMPLE_LIMIT > 0);
+        }
     }
 
     #[test]
     fn storage_lock_warn_thresholds_exist() {
         // These constants are used in health snapshot warnings
-        assert!(STORAGE_LOCK_WAIT_WARN_MS > 0.0);
-        assert!(STORAGE_LOCK_HOLD_WARN_MS > 0.0);
-        assert!(CURSOR_SNAPSHOT_MEMORY_WARN_BYTES > 0);
+        const {
+            assert!(STORAGE_LOCK_WAIT_WARN_MS > 0.0);
+            assert!(STORAGE_LOCK_HOLD_WARN_MS > 0.0);
+            assert!(CURSOR_SNAPSHOT_MEMORY_WARN_BYTES > 0);
+        }
     }
 
     // =========================================================================

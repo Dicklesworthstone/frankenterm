@@ -1063,8 +1063,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = WatchdogConfig::default();
-        config.max_depth = 1; // Trigger at depth > 1
+        let config = WatchdogConfig {
+            max_depth: 1, // Trigger at depth > 1
+            ..Default::default()
+        };
 
         let mut watchdog = ScopeWatchdog::with_config(config);
         let alerts = watchdog.scan(&tree, 2000);
@@ -1384,8 +1386,10 @@ mod tests {
         tree.get_mut(&a).unwrap().children.push(b.clone());
         tree.get_mut(&b).unwrap().children.push(a.clone());
 
-        let mut config = WatchdogConfig::default();
-        config.detect_deadlocks = false;
+        let config = WatchdogConfig {
+            detect_deadlocks: false,
+            ..Default::default()
+        };
         let mut wd = ScopeWatchdog::with_config(config);
         let alerts = wd.scan(&tree, 3000);
         assert!(
@@ -2035,8 +2039,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = WatchdogConfig::default();
-        config.max_depth = 2; // exactly at depth 2 → not triggered
+        let config = WatchdogConfig {
+            max_depth: 2, // exactly at depth 2 → not triggered
+            ..Default::default()
+        };
 
         let mut wd = ScopeWatchdog::with_config(config);
         let alerts = wd.scan(&tree, 2000);
@@ -2064,8 +2070,10 @@ mod tests {
         tree.register(worker.clone(), ScopeTier::Worker, &w1, "e1", 1000)
             .unwrap();
 
-        let mut config = WatchdogConfig::default();
-        config.max_depth = 2; // depth 3 > 2 → triggered
+        let config = WatchdogConfig {
+            max_depth: 2, // depth 3 > 2 → triggered
+            ..Default::default()
+        };
 
         let mut wd = ScopeWatchdog::with_config(config);
         let alerts = wd.scan(&tree, 2000);
@@ -2090,10 +2098,12 @@ mod tests {
 
     #[test]
     fn with_config_uses_custom_values() {
-        let mut config = WatchdogConfig::default();
-        config.finalizer_timeout_ms = 1_000;
-        config.max_depth = 3;
-        config.stale_created_threshold_ms = 5_000;
+        let config = WatchdogConfig {
+            finalizer_timeout_ms: 1_000,
+            max_depth: 3,
+            stale_created_threshold_ms: 5_000,
+            ..Default::default()
+        };
 
         let wd = ScopeWatchdog::with_config(config);
         assert_eq!(wd.config().finalizer_timeout_ms, 1_000);

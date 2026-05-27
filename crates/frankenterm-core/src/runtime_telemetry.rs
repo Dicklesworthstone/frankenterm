@@ -14714,10 +14714,11 @@ mod tests {
         let cert_cfg = SwarmCapacityCertificateConfig::default();
         let mon_cfg = SwarmTailRiskMonitorConfig::default();
         let ledger_cfg = SwarmCapacityEvidenceLedgerConfig::default();
-        let mut fairness = SwarmCapacityFairnessPolicyConfig::default();
-
         // Fairness disabled: controller_version equals the constant.
-        fairness.enabled = false;
+        let fairness = SwarmCapacityFairnessPolicyConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let snap_disabled = SwarmCapacityEvidenceConfigSnapshot::from_configs_with_fairness(
             &cert_cfg,
             &mon_cfg,
@@ -15121,9 +15122,11 @@ mod tests {
             "v1_will_be_truncated_x_x_x_x_x_x_x_x_x_x".to_string(),
         );
         raw.insert("z_dropped".to_string(), "v2".to_string());
-        let mut config = SwarmCapacityEvidenceLedgerConfig::default();
-        config.max_context_fields = 1; // Force one field to be dropped.
-        config.max_context_value_bytes = 4; // Force the surviving value to be truncated.
+        let config = SwarmCapacityEvidenceLedgerConfig {
+            max_context_fields: 1,      // Force one field to be dropped.
+            max_context_value_bytes: 4, // Force the surviving value to be truncated.
+            ..Default::default()
+        };
         let ctx = SwarmCapacityEvidenceContext::redacted_from(raw, |v| v.to_string(), &config);
 
         // Public accessors round-trip the underlying data.
@@ -20587,8 +20590,10 @@ mod tests {
     #[test]
     fn scheduler_snapshot_circuit_breaker_is_black() {
         use crate::swarm_scheduler::*;
-        let mut config = SchedulerConfig::default();
-        config.max_consecutive_scale_ops = 2;
+        let config = SchedulerConfig {
+            max_consecutive_scale_ops: 2,
+            ..Default::default()
+        };
         let scheduler = SwarmScheduler::new(config);
         let mut snap = scheduler.snapshot();
         snap.circuit_breaker_tripped_at = Some(8000);

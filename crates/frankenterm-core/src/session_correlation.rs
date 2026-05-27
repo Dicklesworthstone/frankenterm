@@ -922,8 +922,10 @@ mod tests {
     #[test]
     fn correlate_manual_override() {
         let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
-        let mut options = CassCorrelationOptions::default();
-        options.override_session_id = Some("cass-override".to_string());
+        let options = CassCorrelationOptions {
+            override_session_id: Some("cass-override".to_string()),
+            ..Default::default()
+        };
 
         let result = correlate_from_sessions(&[], start_ms, &options);
         assert_eq!(result.external_id.as_deref(), Some("cass-override"));
@@ -1409,8 +1411,10 @@ mod tests {
             session.started_at = now;
             let session_id = handle.upsert_agent_session(session).await.unwrap();
 
-            let mut options = CassCorrelationOptions::default();
-            options.override_session_id = Some("cass-override".to_string());
+            let options = CassCorrelationOptions {
+                override_session_id: Some("cass-override".to_string()),
+                ..Default::default()
+            };
 
             let cass = CassClient::new();
             let correlation = correlate_and_persist_for_pane(
@@ -1507,8 +1511,10 @@ mod tests {
             session.started_at = now;
             let session_id = handle.upsert_agent_session(session).await.unwrap();
 
-            let mut options = CassCorrelationOptions::default();
-            options.override_session_id = Some("cass-override-cx".to_string());
+            let options = CassCorrelationOptions {
+                override_session_id: Some("cass-override-cx".to_string()),
+                ..Default::default()
+            };
 
             let cass = CassClient::new();
             let cx = crate::cx::for_request();

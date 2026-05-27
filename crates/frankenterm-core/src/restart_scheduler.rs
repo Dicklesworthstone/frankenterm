@@ -820,13 +820,15 @@ mod tests {
 
     #[test]
     fn scheduler_cancel() {
-        let mut scheduler = RestartScheduler::default();
-        scheduler.scheduled = Some(ScheduledRestart {
-            scheduled_at_ms: 1_700_000_000_000,
-            score: 0.9,
-            notified: false,
-            snapshot_taken: false,
-        });
+        let mut scheduler = RestartScheduler {
+            scheduled: Some(ScheduledRestart {
+                scheduled_at_ms: 1_700_000_000_000,
+                score: 0.9,
+                notified: false,
+                snapshot_taken: false,
+            }),
+            ..Default::default()
+        };
         scheduler.cancel();
         assert!(scheduler.scheduled().is_none());
     }

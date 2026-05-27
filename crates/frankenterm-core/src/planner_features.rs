@@ -2554,9 +2554,11 @@ mod tests {
 
     #[test]
     fn impact_caps_at_max() {
-        let mut config = PlannerExtractionConfig::default();
-        config.max_unblock_count = 2;
-        config.max_critical_depth = 1;
+        let config = PlannerExtractionConfig {
+            max_unblock_count: 2,
+            max_critical_depth: 1,
+            ..Default::default()
+        };
 
         // root -> a, b, c (3 children, exceeds max_unblock_count=2)
         let issues = vec![

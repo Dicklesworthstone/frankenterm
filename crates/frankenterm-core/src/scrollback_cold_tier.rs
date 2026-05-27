@@ -1253,9 +1253,11 @@ mod tests {
 
     #[test]
     fn stats_cache_hit_rate_caps_at_100() {
-        let mut s = ColdTierStats::default();
-        s.cache_hits = 1_000;
-        s.cache_misses = 0;
+        let s = ColdTierStats {
+            cache_hits: 1_000,
+            cache_misses: 0,
+            ..Default::default()
+        };
         assert_eq!(s.cache_hit_rate_pct(), 100);
     }
 
