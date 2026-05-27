@@ -893,8 +893,10 @@ mod tests {
 
     #[test]
     fn reduce_stale_search_result_ignored() {
-        let mut state = UiState::default();
-        state.search_last_query = "new".to_string();
+        let mut state = UiState {
+            search_last_query: "new".to_string(),
+            ..Default::default()
+        };
 
         // Result from old query arrives
         reduce(
@@ -1340,16 +1342,20 @@ mod tests {
 
     #[test]
     fn timeline_zoom_in_capped_at_5() {
-        let mut state = UiState::default();
-        state.timeline_zoom = 5;
+        let mut state = UiState {
+            timeline_zoom: 5,
+            ..Default::default()
+        };
         reduce(&mut state, UiAction::TimelineZoomIn);
         assert_eq!(state.timeline_zoom, 5);
     }
 
     #[test]
     fn timeline_zoom_out_decrements() {
-        let mut state = UiState::default();
-        state.timeline_zoom = 3;
+        let mut state = UiState {
+            timeline_zoom: 3,
+            ..Default::default()
+        };
         reduce(&mut state, UiAction::TimelineZoomOut);
         assert_eq!(state.timeline_zoom, 2);
     }
@@ -1364,33 +1370,41 @@ mod tests {
 
     #[test]
     fn timeline_scroll_right_increments() {
-        let mut state = UiState::default();
-        state.timeline_count = 10;
+        let mut state = UiState {
+            timeline_count: 10,
+            ..Default::default()
+        };
         reduce(&mut state, UiAction::TimelineScrollRight);
         assert_eq!(state.timeline_scroll, 1);
     }
 
     #[test]
     fn timeline_scroll_right_clamped() {
-        let mut state = UiState::default();
-        state.timeline_count = 3;
-        state.timeline_scroll = 2;
+        let mut state = UiState {
+            timeline_count: 3,
+            timeline_scroll: 2,
+            ..Default::default()
+        };
         reduce(&mut state, UiAction::TimelineScrollRight);
         assert_eq!(state.timeline_scroll, 2); // clamped to count-1
     }
 
     #[test]
     fn timeline_scroll_right_empty() {
-        let mut state = UiState::default();
-        state.timeline_count = 0;
+        let mut state = UiState {
+            timeline_count: 0,
+            ..Default::default()
+        };
         reduce(&mut state, UiAction::TimelineScrollRight);
         assert_eq!(state.timeline_scroll, 0);
     }
 
     #[test]
     fn timeline_scroll_left_decrements() {
-        let mut state = UiState::default();
-        state.timeline_scroll = 5;
+        let mut state = UiState {
+            timeline_scroll: 5,
+            ..Default::default()
+        };
         reduce(&mut state, UiAction::TimelineScrollLeft);
         assert_eq!(state.timeline_scroll, 4);
     }

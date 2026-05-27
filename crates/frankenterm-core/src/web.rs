@@ -1370,17 +1370,19 @@ mod tests {
 
     #[test]
     fn stream_constants_are_sensible() {
-        assert!(STREAM_DEFAULT_MAX_HZ > 0);
-        assert!(STREAM_MAX_MAX_HZ >= STREAM_DEFAULT_MAX_HZ);
-        assert!(STREAM_CHANNEL_BUFFER > 0);
-        assert!(STREAM_KEEPALIVE_SECS > 0);
-        assert!(STREAM_SCAN_LIMIT > 0);
-        assert!(STREAM_SCAN_MAX_PAGES > 0);
-        assert!(STREAM_MAX_CONSECUTIVE_DROPS > 0);
-        assert!(MAX_REQUEST_BODY_BYTES > 0);
-        assert!(MAX_LIMIT > 0);
-        assert!(DEFAULT_LIMIT > 0);
-        assert!(DEFAULT_LIMIT <= MAX_LIMIT);
+        const {
+            assert!(STREAM_DEFAULT_MAX_HZ > 0);
+            assert!(STREAM_MAX_MAX_HZ >= STREAM_DEFAULT_MAX_HZ);
+            assert!(STREAM_CHANNEL_BUFFER > 0);
+            assert!(STREAM_KEEPALIVE_SECS > 0);
+            assert!(STREAM_SCAN_LIMIT > 0);
+            assert!(STREAM_SCAN_MAX_PAGES > 0);
+            assert!(STREAM_MAX_CONSECUTIVE_DROPS > 0);
+            assert!(MAX_REQUEST_BODY_BYTES > 0);
+            assert!(MAX_LIMIT > 0);
+            assert!(DEFAULT_LIMIT > 0);
+            assert!(DEFAULT_LIMIT <= MAX_LIMIT);
+        };
     }
 
     #[test]

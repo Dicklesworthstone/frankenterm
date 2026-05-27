@@ -2109,18 +2109,22 @@ mod tests {
 
     #[test]
     fn constants_are_positive() {
-        assert!(MAX_EVENT_LINE_BYTES > 0);
-        assert!(MAX_OUTPUT_BYTES > 0);
+        const {
+            assert!(MAX_EVENT_LINE_BYTES > 0);
+            assert!(MAX_OUTPUT_BYTES > 0);
+        };
         assert!(!ACCEPT_POLL_INTERVAL.is_zero());
         assert!(!EVENT_SEND_TIMEOUT.is_zero());
     }
 
     #[test]
     fn output_bytes_less_than_line_bytes() {
-        assert!(
-            MAX_OUTPUT_BYTES < MAX_EVENT_LINE_BYTES,
-            "MAX_OUTPUT_BYTES should be less than MAX_EVENT_LINE_BYTES"
-        );
+        const {
+            assert!(
+                MAX_OUTPUT_BYTES < MAX_EVENT_LINE_BYTES,
+                "MAX_OUTPUT_BYTES should be less than MAX_EVENT_LINE_BYTES"
+            );
+        };
     }
 
     // --- WireEvent serialize → deserialize roundtrip tests ---
