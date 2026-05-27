@@ -1393,10 +1393,12 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
         std::io::Write::write_all(file.as_file_mut(), b"token-1").expect("write token");
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token_path = Some(file.path().display().to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token_path: Some(file.path().display().to_string()),
+            ..Default::default()
+        };
 
         let tok1 = resolve_expected_token(&config)
             .expect("resolve token")
@@ -1421,11 +1423,13 @@ mod tests {
 
     #[test]
     fn resolve_expected_token_rejects_ambiguous_sources() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("inline".to_string());
-        config.token_env = Some("ENV".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("inline".to_string()),
+            token_env: Some("ENV".to_string()),
+            ..Default::default()
+        };
 
         let err = resolve_expected_token(&config).expect_err("should be ambiguous");
         assert!(matches!(err, DistributedCredentialError::TokenAmbiguous));
@@ -1657,8 +1661,10 @@ KBAhs4snj5QspGFqkazmIw==
             let server_cert = temp_pem(SERVER_CERT);
             let server_key = temp_pem(SERVER_KEY);
 
-            let mut config = DistributedConfig::default();
-            config.enabled = true;
+            let mut config = DistributedConfig {
+                enabled: true,
+                ..Default::default()
+            };
             config.tls.enabled = true;
             config.tls.cert_path = Some(server_cert.path().display().to_string());
             config.tls.key_path = Some(server_key.path().display().to_string());
@@ -1713,18 +1719,22 @@ KBAhs4snj5QspGFqkazmIw==
             let client_cert = temp_pem(CLIENT_CERT);
             let client_key = temp_pem(CLIENT_KEY);
 
-            let mut server_config = DistributedConfig::default();
-            server_config.enabled = true;
-            server_config.auth_mode = DistributedAuthMode::Mtls;
+            let mut server_config = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Mtls,
+                ..Default::default()
+            };
             server_config.tls.enabled = true;
             server_config.tls.cert_path = Some(server_cert.path().display().to_string());
             server_config.tls.key_path = Some(server_key.path().display().to_string());
             server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
             server_config.allow_agent_ids = vec!["wa-client".to_string()];
 
-            let mut client_config = DistributedConfig::default();
-            client_config.enabled = true;
-            client_config.auth_mode = DistributedAuthMode::Mtls;
+            let mut client_config = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Mtls,
+                ..Default::default()
+            };
             client_config.tls.enabled = true;
             client_config.tls.cert_path = Some(client_cert.path().display().to_string());
             client_config.tls.key_path = Some(client_key.path().display().to_string());
@@ -1777,8 +1787,10 @@ KBAhs4snj5QspGFqkazmIw==
             let server_cert = temp_pem(SERVER_CERT);
             let server_key = temp_pem(SERVER_KEY);
 
-            let mut config = DistributedConfig::default();
-            config.enabled = true;
+            let mut config = DistributedConfig {
+                enabled: true,
+                ..Default::default()
+            };
             config.tls.enabled = true;
             config.tls.cert_path = Some(server_cert.path().display().to_string());
             config.tls.key_path = Some(server_key.path().display().to_string());
@@ -1836,17 +1848,21 @@ KBAhs4snj5QspGFqkazmIw==
             let server_cert = temp_pem(SERVER_CERT);
             let server_key = temp_pem(SERVER_KEY);
 
-            let mut server_config = DistributedConfig::default();
-            server_config.enabled = true;
-            server_config.auth_mode = DistributedAuthMode::Mtls;
+            let mut server_config = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Mtls,
+                ..Default::default()
+            };
             server_config.tls.enabled = true;
             server_config.tls.cert_path = Some(server_cert.path().display().to_string());
             server_config.tls.key_path = Some(server_key.path().display().to_string());
             server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
 
-            let mut client_config = DistributedConfig::default();
-            client_config.enabled = true;
-            client_config.auth_mode = DistributedAuthMode::Token;
+            let mut client_config = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Token,
+                ..Default::default()
+            };
             client_config.tls.enabled = true;
 
             let server_tls = build_server_config(
@@ -1904,18 +1920,22 @@ KBAhs4snj5QspGFqkazmIw==
             let client_cert = temp_pem(CLIENT_CERT);
             let client_key = temp_pem(CLIENT_KEY);
 
-            let mut server_config = DistributedConfig::default();
-            server_config.enabled = true;
-            server_config.auth_mode = DistributedAuthMode::Mtls;
+            let mut server_config = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Mtls,
+                ..Default::default()
+            };
             server_config.tls.enabled = true;
             server_config.tls.cert_path = Some(server_cert.path().display().to_string());
             server_config.tls.key_path = Some(server_key.path().display().to_string());
             server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
             server_config.allow_agent_ids = vec!["not-allowed".to_string()];
 
-            let mut client_config = DistributedConfig::default();
-            client_config.enabled = true;
-            client_config.auth_mode = DistributedAuthMode::Mtls;
+            let mut client_config = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Mtls,
+                ..Default::default()
+            };
             client_config.tls.enabled = true;
             client_config.tls.cert_path = Some(client_cert.path().display().to_string());
             client_config.tls.key_path = Some(client_key.path().display().to_string());
@@ -1972,8 +1992,10 @@ KBAhs4snj5QspGFqkazmIw==
             let server_cert = temp_pem(SERVER_CERT);
             let server_key = temp_pem(SERVER_KEY);
 
-            let mut config = DistributedConfig::default();
-            config.enabled = true;
+            let mut config = DistributedConfig {
+                enabled: true,
+                ..Default::default()
+            };
             config.tls.enabled = true;
             config.tls.cert_path = Some(server_cert.path().display().to_string());
             config.tls.key_path = Some(server_key.path().display().to_string());
@@ -2239,10 +2261,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_enabled_loopback_with_token_is_ready() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("test-secret".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("test-secret".to_string()),
+            ..Default::default()
+        };
         // bind_addr defaults to 127.0.0.1:4141 (loopback)
         // TLS not required for loopback
 
@@ -2283,9 +2307,11 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_missing_auth_credentials_fails() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            ..Default::default()
+        };
         // No token, token_env, or token_path set
 
         let report = evaluate_readiness(&config);
@@ -2300,9 +2326,11 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_mtls_only_passes_auth_without_token() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Mtls;
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Mtls,
+            ..Default::default()
+        };
         // No token set — mTLS-only doesn't need one
 
         let report = evaluate_readiness(&config);
@@ -2316,10 +2344,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_no_agent_allowlist_is_advisory_warning() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("secret".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("secret".to_string()),
+            ..Default::default()
+        };
         // No allow_agent_ids set
 
         let report = evaluate_readiness(&config);
@@ -2334,11 +2364,13 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_agent_allowlist_passes_when_set() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("secret".to_string());
-        config.allow_agent_ids = vec!["agent-1".to_string(), "agent-2".to_string()];
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("secret".to_string()),
+            allow_agent_ids: vec!["agent-1".to_string(), "agent-2".to_string()],
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let advisory = report
@@ -2351,11 +2383,13 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_non_loopback_without_tls_fails() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("test-secret".to_string());
-        config.bind_addr = "0.0.0.0:4141".to_string();
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("test-secret".to_string()),
+            bind_addr: "0.0.0.0:4141".to_string(),
+            ..Default::default()
+        };
         // TLS disabled, not loopback, allow_insecure=false
 
         let report = evaluate_readiness(&config);
@@ -2370,11 +2404,13 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_non_loopback_with_tls_passes() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("test-secret".to_string());
-        config.bind_addr = "10.0.0.1:4141".to_string();
+        let mut config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("test-secret".to_string()),
+            bind_addr: "10.0.0.1:4141".to_string(),
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some("/etc/certs/server.pem".to_string());
         config.tls.key_path = Some("/etc/certs/server.key".to_string());
@@ -2396,12 +2432,14 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_allow_insecure_bypasses_tls_with_advisory_warning() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("test-secret".to_string());
-        config.bind_addr = "0.0.0.0:4141".to_string();
-        config.allow_insecure = true; // bypass TLS requirement
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("test-secret".to_string()),
+            bind_addr: "0.0.0.0:4141".to_string(),
+            allow_insecure: true, // bypass TLS requirement
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let tls = report
@@ -2422,10 +2460,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_tls_enabled_without_paths_fails() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("test-secret".to_string());
+        let mut config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("test-secret".to_string()),
+            ..Default::default()
+        };
         config.tls.enabled = true;
         // No cert_path or key_path
 
@@ -2441,9 +2481,11 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_empty_bind_addr_fails() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.bind_addr = String::new();
+        let config = DistributedConfig {
+            enabled: true,
+            bind_addr: String::new(),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let bind = report
@@ -2457,10 +2499,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_report_counts_correct() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("test-secret".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("test-secret".to_string()),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let manual_required_pass = report.items.iter().filter(|i| i.required && i.pass).count();
@@ -2481,10 +2525,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_report_serde_roundtrip_batch2() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("test-secret".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("test-secret".to_string()),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let json = serde_json::to_string(&report).expect("serialize report");
@@ -2516,10 +2562,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_token_env_satisfies_auth() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token_env = Some("FT_DIST_TOKEN".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token_env: Some("FT_DIST_TOKEN".to_string()),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let auth = report
@@ -2532,10 +2580,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_token_path_satisfies_auth() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token_path = Some("/run/secrets/wa-token".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token_path: Some("/run/secrets/wa-token".to_string()),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let auth = report
@@ -2548,11 +2598,13 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_ipv6_loopback_recognized() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("secret".to_string());
-        config.bind_addr = "[::1]:4141".to_string();
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("secret".to_string()),
+            bind_addr: "[::1]:4141".to_string(),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let tls = report
@@ -2565,11 +2617,13 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_localhost_recognized_as_loopback() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("secret".to_string());
-        config.bind_addr = "localhost:4141".to_string();
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("secret".to_string()),
+            bind_addr: "localhost:4141".to_string(),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let tls = report
@@ -2623,10 +2677,12 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn readiness_report_json_fields_stable() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("secret".to_string());
+        let config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("secret".to_string()),
+            ..Default::default()
+        };
 
         let report = evaluate_readiness(&config);
         let json = serde_json::to_value(&report).expect("serialize");
@@ -2952,8 +3008,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn token_source_kind_inline() {
-        let mut config = DistributedConfig::default();
-        config.token = Some("inline-token".to_string());
+        let config = DistributedConfig {
+            token: Some("inline-token".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::Inline)
@@ -2962,8 +3020,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn token_source_kind_env() {
-        let mut config = DistributedConfig::default();
-        config.token_env = Some("FT_TOKEN".to_string());
+        let config = DistributedConfig {
+            token_env: Some("FT_TOKEN".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::Env)
@@ -2972,8 +3032,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn token_source_kind_file() {
-        let mut config = DistributedConfig::default();
-        config.token_path = Some("/run/secrets/token".to_string());
+        let config = DistributedConfig {
+            token_path: Some("/run/secrets/token".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::File)
@@ -2988,17 +3050,21 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn token_source_kind_none_when_ambiguous() {
-        let mut config = DistributedConfig::default();
-        config.token = Some("inline".to_string());
-        config.token_env = Some("ENV".to_string());
+        let config = DistributedConfig {
+            token: Some("inline".to_string()),
+            token_env: Some("ENV".to_string()),
+            ..Default::default()
+        };
         assert_eq!(configured_token_source_kind(&config), None);
     }
 
     #[test]
     fn token_source_kind_ignores_empty_strings() {
-        let mut config = DistributedConfig::default();
-        config.token = Some("  ".to_string()); // whitespace only
-        config.token_env = Some("REAL_VAR".to_string());
+        let config = DistributedConfig {
+            token: Some("  ".to_string()), // whitespace only
+            token_env: Some("REAL_VAR".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::Env)
@@ -3024,9 +3090,11 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn resolve_token_inline() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("my-secret".to_string());
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("my-secret".to_string()),
+            ..Default::default()
+        };
 
         let tok = resolve_expected_token(&config).unwrap().unwrap();
         assert_eq!(tok, "my-secret");
@@ -3034,8 +3102,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn resolve_token_no_auth_returns_none() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Mtls;
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Mtls,
+            ..Default::default()
+        };
         // Mtls doesn't require token
 
         assert_eq!(resolve_expected_token(&config).unwrap(), None);
@@ -3043,8 +3113,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn resolve_token_missing_all_sources() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Token;
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Token,
+            ..Default::default()
+        };
         // No token, token_env, or token_path
 
         assert!(matches!(
@@ -3174,9 +3246,11 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn resolve_token_empty_inline() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("  ".to_string()); // whitespace only, treated as empty
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("  ".to_string()), // whitespace only, treated as empty
+            ..Default::default()
+        };
 
         assert!(matches!(
             resolve_expected_token(&config),
@@ -3186,9 +3260,11 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn resolve_token_env_missing_var() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token_env = Some("FT_NONEXISTENT_TEST_VAR_12345".to_string());
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Token,
+            token_env: Some("FT_NONEXISTENT_TEST_VAR_12345".to_string()),
+            ..Default::default()
+        };
 
         assert!(matches!(
             resolve_expected_token(&config),
@@ -3198,9 +3274,11 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn resolve_token_file_not_found() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token_path = Some("/nonexistent/path/to/token".to_string());
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Token,
+            token_path: Some("/nonexistent/path/to/token".to_string()),
+            ..Default::default()
+        };
 
         assert!(matches!(
             resolve_expected_token(&config),
@@ -3278,8 +3356,10 @@ KBAhs4snj5QspGFqkazmIw==
     #[cfg(feature = "distributed")]
     #[test]
     fn build_tls_bundle_rejects_tls_disabled_config() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         // tls.enabled is left as default (false).
         let err = match build_tls_bundle(&config, None) {
             Ok(_) => panic!("disabled TLS must fail"),
@@ -3294,8 +3374,10 @@ KBAhs4snj5QspGFqkazmIw==
     #[cfg(feature = "distributed")]
     #[test]
     fn build_tls_bundle_rejects_missing_cert_path() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.key_path = Some("/dev/null".to_string()); // populated
         // cert_path intentionally left None.
@@ -3312,8 +3394,10 @@ KBAhs4snj5QspGFqkazmIw==
     #[cfg(feature = "distributed")]
     #[test]
     fn build_tls_bundle_rejects_missing_key_path() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some("/dev/null".to_string()); // populated
         // key_path intentionally left None.
@@ -3348,8 +3432,10 @@ KBAhs4snj5QspGFqkazmIw==
         let server_key = temp_pem(SERVER_KEY);
         let ca_cert = temp_pem(CA_CERT);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
@@ -3369,8 +3455,10 @@ KBAhs4snj5QspGFqkazmIw==
         let server_key = temp_pem(SERVER_KEY);
         let ca_cert = temp_pem(CA_CERT);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
@@ -3393,8 +3481,10 @@ KBAhs4snj5QspGFqkazmIw==
         let server_key = temp_pem(SERVER_KEY);
         let ca_cert = temp_pem(CA_CERT);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
@@ -3423,13 +3513,15 @@ KBAhs4snj5QspGFqkazmIw==
         let server_cert = temp_pem(SERVER_CERT);
         let server_key = temp_pem(SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            auth_mode: DistributedAuthMode::Mtls,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
         // client_ca_path intentionally left as None.
-        config.auth_mode = DistributedAuthMode::Mtls;
 
         let err = match build_tls_bundle(&config, None) {
             Ok(_) => panic!("mTLS without client CA path must fail"),
@@ -3460,8 +3552,10 @@ KBAhs4snj5QspGFqkazmIw==
         let empty_cert = temp_pem("# placeholder — no cert blocks\n");
         let server_key = temp_pem(SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(empty_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
@@ -3492,8 +3586,10 @@ KBAhs4snj5QspGFqkazmIw==
         // `load_private_key` should reject as EmptyPrivateKey.
         let wrong_key = temp_pem(SERVER_CERT);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(wrong_key.path().display().to_string());
@@ -3528,8 +3624,10 @@ KBAhs4snj5QspGFqkazmIw==
     #[cfg(feature = "distributed")]
     #[test]
     fn build_tls_bundle_surfaces_io_error_with_path_for_missing_cert_file() {
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         // Point at a path that does not exist.
         config.tls.cert_path = Some("/nonexistent/frankenterm-rusticmaple-cert.pem".to_string());
@@ -3564,8 +3662,10 @@ KBAhs4snj5QspGFqkazmIw==
         let server_cert = temp_pem(SERVER_CERT);
         let server_key = temp_pem(SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
@@ -3878,8 +3978,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn configured_token_source_kind_inline_only() {
-        let mut config = DistributedConfig::default();
-        config.token = Some("secret".to_string());
+        let config = DistributedConfig {
+            token: Some("secret".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::Inline)
@@ -3888,8 +3990,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn configured_token_source_kind_env_only() {
-        let mut config = DistributedConfig::default();
-        config.token_env = Some("MY_TOKEN".to_string());
+        let config = DistributedConfig {
+            token_env: Some("MY_TOKEN".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::Env)
@@ -3898,8 +4002,10 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn configured_token_source_kind_file_only() {
-        let mut config = DistributedConfig::default();
-        config.token_path = Some("/tmp/token".to_string());
+        let config = DistributedConfig {
+            token_path: Some("/tmp/token".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             configured_token_source_kind(&config),
             Some(DistributedTokenSourceKind::File)
@@ -3914,16 +4020,20 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn configured_token_source_kind_multiple() {
-        let mut config = DistributedConfig::default();
-        config.token = Some("secret".to_string());
-        config.token_env = Some("ENV".to_string());
+        let config = DistributedConfig {
+            token: Some("secret".to_string()),
+            token_env: Some("ENV".to_string()),
+            ..Default::default()
+        };
         assert_eq!(configured_token_source_kind(&config), None);
     }
 
     #[test]
     fn configured_token_source_kind_whitespace_ignored() {
-        let mut config = DistributedConfig::default();
-        config.token = Some("  ".to_string()); // whitespace only → treated as empty
+        let config = DistributedConfig {
+            token: Some("  ".to_string()), // whitespace only → treated as empty
+            ..Default::default()
+        };
         assert_eq!(configured_token_source_kind(&config), None);
     }
 
@@ -4007,25 +4117,31 @@ KBAhs4snj5QspGFqkazmIw==
 
     #[test]
     fn resolve_expected_token_no_auth_required() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Mtls; // mtls doesn't require token
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Mtls, // mtls doesn't require token
+            ..Default::default()
+        };
         let result = resolve_expected_token(&config).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn resolve_expected_token_inline() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Token;
-        config.token = Some("inline-secret".to_string());
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Token,
+            token: Some("inline-secret".to_string()),
+            ..Default::default()
+        };
         let tok = resolve_expected_token(&config).unwrap().unwrap();
         assert_eq!(tok, "inline-secret");
     }
 
     #[test]
     fn resolve_expected_token_missing() {
-        let mut config = DistributedConfig::default();
-        config.auth_mode = DistributedAuthMode::Token;
+        let config = DistributedConfig {
+            auth_mode: DistributedAuthMode::Token,
+            ..Default::default()
+        };
         // no token source at all
         let err = resolve_expected_token(&config).unwrap_err();
         assert!(matches!(err, DistributedCredentialError::TokenMissing));
@@ -4045,8 +4161,10 @@ KBAhs4snj5QspGFqkazmIw==
             let server_cert = temp_pem(SERVER_CERT);
             let server_key = temp_pem(SERVER_KEY);
 
-            let mut config = DistributedConfig::default();
-            config.enabled = true;
+            let mut config = DistributedConfig {
+                enabled: true,
+                ..Default::default()
+            };
             config.tls.enabled = true;
             config.tls.cert_path = Some(server_cert.path().display().to_string());
             config.tls.key_path = Some(server_key.path().display().to_string());
@@ -4093,18 +4211,22 @@ KBAhs4snj5QspGFqkazmIw==
             let client_cert = temp_pem(CLIENT_CERT);
             let client_key = temp_pem(CLIENT_KEY);
 
-            let mut server_cfg = DistributedConfig::default();
-            server_cfg.enabled = true;
-            server_cfg.auth_mode = DistributedAuthMode::Mtls;
+            let mut server_cfg = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Mtls,
+                ..Default::default()
+            };
             server_cfg.tls.enabled = true;
             server_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
             server_cfg.tls.key_path = Some(server_key.path().display().to_string());
             server_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
             server_cfg.allow_agent_ids = vec!["wa-client".to_string()];
 
-            let mut client_cfg = DistributedConfig::default();
-            client_cfg.enabled = true;
-            client_cfg.auth_mode = DistributedAuthMode::Mtls;
+            let mut client_cfg = DistributedConfig {
+                enabled: true,
+                auth_mode: DistributedAuthMode::Mtls,
+                ..Default::default()
+            };
             client_cfg.tls.enabled = true;
             client_cfg.tls.cert_path = Some(client_cert.path().display().to_string());
             client_cfg.tls.key_path = Some(client_key.path().display().to_string());
@@ -4158,8 +4280,10 @@ KBAhs4snj5QspGFqkazmIw==
         let server_cert = temp_pem(SERVER_CERT);
         let server_key = temp_pem(SERVER_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
+        let mut config = DistributedConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config.tls.enabled = true;
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
@@ -6186,8 +6310,10 @@ KBAhs4snj5QspGFqkazmIw==
             let server_cert = temp_pem(SERVER_CERT);
             let server_key = temp_pem(SERVER_KEY);
 
-            let mut config = DistributedConfig::default();
-            config.enabled = true;
+            let mut config = DistributedConfig {
+                enabled: true,
+                ..Default::default()
+            };
             config.tls.enabled = true;
             config.tls.cert_path = Some(server_cert.path().display().to_string());
             config.tls.key_path = Some(server_key.path().display().to_string());
@@ -6241,8 +6367,10 @@ KBAhs4snj5QspGFqkazmIw==
             let server_cert = temp_pem(SERVER_CERT);
             let server_key = temp_pem(SERVER_KEY);
 
-            let mut config = DistributedConfig::default();
-            config.enabled = true;
+            let mut config = DistributedConfig {
+                enabled: true,
+                ..Default::default()
+            };
             config.tls.enabled = true;
             config.tls.cert_path = Some(server_cert.path().display().to_string());
             config.tls.key_path = Some(server_key.path().display().to_string());
