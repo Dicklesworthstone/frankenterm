@@ -916,26 +916,28 @@ fn saturating_atomic_add(counter: &AtomicU64, delta: u64) {
 impl ChannelLagTracker {
     fn register(&self, poison_counter: &AtomicU64) -> Arc<AtomicU64> {
         let position = Arc::new(AtomicU64::new(self.sent_seq.load(Ordering::Relaxed)));
-        match self.subscriber_positions.lock() {
-            Ok(mut guard) => {
-                // Prune positions whose subscriber has been dropped before pushing
-                // the new one. Without this, `subscriber_positions` grows without
-                // bound under subscribe/drop churn whenever lag is never queried —
-                // `queued_len`/`oldest_lag_ms` are the only other places that prune,
-                // and they are caller-driven. This keeps the vec bounded by the
-                // live subscriber count regardless of query cadence.
-                guard.retain(|weak| weak.strong_count() > 0);
-                guard.push(Arc::downgrade(&position));
-            }
-            Err(_) => {
-                // br-ft-skec1 site #7: subscriber-positions mutex poisoned →
-                // this subscriber's position is never registered, so it is
-                // invisible to queued_len/oldest_lag_ms and its backlog is
-                // silently undercounted for its entire lifetime. Surface the
-                // loss for parity with the other br-ft-skec1 sites.
+        // ft-htof1 (br-ft-skec1 site #7): a poisoned subscriber_positions mutex
+        // means some other thread panicked while holding it, but the Vec itself
+        // is structurally intact. Recover it via into_inner() so this subscriber
+        // is STILL registered (previously its position was dropped, making it
+        // invisible to queued_len/oldest_lag_ms — its backlog undercounted for
+        // its whole lifetime), and bump the counter so the poison stays
+        // observable rather than silent.
+        let mut guard = match self.subscriber_positions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
                 poison_counter.fetch_add(1, Ordering::Relaxed);
+                poisoned.into_inner()
             }
-        }
+        };
+        // Prune positions whose subscriber has been dropped before pushing
+        // the new one. Without this, `subscriber_positions` grows without
+        // bound under subscribe/drop churn whenever lag is never queried —
+        // `queued_len`/`oldest_lag_ms` are the only other places that prune,
+        // and they are caller-driven. This keeps the vec bounded by the
+        // live subscriber count regardless of query cadence.
+        guard.retain(|weak| weak.strong_count() > 0);
+        guard.push(Arc::downgrade(&position));
         position
     }
 
@@ -947,12 +949,14 @@ impl ChannelLagTracker {
         let sent = self.sent_seq.load(Ordering::Relaxed);
         let mut positions = match self.subscriber_positions.lock() {
             Ok(guard) => guard,
-            Err(_) => {
-                // br-ft-skec1 site #8: subscriber-positions mutex poisoned →
-                // queued_len reports 0 (no backlog), masking a genuine backlog.
-                // Surface the loss for parity with oldest_lag_ms (site #6).
+            Err(poisoned) => {
+                // ft-htof1 (br-ft-skec1 site #8): recover the poisoned guard and
+                // compute the REAL backlog instead of masking it as 0 (which
+                // previously hid a genuine backlog), and bump the counter so the
+                // poison stays observable. The Vec is structurally intact; poison
+                // only signals another thread panicked while holding the lock.
                 poison_counter.fetch_add(1, Ordering::Relaxed);
-                return 0;
+                poisoned.into_inner()
             }
         };
         positions.retain(|position| position.strong_count() > 0);
@@ -2602,6 +2606,58 @@ mod tests {
             "queued_len must surface the poisoned-lock loss too \
              (register={after_register}, after_stats={after_queued})"
         );
+    }
+
+    /// ft-htof1: a poisoned subscriber_positions mutex must be RECOVERED via
+    /// into_inner — not degraded to a dropped registration / masked-0 backlog —
+    /// so the tracker keeps functioning, while STILL bumping the poison counter
+    /// for observability. Distinct from
+    /// `lag_tracker_register_and_queued_len_surface_poison`, which pins only the
+    /// counter; this pins the recovered functional behavior.
+    #[test]
+    fn lag_tracker_recovers_poisoned_lock_ft_htof1() {
+        let tracker = ChannelLagTracker::default();
+        let poison_counter = AtomicU64::new(0);
+
+        // Poison the mutex by panicking while holding the guard.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tracker
+                .subscriber_positions
+                .lock()
+                .expect("lock before poison");
+            panic!("intentional poison");
+        }));
+        assert!(poisoned.is_err());
+
+        // register() on the poisoned lock must recover and ACTUALLY register
+        // the subscriber (previously its position was silently dropped), and
+        // bump the counter.
+        let position = tracker.register(&poison_counter);
+        assert_eq!(
+            poison_counter.load(Ordering::Relaxed),
+            1,
+            "register must bump the poison counter on a poisoned lock"
+        );
+
+        // One send beyond the registered position creates a backlog of 1.
+        tracker.record_send();
+
+        // queued_len() on the (still-poisoned) lock must recover and report the
+        // REAL backlog of 1 — not mask it as 0 — and bump the counter again.
+        // Poison is sticky (into_inner does not clear it), so every access keeps
+        // surfacing the signal.
+        let backlog = tracker.queued_len(&poison_counter);
+        assert_eq!(
+            backlog, 1,
+            "queued_len must recover the poisoned lock and report the real \
+             backlog, not a masked 0"
+        );
+        assert_eq!(
+            poison_counter.load(Ordering::Relaxed),
+            2,
+            "queued_len must also bump the poison counter on a poisoned lock"
+        );
+        drop(position);
     }
 
     /// Structure-aware fuzz / property coverage for the untrusted user-var
