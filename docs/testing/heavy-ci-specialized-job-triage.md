@@ -62,6 +62,14 @@ ordinary Rust code.
   scripts/check_runtime_proof_coverage.py` now reports `uncovered: 0`, and
   `cargo check -p frankenterm-core --lib` passed through RCH remote worker
   `vmi1227854`.
+- Follow-up local generated-artifact checks on the dirty shared checkout must
+  not use `scripts/check_generated_artifacts.sh` as a whole-tree verdict: that
+  wrapper intentionally fails on any unrelated `git diff` or untracked file.
+  The component checks are clean: schema docs have no tracked drift,
+  renderer-corpus drift guard passes, mux-interface guard passes,
+  workspace-cycle guard passes in GitHub Actions local-Cargo mode, loom skeleton
+  coverage passes, RuntimeProof uncovered remains `0`, and the
+  asupersync-test-only guard passes.
 - Coverage: old run `26488812786`, job `78001994064`, failed before coverage
   measurement because `cairo-sys-rs` could not find `cairo.pc`. The fixable CI
   package gap is closed in `ci.yml` by installing Cairo/X11/pkg-config packages
