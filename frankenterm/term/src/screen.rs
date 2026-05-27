@@ -3332,6 +3332,10 @@ mod tests {
     }
 
     #[test]
+    // The empty (`2..2`) and reversed (`2..1`) ranges are the deliberate inputs
+    // under test — `stable_range` must clamp both to `0..0`. The literals trip
+    // the deny-by-default `clippy::reversed_empty_ranges` correctness lint.
+    #[allow(clippy::reversed_empty_ranges)]
     fn stable_range_rejects_empty_and_reversed_ranges() {
         let screen = test_screen(3, 8, 96);
 

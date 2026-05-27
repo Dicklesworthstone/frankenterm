@@ -664,6 +664,10 @@ mod tests {
     }
 
     #[test]
+    // The empty (`5..5`) and reversed (`8..4`) ranges are the deliberate inputs
+    // under test — `sort_if_needed` must drop both. The literals trip the
+    // deny-by-default `clippy::reversed_empty_ranges` correctness lint.
+    #[allow(clippy::reversed_empty_ranges)]
     fn sort_if_needed_drops_empty_unchecked_ranges() {
         let mut set = RangeSet::new();
         set.add_range_unchecked(5..5);
