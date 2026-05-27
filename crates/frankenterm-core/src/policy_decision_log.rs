@@ -141,6 +141,8 @@ impl PolicyDecisionLog {
     ///
     /// Returns the sequence number assigned to the entry, or `None` if
     /// the entry was filtered out by configuration.
+    // Decision-log rows preserve the policy action, context, and outcome dimensions explicitly.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         timestamp_ms: u64,

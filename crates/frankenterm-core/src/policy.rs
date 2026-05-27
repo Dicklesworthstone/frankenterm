@@ -1070,6 +1070,8 @@ impl ApprovalTracker {
     }
 
     /// Submit a new approval request. Returns the generated approval ID.
+    // Approval requests keep action, risk, actor, and context fields explicit at submission.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &mut self,
         action: &str,
@@ -2807,6 +2809,8 @@ impl DecisionContext {
     /// Build the standard audit-trace context shape for non-policy-originated
     /// audit records that still need structured policy metadata.
     #[must_use]
+    // Audit construction mirrors the persisted policy decision schema.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_audit(
         timestamp_ms: i64,
         action: ActionKind,
@@ -5093,6 +5097,8 @@ impl PolicyEngine {
     ///
     /// Creates a pending approval entry and records it in the audit chain.
     /// Returns the generated approval ID.
+    // Approval submission preserves the request envelope and audit metadata as explicit fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_approval(
         &mut self,
         action: &str,
@@ -5633,6 +5639,8 @@ impl PolicyEngine {
     }
 
     /// Quarantine a component and record the action in the audit chain.
+    // Quarantine audit entries keep component, scope, and operator context explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn quarantine_component(
         &mut self,
         component_id: &str,
@@ -7703,6 +7711,8 @@ where
     /// `inject` — no cx propagation there because they're either
     /// synchronous (policy eval, decision capture) or already
     /// bounded by their own timeouts (audit storage writes).
+    // Policy injection keeps Cx, command, actor, and audit dependencies explicit.
+    #[allow(clippy::too_many_arguments)]
     async fn inject_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -8064,6 +8074,8 @@ where
         .await
     }
 
+    // Detached policy injection preserves the same boundary fields without hiding lifetimes.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn inject_with_cx_detached<'a>(
         &mut self,
         cx: &'a crate::cx::Cx,

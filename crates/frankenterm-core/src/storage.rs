@@ -4377,6 +4377,8 @@ impl StorageHandle {
 
     /// Insert a session checkpoint with per-pane state rows.
     /// Returns the checkpoint ID.
+    // Checkpoint insertion keeps session, pane, and resource snapshots explicit at the API boundary.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_session_checkpoint(
         &self,
         session_id: String,
@@ -5043,6 +5045,8 @@ impl StorageHandle {
     ///
     /// This is a storage-level bridge between FTS lexical results and the
     /// semantic retrieval lane, suitable for CLI/robot/MCP integration.
+    // Hybrid search exposes lexical, semantic, and tuning knobs explicitly for callers.
+    #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search_with_results(
         &self,
         query: &str,
@@ -11560,6 +11564,8 @@ fn insert_mux_session_backend(
 /// semantics while inserting the checkpoint row, pane-state batch,
 /// and mux-session timestamp update through [`StorageBackend`].
 /// Called from the writer-thread dispatcher.
+// Backend checkpoint writes preserve checkpoint metadata and pane rows as a single transaction.
+#[allow(clippy::too_many_arguments)]
 fn insert_session_checkpoint_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
@@ -13973,6 +13979,8 @@ fn resolve_semantic_lane_backend(
     }
 }
 
+// Hybrid search backend keeps lexical, semantic, and timeout controls explicit for scoring.
+#[allow(clippy::too_many_arguments)]
 fn hybrid_search_with_results_backend(
     backend: &dyn StorageBackend,
     query: &str,
