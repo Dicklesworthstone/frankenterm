@@ -823,8 +823,10 @@ fn storage_handle_hybrid_search_uses_semantic_cache_and_invalidation() {
     rt.block_on(async {
         let db_path = temp_db_path();
         let handle = StorageHandle::new(&db_path).await.unwrap();
-        let mut config = SemanticBudgetConfig::default();
-        config.max_semantic_latency_ms = u64::MAX;
+        let config = SemanticBudgetConfig {
+            max_semantic_latency_ms: u64::MAX,
+            ..SemanticBudgetConfig::default()
+        };
         handle.set_semantic_budget_config(config);
 
         handle.upsert_pane(test_pane(1)).await.unwrap();
@@ -1885,8 +1887,10 @@ fn write_queue_capacity_matches_config() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let db_path = temp_db_path();
-        let mut config = StorageConfig::default();
-        config.write_queue_size = 64;
+        let config = StorageConfig {
+            write_queue_size: 64,
+            ..StorageConfig::default()
+        };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
         assert_eq!(handle.write_queue_capacity(), 64);
@@ -1954,8 +1958,10 @@ fn gap_recording_works_under_backpressure() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let db_path = temp_db_path();
-        let mut config = StorageConfig::default();
-        config.write_queue_size = 4;
+        let config = StorageConfig {
+            write_queue_size: 4,
+            ..StorageConfig::default()
+        };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
         handle.upsert_pane(test_pane(1)).await.unwrap();

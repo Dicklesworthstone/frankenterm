@@ -74,8 +74,10 @@ fn correlate_and_persist_override_updates_session() {
         session.started_at = now;
         let session_id = handle.upsert_agent_session(session).await.unwrap();
 
-        let mut options = CassCorrelationOptions::default();
-        options.override_session_id = Some("cass-override".to_string());
+        let options = CassCorrelationOptions {
+            override_session_id: Some("cass-override".to_string()),
+            ..CassCorrelationOptions::default()
+        };
 
         let cass = CassClient::new();
         let correlation =
