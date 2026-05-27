@@ -48,7 +48,7 @@ fn parse_cost_usd_field(value: &serde_json::Value) -> Option<f64> {
 }
 
 fn cooldown_query_since_ms(now_ms: i64, cooldown_ms: i64) -> i64 {
-    now_ms.saturating_sub(cooldown_ms.max(0))
+    now_ms.saturating_sub(cooldown_ms.max(0)).max(0)
 }
 
 fn new_workflow_handler_audit_context(
