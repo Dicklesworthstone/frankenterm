@@ -3888,6 +3888,61 @@ mod tests {
     }
 
     #[test]
+    fn duration_micros_u64_is_exact_for_small_and_saturates_at_max() {
+        use std::time::Duration;
+
+        // Exact for representable durations (no rounding, no panic).
+        assert_eq!(duration_micros_u64(Duration::ZERO), 0);
+        assert_eq!(duration_micros_u64(Duration::from_micros(1)), 1);
+        assert_eq!(duration_micros_u64(Duration::from_micros(1234)), 1234);
+        assert_eq!(duration_micros_u64(Duration::from_millis(5)), 5_000);
+        assert_eq!(duration_micros_u64(Duration::from_secs(2)), 2_000_000);
+
+        // Exact right up to the u64 ceiling (as_micros() == u64::MAX still fits).
+        assert_eq!(
+            duration_micros_u64(Duration::from_micros(u64::MAX)),
+            u64::MAX
+        );
+
+        // Saturates (rather than panicking or wrapping) once micros exceed u64.
+        let just_over = Duration::from_micros(u64::MAX) + Duration::from_micros(1);
+        assert_eq!(duration_micros_u64(just_over), u64::MAX);
+        assert_eq!(duration_micros_u64(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn viewport_first_reflow_records_last_viewport_first_reflow_us() {
+        let mut screen = test_screen(3, 8, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(
+            (0..12)
+                .map(|idx| Line::from_text(&format!("line{idx:02}xx"), &attrs, 0, None))
+                .collect::<Vec<_>>(),
+        );
+
+        // Sentinel the field with a value the real recording — bounded by the
+        // resize wall-clock window — can never legitimately produce, so the
+        // post-resize check proves the reflow path overwrote it rather than
+        // leaving it stale. (An untouched field would still read u64::MAX.)
+        screen.last_viewport_first_reflow_us = u64::MAX;
+
+        let started = Instant::now();
+        let _cursor = screen.resize(test_size(3, 4, 96), test_cursor(0, 2, 1), 2, false);
+        let total_us = duration_micros_u64(started.elapsed());
+
+        let recorded = screen.last_viewport_first_reflow_us();
+        assert_ne!(
+            recorded,
+            u64::MAX,
+            "viewport reflow must record (overwrite) last_viewport_first_reflow_us"
+        );
+        assert!(
+            recorded <= total_us,
+            "recorded reflow micros ({recorded}) must be bounded by the resize window ({total_us})"
+        );
+    }
+
+    #[test]
     fn viewport_first_reflow_is_isomorphic_to_full_scan() {
         let mut screen = test_screen(3, 8, 96);
         let attrs = CellAttributes::blank();

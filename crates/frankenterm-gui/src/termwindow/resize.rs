@@ -659,4 +659,20 @@ mod tests {
             "generation bump should saturate instead of wrapping cache keys"
         );
     }
+
+    #[test]
+    fn scale_change_shape_generation_bump_saturates_without_wrapping() {
+        // saturating_add(1): a plain increment everywhere below the ceiling...
+        assert_eq!(next_shape_generation_for_scale_change(1), 2);
+        // ...reaching usize::MAX exactly from one below it.
+        assert_eq!(
+            next_shape_generation_for_scale_change(usize::MAX - 1),
+            usize::MAX
+        );
+        // At the ceiling it must clamp, never wrap to 0 — a wrapped generation
+        // would alias an already-issued shape generation and poison the kerning
+        // cache rather than invalidating it.
+        assert_eq!(next_shape_generation_for_scale_change(usize::MAX), usize::MAX);
+        assert_ne!(next_shape_generation_for_scale_change(usize::MAX), 0);
+    }
 }
