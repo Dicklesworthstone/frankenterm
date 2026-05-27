@@ -4038,6 +4038,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dedup_repeated_hits_keep_hot_entry_resident_while_colder_entries_evict_ft_xs8v6() {
+        let cap = 4;
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), cap);
+
+        for key in ["hot", "cold-1", "cold-2", "cold-3"] {
+            assert_eq!(dedup.check(key), DedupeVerdict::New);
+        }
+
+        for i in 0..8 {
+            let hot = dedup.check("hot");
+            assert!(
+                matches!(hot, DedupeVerdict::Duplicate { .. }),
+                "iteration {i}: hot key must still be resident and duplicate, got {hot:?}"
+            );
+            assert_eq!(dedup.check(&format!("novel-{i}")), DedupeVerdict::New);
+            assert_eq!(dedup.len(), cap);
+            assert!(
+                dedup.get("hot").is_some(),
+                "iteration {i}: active duplicate hit must refresh LRU recency"
+            );
+        }
+
+        assert!(
+            dedup.get("cold-1").is_none(),
+            "cold entries should be eviction candidates before the repeatedly-hit key"
+        );
+        assert_eq!(
+            dedup.check("hot"),
+            DedupeVerdict::Duplicate {
+                suppressed_count: 9
+            }
+        );
+    }
+
     // br-ft-pu2mg: the per-key suppression counter must plateau at u64::MAX, not
     // debug-panic / release-wrap on overflow. Seeds the count at the boundary
     // (mirrors the lagged_count saturation test) and checks one more in-window
@@ -4232,6 +4267,51 @@ mod tests {
             cd.check("b"),
             CooldownVerdict::Send {
                 suppressed_since_last: 0
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_repeated_hits_keep_hot_entry_resident_while_colder_entries_evict_ft_xs8v6() {
+        let cap = 4;
+        let mut cd = NotificationCooldown::with_config(Duration::from_secs(300), cap);
+
+        for key in ["hot", "cold-1", "cold-2", "cold-3"] {
+            assert_eq!(
+                cd.check(key),
+                CooldownVerdict::Send {
+                    suppressed_since_last: 0
+                }
+            );
+        }
+
+        for i in 0..8 {
+            let hot = cd.check("hot");
+            assert!(
+                matches!(hot, CooldownVerdict::Suppress { .. }),
+                "iteration {i}: hot key must still be resident and suppressed, got {hot:?}"
+            );
+            assert_eq!(
+                cd.check(&format!("novel-{i}")),
+                CooldownVerdict::Send {
+                    suppressed_since_last: 0
+                }
+            );
+            assert_eq!(cd.len(), cap);
+            assert!(
+                cd.get("hot").is_some(),
+                "iteration {i}: active cooldown hit must refresh LRU recency"
+            );
+        }
+
+        assert!(
+            cd.get("cold-1").is_none(),
+            "cold entries should be eviction candidates before the repeatedly-hit key"
+        );
+        assert_eq!(
+            cd.check("hot"),
+            CooldownVerdict::Suppress {
+                total_suppressed: 9
             }
         );
     }
