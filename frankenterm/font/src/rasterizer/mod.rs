@@ -1,14 +1,18 @@
 use crate::parser::ParsedFont;
 use crate::units::*;
 use config::FontRasterizerSelection;
+#[cfg(not(windows))]
 use image::{ImageBuffer, Rgba};
 
 /// The amount, as a number in [0,1], to horizontally skew a glyph when rendering synthetic
 /// italics
 pub(crate) const FAKE_ITALIC_SKEW: f64 = 0.2;
 
+#[cfg(not(windows))]
 pub mod colr;
+#[cfg(not(windows))]
 pub mod freetype;
+#[cfg(not(windows))]
 pub mod harfbuzz;
 
 /// A bitmap representation of a glyph.
@@ -37,6 +41,7 @@ pub trait FontRasterizer {
     ) -> anyhow::Result<RasterizedGlyph>;
 }
 
+#[cfg(not(windows))]
 pub fn new_rasterizer(
     rasterizer: FontRasterizerSelection,
     handle: &ParsedFont,
@@ -52,6 +57,17 @@ pub fn new_rasterizer(
     }
 }
 
+#[cfg(windows)]
+pub fn new_rasterizer(
+    rasterizer: FontRasterizerSelection,
+    handle: &ParsedFont,
+    pixel_geometry: config::DisplayPixelGeometry,
+) -> anyhow::Result<Box<dyn FontRasterizer>> {
+    let _ = (rasterizer, handle, pixel_geometry);
+    anyhow::bail!("Windows font rasterization is not wired without cairo");
+}
+
+#[cfg(not(windows))]
 pub(crate) fn swap_red_and_blue<Container: std::ops::Deref<Target = [u8]> + std::ops::DerefMut>(
     image: &mut ImageBuffer<Rgba<u8>, Container>,
 ) {
@@ -62,6 +78,7 @@ pub(crate) fn swap_red_and_blue<Container: std::ops::Deref<Target = [u8]> + std:
     }
 }
 
+#[cfg(not(windows))]
 pub(crate) fn crop_to_non_transparent<Container>(
     image: &mut image::ImageBuffer<Rgba<u8>, Container>,
 ) -> image::SubImage<&mut ImageBuffer<Rgba<u8>, Container>>

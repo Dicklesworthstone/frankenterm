@@ -3,8 +3,10 @@
 pub use harfbuzz::*;
 
 use crate::locator::{FontDataHandle, FontDataSource};
+#[cfg(not(windows))]
 use crate::rasterizer::colr::{ColorLine, ColorStop, DrawOp};
-use anyhow::{ensure, Context, Error};
+use anyhow::{Context, Error, ensure};
+#[cfg(not(windows))]
 use cairo::Extend;
 use memmap2::{Mmap, MmapOptions};
 use std::ffi::CStr;
@@ -13,6 +15,7 @@ use std::mem;
 use std::ops::Range;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::Arc;
+#[cfg(not(windows))]
 use wezterm_color_types::SrgbaPixel;
 
 extern "C" {
@@ -408,11 +411,13 @@ impl Font {
     }
 
     #[allow(unused)]
+    #[cfg(not(windows))]
     pub fn draw_glyph(&self, glyph_pos: u32, funcs: &DrawFuncs, draw_data: *mut c_void) {
         unsafe { hb_font_draw_glyph(self.font, glyph_pos, funcs.funcs, draw_data) }
     }
 
     #[allow(unused)]
+    #[cfg(not(windows))]
     pub fn paint_glyph(
         &self,
         glyph_pos: u32,
@@ -433,6 +438,7 @@ impl Font {
         }
     }
 
+    #[cfg(not(windows))]
     pub fn get_paint_ops_for_glyph(
         &self,
         glyph_pos: u32,
@@ -495,6 +501,7 @@ impl Font {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(windows))]
 pub enum PaintOp {
     PushTransform {
         xx: f32,
@@ -563,6 +570,7 @@ pub enum PaintOp {
     },
 }
 
+#[cfg(not(windows))]
 impl PaintOp {
     unsafe fn paint_data(data: *mut ::std::os::raw::c_void) -> &'static mut Vec<PaintOp> {
         &mut *(data as *mut Vec<PaintOp>)
@@ -804,6 +812,7 @@ impl PaintOp {
     }
 }
 
+#[cfg(not(windows))]
 impl DrawOp {
     unsafe fn draw_data(data: *mut ::std::os::raw::c_void) -> &'static mut Vec<DrawOp> {
         &mut *(data as *mut Vec<DrawOp>)
@@ -886,6 +895,7 @@ impl DrawOp {
     }
 }
 
+#[cfg(not(windows))]
 impl ColorLine {
     /// # Safety
     /// `line` must be a valid pointer to a `hb_color_line_t` and ownership
@@ -928,6 +938,7 @@ impl ColorLine {
     }
 }
 
+#[cfg(not(windows))]
 fn hb_color_to_srgba_pixel(color: hb_color_t) -> SrgbaPixel {
     let red = unsafe { hb_color_get_red(color) };
     let green = unsafe { hb_color_get_green(color) };
@@ -936,6 +947,7 @@ fn hb_color_to_srgba_pixel(color: hb_color_t) -> SrgbaPixel {
     SrgbaPixel::rgba(red, green, blue, alpha)
 }
 
+#[cfg(not(windows))]
 fn hb_extend_to_cairo(extend: hb_paint_extend_t) -> Extend {
     match extend {
         hb_paint_extend_t::HB_PAINT_EXTEND_PAD => Extend::Pad,
@@ -1104,10 +1116,12 @@ impl Buffer {
     }
 }
 
+#[cfg(not(windows))]
 pub struct FontFuncs {
     funcs: *mut hb_paint_funcs_t,
 }
 
+#[cfg(not(windows))]
 impl Drop for FontFuncs {
     fn drop(&mut self) {
         unsafe {
@@ -1116,6 +1130,7 @@ impl Drop for FontFuncs {
     }
 }
 
+#[cfg(not(windows))]
 impl FontFuncs {
     pub fn new() -> anyhow::Result<Self> {
         let funcs = unsafe { hb_paint_funcs_create() };
@@ -1124,10 +1139,12 @@ impl FontFuncs {
     }
 }
 
+#[cfg(not(windows))]
 pub struct DrawFuncs {
     funcs: *mut hb_draw_funcs_t,
 }
 
+#[cfg(not(windows))]
 impl Drop for DrawFuncs {
     fn drop(&mut self) {
         unsafe {
@@ -1136,6 +1153,7 @@ impl Drop for DrawFuncs {
     }
 }
 
+#[cfg(not(windows))]
 impl DrawFuncs {
     pub fn new() -> anyhow::Result<Self> {
         let funcs = unsafe { hb_draw_funcs_create() };
