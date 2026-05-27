@@ -1347,16 +1347,16 @@ impl MissionLoop {
                     break;
                 }
 
-                let resolution = resolve_conflict(
-                    self.config.conflict_detection.strategy,
-                    &assignment.agent_id,
-                    &bucket.holder,
-                    assignment.score,
-                    0.0,
-                    &assignment.bead_id,
-                    bucket.bead_id.as_deref().unwrap_or("unknown"),
+                let resolution = resolve_conflict(ConflictResolutionInput {
+                    strategy: self.config.conflict_detection.strategy,
+                    agent_a: &assignment.agent_id,
+                    agent_b: &bucket.holder,
+                    score_a: assignment.score,
+                    score_b: 0.0,
+                    bead_a: &assignment.bead_id,
+                    bead_b: bucket.bead_id.as_deref().unwrap_or("unknown"),
                     issues,
-                );
+                });
 
                 conflicts.push(AssignmentConflict {
                     conflict_id: make_reservation_conflict_id(
@@ -1460,16 +1460,16 @@ impl MissionLoop {
                     break;
                 }
 
-                let resolution = resolve_conflict(
-                    self.config.conflict_detection.strategy,
-                    &assignment.agent_id,
-                    &bucket.holder,
-                    assignment.score,
-                    0.0, // existing reservation holder has no score context
-                    &assignment.bead_id,
-                    bucket.bead_id.as_deref().unwrap_or("unknown"),
+                let resolution = resolve_conflict(ConflictResolutionInput {
+                    strategy: self.config.conflict_detection.strategy,
+                    agent_a: &assignment.agent_id,
+                    agent_b: &bucket.holder,
+                    score_a: assignment.score,
+                    score_b: 0.0, // existing reservation holder has no score context
+                    bead_a: &assignment.bead_id,
+                    bead_b: bucket.bead_id.as_deref().unwrap_or("unknown"),
                     issues,
-                );
+                });
 
                 conflicts.push(AssignmentConflict {
                     conflict_id: make_reservation_conflict_id(
@@ -1543,16 +1543,16 @@ impl MissionLoop {
                     .map(|a| a.score)
                     .unwrap_or(0.0);
 
-                let resolution = resolve_conflict(
-                    self.config.conflict_detection.strategy,
-                    &winner.agent_id,
-                    loser,
-                    winner.score,
-                    loser_score,
-                    bead_id,
-                    bead_id,
+                let resolution = resolve_conflict(ConflictResolutionInput {
+                    strategy: self.config.conflict_detection.strategy,
+                    agent_a: &winner.agent_id,
+                    agent_b: loser,
+                    score_a: winner.score,
+                    score_b: loser_score,
+                    bead_a: bead_id,
+                    bead_b: bead_id,
                     issues,
-                );
+                });
 
                 let conflict_id = format!(
                     "conflict-bead-{}-{}-{}",
@@ -1591,16 +1591,16 @@ impl MissionLoop {
                 .iter()
                 .find(|c| c.bead_id == assignment.bead_id && c.agent_id != assignment.agent_id)
             {
-                let resolution = resolve_conflict(
-                    self.config.conflict_detection.strategy,
-                    &assignment.agent_id,
-                    &existing.agent_id,
-                    assignment.score,
-                    0.0,
-                    &assignment.bead_id,
-                    &existing.bead_id,
+                let resolution = resolve_conflict(ConflictResolutionInput {
+                    strategy: self.config.conflict_detection.strategy,
+                    agent_a: &assignment.agent_id,
+                    agent_b: &existing.agent_id,
+                    score_a: assignment.score,
+                    score_b: 0.0,
+                    bead_a: &assignment.bead_id,
+                    bead_b: &existing.bead_id,
                     issues,
-                );
+                });
 
                 let conflict_id = format!(
                     "conflict-active-{}-{}-{}",
@@ -1760,50 +1760,54 @@ fn wildcard_match(pattern: &str, candidate: &str) -> bool {
 }
 
 /// Resolve a conflict using the configured strategy.
-fn resolve_conflict(
+struct ConflictResolutionInput<'a> {
     strategy: DeconflictionStrategy,
-    agent_a: &str,
-    agent_b: &str,
+    agent_a: &'a str,
+    agent_b: &'a str,
     score_a: f64,
     score_b: f64,
-    bead_a: &str,
-    bead_b: &str,
-    issues: &[BeadIssueDetail],
-) -> ConflictResolution {
-    match strategy {
+    bead_a: &'a str,
+    bead_b: &'a str,
+    issues: &'a [BeadIssueDetail],
+}
+
+fn resolve_conflict(input: ConflictResolutionInput<'_>) -> ConflictResolution {
+    match input.strategy {
         DeconflictionStrategy::PriorityWins => {
             // Lower priority number = higher priority.
-            let pri_a = issues
+            let pri_a = input
+                .issues
                 .iter()
-                .find(|i| i.id == bead_a)
+                .find(|i| i.id == input.bead_a)
                 .map(|i| i.priority)
                 .unwrap_or(u8::MAX);
-            let pri_b = issues
+            let pri_b = input
+                .issues
                 .iter()
-                .find(|i| i.id == bead_b)
+                .find(|i| i.id == input.bead_b)
                 .map(|i| i.priority)
                 .unwrap_or(u8::MAX);
 
-            if pri_a < pri_b || (pri_a == pri_b && score_a >= score_b) {
+            if pri_a < pri_b || (pri_a == pri_b && input.score_a >= input.score_b) {
                 ConflictResolution::AutoResolved {
-                    winner_agent: agent_a.to_string(),
-                    loser_agent: agent_b.to_string(),
-                    strategy,
+                    winner_agent: input.agent_a.to_string(),
+                    loser_agent: input.agent_b.to_string(),
+                    strategy: input.strategy,
                 }
             } else {
                 ConflictResolution::AutoResolved {
-                    winner_agent: agent_b.to_string(),
-                    loser_agent: agent_a.to_string(),
-                    strategy,
+                    winner_agent: input.agent_b.to_string(),
+                    loser_agent: input.agent_a.to_string(),
+                    strategy: input.strategy,
                 }
             }
         }
         DeconflictionStrategy::FirstClaimWins => {
             // Agent B is the existing holder — they win.
             ConflictResolution::AutoResolved {
-                winner_agent: agent_b.to_string(),
-                loser_agent: agent_a.to_string(),
-                strategy,
+                winner_agent: input.agent_b.to_string(),
+                loser_agent: input.agent_a.to_string(),
+                strategy: input.strategy,
             }
         }
         DeconflictionStrategy::ManualResolution => ConflictResolution::PendingManualResolution,

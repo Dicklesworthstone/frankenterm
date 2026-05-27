@@ -305,30 +305,32 @@ impl<'de> Deserialize<'de> for MissionEvent {
 impl MissionEvent {
     /// Build a new event (use `MissionEventBuilder` for ergonomic construction).
     #[must_use]
-    fn new(
-        sequence: u64,
-        cycle_id: u64,
-        timestamp_ms: i64,
-        kind: MissionEventKind,
-        reason_code: &str,
-        correlation_id: &str,
-        workspace: &str,
-        track: &str,
-    ) -> Self {
-        let phase = kind.phase();
+    fn new(input: MissionEventInput<'_>) -> Self {
+        let phase = input.kind.phase();
         Self {
-            sequence,
-            cycle_id,
-            timestamp_ms,
-            kind,
-            reason_code: reason_code.to_string(),
-            correlation_id: correlation_id.to_string(),
+            sequence: input.sequence,
+            cycle_id: input.cycle_id,
+            timestamp_ms: input.timestamp_ms,
+            kind: input.kind,
+            reason_code: input.reason_code.to_string(),
+            correlation_id: input.correlation_id.to_string(),
             phase,
             details: HashMap::new(),
-            workspace: workspace.to_string(),
-            track: track.to_string(),
+            workspace: input.workspace.to_string(),
+            track: input.track.to_string(),
         }
     }
+}
+
+struct MissionEventInput<'a> {
+    sequence: u64,
+    cycle_id: u64,
+    timestamp_ms: i64,
+    kind: MissionEventKind,
+    reason_code: &'a str,
+    correlation_id: &'a str,
+    workspace: &'a str,
+    track: &'a str,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -432,16 +434,16 @@ impl MissionEventBuilder {
 
     /// Finalize the event (sequence assigned by the log).
     fn build(self, sequence: u64) -> MissionEvent {
-        let mut event = MissionEvent::new(
+        let mut event = MissionEvent::new(MissionEventInput {
             sequence,
-            self.cycle_id,
-            self.timestamp_ms,
-            self.kind,
-            &self.reason_code,
-            &self.correlation_id,
-            &self.workspace,
-            &self.track,
-        );
+            cycle_id: self.cycle_id,
+            timestamp_ms: self.timestamp_ms,
+            kind: self.kind,
+            reason_code: &self.reason_code,
+            correlation_id: &self.correlation_id,
+            workspace: &self.workspace,
+            track: &self.track,
+        });
         event.details = self.details;
         event
     }
@@ -1610,16 +1612,16 @@ mod tests {
         // event must report the canonical phase regardless.
         reset_mission_event_log_normalization_count_for_test();
 
-        let event = MissionEvent::new(
-            42,
-            7,
-            12_345,
-            MissionEventKind::AssignmentEmitted,
-            reason_codes::ASSIGNMENT_EMITTED,
-            "corr-x",
-            "ws",
-            "trk",
-        );
+        let event = MissionEvent::new(MissionEventInput {
+            sequence: 42,
+            cycle_id: 7,
+            timestamp_ms: 12_345,
+            kind: MissionEventKind::AssignmentEmitted,
+            reason_code: reason_codes::ASSIGNMENT_EMITTED,
+            correlation_id: "corr-x",
+            workspace: "ws",
+            track: "trk",
+        });
         // Sanity: builder-built events are always consistent.
         assert_eq!(event.phase, MissionPhase::Dispatch);
 
@@ -1645,16 +1647,16 @@ mod tests {
     fn deserialize_does_not_normalize_consistent_event_ft_a05f3() {
         reset_mission_event_log_normalization_count_for_test();
 
-        let event = MissionEvent::new(
-            1,
-            1,
-            1,
-            MissionEventKind::CycleStarted,
-            reason_codes::CYCLE_STARTED,
-            "corr-y",
-            "ws",
-            "trk",
-        );
+        let event = MissionEvent::new(MissionEventInput {
+            sequence: 1,
+            cycle_id: 1,
+            timestamp_ms: 1,
+            kind: MissionEventKind::CycleStarted,
+            reason_code: reason_codes::CYCLE_STARTED,
+            correlation_id: "corr-y",
+            workspace: "ws",
+            track: "trk",
+        });
         let json = serde_json::to_value(&event).unwrap();
         let restored: MissionEvent = serde_json::from_value(json).unwrap();
         assert_eq!(restored.phase, event.phase);
@@ -1675,16 +1677,16 @@ mod tests {
         // codepath.
         reset_mission_event_log_normalization_count_for_test();
 
-        let event = MissionEvent::new(
-            1,
-            1,
-            1,
-            MissionEventKind::SafetyEnvelopeApplied,
-            reason_codes::ENVELOPE_PASS,
-            "corr-s",
-            "ws",
-            "trk",
-        );
+        let event = MissionEvent::new(MissionEventInput {
+            sequence: 1,
+            cycle_id: 1,
+            timestamp_ms: 1,
+            kind: MissionEventKind::SafetyEnvelopeApplied,
+            reason_code: reason_codes::ENVELOPE_PASS,
+            correlation_id: "corr-s",
+            workspace: "ws",
+            track: "trk",
+        });
         let mut json = serde_json::to_value(&event).unwrap();
         json["phase"] = serde_json::json!("dispatch"); // mismatch — should be Safety
         let restored: MissionEvent = serde_json::from_value(json).expect("loads");
@@ -1761,9 +1763,16 @@ mod tests {
             let kind = kinds[kind_idx % kinds.len()].clone();
             let canonical = kind.phase();
 
-            let event = MissionEvent::new(
-                1, 1, 1, kind.clone(), "test", "corr", "ws", "trk",
-            );
+            let event = MissionEvent::new(MissionEventInput {
+                sequence: 1,
+                cycle_id: 1,
+                timestamp_ms: 1,
+                kind: kind.clone(),
+                reason_code: "test",
+                correlation_id: "corr",
+                workspace: "ws",
+                track: "trk",
+            });
             let mut json = serde_json::to_value(&event).unwrap();
             json["phase"] = serde_json::json!(phase_label);
             let restored: MissionEvent =
