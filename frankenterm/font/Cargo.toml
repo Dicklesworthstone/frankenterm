@@ -15,7 +15,6 @@ vendor-nerd-font-symbols = []
 
 [dependencies]
 anyhow.workspace = true
-cairo-rs.workspace = true
 config.workspace = true
 encoding_rs.workspace = true
 enum-display-derive.workspace = true
@@ -39,6 +38,9 @@ wezterm-color-types.workspace = true
 wezterm-input-types.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 frankenterm-toast-notification.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+cairo-rs.workspace = true
 
 [target.'cfg(any(target_os = "android", all(unix, not(target_os = "macos"))))'.dependencies]
 fontconfig.workspace = true
