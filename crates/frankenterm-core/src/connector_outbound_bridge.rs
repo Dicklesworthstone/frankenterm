@@ -21,6 +21,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::connector_credential_broker::{CredentialScope, CredentialSensitivity};
+use crate::connector_governor::GovernorVerdict;
 use crate::connector_host_runtime::{ConnectorCapability, ConnectorSandboxZone};
 use crate::policy::{
     ActionKind as PolicyActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyEngine,
@@ -688,6 +689,8 @@ pub struct OutboundBridgeTelemetry {
     pub actions_dispatched: u64,
     pub actions_blocked_policy: u64,
     pub actions_blocked_sandbox: u64,
+    pub actions_blocked_governor: u64,
+    pub actions_blocked_reliability: u64,
     pub dispatch_queue_overflows: u64,
 }
 
@@ -701,6 +704,8 @@ pub struct OutboundBridgeTelemetrySnapshot {
     pub actions_dispatched: u64,
     pub actions_blocked_policy: u64,
     pub actions_blocked_sandbox: u64,
+    pub actions_blocked_governor: u64,
+    pub actions_blocked_reliability: u64,
     pub dispatch_queue_overflows: u64,
 }
 
@@ -716,6 +721,8 @@ impl OutboundBridgeTelemetry {
             actions_dispatched: self.actions_dispatched,
             actions_blocked_policy: self.actions_blocked_policy,
             actions_blocked_sandbox: self.actions_blocked_sandbox,
+            actions_blocked_governor: self.actions_blocked_governor,
+            actions_blocked_reliability: self.actions_blocked_reliability,
             dispatch_queue_overflows: self.dispatch_queue_overflows,
         }
     }
@@ -1248,7 +1255,76 @@ impl ConnectorOutboundBridge {
                 created_at_ms: now_ms,
             };
 
-            // 3d. Enqueue
+            // 3d. Reliability + governor admission checks. These must run
+            // before an action is visible to the production dispatch queue.
+            let reliability_block = {
+                let controller = self
+                    .policy
+                    .reliability_registry_mut()
+                    .get_or_create(&action.target_connector);
+                if controller.allow_operation() {
+                    None
+                } else {
+                    Some(controller.circuit_status())
+                }
+            };
+            if let Some(status) = reliability_block {
+                self.telemetry.actions_blocked_reliability =
+                    self.telemetry.actions_blocked_reliability.saturating_add(1);
+                warn!(
+                    rule_id = %rule.rule_id,
+                    connector = %rule.target_connector,
+                    action = %rule.action_kind,
+                    circuit_state = ?status.state,
+                    "outbound action blocked by connector reliability gate"
+                );
+                blocked.push(BlockedAction {
+                    rule_id: rule.rule_id.clone(),
+                    target_connector: rule.target_connector.clone(),
+                    action_kind: rule.action_kind,
+                    reason: format!(
+                        "reliability(circuit={:?}, consecutive_failures={}, cooldown_remaining_ms={:?})",
+                        status.state, status.consecutive_failures, status.cooldown_remaining_ms
+                    ),
+                    policy_decision: Some(policy_decision.clone()),
+                });
+                continue;
+            }
+
+            let queue_depth = self.dispatch_queue.len();
+            let governor_decision = {
+                let governor = self.policy.connector_governor_mut();
+                governor.update_queue_depth(queue_depth);
+                governor.evaluate(&action, now_ms)
+            };
+            if !matches!(&governor_decision.verdict, GovernorVerdict::Allow) {
+                self.telemetry.actions_blocked_governor =
+                    self.telemetry.actions_blocked_governor.saturating_add(1);
+                warn!(
+                    rule_id = %rule.rule_id,
+                    connector = %rule.target_connector,
+                    action = %rule.action_kind,
+                    verdict = %governor_decision.verdict,
+                    reason = %governor_decision.reason,
+                    delay_ms = governor_decision.delay_ms,
+                    "outbound action blocked by connector governor"
+                );
+                blocked.push(BlockedAction {
+                    rule_id: rule.rule_id.clone(),
+                    target_connector: rule.target_connector.clone(),
+                    action_kind: rule.action_kind,
+                    reason: format!(
+                        "governor({}: {}, delay_ms={})",
+                        governor_decision.verdict,
+                        governor_decision.reason,
+                        governor_decision.delay_ms
+                    ),
+                    policy_decision: Some(policy_decision.clone()),
+                });
+                continue;
+            }
+
+            // 3e. Enqueue
             if self.config.dispatch_queue_capacity == 0 {
                 self.telemetry.dispatch_queue_overflows =
                     self.telemetry.dispatch_queue_overflows.saturating_add(1);
@@ -1272,6 +1348,11 @@ impl ConnectorOutboundBridge {
                 self.dispatch_queue.pop_front();
             }
             self.dispatch_queue.push_back(action);
+            {
+                let governor = self.policy.connector_governor_mut();
+                governor.record_enqueue();
+                governor.update_queue_depth(self.dispatch_queue.len());
+            }
 
             self.telemetry.actions_dispatched = self.telemetry.actions_dispatched.saturating_add(1);
             dispatched.push(DispatchedAction {
@@ -1316,7 +1397,15 @@ impl ConnectorOutboundBridge {
 
     /// Drain pending actions from the dispatch queue.
     pub fn drain_actions(&mut self) -> Vec<ConnectorAction> {
-        self.dispatch_queue.drain(..).collect()
+        let actions: Vec<ConnectorAction> = self.dispatch_queue.drain(..).collect();
+        {
+            let governor = self.policy.connector_governor_mut();
+            for _ in &actions {
+                governor.record_dequeue();
+            }
+            governor.update_queue_depth(self.dispatch_queue.len());
+        }
+        actions
     }
 
     /// Peek at the next pending action without removing it.
@@ -1363,8 +1452,10 @@ impl ConnectorOutboundBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit_breaker::CircuitStateKind;
     use crate::config::{PolicyRule, PolicyRuleDecision, PolicyRuleMatch, PolicyRulesConfig};
     use crate::connector_host_runtime::ConnectorCapabilityEnvelope;
+    use crate::connector_reliability::ConnectorErrorKind;
     use crate::policy::{PolicyEngine, PolicySurface};
 
     fn make_event(event_type: &str, source: OutboundEventSource) -> OutboundEvent {
@@ -1946,6 +2037,102 @@ mod tests {
     }
 
     #[test]
+    fn connector_outbound_bridge_open_circuit_blocks_dispatch_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let failed_action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        {
+            let controller = bridge
+                .policy_engine_mut()
+                .reliability_registry_mut()
+                .get_or_create("slack");
+            for i in 0..3 {
+                controller.record_failure(
+                    &failed_action,
+                    "connector timed out",
+                    ConnectorErrorKind::Timeout,
+                    900 + i,
+                );
+            }
+            assert_eq!(controller.circuit_status().state, CircuitStateKind::Open);
+        }
+
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(result.actions_dispatched.is_empty());
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert_eq!(result.actions_blocked[0].target_connector, "slack");
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("reliability(circuit=Open")
+        );
+        assert_eq!(bridge.pending_action_count(), 0);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 0);
+        assert_eq!(tel.actions_blocked_reliability, 1);
+        assert_eq!(tel.actions_blocked_governor, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_governor_blocks_dispatch_ft_x3211() {
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let first = make_event("event.first", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let first_result = bridge.process_event(&first).unwrap();
+        assert_eq!(first_result.actions_dispatched.len(), 1);
+
+        let second =
+            make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
+        let second_result = bridge.process_event(&second).unwrap();
+
+        assert!(second_result.actions_dispatched.is_empty());
+        assert_eq!(second_result.actions_blocked.len(), 1);
+        assert!(
+            second_result.actions_blocked[0]
+                .reason
+                .contains("governor(reject: connector_quota_exhausted")
+        );
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_blocked_governor, 1);
+        assert_eq!(tel.actions_blocked_reliability, 0);
+    }
+
+    #[test]
     fn connector_outbound_bridge_blocks_policy_deny() {
         let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
         bridge.register_sandbox_zone("slack", permissive_zone());
@@ -2495,6 +2682,8 @@ mod tests {
             actions_dispatched: u64::MAX,
             actions_blocked_policy: u64::MAX,
             actions_blocked_sandbox: u64::MAX,
+            actions_blocked_governor: u64::MAX,
+            actions_blocked_reliability: u64::MAX,
             dispatch_queue_overflows: u64::MAX,
         };
 
@@ -2519,6 +2708,8 @@ mod tests {
         assert_eq!(tel.actions_dispatched, u64::MAX);
         assert_eq!(tel.actions_blocked_policy, u64::MAX);
         assert_eq!(tel.actions_blocked_sandbox, u64::MAX);
+        assert_eq!(tel.actions_blocked_governor, u64::MAX);
+        assert_eq!(tel.actions_blocked_reliability, u64::MAX);
         assert_eq!(tel.dispatch_queue_overflows, u64::MAX);
     }
 
@@ -2532,6 +2723,8 @@ mod tests {
             actions_dispatched: 7,
             actions_blocked_policy: 0,
             actions_blocked_sandbox: 1,
+            actions_blocked_governor: 2,
+            actions_blocked_reliability: 3,
             dispatch_queue_overflows: 0,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
