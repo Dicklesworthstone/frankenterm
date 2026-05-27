@@ -2144,7 +2144,11 @@ mod tests {
             max_backoff: Duration::MAX,
         };
 
-        let result: Result<(), ((), ResizeRetryStats)> = retry_with_backoff(policy, |_| Err(()));
+        // `retry_with_backoff` returns stats on BOTH arms:
+        // `Result<(T, ResizeRetryStats), (E, ResizeRetryStats)>`. The closure is
+        // `|_| Err(())`, so T=() and E=(); the Ok arm must carry ResizeRetryStats too.
+        let result: Result<((), ResizeRetryStats), ((), ResizeRetryStats)> =
+            retry_with_backoff(policy, |_| Err(()));
         let (_err, stats) = result.expect_err("retry should exhaust attempts");
 
         assert_eq!(stats.attempts, 3);

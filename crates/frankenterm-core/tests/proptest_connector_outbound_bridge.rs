@@ -646,8 +646,6 @@ proptest! {
         dispatched in 0u64..1000u64,
         blocked_policy in 0u64..1000u64,
         blocked_sandbox in 0u64..1000u64,
-        blocked_governor in 0u64..1000u64,
-        blocked_reliability in 0u64..1000u64,
         overflows in 0u64..1000u64,
     ) {
         let snapshot = OutboundBridgeTelemetrySnapshot {
@@ -658,8 +656,6 @@ proptest! {
             actions_dispatched: dispatched,
             actions_blocked_policy: blocked_policy,
             actions_blocked_sandbox: blocked_sandbox,
-            actions_blocked_governor: blocked_governor,
-            actions_blocked_reliability: blocked_reliability,
             dispatch_queue_overflows: overflows,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
