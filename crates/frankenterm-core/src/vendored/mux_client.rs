@@ -2415,6 +2415,24 @@ mod tests {
         let _ = tx.send(());
     }
 
+    fn direct_mux_client_config(socket_path: PathBuf) -> DirectMuxClientConfig {
+        DirectMuxClientConfig {
+            socket_path: Some(socket_path),
+            ..Default::default()
+        }
+    }
+
+    fn direct_mux_client_config_with_timeout(
+        socket_path: PathBuf,
+        read_timeout: Duration,
+    ) -> DirectMuxClientConfig {
+        DirectMuxClientConfig {
+            socket_path: Some(socket_path),
+            read_timeout,
+            ..Default::default()
+        }
+    }
+
     /// Like `run_async_test` but spawns a dedicated thread so the test gets
     /// a pristine TLS state. Prevents interference when 25 000+ tests run
     /// in parallel and stomp each other's `ASUPERSYNC_HANDLE` thread-local.
@@ -2564,8 +2582,7 @@ mod tests {
                 }
             });
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let panes = client.list_panes().await.expect("list panes");
             assert!(panes.tabs.is_empty());
@@ -2629,8 +2646,7 @@ mod tests {
                 }
             });
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -3694,9 +3710,11 @@ mod tests {
                 captured_frame.expect("captured ListPanes request frame")
             });
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.compression_mode = crate::config::VendoredCompressionMode::Never;
+            let config = DirectMuxClientConfig {
+                socket_path: Some(socket_path),
+                compression_mode: crate::config::VendoredCompressionMode::Never,
+                ..Default::default()
+            };
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let _ = client.list_panes().await.expect("list panes");
             drop(client);
@@ -3806,8 +3824,7 @@ mod tests {
                 }
             });
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let responses = client
                 .get_pane_render_changes_batch(&[10, 20, 30], 3, Duration::from_secs(1))
@@ -4022,8 +4039,7 @@ mod tests {
                 }
             });
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let responses = client
                 .get_pane_render_changes_batch(&[41, 42], 0, Duration::from_secs(1))
@@ -4330,8 +4346,7 @@ mod tests {
                 }
             });
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
             let first_serial = client
@@ -4565,8 +4580,7 @@ mod tests {
                 }
             });
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
+            let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             client.config.read_timeout = Duration::from_millis(500);
 
@@ -5543,9 +5557,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should become ready");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(40);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
 
             let err = DirectMuxClient::connect(config)
                 .await
@@ -5592,9 +5605,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should become ready");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(40);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
 
             let err = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
@@ -5674,9 +5686,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(40);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -5771,9 +5782,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             client.config.write_timeout = Duration::from_millis(5);
 
@@ -5857,9 +5867,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -5939,9 +5948,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -6035,9 +6043,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(40);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
             let err = client
@@ -6118,9 +6125,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(40);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(40));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -6202,9 +6208,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
             let err = client
@@ -6287,9 +6292,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -6392,9 +6396,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
             let panes = client
@@ -6527,9 +6530,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
             let render = client
@@ -6634,9 +6636,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -6773,9 +6774,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.read_timeout = Duration::from_millis(200);
+            let config =
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect");
@@ -6890,10 +6890,12 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.max_frame_bytes = max_frame_bytes;
-            config.read_timeout = Duration::from_millis(200);
+            let config = DirectMuxClientConfig {
+                socket_path: Some(socket_path),
+                max_frame_bytes,
+                read_timeout: Duration::from_millis(200),
+                ..Default::default()
+            };
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
 
             let err = client
@@ -7008,10 +7010,12 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
-            let mut config = DirectMuxClientConfig::default();
-            config.socket_path = Some(socket_path);
-            config.max_frame_bytes = max_frame_bytes;
-            config.read_timeout = Duration::from_millis(200);
+            let config = DirectMuxClientConfig {
+                socket_path: Some(socket_path),
+                max_frame_bytes,
+                read_timeout: Duration::from_millis(200),
+                ..Default::default()
+            };
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect");
