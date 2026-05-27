@@ -281,15 +281,19 @@ mod tests {
 
     #[test]
     fn config_rejects_zero_hot_hours() {
-        let mut cfg = RetentionConfig::default();
-        cfg.hot_hours = 0;
+        let cfg = RetentionConfig {
+            hot_hours: 0,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn config_rejects_t1_extended_over_90() {
-        let mut cfg = RetentionConfig::default();
-        cfg.t1_extended_days = 91;
+        let cfg = RetentionConfig {
+            t1_extended_days: 91,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
@@ -893,39 +897,52 @@ mod tests {
 
     #[test]
     fn retention_config_validate_zero_warm_days() {
-        let mut c = RetentionConfig::default();
-        c.warm_days = 0;
+        let c = RetentionConfig {
+            warm_days: 0,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn retention_config_validate_zero_cold_days() {
-        let mut c = RetentionConfig::default();
-        c.cold_days = 0;
+        let c = RetentionConfig {
+            cold_days: 0,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn retention_config_validate_zero_segment_bytes() {
-        let mut c = RetentionConfig::default();
-        c.max_segment_bytes = 0;
+        let c = RetentionConfig {
+            max_segment_bytes: 0,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn retention_config_validate_zero_segment_duration() {
-        let mut c = RetentionConfig::default();
-        c.max_segment_duration_secs = 0;
+        let c = RetentionConfig {
+            max_segment_duration_secs: 0,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn retention_config_validate_t1_extended_days_limit() {
-        let mut c = RetentionConfig::default();
-        c.t1_extended_days = 91;
-        assert!(c.validate().is_err());
-        c.t1_extended_days = 90;
-        assert!(c.validate().is_ok());
+        let invalid = RetentionConfig {
+            t1_extended_days: 91,
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+        let valid = RetentionConfig {
+            t1_extended_days: 90,
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
     }
 
     #[test]
@@ -1116,11 +1133,13 @@ mod tests {
 
     #[test]
     fn retention_stats_debug_clone_serde() {
-        let mut s = RetentionStats::default();
-        s.active_count = 2;
-        s.active_bytes = 1024;
-        s.sealed_count = 1;
-        s.sealed_bytes = 512;
+        let s = RetentionStats {
+            active_count: 2,
+            active_bytes: 1024,
+            sealed_count: 1,
+            sealed_bytes: 512,
+            ..Default::default()
+        };
         let c = s.clone();
         assert_eq!(c.live_count(), 3);
         assert_eq!(c.live_bytes(), 1536);

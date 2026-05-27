@@ -1536,61 +1536,77 @@ mod tests {
 
     #[test]
     fn validate_min_lines_zero_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.min_lines = 0;
+        let c = ImportanceRetentionConfig {
+            min_lines: 0,
+            ..Default::default()
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("min_lines must be > 0"));
     }
 
     #[test]
     fn validate_max_less_than_min_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.min_lines = 100;
-        c.max_lines = 50;
+        let c = ImportanceRetentionConfig {
+            min_lines: 100,
+            max_lines: 50,
+            ..Default::default()
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("max_lines must be >= min_lines"));
     }
 
     #[test]
     fn validate_nan_threshold_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.importance_threshold = f64::NAN;
+        let c = ImportanceRetentionConfig {
+            importance_threshold: f64::NAN,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn validate_threshold_out_of_range_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.importance_threshold = 1.5;
+        let c = ImportanceRetentionConfig {
+            importance_threshold: 1.5,
+            ..Default::default()
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("importance_threshold must be within"));
     }
 
     #[test]
     fn validate_threshold_negative_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.importance_threshold = -0.1;
+        let c = ImportanceRetentionConfig {
+            importance_threshold: -0.1,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn validate_oldest_window_nan_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.oldest_window_fraction = f64::NAN;
+        let c = ImportanceRetentionConfig {
+            oldest_window_fraction: f64::NAN,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn validate_oldest_window_zero_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.oldest_window_fraction = 0.0;
+        let c = ImportanceRetentionConfig {
+            oldest_window_fraction: 0.0,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn validate_oldest_window_over_one_fails() {
-        let mut c = ImportanceRetentionConfig::default();
-        c.oldest_window_fraction = 1.5;
+        let c = ImportanceRetentionConfig {
+            oldest_window_fraction: 1.5,
+            ..Default::default()
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("oldest_window_fraction must be <= 1"));
     }
