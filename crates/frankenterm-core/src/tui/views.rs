@@ -2913,6 +2913,15 @@ mod tests {
         );
     }
 
+    macro_rules! view_state {
+        ($($field:ident: $value:expr),+ $(,)?) => {
+            ViewState {
+                $($field: $value,)+
+                ..Default::default()
+            }
+        };
+    }
+
     #[test]
     fn render_triage_view_handles_empty_and_populated_state() {
         let empty_state = ViewState::default();
@@ -2950,15 +2959,6 @@ mod tests {
             last_activity_ts: Some(1_700_000_000_000),
             unhandled_event_count: unhandled,
         }
-    }
-
-    macro_rules! view_state {
-        ($($field:ident: $value:expr),+ $(,)?) => {
-            ViewState {
-                $($field: $value,)+
-                ..Default::default()
-            }
-        };
     }
 
     #[test]
