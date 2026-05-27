@@ -26,7 +26,14 @@ fn recover_poisoned<'a, T>(
     result.unwrap_or_else(PoisonError::into_inner)
 }
 
-#[cfg(feature = "jemalloc")]
+// ft-p9hok: jemalloc is gated to non-Windows targets. Its C sys-crate
+// (tikv-jemalloc-sys) cannot build on windows-msvc, and the `tikv-*` deps are
+// absent there (see Cargo.toml's `[target.'cfg(not(windows))'.dependencies]`),
+// so every jemalloc-touching item below is `not(windows)`-gated. On Windows the
+// `jemalloc` feature is a no-op and the build uses the system allocator.
+// Mac/Linux behaviour is unchanged: with the `jemalloc` feature on, this
+// `#[global_allocator]` is installed exactly as before.
+#[cfg(all(feature = "jemalloc", not(windows)))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -53,11 +60,11 @@ impl AllocatorBackend {
 /// Compile-time allocator backend.
 #[must_use]
 pub const fn allocator_backend() -> AllocatorBackend {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(windows)))]
     {
         AllocatorBackend::Jemalloc
     }
-    #[cfg(not(feature = "jemalloc"))]
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
     {
         AllocatorBackend::System
     }
@@ -99,7 +106,7 @@ pub struct PaneArenaStats {
 #[derive(Debug, thiserror::Error)]
 pub enum AllocatorStatsError {
     /// Jemalloc stats access failed.
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(windows)))]
     #[error("jemalloc stats read failed: {0:?}")]
     Jemalloc(tikv_jemalloc_ctl::Error),
     /// Stats are unavailable because jemalloc support is not compiled in.
@@ -109,7 +116,7 @@ pub enum AllocatorStatsError {
 
 /// Read allocator statistics.
 pub fn read_allocator_stats() -> Result<AllocatorStats, AllocatorStatsError> {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(windows)))]
     {
         use tikv_jemalloc_ctl::{epoch, stats};
 
@@ -123,7 +130,7 @@ pub fn read_allocator_stats() -> Result<AllocatorStats, AllocatorStatsError> {
         })
     }
 
-    #[cfg(not(feature = "jemalloc"))]
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
     {
         Err(AllocatorStatsError::JemallocNotEnabled)
     }
@@ -387,10 +394,10 @@ mod tests {
 
     #[test]
     fn allocator_backend_matches_feature_gate() {
-        #[cfg(feature = "jemalloc")]
+        #[cfg(all(feature = "jemalloc", not(windows)))]
         assert_eq!(allocator_backend(), AllocatorBackend::Jemalloc);
 
-        #[cfg(not(feature = "jemalloc"))]
+        #[cfg(not(all(feature = "jemalloc", not(windows))))]
         assert_eq!(allocator_backend(), AllocatorBackend::System);
     }
 
@@ -471,14 +478,14 @@ mod tests {
 
     #[test]
     fn allocator_stats_api_matches_feature_mode() {
-        #[cfg(feature = "jemalloc")]
+        #[cfg(all(feature = "jemalloc", not(windows)))]
         {
             let stats = read_allocator_stats().expect("jemalloc stats should be readable");
             assert!(stats.resident >= stats.allocated);
             assert!(stats.mapped >= stats.resident);
         }
 
-        #[cfg(not(feature = "jemalloc"))]
+        #[cfg(not(all(feature = "jemalloc", not(windows))))]
         {
             let err = read_allocator_stats().expect_err("stats should be unavailable");
             assert!(matches!(err, AllocatorStatsError::JemallocNotEnabled));

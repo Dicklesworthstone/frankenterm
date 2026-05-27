@@ -20,6 +20,14 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 thiserror.workspace = true
+
+# ft-p9hok: jemalloc's C sys-crate (tikv-jemalloc-sys) cannot build on
+# windows-msvc, so the allocator deps are gated to non-Windows targets. The
+# `jemalloc` feature still references them via `dep:` (see [features]); on
+# Windows that activation is a no-op because the optional deps are absent for
+# the target, and the crate falls back to the system allocator (see the
+# `not(windows)` cfgs in lib.rs). Mac/Linux are unchanged.
+[target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
