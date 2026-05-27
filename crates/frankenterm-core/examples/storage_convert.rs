@@ -51,7 +51,6 @@ struct Args {
 
 fn print_usage() {
     eprintln!(
-        "{}",
         "Usage: storage_convert --source <path> --dest <path> [--tables a,b,c] [--verify] [--allow-overwrite]"
     );
 }

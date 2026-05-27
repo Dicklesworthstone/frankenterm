@@ -26,7 +26,9 @@ use frankenterm_core::storage::{PaneRecord, StorageHandle, now_ms};
 #[cfg(feature = "asupersync-runtime")]
 use frankenterm_core::workflows::{ExecutionStatus, StepResult};
 #[cfg(feature = "asupersync-runtime")]
-use frankenterm_core::workflows::{WaitCondition, WorkflowEngine};
+use frankenterm_core::workflows::{
+    WaitCondition, WorkflowEngine, WorkflowStartInput, WorkflowStatusUpdate, WorkflowStepLogInput,
+};
 use frankenterm_core::workflows::{
     WorkflowStepPolicyDecision, WorkflowStepPolicySummary, policy_summary_decision_is_allow,
     redact_text_for_log,
@@ -300,11 +302,13 @@ proptest! {
                 .start_with_id_cx(
                     &cx,
                     &storage,
-                    execution_id.clone(),
-                    "property_engine_state_machine",
-                    pane_id,
-                    None,
-                    Some(serde_json::json!({"case": transitions.len()})),
+                    WorkflowStartInput {
+                        execution_id: execution_id.clone(),
+                        workflow_name: "property_engine_state_machine".to_string(),
+                        pane_id,
+                        trigger_event_id: None,
+                        context: Some(serde_json::json!({"case": transitions.len()})),
+                    },
                 )
                 .await
                 .expect("start workflow engine property execution");
@@ -318,11 +322,13 @@ proptest! {
                     .update_status_cx(
                         &cx,
                         &storage,
-                        &execution_id,
-                        transition.status,
-                        transition.current_step,
-                        wait_condition.as_ref(),
-                        transition.error.as_deref(),
+                        WorkflowStatusUpdate {
+                            execution_id: &execution_id,
+                            status: transition.status,
+                            current_step: transition.current_step,
+                            wait_condition: wait_condition.as_ref(),
+                            error: transition.error.as_deref(),
+                        },
                     )
                     .await
                     .expect("apply generated workflow engine transition");
@@ -416,25 +422,30 @@ proptest! {
                 .start_with_id_cx(
                     &cx,
                     &storage,
-                    execution_id.clone(),
-                    "property_engine_snapshot_restore",
-                    pane_id,
-                    None,
-                    Some(serde_json::json!({"restore_logs": logs.len()})),
+                    WorkflowStartInput {
+                        execution_id: execution_id.clone(),
+                        workflow_name: "property_engine_snapshot_restore".to_string(),
+                        pane_id,
+                        trigger_event_id: None,
+                        context: Some(serde_json::json!({"restore_logs": logs.len()})),
+                    },
                 )
                 .await
                 .expect("start workflow engine restore property execution");
 
             for (step_index, logged_step) in logs.iter().enumerate() {
+                let step_result = logged_step.result();
                 engine
                     .log_step_cx(
                         &cx,
                         &storage,
-                        &execution_id,
-                        step_index,
-                        "restore_step",
-                        &logged_step.result(),
-                        now_ms(),
+                        WorkflowStepLogInput {
+                            execution_id: &execution_id,
+                            step_index,
+                            step_name: "restore_step",
+                            result: &step_result,
+                            started_at: now_ms(),
+                        },
                     )
                     .await
                     .expect("persist generated restore step log");
@@ -460,11 +471,13 @@ proptest! {
                 .update_status_cx(
                     &cx,
                     &storage,
-                    &execution_id,
-                    final_status,
-                    current_step,
-                    wait_condition.as_ref(),
-                    None,
+                    WorkflowStatusUpdate {
+                        execution_id: &execution_id,
+                        status: final_status,
+                        current_step,
+                        wait_condition: wait_condition.as_ref(),
+                        error: None,
+                    },
                 )
                 .await
                 .expect("persist generated restore status");

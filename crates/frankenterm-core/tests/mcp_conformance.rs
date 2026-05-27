@@ -411,13 +411,12 @@ fn mcp_conformance_herd_wave_resource_matches_robot_contract_shape() {
         data["dry_run_plan"]["live_mutation_allowed"].as_bool(),
         Some(false)
     );
-    assert_eq!(
+    assert!(
         data["dry_run_plan"]["reason_codes"]
             .as_array()
             .expect("reason codes array")
             .iter()
-            .any(|reason| reason.as_str() == Some("herd_wave.dry_run.no_live_mutation")),
-        true
+            .any(|reason| reason.as_str() == Some("herd_wave.dry_run.no_live_mutation"))
     );
     assert_eq!(data["mcp_resource"]["implemented"].as_bool(), Some(true));
     assert_eq!(data["mcp_resource"]["uri"].as_str(), Some("wa://herd-wave"));
