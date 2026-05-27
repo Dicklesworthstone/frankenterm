@@ -844,6 +844,9 @@ sync = []
 # untangling the paired cfg(not(...)) bodies first. Don't call this a
 # no-op until those are gone.
 asupersync-runtime = []
+# CI selector only. Tokio is not a production runtime for frankenterm-core;
+# this keeps runtime feature matrices addressable without enabling any deps.
+tokio-compat = []
 recorder-lexical = ["dep:tantivy"]
 frankensqlite-recorder = []
 # br-ft-kcdqp: feature gate for the StorageBackend implementation
