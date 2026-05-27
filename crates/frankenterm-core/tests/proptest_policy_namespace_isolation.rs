@@ -28,6 +28,13 @@ fn arb_tenant_namespace() -> impl Strategy<Value = TenantNamespace> {
     arb_namespace_name().prop_filter_map("valid namespace", TenantNamespace::new)
 }
 
+fn safety_with_namespace_isolation(namespace_isolation: NamespaceIsolationConfig) -> SafetyConfig {
+    SafetyConfig {
+        namespace_isolation,
+        ..Default::default()
+    }
+}
+
 fn arb_resource_kind() -> impl Strategy<Value = NamespacedResourceKind> {
     prop_oneof![
         Just(NamespacedResourceKind::Pane),
@@ -115,16 +122,14 @@ proptest! {
             enabled,
             ..Default::default()
         };
-        let mut safety = SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let engine = PolicyEngine::from_safety_config(&safety);
         prop_assert_eq!(engine.namespace_isolation_enabled(), enabled);
     }
 
     #[test]
     fn from_safety_config_starts_with_empty_registry(config in arb_namespace_isolation_config()) {
-        let mut safety = SafetyConfig::default();
-        safety.namespace_isolation = config;
+        let safety = safety_with_namespace_isolation(config);
         let engine = PolicyEngine::from_safety_config(&safety);
         prop_assert_eq!(engine.namespace_registry().binding_count(), 0);
     }
@@ -145,8 +150,7 @@ proptest! {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         engine.namespace_registry_mut().bind(
@@ -179,8 +183,7 @@ proptest! {
             },
             ..Default::default()
         };
-        let mut safety = SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         engine.namespace_registry_mut().bind(
@@ -209,8 +212,7 @@ proptest! {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         engine.namespace_registry_mut().bind(
@@ -249,8 +251,7 @@ proptest! {
             },
             ..Default::default()
         };
-        let mut safety = SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         engine.namespace_registry_mut().bind(
@@ -366,8 +367,7 @@ proptest! {
             cross_tenant_policy: CrossTenantPolicy::strict(),
             ..Default::default()
         };
-        let mut safety = SafetyConfig::default();
-        safety.namespace_isolation = ns_config;
+        let safety = safety_with_namespace_isolation(ns_config);
         let mut engine = PolicyEngine::from_safety_config(&safety);
 
         let chain_before = engine.audit_chain().len();
