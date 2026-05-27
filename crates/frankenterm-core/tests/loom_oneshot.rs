@@ -278,9 +278,8 @@ fn loom_oneshot_send_close_race_one_outcome() {
 
         // Receiver MUST observe a terminal outcome; either delivery
         // succeeded (Some(99)) or the channel closed first (None).
-        match joined_value {
-            Some(v) => assert_eq!(v, 99),
-            None => {}
+        if let Some(v) = joined_value {
+            assert_eq!(v, 99);
         }
     });
 }
