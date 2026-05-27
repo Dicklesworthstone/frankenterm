@@ -49,42 +49,39 @@ fn arb_pressure_signals() -> impl Strategy<Value = PressureSignals> {
 
 fn arb_invalid_capacity_governor_config() -> impl Strategy<Value = CapacityGovernorConfig> {
     prop_oneof![
-        Just({
-            let mut config = CapacityGovernorConfig::default();
-            config.cpu_throttle_threshold = f64::NAN;
-            config
+        Just(CapacityGovernorConfig {
+            cpu_throttle_threshold: f64::NAN,
+            ..CapacityGovernorConfig::default()
         }),
-        Just({
-            let mut config = CapacityGovernorConfig::default();
-            config.cpu_block_threshold = f64::NAN;
-            config
+        Just(CapacityGovernorConfig {
+            cpu_block_threshold: f64::NAN,
+            ..CapacityGovernorConfig::default()
         }),
-        Just({
-            let mut config = CapacityGovernorConfig::default();
-            config.memory_throttle_threshold = f64::NAN;
-            config
+        Just(CapacityGovernorConfig {
+            memory_throttle_threshold: f64::NAN,
+            ..CapacityGovernorConfig::default()
         }),
-        Just({
-            let mut config = CapacityGovernorConfig::default();
-            config.memory_block_threshold = f64::NAN;
-            config
+        Just(CapacityGovernorConfig {
+            memory_block_threshold: f64::NAN,
+            ..CapacityGovernorConfig::default()
         }),
-        Just({
-            let mut config = CapacityGovernorConfig::default();
-            config.load_average_block_threshold = f64::NAN;
-            config
+        Just(CapacityGovernorConfig {
+            load_average_block_threshold: f64::NAN,
+            ..CapacityGovernorConfig::default()
         }),
         (0.0..=1.0f64, 0.0..=1.0f64).prop_map(|(block, extra)| {
-            let mut config = CapacityGovernorConfig::default();
-            config.cpu_block_threshold = block;
-            config.cpu_throttle_threshold = block + extra + f64::EPSILON;
-            config
+            CapacityGovernorConfig {
+                cpu_block_threshold: block,
+                cpu_throttle_threshold: block + extra + f64::EPSILON,
+                ..CapacityGovernorConfig::default()
+            }
         }),
         (0.0..=1.0f64, 0.0..=1.0f64).prop_map(|(block, extra)| {
-            let mut config = CapacityGovernorConfig::default();
-            config.memory_block_threshold = block;
-            config.memory_throttle_threshold = block + extra + f64::EPSILON;
-            config
+            CapacityGovernorConfig {
+                memory_block_threshold: block,
+                memory_throttle_threshold: block + extra + f64::EPSILON,
+                ..CapacityGovernorConfig::default()
+            }
         }),
     ]
 }
