@@ -75,8 +75,10 @@ fn connector_host_runtime_integration_degraded_path_and_recovery_contract() {
 
 #[test]
 fn connector_host_runtime_integration_upgrade_and_failed_start_recovery() {
-    let mut config = ConnectorHostConfig::default();
-    config.host_id = "connector-host-int".to_string();
+    let config = ConnectorHostConfig {
+        host_id: "connector-host-int".to_string(),
+        ..ConnectorHostConfig::default()
+    };
     let mut runtime = ConnectorHostRuntime::new(config).unwrap();
 
     let start_err = runtime
