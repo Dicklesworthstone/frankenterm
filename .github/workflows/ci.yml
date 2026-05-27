@@ -484,6 +484,18 @@ jobs:
           "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "PERL=C:\Strawberry\perl\bin\perl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Provision Windows OpenSSL
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static-md
+          OPENSSL_ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
+          echo "OPENSSL_DIR=$OPENSSL_ROOT" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+          echo "Provisioned OpenSSL at $OPENSSL_ROOT"
+          ls -la "$OPENSSL_ROOT/lib"
+
       - name: Run tests
         shell: bash
         run: |
@@ -1383,6 +1395,18 @@ jobs:
           }
           "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "PERL=C:\Strawberry\perl\bin\perl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Provision Windows OpenSSL
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static-md
+          OPENSSL_ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
+          echo "OPENSSL_DIR=$OPENSSL_ROOT" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+          echo "Provisioned OpenSSL at $OPENSSL_ROOT"
+          ls -la "$OPENSSL_ROOT/lib"
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}

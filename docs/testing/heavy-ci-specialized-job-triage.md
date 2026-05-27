@@ -31,7 +31,7 @@ ordinary Rust code.
 
 | Job | Required surface | Blocked classification | Action when red |
 | --- | --- | --- | --- |
-| `Test (windows-latest)` | A real GitHub-hosted Windows runner and Windows runtime behavior, not just a local cross-check. | Host/runtime-specific. Cross-compilation can catch `cfg` and metadata errors, but it cannot prove native Windows process, filesystem, path, shell, or named-pipe behavior. | Pull the failed Windows job log. Fix compile/test defects that name repository code. If the failure is runner image drift, Windows-only service behavior, path length, OpenSSL/Perl bootstrap, or another host/runtime facility, document the exact log line and keep it blocked on Windows runner behavior. |
+| `Test (windows-latest)` | A real GitHub-hosted Windows runner and Windows runtime behavior, not just a local cross-check. | Host/runtime-specific. Cross-compilation can catch `cfg` and metadata errors, but it cannot prove native Windows process, filesystem, path, shell, or named-pipe behavior. | Pull the failed Windows job log. Fix compile/test defects that name repository code. OpenSSL bootstrap is expected to be provisioned by CI with vcpkg; treat missing OpenSSL as workflow drift. If the failure is runner image drift, Windows-only service behavior, path length, or another host/runtime facility after bootstrap, document the exact log line and keep it blocked on Windows runner behavior. |
 | `GPU Regression (macOS 15 Metal)` | macOS 15 on Apple Silicon with a Metal adapter. | Hardware-specific reference lane. Linux llvmpipe and local headless checks are diagnostic only and cannot prove the Metal golden path. | Fix harness or fixture defects that reproduce without Metal. If adapter availability, Metal driver behavior, or hosted macOS graphics capability is the cause, retain the uploaded artifacts and classify as hardware/host blocked. |
 | `GPU Regression (Linux llvmpipe)` | Ubuntu 24.04 with Mesa Vulkan software renderer and the `llvmpipe` adapter selected. | Host/runtime-specific software-renderer lane. It is not a substitute for macOS Metal goldens. | Fix package or harness defects when the Mesa stack is installable. If the hosted image cannot provide the expected software adapter or Vulkan ICD, classify as host blocked and cite the adapter/probe log. |
 | `GPU Regression Required` | Aggregates the macOS Metal and Linux llvmpipe results. | Derived gate. It is only actionable through the underlying GPU jobs. | Do not patch this gate directly unless the aggregation logic is wrong. Classify by the failed dependency result. |
@@ -55,5 +55,9 @@ ordinary Rust code.
   `vmi1153651` but timed out at the RCH SSH command limit. That timeout is
   proof-lane red, not a local cargo substitute and not evidence of a code
   failure.
+- Older `Test (windows-latest)` run `26503816816`, job `78050944944`, failed
+  before tests because `openssl-sys` could not find `OPENSSL_DIR` or vcpkg
+  OpenSSL. `ci.yml` now provisions the same `x64-windows-static-md` OpenSSL
+  triplet already used by `windows-check.yml`.
 - Local helper checks used for non-Cargo surfaces: runtime-proof script,
   operator Bats fixtures, `cargo audit`, `git diff --check`, and `actionlint`.
