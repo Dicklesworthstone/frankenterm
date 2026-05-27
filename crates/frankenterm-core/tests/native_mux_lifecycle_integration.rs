@@ -7,6 +7,8 @@ use frankenterm_core::session_topology::{
 };
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 
+// Test fixture mirrors PaneInfo's independently varied identity, size, and activity fields.
+#[allow(clippy::too_many_arguments)]
 fn make_pane(
     pane_id: u64,
     tab_id: u64,
