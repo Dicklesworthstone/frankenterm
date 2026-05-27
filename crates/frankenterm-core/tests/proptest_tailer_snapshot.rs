@@ -15,10 +15,7 @@ use frankenterm_core::tailer::{
 };
 
 fn arb_priority_tier() -> impl Strategy<Value = CapturePriorityTier> {
-    prop_oneof![
-        Just(CapturePriorityTier::High),
-        Just(CapturePriorityTier::Low)
-    ]
+    prop_oneof![Just(CapturePriorityTier::High), Just(CapturePriorityTier::Low)]
 }
 
 fn arb_tailer_mode() -> impl Strategy<Value = TailerMode> {
@@ -60,47 +57,39 @@ fn arb_skip_reason() -> impl Strategy<Value = CaptureSkipReason> {
 
 fn arb_pane_snapshot() -> impl Strategy<Value = PaneSchedulerSnapshot> {
     (
-        (
-            any::<u64>(),
-            any::<u32>(),
-            arb_priority_tier(),
-            arb_tailer_mode(),
-            any::<bool>(),
-            any::<Option<u64>>(),
-            any::<u64>(),
-            any::<u64>(),
-        ),
-        (
-            arb_skip_reason(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<bool>(),
-            arb_starvation_warning(),
-        ),
+        any::<u64>(),
+        any::<u32>(),
+        arb_priority_tier(),
+        arb_tailer_mode(),
+        any::<bool>(),
+        any::<Option<u64>>(),
+        any::<u64>(),
+        any::<u64>(),
+        arb_skip_reason(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<bool>(),
+        arb_starvation_warning(),
     )
         .prop_map(
             |(
-                (
-                    pane_id,
-                    priority,
-                    tier,
-                    mode,
-                    stale,
-                    last_successful_capture_age_ms,
-                    last_poll_age_ms,
-                    current_interval_ms,
-                ),
-                (
-                    last_reason_code,
-                    selection_opportunities,
-                    selected_count,
-                    skipped_count,
-                    consecutive_backpressure,
-                    overflow_gap_pending,
-                    starvation_warning,
-                ),
+                pane_id,
+                priority,
+                tier,
+                mode,
+                stale,
+                last_successful_capture_age_ms,
+                last_poll_age_ms,
+                current_interval_ms,
+                last_reason_code,
+                selection_opportunities,
+                selected_count,
+                skipped_count,
+                consecutive_backpressure,
+                overflow_gap_pending,
+                starvation_warning,
             )| PaneSchedulerSnapshot {
                 pane_id,
                 priority,

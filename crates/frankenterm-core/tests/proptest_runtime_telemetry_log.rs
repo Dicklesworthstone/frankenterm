@@ -37,11 +37,7 @@ proptest! {
     #[test]
     fn telemetry_log_capacity_and_conservation(cap in 1usize..20, n in 0usize..60) {
         let mut log = log_with_capacity(cap);
-        let max = RuntimeTelemetryLogConfig {
-            max_events: cap,
-            ..RuntimeTelemetryLogConfig::default()
-        }
-        .normalized_max_events();
+        let max = log.normalized_max_events();
         emit_n(&mut log, n);
         prop_assert!(log.len() <= max, "len {} must be <= capacity {}", log.len(), max);
         prop_assert_eq!(log.total_emitted(), n as u64, "every emit must be counted");
