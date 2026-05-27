@@ -496,6 +496,26 @@ jobs:
           echo "Provisioned OpenSSL at $OPENSSL_ROOT"
           ls -la "$OPENSSL_ROOT/lib"
 
+      - name: Report Ubuntu disk before cleanup
+        if: runner.os == 'Linux'
+        run: df -h
+
+      - name: Free Ubuntu runner disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Report Ubuntu disk after cleanup
+        if: runner.os == 'Linux'
+        run: df -h
+
       - name: Run tests
         shell: bash
         run: |
