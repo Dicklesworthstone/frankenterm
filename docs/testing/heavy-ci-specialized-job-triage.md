@@ -49,12 +49,32 @@ ordinary Rust code.
 
 ## Current task #26 proof notes
 
-- `cargo check -p frankenterm-core --lib` passed through RCH remote worker
-  `vmi1152480` after the fixable changes.
-- The focused generated-artifact test lane reached RCH remote worker
-  `vmi1153651` but timed out at the RCH SSH command limit. That timeout is
-  proof-lane red, not a local cargo substitute and not evidence of a code
-  failure.
+- Operator Shell Tests: old run `26488812786` is superseded by commit
+  `8d663a8dd`; the exact local Bats suites passed after the fixture refresh:
+  `tests/clean_stale_tests.bats` 33/33, `tests/swarm_tick_tests.bats` 23/23,
+  and `tests/operator_lock_tests.bats` 2/2.
+- Generated Artifacts: old run `26488812786`, job `78001993946`, failed in
+  `RuntimeProof coverage ratchet (ft-3kv6e)` because five public async sites
+  were uncovered (`ipc.rs::{connect,accept}`,
+  `native_events.rs::{connect,accept}`, and `storage.rs::count_events`).
+  Commit `a3cdb36fe` fixed the IPC/native-event wrappers and made the ratchet
+  understand the existing `count_events` Cx sibling. `python3
+  scripts/check_runtime_proof_coverage.py` now reports `uncovered: 0`, and
+  `cargo check -p frankenterm-core --lib` passed through RCH remote worker
+  `vmi1227854`.
+- Coverage: old run `26488812786`, job `78001994064`, failed before coverage
+  measurement because `cairo-sys-rs` could not find `cairo.pc`. The fixable CI
+  package gap is closed in `ci.yml` by installing Cairo/X11/pkg-config packages
+  before `cargo llvm-cov`; newer runs were cancelled by subsequent pushes before
+  producing a fresh coverage result.
+- Resize Performance Gates: old run `26488812786`, job `78001994063`, failed
+  before latency evaluation on compile drift: `RuntimeTelemetryLog` no longer
+  exposed `normalized_max_events()`, and `RecorderStorageConfig` gained the
+  required `frankensqlite` field. Commits `da1cf2317`, `ecfe47278`, and
+  `7f6ca8ada` fix the benchmark dependency gate and the test compile drift.
+  Targeted RCH tests reached remote workers but timed out at the SSH command
+  limit (`vmi1227854` and `vmi1264463`, both `[RCH-E104]`), so the proof lane is
+  still red until a remote window completes.
 - Older `Test (windows-latest)` run `26503816816`, job `78050944944`, failed
   before tests because `openssl-sys` could not find `OPENSSL_DIR` or vcpkg
   OpenSSL. `ci.yml` now provisions the same `x64-windows-static-md` OpenSSL
