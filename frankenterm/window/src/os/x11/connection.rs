@@ -55,32 +55,6 @@ impl ScreenResources {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
-    #[test]
-    fn lock_poison_recovering_clears_poisoned_mutex() {
-        let lock = Mutex::new(Vec::from([1_u8]));
-
-        let poison_result = catch_unwind(AssertUnwindSafe(|| {
-            let _guard = lock.lock().expect("initial lock for poison test");
-            panic!("poison X11 helper lock");
-        }));
-        assert!(poison_result.is_err());
-        assert!(lock.is_poisoned());
-
-        {
-            let mut guard = lock_poison_recovering(&lock, "unit test recovery");
-            guard.push(2);
-        }
-
-        assert!(!lock.is_poisoned());
-        assert_eq!(*lock.lock().expect("lock after clear_poison"), vec![1, 2]);
-    }
-}
-
 pub struct XConnection {
     pub conn: xcb::Connection,
     default_dpi: RefCell<f64>,
@@ -1139,5 +1113,31 @@ impl XConnection {
             .ok_or_else(|| anyhow::anyhow!("active window is not in any screen"))?
             .0
             .clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn lock_poison_recovering_clears_poisoned_mutex() {
+        let lock = Mutex::new(Vec::from([1_u8]));
+
+        let poison_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lock.lock().expect("initial lock for poison test");
+            panic!("poison X11 helper lock");
+        }));
+        assert!(poison_result.is_err());
+        assert!(lock.is_poisoned());
+
+        {
+            let mut guard = lock_poison_recovering(&lock, "unit test recovery");
+            guard.push(2);
+        }
+
+        assert!(!lock.is_poisoned());
+        assert_eq!(*lock.lock().expect("lock after clear_poison"), vec![1, 2]);
     }
 }
