@@ -2585,15 +2585,17 @@ name: loop_max
 steps:
   - type: loop
     id: loop1
-    count: 1000
+        count: 1000
     body:
       - type: notify
         id: inner
         message: "x"
 "#;
         let descriptor: WorkflowDescriptor = serde_yaml::from_str(yaml).unwrap();
-        let mut limits = DescriptorLimits::default();
-        limits.max_steps = 1000;
+        let limits = DescriptorLimits {
+            max_steps: 1000,
+            ..Default::default()
+        };
         assert!(descriptor.validate(&limits).is_ok());
     }
 

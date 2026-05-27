@@ -2597,14 +2597,16 @@ mod tests {
 
     #[test]
     fn overflow_threshold_constant_is_reasonable() {
-        assert!(
-            OVERFLOW_BACKPRESSURE_THRESHOLD >= 2,
-            "threshold must be at least 2 to avoid spurious gap emission"
-        );
-        assert!(
-            OVERFLOW_BACKPRESSURE_THRESHOLD <= 100,
-            "threshold should not be excessively large"
-        );
+        const {
+            assert!(
+                OVERFLOW_BACKPRESSURE_THRESHOLD >= 2,
+                "threshold must be at least 2 to avoid spurious gap emission"
+            );
+            assert!(
+                OVERFLOW_BACKPRESSURE_THRESHOLD <= 100,
+                "threshold should not be excessively large"
+            );
+        }
     }
 
     #[test]
@@ -4772,12 +4774,13 @@ mod tests {
 
     #[test]
     fn tailer_metrics_fields_mutate() {
-        let mut m = TailerMetrics::default();
-        m.events_sent = 10;
-        m.send_timeouts = 3;
-        m.capture_timeouts = 2;
-        m.no_change_captures = 7;
-        m.overflow_gaps_emitted = 1;
+        let m = TailerMetrics {
+            events_sent: 10,
+            send_timeouts: 3,
+            capture_timeouts: 2,
+            no_change_captures: 7,
+            overflow_gaps_emitted: 1,
+        };
         assert_eq!(m.events_sent, 10);
         assert_eq!(m.send_timeouts, 3);
         assert_eq!(m.capture_timeouts, 2);

@@ -793,8 +793,10 @@ mod tests {
 
     #[test]
     fn tiles_per_slice_axis_zero_tile_dim_safe() {
-        let mut c = AtlasArrayConfig::default();
-        c.tile_dim = 0;
+        let c = AtlasArrayConfig {
+            tile_dim: 0,
+            ..Default::default()
+        };
         assert_eq!(c.tiles_per_slice_axis(), 0);
     }
 

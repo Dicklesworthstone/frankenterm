@@ -4151,8 +4151,10 @@ mod tests {
             // Pane 99 is NOT added
         });
 
-        let mut config = TxExecutionConfig::default();
-        config.auto_compensate = true;
+        let config = TxExecutionConfig {
+            auto_compensate: true,
+            ..Default::default()
+        };
 
         let executor = make_pane_executor(mock.clone() as WeztermHandle);
         let engine = TxExecutionEngine::new(executor, config);
@@ -4217,8 +4219,10 @@ mod tests {
             mock.add_default_pane(0).await;
         });
 
-        let mut config = TxExecutionConfig::default();
-        config.fail_step = Some("s2".to_string());
+        let config = TxExecutionConfig {
+            fail_step: Some("s2".to_string()),
+            ..Default::default()
+        };
 
         let executor = make_pane_executor(mock as WeztermHandle);
         let engine = TxExecutionEngine::new(executor, config);

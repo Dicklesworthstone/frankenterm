@@ -7565,9 +7565,11 @@ mod tests {
             alt_screen in any::<bool>(),
             command_running in any::<bool>(),
         ) {
-            let mut capabilities = crate::policy::PaneCapabilities::default();
-            capabilities.alt_screen = Some(alt_screen);
-            capabilities.command_running = command_running;
+            let capabilities = crate::policy::PaneCapabilities {
+                alt_screen: Some(alt_screen),
+                command_running,
+                ..Default::default()
+            };
 
             let result = run_process_triage_step(
                 0,

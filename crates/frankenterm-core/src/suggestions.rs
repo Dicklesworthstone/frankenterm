@@ -2661,8 +2661,10 @@ mod tests {
     fn test_optimization_rule_unused_packs() {
         let rule = OptimizationRule;
         let mut ctx = SuggestionContext::new();
-        let mut metrics = SystemMetrics::default();
-        metrics.unused_pattern_packs = vec!["python-pack".to_string(), "ruby-pack".to_string()];
+        let metrics = SystemMetrics {
+            unused_pattern_packs: vec!["python-pack".to_string(), "ruby-pack".to_string()],
+            ..Default::default()
+        };
         ctx.set_system_metrics(metrics);
 
         assert!(rule.applies(&ctx));

@@ -5224,8 +5224,10 @@ steps:
         use crate::config::{CompactionPromptOverride, PaneFilterRule};
         use serde_json::json;
 
-        let mut config = crate::config::CompactionPromptConfig::default();
-        config.default = "default".to_string();
+        let mut config = crate::config::CompactionPromptConfig {
+            default: "default".to_string(),
+            ..Default::default()
+        };
         config
             .by_agent
             .insert("codex".to_string(), "agent".to_string());
@@ -5290,9 +5292,11 @@ steps:
     fn handle_compaction_prompt_bounds_and_redaction() {
         use serde_json::json;
 
-        let mut config = crate::config::CompactionPromptConfig::default();
-        config.max_prompt_len = 25;
-        config.max_snippet_len = 16;
+        let mut config = crate::config::CompactionPromptConfig {
+            max_prompt_len: 25,
+            max_snippet_len: 16,
+            ..Default::default()
+        };
         config.by_agent.clear();
         config.default = "Prompt {{pane_cwd}}".to_string();
 
@@ -8110,8 +8114,10 @@ Try again at 3:00 PM UTC.
                     .expect("storage"),
             );
 
-            let mut caps = PaneCapabilities::default();
-            caps.alt_screen = Some(true);
+            let caps = PaneCapabilities {
+                alt_screen: Some(true),
+                ..Default::default()
+            };
             let mut ctx = WorkflowContext::new(storage, 7, caps, "exec-triage-alt");
 
             let wf = HandleProcessTriageLifecycle::new();
@@ -9769,11 +9775,8 @@ Try again at 3:00 PM UTC.
             // Alphanumeric codes (including digits) should pass validation
             let outcome = execute_device_auth_step("AB12-CD34", "default", &tmp, None, true);
             // Should NOT fail with invalid_code
-            match &outcome {
-                DeviceAuthStepOutcome::Failed { error_kind, .. } => {
-                    assert_ne!(error_kind.as_deref(), Some("invalid_code"));
-                }
-                _ => {} // Authenticated or BootstrapRequired are both fine
+            if let DeviceAuthStepOutcome::Failed { error_kind, .. } = &outcome {
+                assert_ne!(error_kind.as_deref(), Some("invalid_code"));
             }
 
             let _ = std::fs::remove_dir_all(&tmp);
