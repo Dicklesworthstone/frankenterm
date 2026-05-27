@@ -176,10 +176,12 @@ mod tests {
 
     #[test]
     fn email_config_requires_host_and_recipients() {
-        let mut config = EmailNotifyConfig::default();
-        config.enabled = true;
-        config.from = "wa@example.com".to_string();
-        config.to = vec!["ops@example.com".to_string()];
+        let config = EmailNotifyConfig {
+            enabled: true,
+            from: "wa@example.com".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..Default::default()
+        };
 
         let err = config.validate().unwrap_err();
         assert!(err.contains("smtp_host"));
@@ -187,11 +189,13 @@ mod tests {
 
     #[test]
     fn email_config_rejects_invalid_addresses() {
-        let mut config = EmailNotifyConfig::default();
-        config.enabled = true;
-        config.smtp_host = "smtp.example.com".to_string();
-        config.from = "invalid".to_string();
-        config.to = vec!["ops@example.com".to_string()];
+        let config = EmailNotifyConfig {
+            enabled: true,
+            smtp_host: "smtp.example.com".to_string(),
+            from: "invalid".to_string(),
+            to: vec!["ops@example.com".to_string()],
+            ..Default::default()
+        };
 
         let err = config.validate().unwrap_err();
         assert!(err.contains("from"));

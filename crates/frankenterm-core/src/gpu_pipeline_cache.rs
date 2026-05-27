@@ -602,9 +602,11 @@ mod tests {
 
     #[test]
     fn stats_hit_rate_caps_at_100() {
-        let mut s = CacheStats::default();
-        s.cache_hits_total = 1_000;
-        s.cache_misses_total = 0;
+        let s = CacheStats {
+            cache_hits_total: 1_000,
+            cache_misses_total: 0,
+            ..Default::default()
+        };
         assert_eq!(s.hit_rate_pct(), 100);
     }
 

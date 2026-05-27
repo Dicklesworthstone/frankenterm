@@ -494,9 +494,11 @@ mod tests {
 
     #[test]
     fn search_constants_are_reasonable() {
-        assert!(SEARCH_LIMIT_DEFAULT > 0);
-        assert!(SEARCH_LIMIT_DEFAULT <= SEARCH_LIMIT_MAX);
-        assert!(SEARCH_SNIPPET_MAX_TOKENS > 0);
+        const {
+            assert!(SEARCH_LIMIT_DEFAULT > 0);
+            assert!(SEARCH_LIMIT_DEFAULT <= SEARCH_LIMIT_MAX);
+            assert!(SEARCH_SNIPPET_MAX_TOKENS > 0);
+        }
         assert!(!SEARCH_HIGHLIGHT_PREFIX.is_empty());
         assert!(!SEARCH_HIGHLIGHT_SUFFIX.is_empty());
     }

@@ -5409,8 +5409,10 @@ disabled_rules = ["codex.usage_warning"]
 
     #[test]
     fn db_path_relative_validates() {
-        let mut cfg = StorageConfig::default();
-        cfg.db_path = "subdir/ft.db".to_string();
+        let cfg = StorageConfig {
+            db_path: "subdir/ft.db".to_string(),
+            ..Default::default()
+        };
         cfg.validate().expect("plain relative path must validate");
     }
 
@@ -5468,8 +5470,10 @@ disabled_rules = ["codex.usage_warning"]
     fn db_path_validate_invokes_workspace_check() {
         // End-to-end: StorageConfig::validate must surface the
         // br-ft-at5kq containment failure.
-        let mut cfg = StorageConfig::default();
-        cfg.db_path = "/etc/passwd-ish.db".to_string();
+        let cfg = StorageConfig {
+            db_path: "/etc/passwd-ish.db".to_string(),
+            ..Default::default()
+        };
         let err = cfg
             .validate()
             .expect_err("absolute path must fail validate");
@@ -8373,10 +8377,12 @@ mode = "periodic"
 
     #[test]
     fn safety_config_decision_log_toml_roundtrip() {
-        let mut safety = SafetyConfig::default();
-        safety.decision_log = crate::policy_decision_log::DecisionLogConfig {
-            max_entries: 500,
-            record_allows: false,
+        let safety = SafetyConfig {
+            decision_log: crate::policy_decision_log::DecisionLogConfig {
+                max_entries: 500,
+                record_allows: false,
+            },
+            ..Default::default()
         };
         let toml_str = toml::to_string(&safety).expect("serialize");
         let back: SafetyConfig = toml::from_str(&toml_str).expect("deserialize");

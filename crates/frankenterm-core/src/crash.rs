@@ -7898,13 +7898,17 @@ mod tests {
 
     #[test]
     fn max_backtrace_len_is_bounded() {
-        assert!(MAX_BACKTRACE_LEN <= MAX_BUNDLE_SIZE);
+        const {
+            assert!(MAX_BACKTRACE_LEN <= MAX_BUNDLE_SIZE);
+        }
     }
 
     #[test]
     fn max_bundle_size_is_reasonable() {
-        assert!(MAX_BUNDLE_SIZE >= 1024, "bundle size too small");
-        assert!(MAX_BUNDLE_SIZE <= 10 * 1024 * 1024, "bundle size too large");
+        const {
+            assert!(MAX_BUNDLE_SIZE >= 1024, "bundle size too small");
+            assert!(MAX_BUNDLE_SIZE <= 10 * 1024 * 1024, "bundle size too large");
+        }
     }
 
     #[test]

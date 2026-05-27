@@ -3003,7 +3003,9 @@ mod tests {
     fn protocol_constants() {
         assert_eq!(PROTOCOL_VERSION, 1);
         assert_eq!(MAX_MESSAGE_SIZE, 1_048_576);
-        assert!(DEFAULT_AGENT_STALE_AFTER_MS > 0);
+        const {
+            assert!(DEFAULT_AGENT_STALE_AFTER_MS > 0);
+        }
     }
 
     // ── WirePayload coverage ────────────────────────────────

@@ -3086,13 +3086,17 @@ mod tests {
 
     #[test]
     fn send_osc_segment_limit_reasonable() {
-        assert!(SEND_OSC_SEGMENT_LIMIT > 0);
-        assert!(SEND_OSC_SEGMENT_LIMIT <= 1000);
+        const {
+            assert!(SEND_OSC_SEGMENT_LIMIT > 0);
+            assert!(SEND_OSC_SEGMENT_LIMIT <= 1000);
+        }
     }
 
     #[test]
     fn mcp_refresh_cooldown_positive() {
-        assert!(MCP_REFRESH_COOLDOWN_MS > 0);
+        const {
+            assert!(MCP_REFRESH_COOLDOWN_MS > 0);
+        }
     }
 
     // ── map_mcp_error additional branches ─────────────────────────────────

@@ -709,8 +709,10 @@ mod tests {
     fn feature_isolation_leak_detected() {
         // Manually construct a leaked isolation record and run it through evaluate.
         let scan = ScanReport::clean(10, 500, 9);
-        let mut config = GuardConfig::default();
-        config.enforce_feature_flags = true;
+        let config = GuardConfig {
+            enforce_feature_flags: true,
+            ..Default::default()
+        };
 
         // Build a result and inject a leaked isolation check after the fact.
         let mut result = GuardSuiteResult::evaluate(&config, &scan);
