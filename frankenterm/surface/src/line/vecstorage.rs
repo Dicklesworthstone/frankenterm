@@ -3,10 +3,15 @@ use alloc::sync::Arc;
 use frankenterm_cell::Cell;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
-use unicode_segmentation::UnicodeSegmentation;
 
 extern crate alloc;
 use alloc::vec::Vec;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HyperlinkCellMatch {
+    pub(crate) cell_indices: Vec<usize>,
+    pub(crate) link: Arc<crate::hyperlink::Hyperlink>,
+}
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
@@ -34,34 +39,19 @@ impl VecStorage {
         self.cells[idx] = cell;
     }
 
-    pub(crate) fn scan_and_create_hyperlinks(
-        &mut self,
-        line: &str,
-        matches: Vec<crate::hyperlink::RuleMatch>,
-    ) -> bool {
-        // The capture range is measured in bytes but we need to translate
-        // that to the index of the column.  This is complicated a bit further
-        // because double wide sequences have a blank column cell after them
-        // in the cells array, but the string we match against excludes that
-        // string.
-        let mut cell_idx = 0;
+    pub(crate) fn scan_and_create_hyperlinks(&mut self, matches: Vec<HyperlinkCellMatch>) -> bool {
         let mut has_implicit_hyperlinks = false;
-        for (byte_idx, _grapheme) in line.grapheme_indices(true) {
-            let cell = &mut self.cells[cell_idx];
-            let mut matched = false;
-            for m in &matches {
-                if m.range.contains(&byte_idx) {
-                    let attrs = cell.attrs_mut();
-                    // Don't replace existing links
-                    if attrs.hyperlink().is_none() {
-                        attrs.set_hyperlink(Some(Arc::clone(&m.link)));
-                        matched = true;
-                    }
+        for matched in matches {
+            for cell_idx in matched.cell_indices {
+                let Some(cell) = self.cells.get_mut(cell_idx) else {
+                    continue;
+                };
+                let attrs = cell.attrs_mut();
+                // Don't replace existing links.
+                if attrs.hyperlink().is_none() {
+                    attrs.set_hyperlink(Some(Arc::clone(&matched.link)));
+                    has_implicit_hyperlinks = true;
                 }
-            }
-            cell_idx += cell.width();
-            if matched {
-                has_implicit_hyperlinks = true;
             }
         }
 

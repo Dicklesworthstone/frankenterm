@@ -4,8 +4,8 @@ use crate::line::cellref::CellRef;
 use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
-use crate::line::vecstorage::{VecStorage, VecStorageIter};
-use crate::{Change, SequenceNo, SEQ_ZERO};
+use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage, VecStorageIter};
+use crate::{Change, SEQ_ZERO, SequenceNo};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -45,6 +45,87 @@ fn checked_materialized_end(idx: usize, width: usize) -> Option<usize> {
 pub struct ZoneRange {
     pub semantic_type: SemanticType,
     pub range: Range<u16>,
+}
+
+#[derive(Debug)]
+struct HyperlinkScanCell {
+    byte_range: Range<usize>,
+    cell_index: usize,
+}
+
+#[derive(Debug, Default)]
+struct HyperlinkScanRun {
+    text: String,
+    cells: Vec<HyperlinkScanCell>,
+}
+
+impl HyperlinkScanRun {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn push(&mut self, cell: CellRef<'_>) {
+        let start = self.text.len();
+        self.text.push_str(cell.str());
+        let end = self.text.len();
+        if start != end {
+            self.cells.push(HyperlinkScanCell {
+                byte_range: start..end,
+                cell_index: cell.cell_index(),
+            });
+        }
+    }
+
+    fn finish_into(self, runs: &mut Vec<Self>) {
+        if !self.is_empty() {
+            runs.push(self);
+        }
+    }
+}
+
+fn hyperlink_cell_matches(
+    scan_runs: Vec<HyperlinkScanRun>,
+    rules: &[Rule],
+) -> Vec<HyperlinkCellMatch> {
+    let mut cell_matches = Vec::new();
+    for scan_run in scan_runs {
+        for matched in Rule::match_hyperlinks(&scan_run.text, rules) {
+            let Some(first_cell_idx) = scan_run
+                .cells
+                .iter()
+                .position(|cell| cell.byte_range.start == matched.range.start)
+            else {
+                continue;
+            };
+
+            let mut cell_indices = Vec::new();
+            let mut match_end_aligned = false;
+            for cell in scan_run.cells.iter().skip(first_cell_idx) {
+                if cell.byte_range.start >= matched.range.end {
+                    break;
+                }
+                if cell.byte_range.end > matched.range.end {
+                    cell_indices.clear();
+                    break;
+                }
+
+                cell_indices.push(cell.cell_index);
+                if cell.byte_range.end == matched.range.end {
+                    match_end_aligned = true;
+                    break;
+                }
+            }
+
+            if match_end_aligned && !cell_indices.is_empty() {
+                cell_matches.push(HyperlinkCellMatch {
+                    cell_indices,
+                    link: matched.link,
+                });
+            }
+        }
+    }
+
+    cell_matches
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -659,24 +740,44 @@ impl Line {
             return;
         }
 
-        // FIXME: let's build a string and a byte-to-cell map here, and
-        // use this as an opportunity to rebuild HAS_HYPERLINK, skip matching
-        // cells with existing non-implicit hyperlinks, and avoid matching
-        // text with zero-width cells.
+        let (scan_runs, has_explicit_hyperlink) = self.hyperlink_scan_runs();
         self.bits |= LineBits::SCANNED_IMPLICIT_HYPERLINKS;
         self.bits &= !LineBits::HAS_IMPLICIT_HYPERLINKS;
-        let line = self.as_str();
+        self.bits
+            .set(LineBits::HAS_HYPERLINK, has_explicit_hyperlink);
 
-        let matches = Rule::match_hyperlinks(&line, rules);
+        let matches = hyperlink_cell_matches(scan_runs, rules);
         if matches.is_empty() {
             return;
         }
 
-        let line = line.into_owned();
         let cells = self.coerce_vec_storage();
-        if cells.scan_and_create_hyperlinks(&line, matches) {
+        if cells.scan_and_create_hyperlinks(matches) {
             self.bits |= LineBits::HAS_IMPLICIT_HYPERLINKS;
         }
+    }
+
+    fn hyperlink_scan_runs(&self) -> (Vec<HyperlinkScanRun>, bool) {
+        let mut runs = Vec::new();
+        let mut current = HyperlinkScanRun::default();
+        let mut has_explicit_hyperlink = false;
+
+        for cell in self.visible_cells() {
+            let has_non_implicit_hyperlink =
+                matches!(cell.attrs().hyperlink(), Some(link) if !link.is_implicit());
+            has_explicit_hyperlink |= has_non_implicit_hyperlink;
+
+            if has_non_implicit_hyperlink || cell.width() == 0 {
+                current.finish_into(&mut runs);
+                current = HyperlinkScanRun::default();
+                continue;
+            }
+
+            current.push(cell);
+        }
+
+        current.finish_into(&mut runs);
+        (runs, has_explicit_hyperlink)
     }
 
     /// Scan through a logical line that is comprised of an array of

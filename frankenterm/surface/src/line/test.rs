@@ -1,12 +1,13 @@
 #![cfg(test)]
 
 use super::*;
+use crate::SEQ_ZERO;
 use crate::hyperlink::{Hyperlink, Rule};
 use crate::line::clusterline::ClusteredLine;
-use crate::SEQ_ZERO;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 use frankenterm_cell::{Cell, CellAttributes};
 use k9::assert_equal as assert_eq;
 
@@ -29,10 +30,7 @@ fn append_line() {
 fn hyperlinks() {
     let text = "❤ 😍🤢 http://example.com \u{1f468}\u{1f3fe}\u{200d}\u{1f9b0} http://example.com";
 
-    let rules = vec![
-        Rule::new(r"\b\w+://(?:[\w.-]+)\.[a-z]{2,15}\S*\b", "$0").unwrap(),
-        Rule::new(r"\b\w+@[\w-]+(\.[\w-]+)+\b", "mailto:$0").unwrap(),
-    ];
+    let rules = hyperlink_rules();
 
     let hyperlink = Arc::new(Hyperlink::new_implicit("http://example.com"));
     let hyperlink_attr = CellAttributes::default()
@@ -99,6 +97,126 @@ fn hyperlinks() {
             Cell::new('m', hyperlink_attr.clone()),
         ]
     );
+}
+
+fn hyperlink_rules() -> Vec<Rule> {
+    vec![
+        Rule::new(r"\b\w+://(?:[\w.-]+)\.[a-z]{2,15}\S*\b", "$0").unwrap(),
+        Rule::new(r"\b\w+@[\w-]+(\.[\w-]+)+\b", "mailto:$0").unwrap(),
+    ]
+}
+
+fn linked_uri(cell: &Cell) -> Option<&str> {
+    cell.attrs().hyperlink().map(|link| link.uri())
+}
+
+#[test]
+fn implicit_hyperlink_after_wide_cell_uses_visible_cell_map() {
+    let mut line: Line = "中http://example.com".into();
+
+    line.scan_and_create_hyperlinks(&hyperlink_rules());
+
+    let cells = line.coerce_vec_storage().to_vec();
+    assert_eq!(cells[0].str(), "中");
+    assert_eq!(cells[1].str(), " ");
+    assert_eq!(linked_uri(&cells[0]), None);
+    assert_eq!(linked_uri(&cells[1]), None);
+    assert_eq!(linked_uri(&cells[2]), Some("http://example.com"));
+    assert_eq!(
+        linked_uri(cells.last().unwrap()),
+        Some("http://example.com")
+    );
+}
+
+#[test]
+fn implicit_hyperlink_with_wide_cell_inside_match_skips_spacer_cell() {
+    let wide_link = Arc::new(Hyperlink::new_implicit("https://wide.example/"));
+    let wide_link_attr = CellAttributes::default()
+        .set_hyperlink(Some(wide_link))
+        .clone();
+    let mut line = Line::from_cells(
+        vec![
+            Cell::new('x', CellAttributes::default()),
+            Cell::new_grapheme("❤", CellAttributes::default(), None),
+            Cell::new(' ', CellAttributes::default()),
+            Cell::new('y', CellAttributes::default()),
+        ],
+        SEQ_ZERO,
+    );
+    let rules = vec![Rule::new(r"\S+", "https://wide.example/").unwrap()];
+
+    line.scan_and_create_hyperlinks(&rules);
+
+    let cells = line.coerce_vec_storage().to_vec();
+    assert_eq!(cells[0].attrs(), &wide_link_attr);
+    assert_eq!(cells[1].attrs(), &wide_link_attr);
+    assert_eq!(linked_uri(&cells[2]), None);
+    assert_eq!(cells[3].attrs(), &wide_link_attr);
+}
+
+#[test]
+fn implicit_hyperlink_scan_splits_at_zero_width_cells() {
+    let zero_width = Cell::new_grapheme(
+        "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+        CellAttributes::default(),
+        None,
+    );
+    assert_eq!(zero_width.width(), 0);
+    let cells: Vec<Cell> = vec![
+        Cell::new('a', CellAttributes::default()),
+        Cell::new('b', CellAttributes::default()),
+        zero_width,
+        Cell::new('c', CellAttributes::default()),
+        Cell::new('d', CellAttributes::default()),
+    ];
+    let mut line = Line::from_cells(cells, SEQ_ZERO);
+    let rules = vec![Rule::new(r"ab.*cd", "https://zero-width.example/").unwrap()];
+
+    line.scan_and_create_hyperlinks(&rules);
+
+    assert!(!line.has_hyperlink());
+    assert!(
+        line.coerce_vec_storage()
+            .iter()
+            .all(|cell| cell.attrs().hyperlink().is_none())
+    );
+}
+
+#[test]
+fn implicit_hyperlink_scan_excludes_explicit_link_spans() {
+    let explicit_link = Arc::new(Hyperlink::new("https://explicit.example/"));
+    let explicit_attr = CellAttributes::default()
+        .set_hyperlink(Some(explicit_link))
+        .clone();
+    let text = "http://blocked.test http://ok.test";
+    let cells: Vec<Cell> = text
+        .chars()
+        .enumerate()
+        .map(|(idx, c)| {
+            let attrs = if idx == "http://blocked".len() {
+                explicit_attr.clone()
+            } else {
+                CellAttributes::default()
+            };
+            Cell::new(c, attrs)
+        })
+        .collect();
+    let explicit_idx = "http://blocked".len();
+    let ok_start = "http://blocked.test ".len();
+    let mut line = Line::from_cells(cells, SEQ_ZERO);
+
+    line.scan_and_create_hyperlinks(&hyperlink_rules());
+
+    let cells = line.coerce_vec_storage().to_vec();
+    assert!(line.has_hyperlink());
+    assert_eq!(linked_uri(&cells[0]), None);
+    assert_eq!(
+        linked_uri(&cells[explicit_idx]),
+        Some("https://explicit.example/")
+    );
+    assert_eq!(linked_uri(&cells[explicit_idx + 1]), None);
+    assert_eq!(linked_uri(&cells[ok_start]), Some("http://ok.test"));
+    assert_eq!(linked_uri(cells.last().unwrap()), Some("http://ok.test"));
 }
 
 #[test]
