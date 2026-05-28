@@ -6726,6 +6726,50 @@ fn mux_socket_path_is_usable(path: &std::path::Path) -> bool {
     }
 }
 
+fn explicit_mux_socket_path_is_usable(config: &crate::config::Config) -> bool {
+    let Some(path) = config.vendored.mux_socket_path.as_deref() else {
+        return false;
+    };
+    let trimmed = path.trim();
+    !trimmed.is_empty() && mux_socket_path_is_usable(std::path::Path::new(trimmed))
+}
+
+#[cfg(feature = "vendored")]
+fn compatibility_inputs_for_backend_selection(
+    report: &crate::vendored::VendoredCompatibilityReport,
+    explicit_mux_socket_found: bool,
+) -> (bool, String, Option<serde_json::Value>) {
+    let mut json = serde_json::to_value(report).ok();
+    let explicit_socket_overrides_missing_local_cli = explicit_mux_socket_found
+        && report.vendored_enabled
+        && report.vendored_commit.is_some()
+        && report.local_version.is_none()
+        && report.message.contains("local WezTerm version unavailable");
+
+    if explicit_socket_overrides_missing_local_cli {
+        if let Some(serde_json::Value::Object(map)) = json.as_mut() {
+            map.insert(
+                "explicit_mux_socket_override".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            map.insert(
+                "effective_allow_vendored".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        return (
+            true,
+            format!(
+                "explicit vendored.mux_socket_path configured; using vendored backend without local WezTerm CLI ({})",
+                report.message
+            ),
+            json,
+        );
+    }
+
+    (report.allow_vendored, report.message.clone(), json)
+}
+
 /// Build a `UnifiedClient` by probing the runtime environment.
 ///
 /// 1. Check if the `vendored` feature is enabled (compile time).
@@ -6734,6 +6778,11 @@ fn mux_socket_path_is_usable(path: &std::path::Path) -> bool {
 /// 4. If all pass, use vendored backend; else fall back to CLI.
 pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
     let vendored_enabled = cfg!(feature = "vendored");
+    let explicit_socket_found = explicit_mux_socket_path_is_usable(config);
+    // Socket discovery: use the shared resolver that checks config, env, AND
+    // canonical WezTerm unix-domain defaults (GH #48).
+    let socket_found = explicit_socket_found
+        || discover_mux_socket(config.vendored.mux_socket_path.as_deref()).is_some();
 
     // Build compatibility inputs depending on feature availability.
     let (allow_vendored, compat_message, compat_json) = if vendored_enabled {
@@ -6741,8 +6790,7 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
         {
             let local_version = crate::vendored::read_local_wezterm_version();
             let report = crate::vendored::compatibility_report(local_version.as_ref());
-            let json = serde_json::to_value(&report).ok();
-            (report.allow_vendored, report.message.clone(), json)
+            compatibility_inputs_for_backend_selection(&report, explicit_socket_found)
         }
         #[cfg(not(feature = "vendored"))]
         {
@@ -6751,10 +6799,6 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
     } else {
         (false, "vendored feature not enabled".to_string(), None)
     };
-
-    // Socket discovery: use the shared resolver that checks config, env, AND
-    // canonical WezTerm unix-domain defaults (GH #48).
-    let socket_found = discover_mux_socket(config.vendored.mux_socket_path.as_deref()).is_some();
 
     let inputs = BackendSelectionInputs {
         vendored_feature_enabled: vendored_enabled,
@@ -8262,6 +8306,83 @@ mod unified_tests {
         );
         let sel = evaluate_backend_selection(&inp);
         assert_eq!(sel.kind, BackendKind::Vendored);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn explicit_mux_socket_overrides_missing_local_wezterm_cli_probe() {
+        let report = crate::vendored::VendoredCompatibilityReport {
+            status: crate::vendored::VendoredCompatibilityStatus::Incompatible,
+            vendored_enabled: true,
+            allow_vendored: false,
+            local_version: None,
+            local_commit: None,
+            vendored_commit: Some("abcdef12".to_string()),
+            vendored_version: Some("frankenterm-test".to_string()),
+            message:
+                "local WezTerm version unavailable; refusing vendored backend compatibility probe"
+                    .to_string(),
+            recommendation: Some(
+                "Install WezTerm or ensure the wezterm binary is on PATH".to_string(),
+            ),
+        };
+
+        let (allow_vendored, compat_message, compat_json) =
+            compatibility_inputs_for_backend_selection(&report, true);
+
+        assert!(allow_vendored);
+        assert!(compat_message.contains("explicit vendored.mux_socket_path configured"));
+        let compat_json = compat_json.expect("compatibility JSON");
+        assert_eq!(
+            compat_json["explicit_mux_socket_override"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            compat_json["effective_allow_vendored"].as_bool(),
+            Some(true)
+        );
+
+        let sel = evaluate_backend_selection(&BackendSelectionInputs {
+            vendored_feature_enabled: true,
+            allow_vendored,
+            compat_message,
+            compat_json: Some(compat_json),
+            socket_discovered: true,
+        });
+        assert_eq!(sel.kind, BackendKind::Vendored);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn missing_local_wezterm_cli_without_explicit_socket_stays_cli() {
+        let report = crate::vendored::VendoredCompatibilityReport {
+            status: crate::vendored::VendoredCompatibilityStatus::Incompatible,
+            vendored_enabled: true,
+            allow_vendored: false,
+            local_version: None,
+            local_commit: None,
+            vendored_commit: Some("abcdef12".to_string()),
+            vendored_version: Some("frankenterm-test".to_string()),
+            message:
+                "local WezTerm version unavailable; refusing vendored backend compatibility probe"
+                    .to_string(),
+            recommendation: Some(
+                "Install WezTerm or ensure the wezterm binary is on PATH".to_string(),
+            ),
+        };
+
+        let (allow_vendored, compat_message, compat_json) =
+            compatibility_inputs_for_backend_selection(&report, false);
+
+        assert!(!allow_vendored);
+        let sel = evaluate_backend_selection(&BackendSelectionInputs {
+            vendored_feature_enabled: true,
+            allow_vendored,
+            compat_message,
+            compat_json,
+            socket_discovered: true,
+        });
+        assert_eq!(sel.kind, BackendKind::Cli);
     }
 
     #[test]
