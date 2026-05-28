@@ -500,7 +500,7 @@ jobs:
         if: runner.os == 'Linux'
         run: df -h
 
-      - name: Free Ubuntu runner disk space
+      - name: Free Ubuntu runner disk space aggressively
         if: runner.os == 'Linux'
         uses: jlumbroso/free-disk-space@main
         with:
@@ -1066,6 +1066,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: resize-performance-gates
+
+      - name: Report Ubuntu disk before cleanup
+        run: df -h
+
+      - name: Free Ubuntu runner disk space aggressively
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Report Ubuntu disk after cleanup
+        run: df -h
 
       - name: Run resize performance regression gates
         run: scripts/check_resize_performance_gates.sh
