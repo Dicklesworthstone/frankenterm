@@ -370,6 +370,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.13.0",
+ "io-uring",
  "js-sys",
  "libc",
  "memchr",
