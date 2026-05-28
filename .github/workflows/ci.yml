@@ -518,6 +518,9 @@ jobs:
 
       - name: Run tests
         shell: bash
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_TEST_INCREMENTAL: "false"
         run: |
           set -eo pipefail
           mkdir -p target/ci-logs
@@ -1085,6 +1088,9 @@ jobs:
         run: df -h
 
       - name: Run resize performance regression gates
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_TEST_INCREMENTAL: "false"
         run: scripts/check_resize_performance_gates.sh
 
       - name: Upload resize gate artifacts
