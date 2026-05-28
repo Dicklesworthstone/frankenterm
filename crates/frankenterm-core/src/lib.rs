@@ -750,8 +750,14 @@ pub mod browser;
 // Both compile the `tui` module but with different rendering backends.
 // The `rollout` feature compiles both backends and enables runtime selection via
 // the FT_TUI_BACKEND environment variable (see docs/ftui-rollout-strategy.md).
+// `tui-oracle` is additive test coverage and can compile beside default `ftui`.
 // See docs/adr/0004-phased-rollout-and-rollback.md for migration details.
-#[cfg(all(feature = "tui", feature = "ftui", not(feature = "rollout")))]
+#[cfg(all(
+    feature = "tui",
+    feature = "ftui",
+    not(feature = "tui-oracle"),
+    not(feature = "rollout")
+))]
 compile_error!(
     "Features `tui` and `ftui` are mutually exclusive. \
      Use `--features tui` for the legacy ratatui backend or \

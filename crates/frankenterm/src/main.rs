@@ -41973,7 +41973,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             frankenterm_core::web::run_web_server_with_cx(&web_cx, web_config).await?;
         }
 
-        #[cfg(all(feature = "tui", not(feature = "rollout")))]
+        #[cfg(all(feature = "tui", not(feature = "ftui"), not(feature = "rollout")))]
         Some(Commands::Tui { debug, refresh }) => {
             use frankenterm_core::tui::{AppConfig, ProductionQueryClient, run_tui};
             use std::time::Duration;
@@ -42017,7 +42017,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        #[cfg(all(feature = "ftui", not(feature = "tui"), not(feature = "rollout")))]
+        #[cfg(all(feature = "ftui", not(feature = "rollout")))]
         Some(Commands::Tui { debug, refresh }) => {
             use frankenterm_core::tui::{AppConfig, ProductionQueryClient, run_tui};
             use std::time::Duration;

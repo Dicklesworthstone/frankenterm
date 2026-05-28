@@ -40,8 +40,11 @@
 //! - `tui-oracle`: Legacy ratatui/crossterm backend for parity tests
 //! - `rollout`: Both backends compiled; runtime selection via `FT_TUI_BACKEND`
 //!
-//! `tui-oracle` and `ftui` are mutually exclusive unless `rollout` is active.
-//! The QueryClient trait and data types are shared between both backends.
+//! `tui` and `ftui` are mutually exclusive unless `rollout` is active. The
+//! `tui-oracle` feature may compile the legacy backend beside the default
+//! `ftui` backend for parity coverage, but the public `App` aliases still point
+//! at `ftui` unless `rollout` is active. The QueryClient trait and data types
+//! are shared between both backends.
 
 // QueryClient trait and data types — framework-agnostic, always compiled.
 mod query;
@@ -86,16 +89,26 @@ pub mod command_handoff;
 pub mod state;
 
 // Legacy ratatui backend
+// In additive oracle builds the legacy backend is compiled for parity checks,
+// while the public TUI aliases stay on the default ftui backend.
 #[cfg(feature = "tui")]
+#[cfg_attr(
+    all(feature = "ftui", feature = "tui-oracle", not(feature = "rollout")),
+    allow(dead_code)
+)]
 mod app;
 #[cfg(feature = "tui")]
+#[cfg_attr(
+    all(feature = "ftui", feature = "tui-oracle", not(feature = "rollout")),
+    allow(dead_code)
+)]
 mod views;
 
 // Single-backend re-exports (suppressed when rollout is active to avoid
 // name collisions — rollout.rs provides the dispatch layer instead).
-#[cfg(all(feature = "tui", not(feature = "rollout")))]
+#[cfg(all(feature = "tui", not(feature = "ftui"), not(feature = "rollout")))]
 pub use app::{App, AppConfig, run_tui};
-#[cfg(all(feature = "tui", not(feature = "rollout")))]
+#[cfg(all(feature = "tui", not(feature = "ftui"), not(feature = "rollout")))]
 pub use views::{View, ViewState};
 
 // FrankenTUI backend (migration target — FTUI-03 through FTUI-06).
