@@ -215,6 +215,21 @@ impl WeztermSubprocessFixture {
         &self.socket_path
     }
 
+    /// Path where the fixture captures mux-server stdout.
+    pub fn stdout_path(&self) -> &Path {
+        &self.stdout_path
+    }
+
+    /// Path where the fixture captures mux-server stderr.
+    pub fn stderr_path(&self) -> &Path {
+        &self.stderr_path
+    }
+
+    /// Snapshot the current mux-server stdout/stderr logs.
+    pub fn child_output_snapshot(&self) -> (String, String) {
+        read_child_output(&self.stdout_path, &self.stderr_path)
+    }
+
     /// Path to the hermetic HOME directory (for tests that need to plant
     /// additional state there, e.g. wezterm config overrides).
     pub fn home_dir(&self) -> &Path {
@@ -382,23 +397,59 @@ fn build_mux_binary() -> Option<PathBuf> {
     let cargo = std::env::var_os("CARGO")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cargo"));
+    let timeout = mux_fixture_build_timeout();
 
     eprintln!("building frankenterm-mux-server for real mux fixture");
-    let status = Command::new(cargo)
+    let mut child = Command::new(cargo)
         .current_dir(workspace_root)
         .arg("build")
         .arg("-p")
         .arg("frankenterm-mux-server")
-        .status()
+        .spawn()
         .ok()?;
 
-    if !status.success() {
-        return None;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "timed out building frankenterm-mux-server for real mux fixture after {}s",
+                    timeout.as_secs()
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(err) => {
+                eprintln!("failed to poll frankenterm-mux-server fixture build: {err}");
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
 
     mux_binary_candidates()
         .into_iter()
         .find(|candidate| candidate.exists())
+}
+
+fn mux_fixture_build_timeout() -> Duration {
+    std::env::var("FT_MUX_FIXTURE_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(900))
 }
 
 fn mux_binary_candidates() -> Vec<PathBuf> {

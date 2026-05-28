@@ -29,6 +29,15 @@ use frankenterm_core::wezterm::SplitDirection;
 use frankenterm_core::wezterm::{PaneInfo, SpawnTarget, WeztermClient};
 #[cfg(all(feature = "vendored", unix))]
 use frankenterm_term::TerminalSize;
+use std::fmt::Display;
+use std::future::Future;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+const MUX_CLIENT_OP_TIMEOUT: Duration = Duration::from_secs(30);
+const MUX_CLIENT_OP_HARD_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 
 /// Emit a structured JSON-line trace (per the no-mocks skill's logging
 /// pattern) on test stderr so CI failures are debuggable.
@@ -46,32 +55,74 @@ fn log(test: &str, phase: &str, body: serde_json::Value) {
     eprintln!("{line}");
 }
 
-fn spawn_in_window(runtime: &RuntimeFixture, client: &WeztermClient, window_id: u64) -> u64 {
-    runtime
-        .block_on({
-            let client = client.clone();
-            async move {
-                Box::pin(client.spawn_targeted(
-                    None,
-                    None,
-                    SpawnTarget {
-                        window_id: Some(window_id),
-                        new_window: false,
-                    },
-                ))
-                .await
-            }
-        })
-        .expect("spawn pane in fixture window")
+fn block_on_mux_operation<T, E, F>(runtime: &RuntimeFixture, phase: &str, future: F) -> T
+where
+    E: Display,
+    F: Future<Output = Result<T, E>>,
+{
+    match runtime.block_on(async {
+        frankenterm_core::runtime_async::timeout(MUX_CLIENT_OP_TIMEOUT, future).await
+    }) {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => panic!("{phase} failed: {err}"),
+        Err(err) => panic!(
+            "{phase} timed out after {}s: {err}",
+            MUX_CLIENT_OP_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+fn block_on_owned_mux_operation<T, E, F>(phase: &'static str, future: F) -> T
+where
+    T: Send + 'static,
+    E: Display + Send + 'static,
+    F: Future<Output = Result<T, E>> + Send + 'static,
+{
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let runtime = RuntimeFixture::current_thread();
+            block_on_mux_operation(&runtime, phase, future)
+        }));
+        let _ = tx.send(result);
+    });
+
+    let hard_timeout = MUX_CLIENT_OP_TIMEOUT + MUX_CLIENT_OP_HARD_TIMEOUT_GRACE;
+    match rx.recv_timeout(hard_timeout) {
+        Ok(Ok(value)) => value,
+        Ok(Err(payload)) => panic::resume_unwind(payload),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "{phase} hard timed out after {}s without unwinding",
+            hard_timeout.as_secs()
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{phase} worker thread disconnected before reporting a result")
+        }
+    }
+}
+
+fn spawn_in_window(_runtime: &RuntimeFixture, client: &WeztermClient, window_id: u64) -> u64 {
+    block_on_owned_mux_operation("spawn pane in fixture window", {
+        let client = client.clone();
+        async move {
+            Box::pin(client.spawn_targeted(
+                None,
+                None,
+                SpawnTarget {
+                    window_id: Some(window_id),
+                    new_window: false,
+                },
+            ))
+            .await
+        }
+    })
 }
 
 fn spawn_in_first_window(runtime: &RuntimeFixture, client: &WeztermClient) -> u64 {
-    let panes = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.list_panes().await }
-        })
-        .expect("list_panes before targeted spawn");
+    let panes = block_on_owned_mux_operation("list_panes before targeted spawn", {
+        let client = client.clone();
+        async move { client.list_panes().await }
+    });
     let window_id = panes
         .first()
         .expect("fixture should expose an initial pane")
@@ -81,7 +132,7 @@ fn spawn_in_first_window(runtime: &RuntimeFixture, client: &WeztermClient) -> u6
 
 #[cfg(all(feature = "vendored", unix))]
 fn wait_until_text_contains(
-    runtime: &RuntimeFixture,
+    _runtime: &RuntimeFixture,
     client: &frankenterm_core::wezterm::WeztermClient,
     pane_id: u64,
     needle: &str,
@@ -90,9 +141,9 @@ fn wait_until_text_contains(
     let start = std::time::Instant::now();
     loop {
         let client_for_poll = client.clone();
-        let text = runtime
-            .block_on(Box::pin(client_for_poll.get_text(pane_id, false)))
-            .expect("get_text during loopback wait");
+        let text = block_on_owned_mux_operation("get_text during loopback wait", async move {
+            client_for_poll.get_text(pane_id, false).await
+        });
         if text.contains(needle) {
             log(
                 "loopback",
@@ -129,7 +180,6 @@ fn one_pane_listing_carries_basic_metadata() {
     }
     let fixture = WeztermSubprocessFixture::spawn().expect("spawn mux subprocess");
     let client = fixture.client();
-    let runtime = RuntimeFixture::current_thread();
 
     log(
         "one_pane",
@@ -137,9 +187,11 @@ fn one_pane_listing_carries_basic_metadata() {
         serde_json::json!({"pid": fixture.pid()}),
     );
 
-    let panes = runtime
-        .block_on(async move { client.list_panes().await })
-        .expect("list_panes");
+    let panes =
+        block_on_owned_mux_operation(
+            "one_pane list_panes",
+            async move { client.list_panes().await },
+        );
 
     log(
         "one_pane",
@@ -180,12 +232,10 @@ fn spawn_second_pane_increments_listing() {
     let client = fixture.client();
     let runtime = RuntimeFixture::current_thread();
 
-    let initial = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.list_panes().await }
-        })
-        .expect("initial list_panes");
+    let initial = block_on_owned_mux_operation("initial list_panes", {
+        let client = client.clone();
+        async move { client.list_panes().await }
+    });
     log(
         "two_pane",
         "before_spawn",
@@ -200,12 +250,10 @@ fn spawn_second_pane_increments_listing() {
         serde_json::json!({"new_pane_id": new_pane_id}),
     );
 
-    let after = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.list_panes().await }
-        })
-        .expect("post-spawn list_panes");
+    let after = block_on_owned_mux_operation("post-spawn list_panes", {
+        let client = client.clone();
+        async move { client.list_panes().await }
+    });
     log(
         "two_pane",
         "after_spawn",
@@ -243,12 +291,10 @@ fn pane_listing_serializes_and_roundtrips() {
 
     // Two-pane snapshot for richer roundtrip surface.
     spawn_in_first_window(&runtime, &client);
-    let panes = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.list_panes().await }
-        })
-        .expect("list_panes");
+    let panes = block_on_owned_mux_operation("roundtrip list_panes", {
+        let client = client.clone();
+        async move { client.list_panes().await }
+    });
 
     let json = serde_json::to_string(&panes).expect("serialize Vec<PaneInfo>");
     log(
@@ -296,12 +342,10 @@ fn restart_fixture_yields_independent_pane_state() {
         let client = fixture.client();
         // Spawn a second pane so the snapshot is non-trivial
         spawn_in_first_window(&runtime, &client);
-        let panes = runtime
-            .block_on({
-                let client = client.clone();
-                async move { client.list_panes().await }
-            })
-            .expect("list_panes A");
+        let panes = block_on_owned_mux_operation("restart fixture A list_panes", {
+            let client = client.clone();
+            async move { client.list_panes().await }
+        });
         log(
             "restart",
             "snapshot_A",
@@ -330,12 +374,10 @@ fn restart_fixture_yields_independent_pane_state() {
         socket_a,
         "fixture B must use a different socket path"
     );
-    let panes_b = runtime
-        .block_on({
-            let client = fixture_b.client();
-            async move { client.list_panes().await }
-        })
-        .expect("list_panes B");
+    let panes_b = block_on_owned_mux_operation("restart fixture B list_panes", {
+        let client = fixture_b.client();
+        async move { client.list_panes().await }
+    });
     log(
         "restart",
         "snapshot_B",
@@ -397,12 +439,10 @@ fn wait_until_pane_count_observes_async_spawn() {
     let count_at_least = |target: usize, deadline: std::time::Duration| -> Vec<PaneInfo> {
         let start = std::time::Instant::now();
         loop {
-            let panes = runtime
-                .block_on({
-                    let client = client.clone();
-                    async move { client.list_panes().await }
-                })
-                .expect("list_panes during wait");
+            let panes = block_on_owned_mux_operation("list_panes during wait", {
+                let client = client.clone();
+                async move { client.list_panes().await }
+            });
             if panes.len() >= target {
                 log(
                     "wait_until",
@@ -450,13 +490,23 @@ fn no_mock_spawn_send_resize_read_loopback() {
         .expect("spawn mux subprocess");
     let client = fixture.client();
     let runtime = RuntimeFixture::current_thread();
+    let stdout_path = fixture.stdout_path().display().to_string();
+    let stderr_path = fixture.stderr_path().display().to_string();
+    log(
+        "loopback",
+        "fixture_spawned",
+        serde_json::json!({
+            "pid": fixture.pid(),
+            "socket": fixture.socket_path().display().to_string(),
+            "mux_stdout": stdout_path,
+            "mux_stderr": stderr_path,
+        }),
+    );
 
-    let initial = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.list_panes().await }
-        })
-        .expect("initial list_panes");
+    let initial = block_on_owned_mux_operation("initial list_panes", {
+        let client = client.clone();
+        async move { client.list_panes().await }
+    });
     assert_eq!(initial.len(), 1, "cat fixture should start with one pane");
     let source = initial[0].clone();
     log(
@@ -468,26 +518,24 @@ fn no_mock_spawn_send_resize_read_loopback() {
             "window_id": source.window_id,
             "rows": source.effective_rows(),
             "cols": source.effective_cols(),
+            "mux_stdout": stdout_path,
+            "mux_stderr": stderr_path,
         }),
     );
 
     let spawned_pane_id = spawn_in_window(&runtime, &client, source.window_id);
-    let split_pane_id = runtime
-        .block_on({
-            let client = client.clone();
-            async move {
-                client
-                    .split_pane(source.pane_id, SplitDirection::Right, None, Some(40))
-                    .await
-            }
-        })
-        .expect("split source pane");
-    let after_spawn = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.list_panes().await }
-        })
-        .expect("post-spawn list_panes");
+    let split_pane_id = block_on_owned_mux_operation("split source pane", {
+        let client = client.clone();
+        async move {
+            client
+                .split_pane(source.pane_id, SplitDirection::Right, None, Some(40))
+                .await
+        }
+    });
+    let after_spawn = block_on_owned_mux_operation("post-spawn list_panes", {
+        let client = client.clone();
+        async move { client.list_panes().await }
+    });
     let ids: Vec<u64> = after_spawn.iter().map(|pane| pane.pane_id).collect();
     log(
         "loopback",
@@ -514,14 +562,12 @@ fn no_mock_spawn_send_resize_read_loopback() {
         "fixture should contain source, spawned, and split panes"
     );
 
-    let mut direct = runtime
-        .block_on(async {
-            DirectMuxClient::connect(
-                DirectMuxClientConfig::default().with_socket_path(fixture.socket_path()),
-            )
-            .await
-        })
-        .expect("connect direct mux client");
+    let mut direct = block_on_mux_operation(&runtime, "connect direct mux client", async {
+        DirectMuxClient::connect(
+            DirectMuxClientConfig::default().with_socket_path(fixture.socket_path()),
+        )
+        .await
+    });
     let resized = TerminalSize {
         rows: 31,
         cols: 96,
@@ -529,16 +575,14 @@ fn no_mock_spawn_send_resize_read_loopback() {
         pixel_height: 620,
         dpi: 96,
     };
-    runtime
-        .block_on(Box::pin(direct.resize(
-            source.tab_id,
-            source.pane_id,
-            resized,
-        )))
-        .expect("direct mux resize");
-    let render = runtime
-        .block_on(async { direct.get_pane_render_changes(source.pane_id).await })
-        .expect("render changes after resize");
+    block_on_mux_operation(
+        &runtime,
+        "direct mux resize",
+        Box::pin(direct.resize(source.tab_id, source.pane_id, resized)),
+    );
+    let render = block_on_mux_operation(&runtime, "render changes after resize", async {
+        direct.get_pane_render_changes(source.pane_id).await
+    });
     log(
         "loopback",
         "resized",
@@ -558,23 +602,21 @@ fn no_mock_spawn_send_resize_read_loopback() {
         source.pane_id,
         std::process::id()
     );
-    runtime
-        .block_on({
-            let client = client.clone();
-            let token = token.clone();
-            async move {
-                client
-                    .send_text_with_options(source.pane_id, &format!("{token}\n"), true, true)
-                    .await
-            }
-        })
-        .expect("send token to cat pane");
+    block_on_owned_mux_operation("send token to cat pane", {
+        let client = client.clone();
+        let token = token.clone();
+        async move {
+            client
+                .send_text_with_options(source.pane_id, &format!("{token}\n"), true, true)
+                .await
+        }
+    });
     let text = wait_until_text_contains(
         &runtime,
         &client,
         source.pane_id,
         &token,
-        std::time::Duration::from_secs(5),
+        Duration::from_secs(5),
     );
     assert!(
         text.contains(&token),

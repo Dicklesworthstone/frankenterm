@@ -13,6 +13,8 @@ SUMMARY_REMOTE_TARGET_DIR="${REMOTE_TARGET_DIR}"
 MUX_BIN="\${CARGO_TARGET_DIR}/debug/frankenterm-mux-server"
 
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-7200}"
+LOOPBACK_TEST_TIMEOUT_SECS="${LOOPBACK_TEST_TIMEOUT_SECS:-900}"
+FT_MUX_FIXTURE_BUILD_TIMEOUT_SECS="${FT_MUX_FIXTURE_BUILD_TIMEOUT_SECS:-600}"
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
 RCH_SKIP_SELECTION_PREFLIGHT="${RCH_SKIP_SELECTION_PREFLIGHT:-0}"
@@ -248,7 +250,9 @@ run_selection_preflight() {
   return 1
 }
 
-run_rch_step() {
+run_rch_step_with_timeout() {
+  local timeout_secs="$1"
+  shift
   local decision_path="$1"
   local log_file="$2"
   local command_summary="$3"
@@ -257,7 +261,7 @@ run_rch_step() {
   emit_event "${decision_path}" "running" "remote_rch_started" "none" "${log_file}" "${command_summary}"
   set +e
   (
-    run_rch_cargo_logged "${log_file}" "$@"
+    run_rch_cargo_logged_with_timeout "${timeout_secs}" "${log_file}" "$@"
   )
   local rc=$?
   set -e
@@ -273,6 +277,10 @@ run_rch_step() {
   reason="$(failure_reason_for_log "${log_file}")"
   emit_event "${decision_path}" "failed" "${reason}" "cargo_or_rch_failed" "${log_file}" "${command_summary}" "${worker}"
   return "${rc}"
+}
+
+run_rch_step() {
+  run_rch_step_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@"
 }
 
 write_summary() {
@@ -323,6 +331,8 @@ write_summary() {
     --arg retry_reason "${retry_reason}" \
     --arg retry_target_dir "${retry_target_dir}" \
     --arg remote_target_dir "${SUMMARY_REMOTE_TARGET_DIR}" \
+    --arg loopback_test_timeout_secs "${LOOPBACK_TEST_TIMEOUT_SECS}" \
+    --arg mux_fixture_build_timeout_secs "${FT_MUX_FIXTURE_BUILD_TIMEOUT_SECS}" \
     --arg mux_bin "${MUX_BIN}" \
     --argjson retry_performed "${retry_performed}" \
     '{
@@ -332,6 +342,8 @@ write_summary() {
       outcome: $outcome,
       artifact_dir: $artifact_dir,
       remote_target_dir: $remote_target_dir,
+      loopback_test_timeout_secs: ($loopback_test_timeout_secs | tonumber),
+      mux_fixture_build_timeout_secs: ($mux_fixture_build_timeout_secs | tonumber),
       mux_bin: $mux_bin,
       artifacts: ({
         events_jsonl: $event_log,
@@ -382,9 +394,10 @@ run_loopback_test() {
   local log_file="$2"
   local target_dir="$3"
 
-  run_rch_step "${decision_path}" "${log_file}" \
+  run_rch_step_with_timeout "${LOOPBACK_TEST_TIMEOUT_SECS}" "${decision_path}" "${log_file}" \
     "cargo test -p frankenterm-core --no-default-features --features vendored,asupersync-runtime --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback target_dir=${target_dir}" \
     env FT_REAL_WEZTERM_TESTS=1 \
+    FT_MUX_FIXTURE_BUILD_TIMEOUT_SECS="${FT_MUX_FIXTURE_BUILD_TIMEOUT_SECS}" \
     CARGO_TARGET_DIR="${target_dir}" \
     cargo test --config net.git-fetch-with-cli=true \
       -p frankenterm-core --no-default-features --features vendored,asupersync-runtime \
