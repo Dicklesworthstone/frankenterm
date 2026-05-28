@@ -16,10 +16,10 @@ maps them so future operators can reach either via the cross-link.
 | Canonical (ft-2okh0.5.x) | Session decomposition | Scope |
 | ------------------------ | --------------------- | ----- |
 | `ft-2okh0.5.1` mmap-backed scrollback (page-aligned, kill-9 survivable) | `ft-kscfg` mmap scrollback file format + write path | Format substrate at `crates/frankenterm-core/src/scrollback_mmap_format.rs` (256-byte header, tagged-length records, 17 round-trip tests). Ingest write-path wiring is in `append_captured_segment_to_mmap_scrollback`; encryption-at-rest remains separate follow-up work. |
-| `ft-2okh0.5.2` recovery protocol on launch | `ft-5te6x` recovery protocol — discover orphan scrollback + session-restore prompt | Orphan scanner at `crates/frankenterm-core/src/scrollback_mmap_recovery.rs` (OrphanState taxonomy, LockProbe trait, production `FlockLockProbe`). CLI commands are present and respect live writer locks; the remaining live blocker is `ft-4q0yg` (recover-command byte replay). |
+| `ft-2okh0.5.2` recovery protocol on launch | `ft-5te6x` recovery protocol — discover orphan scrollback + session-restore prompt | Orphan scanner at `crates/frankenterm-core/src/scrollback_mmap_recovery.rs` (OrphanState taxonomy, LockProbe trait, production `FlockLockProbe`). CLI commands are present, respect live writer locks, and `ft session recover` reports mmap replay status/counts while writing exact UTF-8 replay chunks into the replacement pane. |
 | `ft-2okh0.5.3` native tmux control protocol speaker | `ft-hs5f6` native tmux control-protocol speaker (Tier-1 RPC subset) | Wire-format substrate at `crates/frankenterm-core/src/tmux_control_protocol.rs` (TmuxCommand enum, parse_command + TmuxResponse encoder, 25 unit tests). Wired-pass blocker: `ft-l4cef`; current daemon slice probes tmux line protocol, supports read-only `list-sessions` / `list-windows`, and returns explicit typed `%error` frames for Tier-2 `pipe-pane` / `copy-mode`, while mutating commands and the notification stream remain pending. `ft-2h56m` closed only the socket-lock/listener slice. |
 | `ft-2okh0.5.4` tmux compatibility test corpus | `ft-53zsr` tmux compatibility matrix verification | Compatibility matrix doc at `docs/term-emulator/tmux-compat-matrix.md` with substrate-pass / wired-pass taxonomy. |
-| `ft-2okh0.5.5` crash-recovery adversarial fuzz — kill-9 stress test corpus | `ft-0ulxc` crash-recovery test fixture: kill -9 mid-session integrity | 7 substrate invariant tests at `crates/frankenterm-core/tests/crash_recovery_kill9.rs` (pre-msync byte safety, pane_uuid continuity, bounded loss, mid-header tear, mid-cursor tear, msync boundary, header-only edge case). E2e placeholder `#[ignore]`'d on `ft-4q0yg` until recover-command byte replay exists. |
+| `ft-2okh0.5.5` crash-recovery adversarial fuzz — kill-9 stress test corpus | `ft-0ulxc` crash-recovery test fixture: kill -9 mid-session integrity | 7 substrate invariant tests at `crates/frankenterm-core/tests/crash_recovery_kill9.rs` (pre-msync byte safety, pane_uuid continuity, bounded loss, mid-header tear, mid-cursor tear, msync boundary, header-only edge case). The full Unix subprocess harness is `session_recover_replays_sigkill_orphan_into_real_mux` in `crates/frankenterm/tests/cli_contract_tests.rs`: it kills a child mmap writer with SIGKILL, invokes `ft session recover`, and verifies the durable prefix on a hermetic mux pane. |
 
 This document is the foundational decision record that unblocks
 all sub-bead implementations under both decompositions. It pins
@@ -139,7 +139,10 @@ On ft launch (sub-bead ft-5te6x):
 3. The interactive picker (CLI) lets the operator `recover` or
    `discard`. Recovered panes get a fresh `pane_id` but the
    original `pane_uuid` is preserved for downstream identity
-   continuity.
+   continuity. Recover reads the mmap file's linear record prefix,
+   reports record/byte/chunk counts in structured output, skips
+   non-UTF-8 records with explicit diagnostics, and replays exact
+   UTF-8 payload chunks without adding synthetic newlines.
 
 ## Redaction + encryption boundary
 
@@ -154,7 +157,7 @@ On ft launch (sub-bead ft-5te6x):
 
 ## Tested invariants (sub-bead ft-0ulxc)
 
-The kill-9 fixture under `ft-0ulxc` proves:
+The kill-9 substrate fixture under `ft-0ulxc` proves:
 
 1. **Pre-msync byte safety**: bytes that *did* hit `MS_SYNC`
    before the kill survive byte-for-byte across restart.
@@ -169,6 +172,14 @@ The kill-9 fixture under `ft-0ulxc` proves:
 The fixture is `cfg(unix)` because SIGKILL semantics are
 POSIX-specific. Windows uses a `TerminateProcess` analog under a
 separate fixture (deferred, not in scope for v1).
+
+The Unix E2E harness under `ft-rlvsz` is gated by
+`FT_REAL_WEZTERM_TESTS=1` because it starts a real mux subprocess.
+It uses isolated `FT_WORKSPACE`, `XDG_DATA_HOME`, and `HOME`,
+waits for a child mmap writer to cross a sync boundary, sends
+SIGKILL to that child, runs the actual `ft session recover
+<pane_uuid> --format json` binary, and polls the recovered pane
+for the durable pre-kill text prefix.
 
 ## Compatibility constraints
 

@@ -41,27 +41,22 @@
 //!
 //! # Why simulate truncation rather than spawn-and-kill
 //!
-//! The bead's full e2e test (spawn ft as a subprocess + `kill -9` +
-//! `ft session recover <pane_id>` + assert byte-for-byte hash match)
-//! now has the write-path and command-shell substrate, but still
-//! needs the recovery command to replay mmap records into the newly
-//! spawned pane:
-//!
-//! - `ft session recover <pane_id>` currently reports
-//!   `pending_mmap_read_side` instead of replaying records
-//!   (**ft-4q0yg**).
-//!
-//! Until that ships, the e2e fixture has no live byte-replay path to
-//! assert against.
+//! The bead's full e2e test now lives in
+//! `crates/frankenterm/tests/cli_contract_tests.rs` as
+//! `session_recover_replays_sigkill_orphan_into_real_mux`: a real
+//! child-process writer is killed with SIGKILL, `ft session recover
+//! <pane_uuid>` is invoked against isolated FT/XDG roots and a
+//! hermetic mux socket, and the recovered pane surface is polled for
+//! the durable pre-kill prefix.
 //! Truncation is the substrate-level analog of `kill -9`: bytes
 //! that *did* hit `MS_SYNC` correspond to bytes the OS would have
 //! flushed before the kill; bytes after the truncation point
 //! correspond to the in-flight buffer that gets lost.
 //!
-//! The full e2e test (spawn-and-kill) is included in this file as
-//! [`spawn_and_kill_e2e_placeholder`] gated with `#[ignore]` and a
-//! `cfg(unix)` so CI picks it up automatically once ft-4q0yg lands.
-//! The ignore annotation documents the exact unblock list inline.
+//! This file keeps the byte-level crash-format invariants next to the
+//! format helpers; the CLI/mux subprocess test is intentionally placed
+//! in the `frankenterm` crate so Cargo builds the real `ft` binary and
+//! the test can invoke that binary instead of a mock command surface.
 //!
 //! # Why `cfg(unix)`
 //!
@@ -342,40 +337,4 @@ fn regression_guard_kill_immediately_after_header_write() {
     let h = candidate.header_ok().unwrap();
     assert_eq!(h.write_cursor_bytes, 0);
     assert_eq!(h.total_bytes_written, 0);
-}
-
-/// Full e2e fixture per the bead's primary acceptance criterion:
-/// spawn ft as a subprocess, write a known input stream, kill -9,
-/// restart, run `ft session recover <pane_id>`, assert byte-for-byte
-/// hash match against the pre-kill snapshot.
-///
-/// **Currently `#[ignore]`** because the e2e path requires:
-/// - `ft session recover <pane_id>` byte replay, tracked by
-///   **ft-4q0yg**. The write path and command shell exist; the
-///   command still reports `pending_mmap_read_side`.
-///
-/// Once that unblocks, drop the `#[ignore]` and replace the body
-/// with the full subprocess fixture. The substrate invariants
-/// above already guard the format-level contract, so the e2e test
-/// only needs to prove the wiring honors that contract under a
-/// real `kill -9 <pid>` signal.
-#[test]
-#[ignore = "blocked on ft-4q0yg (recover byte replay + active SIGKILL e2e)"]
-fn spawn_and_kill_e2e_placeholder() {
-    // Intentionally empty. Kept as a tracker so `cargo test
-    // -- --ignored` lists the deferred coverage gap by name.
-    //
-    // Implementation outline once unblocked:
-    //   1. spawn ft as a child (asupersync runtime + a known
-    //      pane_uuid + a deterministic input stream).
-    //   2. wait for the first MS_SYNC to land (poll
-    //      `last_msync_at_epoch_ms` via the format substrate).
-    //   3. compute SHA-256 of the file's byte content as the
-    //      pre-kill snapshot.
-    //   4. `kill(child_pid, SIGKILL)`.
-    //   5. wait for the child to exit.
-    //   6. invoke `ft session recover <pane_id>`.
-    //   7. recompute the SHA-256 of the post-recovery scrollback.
-    //   8. assert hash equality on the pre-msync prefix.
-    //   9. assert pane_uuid round-trip via the format substrate.
 }

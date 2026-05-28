@@ -41,11 +41,11 @@
 //!   <id>`, and `ft session discard <id>` are wired in
 //!   `crates/frankenterm/src/main.rs`; production CLI scanning uses
 //!   [`FlockLockProbe`] so live writers remain locked and disabled.
-//! - `ft session recover <id>` currently creates the replacement pane
-//!   but still needs to replay mmap records into that pane instead of
-//!   reporting `pending_mmap_read_side` (`ft-4q0yg`).
-//! - This module remains the header-level classifier; byte replay and
-//!   pane attachment live in the recovery command layer.
+//! - `ft session recover <id>` reads the orphaned mmap records, builds
+//!   an exact UTF-8 replay plan, and writes replay chunks into the
+//!   replacement pane via the mux command layer.
+//! - This module owns the header-level classifier and replay-plan
+//!   accounting; live pane attachment remains in the CLI command layer.
 //!
 //! # Why ship the scanner first
 //!
@@ -67,7 +67,7 @@
 //! tests can substitute a deterministic probe while the CLI uses
 //! [`FlockLockProbe`].
 
-use crate::scrollback_mmap_format::{HEADER_SIZE, HeaderDecodeError, ScrollbackHeader};
+use crate::scrollback_mmap_format::{HEADER_SIZE, HeaderDecodeError, RecordKind, ScrollbackHeader};
 use fs2::FileExt;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
@@ -130,6 +130,225 @@ impl OrphanCandidate {
             (OrphanState::Corrupt, Some(Err(err))) => Some(err),
             _ => None,
         }
+    }
+}
+
+/// Default maximum chunk size for replaying recovered mmap payloads through the
+/// mux write API.
+pub const DEFAULT_REPLAY_CHUNK_BYTES: usize = 4096;
+
+/// Replay status derived from a decoded mmap record stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmapReplayStatus {
+    /// The mmap file contained no replayable records and no skipped records.
+    Empty,
+    /// Every decoded record could be converted into an exact UTF-8 replay
+    /// payload.
+    Replayed,
+    /// Some records can be replayed, but at least one record was skipped.
+    Partial,
+    /// Records were present, but none could be replayed safely.
+    Unreplayable,
+}
+
+impl MmapReplayStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Replayed => "replayed",
+            Self::Partial => "partial",
+            Self::Unreplayable => "unreplayable",
+        }
+    }
+}
+
+/// Why a decoded mmap record was not replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MmapReplaySkipReason {
+    /// The mux write boundary accepts text. A non-UTF-8 payload would be
+    /// lossy, so recovery leaves that record out and reports it.
+    InvalidUtf8 {
+        valid_up_to: usize,
+        error_len: Option<usize>,
+    },
+}
+
+impl MmapReplaySkipReason {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::InvalidUtf8 { .. } => "invalid_utf8",
+        }
+    }
+}
+
+/// A replay chunk ready for `MuxInterface::send_text_with_options` with
+/// `no_newline=true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmapReplayChunk {
+    pub record_index: usize,
+    pub record_kind: RecordKind,
+    pub text: String,
+}
+
+/// One decoded record that could not be represented exactly at the mux text
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmapReplaySkippedRecord {
+    pub record_index: usize,
+    pub record_kind: RecordKind,
+    pub payload_bytes: usize,
+    pub reason: MmapReplaySkipReason,
+}
+
+/// Per-record-kind replay accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmapReplayKindCount {
+    pub record_kind: RecordKind,
+    pub records: usize,
+    pub payload_bytes: usize,
+}
+
+/// Exact replay plan for decoded mmap records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmapReplayPlan {
+    pub records_read: usize,
+    pub records_replayed: usize,
+    pub bytes_read: usize,
+    pub bytes_replayed: usize,
+    pub chunks: Vec<MmapReplayChunk>,
+    pub skipped: Vec<MmapReplaySkippedRecord>,
+    pub kind_counts: Vec<MmapReplayKindCount>,
+}
+
+impl MmapReplayPlan {
+    /// Build an exact UTF-8 replay plan from decoded mmap records.
+    ///
+    /// This deliberately does not insert separators between records. The mmap
+    /// payloads are already the durable byte stream; recovery must not add
+    /// synthetic newlines or terminal reset prefixes.
+    #[must_use]
+    pub fn from_records(records: Vec<(RecordKind, Vec<u8>)>, chunk_size: usize) -> Self {
+        let chunk_size = chunk_size.max(1);
+        let mut plan = Self {
+            records_read: 0,
+            records_replayed: 0,
+            bytes_read: 0,
+            bytes_replayed: 0,
+            chunks: Vec::new(),
+            skipped: Vec::new(),
+            kind_counts: Vec::new(),
+        };
+
+        for (record_index, (record_kind, payload)) in records.into_iter().enumerate() {
+            let payload_bytes = payload.len();
+            plan.records_read += 1;
+            plan.bytes_read += payload_bytes;
+            plan.bump_kind_count(record_kind, payload_bytes);
+
+            match String::from_utf8(payload) {
+                Ok(text) => {
+                    plan.records_replayed += 1;
+                    plan.bytes_replayed += payload_bytes;
+                    push_replay_chunks(
+                        &mut plan.chunks,
+                        record_index,
+                        record_kind,
+                        &text,
+                        chunk_size,
+                    );
+                }
+                Err(err) => {
+                    let utf8 = err.utf8_error();
+                    plan.skipped.push(MmapReplaySkippedRecord {
+                        record_index,
+                        record_kind,
+                        payload_bytes,
+                        reason: MmapReplaySkipReason::InvalidUtf8 {
+                            valid_up_to: utf8.valid_up_to(),
+                            error_len: utf8.error_len(),
+                        },
+                    });
+                }
+            }
+        }
+
+        plan
+    }
+
+    #[must_use]
+    pub fn status(&self) -> MmapReplayStatus {
+        if self.records_read == 0 {
+            MmapReplayStatus::Empty
+        } else if self.records_replayed == self.records_read {
+            MmapReplayStatus::Replayed
+        } else if self.records_replayed > 0 {
+            MmapReplayStatus::Partial
+        } else {
+            MmapReplayStatus::Unreplayable
+        }
+    }
+
+    fn bump_kind_count(&mut self, record_kind: RecordKind, payload_bytes: usize) {
+        if let Some(count) = self
+            .kind_counts
+            .iter_mut()
+            .find(|count| count.record_kind == record_kind)
+        {
+            count.records += 1;
+            count.payload_bytes += payload_bytes;
+            return;
+        }
+        self.kind_counts.push(MmapReplayKindCount {
+            record_kind,
+            records: 1,
+            payload_bytes,
+        });
+    }
+}
+
+#[must_use]
+pub const fn replay_record_kind_label(record_kind: RecordKind) -> &'static str {
+    match record_kind {
+        RecordKind::Text => "text",
+        RecordKind::Osc => "osc",
+        RecordKind::Csi => "csi",
+        RecordKind::Cursor => "cursor",
+        RecordKind::Clear => "clear",
+    }
+}
+
+fn push_replay_chunks(
+    chunks: &mut Vec<MmapReplayChunk>,
+    record_index: usize,
+    record_kind: RecordKind,
+    text: &str,
+    chunk_size: usize,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + chunk_size).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = text[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(text.len(), |(offset, _)| start + offset);
+        }
+
+        chunks.push(MmapReplayChunk {
+            record_index,
+            record_kind,
+            text: text[start..end].to_string(),
+        });
+        start = end;
     }
 }
 
@@ -646,6 +865,72 @@ mod tests {
         bad[0..4].copy_from_slice(b"NOPE");
         fs::write(&path, bad).unwrap();
         path
+    }
+
+    #[test]
+    fn mmap_replay_plan_preserves_exact_record_payloads() {
+        let plan = MmapReplayPlan::from_records(
+            vec![
+                (RecordKind::Text, b"first".to_vec()),
+                (RecordKind::Text, b"\nsecond".to_vec()),
+                (RecordKind::Csi, b"\x1b[31m".to_vec()),
+            ],
+            DEFAULT_REPLAY_CHUNK_BYTES,
+        );
+
+        assert_eq!(plan.status(), MmapReplayStatus::Replayed);
+        assert_eq!(plan.records_read, 3);
+        assert_eq!(plan.records_replayed, 3);
+        assert_eq!(plan.bytes_read, "first\nsecond\x1b[31m".len());
+        assert_eq!(plan.bytes_replayed, plan.bytes_read);
+        let replayed = plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        assert_eq!(replayed, "first\nsecond\x1b[31m");
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn mmap_replay_plan_reports_invalid_utf8_without_lossy_replay() {
+        let plan = MmapReplayPlan::from_records(
+            vec![
+                (RecordKind::Text, b"ok".to_vec()),
+                (RecordKind::Text, vec![0xff, b'x']),
+            ],
+            DEFAULT_REPLAY_CHUNK_BYTES,
+        );
+
+        assert_eq!(plan.status(), MmapReplayStatus::Partial);
+        assert_eq!(plan.records_read, 2);
+        assert_eq!(plan.records_replayed, 1);
+        assert_eq!(plan.bytes_read, 4);
+        assert_eq!(plan.bytes_replayed, 2);
+        assert_eq!(plan.chunks.len(), 1);
+        assert_eq!(plan.chunks[0].text, "ok");
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].record_index, 1);
+        assert_eq!(plan.skipped[0].reason.as_str(), "invalid_utf8");
+    }
+
+    #[test]
+    fn mmap_replay_plan_chunks_on_utf8_boundaries() {
+        let plan =
+            MmapReplayPlan::from_records(vec![(RecordKind::Text, "aébc".as_bytes().to_vec())], 2);
+
+        let replayed = plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        assert_eq!(plan.status(), MmapReplayStatus::Replayed);
+        assert_eq!(replayed, "aébc");
+        assert!(
+            plan.chunks
+                .iter()
+                .all(|chunk| std::str::from_utf8(chunk.text.as_bytes()).is_ok())
+        );
     }
 
     #[test]

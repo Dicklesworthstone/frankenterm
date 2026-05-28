@@ -49512,8 +49512,7 @@ async fn handle_snapshot_command(
             let engine = SnapshotEngine::new(db_path, config.snapshots.clone());
 
             // Get current pane list
-            let wezterm =
-                frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
+            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
             let panes = wezterm
                 .list_panes()
                 .await
@@ -50293,28 +50292,80 @@ async fn handle_session_command(
                 exit_session_orphan_error(&err, output_format);
             }
 
-            let wezterm =
-                frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
-            let pane_id = wezterm
-                .spawn(None, None)
-                .await
-                .map_err(|err| anyhow::anyhow!("Failed to create recovery pane: {err}"))?;
+            let replay_records =
+                frankenterm_core::scrollback_mmap_writer::read_linear_records(&candidate.path)
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "Failed to read scrollback mmap records from {}: {err}",
+                            candidate.path.display()
+                        )
+                    })?;
+            let replay_plan =
+                frankenterm_core::scrollback_mmap_recovery::MmapReplayPlan::from_records(
+                    replay_records,
+                    frankenterm_core::scrollback_mmap_recovery::DEFAULT_REPLAY_CHUNK_BYTES,
+                );
+
+            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+            let mux_timeout_seconds = config.cli.timeout_seconds.max(1);
+            let pane_id = session_recovery_create_pane(&wezterm, mux_timeout_seconds).await?;
+
+            let mut chunks_sent = 0usize;
+            for chunk in &replay_plan.chunks {
+                let cx = session_recovery_deadline_cx(mux_timeout_seconds);
+                wezterm
+                    .send_text_with_options_with_cx(&cx, pane_id, &chunk.text, true, true)
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "Failed to replay scrollback record {} ({}) into pane {pane_id}: {err}",
+                            chunk.record_index,
+                            frankenterm_core::scrollback_mmap_recovery::replay_record_kind_label(
+                                chunk.record_kind
+                            )
+                        )
+                    })?;
+                chunks_sent += 1;
+            }
 
             let payload = serde_json::json!({
                 "ok": true,
                 "action": "recover",
-                "pane_uuid": pane_uuid,
+                "pane_uuid": &pane_uuid,
                 "pane_id": pane_id,
                 "path": candidate.path.display().to_string(),
-                "scrollback_replay": "pending_mmap_read_side",
-                "hint": "A fresh pane was created for this orphan. Byte replay waits for the mmap read-side recovery follow-up.",
+                "identity": {
+                    "source_pane_uuid": &pane_uuid,
+                    "recovered_pane_uuid": &pane_uuid,
+                    "new_pane_id": pane_id,
+                },
+                "scrollback_replay": session_mmap_replay_json(&replay_plan, chunks_sent),
             });
 
             if !print_snapshot_session_structured_output(&payload, output_format)? {
                 println!("Recovered scrollback orphan {pane_uuid}");
                 println!("  Pane ID: {pane_id}");
                 println!("  File:    {}", candidate.path.display());
-                println!("  Replay:  pending mmap read-side recovery");
+                println!(
+                    "  Replay:  {} ({} of {} records, {} of {} bytes, {} chunks)",
+                    replay_plan.status().as_str(),
+                    replay_plan.records_replayed,
+                    replay_plan.records_read,
+                    replay_plan.bytes_replayed,
+                    replay_plan.bytes_read,
+                    chunks_sent
+                );
+                for skipped in &replay_plan.skipped {
+                    println!(
+                        "  Skipped: record {} {} ({} bytes): {}",
+                        skipped.record_index,
+                        frankenterm_core::scrollback_mmap_recovery::replay_record_kind_label(
+                            skipped.record_kind
+                        ),
+                        skipped.payload_bytes,
+                        skipped.reason.as_str()
+                    );
+                }
             }
         }
 
@@ -50570,6 +50621,103 @@ fn session_orphan_candidates_json(
             item
         })
         .collect()
+}
+
+fn session_mmap_replay_json(
+    plan: &frankenterm_core::scrollback_mmap_recovery::MmapReplayPlan,
+    chunks_sent: usize,
+) -> serde_json::Value {
+    let kind_counts: Vec<serde_json::Value> = plan
+        .kind_counts
+        .iter()
+        .map(|count| {
+            serde_json::json!({
+                "kind": frankenterm_core::scrollback_mmap_recovery::replay_record_kind_label(
+                    count.record_kind
+                ),
+                "records": count.records,
+                "payload_bytes": count.payload_bytes,
+            })
+        })
+        .collect();
+    let skipped: Vec<serde_json::Value> = plan
+        .skipped
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "record_index": record.record_index,
+                "kind": frankenterm_core::scrollback_mmap_recovery::replay_record_kind_label(
+                    record.record_kind
+                ),
+                "payload_bytes": record.payload_bytes,
+                "reason": session_mmap_replay_skip_reason_json(&record.reason),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "status": plan.status().as_str(),
+        "mode": "mmap_linear_records",
+        "records_read": plan.records_read,
+        "records_replayed": plan.records_replayed,
+        "bytes_read": plan.bytes_read,
+        "bytes_replayed": plan.bytes_replayed,
+        "chunks_planned": plan.chunks.len(),
+        "chunks_sent": chunks_sent,
+        "kind_counts": kind_counts,
+        "skipped": skipped,
+    })
+}
+
+fn session_recovery_deadline_cx(timeout_seconds: u64) -> frankenterm_core::cx::Cx {
+    let seed = frankenterm_core::cx::Cx::for_request();
+    let now = seed
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |driver| driver.now());
+    frankenterm_core::cx::Cx::for_request_with_budget(
+        frankenterm_core::cx::Budget::new()
+            .with_deadline(now + std::time::Duration::from_secs(timeout_seconds.max(1))),
+    )
+}
+
+async fn session_recovery_create_pane(
+    wezterm: &frankenterm_core::wezterm::WeztermHandle,
+    timeout_seconds: u64,
+) -> anyhow::Result<u64> {
+    let cx = session_recovery_deadline_cx(timeout_seconds);
+    let panes = wezterm
+        .list_panes_with_cx(&cx)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to list live panes before recovery spawn: {err}"))?;
+    let source_pane_id = panes.first().map(|pane| pane.pane_id).ok_or_else(|| {
+        anyhow::anyhow!("Failed to create recovery pane: no live mux window found")
+    })?;
+
+    wezterm
+        .split_pane_with_cx(
+            &cx,
+            source_pane_id,
+            frankenterm_core::wezterm::SplitDirection::Right,
+            None,
+            Some(50),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to create recovery pane: {err}"))
+}
+
+fn session_mmap_replay_skip_reason_json(
+    reason: &frankenterm_core::scrollback_mmap_recovery::MmapReplaySkipReason,
+) -> serde_json::Value {
+    match reason {
+        frankenterm_core::scrollback_mmap_recovery::MmapReplaySkipReason::InvalidUtf8 {
+            valid_up_to,
+            error_len,
+        } => serde_json::json!({
+            "code": reason.as_str(),
+            "valid_up_to": valid_up_to,
+            "error_len": error_len,
+        }),
+    }
 }
 
 /// Truncate a session ID for display.
@@ -58260,6 +58408,32 @@ recorder_backend = "frankensqlite"
         assert_eq!(session_orphan_state_label(&candidate.state), "orphaned");
         assert!(session_orphan_recoverability_error(candidate, &pane_uuid).is_none());
         assert!(session_orphan_discardability_error(candidate, &pane_uuid).is_none());
+    }
+
+    #[test]
+    fn session_mmap_replay_json_reports_actual_counts() {
+        use frankenterm_core::scrollback_mmap_format::RecordKind;
+        use frankenterm_core::scrollback_mmap_recovery::{
+            DEFAULT_REPLAY_CHUNK_BYTES, MmapReplayPlan,
+        };
+
+        let plan = MmapReplayPlan::from_records(
+            vec![
+                (RecordKind::Text, b"hello".to_vec()),
+                (RecordKind::Csi, b"\x1b[0m".to_vec()),
+            ],
+            DEFAULT_REPLAY_CHUNK_BYTES,
+        );
+        let payload = session_mmap_replay_json(&plan, plan.chunks.len());
+
+        assert_eq!(payload["status"], "replayed");
+        assert_eq!(payload["mode"], "mmap_linear_records");
+        assert_eq!(payload["records_read"], 2);
+        assert_eq!(payload["records_replayed"], 2);
+        assert_eq!(payload["bytes_read"], 9);
+        assert_eq!(payload["bytes_replayed"], 9);
+        assert_eq!(payload["chunks_sent"], 2);
+        assert_eq!(payload["skipped"].as_array().unwrap().len(), 0);
     }
 
     #[test]

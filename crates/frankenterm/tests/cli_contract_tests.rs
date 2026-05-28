@@ -12,16 +12,29 @@
 //! - Secret-like strings never leak unredacted
 
 use assert_cmd::Command;
+#[cfg(unix)]
+#[path = "../../frankenterm-core/tests/common/wezterm_subprocess.rs"]
+mod wezterm_subprocess;
 use frankenterm_core::plan::{
     MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
     TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId,
 };
+#[cfg(unix)]
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
+#[cfg(unix)]
+use frankenterm_core::scrollback_mmap_format::RecordKind;
 use frankenterm_core::scrollback_mmap_format::{FormatVersion, HeaderFlags, ScrollbackHeader};
+#[cfg(unix)]
+use frankenterm_core::scrollback_mmap_writer::{MmapScrollback, MmapScrollbackConfig};
 use predicates::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
@@ -84,6 +97,94 @@ fn write_test_scrollback(
     file.write_all(&header.encode())
         .expect("write scrollback header");
     (pane_uuid, path)
+}
+
+#[cfg(unix)]
+fn spawn_sigkill_writer_child(
+    scrollback_dir: &std::path::Path,
+    pane_uuid: &str,
+    payload: &str,
+    ready_path: &std::path::Path,
+) -> std::process::Child {
+    let current_exe = std::env::current_exe().expect("resolve current test binary");
+    std::process::Command::new(current_exe)
+        .arg("--exact")
+        .arg("session_recover_sigkill_writer_child_process")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("FT_RLVSZ_SIGKILL_CHILD", "1")
+        .env("FT_RLVSZ_SCROLLBACK_DIR", scrollback_dir)
+        .env("FT_RLVSZ_PANE_UUID", pane_uuid)
+        .env("FT_RLVSZ_PAYLOAD", payload)
+        .env("FT_RLVSZ_READY_PATH", ready_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn SIGKILL writer child test process")
+}
+
+#[cfg(unix)]
+fn wait_for_sigkill_writer_ready(
+    child: &mut std::process::Child,
+    ready_path: &std::path::Path,
+) -> std::path::PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if ready_path.exists() {
+            let raw = std::fs::read_to_string(ready_path).expect("read writer ready file");
+            return std::path::PathBuf::from(raw.trim());
+        }
+        if let Some(status) = child.try_wait().expect("poll writer child") {
+            panic!("SIGKILL writer child exited before ready: {status:?}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for SIGKILL writer child ready file {}",
+            ready_path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn write_recover_mux_config(config_path: &std::path::Path, mux_socket_path: &std::path::Path) {
+    let socket = mux_socket_path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let toml =
+        format!("[vendored]\nmux_socket_path = \"{socket}\"\n\n[cli]\ntimeout_seconds = 30\n");
+    std::fs::write(config_path, toml).expect("write recover mux config");
+    std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
+        .expect("harden recover mux config permissions");
+}
+
+#[cfg(unix)]
+fn wait_for_real_mux_text(
+    fixture: &wezterm_subprocess::WeztermSubprocessFixture,
+    pane_id: u64,
+    needles: &[&str],
+) -> String {
+    let client = fixture.client();
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build mux poll runtime");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let text = runtime
+            .block_on(async { client.get_text(pane_id, false).await })
+            .expect("read recovered pane text");
+        if needles.iter().all(|needle| text.contains(needle)) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for recovered pane {pane_id} to contain {needles:?}; last text={text:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
@@ -2796,6 +2897,147 @@ fn session_recover_unknown_uuid_returns_structured_exit_2() {
             .unwrap_or_default()
             .contains(&missing_uuid)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_recover_replays_sigkill_orphan_into_real_mux() {
+    if !wezterm_subprocess::should_run() {
+        eprintln!("skipping real SIGKILL recover test; set FT_REAL_WEZTERM_TESTS=1");
+        return;
+    }
+
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let scrollback_dir = data_home.join("ft").join("scrollback");
+    std::fs::create_dir_all(&scrollback_dir).expect("create scrollback dir");
+    let pane_uuid = "c3".repeat(32);
+    let payload = "ft-rlvsz durable prefix line 1\nft-rlvsz durable prefix line 2\n";
+    let ready_path = dir.path().join("sigkill-writer.ready");
+
+    let mut child = spawn_sigkill_writer_child(&scrollback_dir, &pane_uuid, payload, &ready_path);
+    let scrollback_path = wait_for_sigkill_writer_ready(&mut child, &ready_path);
+    let pre_kill_records =
+        frankenterm_core::scrollback_mmap_writer::read_linear_records(&scrollback_path)
+            .expect("read pre-kill linear records");
+    assert!(
+        pre_kill_records.iter().any(|(_, bytes)| bytes
+            .windows(payload.as_bytes().len())
+            .any(|w| { w == payload.as_bytes() })),
+        "writer child should sync the durable payload before SIGKILL"
+    );
+
+    child.kill().expect("send SIGKILL to writer child");
+    let status = child.wait().expect("wait for writer child");
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "writer child should terminate via SIGKILL"
+    );
+
+    let fixture =
+        wezterm_subprocess::WeztermSubprocessFixture::spawn_with_default_prog(&["/bin/cat"])
+            .expect("spawn hermetic mux subprocess");
+    let config_path = dir.path().join("frankenterm.toml");
+    write_recover_mux_config(&config_path, fixture.socket_path());
+
+    let output = Command::cargo_bin("ft")
+        .expect("ft binary should be built")
+        .timeout(std::time::Duration::from_secs(60))
+        .env("FT_WORKSPACE", &ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("HOME", dir.path())
+        .arg("--config")
+        .arg(&config_path)
+        .args(["session", "recover", &pane_uuid, "--format", "json"])
+        .output()
+        .expect("ft session recover should execute");
+
+    assert!(
+        output.status.success(),
+        "recover failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recover: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("recover stdout should be JSON");
+    assert_eq!(recover["ok"], true);
+    assert_eq!(recover["action"], "recover");
+    assert_eq!(recover["pane_uuid"], pane_uuid);
+    assert_eq!(recover["identity"]["source_pane_uuid"], pane_uuid);
+    assert_eq!(recover["identity"]["recovered_pane_uuid"], pane_uuid);
+    assert_eq!(recover["scrollback_replay"]["status"], "replayed");
+    assert_eq!(recover["scrollback_replay"]["records_read"], 1);
+    assert_eq!(recover["scrollback_replay"]["records_replayed"], 1);
+    assert_eq!(recover["scrollback_replay"]["chunks_sent"], 1);
+    assert_eq!(
+        recover["scrollback_replay"]["bytes_replayed"],
+        payload.as_bytes().len() as u64
+    );
+
+    let pane_id = recover["pane_id"]
+        .as_u64()
+        .expect("recover output should include new pane_id");
+    let recovered_text = wait_for_real_mux_text(
+        &fixture,
+        pane_id,
+        &[
+            "ft-rlvsz durable prefix line 1",
+            "ft-rlvsz durable prefix line 2",
+        ],
+    );
+    assert!(
+        recovered_text.contains("ft-rlvsz durable prefix line 1")
+            && recovered_text.contains("ft-rlvsz durable prefix line 2"),
+        "recovered pane should expose replayed payload, got {recovered_text:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "child helper for session_recover_replays_sigkill_orphan_into_real_mux"]
+fn session_recover_sigkill_writer_child_process() {
+    if std::env::var("FT_RLVSZ_SIGKILL_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+
+    let scrollback_dir = std::path::PathBuf::from(
+        std::env::var_os("FT_RLVSZ_SCROLLBACK_DIR").expect("FT_RLVSZ_SCROLLBACK_DIR is required"),
+    );
+    let pane_uuid = std::env::var("FT_RLVSZ_PANE_UUID").expect("FT_RLVSZ_PANE_UUID is required");
+    let payload = std::env::var("FT_RLVSZ_PAYLOAD").expect("FT_RLVSZ_PAYLOAD is required");
+    let ready_path = std::path::PathBuf::from(
+        std::env::var_os("FT_RLVSZ_READY_PATH").expect("FT_RLVSZ_READY_PATH is required"),
+    );
+
+    let config = MmapScrollbackConfig::new(&scrollback_dir, &pane_uuid)
+        .with_cap_bytes(4096)
+        .with_sync_every_appends(1)
+        .with_sync_interval(std::time::Duration::from_secs(3600));
+    let mut writer = MmapScrollback::open(config).expect("open child mmap writer");
+    let report = writer
+        .append(RecordKind::Text, payload.as_bytes())
+        .expect("append child payload");
+    assert!(
+        report.synced,
+        "first append should hit durable sync boundary"
+    );
+    if let Some(flushed) = writer
+        .flush_pending_redaction()
+        .expect("flush child redaction tail")
+    {
+        assert!(
+            flushed.payload_bytes > 0,
+            "redaction flush should not create empty records"
+        );
+    }
+    writer.sync().expect("sync child payload");
+    std::fs::write(&ready_path, writer.path().display().to_string())
+        .expect("write child ready file");
+
+    loop {
+        std::thread::park_timeout(std::time::Duration::from_secs(3600));
+    }
 }
 
 // =============================================================================
