@@ -214,6 +214,7 @@ pub mod dancing_links;
 pub mod dashboard;
 pub mod dataflow;
 pub mod dec_2026_presentation_hold;
+pub mod deferred_proof_replay;
 pub mod degradation;
 pub mod demo_scenarios;
 pub mod dependency_eradication;
