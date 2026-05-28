@@ -77,9 +77,12 @@ impl DispatchIoBackend {
     pub const fn current_default() -> Self {
         #[cfg(all(feature = "io-uring", target_os = "linux"))]
         {
-            return Self::IoUring;
+            Self::IoUring
         }
-        Self::readiness_default()
+        #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+        {
+            Self::readiness_default()
+        }
     }
 }
 
@@ -561,7 +564,7 @@ impl DispatchIoUringRuntime {
             .name("ft-mux-io-uring".to_string())
             .spawn(move || {
                 while !poll_shutdown.load(Ordering::Acquire) {
-                    match poll_driver.turn(None) {
+                    match poll_driver.turn_with(None, |_, _| {}) {
                         Ok(_) => {}
                         Err(err) => {
                             poll_state.fail_waiters(
