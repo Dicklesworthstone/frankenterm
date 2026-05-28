@@ -70,6 +70,7 @@ pub mod api_schema;
 pub mod approval;
 pub mod approval_impact_simulator;
 pub mod approval_impact_simulator_doctor;
+pub mod attention_router;
 // `atlas_bin_packing` extracted to `frankenterm-core-atlas-pack-types`
 // (ft-kxopr second half) so the vendored `frankenterm/window/`
 // crate can depend on it directly without inverting the layering.

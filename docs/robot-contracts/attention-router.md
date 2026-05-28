@@ -2,9 +2,11 @@
 
 Tracking bead: `ft-x3nsb.1`
 
-Status: planned contract. This document defines the target behavior for a
-future side-effect-free attention-router surface. It does not claim a shipped
-CLI, Robot Mode, or MCP implementation.
+Status: planned contract with an initial source-adapter substrate. This
+document defines the target behavior for a future side-effect-free
+attention-router surface. `frankenterm_core::attention_router` provides
+bounded read-only source snapshot DTOs, but this document does not claim a
+shipped CLI, Robot Mode, or MCP implementation.
 
 Operator runbook: `docs/operator-runbook.md` section 2C.
 
