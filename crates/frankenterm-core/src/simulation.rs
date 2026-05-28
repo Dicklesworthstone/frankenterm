@@ -1568,12 +1568,7 @@ fn plan_render_prep(
     state: &mut HashMap<u64, FontRenderPipelineState>,
 ) -> (u64, Option<FontRenderPrepMetrics>) {
     if *action != EventAction::SetFontSize {
-        let render_hint = match mock_event {
-            MockEvent::AppendOutput(text) => text.len(),
-            MockEvent::SetTitle(text) => text.len(),
-            MockEvent::Resize(cols, rows) => (*cols as usize) + (*rows as usize),
-            MockEvent::ClearScreen => 0,
-        };
+        let render_hint = non_font_render_prep_hint(action, content, mock_event);
         let hint_u64 = u64::try_from(render_hint).unwrap_or(u64::MAX);
         let duration_ns = 20_000u64.saturating_add(hint_u64.saturating_mul(75));
         return (duration_ns, None);
@@ -1646,6 +1641,22 @@ fn plan_render_prep(
             staged_batches_deferred,
         }),
     )
+}
+
+fn non_font_render_prep_hint(action: &EventAction, content: &str, mock_event: &MockEvent) -> usize {
+    if *action == EventAction::GenerateScrollback {
+        const VIEWPORT_FIRST_ROWS: usize = 24;
+        if let Ok((lines, width)) = parse_scrollback_spec(content) {
+            return lines.min(VIEWPORT_FIRST_ROWS).saturating_mul(width);
+        }
+    }
+
+    match mock_event {
+        MockEvent::AppendOutput(text) => text.len(),
+        MockEvent::SetTitle(text) => text.len(),
+        MockEvent::Resize(cols, rows) => (*cols as usize) + (*rows as usize),
+        MockEvent::ClearScreen => 0,
+    }
 }
 
 fn parse_font_scale(content: &str) -> f64 {
@@ -2289,6 +2300,37 @@ events:
             assert_eq!(third.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
             assert!(third.shader_warmup);
             assert!(third.deferred_glyphs > 0);
+        });
+    }
+
+    #[test]
+    fn generate_scrollback_render_prep_charges_viewport_tail_only() {
+        run_async_test(async {
+            let yaml = r#"
+name: large_scrollback_viewport_first
+duration: "2s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: generate_scrollback
+    content: "2000x100"
+"#;
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+
+            let (_executed, timeline) = scenario
+                .execute_all_with_resize_timeline(&mock)
+                .await
+                .unwrap();
+            let render_prep = timeline.events[0].stages[3].duration_ns;
+            assert!(
+                render_prep < 6_000_000,
+                "generated scrollback setup must not charge the full scrollback payload to one render-prep frame: {render_prep}ns"
+            );
+            assert!(timeline.events[0].stages[3].render_prep_metrics.is_none());
         });
     }
 
