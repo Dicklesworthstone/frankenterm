@@ -315,6 +315,7 @@ pub mod identity_graph;
 pub mod ime_caret;
 pub mod incident_autopsy;
 pub mod incident_bundle;
+pub mod hot_path_metrics;
 pub mod ingest;
 pub mod input_latency;
 pub mod input_priority;

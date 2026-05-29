@@ -837,6 +837,11 @@ tui-dashboard = ["tui-widgets", "dep:ftui-runtime", "dep:ftui-core", "dep:ftui-b
 rollout = ["tui-oracle", "ftui"]
 metrics = []
 native-wezterm = []
+# Per-frame self-time instrumentation for the hottest loops (extract_delta,
+# scan_pipeline, redactor). NON-default: the default build compiles the timer to a
+# zero-sized no-op (no overhead). Enable for MT8 keep-gate attribution + capturing
+# a `.bench-history` baseline. (gauntlet FND-002)
+hot-path-metrics = []
 # Test/fuzz-only feature: exposes private parsers (e.g. native_events::
 # decode_wire_event_for_fuzz) so the frankenterm-fuzz crate can target
 # them without leaking the wire-format surface to production builds.

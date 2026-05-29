@@ -523,6 +523,8 @@ impl ScanPipeline {
     /// Process a complete buffer through all pipeline stages.
     #[must_use]
     pub fn process(&self, bytes: &[u8]) -> ScanOutput {
+        // FND-002 / MT8: per-frame self-time (no-op unless `hot-path-metrics`).
+        let _hpt = crate::hot_path_metrics::HotPathTimer::start("scan_pipeline.process");
         // Stage 1: SIMD metrics scan
         let mut metrics = scan_newlines_and_ansi(bytes);
         // [ft-5m5xc] Respect enable_ansi_analysis. The SIMD scan

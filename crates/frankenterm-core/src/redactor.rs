@@ -636,6 +636,8 @@ impl Redactor {
     /// Redact all detected secrets from the input text.
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
+        // FND-002 / MT8: per-frame self-time (no-op unless `hot-path-metrics`).
+        let _hpt = crate::hot_path_metrics::HotPathTimer::start("redactor.redact");
         let mut result = text.to_string();
 
         for pattern in SECRET_PATTERNS {

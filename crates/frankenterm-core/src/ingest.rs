@@ -1806,6 +1806,8 @@ fn hash_text(text: &str) -> u64 {
 /// it finds the largest overlap where a suffix of `previous` matches a prefix of `current`.
 #[must_use]
 pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
+    // FND-002 / MT8: per-frame self-time (no-op unless `hot-path-metrics`).
+    let _hpt = crate::hot_path_metrics::HotPathTimer::start("ingest.extract_delta");
     if previous == current {
         return DeltaResult::NoChange;
     }
