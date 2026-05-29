@@ -54,9 +54,10 @@ Column meanings:
 | `ft replay` decoded frame output | payload text | ✓ (when `--redact`) | `replay.rs:814-830` gated on `opts.redact`. Same opt-in caveat. |
 | Audit table writes | action summary + decision context | ✓ | `storage::record_audit_action_redacted` at `:6647` (write-time redaction; persisted audit rows are already clean). |
 
-### Known gap NOT in this matrix
+### Distributed-mode aggregator ingest (closed — FND-004)
 
-- **Distributed mode aggregator forwarding**: `crates/frankenterm-core/src/distributed.rs` shows zero `Redactor` usages. The wire-protocol forwarding path is across multiple files and a full audit is out of scope for this pass; filed separately if needed. The default `Config.distributed.enabled = false` limits exposure, but when enabled the threat model should be re-evaluated.
+- **Distributed mode aggregator forwarding** (`--features distributed`): remote `WirePayload::PaneDelta` content is now redacted at the aggregator ingest choke point — `crates/frankenterm/src/main.rs` `distributed_persist_payload()` applies `frankenterm_core::redactor::Redactor::new().redact(&delta.content)` immediately before `append_segment`, mirroring the local capture path (`crates/frankenterm-core/src/ingest.rs:1680` `redact_segment_for_persist`). Previously this path stored remote pane content RAW in `output_segments`, a fail-closed redaction violation at the storage layer (an unredacted DB export or any direct-segment read could leak secrets even though the standard read APIs redact at output). Redaction is idempotent, so the read-path redactors are unaffected.
+- **Remaining**: a runtime planted-secret differential against `distributed_persist_payload()` is still desirable (tracked GA-FND-004-test) — blocked only because the fn is a private async fn in the binary crate; correctness today rests on reuse of the exhaustively-tested `Redactor` at the exact choke point + a clean `cargo check --features distributed`. The `Detection` wire variant's `matched_text`/`extracted` are a *separate* surface not covered by this row.
 
 ## Actionable findings from this audit
 
