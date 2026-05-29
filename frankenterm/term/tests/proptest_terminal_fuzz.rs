@@ -110,6 +110,28 @@ struct ChunkSnapshot {
     title: String,
     scrollback_rows: usize,
     pty_responses: Vec<u8>,
+    // INV-TERM-2 / gauntlet FND-008: the prior snapshot captured cursor + title +
+    // scrollback_rows + pty_responses but NOT the on-screen cell content, so a
+    // chunk-split that landed text in the wrong cells (without moving the cursor or
+    // changing the scrollback row count) would slip through. Serializing every
+    // in-memory line's rendered text closes that gap.
+    cells: Vec<String>,
+}
+
+/// Serialize the full in-memory grid (scrollback + visible) as per-line rendered
+/// text. This is the FND-008 cell-content axis of the chunk-determinism
+/// differential: identical byte streams must produce identical cell content
+/// regardless of how the bytes were chunked across `advance_bytes` calls.
+fn serialize_screen_cells(term: &Terminal) -> Vec<String> {
+    // `for_each_phys_line` is the public (non-`cfg(test)`) iterator over every
+    // physical line (scrollback + visible); `visible_lines`/`all_lines` are
+    // `#[cfg(test)]` on the crate itself and thus unavailable from an integration
+    // test. Capture each line's rendered text.
+    let mut cells = Vec::new();
+    term.screen().for_each_phys_line(|_idx, line| {
+        cells.push(line.as_str().to_string());
+    });
+    cells
 }
 
 fn chunk_snapshot(term: &Terminal, capture: &CapturedWriter) -> ChunkSnapshot {
@@ -120,6 +142,7 @@ fn chunk_snapshot(term: &Terminal, capture: &CapturedWriter) -> ChunkSnapshot {
         title: term.get_title().to_string(),
         scrollback_rows: term.screen().scrollback_rows(),
         pty_responses: capture.snapshot(),
+        cells: serialize_screen_cells(term),
     }
 }
 
@@ -810,4 +833,88 @@ proptest! {
             payload.len()
         );
     }
+
+    /// CELL-CONTENT chunk-boundary invariance for WELL-FORMED escape streams
+    /// (INV-TERM-2 / gauntlet FND-008). The pre-existing
+    /// `chunked_advance_bytes_matches_single_shot` compares only cursor +
+    /// scrollback-row-count; the byte-by-byte snapshot test (now upgraded with the
+    /// `cells` field) covers cell content but only at 1-byte splits. This adds the
+    /// missing axis: ARBITRARY chunk sizes over complete PTY escape streams, with a
+    /// full snapshot that includes the rendered text of every in-memory line. A
+    /// chunk split that lands text in the wrong cells without moving the cursor or
+    /// changing the scrollback count is caught here.
+    ///
+    /// Scope note (gauntlet FND-009): this asserts invariance for WELL-FORMED
+    /// input. Cell content is NOT chunk-invariant for some MALFORMED byte streams
+    /// (incomplete UTF-8 multibyte sequences, e.g. `0xC2 0x00`, followed by a
+    /// trailing combining mark) — a real but narrow robustness divergence filed
+    /// separately as FND-009. Using the complete-escape generator keeps this test
+    /// honestly green while the divergence is triaged.
+    #[test]
+    fn cell_content_chunk_invariant_for_complete_escape_streams(
+        payload in arb_complete_pty_escape_payload(),
+        chunk_sizes in proptest::collection::vec(1usize..=32, 0..16),
+        rows in 4usize..=16,
+        cols in 8usize..=80,
+    ) {
+        let (mut whole, whole_capture) = make_term_with_capture(rows, cols);
+        whole.advance_bytes(&payload);
+        let expected = chunk_snapshot(&whole, &whole_capture);
+
+        let (mut chunked, chunked_capture) = make_term_with_capture(rows, cols);
+        let mut offset = 0;
+        for size in &chunk_sizes {
+            if offset >= payload.len() {
+                break;
+            }
+            let end = (offset + size).min(payload.len());
+            chunked.advance_bytes(&payload[offset..end]);
+            offset = end;
+        }
+        if offset < payload.len() {
+            chunked.advance_bytes(&payload[offset..]);
+        }
+        let actual = chunk_snapshot(&chunked, &chunked_capture);
+
+        // Cell-content axis first (the FND-008 addition), then the full snapshot.
+        prop_assert_eq!(
+            &actual.cells,
+            &expected.cells,
+            "chunked vs single-shot screen cell content diverged (payload_len={}, chunks={:?})",
+            payload.len(),
+            chunk_sizes
+        );
+        prop_assert_eq!(
+            actual,
+            expected,
+            "chunked vs single-shot full terminal snapshot diverged (payload_len={})",
+            payload.len()
+        );
+    }
+}
+
+/// MUTATION CHECK (non-vacuity guard for FND-008). `serialize_screen_cells` must
+/// DISTINGUISH two terminals with different on-screen text and be deterministic
+/// for identical input. If it collapsed "hello" and "world" to the same value,
+/// the cell-content axis of `cell_content_is_chunk_boundary_invariant` would be
+/// vacuous.
+#[test]
+fn mutation_check_serialize_screen_cells_distinguishes_content() {
+    let mut a = make_term(6, 20);
+    a.advance_bytes(b"hello");
+    let mut b = make_term(6, 20);
+    b.advance_bytes(b"world");
+    assert_ne!(
+        serialize_screen_cells(&a),
+        serialize_screen_cells(&b),
+        "serializer must distinguish different screen content"
+    );
+
+    let mut c = make_term(6, 20);
+    c.advance_bytes(b"hello");
+    assert_eq!(
+        serialize_screen_cells(&a),
+        serialize_screen_cells(&c),
+        "serializer must be deterministic for identical input"
+    );
 }
