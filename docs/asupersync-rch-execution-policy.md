@@ -223,6 +223,9 @@ Valid diagnostic evidence that is not enough to close:
   described as scheduler-selected evidence.
 - `worker_self_test_only` from `rch check` or `rch status`. This only proves the
   substrate was partly reachable.
+- `RCH-CARGO-GIT-FETCH-STALL` from `run_rch_cargo_logged_with_timeout`. This
+  proves RCH selected a remote worker and Cargo reached git dependency fetching,
+  but no compile/test output arrived before the fail-closed timeout.
 
 Required reopen triggers:
 
@@ -309,6 +312,21 @@ worker_specific_closeout{
   source_mirror_reason_code: rch_mirror.missing_tracked_file
   artifact: tests/e2e/logs/.../rch_mirror_preflight.json
   action: "keep source/test bead open; fix mirror or rerun on an attested worker"
+}
+```
+
+Classify remote dependency-fetch stalls separately from generic remote stalls:
+
+```toon
+worker_specific_closeout{
+  bead_id: ft-example.3
+  decision: block
+  reason_code: RCH-CARGO-GIT-FETCH-STALL
+  worker_evidence_confidence: inconclusive_worker_evidence
+  selected_worker_id: vmi1153651
+  worker_queue_state: queue_timeout
+  artifact: tests/e2e/logs/.../cargo.log.rch_meta.json
+  action: "keep source/test bead open; cite dependency-fetch timeout, not local Cargo"
 }
 ```
 

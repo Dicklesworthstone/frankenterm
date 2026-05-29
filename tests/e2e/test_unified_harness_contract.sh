@@ -159,6 +159,7 @@ MISSING_FILE_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_remote_mirror_missing_file_
 MISSING_LIB_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_remote_mirror_missing_lib_${RUN_ID}.log"
 DEP_INFO_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_cargo_dep_info_missing_${RUN_ID}.log"
 LOCAL_DEP_INFO_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_local_cargo_dep_info_${RUN_ID}.log"
+GIT_FETCH_STALL_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_cargo_git_fetch_stall_${RUN_ID}.log"
 WORKER_BUSY_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_worker_selection_all_busy_${RUN_ID}.log"
 BAD_GUARD_ERR="${ARTIFACT_DIR}/shared_guard_fail_open_${RUN_ID}.stderr.log"
 GOOD_GUARD_ERR="${ARTIFACT_DIR}/shared_guard_clean_${RUN_ID}.stderr.log"
@@ -191,6 +192,11 @@ printf '%s\n' \
   '  No such file or directory (os error 2)' \
   > "${LOCAL_DEP_INFO_GUARD_LOG}"
 printf '%s\n' \
+  'Selected worker: vmi1153651 at 100.64.0.10' \
+  'Sync complete: 28413 files, 17490321 bytes in 142220ms' \
+  '    Updating git repository `https://github.com/Dicklesworthstone/frankentui`' \
+  > "${GIT_FETCH_STALL_GUARD_LOG}"
+printf '%s\n' \
   '{"api_version":"1.0","command":"diagnose","success":true,"data":{"worker_selection":{"worker":null,"reason":"all_workers_busy"}}}' \
   > "${WORKER_BUSY_GUARD_LOG}"
 set +e
@@ -206,6 +212,8 @@ MISSING_LIB_REASON_DETAIL="$(rch_extract_failure_reason_detail "${MISSING_LIB_GU
 DEP_INFO_REASON_CODE="$(rch_extract_failure_reason_code "${DEP_INFO_GUARD_LOG}")"
 DEP_INFO_REASON_DETAIL="$(rch_extract_failure_reason_detail "${DEP_INFO_GUARD_LOG}")"
 LOCAL_DEP_INFO_REASON_CODE="$(rch_extract_failure_reason_code "${LOCAL_DEP_INFO_GUARD_LOG}")"
+GIT_FETCH_STALL_REASON_CODE="$(rch_extract_failure_reason_code "${GIT_FETCH_STALL_GUARD_LOG}")"
+GIT_FETCH_STALL_REASON_DETAIL="$(rch_extract_failure_reason_detail "${GIT_FETCH_STALL_GUARD_LOG}")"
 WORKER_BUSY_REASON_CODE="$(rch_extract_failure_reason_code "${WORKER_BUSY_GUARD_LOG}")"
 WORKER_BUSY_REASON_DETAIL="$(rch_extract_failure_reason_detail "${WORKER_BUSY_GUARD_LOG}")"
 
@@ -218,6 +226,7 @@ for token in \
   "RCH_REQUIRE_REMOTE" \
   "RCH-REMOTE-MIRROR-MISSING-FILE" \
   "RCH-CARGO-DEP-INFO-MISSING" \
+  "RCH-CARGO-GIT-FETCH-STALL" \
   "RCH-WORKER-SELECTION-ALL-BUSY" \
   "check_rch_fallback" \
   "rch_init" \
@@ -236,13 +245,15 @@ if [ "${BAD_GUARD_RC}" -ne 0 ] \
   && [ "${DEP_INFO_REASON_CODE}" = "RCH-CARGO-DEP-INFO-MISSING" ] \
   && [[ "${DEP_INFO_REASON_DETAIL}" == *"could not parse/generate dep info at:"* ]] \
   && [ -z "${LOCAL_DEP_INFO_REASON_CODE}" ] \
+  && [ "${GIT_FETCH_STALL_REASON_CODE}" = "RCH-CARGO-GIT-FETCH-STALL" ] \
+  && [[ "${GIT_FETCH_STALL_REASON_DETAIL}" == *"Updating git repository"* ]] \
   && [ "${WORKER_BUSY_REASON_CODE}" = "RCH-WORKER-SELECTION-ALL-BUSY" ] \
   && [[ "${WORKER_BUSY_REASON_DETAIL}" == "worker_selection.reason=all_workers_busy" ]] \
   && [ "${GUARD_SURFACE_OK}" = "true" ]; then
   record_result "shared_rch_guard_coverage" "true"
 else
-  echo "    bad_guard_rc=${BAD_GUARD_RC} good_guard_rc=${GOOD_GUARD_RC} missing_file_reason_code=${MISSING_FILE_REASON_CODE} missing_lib_reason_code=${MISSING_LIB_REASON_CODE} dep_info_reason_code=${DEP_INFO_REASON_CODE} local_dep_info_reason_code=${LOCAL_DEP_INFO_REASON_CODE} worker_busy_reason_code=${WORKER_BUSY_REASON_CODE}"
-  record_result "shared_rch_guard_coverage" "false" "precondition_failed" "config" "shared guard missing local-fallback, remote-mirror, dep-info, or worker-selection coverage"
+  echo "    bad_guard_rc=${BAD_GUARD_RC} good_guard_rc=${GOOD_GUARD_RC} missing_file_reason_code=${MISSING_FILE_REASON_CODE} missing_lib_reason_code=${MISSING_LIB_REASON_CODE} dep_info_reason_code=${DEP_INFO_REASON_CODE} local_dep_info_reason_code=${LOCAL_DEP_INFO_REASON_CODE} git_fetch_stall_reason_code=${GIT_FETCH_STALL_REASON_CODE} worker_busy_reason_code=${WORKER_BUSY_REASON_CODE}"
+  record_result "shared_rch_guard_coverage" "false" "precondition_failed" "config" "shared guard missing local-fallback, remote-mirror, dep-info, git-fetch-stall, or worker-selection coverage"
 fi
 
 # Summary

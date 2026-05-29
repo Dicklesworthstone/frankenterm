@@ -306,6 +306,7 @@ tmp_refused_fallback_record="${tmp_dir}/fallback-refused.json"
 tmp_refused_fallback_ledger="${tmp_dir}/fallback-refused-ledger.jsonl"
 tmp_refused_fallback_report="${tmp_dir}/fallback-refused-report.json"
 tmp_timeout_record="${tmp_dir}/timeout.json"
+tmp_git_fetch_timeout_record="${tmp_dir}/git-fetch-timeout.json"
 tmp_light_timeout_record="${tmp_dir}/light-timeout.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
@@ -762,6 +763,62 @@ expect_validation_failure \
   "wrapper_ledger" \
   "timeout_classification" \
   "wrapper-emitted timeout record must not validate as passing proof"
+
+git_fetch_timeout_log="${tmp_dir}/git-fetch-timeout.log"
+{
+  printf '%s\n' "Selected worker: vmi1153651 at ubuntu@100.64.0.10"
+  printf '%s\n' "Sync complete: workspace in 928ms"
+  printf '%s\n' "    Updating git repository \`https://github.com/Dicklesworthstone/frankentui\`"
+} >"${git_fetch_timeout_log}"
+git_fetch_reason_code="$(rch_extract_failure_reason_code "${git_fetch_timeout_log}")"
+git_fetch_reason_detail="$(rch_extract_failure_reason_detail "${git_fetch_timeout_log}")"
+git_fetch_timeout_code="$(rch_timeout_reason_code "${git_fetch_timeout_log}")"
+git_fetch_timeout_message="$(rch_timeout_reason_message "${git_fetch_timeout_code}" "1")"
+if [[ "${git_fetch_reason_code}" != "RCH-CARGO-GIT-FETCH-STALL" ]] \
+  || [[ "${git_fetch_timeout_code}" != "RCH-CARGO-GIT-FETCH-STALL" ]] \
+  || [[ "${git_fetch_reason_detail}" != *"Updating git repository"* ]] \
+  || [[ "${git_fetch_timeout_message}" != *"git dependency before compile/test output"* ]]; then
+  emit_log \
+    "failed" \
+    "wrapper_guard" \
+    "git_fetch_timeout_classification" \
+    "git_fetch_stall_not_classified" \
+    "unexpected_failure_reason" \
+    "$(basename "${git_fetch_timeout_log}")" \
+    "remote git dependency fetch timeout must receive a stable RCH-CARGO-GIT-FETCH-STALL reason code"
+  exit 1
+fi
+rch_write_meta_json "${git_fetch_timeout_log}" "124"
+RCH_PROOF_LEDGER_FILE="${wrapper_ledger}" \
+RCH_PROOF_LEDGER_BEAD_ID="ft-kvs1e" \
+RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+  rch_emit_proof_ledger_entry \
+    "run_rch_cargo_logged_with_timeout 1 ${git_fetch_timeout_log} env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace" \
+    "${git_fetch_timeout_log}" \
+    "124" \
+    "target/rch-proof" \
+    "retained" \
+    "${git_fetch_reason_detail}"
+tail -n 1 "${wrapper_ledger}" >"${tmp_git_fetch_timeout_record}"
+if [[ "$(jq -r '.runs[0].validation_status' "${tmp_git_fetch_timeout_record}")" != "timeout" ]] \
+  || [[ "$(jq -r '.runs[0].fallback_reason_code // ""' "${tmp_git_fetch_timeout_record}")" != "RCH-CARGO-GIT-FETCH-STALL" ]] \
+  || [[ "$(jq -r '.runs[0].remote_cargo_reached' "${tmp_git_fetch_timeout_record}")" != "false" ]] \
+  || [[ "$(jq -r '.runs[0].worker_evidence_confidence' "${tmp_git_fetch_timeout_record}")" != "inconclusive_worker_evidence" ]]; then
+  emit_log \
+    "failed" \
+    "wrapper_ledger" \
+    "git_fetch_timeout_classification" \
+    "git_fetch_timeout_not_marked" \
+    "unexpected_validation_status" \
+    "$(basename "${tmp_git_fetch_timeout_record}")" \
+    "git dependency fetch timeout record must be timeout/inconclusive with RCH-CARGO-GIT-FETCH-STALL"
+  exit 1
+fi
+expect_validation_failure \
+  "${tmp_git_fetch_timeout_record}" \
+  "wrapper_ledger" \
+  "git_fetch_timeout_classification" \
+  "wrapper-emitted git dependency fetch timeout record must not validate as passing proof"
 
 light_timeout_log="${tmp_dir}/light-timeout.log"
 printf '%s\n' "rch workers probe still running" >"${light_timeout_log}"

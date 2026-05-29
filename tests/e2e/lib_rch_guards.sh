@@ -705,6 +705,21 @@ rch_log_has_cargo_dep_info_missing() {
         && grep -Fq 'No such file or directory (os error 2)' "${output_file}" 2>/dev/null
 }
 
+rch_log_has_cargo_git_fetch_stall() {
+    local output_file="$1"
+    rch_log_has_remote_execution_marker "${output_file}" || return 1
+    grep -Eq '^[[:space:]]*Updating git repository[[:space:]]+' "${output_file}" 2>/dev/null || return 1
+    if rch_log_remote_cargo_reached "${output_file}"; then
+        return 1
+    fi
+    return 0
+}
+
+rch_log_last_cargo_git_fetch_line() {
+    local output_file="$1"
+    grep -E '^[[:space:]]*Updating git repository[[:space:]]+' "${output_file}" 2>/dev/null | tail -n 1
+}
+
 rch_log_has_worker_selection_all_busy() {
     local output_file="$1"
     jq -e '
@@ -730,6 +745,8 @@ rch_extract_failure_reason_code() {
         printf '%s\n' "RCH-WORKER-SELECTION-ALL-BUSY"
     elif rch_log_has_cargo_dep_info_missing "${output_file}"; then
         printf '%s\n' "RCH-CARGO-DEP-INFO-MISSING"
+    elif rch_log_has_cargo_git_fetch_stall "${output_file}"; then
+        printf '%s\n' "RCH-CARGO-GIT-FETCH-STALL"
     elif grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
         printf '%s\n' "RCH-CROSS-RUST-TARGET-MISSING"
     elif grep -Fq "x86_64-w64-mingw32-gcc: not found" "${output_file}" 2>/dev/null; then
@@ -758,6 +775,8 @@ rch_extract_failure_reason_detail() {
         jq -r '"worker_selection.reason=" + (.data.worker_selection.reason // "unknown")' "${output_file}" 2>/dev/null
     elif rch_log_has_cargo_dep_info_missing "${output_file}"; then
         sed -n '/^error: could not parse\/generate dep info at: /p' "${output_file}" 2>/dev/null | tail -n 1
+    elif rch_log_has_cargo_git_fetch_stall "${output_file}"; then
+        rch_log_last_cargo_git_fetch_line "${output_file}"
     elif grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
         grep -F "can't find crate for \`core\`" "${output_file}" 2>/dev/null | tail -n 1
     elif grep -Fq "x86_64-w64-mingw32-gcc: not found" "${output_file}" 2>/dev/null; then
@@ -1581,7 +1600,9 @@ rch_timeout_queue_log() {
 
 rch_timeout_reason_code() {
     local output_file="$1"
-    if grep -Eq 'Retrieving (build )?artifacts?( from)?' "${output_file}" 2>/dev/null; then
+    if rch_log_has_cargo_git_fetch_stall "${output_file}"; then
+        printf '%s\n' "RCH-CARGO-GIT-FETCH-STALL"
+    elif grep -Eq 'Retrieving (build )?artifacts?( from)?' "${output_file}" 2>/dev/null; then
         printf '%s\n' "RCH-ARTIFACT-STALL"
     else
         printf '%s\n' "RCH-REMOTE-STALL"
@@ -1593,6 +1614,8 @@ rch_timeout_reason_message() {
     local timeout_secs="$2"
     if [[ "${reason_code}" == "RCH-ARTIFACT-STALL" ]]; then
         printf '%s\n' "rch remote command timed out after ${timeout_secs}s while retrieving artifacts from the worker"
+    elif [[ "${reason_code}" == "RCH-CARGO-GIT-FETCH-STALL" ]]; then
+        printf '%s\n' "rch remote command timed out after ${timeout_secs}s while Cargo was fetching a git dependency before compile/test output"
     else
         printf '%s\n' "rch remote command timed out after ${timeout_secs}s"
     fi
