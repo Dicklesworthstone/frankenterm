@@ -62,6 +62,7 @@ pub mod agent_correlator;
 pub mod agent_detection;
 #[cfg(feature = "agent-mail")]
 pub mod agent_mail_bridge;
+pub mod agent_mail_outbox;
 pub mod agent_pane_state;
 pub mod agent_profiles;
 pub mod agent_provider;

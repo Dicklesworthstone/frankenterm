@@ -1,0 +1,584 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-agent-mail-outbox-entry.json",
+  "title": "FrankenTerm Agent Mail Fallback Outbox Entry",
+  "description": "Durable outage-spool record for an intended Agent Mail coordination write captured after Agent Mail is unavailable after the single allowed retry. The record never claims delivery; replay state is explicit and auditable.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "source_bead",
+    "replay_id",
+    "created_at",
+    "agent",
+    "thread_id",
+    "recipients",
+    "subject",
+    "body_policy",
+    "importance",
+    "ack_required",
+    "attachments",
+    "source_operation",
+    "failure_reason",
+    "state",
+    "state_reason",
+    "operator_decision",
+    "replay_receipt",
+    "retention",
+    "reservation_intent",
+    "beads_fallback"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.agent_mail_outbox_entry.v1"
+    },
+    "source_bead": {
+      "type": "string",
+      "const": "ft-dezx8.1"
+    },
+    "replay_id": {
+      "type": "string",
+      "pattern": "^amq1-[a-f0-9]{24}$"
+    },
+    "created_at": {
+      "$ref": "#/$defs/utc_timestamp"
+    },
+    "agent": {
+      "$ref": "#/$defs/agent"
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "recipients": {
+      "$ref": "#/$defs/recipients"
+    },
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "body_policy": {
+      "$ref": "#/$defs/body_policy"
+    },
+    "importance": {
+      "$ref": "#/$defs/importance"
+    },
+    "ack_required": {
+      "type": "boolean"
+    },
+    "attachments": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/attachment_ref"
+      }
+    },
+    "source_operation": {
+      "$ref": "#/$defs/source_operation"
+    },
+    "failure_reason": {
+      "$ref": "#/$defs/failure_reason"
+    },
+    "state": {
+      "$ref": "#/$defs/state"
+    },
+    "state_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "operator_decision": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/operator_decision"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "replay_receipt": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/replay_receipt"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "retention": {
+      "$ref": "#/$defs/retention"
+    },
+    "reservation_intent": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/reservation_intent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "beads_fallback": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/beads_fallback"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "utc_timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "safe_path": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "^~"
+          },
+          {
+            "pattern": "\\.\\."
+          },
+          {
+            "pattern": "\\\\"
+          },
+          {
+            "pattern": "://"
+          },
+          {
+            "pattern": "(^|/)\\.git(/|$)"
+          }
+        ]
+      }
+    },
+    "agent": {
+      "type": "object",
+      "required": [
+        "name",
+        "program",
+        "model",
+        "project_key"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "program": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_key": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "recipients": {
+      "type": "object",
+      "required": [
+        "to",
+        "cc",
+        "bcc"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "to": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "cc": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "bcc": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "body_policy": {
+      "type": "object",
+      "required": [
+        "body_sha256",
+        "body_storage",
+        "body_preview_redacted",
+        "body_byte_count",
+        "max_retained_bytes",
+        "raw_body_retained"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "body_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "body_storage": {
+          "type": "string",
+          "enum": [
+            "digest_only",
+            "bounded_markdown"
+          ]
+        },
+        "body_preview_redacted": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 512
+        },
+        "body_byte_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "max_retained_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "raw_body_retained": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "importance": {
+      "type": "string",
+      "enum": [
+        "low",
+        "normal",
+        "high",
+        "urgent"
+      ]
+    },
+    "attachment_ref": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256",
+        "byte_count",
+        "content_type",
+        "retention"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/safe_path"
+        },
+        "sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "byte_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 67108864
+        },
+        "content_type": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "retention": {
+          "type": "string",
+          "enum": [
+            "reference_only",
+            "digest_only"
+          ]
+        }
+      }
+    },
+    "source_operation": {
+      "type": "string",
+      "enum": [
+        "send_message",
+        "reply_message",
+        "file_reservation",
+        "release_reservation",
+        "beads_status_comment",
+        "beads_closeout_comment",
+        "stale_owner_handoff_notice",
+        "coordination_notice"
+      ]
+    },
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "agent_mail_unavailable",
+        "database_recovery_notice",
+        "api_unreachable",
+        "registration_failed",
+        "contact_permission_blocked",
+        "timeout",
+        "unknown"
+      ]
+    },
+    "failure_reason": {
+      "type": "object",
+      "required": [
+        "class",
+        "summary",
+        "retry_count",
+        "retry_limit",
+        "last_attempt_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/failure_class"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retry_limit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "last_attempt_at": {
+          "$ref": "#/$defs/utc_timestamp"
+        }
+      }
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "replay_dry_run_ok",
+        "replayed",
+        "replay_failed",
+        "superseded",
+        "discarded_by_operator"
+      ]
+    },
+    "operator_decision": {
+      "type": "object",
+      "required": [
+        "operator",
+        "decided_at",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "operator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decided_at": {
+          "$ref": "#/$defs/utc_timestamp"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "replay_receipt": {
+      "type": "object",
+      "required": [
+        "dry_run_at",
+        "replayed_at",
+        "delivered_message_id",
+        "failure_summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "dry_run_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/utc_timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replayed_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/utc_timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "delivered_message_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "failure_summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "required": [
+        "retain_until",
+        "automatic_discard",
+        "redaction"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "retain_until": {
+          "$ref": "#/$defs/utc_timestamp"
+        },
+        "automatic_discard": {
+          "type": "boolean",
+          "const": false
+        },
+        "redaction": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "body_digest_only",
+              "body_preview_redacted",
+              "attachment_refs_only",
+              "bcc_allowed_for_replay"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "reservation_intent": {
+      "type": "object",
+      "required": [
+        "paths",
+        "exclusive",
+        "ttl_seconds",
+        "reason_sha256",
+        "reason_preview_redacted"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/safe_path"
+          }
+        },
+        "exclusive": {
+          "type": "boolean"
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 604800
+        },
+        "reason_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reason_preview_redacted": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 512
+        }
+      }
+    },
+    "beads_fallback": {
+      "type": "object",
+      "required": [
+        "bead_id",
+        "action",
+        "comment_sha256",
+        "comment_preview_redacted"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bead_id": {
+          "type": "string",
+          "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "comment_only",
+            "status_transition",
+            "closeout_blocked",
+            "closeout_complete"
+          ]
+        },
+        "comment_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "comment_preview_redacted": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    }
+  }
+}

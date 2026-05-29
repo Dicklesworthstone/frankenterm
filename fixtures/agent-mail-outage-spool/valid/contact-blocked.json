@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_outbox_entry.v1",
+  "source_bead": "ft-dezx8.1",
+  "replay_id": "amq1-c0f17e6710c8a23d9b47e5f2",
+  "created_at": "2026-05-29T13:36:00Z",
+  "agent": {
+    "name": "IvoryCreek",
+    "program": "codex-cli",
+    "model": "gpt-5-codex",
+    "project_key": "/Users/jemanuel/projects/frankenterm"
+  },
+  "thread_id": "ft-dezx8.1",
+  "recipients": {
+    "to": [
+      "SapphireCardinal"
+    ],
+    "cc": [],
+    "bcc": []
+  },
+  "subject": "ft-dezx8.1 contact approval blocked",
+  "body_policy": {
+    "body_sha256": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
+    "body_storage": "digest_only",
+    "body_preview_redacted": "Contact permission failure recorded as a queued outbox item for later operator review.",
+    "body_byte_count": 151,
+    "max_retained_bytes": 4096,
+    "raw_body_retained": false
+  },
+  "importance": "normal",
+  "ack_required": false,
+  "attachments": [],
+  "source_operation": "send_message",
+  "failure_reason": {
+    "class": "contact_permission_blocked",
+    "summary": "Contact approval failed after retry; queued without bypassing Agent Mail policy.",
+    "retry_count": 1,
+    "retry_limit": 1,
+    "last_attempt_at": "2026-05-29T13:36:10Z"
+  },
+  "state": "queued",
+  "state_reason": null,
+  "operator_decision": null,
+  "replay_receipt": null,
+  "retention": {
+    "retain_until": "2026-06-28T13:36:00Z",
+    "automatic_discard": false,
+    "redaction": [
+      "body_digest_only",
+      "body_preview_redacted",
+      "attachment_refs_only"
+    ]
+  },
+  "reservation_intent": null,
+  "beads_fallback": null
+}

@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_outbox_entry.v1",
+  "source_bead": "ft-dezx8.1",
+  "replay_id": "amq1-f1e2d3c4b5a6978877665544",
+  "created_at": "2026-05-29T13:38:00Z",
+  "agent": {
+    "name": "IvoryCreek",
+    "program": "codex-cli",
+    "model": "gpt-5-codex",
+    "project_key": "/Users/jemanuel/projects/frankenterm"
+  },
+  "thread_id": "ft-dezx8.1",
+  "recipients": {
+    "to": [
+      "SapphireCardinal"
+    ],
+    "cc": [],
+    "bcc": []
+  },
+  "subject": "ft-dezx8.1 reservation intent",
+  "body_policy": {
+    "body_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    "body_storage": "digest_only",
+    "body_preview_redacted": "Outbox entry records an intended exclusive reservation without mutating Agent Mail.",
+    "body_byte_count": 167,
+    "max_retained_bytes": 4096,
+    "raw_body_retained": false
+  },
+  "importance": "normal",
+  "ack_required": false,
+  "attachments": [
+    {
+      "path": "fixtures/agent-mail-outage-spool/manifest.json",
+      "sha256": "22223333444455556666777788889999aaaabbbbccccddddeeeeffff00001111",
+      "byte_count": 1045,
+      "content_type": "application/json",
+      "retention": "digest_only"
+    }
+  ],
+  "source_operation": "file_reservation",
+  "failure_reason": {
+    "class": "agent_mail_unavailable",
+    "summary": "Reservation coordination could not be announced through Agent Mail after retry.",
+    "retry_count": 1,
+    "retry_limit": 1,
+    "last_attempt_at": "2026-05-29T13:38:10Z"
+  },
+  "state": "queued",
+  "state_reason": null,
+  "operator_decision": null,
+  "replay_receipt": null,
+  "retention": {
+    "retain_until": "2026-06-28T13:38:00Z",
+    "automatic_discard": false,
+    "redaction": [
+      "body_digest_only",
+      "body_preview_redacted",
+      "attachment_refs_only"
+    ]
+  },
+  "reservation_intent": {
+    "paths": [
+      "crates/frankenterm-core/src/agent_mail_outbox.rs",
+      "docs/json-schema/ft-agent-mail-outbox-entry.json",
+      "fixtures/agent-mail-outage-spool/manifest.json"
+    ],
+    "exclusive": true,
+    "ttl_seconds": 7200,
+    "reason_sha256": "3333444455556666777788889999aaaabbbbccccddddeeeeffff000011112222",
+    "reason_preview_redacted": "Reserve the outbox contract files for ft-dezx8.1."
+  },
+  "beads_fallback": null
+}

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_outbox_entry.v1",
+  "source_bead": "ft-dezx8.1",
+  "replay_id": "amq1-bad5bead5c105e001234abcd",
+  "created_at": "2026-05-29T13:39:00Z",
+  "agent": {
+    "name": "IvoryCreek",
+    "program": "codex-cli",
+    "model": "gpt-5-codex",
+    "project_key": "/Users/jemanuel/projects/frankenterm"
+  },
+  "thread_id": "ft-dezx8.1",
+  "recipients": {
+    "to": [
+      "SapphireCardinal"
+    ],
+    "cc": [],
+    "bcc": []
+  },
+  "subject": "ft-dezx8.1 Beads fallback closeout",
+  "body_policy": {
+    "body_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+    "body_storage": "digest_only",
+    "body_preview_redacted": "Beads comment records the closeout fallback while Agent Mail delivery remains unclaimed.",
+    "body_byte_count": 198,
+    "max_retained_bytes": 4096,
+    "raw_body_retained": false
+  },
+  "importance": "normal",
+  "ack_required": false,
+  "attachments": [],
+  "source_operation": "beads_closeout_comment",
+  "failure_reason": {
+    "class": "agent_mail_unavailable",
+    "summary": "Closeout notice fell back to Beads because Agent Mail remained unavailable after retry.",
+    "retry_count": 1,
+    "retry_limit": 1,
+    "last_attempt_at": "2026-05-29T13:39:10Z"
+  },
+  "state": "superseded",
+  "state_reason": "Beads closeout comment is the current coordination surface; Agent Mail delivery is still unclaimed.",
+  "operator_decision": null,
+  "replay_receipt": null,
+  "retention": {
+    "retain_until": "2026-06-28T13:39:00Z",
+    "automatic_discard": false,
+    "redaction": [
+      "body_digest_only",
+      "body_preview_redacted",
+      "attachment_refs_only"
+    ]
+  },
+  "reservation_intent": null,
+  "beads_fallback": {
+    "bead_id": "ft-dezx8.1",
+    "action": "closeout_blocked",
+    "comment_sha256": "444455556666777788889999aaaabbbbccccddddeeeeffff0000111122223333",
+    "comment_preview_redacted": "Recorded fallback closeout in Beads without claiming Agent Mail delivery."
+  }
+}

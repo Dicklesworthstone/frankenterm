@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_outbox_entry.v1",
+  "source_bead": "ft-dezx8.1",
+  "replay_id": "amq1-a55e17c0dede0a7b1c2d3e4f",
+  "created_at": "2026-05-29T13:37:00Z",
+  "agent": {
+    "name": "IvoryCreek",
+    "program": "codex-cli",
+    "model": "gpt-5-codex",
+    "project_key": "/Users/jemanuel/projects/frankenterm"
+  },
+  "thread_id": "ft-dezx8.1",
+  "recipients": {
+    "to": [
+      "SapphireCardinal"
+    ],
+    "cc": [
+      "SilverTrout"
+    ],
+    "bcc": []
+  },
+  "subject": "ft-dezx8.1 ack-required replay notice",
+  "body_policy": {
+    "body_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "body_storage": "bounded_markdown",
+    "body_preview_redacted": "Ack-required coordination notice was bounded, redacted, and dry-run checked before replay.",
+    "body_byte_count": 221,
+    "max_retained_bytes": 4096,
+    "raw_body_retained": false
+  },
+  "importance": "high",
+  "ack_required": true,
+  "attachments": [],
+  "source_operation": "send_message",
+  "failure_reason": {
+    "class": "api_unreachable",
+    "summary": "Agent Mail endpoint was unreachable during the original send attempt.",
+    "retry_count": 1,
+    "retry_limit": 1,
+    "last_attempt_at": "2026-05-29T13:37:10Z"
+  },
+  "state": "replay_dry_run_ok",
+  "state_reason": null,
+  "operator_decision": null,
+  "replay_receipt": {
+    "dry_run_at": "2026-05-29T13:42:00Z",
+    "replayed_at": null,
+    "delivered_message_id": null,
+    "failure_summary": null
+  },
+  "retention": {
+    "retain_until": "2026-06-28T13:37:00Z",
+    "automatic_discard": false,
+    "redaction": [
+      "body_digest_only",
+      "body_preview_redacted",
+      "attachment_refs_only",
+      "bcc_allowed_for_replay"
+    ]
+  },
+  "reservation_intent": null,
+  "beads_fallback": null
+}
