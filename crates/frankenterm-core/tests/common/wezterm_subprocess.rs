@@ -160,6 +160,7 @@ impl WeztermSubprocessFixture {
             // Strip env vars that would inadvertently target the user's
             // interactive session.
             .env_remove("WEZTERM_UNIX_SOCKET")
+            .env_remove("FRANKENTERM_UNIX_SOCKET")
             .env_remove("WEZTERM_PANE")
             .arg("--config-file")
             .arg(&config_path)
@@ -169,6 +170,9 @@ impl WeztermSubprocessFixture {
             .stderr(Stdio::from(
                 File::create(&stderr_path).map_err(FixtureError::SpawnFailed)?,
             ));
+        if !default_prog.is_empty() {
+            cmd.arg("--").args(default_prog);
+        }
 
         let mut child = cmd.spawn().map_err(FixtureError::SpawnFailed)?;
 

@@ -20,8 +20,6 @@ use frankenterm_core::plan::{
     TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId,
 };
 #[cfg(unix)]
-use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
-#[cfg(unix)]
 use frankenterm_core::scrollback_mmap_format::RecordKind;
 use frankenterm_core::scrollback_mmap_format::{FormatVersion, HeaderFlags, ScrollbackHeader};
 #[cfg(unix)]
@@ -148,6 +146,40 @@ fn wait_for_sigkill_writer_ready(
 }
 
 #[cfg(unix)]
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let raw = path.as_os_str().to_string_lossy();
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+const REAL_MUX_ROBOT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
+#[cfg(unix)]
+const REAL_MUX_ROBOT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+#[cfg(unix)]
+fn wait_for_mux_pane_process_ready(
+    fixture: &wezterm_subprocess::WeztermSubprocessFixture,
+    ready_path: &std::path::Path,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if ready_path.exists() {
+            return;
+        }
+        let (mux_stdout, mux_stderr) = fixture.child_output_snapshot();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for mux pane process ready file {}; mux stdout={}; mux stderr={}",
+            ready_path.display(),
+            mux_stdout,
+            mux_stderr
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
 fn write_recover_mux_config(config_path: &std::path::Path, mux_socket_path: &std::path::Path) {
     let socket = mux_socket_path
         .display()
@@ -162,29 +194,150 @@ fn write_recover_mux_config(config_path: &std::path::Path, mux_socket_path: &std
 }
 
 #[cfg(unix)]
+fn wait_for_real_mux_ready(
+    workspace: &str,
+    data_home: &std::path::Path,
+    home: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let deadline = std::time::Instant::now() + REAL_MUX_ROBOT_WAIT_TIMEOUT;
+    loop {
+        let last_error = match run_robot_state_probe(workspace, data_home, home, config_path) {
+            Ok(panes) if !panes.is_empty() => return panes,
+            Ok(_) => "ft robot state returned zero panes".to_string(),
+            Err(err) => err,
+        };
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mux fixture did not become ready: {last_error}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn run_robot_state_probe(
+    workspace: &str,
+    data_home: &std::path::Path,
+    home: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<Vec<serde_json::Value>, String> {
+    let output = Command::cargo_bin("ft")
+        .map_err(|err| format!("ft binary should be built: {err}"))?
+        .timeout(REAL_MUX_ROBOT_PROBE_TIMEOUT)
+        .env("FT_WORKSPACE", workspace)
+        .env("XDG_DATA_HOME", data_home)
+        .env("HOME", home)
+        .env("FT_LOG_LEVEL", "debug")
+        .env(
+            "RUST_LOG",
+            "frankenterm_core::vendored=debug,frankenterm_core::wezterm=debug,ft=debug",
+        )
+        .env("FT_WEZTERM_CLI", "/nonexistent/wezterm")
+        .arg("--config")
+        .arg(config_path)
+        .args(["robot", "--format", "json", "state"])
+        .output()
+        .map_err(|err| format!("ft robot state failed to execute: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "ft robot state failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("ft robot state stdout was not JSON: {err}"))?;
+    if payload["ok"] != true {
+        return Err(format!("ft robot state returned error response: {payload}"));
+    }
+    payload["data"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| format!("ft robot state data was not an array: {payload}"))
+}
+
+#[cfg(unix)]
 fn wait_for_real_mux_text(
-    fixture: &wezterm_subprocess::WeztermSubprocessFixture,
+    workspace: &str,
+    data_home: &std::path::Path,
+    home: &std::path::Path,
+    config_path: &std::path::Path,
     pane_id: u64,
     needles: &[&str],
 ) -> String {
-    let client = fixture.client();
-    let runtime = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build mux poll runtime");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + REAL_MUX_ROBOT_WAIT_TIMEOUT;
     loop {
-        let text = runtime
-            .block_on(async { client.get_text(pane_id, false).await })
-            .expect("read recovered pane text");
-        if needles.iter().all(|needle| text.contains(needle)) {
-            return text;
-        }
+        let last_error =
+            match run_robot_get_text_probe(workspace, data_home, home, config_path, pane_id) {
+                Ok(text) if needles.iter().all(|needle| text.contains(needle)) => return text,
+                Ok(text) => format!("pane text missing {needles:?}; last text={text:?}"),
+                Err(err) => err,
+            };
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for recovered pane {pane_id} to contain {needles:?}; last text={text:?}"
+            "timed out waiting for recovered pane {pane_id} to contain {needles:?}: {last_error}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+#[cfg(unix)]
+fn run_robot_get_text_probe(
+    workspace: &str,
+    data_home: &std::path::Path,
+    home: &std::path::Path,
+    config_path: &std::path::Path,
+    pane_id: u64,
+) -> Result<String, String> {
+    let pane_id_arg = pane_id.to_string();
+    let output = Command::cargo_bin("ft")
+        .map_err(|err| format!("ft binary should be built: {err}"))?
+        .timeout(REAL_MUX_ROBOT_PROBE_TIMEOUT)
+        .env("FT_WORKSPACE", workspace)
+        .env("XDG_DATA_HOME", data_home)
+        .env("HOME", home)
+        .env("FT_LOG_LEVEL", "debug")
+        .env(
+            "RUST_LOG",
+            "frankenterm_core::vendored=debug,frankenterm_core::wezterm=debug,ft=debug",
+        )
+        .env("FT_WEZTERM_CLI", "/nonexistent/wezterm")
+        .arg("--config")
+        .arg(config_path)
+        .args([
+            "robot",
+            "--format",
+            "json",
+            "get-text",
+            &pane_id_arg,
+            "--tail",
+            "200",
+        ])
+        .output()
+        .map_err(|err| format!("ft robot get-text failed to execute: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "ft robot get-text failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("ft robot get-text stdout was not JSON: {err}"))?;
+    if payload["ok"] != true {
+        return Err(format!(
+            "ft robot get-text returned error response: {payload}"
+        ));
+    }
+    payload["data"]["text"]
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("ft robot get-text data.text was not a string: {payload}"))
 }
 
 fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
@@ -2935,11 +3088,25 @@ fn session_recover_replays_sigkill_orphan_into_real_mux() {
         "writer child should terminate via SIGKILL"
     );
 
-    let fixture =
-        wezterm_subprocess::WeztermSubprocessFixture::spawn_with_default_prog(&["/bin/cat"])
-            .expect("spawn hermetic mux subprocess");
+    let mux_cat_ready_path = dir.path().join("mux-cat.ready");
+    let mux_cat_script = format!(
+        "printf ready > {}; exec /bin/cat",
+        shell_quote_path(&mux_cat_ready_path)
+    );
+    let fixture = wezterm_subprocess::WeztermSubprocessFixture::spawn_with_default_prog(&[
+        "/bin/sh",
+        "-c",
+        &mux_cat_script,
+    ])
+    .expect("spawn hermetic mux subprocess");
+    wait_for_mux_pane_process_ready(&fixture, &mux_cat_ready_path);
     let config_path = dir.path().join("frankenterm.toml");
     write_recover_mux_config(&config_path, fixture.socket_path());
+    let initial_panes = wait_for_real_mux_ready(&ws, &data_home, dir.path(), &config_path);
+    assert!(
+        !initial_panes.is_empty(),
+        "mux fixture should expose an initial pane before recover"
+    );
 
     let output = Command::cargo_bin("ft")
         .expect("ft binary should be built")
@@ -2955,7 +3122,8 @@ fn session_recover_replays_sigkill_orphan_into_real_mux() {
 
     assert!(
         output.status.success(),
-        "recover failed: stdout={} stderr={}",
+        "recover failed: status={:?} stdout={} stderr={}",
+        output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -2979,7 +3147,10 @@ fn session_recover_replays_sigkill_orphan_into_real_mux() {
         .as_u64()
         .expect("recover output should include new pane_id");
     let recovered_text = wait_for_real_mux_text(
-        &fixture,
+        &ws,
+        &data_home,
+        dir.path(),
+        &config_path,
         pane_id,
         &[
             "ft-rlvsz durable prefix line 1",

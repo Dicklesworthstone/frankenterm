@@ -19325,6 +19325,38 @@ fn add_distributed_remote_pane_text_placeholders(
     }
 }
 
+async fn robot_list_panes_on_runtime_task(
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
+    let task = frankenterm_core::runtime_async::task::spawn(async move {
+        let cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        wezterm.list_panes_with_cx(&cx).await
+    });
+    task.await
+        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
+            operation: "robot.list_panes.await_task",
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?
+}
+
+async fn robot_get_text_on_runtime_task(
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+    pane_id: u64,
+    escapes: bool,
+) -> frankenterm_core::Result<String> {
+    let task = frankenterm_core::runtime_async::task::spawn(async move {
+        let cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        wezterm.get_text_with_cx(&cx, pane_id, escapes).await
+    });
+    task.await
+        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
+            operation: "robot.get_text.await_task",
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?
+}
+
 async fn batch_get_pane_text(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
     pane_ids: &[u64],
@@ -25673,10 +25705,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         } => {
                             let wezterm =
                                 frankenterm_core::wezterm::wezterm_handle_from_config(&config);
-                            // ft-xbnl0.2.3 tick 231: cx-first wezterm.
-                            let cx = frankenterm_core::cx::Cx::current()
-                                .unwrap_or_else(frankenterm_core::cx::for_request);
-                            match wezterm.list_panes_with_cx(&cx).await {
+                            match robot_list_panes_on_runtime_task(wezterm.clone()).await {
                                 Ok(panes) => {
                                     let filter = &config.ingest.panes;
                                     let mut states: Vec<PaneState> = panes
@@ -25989,11 +26018,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 return Ok(());
                             }
 
-                            // ft-xbnl0.2.3 tick 231: cx-first wezterm.
-                            let cx = frankenterm_core::cx::Cx::current()
-                                .unwrap_or_else(frankenterm_core::cx::for_request);
                             let mut pane_ids = if all {
-                                match wezterm.list_panes_with_cx(&cx).await {
+                                match robot_list_panes_on_runtime_task(wezterm.clone()).await {
                                     Ok(panes) => panes.iter().map(|pane| pane.pane_id).collect(),
                                     Err(e) => {
                                         let response = RobotResponse::<RobotBatchGetTextData>::error_with_code(
@@ -26142,10 +26168,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
-                                // ft-xbnl0.2.3 tick 231: cx-first wezterm.
-                                let cx = frankenterm_core::cx::Cx::current()
-                                    .unwrap_or_else(frankenterm_core::cx::for_request);
-                                match wezterm.get_text_with_cx(&cx, pane_id, escapes).await {
+                                match robot_get_text_on_runtime_task(
+                                    wezterm.clone(),
+                                    pane_id,
+                                    escapes,
+                                )
+                                .await
+                                {
                                     Ok(full_text) => {
                                         let (text, truncated, truncation_info) =
                                             apply_tail_truncation(&full_text, tail);
@@ -50340,19 +50369,22 @@ async fn handle_session_command(
 
             let mut chunks_sent = 0usize;
             for chunk in &replay_plan.chunks {
-                let cx = session_recovery_deadline_cx(mux_timeout_seconds);
-                wezterm
-                    .send_text_with_options_with_cx(&cx, pane_id, &chunk.text, true, true)
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "Failed to replay scrollback record {} ({}) into pane {pane_id}: {err}",
-                            chunk.record_index,
-                            frankenterm_core::scrollback_mmap_recovery::replay_record_kind_label(
-                                chunk.record_kind
-                            )
+                session_recovery_send_text_on_runtime_task(
+                    wezterm.clone(),
+                    mux_timeout_seconds,
+                    pane_id,
+                    chunk.text.clone(),
+                )
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "Failed to replay scrollback record {} ({}) into pane {pane_id}: {err}",
+                        chunk.record_index,
+                        frankenterm_core::scrollback_mmap_recovery::replay_record_kind_label(
+                            chunk.record_kind
                         )
-                    })?;
+                    )
+                })?;
                 chunks_sent += 1;
             }
             tracing::info!(
@@ -50718,13 +50750,11 @@ async fn session_recovery_create_pane(
     wezterm: &frankenterm_core::wezterm::WeztermHandle,
     timeout_seconds: u64,
 ) -> anyhow::Result<u64> {
-    let cx = session_recovery_deadline_cx(timeout_seconds);
     tracing::info!(
         timeout_seconds,
         "listing live mux panes before recovery replay"
     );
-    let panes = wezterm
-        .list_panes_with_cx(&cx)
+    let panes = session_recovery_list_panes_on_runtime_task(wezterm.clone(), timeout_seconds)
         .await
         .map_err(|err| anyhow::anyhow!("Failed to list live panes before recovery spawn: {err}"))?;
     let source_pane_id = panes
@@ -50738,16 +50768,67 @@ async fn session_recovery_create_pane(
         timeout_seconds,
         "splitting live mux pane for recovery replay"
     );
-    wezterm
-        .split_pane_with_cx(
-            &cx,
-            source_pane_id,
-            frankenterm_core::wezterm::SplitDirection::Right,
-            None,
-            Some(50),
-        )
+    session_recovery_split_pane_on_runtime_task(wezterm.clone(), timeout_seconds, source_pane_id)
         .await
         .map_err(|err| anyhow::anyhow!("Failed to create recovery pane: {err}"))
+}
+
+async fn session_recovery_list_panes_on_runtime_task(
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+    timeout_seconds: u64,
+) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
+    let task = frankenterm_core::runtime_async::task::spawn(async move {
+        let cx = session_recovery_deadline_cx(timeout_seconds);
+        wezterm.list_panes_with_cx(&cx).await
+    });
+    task.await
+        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
+            operation: "session.recovery.list_panes.await_task",
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?
+}
+
+async fn session_recovery_split_pane_on_runtime_task(
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+    timeout_seconds: u64,
+    source_pane_id: u64,
+) -> frankenterm_core::Result<u64> {
+    let task = frankenterm_core::runtime_async::task::spawn(async move {
+        let cx = session_recovery_deadline_cx(timeout_seconds);
+        wezterm
+            .split_pane_with_cx(
+                &cx,
+                source_pane_id,
+                frankenterm_core::wezterm::SplitDirection::Right,
+                None,
+                Some(50),
+            )
+            .await
+    });
+    task.await
+        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
+            operation: "session.recovery.split_pane.await_task",
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?
+}
+
+async fn session_recovery_send_text_on_runtime_task(
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+    timeout_seconds: u64,
+    pane_id: u64,
+    text: String,
+) -> frankenterm_core::Result<()> {
+    let task = frankenterm_core::runtime_async::task::spawn(async move {
+        let cx = session_recovery_deadline_cx(timeout_seconds);
+        wezterm
+            .send_text_with_options_with_cx(&cx, pane_id, &text, true, true)
+            .await
+    });
+    task.await
+        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
+            operation: "session.recovery.send_text.await_task",
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?
 }
 
 fn session_mmap_replay_skip_reason_json(
