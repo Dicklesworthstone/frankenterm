@@ -3353,10 +3353,16 @@ impl ObservationRuntime {
 
                                         // Publish to event bus for workflow runners (if configured)
                                         if let Some(ref bus) = event_bus {
+                                            // FND-010 / INV-RED-1: the stored row is
+                                            // redacted, but the live event bus was
+                                            // publishing the RAW in-memory detection
+                                            // (matched_text can contain a secret) to
+                                            // subscribers (web SSE, workflow runners).
+                                            // Redact the emitted copy too.
                                             let event = crate::events::Event::PatternDetected {
                                                 pane_id,
                                                 pane_uuid: pane_uuid.clone(),
-                                                detection: detection.clone(),
+                                                detection: redact_detection(&detection),
                                                 event_id: Some(event_id),
                                             };
                                             let delivered = bus.publish(event);
@@ -5002,6 +5008,23 @@ fn redact_json_leaves(value: &mut serde_json::Value, redactor: &Redactor) {
     }
 }
 
+/// Return a copy of `detection` with `matched_text` and the string leaves of
+/// `extracted` redacted (rule_id / severity / span etc. are left intact).
+///
+/// `matched_text` is the full regex match span (`patterns.rs` `m.as_str()`), so a
+/// rule whose pattern reaches past its anchor can capture adjacent secret bytes.
+/// Apply this anywhere a `Detection` is persisted OR emitted on the event bus so
+/// that no consumer — storage rows, `ft robot events`, web `/events`, live
+/// `EventBus` subscribers (SSE), distributed aggregators — ever sees a raw match.
+/// Redaction is idempotent. (gauntlet FND-010 / INV-RED-1.)
+pub fn redact_detection(detection: &Detection) -> Detection {
+    let redactor = Redactor::new();
+    let mut redacted = detection.clone();
+    redacted.matched_text = redactor.redact(&detection.matched_text);
+    redact_json_leaves(&mut redacted.extracted, &redactor);
+    redacted
+}
+
 /// Convert a Detection to a StoredEvent for persistence.
 /// Redacts matched_text and string values inside extracted at write time so that
 /// all downstream consumers (storage rows, wa.events, ft robot events, web /events,
@@ -5024,10 +5047,7 @@ fn detection_to_stored_event(
     };
     let dedupe_key = format!("{identity_key}:{bucket}");
 
-    let redactor = Redactor::new();
-    let redacted_matched_text = redactor.redact(&detection.matched_text);
-    let mut redacted_extracted = detection.extracted.clone();
-    redact_json_leaves(&mut redacted_extracted, &redactor);
+    let redacted = redact_detection(detection);
 
     StoredEvent {
         id: 0, // Will be assigned by storage
@@ -5041,8 +5061,8 @@ fn detection_to_stored_event(
             crate::patterns::Severity::Critical => "critical".to_string(),
         },
         confidence: detection.confidence,
-        extracted: Some(redacted_extracted),
-        matched_text: Some(redacted_matched_text),
+        extracted: Some(redacted.extracted),
+        matched_text: Some(redacted.matched_text),
         segment_id,
         detected_at,
         dedupe_key: Some(dedupe_key),

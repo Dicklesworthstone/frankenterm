@@ -21403,6 +21403,11 @@ async fn distributed_persist_payload(
                 matched_text: detection_notice.matched_text,
                 span: (0, 0),
             };
+            // FND-010 / INV-RED-1: redact the inbound distributed detection before
+            // it is persisted to the events table or re-broadcast on the event bus.
+            // matched_text is the full regex span and can carry a secret; the local
+            // path redacts via redact_detection, the distributed path must too.
+            let detection = frankenterm_core::runtime::redact_detection(&detection);
             let detected_at = if detection_notice.detected_at_ms > 0 {
                 detection_notice.detected_at_ms
             } else {
