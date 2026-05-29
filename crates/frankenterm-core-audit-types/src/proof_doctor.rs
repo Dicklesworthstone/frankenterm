@@ -1188,8 +1188,26 @@ fn retained_rch_reason_blocker(evidence: &ProofDoctorEvidence) -> Option<ProofDo
         .rch_failure_reason_detail
         .as_deref()
         .or(evidence.diagnostic_summary.as_deref());
+    let normalized_detail = detail.map(normalize_rch_reason);
+    let ssh_timeout_reason = retained_ssh_timeout_reason(&reason, normalized_detail.as_deref());
 
-    let (kind, reason_code, message, next_action) = if reason.contains("queue_timeout")
+    let (kind, reason_code, message, next_action) = if ssh_timeout_reason
+        && evidence.remote_cargo_reached
+    {
+        (
+            ProofDoctorBlockerKind::RemoteSubstrate,
+            "proof.rch.post_cargo_ssh_timeout",
+            "RCH reached remote Cargo, then the SSH command timed out before proof closeout.",
+            "Preserve the retained timeout artifact and rerun or resume through RCH; do not substitute local Cargo proof.",
+        )
+    } else if ssh_timeout_reason {
+        (
+            ProofDoctorBlockerKind::RemoteLaunch,
+            "proof.rch.pre_cargo_ssh_timeout",
+            "RCH selected a remote execution path, then the SSH command timed out before retained remote-Cargo evidence appeared.",
+            "Treat as pre-Cargo infrastructure failure and rerun or resume through RCH with retained artifacts.",
+        )
+    } else if reason.contains("queue_timeout")
         || reason.contains("timeout_before_assignment")
         || (reason.contains("timeout") && evidence.selected_worker.is_none())
     {
@@ -1268,10 +1286,46 @@ fn retained_rch_reason_blocker(evidence: &ProofDoctorEvidence) -> Option<ProofDo
     if evidence.sync_duration_ms.is_some() {
         blocker = blocker.with_evidence("sync_duration_ms");
     }
+    if evidence.remote_command_duration_ms.is_some() {
+        blocker = blocker.with_evidence("remote_command_duration_ms");
+    }
+    if evidence.wrapper_exit_code.is_some() {
+        blocker = blocker.with_evidence("wrapper_exit_code");
+    }
+    if evidence.remote_exit_code.is_some() {
+        blocker = blocker.with_evidence("remote_exit_code");
+    }
+    if evidence.timed_out {
+        blocker = blocker.with_evidence("timed_out");
+    }
+    if evidence.remote_cargo_reached {
+        blocker = blocker.with_evidence("remote_cargo_reached");
+    }
+    if evidence.rustc_reached {
+        blocker = blocker.with_evidence("rustc_reached");
+    }
+    if evidence.test_binary_started {
+        blocker = blocker.with_evidence("test_binary_started");
+    }
     if !evidence.artifact_paths.is_empty() {
         blocker = blocker.with_evidence("artifact_paths");
     }
     Some(blocker)
+}
+
+fn retained_ssh_timeout_reason(reason: &str, detail: Option<&str>) -> bool {
+    reason.contains("rch_e104")
+        || reason.contains("ssh_timeout")
+        || reason.contains("ssh_command_timeout")
+        || reason.contains("ssh_command_timed_out")
+        || reason.contains("command_timed_out")
+        || reason.contains("remote_command_timeout")
+        || detail.is_some_and(|detail| {
+            detail.contains("ssh_command_timeout")
+                || detail.contains("ssh_command_timed_out")
+                || (detail.contains("ssh")
+                    && (detail.contains("timeout") || detail.contains("timed_out")))
+        })
 }
 
 fn normalize_rch_reason(reason: &str) -> String {
@@ -1687,7 +1741,9 @@ fn projection_for(
 fn infra_projection_state(reason_code: &str) -> ProofState {
     if matches!(
         reason_code,
-        "proof.rch.dep_info_lost_after_cargo_started" | "proof.rch.post_cargo_substrate_failure"
+        "proof.rch.dep_info_lost_after_cargo_started"
+            | "proof.rch.post_cargo_ssh_timeout"
+            | "proof.rch.post_cargo_substrate_failure"
     ) {
         ProofState::InfraBlockedPostCargo
     } else {
@@ -2815,6 +2871,100 @@ mod tests {
                 .as_ref()
                 .map(|projection| projection.state),
             Some(ProofState::InfraBlockedPostCargo)
+        );
+    }
+
+    #[test]
+    fn retained_rch_meta_post_cargo_ssh_timeout_stays_infra_not_source() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::TerminalClassified;
+        merge_proof_doctor_artifact_json(
+            &mut input.evidence,
+            "tests/e2e/artifacts/demo/cargo.log.rch_meta.json",
+            &serde_json::json!({
+                "selected_worker": "vmi1153651",
+                "sync_duration_ms": 176008,
+                "remote_duration_ms": 1800000,
+                "remote_cargo_reached": true,
+                "remote_rustc_reached": true,
+                "timed_out": true,
+                "wrapper_exit_code": 1,
+                "failure_reason_code": "RCH-E104",
+                "failure_reason_detail": "SSH command timed out after 1800s"
+            }),
+        );
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::InfraBlocked);
+        assert_ne!(verdict.status, ProofDoctorStatus::SourceBlocked);
+        assert_eq!(
+            verdict.blockers[0].blocker_kind,
+            ProofDoctorBlockerKind::RemoteSubstrate
+        );
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.rch.post_cargo_ssh_timeout"
+        );
+        assert!(verdict.evidence.timed_out);
+        assert!(verdict.evidence.remote_cargo_reached);
+        assert_eq!(verdict.evidence.remote_command_duration_ms, Some(1_800_000));
+        assert!(
+            verdict.blockers[0]
+                .evidence_keys
+                .iter()
+                .any(|key| key == "remote_cargo_reached")
+        );
+        assert!(
+            verdict.blockers[0]
+                .evidence_keys
+                .iter()
+                .any(|key| key == "timed_out")
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::InfraBlockedPostCargo)
+        );
+    }
+
+    #[test]
+    fn retained_rch_meta_pre_cargo_ssh_timeout_is_infra_blocked() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::TerminalClassified;
+        merge_proof_doctor_artifact_json(
+            &mut input.evidence,
+            "tests/e2e/artifacts/demo/cargo.log.rch_meta.json",
+            &serde_json::json!({
+                "selected_worker": "vmi1153651",
+                "sync_duration_ms": 176008,
+                "timed_out": true,
+                "wrapper_exit_code": 1,
+                "failure_reason_code": "RCH-E104",
+                "failure_reason_detail": "SSH command timed out before Cargo started"
+            }),
+        );
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::InfraBlocked);
+        assert_eq!(
+            verdict.blockers[0].blocker_kind,
+            ProofDoctorBlockerKind::RemoteLaunch
+        );
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.rch.pre_cargo_ssh_timeout"
+        );
+        assert!(!verdict.evidence.remote_cargo_reached);
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::InfraBlockedPreCargo)
         );
     }
 
