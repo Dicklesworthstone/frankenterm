@@ -104,6 +104,19 @@ pub enum DemoScenarioManifestError {
         /// Field name.
         field: &'static str,
     },
+    /// The manifest boundary tries to claim target-class production proof.
+    #[error("demo scenario manifest proof boundary claims target-class production capacity")]
+    ProofBoundaryOverclaim,
+    /// A declared artifact hash is not lowercase SHA-256.
+    #[error("demo scenario `{scenario_id}` artifact `{artifact_id}` has invalid sha256 `{sha256}`")]
+    InvalidArtifactHash {
+        /// Scenario id.
+        scenario_id: String,
+        /// Artifact id.
+        artifact_id: String,
+        /// Rejected hash.
+        sha256: String,
+    },
 }
 
 /// Top-level manifest for bundled demo scenarios.
@@ -139,6 +152,7 @@ impl DemoScenarioManifest {
         validate_non_empty("<manifest>", "title", &self.title)?;
         validate_non_empty("<manifest>", "proof_boundary", &self.proof_boundary)?;
         reject_secret_shaped_text("<manifest>", "proof_boundary", &self.proof_boundary)?;
+        reject_target_class_overclaim(&self.proof_boundary)?;
 
         if self.scenarios.is_empty() {
             return Err(DemoScenarioManifestError::EmptyManifest);
@@ -309,6 +323,9 @@ pub struct DemoScenarioArtifact {
     /// Whether the artifact must carry or cite a content hash.
     #[serde(default)]
     pub content_hash_required: bool,
+    /// Optional pinned lowercase SHA-256 for committed artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 impl DemoScenarioArtifact {
@@ -318,6 +335,9 @@ impl DemoScenarioArtifact {
         validate_scenario_id(&self.id)?;
         validate_relative_path(scenario_id, "artifact.path", &self.path)?;
         validate_artifact_budget(scenario_id, &self.id, self.max_bytes)?;
+        if let Some(sha256) = &self.sha256 {
+            validate_sha256(scenario_id, &self.id, sha256)?;
+        }
         reject_secret_shaped_text(scenario_id, "artifact.id", &self.id)?;
         reject_secret_shaped_text(scenario_id, "artifact.path", &self.path)
     }
@@ -507,16 +527,57 @@ fn reject_secret_shaped_text(
     Ok(())
 }
 
+fn reject_target_class_overclaim(value: &str) -> Result<(), DemoScenarioManifestError> {
+    let lower = value.to_ascii_lowercase();
+    let mentions_target_class = lower.contains("target-class")
+        || lower.contains("200+ pane")
+        || lower.contains("64-core")
+        || lower.contains("256 gib")
+        || lower.contains("production capacity");
+    let clearly_negated = lower.contains("not target-class")
+        || lower.contains("not evidence")
+        || lower.contains("not be used")
+        || lower.contains("must not")
+        || lower.contains("do not");
+    if mentions_target_class && !clearly_negated {
+        return Err(DemoScenarioManifestError::ProofBoundaryOverclaim);
+    }
+    Ok(())
+}
+
+fn validate_sha256(
+    scenario_id: &str,
+    artifact_id: &str,
+    sha256: &str,
+) -> Result<(), DemoScenarioManifestError> {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DemoScenarioManifestError::InvalidArtifactHash {
+            scenario_id: scenario_id.to_string(),
+            artifact_id: artifact_id.to_string(),
+            sha256: sha256.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const FIXTURE_MANIFEST: &str = include_str!("../../../fixtures/demo-lab/manifest.v1.json");
 
+    fn fixture_manifest() -> DemoScenarioManifest {
+        DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
+            .expect("demo manifest fixture should validate")
+    }
+
     #[test]
     fn bundled_demo_manifest_fixture_validates() {
-        let manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let manifest = fixture_manifest();
         let ids = manifest
             .scenarios
             .iter()
@@ -527,8 +588,7 @@ mod tests {
 
     #[test]
     fn demo_manifest_fixture_is_toon_compatible() {
-        let manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let manifest = fixture_manifest();
         let value = serde_json::to_value(manifest).expect("manifest serializes");
         let toon = toon_rust::encode(value.clone(), None);
         let decoded = toon_rust::try_decode(&toon, None).expect("manifest TOON decodes");
@@ -540,9 +600,56 @@ mod tests {
     }
 
     #[test]
+    fn manifest_fixture_retains_pinned_sha256_fields() {
+        let manifest = fixture_manifest();
+        assert_eq!(
+            manifest.scenarios[0].expected_artifacts[1]
+                .sha256
+                .as_deref(),
+            Some("7f33c947552bbecf774a3172200b44fd9e014c0a1b7365e37bbea04a9b1c845b")
+        );
+    }
+
+    #[test]
+    fn unsupported_schema_version_fails_closed() {
+        let mut manifest = fixture_manifest();
+        manifest.schema_version = "ft.demo.scenario-manifest.v2".to_string();
+        assert!(matches!(
+            manifest.validate(),
+            Err(DemoScenarioManifestError::UnsupportedSchemaVersion(version))
+                if version == "ft.demo.scenario-manifest.v2"
+        ));
+    }
+
+    #[test]
+    fn missing_required_json_field_fails_closed() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(FIXTURE_MANIFEST).expect("fixture parses as JSON");
+        value
+            .as_object_mut()
+            .expect("manifest root is an object")
+            .remove("title");
+        assert!(matches!(
+            DemoScenarioManifest::from_json(&value.to_string()),
+            Err(DemoScenarioManifestError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn target_class_proof_boundary_overclaim_fails_closed() {
+        let mut manifest = fixture_manifest();
+        manifest.proof_boundary =
+            "Demo fixtures prove target-class 200+ panes on 64-core / 256 GiB operators."
+                .to_string();
+        assert!(matches!(
+            manifest.validate(),
+            Err(DemoScenarioManifestError::ProofBoundaryOverclaim)
+        ));
+    }
+
+    #[test]
     fn duplicate_ids_fail_closed() {
-        let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let mut manifest = fixture_manifest();
         manifest.scenarios[1].id = manifest.scenarios[0].id.clone();
         assert!(matches!(
             manifest.validate(),
@@ -552,8 +659,7 @@ mod tests {
 
     #[test]
     fn path_traversal_fails_closed() {
-        let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let mut manifest = fixture_manifest();
         manifest.scenarios[0].scenario_path = "../secret.yaml".to_string();
         assert!(matches!(
             manifest.validate(),
@@ -564,8 +670,7 @@ mod tests {
 
     #[test]
     fn platform_specific_paths_fail_closed() {
-        let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let mut manifest = fixture_manifest();
         manifest.scenarios[0].scenario_path = r"C:\secret.yaml".to_string();
         assert!(matches!(
             manifest.validate(),
@@ -576,8 +681,7 @@ mod tests {
 
     #[test]
     fn missing_required_degradation_reason_fails_closed() {
-        let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let mut manifest = fixture_manifest();
         manifest.scenarios[0]
             .degradation
             .retain(|entry| entry.reason != DemoScenarioDegradationReason::RchProofUnavailable);
@@ -591,8 +695,7 @@ mod tests {
 
     #[test]
     fn secret_shaped_text_fails_closed() {
-        let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let mut manifest = fixture_manifest();
         manifest.scenarios[0].purpose = "prove redaction with bearer token".to_string();
         assert!(matches!(
             manifest.validate(),
@@ -603,14 +706,29 @@ mod tests {
 
     #[test]
     fn oversized_artifact_budget_fails_closed() {
-        let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
-            .expect("demo manifest fixture should validate");
+        let mut manifest = fixture_manifest();
         manifest.scenarios[0].expected_artifacts[0].max_bytes =
             DEMO_SCENARIO_MAX_ARTIFACT_BYTES + 1;
         assert!(matches!(
             manifest.validate(),
             Err(DemoScenarioManifestError::InvalidArtifactBudget { scenario_id, artifact_id, .. })
                 if scenario_id == "quickstart" && artifact_id == "manifest"
+        ));
+    }
+
+    #[test]
+    fn malformed_artifact_hash_fails_closed() {
+        let mut manifest = fixture_manifest();
+        manifest.scenarios[0].expected_artifacts[1].sha256 = Some("ABC123".to_string());
+        assert!(matches!(
+            manifest.validate(),
+            Err(DemoScenarioManifestError::InvalidArtifactHash {
+                scenario_id,
+                artifact_id,
+                sha256
+            }) if scenario_id == "quickstart"
+                && artifact_id == "scenario_yaml"
+                && sha256 == "ABC123"
         ));
     }
 }
