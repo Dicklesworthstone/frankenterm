@@ -488,10 +488,10 @@ fn synthetic_robot_success_envelope_with_error_fields_must_fail() {
 }
 
 #[test]
-fn synthetic_robot_error_envelope_with_data_must_fail() {
+fn synthetic_robot_error_envelope_with_diagnostic_data_validates() {
     let schema = load_envelope_schema();
 
-    let broken = serde_json::json!({
+    let envelope = serde_json::json!({
         "ok": false,
         "data": { "pane_id": 7 },
         "error": "storage unavailable",
@@ -501,11 +501,27 @@ fn synthetic_robot_error_envelope_with_data_must_fail() {
         "now": 1_700_000_000_000_u64,
     });
 
-    let result = schema.validate(&broken);
-    assert!(
-        result.is_err(),
-        "validator MUST reject robot ok=false envelopes that also carry data"
-    );
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("robot error diagnostic data", errors));
+}
+
+#[test]
+fn synthetic_robot_envelope_with_schema_version_validates() {
+    let schema = load_envelope_schema();
+
+    let envelope = serde_json::json!({
+        "ok": true,
+        "data": { "pane_id": 7 },
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "schema_version": 1,
+    });
+
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("robot schema_version", errors));
 }
 
 #[test]

@@ -2,17 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-envelope.json",
   "title": "WA Robot Response Envelope",
-  "description": "Standard JSON envelope for all wa robot mode responses. Every robot command returns this structure with command-specific data in the 'data' field.",
+  "description": "Standard JSON envelope for all wa robot mode responses. Every robot command returns this structure with command-specific data in the 'data' field on success and optional diagnostic data on failure.",
   "type": "object",
   "required": ["ok", "elapsed_ms", "version", "now"],
   "additionalProperties": false,
   "properties": {
     "ok": {
       "type": "boolean",
-      "description": "Whether the command succeeded. When true, 'data' contains the result. When false, 'error' and 'error_code' describe the failure."
+      "description": "Whether the command succeeded. When true, 'data' contains the result. When false, 'error' and 'error_code' describe the failure and 'data' may contain structured diagnostic context."
     },
     "data": {
-      "description": "Command-specific response data. Present when ok=true. Type depends on the specific command."
+      "description": "Command-specific response data when ok=true, or structured diagnostic context when ok=false. Type depends on the specific command."
     },
     "error": {
       "type": "string",
@@ -44,6 +44,11 @@
       "minimum": 0,
       "description": "Unix timestamp in milliseconds when the response was generated."
     },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Robot envelope schema version. Current emitters include this field; old fixtures may omit it and should be interpreted as version 1."
+    },
     "mcp_version": {
       "type": "string",
       "description": "Optional MCP-compatible envelope version emitted by robot fixtures that are also consumed through MCP surfaces.",
@@ -64,10 +69,7 @@
     }
   },
   "else": {
-    "required": ["error", "error_code"],
-    "not": {
-      "required": ["data"]
-    }
+    "required": ["error", "error_code"]
   },
   "$defs": {
     "error_codes": {
