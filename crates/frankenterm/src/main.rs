@@ -21270,10 +21270,21 @@ async fn distributed_persist_payload(
                     return Ok(());
                 }
 
+                // FND-004 / INV-RED-1: redact distributed pane content at the
+                // aggregator ingest choke point, mirroring the local capture path
+                // (frankenterm-core ingest.rs:1680 `redact_segment_for_persist`).
+                // Without this, remote pane content was persisted RAW into
+                // `output_segments` — a fail-closed redaction violation at the
+                // storage layer (an unredacted DB export or any direct-segment read
+                // would leak secrets, even though the standard read APIs redact at
+                // output). Redaction is idempotent, so the read-path redactors that
+                // run later are unaffected.
+                let redacted_content =
+                    frankenterm_core::redactor::Redactor::new().redact(&delta.content);
                 let segment = storage_handle
                     .append_segment(
                         remote_pane_id,
-                        &delta.content,
+                        &redacted_content,
                         Some(format!(
                             "remote_sender={canonical_sender};remote_seq={}",
                             delta.seq
@@ -50308,7 +50319,19 @@ async fn handle_session_command(
 
             let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
             let mux_timeout_seconds = config.cli.timeout_seconds.max(1);
+            tracing::info!(
+                pane_uuid = %pane_uuid,
+                records = replay_plan.records_read,
+                chunks = replay_plan.chunks.len(),
+                timeout_seconds = mux_timeout_seconds,
+                "starting scrollback orphan recovery replay"
+            );
             let pane_id = session_recovery_create_pane(&wezterm, mux_timeout_seconds).await?;
+            tracing::info!(
+                pane_uuid = %pane_uuid,
+                pane_id,
+                "created recovery pane for scrollback replay"
+            );
 
             let mut chunks_sent = 0usize;
             for chunk in &replay_plan.chunks {
@@ -50327,6 +50350,12 @@ async fn handle_session_command(
                     })?;
                 chunks_sent += 1;
             }
+            tracing::info!(
+                pane_uuid = %pane_uuid,
+                pane_id,
+                chunks_sent,
+                "completed scrollback orphan replay"
+            );
 
             let payload = serde_json::json!({
                 "ok": true,
@@ -50685,14 +50714,25 @@ async fn session_recovery_create_pane(
     timeout_seconds: u64,
 ) -> anyhow::Result<u64> {
     let cx = session_recovery_deadline_cx(timeout_seconds);
+    tracing::info!(
+        timeout_seconds,
+        "listing live mux panes before recovery replay"
+    );
     let panes = wezterm
         .list_panes_with_cx(&cx)
         .await
         .map_err(|err| anyhow::anyhow!("Failed to list live panes before recovery spawn: {err}"))?;
-    let source_pane_id = panes.first().map(|pane| pane.pane_id).ok_or_else(|| {
-        anyhow::anyhow!("Failed to create recovery pane: no live mux window found")
-    })?;
+    let source_pane_id = panes
+        .first()
+        .map(|pane| pane.pane_id)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create recovery pane: no live mux pane found"))?;
 
+    tracing::info!(
+        source_pane_id,
+        live_panes = panes.len(),
+        timeout_seconds,
+        "splitting live mux pane for recovery replay"
+    );
     wezterm
         .split_pane_with_cx(
             &cx,
