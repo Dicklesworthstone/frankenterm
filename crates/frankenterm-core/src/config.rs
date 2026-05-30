@@ -2678,6 +2678,54 @@ impl PolicyRuleMatch {
     }
 }
 
+impl PolicyRule {
+    /// Validate a single custom policy rule at config-load time.
+    ///
+    /// Mirrors the validation other config rule-lists already get
+    /// (`PaneFilterRule`/`PanePriorityConfig`): a non-empty id for audit
+    /// integrity, and that every `command_patterns` entry compiles as a
+    /// `regex::Regex` — the exact constructor the evaluator uses
+    /// (`policy_dsl::match_regex` does `regex::Regex::new(p).map(..).unwrap_or(false)`).
+    /// Without this, a typo'd command pattern loads silently and then *never
+    /// matches* at evaluation time, so the operator's intended
+    /// allow/deny/require_approval rule is silently inert. A catch-all rule
+    /// (all-empty `match_on`) is intentional (see `is_catch_all`) and NOT
+    /// rejected; `pane_titles`/`pane_cwds` are globs, not regexes, so they are
+    /// not regex-validated here.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("Policy rule id cannot be empty".to_string());
+        }
+        for pattern in &self.match_on.command_patterns {
+            if regex::Regex::new(pattern).is_err() {
+                return Err(format!(
+                    "Policy rule '{}' has an invalid command_patterns regex: {pattern}",
+                    self.id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PolicyRulesConfig {
+    /// Validate the custom policy rule-set at config-load time: every rule
+    /// individually valid, and rule ids unique (duplicate ids defeat the
+    /// audit/debugging purpose the `id` field documents, mirroring the
+    /// duplicate-id rejection `PanePriorityConfig`/`PaneFilterConfig` already
+    /// enforce). An empty rule-set is valid (the default).
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for rule in &self.rules {
+            rule.validate()?;
+            if !seen.insert(rule.id.clone()) {
+                return Err(format!("Duplicate policy rule id: {}", rule.id));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Decision for a policy rule
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4742,6 +4790,17 @@ impl Config {
             .validate_into_result()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
+        // Bring custom policy rules into the same load-time validation regime as
+        // every sibling rule-list (pane filters, priorities, smart-selection):
+        // surface an invalid `command_patterns` regex or a duplicate/empty rule
+        // id now, instead of letting the rule load and then silently never-match
+        // at evaluation time (the evaluator compiles command regexes with
+        // `regex::Regex::new(..).unwrap_or(false)`).
+        self.safety
+            .rules
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
         let tuning_errors = self.tuning.validate();
         if !tuning_errors.is_empty() {
             return Err(
@@ -5645,6 +5704,90 @@ db_path = "/tmp/attacker.db"
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("search.quality_weight"));
+    }
+
+    fn policy_rule(id: &str, command_patterns: Vec<String>) -> PolicyRule {
+        PolicyRule {
+            id: id.to_string(),
+            description: None,
+            priority: default_priority(),
+            match_on: PolicyRuleMatch {
+                command_patterns,
+                ..PolicyRuleMatch::default()
+            },
+            decision: PolicyRuleDecision::Deny,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_policy_rule_invalid_command_regex() {
+        // A typo'd command_patterns regex must be surfaced at config-load time
+        // rather than loading silently and never-matching at evaluation time.
+        let mut config = Config::default();
+        config
+            .safety
+            .rules
+            .rules
+            .push(policy_rule("bad-regex", vec!["[invalid".to_string()]));
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("invalid command_patterns regex"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_policy_rule_id() {
+        let mut config = Config::default();
+        config
+            .safety
+            .rules
+            .rules
+            .push(policy_rule("   ", Vec::new()));
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("Policy rule id cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_policy_rule_ids() {
+        let mut config = Config::default();
+        config
+            .safety
+            .rules
+            .rules
+            .push(policy_rule("dup", Vec::new()));
+        config
+            .safety
+            .rules
+            .rules
+            .push(policy_rule("dup", Vec::new()));
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("Duplicate policy rule id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_valid_policy_rules_including_catch_all() {
+        // A valid command regex AND an intentional catch-all (empty match_on)
+        // both pass: catch-all is a documented first-class concept, not an error.
+        let mut config = Config::default();
+        config
+            .safety
+            .rules
+            .rules
+            .push(policy_rule("deny-rm-rf", vec![r"^rm\s+-rf".to_string()]));
+        config
+            .safety
+            .rules
+            .rules
+            .push(policy_rule("catch-all", Vec::new()));
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
     }
 
     #[test]
