@@ -559,21 +559,24 @@ fn basic_output() {
     assert_visible_contents(&term, file!(), line!(), &["", " hello, wo", "rld!", "", ""]);
 
     term.erase_in_display(EraseInDisplay::EraseToStartOfDisplay);
-    assert_visible_contents(
-        &term,
-        file!(),
-        line!(),
-        &["", "          ", "     ", "", ""],
-    );
+    // ft divergence (ft-3q4r2 / 9ed3073d2): erasing with the default pen fills
+    // cells with default blanks, and `prune_trailing_blanks` now collapses an
+    // all-default-blank line to zero stored cells, so a fully-erased line renders
+    // as "" via `as_str` rather than as materialized spaces. (Visually identical
+    // in the GUI, which pads to width; cleaner for text capture / scrollback.)
+    assert_visible_contents(&term, file!(), line!(), &["", "", "", "", ""]);
 
     term.cup(0, 2);
     term.print("woot");
     term.cup(2, 2);
     term.erase_in_line(EraseInLine::EraseToEndOfLine);
-    assert_visible_contents(&term, file!(), line!(), &["", "          ", "wo", "", ""]);
+    assert_visible_contents(&term, file!(), line!(), &["", "", "wo", "", ""]);
 
     term.erase_in_line(EraseInLine::EraseToStartOfLine);
-    assert_visible_contents(&term, file!(), line!(), &["", "          ", "   ", "", ""]);
+    // Same ft-3q4r2 prune divergence: the erased cells are default blanks, so
+    // both the previously-cleared line 1 and the just-cleared prefix of line 2
+    // collapse to empty rather than rendering as spaces.
+    assert_visible_contents(&term, file!(), line!(), &["", "", "", "", ""]);
 }
 
 #[test]

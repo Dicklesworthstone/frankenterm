@@ -436,7 +436,10 @@ fn test_erase_scrollback_and_viewport_with_tiering_enabled() {
 
     term.erase_scrollback_and_viewport();
 
-    assert_all_contents(&term, file!(), line!(), &["a", "   ", "   "]);
+    // ft divergence (ft-3q4r2 / 9ed3073d2): the two erased viewport rows are
+    // all default blanks, which `prune_trailing_blanks` collapses to zero stored
+    // cells, so they render as "" rather than materialized spaces.
+    assert_all_contents(&term, file!(), line!(), &["a", "", ""]);
     term.print("b");
-    assert_all_contents(&term, file!(), line!(), &["ab", "   ", "   "]);
+    assert_all_contents(&term, file!(), line!(), &["ab", "", ""]);
 }
