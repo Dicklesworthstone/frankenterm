@@ -156,7 +156,62 @@ impl<'a> Performer<'a> {
                     // Ensure that White_Space shows as a space
                     print_width = 1;
                 } else {
-                    log::trace!("Eliding zero-width grapheme {:?}", g);
+                    // FND-009 / INV-TERM-2: a zero-width grapheme (combining mark,
+                    // diacritic) may continue the cluster of the cell to our left.
+                    // When the whole byte stream arrives in one `advance_bytes`
+                    // call, `Graphemes` batches base+mark into a single grapheme and
+                    // the mark renders. When the mark arrives in a SEPARATE call
+                    // (its base already committed — e.g. a PTY read split a cluster),
+                    // it reaches us standalone and was being dropped, so the same
+                    // bytes rendered differently depending on chunk boundaries
+                    // (`a` then `U+0301` -> `a` instead of `á`). Attach it to the
+                    // previous cell IFF it genuinely clusters with that cell's
+                    // grapheme AND the cluster's column width is unchanged (so we
+                    // never have to claim an adjacent cell): re-running `Graphemes`
+                    // matches whole-buffer semantics exactly, and non-clustering or
+                    // width-changing zero-width controls (BIDI format chars, VS16
+                    // emoji-presentation) are still elided as before.
+                    let x = self.cursor.x;
+                    let y = self.cursor.y;
+                    let mut attached = false;
+                    if x > 0 {
+                        // Clone the unicode version out before borrowing the screen
+                        // mutably (width math below would otherwise re-borrow self).
+                        let unicode_version = self.unicode_version.clone();
+                        let screen = self.screen_mut();
+                        let phys = screen.phys_row(y);
+                        let line = screen.line_mut(phys);
+                        let mut idx = x;
+                        while idx > 0 {
+                            idx -= 1;
+                            let info = line.get_cell(idx).map(|c| {
+                                (c.str().to_string(), c.width(), c.attrs().clone())
+                            });
+                            match info {
+                                // Wide-char continuation cell (empty); walk left to
+                                // the glyph that owns this column pair.
+                                Some((s, _w, _a)) if s.is_empty() => continue,
+                                Some((s, w, a)) => {
+                                    let combined = format!("{s}{g}");
+                                    let combined_width = grapheme_column_width(
+                                        &combined,
+                                        Some(&unicode_version),
+                                    );
+                                    if combined_width == w
+                                        && Graphemes::new(combined.as_str()).count() == 1
+                                    {
+                                        line.set_cell_grapheme(idx, &combined, w, a, seqno);
+                                        attached = true;
+                                    }
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    if !attached {
+                        log::trace!("Eliding zero-width grapheme {:?}", g);
+                    }
                     continue;
                 }
             }

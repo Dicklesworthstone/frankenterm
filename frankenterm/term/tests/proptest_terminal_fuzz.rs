@@ -918,3 +918,96 @@ fn mutation_check_serialize_screen_cells_distinguishes_content() {
         "serializer must be deterministic for identical input"
     );
 }
+
+/// INV-TERM-2 (well-formed scope) — gauntlet FND-009.
+///
+/// PINS the cell-content chunk-determinism that holds for well-formed UTF-8: base
+/// characters (precomposed accents, wide CJK, single emoji) AND width-preserving
+/// combining marks (the FND-009 fix in `terminalstate/performer.rs` attaches a
+/// cross-call zero-width combining mark to the previous cell when it genuinely
+/// clusters without changing column width). Each case is fed whole, byte-by-byte
+/// (the hardest case — the UTF-8 collector must buffer partial sequences AND the
+/// combining mark arrives standalone), and at arbitrary chunk sizes; all must
+/// yield byte-identical screen cells.
+///
+/// Remaining out of scope (see `known_limitation_*` below, GA-FND-009): width-
+/// CHANGING marks (VS16 emoji-presentation) and multi-base ZWJ emoji sequences —
+/// those need width reflow / cross-call cluster buffering and are still divergent.
+#[test]
+fn well_formed_unicode_cell_content_is_chunk_boundary_invariant() {
+    let cases: &[&str] = &[
+        "abc",                   // ascii baseline
+        "café",                  // precomposed é (single-codepoint base)
+        "a\u{0301}e\u{0301}",    // combining acute over base chars (FND-009 fix)
+        "x\u{0730}y",            // the FND-009 combining mark, on a valid base
+        "a\u{0301}\u{0323}",     // stacked combining (acute + dot below)
+        "你好世界",                // wide CJK (3-byte, width 2)
+        "日本語テスト",            // more CJK
+        "🎉🚀",                   // 4-byte emoji (base chars)
+        "mixed café 你 🎉 done",  // realistic mixed line
+    ];
+    for case in cases {
+        let bytes = case.as_bytes();
+        let mut whole = make_term(8, 40);
+        whole.advance_bytes(bytes);
+        let expected = serialize_screen_cells(&whole);
+
+        // (a) byte-by-byte — splits every multibyte char mid-sequence.
+        let mut bb = make_term(8, 40);
+        for b in bytes {
+            bb.advance_bytes([*b]);
+        }
+        assert_eq!(
+            serialize_screen_cells(&bb),
+            expected,
+            "well-formed {case:?} diverged under byte-by-byte chunking"
+        );
+
+        // (b) several arbitrary chunk sizes.
+        for &size in &[2usize, 3, 5, 7] {
+            let mut ch = make_term(8, 40);
+            let mut off = 0;
+            while off < bytes.len() {
+                let end = (off + size).min(bytes.len());
+                ch.advance_bytes(&bytes[off..end]);
+                off = end;
+            }
+            assert_eq!(
+                serialize_screen_cells(&ch),
+                expected,
+                "well-formed {case:?} diverged under chunk size {size}"
+            );
+        }
+    }
+}
+
+/// FND-009 — REMAINING known gap (documented, not yet fixed): GA-FND-009.
+///
+/// Width-preserving combining marks split across `advance_bytes` calls are now
+/// fixed (see the positive test above). Two harder cases of zero-width joiners
+/// remain divergent across chunk boundaries and need deeper work:
+///   - width-CHANGING marks (VS16 `❤\u{FE0F}` turns a width-1 cell into width-2,
+///     which would have to claim the adjacent cell — the fix deliberately only
+///     attaches when column width is unchanged);
+///   - multi-base ZWJ emoji (`👨\u{200D}👩\u{200D}👧`) → a later base must JOIN
+///     the previous cell, needing cross-call grapheme-cluster buffering.
+/// `#[ignore]`'d so the gap is recorded + runnable on demand without breaking CI;
+/// it documents (does not assert) the current divergent behavior.
+#[test]
+#[ignore = "FND-009: width-changing VS + multi-base ZWJ split across advance_bytes diverge; tracked GA-FND-009"]
+fn known_limitation_width_changing_and_zwj_chunk_divergence() {
+    for case in ["❤\u{FE0F}", "👨\u{200D}👩\u{200D}👧"] {
+        let bytes = case.as_bytes();
+        let mut whole = make_term(8, 40);
+        whole.advance_bytes(bytes);
+        let expected = serialize_screen_cells(&whole);
+
+        let mut bb = make_term(8, 40);
+        for b in bytes {
+            bb.advance_bytes([*b]);
+        }
+        // Documented current behavior: these MAY differ. We do not assert equality
+        // (that is the known gap); we just exercise the path so it stays runnable.
+        let _ = (serialize_screen_cells(&bb), expected);
+    }
+}
