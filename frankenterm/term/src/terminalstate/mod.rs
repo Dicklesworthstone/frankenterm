@@ -2533,7 +2533,7 @@ impl TerminalState {
             self.left_and_right_margins = left..next_col_saturating(right);
 
             // DECSLRM moves the cursor to column 1, line 1 of the page.
-            self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
+            self.set_cursor_position_absolute(self.left_and_right_margins.start, 0);
             log::debug!(
                 "SetLeftAndRightMargins {:?} (and move cursor to top left: {:?})",
                 self.left_and_right_margins,
@@ -2920,6 +2920,7 @@ impl TerminalState {
             let stable_row = first_stable_row + idx as StableRowIndex;
 
             for zone_range in line.semantic_zone_ranges() {
+                let zone_end_x = zone_range.range.end.saturating_sub(1) as usize;
                 let new_zone = match current_zone.as_ref() {
                     None => true,
                     Some(zone) => zone.semantic_type != zone_range.semantic_type,
@@ -2933,14 +2934,14 @@ impl TerminalState {
                     current_zone.replace(SemanticZone {
                         start_x: zone_range.range.start as usize,
                         start_y: stable_row,
-                        end_x: zone_range.range.end as usize,
+                        end_x: zone_end_x,
                         end_y: stable_row,
                         semantic_type: zone_range.semantic_type,
                     });
                 }
 
                 if let Some(zone) = current_zone.as_mut() {
-                    zone.end_x = zone_range.range.end as usize;
+                    zone.end_x = zone_end_x;
                     zone.end_y = stable_row;
                 }
             }
