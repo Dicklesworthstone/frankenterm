@@ -2403,11 +2403,14 @@ steps:
     }
 
     #[test]
-    fn matcher_validate_empty_substring_ok() {
+    fn matcher_validate_empty_substring_rejected() {
+        // An empty substring matcher matches every line (a footgun), so it is
+        // rejected at validation time (fad8b98da "reject empty workflow
+        // descriptor matchers"); the empty-regex arm rejects identically.
         let matcher = DescriptorMatcher::Substring {
             value: String::new(),
         };
-        assert!(matcher.validate(&DescriptorLimits::default()).is_ok());
+        assert!(matcher.validate(&DescriptorLimits::default()).is_err());
     }
 
     #[test]
@@ -2585,7 +2588,7 @@ name: loop_max
 steps:
   - type: loop
     id: loop1
-        count: 1000
+    count: 1000
     body:
       - type: notify
         id: inner
