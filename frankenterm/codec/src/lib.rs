@@ -50,6 +50,14 @@ use thiserror::Error;
 
 mod bounded_varbincode;
 
+/// Bounded deserialize for **untrusted** varbincode payloads. Caps container
+/// length (`MAX_CONTAINER_ITEMS`), per-container bytes (`MAX_CONTAINER_BYTES`),
+/// and the serde `size_hint` so a malicious length prefix cannot drive an
+/// unbounded `Vec::with_capacity`. Use this — not raw `varbincode::deserialize` —
+/// on any attacker-influenced input (wire frames, persisted scrollback, etc.).
+/// Wire-format-compatible with `varbincode::serialize`. (gauntlet FND-013)
+pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize;
+
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize_for_fuzz;

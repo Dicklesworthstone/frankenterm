@@ -190,7 +190,14 @@ fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
         payload
     };
 
-    varbincode::deserialize(decoded_payload.as_slice()).ok()
+    // FND-013: decode untrusted scrollback through codec's BOUNDED varbincode
+    // (caps container length/bytes + size_hint) instead of raw varbincode, so a
+    // malicious length prefix in a Line cannot drive an unbounded preallocation.
+    // The 16 MB input cap above bounds bytes; this bounds the decoded structure
+    // independently of serde-version `size_hint::cautious` behavior. Wire-format
+    // compatible with the `varbincode::serialize` on the encode side.
+    let mut reader = decoded_payload.as_slice();
+    codec::bounded_varbincode_deserialize(&mut reader).ok()
 }
 
 fn legacy_text_scrollback_line(text: &str) -> wezterm_term::Line {
