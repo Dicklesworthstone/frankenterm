@@ -96,7 +96,11 @@ fn last_col_in(range: &std::ops::Range<usize>) -> usize {
 }
 
 fn last_row_in(range: &std::ops::Range<i64>) -> i64 {
-    range.end.saturating_sub(1)
+    // Clamp to 0 so an empty range yields a valid (non-negative) row index,
+    // matching the usize sibling `last_col_in` (which saturates at 0). For all
+    // real, non-empty scroll regions `end >= 1`, so this `.max(0)` is a no-op;
+    // it only guards the degenerate empty-range edge against a negative index.
+    range.end.saturating_sub(1).max(0)
 }
 
 fn last_col_for_width(cols: usize) -> usize {
@@ -104,7 +108,10 @@ fn last_col_for_width(cols: usize) -> usize {
 }
 
 fn last_row_for_height(rows: usize) -> i64 {
-    usize_to_i64_saturating(rows).saturating_sub(1)
+    // Clamp to 0 to mirror the usize sibling `last_col_for_width`; a 0-height
+    // screen yields row 0 rather than a negative index. Real screens have
+    // `rows >= 1`, so this is a no-op outside the degenerate zero-height case.
+    usize_to_i64_saturating(rows).saturating_sub(1).max(0)
 }
 
 fn next_sequence_no(seqno: SequenceNo) -> SequenceNo {
