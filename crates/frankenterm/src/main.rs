@@ -58959,6 +58959,91 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    /// FND-004 (gauntlet): the distributed ingest path must redact pane content
+    /// BEFORE it lands in storage, so `output_segments.content` never holds a raw
+    /// secret (an unredacted DB export or any direct-segment read would otherwise
+    /// leak it, even though the higher read APIs redact at output). Plant a known
+    /// secret in a remote PaneDelta, persist it through the production
+    /// `distributed_persist_payload`, then read the stored segment via the
+    /// low-level `StorageHandle::search` (which does NOT redact at read time) and
+    /// assert the raw secret is gone + a redaction marker is present. FAILS if the
+    /// ingest-side redaction is removed.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_persist_payload_redacts_pane_content_at_ingest() {
+        run_async_test(async {
+            let (storage_handle, db_path) =
+                setup_storage("distributed_persist_payload_redact").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-secretful";
+            let source_pane_id = 23;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let marker = "DIST_REDACT_MARKER";
+            let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz012345";
+            let content = format!("{marker} leaked {secret} in remote output");
+
+            distributed_persist_payload(
+                sender,
+                None,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 0,
+                        content: content.clone(),
+                        content_len: content.len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let hits = storage_handle.search(marker).await.unwrap();
+                let seg = hits
+                    .iter()
+                    .find(|seg| seg.pane_id == remote_pane_id)
+                    .expect("planted distributed segment must be searchable by its marker");
+                assert!(
+                    !seg.content.contains(secret),
+                    "raw secret must NOT survive in stored distributed segment content: {}",
+                    seg.content
+                );
+                assert!(
+                    seg.content.contains("[REDACTED"),
+                    "expected a redaction marker in stored content: {}",
+                    seg.content
+                );
+                assert!(
+                    seg.content.contains(marker),
+                    "non-secret marker should be preserved: {}",
+                    seg.content
+                );
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_persist_payload_normalizes_sender_case_for_remote_pane_mapping() {
