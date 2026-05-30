@@ -201,11 +201,6 @@ fn test_789() {
         bits: LineBits(
             0x0,
         ),
-        appdata: Mutex {
-            data: None,
-            poisoned: false,
-            ..
-        },
     },
 ]
 "#
