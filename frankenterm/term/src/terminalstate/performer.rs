@@ -330,7 +330,19 @@ impl<'a> Performer<'a> {
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
             Action::Esc(esc) => self.esc_dispatch(esc),
             Action::CSI(csi) => self.csi_dispatch(csi),
-            Action::Sixel(sixel) => self.sixel(sixel),
+            Action::Sixel(sixel) => {
+                // FND-017: a sixel renders an image at the current cursor, so any
+                // buffered text must be committed (and the cursor advanced) first
+                // — exactly as the KittyImage arm below already does. Without this
+                // flush, a preceding `Print` still sitting in `self.print` leaves
+                // the cursor un-advanced, the sixel lands on the wrong column, and
+                // the same bytes render differently depending on how they were
+                // chunked across `advance_bytes` calls (the print buffer is flushed
+                // at each call boundary by the Performer's Drop). Flushing here
+                // makes sixel placement chunk-boundary-invariant.
+                self.flush_print();
+                self.sixel(sixel)
+            }
             Action::XtGetTcap(names) => self.xt_get_tcap(names),
             Action::KittyImage(img) => {
                 self.flush_print();

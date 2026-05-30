@@ -1011,19 +1011,24 @@ fn known_limitation_width_changing_and_zwj_chunk_divergence() {
     }
 }
 
-/// GA-FND-017 — REMAINING known gap (documented, not yet fixed): DCS-sequence cell
-/// content is not chunk-boundary-deterministic. A 20k-case soak of the
-/// complete-escape chunk-determinism test (after FND-008 added cell content to the
-/// comparison) found that `" "` followed by a DCS sequence (`ESC P q a ESC \`)
-/// renders as `"  "` (two cells) when delivered byte-by-byte but `" "` (one cell)
-/// when delivered whole. cursor + scrollback + pty-responses still match; only the
-/// rendered cells differ. Root cause is in the vendored DCS/parser handling (like
-/// FND-009, an upstream-shared parser-state issue across `advance_bytes`
-/// boundaries). `#[ignore]`'d so the gap is recorded + runnable on demand without
-/// flaking CI; it documents (does not assert) the current divergent behavior.
+/// FND-017 (FIXED) — DCS/sixel cell content is chunk-boundary-invariant.
+///
+/// A 20k-case soak of the complete-escape chunk-determinism test (after FND-008
+/// added cell content to the comparison) found that `" "` followed by a sixel
+/// DCS (`ESC P q a ESC \`) rendered as `"  "` byte-by-byte but `" "` whole.
+/// Root cause was NOT the vendored parser: vtparse's `parse` is literally
+/// `for b in bytes { parse_byte(b) }`, so the `Action` stream is identical
+/// either way. The divergence was in ft's own `terminalstate::performer`: the
+/// `Sixel` dispatch arm rendered the image WITHOUT first flushing the pending
+/// `print` buffer, so a preceding `Print(' ')` left the cursor un-advanced and
+/// the sixel landed on column 0. Because the print buffer is flushed at every
+/// `advance_bytes` call boundary (Performer `Drop`), whole vs split delivery
+/// diverged. Fixed by flushing before the sixel — mirroring the `KittyImage`
+/// arm — so the sixel placement is now chunk-invariant (and byte-by-byte, the
+/// previously-correct path, is preserved). This asserts equality as the
+/// regression gate.
 #[test]
-#[ignore = "GA-FND-017: DCS-sequence cell content diverges across advance_bytes boundaries"]
-fn known_limitation_dcs_cell_content_chunk_divergence() {
+fn fnd_017_dcs_sixel_cell_content_is_chunk_boundary_invariant() {
     let payload: &[u8] = &[0x20, 0x1B, b'P', b'q', b'a', 0x1B, 0x5C]; // " " + DCS q a ST
     let mut whole = make_term(4, 8);
     whole.advance_bytes(payload);
@@ -1033,7 +1038,9 @@ fn known_limitation_dcs_cell_content_chunk_divergence() {
     for b in payload {
         bb.advance_bytes([*b]);
     }
-    // Documented current behavior: these MAY differ (the known gap). Exercise the
-    // path so it stays runnable; do not assert equality.
-    let _ = (serialize_screen_cells(&bb), expected);
+    assert_eq!(
+        serialize_screen_cells(&bb),
+        expected,
+        "FND-017: sixel cell content must be identical whole vs byte-by-byte"
+    );
 }
