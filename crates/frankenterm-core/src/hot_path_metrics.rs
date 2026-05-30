@@ -121,7 +121,7 @@ mod disabled {
 
     impl HotPathTimer {
         /// No-op when the `hot-path-metrics` feature is disabled.
-        #[inline(always)]
+        #[inline]
         pub fn start(_name: &'static str) -> Self {
             Self
         }
@@ -132,7 +132,7 @@ mod disabled {
     // `clippy::no_effect_underscore_binding` quiet under `-D warnings`). The drop
     // glue is empty and is elided in optimized builds — still zero cost.
     impl Drop for HotPathTimer {
-        #[inline(always)]
+        #[inline]
         fn drop(&mut self) {}
     }
 }

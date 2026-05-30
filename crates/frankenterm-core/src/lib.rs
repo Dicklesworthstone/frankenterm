@@ -312,11 +312,11 @@ pub mod handoff_capsule_inspect;
 pub mod hardware_profile;
 pub mod headless_mux_server;
 // `hyperloglog` extracted to `frankenterm-core-telemetry-types`.
+pub mod hot_path_metrics;
 pub mod identity_graph;
 pub mod ime_caret;
 pub mod incident_autopsy;
 pub mod incident_bundle;
-pub mod hot_path_metrics;
 pub mod ingest;
 pub mod input_latency;
 pub mod input_priority;

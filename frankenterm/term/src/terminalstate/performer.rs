@@ -184,19 +184,17 @@ impl<'a> Performer<'a> {
                         let mut idx = x;
                         while idx > 0 {
                             idx -= 1;
-                            let info = line.get_cell(idx).map(|c| {
-                                (c.str().to_string(), c.width(), c.attrs().clone())
-                            });
+                            let info = line
+                                .get_cell(idx)
+                                .map(|c| (c.str().to_string(), c.width(), c.attrs().clone()));
                             match info {
                                 // Wide-char continuation cell (empty); walk left to
                                 // the glyph that owns this column pair.
                                 Some((s, _w, _a)) if s.is_empty() => continue,
                                 Some((s, w, a)) => {
                                     let combined = format!("{s}{g}");
-                                    let combined_width = grapheme_column_width(
-                                        &combined,
-                                        Some(&unicode_version),
-                                    );
+                                    let combined_width =
+                                        grapheme_column_width(&combined, Some(&unicode_version));
                                     if combined_width == w
                                         && Graphemes::new(combined.as_str()).count() == 1
                                     {

@@ -33,7 +33,10 @@ fn hot_path_timers_record_self_time_and_reset_clears() {
         .get("ingest.extract_delta")
         .expect("extract_delta frame must be recorded");
     assert!(delta.count >= 3, "extract_delta count was {}", delta.count);
-    assert!(delta.total_nanos > 0, "extract_delta total_nanos must be > 0");
+    assert!(
+        delta.total_nanos > 0,
+        "extract_delta total_nanos must be > 0"
+    );
     // max is the largest single sample; it can never be below the mean.
     assert!(
         delta.max_nanos >= delta.mean_nanos(),
@@ -46,14 +49,16 @@ fn hot_path_timers_record_self_time_and_reset_clears() {
         .get("redactor.redact")
         .expect("redactor.redact frame must be recorded");
     assert!(red.count >= 2, "redactor.redact count was {}", red.count);
-    assert!(red.total_nanos > 0, "redactor.redact total_nanos must be > 0");
+    assert!(
+        red.total_nanos > 0,
+        "redactor.redact total_nanos must be > 0"
+    );
 
     // reset() clears the registry.
     reset();
     let cleared = snapshot();
     assert!(
-        !cleared.contains_key("ingest.extract_delta")
-            && !cleared.contains_key("redactor.redact"),
+        !cleared.contains_key("ingest.extract_delta") && !cleared.contains_key("redactor.redact"),
         "reset() must clear the registry, got {} frames",
         cleared.len()
     );

@@ -84,8 +84,14 @@ fn redact_detection_matches_canonical_redactor_contract() {
     let d = detection_with(raw, serde_json::json!({}));
     let r = redact_detection(&d);
     let canonical = Redactor::new().redact(raw);
-    assert_eq!(r.matched_text, canonical, "must delegate to the canonical Redactor");
-    assert_ne!(r.matched_text, raw, "delegation must be non-vacuous on a redactable input");
+    assert_eq!(
+        r.matched_text, canonical,
+        "must delegate to the canonical Redactor"
+    );
+    assert_ne!(
+        r.matched_text, raw,
+        "delegation must be non-vacuous on a redactable input"
+    );
 }
 
 #[test]

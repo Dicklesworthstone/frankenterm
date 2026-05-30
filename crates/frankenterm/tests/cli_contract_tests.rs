@@ -3075,7 +3075,7 @@ fn session_recover_replays_sigkill_orphan_into_real_mux() {
             .expect("read pre-kill linear records");
     assert!(
         pre_kill_records.iter().any(|(_, bytes)| bytes
-            .windows(payload.as_bytes().len())
+            .windows(payload.len())
             .any(|w| { w == payload.as_bytes() })),
         "writer child should sync the durable payload before SIGKILL"
     );
@@ -3140,7 +3140,7 @@ fn session_recover_replays_sigkill_orphan_into_real_mux() {
     assert_eq!(recover["scrollback_replay"]["chunks_sent"], 1);
     assert_eq!(
         recover["scrollback_replay"]["bytes_replayed"],
-        payload.as_bytes().len() as u64
+        payload.len() as u64
     );
 
     let pane_id = recover["pane_id"]

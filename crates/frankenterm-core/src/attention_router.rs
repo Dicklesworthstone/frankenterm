@@ -490,10 +490,10 @@ fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
 mod tests {
     use super::*;
 
-    fn source<'a>(
-        bundle: &'a AttentionRouterSourceBundle,
+    fn source(
+        bundle: &AttentionRouterSourceBundle,
         kind: AttentionRouterSourceKind,
-    ) -> &'a AttentionRouterSourceSnapshot {
+    ) -> &AttentionRouterSourceSnapshot {
         bundle
             .sources
             .iter()

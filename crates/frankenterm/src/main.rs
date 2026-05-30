@@ -49557,7 +49557,7 @@ async fn handle_snapshot_command(
             let engine = SnapshotEngine::new(db_path, config.snapshots.clone());
 
             // Get current pane list
-            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
             let panes = wezterm
                 .list_panes()
                 .await

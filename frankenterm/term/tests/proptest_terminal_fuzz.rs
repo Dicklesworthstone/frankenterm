@@ -939,10 +939,10 @@ fn well_formed_unicode_cell_content_is_chunk_boundary_invariant() {
         "a\u{0301}e\u{0301}",    // combining acute over base chars (FND-009 fix)
         "x\u{0730}y",            // the FND-009 combining mark, on a valid base
         "a\u{0301}\u{0323}",     // stacked combining (acute + dot below)
-        "你好世界",                // wide CJK (3-byte, width 2)
-        "日本語テスト",            // more CJK
-        "🎉🚀",                   // 4-byte emoji (base chars)
-        "mixed café 你 🎉 done",  // realistic mixed line
+        "你好世界",              // wide CJK (3-byte, width 2)
+        "日本語テスト",          // more CJK
+        "🎉🚀",                  // 4-byte emoji (base chars)
+        "mixed café 你 🎉 done", // realistic mixed line
     ];
     for case in cases {
         let bytes = case.as_bytes();
@@ -989,6 +989,7 @@ fn well_formed_unicode_cell_content_is_chunk_boundary_invariant() {
 ///     attaches when column width is unchanged);
 ///   - multi-base ZWJ emoji (`👨\u{200D}👩\u{200D}👧`) → a later base must JOIN
 ///     the previous cell, needing cross-call grapheme-cluster buffering.
+///
 /// `#[ignore]`'d so the gap is recorded + runnable on demand without breaking CI;
 /// it documents (does not assert) the current divergent behavior.
 #[test]

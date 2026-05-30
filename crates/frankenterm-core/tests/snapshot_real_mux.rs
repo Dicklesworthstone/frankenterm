@@ -142,7 +142,7 @@ fn wait_until_text_contains(
     loop {
         let client_for_poll = client.clone();
         let text = block_on_owned_mux_operation("get_text during loopback wait", async move {
-            client_for_poll.get_text(pane_id, false).await
+            Box::pin(client_for_poll.get_text(pane_id, false)).await
         });
         if text.contains(needle) {
             log(
