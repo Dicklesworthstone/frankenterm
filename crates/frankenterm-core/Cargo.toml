@@ -202,6 +202,13 @@ frankenterm-core-test-macros = { path = "../frankenterm-core-test-macros" }
 name = "aggregator_merge"
 harness = false
 
+# gauntlet FND-002 / GA-FND-002-bench: per-frame self-time of the hot loops.
+# Run with `--features hot-path-metrics` to capture the snapshot; without the
+# feature it prints a hint and exits.
+[[bench]]
+name = "hot_path_self_time"
+harness = false
+
 # br-ft-giisk substrate-pass: side-by-side rusqlite vs
 # frankensqlite backend comparison (single-writer / concurrent-
 # writer / checkpoint latency). Frankensqlite leg lights up
