@@ -7089,16 +7089,25 @@ log_level = "debug"
 
     #[test]
     fn storage_recorder_backend_toml_rejects_frankensqlite_and_legacy_alias() {
+        // `from_toml` only parses; the not-yet-implemented backend is rejected in
+        // `validate()` (StorageConfig::validate), which the production load path
+        // runs (main.rs calls `config.validate()` after `Config::load`). Parse
+        // then validate, and match the actual error text.
         let err = Config::from_toml(
             r#"
 [storage]
 recorder_backend = "frankensqlite"
 "#,
         )
+        .expect("frankensqlite backend parses")
+        .validate()
         .unwrap_err()
         .to_string();
-        assert!(err.contains("frankensqlite recorder backend is not yet implemented"));
-        assert!(err.contains("append_log"));
+        assert!(
+            err.contains("frankensqlite is not yet implemented"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("append_log"), "unexpected error: {err}");
 
         let legacy = Config::from_toml(
             r#"
@@ -7106,10 +7115,15 @@ recorder_backend = "frankensqlite"
 recorder_backend = "franken_sqlite"
 "#,
         )
+        .expect("legacy franken_sqlite alias parses")
+        .validate()
         .unwrap_err()
         .to_string();
-        assert!(legacy.contains("frankensqlite recorder backend is not yet implemented"));
-        assert!(legacy.contains("append_log"));
+        assert!(
+            legacy.contains("frankensqlite is not yet implemented"),
+            "unexpected error: {legacy}"
+        );
+        assert!(legacy.contains("append_log"), "unexpected error: {legacy}");
     }
 
     #[test]
