@@ -717,6 +717,12 @@ struct EnvelopeFacts {
     target_class_unproven: bool,
     stale_telemetry: bool,
     insufficient_proof: bool,
+    /// A REQUIRED measurement source (capacity_resource or rch) is absent
+    /// (NotCollected / Unavailable). Unlike `capacity.*`/`rch.*` reason-coded
+    /// failures, an absent source may carry no failure reason code, so without
+    /// this fact the decision would fall through to Admit — a fail-OPEN against
+    /// the documented `missing_signal_behavior = "lower_envelope"` contract.
+    required_telemetry_missing: bool,
 }
 
 impl EnvelopeFacts {
@@ -830,6 +836,20 @@ impl EnvelopeFacts {
                     "rch.remote_cargo_reached_false",
                     "local_cargo.forbidden",
                 ],
+            ),
+            // Fail-closed on ABSENT required telemetry. capacity_resource and rch
+            // are required inputs; if either is NotCollected/Unavailable we must
+            // not admit, even when the source reported no failure reason code.
+            // (agent_mail / git / target_class / stale_telemetry already guard on
+            // their source state above; this closes the same gap for capacity+rch.)
+            required_telemetry_missing: matches!(
+                input.input_domains.capacity_resource.state,
+                OperatingEnvelopeSourceState::NotCollected
+                    | OperatingEnvelopeSourceState::Unavailable
+            ) || matches!(
+                input.input_domains.rch.state,
+                OperatingEnvelopeSourceState::NotCollected
+                    | OperatingEnvelopeSourceState::Unavailable
             ),
         }
     }
@@ -977,6 +997,21 @@ fn decision_for(
             (
                 OperatingEnvelopeOutcome::Degrade,
                 OperatingEnvelopeTier::Yellow,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.required_telemetry_missing {
+            // FND/GA-FND-015: a required telemetry source (capacity_resource or
+            // rch) is absent and none of the reason-coded failure facts fired.
+            // Fail CLOSED — lower the envelope rather than admit on missing
+            // measurement (the documented `missing_signal_behavior` contract).
+            push_unique(&mut reason_codes, "fail_closed.lower_missing");
+            push_unique(&mut reason_codes, "telemetry.required_source_missing");
+            (
+                OperatingEnvelopeOutcome::Defer,
+                OperatingEnvelopeTier::Orange,
                 OperatingEnvelopeConfidence::Mixed,
                 dirty_tree_state(facts),
                 input.budgets.docs_static_checks,
@@ -1654,6 +1689,55 @@ mod tests {
             plan.decision
                 .reason_codes
                 .contains(&"target_hardware.skipped_not_proven".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_capacity_telemetry_fails_closed_not_admit() {
+        // gauntlet GA-FND-015: a REQUIRED source (capacity_resource) that is
+        // NotCollected must NOT admit — the envelope fails closed on absent
+        // telemetry even when the source carries no failure reason code. Before the
+        // fix, this fell through to Admit (Green) — a fail-OPEN.
+        let mut domains = base_domains();
+        domains.capacity_resource = source(
+            "capacity-missing",
+            OperatingEnvelopeSourceKind::CapacityResource,
+            "capacity.green",
+        )
+        .not_collected("capacity.collector_unreachable");
+        let plan = plan_with(domains);
+        assert_ne!(
+            plan.decision.outcome,
+            OperatingEnvelopeOutcome::Admit,
+            "missing capacity telemetry must NOT admit (fail-closed); outcome={:?} reasons={:?}",
+            plan.decision.outcome,
+            plan.decision.reason_codes
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"telemetry.required_source_missing".to_string()),
+            "expected telemetry.required_source_missing; got {:?}",
+            plan.decision.reason_codes
+        );
+    }
+
+    #[test]
+    fn missing_rch_telemetry_fails_closed_not_admit() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-missing",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.remote_cargo_reached_true",
+        )
+        .not_collected("rch.collector_unreachable");
+        let plan = plan_with(domains);
+        assert_ne!(
+            plan.decision.outcome,
+            OperatingEnvelopeOutcome::Admit,
+            "missing rch telemetry must NOT admit (fail-closed); outcome={:?} reasons={:?}",
+            plan.decision.outcome,
+            plan.decision.reason_codes
         );
     }
 
