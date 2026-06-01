@@ -682,6 +682,38 @@ Good backports feel like FrankenTerm-native fixes with traceable upstream proven
 
 ## Installation
 
+### Via install script (curl | bash)
+
+The one-liner installs a prebuilt `ft` binary (no Rust toolchain required) and, on Apple-Silicon macOS, the **FrankenTerm.app** GUI bundle:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
+```
+
+```bash
+# Force a fresh fetch past any CDN cache:
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh?$(date +%s)" | bash
+```
+
+What it does:
+- Downloads the release asset for your platform, verifies its SHA-256 checksum (and Sigstore signature when published), and installs the `ft` CLI to `~/.local/bin` (override with `--dest DIR`, or `--system` for `/usr/local/bin`).
+- **On macOS arm64**, it also installs **FrankenTerm.app** (the GUI terminal emulator) to `/Applications` (or `~/Applications` when `/Applications` isn't writable), registers it with LaunchServices, and refreshes the Dock so an existing Dock pin resolves to the new version. It does **not** add a new Dock tile. Skip it with `--no-app`, force it with `--with-app`, relocate it with `--app-dest DIR`.
+- Falls back to a from-source build when no prebuilt asset matches your platform (Intel Mac, uncommon targets).
+
+| Flag | Effect |
+|---|---|
+| `--version vX.Y.Z` | Install a specific release (default: latest) |
+| `--dest DIR` / `--system` | CLI install location (`~/.local/bin` default; `/usr/local/bin` with sudo) |
+| `--easy-mode` | Append `~/.local/bin` to `PATH` in your shell rc files |
+| `--with-font` | Also install the bundled Pragmasevka Nerd Font |
+| `--no-app` / `--with-app` / `--app-dest DIR` | macOS GUI-app control (skip / force / relocate) |
+| `--from-source` | Build from source instead of downloading (needs Rust + git) |
+| `--offline TARBALL` | Install from a local tarball; no network |
+| `--no-verify` | Skip checksum/signature verification (testing only) |
+| `--verify` | Run `ft doctor` after install |
+
+The bundled GUI app is **ad-hoc signed** (not Developer-ID notarized). A curl/terminal-placed bundle isn't Gatekeeper-quarantined, so it launches normally; if you instead fetch the `.app` asset through a browser, clear the quarantine flag with `xattr -dr com.apple.quarantine /Applications/FrankenTerm.app` before first launch.
+
 ### Via Cargo (fastest)
 
 ```bash
