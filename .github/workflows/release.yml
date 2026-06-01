@@ -219,6 +219,42 @@ jobs:
           cd ../../../dist
           shasum -a 256 "${{ matrix.asset }}.tar.xz" > "${{ matrix.asset }}.tar.xz.sha256"
 
+      - name: Bundle + checksum macOS .app
+        if: runner.os == 'macOS'
+        # Secondary darwin asset: mirror the attestation steps' philosophy and
+        # don't let a GUI-bundle failure block the primary ft CLI release. The
+        # red step still surfaces in the Actions UI for the maintainer.
+        continue-on-error: true
+        run: |
+          # The darwin build above produced the full default-members set
+          # (frankenterm-gui + frankenterm-mux-server + ft) under
+          # target/<triple>/release. Package them into FrankenTerm.app (icon,
+          # Info.plist, bundled Pragmasevka font, ad-hoc signature) and publish
+          # the bundle as a SECOND darwin asset so the curl|bash installer can
+          # place the GUI app on macOS hosts — not just the ft CLI.
+          #
+          # NOTE: ad-hoc signed only. Developer-ID signing + notarization is a
+          # separate, credential-bearing lift; until then the installer relies
+          # on the no-quarantine local-install path (a terminal/curl-placed app
+          # is not Gatekeeper-quarantined). create-macos-bundle.sh locates the
+          # binaries at $CARGO_TARGET_DIR/release/*, so point it at the
+          # per-target dir the --target build wrote to.
+          set -euo pipefail
+          # create-macos-bundle.sh hard-fails without zstd (it unpacks the
+          # bundled Pragmasevka font payload); ensure it's present so a missing
+          # tool can't fail the whole release. brew is preinstalled on runners.
+          command -v zstd >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install zstd
+          mkdir -p dist
+          CARGO_TARGET_DIR="target/${{ matrix.target }}" \
+            scripts/create-macos-bundle.sh --skip-build --output dist-app
+          cd dist-app
+          # COPYFILE_DISABLE stops bsdtar from emitting ._* AppleDouble sidecars.
+          COPYFILE_DISABLE=1 tar -cJf \
+            "../dist/FrankenTerm-darwin-arm64.app.tar.xz" FrankenTerm.app
+          cd ../dist
+          shasum -a 256 "FrankenTerm-darwin-arm64.app.tar.xz" \
+            > "FrankenTerm-darwin-arm64.app.tar.xz.sha256"
+
       - name: Create zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
