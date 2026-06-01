@@ -15,6 +15,9 @@
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run `ft doctor` after install
 #   --with-font        Also install the bundled Pragmasevka Nerd Font
+#   --no-app           macOS: skip the FrankenTerm.app GUI bundle install
+#   --with-app         macOS: force the FrankenTerm.app GUI bundle install
+#   --app-dest DIR     macOS: install FrankenTerm.app to DIR (default /Applications)
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
@@ -24,7 +27,7 @@
 #   --help             Show this message
 #
 # Environment overrides:
-#   VERSION, OWNER, REPO, DEST, ARTIFACT_URL, CHECKSUM, CHECKSUM_URL,
+#   VERSION, OWNER, REPO, DEST, APP_DEST, ARTIFACT_URL, CHECKSUM, CHECKSUM_URL,
 #   SIGSTORE_BUNDLE_URL, COSIGN_IDENTITY_RE, COSIGN_OIDC_ISSUER,
 #   HTTP_PROXY, HTTPS_PROXY
 #
@@ -64,6 +67,16 @@ FROM_SOURCE=0
 NO_GUM=0
 NO_CHECKSUM=0
 FORCE_INSTALL=0
+# macOS GUI app (.app) install. -1 = auto (on for darwin-arm64 prebuilt
+# installs), 0 = disabled (--no-app), 1 = forced (--with-app). APP_DEST
+# overrides the install directory (default /Applications, fallback
+# ~/Applications when /Applications isn't writable). APP_ASSET is the
+# published bundle archive; APP_INSTALLED_PATH is set on success for the
+# final summary box.
+INSTALL_APP=-1
+APP_DEST="${APP_DEST:-}"
+APP_ASSET="FrankenTerm-darwin-arm64.app.tar.xz"
+APP_INSTALLED_PATH=""
 OFFLINE_TARBALL=""
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
@@ -514,6 +527,153 @@ install_pragmasevka() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# macOS GUI app (FrankenTerm.app) install
+#
+# Default-on for darwin/arm64 prebuilt installs (the published .app asset only
+# exists for that target). Downloads the signed bundle, places it in
+# /Applications (or ~/Applications without admin rights), registers it with
+# LaunchServices, and refreshes the Dock so an existing Dock pin / Spotlight /
+# Launchpad resolve to the new version. It does NOT add a new Dock tile — app
+# pinning is a user gesture, not an installer's job.
+# ───────────────────────────────────────────────────────────────────────────
+should_install_app() {
+  # Explicit opt-out always wins.
+  [ "$INSTALL_APP" -eq 0 ] && return 1
+  # GUI app is macOS-only.
+  if [ "${OS:-}" != "darwin" ]; then
+    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored: the FrankenTerm GUI app is macOS-only"
+    return 1
+  fi
+  # Only the arm64 prebuilt bundle is published.
+  if [ "${ARCH:-}" != "aarch64" ]; then
+    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored: no prebuilt FrankenTerm.app for ${OS}/${ARCH}; build it with scripts/create-macos-bundle.sh"
+    return 1
+  fi
+  # Source builds and offline mode have no published .app to fetch.
+  if [ "$FROM_SOURCE" -eq 1 ]; then
+    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored for source builds; run scripts/create-macos-bundle.sh after building"
+    return 1
+  fi
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    [ "$INSTALL_APP" -eq 1 ] && warn "--with-app ignored in --offline mode (no network for the .app asset)"
+    return 1
+  fi
+  return 0
+}
+
+install_macos_app() {
+  local app_url dest tmp_app_tar extracted_app target_app
+  app_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${APP_ASSET}"
+
+  # Destination: explicit --app-dest, else /Applications when writable, else
+  # ~/Applications (no sudo). ~/Applications is a first-class macOS app dir.
+  dest="$APP_DEST"
+  if [ -z "$dest" ]; then
+    if [ -w "/Applications" ]; then
+      dest="/Applications"
+    else
+      dest="$HOME/Applications"
+      info "/Applications not writable; installing app to $dest"
+    fi
+  fi
+  if ! mkdir -p "$dest" 2>/dev/null; then
+    warn "Could not create app destination $dest; skipping GUI app install"
+    return 0
+  fi
+
+  info "Downloading FrankenTerm.app from $app_url"
+  tmp_app_tar="$TMP/$APP_ASSET"
+  if ! run_with_spinner "Downloading $APP_ASSET" \
+      curl -fsSL --max-time 300 --retry 3 --retry-delay 2 --retry-connrefused \
+      ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$app_url" -o "$tmp_app_tar"; then
+    warn "FrankenTerm.app asset not found at $app_url; skipping GUI app install"
+    warn "(The ft CLI install above is unaffected.)"
+    return 0
+  fi
+
+  # Checksum: fail CLOSED, same posture as the ft CLI. The .app is executable
+  # code going into /Applications, so we never install it unverified. A missing
+  # sidecar or a mismatch skips the GUI app (the ft CLI install is unaffected)
+  # rather than aborting the whole installer; --no-verify is the explicit
+  # escape hatch. The release workflow always publishes the sidecar.
+  if [ "$NO_CHECKSUM" -eq 1 ]; then
+    warn "App checksum verification skipped (--no-verify)"
+  else
+    local app_sum=""
+    if curl -fsSL --max-time 30 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "${app_url}.sha256" -o "$TMP/app.sha256" 2>/dev/null; then
+      app_sum=$(awk '{print $1}' "$TMP/app.sha256")
+    fi
+    if [ -n "$app_sum" ]; then
+      verify_checksum "$tmp_app_tar" "$app_sum" || { err "FrankenTerm.app checksum failed; skipping GUI app install"; return 0; }
+    else
+      warn "Could not fetch the FrankenTerm.app checksum; skipping GUI app install"
+      warn "(Pass --no-verify to install the app without checksum verification.)"
+      return 0
+    fi
+  fi
+
+  info "Extracting FrankenTerm.app"
+  if ! tar -xf "$tmp_app_tar" -C "$TMP"; then
+    warn "Failed to extract $APP_ASSET; skipping GUI app install"
+    return 0
+  fi
+  extracted_app="$TMP/FrankenTerm.app"
+  if [ ! -d "$extracted_app" ]; then
+    extracted_app=$(find "$TMP" -maxdepth 3 -type d -name "FrankenTerm.app" 2>/dev/null | head -n 1)
+  fi
+  if [ -z "$extracted_app" ] || [ ! -d "$extracted_app" ]; then
+    warn "FrankenTerm.app not found in $APP_ASSET; skipping GUI app install"
+    return 0
+  fi
+
+  target_app="$dest/FrankenTerm.app"
+  # Replace any existing bundle. The path is pinned to '*/FrankenTerm.app', so
+  # this rm can only ever touch the bundle we manage.
+  if [ -e "$target_app" ]; then
+    if ! rm -rf "$target_app" 2>/dev/null; then
+      warn "Could not replace existing $target_app (permission?); skipping GUI app install"
+      return 0
+    fi
+  fi
+  # Guard the copy: under `set -e` an unhandled ditto/cp failure (perms, disk
+  # full) would abort the whole installer *after* the CLI was already placed.
+  if command -v ditto >/dev/null 2>&1; then
+    if ! ditto "$extracted_app" "$target_app"; then
+      warn "Failed to copy FrankenTerm.app to $target_app; skipping GUI app install"
+      return 0
+    fi
+  else
+    if ! cp -R "$extracted_app" "$target_app"; then
+      warn "Failed to copy FrankenTerm.app to $target_app; skipping GUI app install"
+      return 0
+    fi
+  fi
+
+  # A terminal/curl-placed bundle isn't Gatekeeper-quarantined, but strip the
+  # attribute defensively so a proxy/CDN that tagged the download can't force a
+  # first-launch prompt.
+  xattr -dr com.apple.quarantine "$target_app" 2>/dev/null || true
+
+  # Register with LaunchServices — the step a Finder drag-to-Applications does
+  # for free — so an existing Dock pin, Spotlight, and Launchpad resolve to the
+  # new bundle.
+  local lsreg="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+  if [ -x "$lsreg" ]; then
+    "$lsreg" -f "$target_app" >/dev/null 2>&1 || true
+  fi
+
+  # Refresh (not re-pin) the Dock so a pinned tile rebinds to the new bundle.
+  # Only when a Dock is actually running (a GUI login session); the Dock
+  # relaunches itself. Never adds a tile.
+  if pgrep -x Dock >/dev/null 2>&1; then
+    killall Dock >/dev/null 2>&1 || true
+  fi
+
+  ok "Installed FrankenTerm.app → $target_app"
+  APP_INSTALLED_PATH="$target_app"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Build-from-source fallback
 # ───────────────────────────────────────────────────────────────────────────
 ensure_rust() {
@@ -572,7 +732,8 @@ build_from_source() {
 usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode]
-                  [--verify] [--with-font] [--from-source] [--quiet]
+                  [--verify] [--with-font] [--no-app] [--with-app]
+                  [--app-dest DIR] [--from-source] [--quiet]
                   [--no-gum] [--no-verify] [--offline TARBALL] [--force]
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL]
                   [--help]
@@ -584,6 +745,9 @@ Options:
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run \`ft doctor\` after install
   --with-font        Also install the bundled Pragmasevka Nerd Font
+  --no-app           macOS: skip the FrankenTerm.app GUI bundle install
+  --with-app         macOS: force the FrankenTerm.app GUI bundle install
+  --app-dest DIR     macOS: install FrankenTerm.app to DIR (default /Applications)
   --from-source      Build from source (slow; requires Rust + git)
   --quiet, -q        Suppress non-error output
   --no-gum           Disable gum formatting even if available
@@ -596,7 +760,7 @@ Options:
   --help, -h         Show this message
 
 Environment overrides:
-  VERSION, OWNER, REPO, DEST, ARTIFACT_URL, CHECKSUM, CHECKSUM_URL,
+  VERSION, OWNER, REPO, DEST, APP_DEST, ARTIFACT_URL, CHECKSUM, CHECKSUM_URL,
   SIGSTORE_BUNDLE_URL, COSIGN_IDENTITY_RE, COSIGN_OIDC_ISSUER,
   HTTP_PROXY, HTTPS_PROXY
 EOFU
@@ -617,6 +781,9 @@ while [ $# -gt 0 ]; do
     --easy-mode) EASY=1; shift ;;
     --verify) VERIFY=1; shift ;;
     --with-font) WITH_FONT=1; shift ;;
+    --no-app) INSTALL_APP=0; shift ;;
+    --with-app) INSTALL_APP=1; shift ;;
+    --app-dest) require_option_value "$1" "${2:-}"; APP_DEST="$2"; shift 2 ;;
     --from-source) FROM_SOURCE=1; shift ;;
     --quiet|-q) QUIET=1; shift ;;
     --no-gum) NO_GUM=1; shift ;;
@@ -705,9 +872,15 @@ if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] 
     && check_installed_version "$VERSION"; then
   ok "ft $VERSION is already installed at $DEST/ft"
   info "Use --force to reinstall"
-  if [ "$WITH_FONT" -eq 1 ]; then
+  # Still honour the font / GUI-app side installs even when the CLI is current,
+  # so a re-run can add the .app to an existing CLI-only install. Decide once
+  # (should_install_app may warn under --with-app) to avoid a double call.
+  app_wanted=0
+  if should_install_app; then app_wanted=1; fi
+  if [ "$WITH_FONT" -eq 1 ] || [ "$app_wanted" -eq 1 ]; then
     TMP=$(mktemp -d)
-    install_pragmasevka
+    if [ "$WITH_FONT" -eq 1 ]; then install_pragmasevka; fi
+    if [ "$app_wanted" -eq 1 ]; then install_macos_app; fi
   fi
   exit 0
 fi
@@ -819,6 +992,10 @@ if [ "$WITH_FONT" -eq 1 ]; then
   install_pragmasevka
 fi
 
+if should_install_app; then
+  install_macos_app
+fi
+
 if [ "$VERIFY" -eq 1 ]; then
   info "Running \`ft doctor --json\` (informational; non-zero exit is OK on first install)"
   set +e
@@ -857,6 +1034,9 @@ if [ "$QUIET" -eq 0 ]; then
   if [ "$WITH_FONT" -eq 1 ]; then
     summary_lines+=("Font:     Pragmasevka NF installed")
   fi
+  if [ -n "$APP_INSTALLED_PATH" ]; then
+    summary_lines+=("GUI app:  $APP_INSTALLED_PATH")
+  fi
   summary_lines+=("")
   summary_lines+=("Quick start:")
   summary_lines+=("  ft --help               Show all subcommands")
@@ -873,6 +1053,9 @@ if [ "$QUIET" -eq 0 ]; then
       linux)  summary_lines+=("  rm -rf ${XDG_DATA_HOME:-$HOME/.local/share}/fonts/pragmasevka") ;;
       darwin) summary_lines+=("  rm -rf $HOME/Library/Fonts/pragmasevka") ;;
     esac
+  fi
+  if [ -n "$APP_INSTALLED_PATH" ]; then
+    summary_lines+=("  rm -rf $APP_INSTALLED_PATH")
   fi
   summary_lines+=("")
   summary_lines+=("Docs:     https://github.com/${OWNER}/${REPO}")
