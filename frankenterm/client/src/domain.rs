@@ -785,9 +785,34 @@ impl ClientDomain {
 
                 if let Some(local_window_id) = primary_window_id {
                     // Verify that the workspace is consistent between the local and remote
-                    // windows
-                    if let Some(window) = mux.get_window(local_window_id) {
-                        if Some(window.get_workspace()) == workspace.as_deref() {
+                    // windows.
+                    //
+                    // NB: `Mux::get_window` hands back a read guard over the shared
+                    // `windows` RwLock, while `add_tab_to_window` acquires the *write*
+                    // lock on that same RwLock. Holding the read guard across that call
+                    // self-deadlocks parking_lot's (non-reentrant) RwLock — observed as a
+                    // hang on remote-domain attach (main thread parked in
+                    // `get_window_mut` -> `lock_exclusive_slow`). Decide what to do while
+                    // the read guard is alive, then drop it *before* mutating the mux.
+                    enum PrimaryWindow {
+                        Reuse,
+                        WorkspaceMismatch,
+                        Disappeared,
+                    }
+                    let decision = match mux.get_window(local_window_id) {
+                        Some(window) => {
+                            if Some(window.get_workspace()) == workspace.as_deref() {
+                                PrimaryWindow::Reuse
+                            } else {
+                                PrimaryWindow::WorkspaceMismatch
+                            }
+                        }
+                        None => PrimaryWindow::Disappeared,
+                    };
+                    // `window` read guard is dropped here, before any write lock.
+
+                    match decision {
+                        PrimaryWindow::Reuse => {
                             // Yes! We can use this window
                             log::debug!(
                                 "adding remote window {} as tab to local window {}",
@@ -802,12 +827,14 @@ impl ClientDomain {
                             primary_window_id.take();
                             continue;
                         }
-                    } else {
-                        log::debug!(
-                            "primary local window {} disappeared during remote topology sync",
-                            local_window_id
-                        );
-                        primary_window_id.take();
+                        PrimaryWindow::WorkspaceMismatch => {}
+                        PrimaryWindow::Disappeared => {
+                            log::debug!(
+                                "primary local window {} disappeared during remote topology sync",
+                                local_window_id
+                            );
+                            primary_window_id.take();
+                        }
                     }
                 }
                 log::debug!(
