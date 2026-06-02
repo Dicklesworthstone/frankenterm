@@ -1126,4 +1126,25 @@ mod tests {
         let result = block_on(async { 7 });
         assert_eq!(result, 7);
     }
+
+    /// Counterpart to `block_on_panics_when_called_inside_dispatch_scope`:
+    /// `block_on_io` MUST be usable from the GUI main-thread spawn queue. It
+    /// spawns the future onto a runtime worker and joins, so the worker drives
+    /// the task (and its I/O) independently of the parked caller — it cannot
+    /// trip the main-thread guard and cannot self-deadlock. This is the property
+    /// that lets `PaneWriter::write` ship a keystroke to a remote pane and the
+    /// mux client reader run, both correctly, after the smol->asupersync move.
+    #[test]
+    fn block_on_io_is_safe_inside_dispatch_scope() {
+        assert!(!is_in_main_thread_dispatch());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = enter_main_thread_dispatch_scope();
+            block_on_io(async { 21 + 21 })
+        }));
+        assert_eq!(
+            result.expect("block_on_io must not panic inside a main-thread dispatch scope"),
+            42,
+        );
+        assert!(!is_in_main_thread_dispatch());
+    }
 }

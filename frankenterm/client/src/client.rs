@@ -2068,6 +2068,19 @@ mod tests {
     /// the reader as a scheduler-managed task via `block_on_io`. This test
     /// drives the REAL `client_thread` against a server that delays its reply,
     /// so it hangs (watchdog-killed) on regression and completes on success.
+    /// Regression guard for the connect hang (#1). The mux reader must receive
+    /// socket-readiness wakeups even when the server reply arrives AFTER it
+    /// parks (any real, latency-bearing connection). `client_thread` runs the
+    /// reader via `block_on_io` (a scheduler-managed, reactor-driven task);
+    /// before that it was a directly-polled `block_on` future, which asupersync
+    /// never delivers fd readiness to, so a delayed reply hung forever.
+    ///
+    /// NB: this is deliberately a *real fd* test (UDS + a wall-clock watchdog),
+    /// NOT an asupersync `LabRuntime` test. LabRuntime models logical concurrency
+    /// / scheduling (DPOR) for simulated tasks; it does not model the OS fd
+    /// reactor whose readiness delivery is the actual bug here, so a LabRuntime
+    /// test would prove nothing about this regression. The watchdog converts a
+    /// hang into a fast, explicit failure.
     #[cfg(unix)]
     #[test]
     fn reader_receives_delayed_handshake_reply_ft_connect_fix() {
@@ -2166,6 +2179,122 @@ mod tests {
             .join()
             .expect("server thread should join")
             .expect("server handshake loop should succeed");
+    }
+
+    /// Regression guard for the remote-pane write path (#4). `PaneWriter::write`
+    /// is a sync `std::io::Write` impl invoked on the GUI main-thread spawn queue
+    /// when the user types into a remote pane; it drives the WriteToPane mux RPC
+    /// via `block_on_io`. Pre-fix it used `block_on`, which panics under the
+    /// main-thread dispatch scope. This test runs that exact pattern —
+    /// `block_on_io(client.write_to_pane(..))` inside
+    /// `enter_main_thread_dispatch_scope()` — against the real reader + a server
+    /// that answers WriteToPane, and asserts it completes (no panic, no hang).
+    #[cfg(unix)]
+    #[test]
+    fn main_thread_pane_write_round_trips_ft_connect_fix() {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(12));
+            eprintln!("WATCHDOG: main-thread pane write HUNG — block_on/IO regression");
+            std::process::exit(96);
+        });
+
+        reset_test_logger();
+        let socket_path = unique_handshake_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind local UDS mux server");
+        let server = std::thread::Builder::new()
+            .name("ft-pane-write-server".to_string())
+            .spawn(move || -> anyhow::Result<()> {
+                let (mut stream, _addr) = listener.accept().context("accept mux client")?;
+                loop {
+                    let decoded = Pdu::decode(&mut stream).context("server decode client PDU")?;
+                    let (response, done) = match decoded.pdu {
+                        Pdu::GetCodecVersion(_) => (
+                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                codec_vers: CODEC_VERSION,
+                                version_string: "ft-pane-write-server".to_string(),
+                                executable_path: PathBuf::from("/usr/local/bin/ft"),
+                                config_file_path: None,
+                                min_supported: CODEC_VERSION,
+                            }),
+                            false,
+                        ),
+                        Pdu::SetClientId(_) => (Pdu::UnitResponse(UnitResponse {}), false),
+                        // The WriteToPane reply is what PaneWriter::write blocks on.
+                        Pdu::WriteToPane(_) => (Pdu::UnitResponse(UnitResponse {}), true),
+                        other => panic!("unexpected client PDU: {}", other.pdu_name()),
+                    };
+                    response
+                        .encode(&mut stream, decoded.serial)
+                        .context("server encode response PDU")?;
+                    stream.flush().context("server flush response PDU")?;
+                    if done {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+            .expect("spawn pane-write UDS server");
+
+        let mut ui = ConnectionUI::new_headless();
+        let unix_domain = UnixDomain {
+            name: "ft-pane-write".to_string(),
+            socket_path: Some(socket_path),
+            no_serve_automatically: true,
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut reconnectable = Reconnectable::new(ClientDomainConfig::Unix(unix_domain), None);
+        reconnectable
+            .connect(true, &mut ui, true)
+            .expect("connect to local UDS server");
+        let client_domain_config = reconnectable.config.clone();
+        let is_reconnectable = reconnectable.reconnectable();
+        let is_local = reconnectable.is_local();
+        let (sender, receiver) = unbounded();
+        let client = std::sync::Arc::new(Client {
+            sender,
+            local_domain_id: None,
+            client_id: ClientId::new(),
+            client_domain_config,
+            is_reconnectable,
+            is_local,
+        });
+
+        let reader = std::thread::Builder::new()
+            .name("ft-pane-write-reader".to_string())
+            .spawn(move || {
+                let (result, _reconnectable, _receiver) =
+                    client_thread(reconnectable, None, receiver);
+                result
+            })
+            .expect("spawn reader thread");
+
+        asupersync_block_on(client.verify_version_compat(&ui)).expect("handshake completes");
+
+        // The crux: a main-thread sync write to a remote pane. Mirrors
+        // PaneWriter::write exactly (block_on_io inside the main-thread dispatch
+        // scope). Pre-fix this panicked on the block_on main-thread guard.
+        let write_client = std::sync::Arc::clone(&client);
+        let result = {
+            let _scope = promise::spawn::enter_main_thread_dispatch_scope();
+            promise::spawn::block_on_io(async move {
+                write_client
+                    .write_to_pane(codec::WriteToPane {
+                        pane_id: 1,
+                        data: b"hello-remote".to_vec(),
+                    })
+                    .await
+            })
+        };
+        result.expect("main-thread pane write must round-trip without panic or hang");
+
+        drop(client);
+        let _ = reader.join();
+        server
+            .join()
+            .expect("server thread should join")
+            .expect("server pane-write loop should succeed");
     }
 
     #[test]

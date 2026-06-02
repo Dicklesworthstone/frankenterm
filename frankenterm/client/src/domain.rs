@@ -1327,8 +1327,30 @@ mod tests {
         }
     }
 
+    /// Spawn a watchdog that aborts the test process if the body does not
+    /// finish within `secs`. Used to turn a *deadlock* regression into a fast,
+    /// obvious failure instead of a hung test binary (CI would otherwise just
+    /// time out the whole suite with no signal).
+    fn deadlock_watchdog(secs: u64, label: &'static str) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            eprintln!(
+                "WATCHDOG: `{label}` did not complete within {secs}s — likely a \
+                 mux-lock deadlock regression (read guard held across a write lock)."
+            );
+            std::process::exit(97);
+        });
+    }
+
+    /// Regression guard for the remote-attach deadlock: `process_pane_list`
+    /// takes the "reuse existing primary window with matching workspace" branch
+    /// here (local window workspace "ops" == the listing's "ops"), which used to
+    /// hold `Mux::get_window`'s read guard across `add_tab_to_window`'s write
+    /// lock and self-deadlock parking_lot's RwLock. The watchdog makes a
+    /// regression fail fast instead of hanging.
     #[test]
     fn process_pane_list_seeds_spawned_client_pane_alt_screen_state() {
+        deadlock_watchdog(30, "process_pane_list_seeds_spawned_client_pane_alt_screen_state");
         let _lock = TEST_LOCK.lock().unwrap();
         ensure_test_scheduler();
         let mux = Arc::new(Mux::new(None));

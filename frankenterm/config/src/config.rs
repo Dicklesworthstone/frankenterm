@@ -3245,6 +3245,37 @@ mod tests {
         assert!(dirs.is_empty());
     }
 
+    /// Regression guard for the config-reload main-thread panic (#3).
+    ///
+    /// `TermWindow::config_was_reloaded` runs the config load on the GUI
+    /// main-thread spawn queue. `try_load` used to evaluate the Lua config via
+    /// `promise::spawn::block_on(chunk.eval_async())`, and that block_on aborts
+    /// when invoked under the main-thread dispatch scope ("block_on called while
+    /// running a task on the main-thread spawn queue"). The fix uses synchronous
+    /// `eval()`. This test loads a real Lua config file while inside the
+    /// main-thread dispatch scope and asserts it succeeds rather than panicking.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn config_loads_under_main_thread_dispatch_scope() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frankenterm.lua");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "return {{ font_size = 13.5 }}").unwrap();
+        drop(f);
+
+        let _scope = promise::spawn::enter_main_thread_dispatch_scope();
+        let overrides = Value::Null;
+        let loaded = Config::try_load(&PathPossibility::required(path), &overrides)
+            .expect("config load must not error on the main thread")
+            .expect("config file should be found");
+        assert!(
+            loaded.config.is_ok(),
+            "config eval must succeed under main-thread dispatch: {:?}",
+            loaded.config.as_ref().err()
+        );
+    }
+
     // ── BoldBrightening ────────────────────────────────────────
 
     #[test]
