@@ -329,23 +329,38 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// `block_on_io` spawns the future as a scheduler-managed task (whose reactor
 /// registrations *are* driven) and blocks on its join handle, so I/O wakeups
 /// fire correctly. Use this for any future that does socket/timer I/O on a
-/// dedicated blocking thread (the mux client reader is the canonical case).
+/// dedicated blocking thread (the mux client reader) OR a short sync-over-async
+/// I/O call made from the GUI main thread (e.g. `PaneWriter::write` shipping a
+/// keystroke to a remote pane).
+///
+/// Unlike [`block_on`], this is SAFE to call on the main-thread spawn queue: the
+/// spawned task runs on a *separate* runtime worker that drives it (and its I/O)
+/// to completion independently, so parking the caller on the join handle cannot
+/// self-deadlock the GUI the way a directly-polled `block_on` would. (It does
+/// briefly block the event loop until the I/O completes — acceptable for the
+/// short mux RPCs this is used for, and the behavior `smol::block_on` had before
+/// the asupersync migration. A future, fully-async rewrite of those sync write
+/// paths is the proper end state.)
+///
+/// The future MUST NOT depend on the calling thread making progress (e.g. it
+/// must not block on `spawn_into_main_thread`), or it will deadlock when invoked
+/// from the main thread. Mux client RPCs satisfy this: they are serviced by the
+/// reader task on the runtime, not by the caller.
 #[cfg(feature = "async-asupersync")]
 pub fn block_on_io<F>(future: F) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    assert_not_in_main_thread_dispatch();
     let join = ASUPERSYNC_RUNTIME.handle().spawn(future);
     ASUPERSYNC_RUNTIME.block_on(join)
 }
 
 /// Non-asupersync fallback: `async_io::block_on` already drives the global
-/// async-io reactor, so plain block-on is sufficient there.
+/// async-io reactor (on its own reactor thread), so it is likewise safe to call
+/// from the main thread.
 #[cfg(not(feature = "async-asupersync"))]
 pub fn block_on_io<F: Future>(future: F) -> F::Output {
-    assert_not_in_main_thread_dispatch();
     async_io::block_on(future)
 }
 

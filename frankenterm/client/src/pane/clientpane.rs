@@ -694,12 +694,22 @@ struct PaneWriter {
 
 impl std::io::Write for PaneWriter {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
-        promise::spawn::block_on(self.client.client.write_to_pane(WriteToPane {
-            pane_id: self.remote_pane_id,
-            data: data.to_vec(),
-        }))
+        // This is a sync `Write` impl invoked on the GUI main thread when the
+        // user types into a remote pane. It must drive a mux RPC to completion.
+        // Use `block_on_io` (spawn-on-runtime + join), NOT `block_on`: the RPC
+        // is serviced by the reader task on the runtime, so its I/O readiness is
+        // actually driven and the main-thread `block_on` deadlock guard does not
+        // trip. Plain `block_on` here panicked ("called while running a task on
+        // the main-thread spawn queue") / could not drive the reply.
+        let client = Arc::clone(&self.client);
+        let pane_id = self.remote_pane_id;
+        let data = data.to_vec();
+        let len = data.len();
+        promise::spawn::block_on_io(async move {
+            client.client.write_to_pane(WriteToPane { pane_id, data }).await
+        })
         .map_err(|e| std::io::Error::other(format!("{}", e)))?;
-        Ok(data.len())
+        Ok(len)
     }
 
     fn flush(&mut self) -> Result<(), std::io::Error> {

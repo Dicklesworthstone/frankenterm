@@ -1461,14 +1461,22 @@ impl Config {
             frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
                 let cfg: Config;
 
-                let config: mlua::Value = promise::spawn::block_on(
-                    // Skip a potential BOM that Windows software may have placed in the
-                    // file. Note that we can't catch this happening for files that are
-                    // imported via the lua require function.
-                    lua.load(s.trim_start_matches('\u{FEFF}'))
-                        .set_name(p.to_string_lossy())
-                        .eval_async(),
-                )?;
+                // Config evaluation is synchronous CPU-bound Lua: it builds a
+                // config table and returns it. Use the synchronous `eval()`
+                // rather than `block_on(eval_async())`. The latter calls
+                // `promise::spawn::block_on`, whose main-thread-dispatch guard
+                // panics when config is (re)loaded on the GUI main thread
+                // (e.g. TermWindow::config_was_reloaded). Upstream relied on
+                // `smol::block_on` tolerating that; the asupersync-era block_on
+                // does not. Sync eval avoids the runtime entirely.
+                //
+                // Skip a potential BOM that Windows software may have placed in
+                // the file. Note that we can't catch this happening for files
+                // that are imported via the lua require function.
+                let config: mlua::Value = lua
+                    .load(s.trim_start_matches('\u{FEFF}'))
+                    .set_name(p.to_string_lossy())
+                    .eval()?;
                 let config = Config::apply_overrides_to(&lua, config)?;
                 let config = Config::apply_overrides_obj_to(&lua, config, overrides)?;
                 cfg = Config::from_lua(config, &lua).with_context(|| {
