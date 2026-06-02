@@ -558,7 +558,7 @@ getrandom = "0.3"
 trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
-fastmcp = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "884d45b173f691682d23e20aa6089bf4115705b8", package = "fastmcp-rust" }
+fastmcp = { path = "/dp/fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
 fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "39ff887fca40763a62233d2e7b83b5b62725b286", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
@@ -591,7 +591,7 @@ debug = false       # No debuginfo in release artifacts
 # the upstream repos as git dependencies.
 [patch.crates-io]
 # Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
+rich_rust = { path = "/dp/rich_rust" }
 # asupersync is sourced from the local sibling checkout (/dp -> ~/projects) so the
 # build always tracks the latest local asupersync. A previously pinned github rev
 # (3b9d1199) had diverged from local main and shipped an older io_driver waker path
@@ -605,7 +605,7 @@ k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
 asupersync = { path = "/dp/asupersync" }
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
+rich_rust = { path = "/dp/rich_rust" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
 asupersync = { path = "/dp/asupersync" }
