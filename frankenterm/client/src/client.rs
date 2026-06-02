@@ -384,11 +384,27 @@ fn fallback_rewake(task_cx: &TaskContext<'_>) {
 }
 
 fn client_thread(
-    reconnectable: &mut Reconnectable,
+    mut reconnectable: Reconnectable,
     local_domain_id: Option<DomainId>,
-    rx: &mut Receiver<ReaderMessage>,
-) -> anyhow::Result<()> {
-    promise::spawn::block_on(client_thread_async(reconnectable, local_domain_id, rx))
+    mut rx: Receiver<ReaderMessage>,
+) -> (
+    anyhow::Result<()>,
+    Reconnectable,
+    Receiver<ReaderMessage>,
+) {
+    // The reader performs ALL of this connection's socket I/O, so it must run as
+    // a scheduler-managed task (block_on_io) rather than a directly-polled
+    // block_on future. asupersync only delivers socket-readiness wakeups to
+    // tasks living on the scheduler; a future polled directly by block_on just
+    // parks the thread and never gets the wakeup, so the handshake reply that
+    // arrives *after* the reader parks (any real, latency-bearing connection
+    // such as an SSH-proxy mux domain) is never consumed and the version check
+    // times out. We move the owned reconnectable + receiver into the task and
+    // return them so the reconnect loop can reuse them on the next attempt.
+    promise::spawn::block_on_io(async move {
+        let result = client_thread_async(&mut reconnectable, local_domain_id, &mut rx).await;
+        (result, reconnectable, rx)
+    })
 }
 
 async fn client_thread_async(
@@ -596,12 +612,12 @@ pub fn unix_connect_with_retry(
     error.unwrap_or_else(|| Err(anyhow!("unix connection failed without recording a cause")))
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 pub trait AsyncReadAndWrite: Unpin + AsyncRead + AsyncWrite + std::fmt::Debug + Send {
     async fn wait_for_readable(&self) -> anyhow::Result<()>;
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl AsyncReadAndWrite for UnixStream {
     async fn wait_for_readable(&self) -> anyhow::Result<()> {
         UnixStream::wait_for_readable(self)
@@ -610,7 +626,7 @@ impl AsyncReadAndWrite for UnixStream {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl AsyncReadAndWrite for AsyncSslStream {
     async fn wait_for_readable(&self) -> anyhow::Result<()> {
         AsyncSslStream::wait_for_readable(self)
@@ -619,7 +635,7 @@ impl AsyncReadAndWrite for AsyncSslStream {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl AsyncReadAndWrite for SshStream {
     async fn wait_for_readable(&self) -> anyhow::Result<()> {
         SshStream::wait_for_readable(self).await.map_err(Into::into)
@@ -1362,9 +1378,11 @@ impl Client {
 
                 let mut backoff = base_interval;
                 loop {
-                    if let Err(e) =
-                        client_thread(&mut reconnectable, local_domain_id, &mut receiver)
-                    {
+                    let (thread_result, returned_reconnectable, returned_receiver) =
+                        client_thread(reconnectable, local_domain_id, receiver);
+                    reconnectable = returned_reconnectable;
+                    receiver = returned_receiver;
+                    if let Err(e) = thread_result {
                         if !reconnectable.reconnectable() || local_domain_id.is_none() {
                             log::debug!("client thread ended: {}", e);
                             break;
@@ -2035,6 +2053,115 @@ mod tests {
         );
 
         drop(client);
+        server
+            .join()
+            .expect("server thread should join")
+            .expect("server handshake loop should succeed");
+    }
+
+    /// Regression for the mux-client connect hang: the reader must receive
+    /// socket-readiness wakeups even when the server's reply arrives AFTER the
+    /// reader parks (i.e. any real, latency-bearing connection). Before the fix
+    /// the reader ran as a directly-polled `block_on` future, which asupersync
+    /// never delivers I/O wakeups to, so a delayed handshake reply was never
+    /// consumed and `verify_version_compat` timed out. `client_thread` now runs
+    /// the reader as a scheduler-managed task via `block_on_io`. This test
+    /// drives the REAL `client_thread` against a server that delays its reply,
+    /// so it hangs (watchdog-killed) on regression and completes on success.
+    #[cfg(unix)]
+    #[test]
+    fn reader_receives_delayed_handshake_reply_ft_connect_fix() {
+        // Watchdog: if the reader never wakes, fail fast instead of waiting out
+        // the 60s in-flight handshake timeout.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(12));
+            eprintln!("WATCHDOG: delayed-handshake reader HUNG — readiness regression");
+            std::process::exit(98);
+        });
+
+        reset_test_logger();
+        let socket_path = unique_handshake_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind local UDS handshake server");
+        let server = std::thread::Builder::new()
+            .name("ft-connect-fix-delayed-server".to_string())
+            .spawn(move || -> anyhow::Result<()> {
+                let (mut stream, _addr) = listener.accept().context("accept mux client")?;
+                let mut first = true;
+                loop {
+                    let decoded = Pdu::decode(&mut stream).context("server decode client PDU")?;
+                    if first {
+                        // Reply only AFTER the reader has parked waiting for
+                        // readability — the condition the old code hung on.
+                        std::thread::sleep(Duration::from_millis(400));
+                        first = false;
+                    }
+                    let response = match decoded.pdu {
+                        Pdu::GetCodecVersion(_) => Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                            codec_vers: CODEC_VERSION,
+                            version_string: "ft-connect-fix-delayed-server".to_string(),
+                            executable_path: PathBuf::from("/usr/local/bin/ft"),
+                            config_file_path: None,
+                            min_supported: CODEC_VERSION,
+                        }),
+                        Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                        other => panic!("unexpected client handshake PDU: {}", other.pdu_name()),
+                    };
+                    response
+                        .encode(&mut stream, decoded.serial)
+                        .context("server encode response PDU")?;
+                    stream.flush().context("server flush response PDU")?;
+                    if matches!(response, Pdu::UnitResponse(_)) {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+            .expect("spawn delayed UDS handshake server");
+
+        let mut ui = ConnectionUI::new_headless();
+        let unix_domain = UnixDomain {
+            name: "ft-connect-fix".to_string(),
+            socket_path: Some(socket_path),
+            no_serve_automatically: true,
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(unix_domain), None);
+        reconnectable
+            .connect(true, &mut ui, true)
+            .expect("connect to local UDS handshake server");
+        let client_domain_config = reconnectable.config.clone();
+        let is_reconnectable = reconnectable.reconnectable();
+        let is_local = reconnectable.is_local();
+        let (sender, receiver) = unbounded();
+        let client = Client {
+            sender,
+            local_domain_id: None,
+            client_id: ClientId::new(),
+            client_domain_config,
+            is_reconnectable,
+            is_local,
+        };
+
+        // Run the REAL reader exactly as production does (client_thread ->
+        // block_on_io -> scheduler-managed, reactor-driven task).
+        let reader = std::thread::Builder::new()
+            .name("ft-connect-fix-reader".to_string())
+            .spawn(move || {
+                let (result, _reconnectable, _receiver) =
+                    client_thread(reconnectable, None, receiver);
+                result
+            })
+            .expect("spawn reader thread");
+
+        let info = asupersync_block_on(client.verify_version_compat(&ui))
+            .expect("delayed handshake reply must be consumed by the reader");
+        assert_eq!(info.codec_vers, CODEC_VERSION);
+
+        drop(client);
+        let _ = reader.join();
         server
             .join()
             .expect("server thread should join")

@@ -315,6 +315,40 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     ASUPERSYNC_RUNTIME.block_on(future)
 }
 
+/// Run an I/O-bound future to completion with the runtime's reactor actually
+/// driving it.
+///
+/// `block_on` polls its future *directly* on the calling thread and merely
+/// parks between wakeups; asupersync only services socket/timer readiness for
+/// futures that live on the scheduler, so a future that performs network I/O
+/// under plain `block_on` hangs forever the moment it has to wait for bytes
+/// that arrive *after* it parks (e.g. a mux handshake reply over an SSH proxy).
+/// The local-fast case is masked by readiness fast-paths, which is why it only
+/// bites real remote connections.
+///
+/// `block_on_io` spawns the future as a scheduler-managed task (whose reactor
+/// registrations *are* driven) and blocks on its join handle, so I/O wakeups
+/// fire correctly. Use this for any future that does socket/timer I/O on a
+/// dedicated blocking thread (the mux client reader is the canonical case).
+#[cfg(feature = "async-asupersync")]
+pub fn block_on_io<F>(future: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    assert_not_in_main_thread_dispatch();
+    let join = ASUPERSYNC_RUNTIME.handle().spawn(future);
+    ASUPERSYNC_RUNTIME.block_on(join)
+}
+
+/// Non-asupersync fallback: `async_io::block_on` already drives the global
+/// async-io reactor, so plain block-on is sufficient there.
+#[cfg(not(feature = "async-asupersync"))]
+pub fn block_on_io<F: Future>(future: F) -> F::Output {
+    assert_not_in_main_thread_dispatch();
+    async_io::block_on(future)
+}
+
 pub struct SimpleExecutor {
     rx: Receiver<SpawnFunc>,
 }
