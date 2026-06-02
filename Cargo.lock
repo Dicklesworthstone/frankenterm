@@ -43,6 +43,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "subtle",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -196,12 +221,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "array-macro"
-version = "2.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "220a2c618ab466efe41d0eace94dfeff1c35e3aa47891bdb95e1c0fefffd3c99"
-
-[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,19 +370,19 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.3.2"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
+version = "0.3.3"
 dependencies = [
+ "aes-gcm",
  "asupersync-macros",
  "base64 0.22.1",
  "bincode-next",
+ "chacha20poly1305",
  "crc32fast",
  "crossbeam-deque",
  "crossbeam-queue",
- "faa_array_queue",
- "franken-decision 0.3.1",
- "franken-evidence 0.3.1",
- "franken-kernel 0.3.1",
+ "franken-decision 0.3.3",
+ "franken-evidence 0.3.3",
+ "franken-kernel 0.3.3",
  "futures-lite",
  "getrandom 0.4.2",
  "hashbrown 0.17.0",
@@ -380,11 +399,11 @@ dependencies = [
  "pin-project",
  "polling",
  "prost",
- "ring",
  "rmp-serde",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "semver",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -393,6 +412,8 @@ dependencies = [
  "slab",
  "smallvec",
  "socket2 0.6.3",
+ "subtle",
+ "sysinfo 0.33.1",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -403,12 +424,12 @@ dependencies = [
  "web-sys",
  "windows-sys 0.61.2",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
 name = "asupersync-macros"
-version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
+version = "0.3.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -572,7 +593,7 @@ dependencies = [
 name = "async_ossl"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "async-io",
  "futures",
  "openssl",
@@ -1396,7 +1417,7 @@ name = "codec"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "base91",
  "byteorder",
  "chrono",
@@ -2050,6 +2071,15 @@ checksum = "eb2a7d3066da2de787b7f032c736763eb7ae5d355f81a68bab2675a96008b0bf"
 dependencies = [
  "lab",
  "phf",
+]
+
+[[package]]
+name = "ctr"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -2752,16 +2782,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "faa_array_queue"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2db1d52f890d54e3faccffedd747caa5280e6a7fa72e3241d8d35e3bd53373e2"
-dependencies = [
- "array-macro",
- "peril",
-]
-
-[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2821,7 +2841,7 @@ name = "fastapi-core"
 version = "0.3.0"
 source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=39ff887fca40763a62233d2e7b83b5b62725b286#39ff887fca40763a62233d2e7b83b5b62725b286"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "fastapi-openapi",
  "fastapi-router",
  "fastapi-types",
@@ -2836,7 +2856,7 @@ name = "fastapi-http"
 version = "0.3.0"
 source = "git+https://github.com/Dicklesworthstone/fastapi_rust?rev=39ff887fca40763a62233d2e7b83b5b62725b286#39ff887fca40763a62233d2e7b83b5b62725b286"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "fastapi-core",
 ]
 
@@ -3369,11 +3389,10 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
+version = "0.3.3"
 dependencies = [
- "franken-evidence 0.3.1",
- "franken-kernel 0.3.1",
+ "franken-evidence 0.3.3",
+ "franken-kernel 0.3.3",
  "serde",
 ]
 
@@ -3389,8 +3408,7 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -3407,8 +3425,7 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.3.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=3b9d1199eca3b255edaddba70151006e0a8c9fd2#3b9d1199eca3b255edaddba70151006e0a8c9fd2"
+version = "0.3.3"
 dependencies = [
  "serde",
 ]
@@ -3418,7 +3435,7 @@ name = "frankensearch"
 version = "0.3.2"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-fusion",
@@ -3432,7 +3449,7 @@ name = "frankensearch-core"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3447,7 +3464,7 @@ name = "frankensearch-embed"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "dirs",
  "fastembed",
  "frankensearch-core",
@@ -3466,7 +3483,7 @@ version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
  "ahash",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-index",
@@ -3500,7 +3517,7 @@ name = "frankensearch-lexical"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=2cad158f4468ece7076e3fe529c8e5c20b2e020e#2cad158f4468ece7076e3fe529c8e5c20b2e020e"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "frankensearch-core",
  "rayon",
  "serde",
@@ -3515,7 +3532,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "chrono",
  "clap",
  "dirs",
@@ -3608,7 +3625,7 @@ name = "frankenterm-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "async-channel",
  "async-trait",
  "async_ossl",
@@ -3667,7 +3684,7 @@ name = "frankenterm-core"
 version = "0.3.0"
 dependencies = [
  "aho-corasick",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "base64 0.22.1",
  "bloomfilter",
  "chacha20poly1305",
@@ -3748,7 +3765,7 @@ dependencies = [
  "sha2 0.10.9",
  "shell-words",
  "shlex",
- "sysinfo",
+ "sysinfo 0.36.1",
  "tantivy",
  "tempfile",
  "thiserror 2.0.18",
@@ -4224,7 +4241,7 @@ name = "frankenterm-mux-server-impl"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "async-channel",
  "async_ossl",
  "base64 0.22.1",
@@ -4295,7 +4312,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_fs",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "async-channel",
  "async_ossl",
  "base64 0.22.1",
@@ -4419,7 +4436,7 @@ dependencies = [
 name = "frankenterm-uds"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "async-io",
  "futures",
  "libc",
@@ -4825,6 +4842,16 @@ dependencies = [
  "wasip2",
  "wasip3",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "ghash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
+dependencies = [
+ "opaque-debug",
+ "polyval",
 ]
 
 [[package]]
@@ -8091,16 +8118,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "os-thread-local"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd7fc7fa9ea7dc8907f9b10e730106ed0011926e7f5abb382530ac91d1af2b7c"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "os_pipe"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8208,15 +8225,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "peril"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7282796ee07ffa4fba714b83beee0b334540d23818de49ebfe7b380eaf32089f"
-dependencies = [
- "os-thread-local",
-]
 
 [[package]]
 name = "pest"
@@ -8465,6 +8473,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyval"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8484,7 +8504,7 @@ name = "portable-pty"
 version = "0.9.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "bitflags 1.3.2",
  "downcast-rs 1.2.1",
  "filedescriptor 0.8.3",
@@ -8647,7 +8667,7 @@ name = "promise"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "asupersync 0.3.2",
+ "asupersync 0.3.3",
  "async-executor",
  "async-io",
  "async-task",
@@ -10360,6 +10380,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fc858248ea01b66f19d8e8a6d55f41deaf91e9d495246fd01368d99935c6c01"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+ "memchr",
+ "ntapi",
+ "rayon",
+ "windows 0.57.0",
 ]
 
 [[package]]
@@ -12898,6 +12932,16 @@ dependencies = [
 
 [[package]]
 name = "windows"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
+dependencies = [
+ "windows-core 0.57.0",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd04d41d93c4992d421894c18c8b43496aa748dd4c081bac0dc93eb0489272b6"
@@ -12926,6 +12970,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
  "windows-core 0.61.2",
+]
+
+[[package]]
+name = "windows-core"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
+dependencies = [
+ "windows-implement 0.57.0",
+ "windows-interface 0.57.0",
+ "windows-result 0.1.2",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -12967,6 +13023,17 @@ dependencies = [
 
 [[package]]
 name = "windows-implement"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9107ddc059d5b6fbfbffdfa7a7fe3e22a226def0b2608f72e9d552763d3e1ad7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "windows-implement"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bbd5b46c938e506ecbce286b6628a02171d56153ba733b6c741fc627ec9579b"
@@ -12981,6 +13048,17 @@ name = "windows-implement"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29bee4b38ea3cde66011baa44dba677c432a78593e202392d1e9070cf2a7fca7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13040,6 +13118,15 @@ dependencies = [
  "windows-link 0.2.1",
  "windows-result 0.4.1",
  "windows-strings 0.5.1",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e383302e8ec8515204254685643de10811af0ed97ea37210dc26fb0032647f8"
+dependencies = [
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -13854,6 +13941,20 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "zerotrie"
