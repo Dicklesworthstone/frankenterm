@@ -52,6 +52,44 @@ impl Default for ClusteringConfig {
     }
 }
 
+/// Upper bound on LSH bands accepted from configuration.
+const MAX_NUM_BANDS: usize = 256;
+
+/// Upper bound on MinHash functions accepted from configuration.
+///
+/// `minhash_signature` allocates (and iterates) `num_hashes` u64 slots per
+/// inserted error, so this also caps per-insert CPU/memory cost. The default
+/// is 128; 4096 leaves generous headroom for accuracy tuning.
+const MAX_NUM_HASHES: usize = 4096;
+
+impl ClusteringConfig {
+    /// Clamp the configuration to safe, internally consistent values.
+    ///
+    /// `ClusteringConfig` derives `Deserialize` with public fields, so values
+    /// can arrive from external or mistyped sources. The LSH band index
+    /// requires `num_bands >= 1` and `num_hashes` divisible by `num_bands`
+    /// (its constructor asserts both), and `minhash_signature` allocates
+    /// `num_hashes` slots per insert — an unsanitized config could therefore
+    /// panic the constructor (mod-by-zero / divisibility assert) or request an
+    /// absurd allocation. Normalization rules:
+    ///
+    /// - `num_bands` is clamped to `1..=MAX_NUM_BANDS`.
+    /// - `num_hashes` is clamped to `num_bands..=MAX_NUM_HASHES`, then rounded
+    ///   down to the nearest multiple of `num_bands` (never below
+    ///   `num_bands`).
+    ///
+    /// Valid configurations — the default included — pass through unchanged.
+    /// Same clamp-with-rationale idiom as `ApprovalTracker::new`'s
+    /// zero-capacity defense.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.num_bands = self.num_bands.clamp(1, MAX_NUM_BANDS);
+        self.num_hashes = self.num_hashes.clamp(self.num_bands, MAX_NUM_HASHES);
+        self.num_hashes -= self.num_hashes % self.num_bands;
+        self
+    }
+}
+
 // =============================================================================
 // MinHash
 // =============================================================================
@@ -271,7 +309,13 @@ struct ClusterMeta {
 
 impl ErrorClusterer {
     /// Create a new clustering engine.
+    ///
+    /// The configuration is passed through [`ClusteringConfig::sanitized`]
+    /// first, so out-of-range or inconsistent values (zero bands, hash count
+    /// not divisible by the band count, absurd hash counts) are clamped to
+    /// safe equivalents instead of panicking inside `BandIndex::new`.
     pub fn new(config: ClusteringConfig) -> Self {
+        let config = config.sanitized();
         Self {
             band_index: BandIndex::new(config.num_hashes, config.num_bands),
             union_find: UnionFind::new(0),
@@ -523,6 +567,93 @@ mod tests {
         assert_ne!(uf.find(a), uf.find(b));
         uf.union(a, b);
         assert_eq!(uf.find(a), uf.find(b));
+    }
+
+    #[test]
+    fn sanitized_default_config_is_unchanged() {
+        let cfg = ClusteringConfig::default().sanitized();
+        let default = ClusteringConfig::default();
+        assert_eq!(cfg.num_hashes, default.num_hashes);
+        assert_eq!(cfg.num_bands, default.num_bands);
+        assert_eq!(cfg.shingle_size, default.shingle_size);
+        assert_eq!(cfg.max_clusters, default.max_clusters);
+        assert_eq!(
+            cfg.max_samples_per_cluster,
+            default.max_samples_per_cluster
+        );
+    }
+
+    #[test]
+    fn new_with_zero_bands_does_not_panic() {
+        // Pre-fix: BandIndex::new asserted num_bands > 0, so a Deserialize'd
+        // config with num_bands: 0 panicked the constructor (and the
+        // divisibility assert's `num_hashes % num_bands` would itself be a
+        // mod-by-zero). Sanitization clamps to 1 band.
+        let cfg = ClusteringConfig {
+            num_bands: 0,
+            ..ClusteringConfig::default()
+        };
+        let mut clusterer = ErrorClusterer::new(cfg);
+        assert_eq!(clusterer.config.num_bands, 1);
+        // The engine must actually work post-sanitization.
+        let id = clusterer.insert("error: boom", Some(1), 10);
+        assert_eq!(clusterer.clusters().len(), 1);
+        let _ = id;
+    }
+
+    #[test]
+    fn new_with_non_divisible_hashes_rounds_down() {
+        // 100 hashes across 16 bands is not divisible; pre-fix this tripped
+        // the divisibility assert. Sanitization rounds down to 96 (= 6 rows
+        // per band), never below num_bands.
+        let cfg = ClusteringConfig {
+            num_hashes: 100,
+            num_bands: 16,
+            ..ClusteringConfig::default()
+        };
+        let clusterer = ErrorClusterer::new(cfg);
+        assert_eq!(clusterer.config.num_hashes, 96);
+        assert_eq!(clusterer.config.num_bands, 16);
+    }
+
+    #[test]
+    fn new_with_absurd_hash_count_is_capped() {
+        // minhash_signature allocates num_hashes u64 slots per insert; an
+        // unsanitized usize::MAX would be an OOM request. Capped to
+        // MAX_NUM_HASHES (already a multiple of the default 16 bands).
+        let cfg = ClusteringConfig {
+            num_hashes: usize::MAX,
+            ..ClusteringConfig::default()
+        };
+        let clusterer = ErrorClusterer::new(cfg);
+        assert_eq!(clusterer.config.num_hashes, MAX_NUM_HASHES);
+    }
+
+    #[test]
+    fn new_with_hashes_below_bands_clamps_up_to_bands() {
+        // 4 hashes across 16 bands is impossible (rows_per_band would be 0);
+        // sanitization raises num_hashes to num_bands (1 row per band).
+        let cfg = ClusteringConfig {
+            num_hashes: 4,
+            num_bands: 16,
+            ..ClusteringConfig::default()
+        };
+        let clusterer = ErrorClusterer::new(cfg);
+        assert_eq!(clusterer.config.num_hashes, 16);
+        assert_eq!(clusterer.config.num_bands, 16);
+    }
+
+    #[test]
+    fn new_with_oversized_band_count_is_capped() {
+        let cfg = ClusteringConfig {
+            num_hashes: usize::MAX,
+            num_bands: usize::MAX,
+            ..ClusteringConfig::default()
+        };
+        let clusterer = ErrorClusterer::new(cfg);
+        assert_eq!(clusterer.config.num_bands, MAX_NUM_BANDS);
+        assert_eq!(clusterer.config.num_hashes, MAX_NUM_HASHES);
+        assert_eq!(clusterer.config.num_hashes % clusterer.config.num_bands, 0);
     }
 
     #[test]
