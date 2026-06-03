@@ -8535,7 +8535,16 @@ mod writer_io_scheduler_tests {
             assert_eq!(storage_writer_panics_total(), 1);
             assert_eq!(gate.scheduler.aggregate_items(), 0);
             assert!(gate.next_ordering_sequence_by_stream.is_empty());
-            assert!(crate::runtime_async::oneshot_recv(panic_rx).await.is_err());
+            let panic_result = crate::runtime_async::oneshot_recv(panic_rx)
+                .await
+                .expect("panicking command should receive a typed panic error");
+            let panic_error = panic_result.expect_err("panicking command should fail closed");
+            assert!(
+                panic_error
+                    .to_string()
+                    .contains("storage writer recovered from dispatch panic"),
+                "{panic_error}"
+            );
             let tail_result = crate::runtime_async::oneshot_recv(tail_rx)
                 .await
                 .expect("undispatched tail command should receive a panic error");
@@ -8568,22 +8577,109 @@ mod writer_io_scheduler_tests {
     }
 }
 
+trait BestEffortRespond<T> {
+    fn respond_best_effort(self, value: T);
+}
+
+impl<T> BestEffortRespond<T> for oneshot::Sender<T> {
+    fn respond_best_effort(self, value: T) {
+        let _ = self.send(value);
+    }
+}
+
+// rustc can report these panic-response guards as dead in dependency builds
+// whose reachable surface does not include the storage writer loop.
+#[allow(dead_code)]
+struct WriterResultResponder<T> {
+    respond: Option<oneshot::Sender<Result<T>>>,
+}
+
+#[allow(dead_code)]
+impl<T> WriterResultResponder<T> {
+    fn new(respond: oneshot::Sender<Result<T>>) -> Self {
+        Self {
+            respond: Some(respond),
+        }
+    }
+}
+
+impl<T> BestEffortRespond<Result<T>> for WriterResultResponder<T> {
+    fn respond_best_effort(mut self, value: Result<T>) {
+        if let Some(respond) = self.respond.take() {
+            respond_oneshot_best_effort(respond, value);
+        }
+    }
+}
+
+impl<T> Drop for WriterResultResponder<T> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+
+        if let Some(respond) = self.respond.take() {
+            respond_oneshot_best_effort(
+                respond,
+                writer_panic_error("storage writer recovered from dispatch panic"),
+            );
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct WriterShutdownResponder {
+    respond: Option<oneshot::Sender<()>>,
+}
+
+#[allow(dead_code)]
+impl WriterShutdownResponder {
+    fn new(respond: oneshot::Sender<()>) -> Self {
+        Self {
+            respond: Some(respond),
+        }
+    }
+}
+
+impl BestEffortRespond<()> for WriterShutdownResponder {
+    fn respond_best_effort(mut self, value: ()) {
+        if let Some(respond) = self.respond.take() {
+            respond_oneshot_best_effort(respond, value);
+        }
+    }
+}
+
+impl Drop for WriterShutdownResponder {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+
+        if let Some(respond) = self.respond.take() {
+            respond_oneshot_best_effort(respond, ());
+        }
+    }
+}
+
 /// br-ft-x2oyy: ship `value` back through the
 /// `WriteCommand::respond` oneshot channel under the
 /// receiver-dropped-is-fine contract documented on
-/// [`dispatch_write_command_raw`]. The
-/// `Result<(), oneshot::SendError<T>>` is intentionally
-/// discarded — see the dispatcher's rustdoc for the design
-/// rationale (oneshot send fails iff Receiver dropped → caller
-/// cancelled → no longer cares about the result; the SQLite
-/// write itself has already happened by this point and is
-/// folded into writer-side telemetry regardless of the return path).
+/// [`dispatch_write_command_raw`]. The send result is intentionally
+/// discarded — see the dispatcher's rustdoc for the design rationale
+/// (oneshot send fails iff Receiver dropped → caller cancelled → no
+/// longer cares about the result; the SQLite write itself has already
+/// happened by this point and is folded into writer-side telemetry
+/// regardless of the return path).
 ///
-/// Replaces the 62 inline `let _ = respond.send(value);`
-/// sites in `dispatch_write_command_raw`'s match arms — the helper
-/// name makes the contract self-documenting at every callsite.
-fn respond_oneshot_best_effort<T>(tx: oneshot::Sender<T>, value: T) {
-    let _ = tx.send(value);
+/// `ft-g3hrl.1`: dispatch arms shadow their raw sender with
+/// [`WriterResultResponder`] before doing fallible work. If a backend
+/// panic unwinds through the arm before the normal response path runs,
+/// the guard sends a typed storage writer panic error instead of
+/// letting the caller observe a closed response channel.
+fn respond_oneshot_best_effort<T, R>(tx: R, value: T)
+where
+    R: BestEffortRespond<T>,
+{
+    tx.respond_best_effort(value);
 }
 
 /// Dispatch a single already-admitted write command to the appropriate sync handler.
@@ -8636,6 +8732,7 @@ fn dispatch_write_command_raw(
             content_hash,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let mut moved_retained_tail = false;
             let result = (|| {
                 let (redacted_content, moved_tail) =
@@ -8661,11 +8758,13 @@ fn dispatch_write_command_raw(
             reason,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = flush_segment_redactor_for_pane(segment_redactors, pane_id)
                 .and_then(|()| record_gap_backend(backend, pane_id, &reason));
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordEvent { event, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = record_event_backend(backend, &event);
             respond_oneshot_best_effort(respond, result);
         }
@@ -8675,6 +8774,7 @@ fn dispatch_write_command_raw(
             status,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result =
                 mark_event_handled_backend(backend, event_id, workflow_id.as_deref(), &status);
             respond_oneshot_best_effort(respond, result);
@@ -8685,6 +8785,7 @@ fn dispatch_write_command_raw(
             updated_by,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = set_event_triage_state_backend(
                 backend,
                 event_id,
@@ -8699,6 +8800,7 @@ fn dispatch_write_command_raw(
             updated_by,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result =
                 set_event_note_backend(backend, event_id, note.as_deref(), updated_by.as_deref());
             respond_oneshot_best_effort(respond, result);
@@ -8709,6 +8811,7 @@ fn dispatch_write_command_raw(
             created_by,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = add_event_label_backend(backend, event_id, &label, created_by.as_deref());
             respond_oneshot_best_effort(respond, result);
         }
@@ -8717,10 +8820,12 @@ fn dispatch_write_command_raw(
             label,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = remove_event_label_backend(backend, event_id, &label);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertEventMute { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = upsert_event_mute_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
@@ -8728,18 +8833,22 @@ fn dispatch_write_command_raw(
             identity_key,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = delete_event_mute_backend(backend, &identity_key);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertPane { pane, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = upsert_pane_backend(backend, &pane);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertWorkflow { workflow, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = upsert_workflow_backend(backend, &workflow);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertActionPlan { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // upsert_action_plan direct-rusqlite path.
@@ -8747,6 +8856,7 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertPreparedPlan { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // insert_prepared_plan direct-rusqlite path.
@@ -8758,6 +8868,7 @@ fn dispatch_write_command_raw(
             now_ms,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = consume_prepared_plan_backend(backend, &plan_id, now_ms);
             respond_oneshot_best_effort(respond, result);
         }
@@ -8777,6 +8888,7 @@ fn dispatch_write_command_raw(
             completed_at,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = insert_step_log_backend(
                 backend,
                 &workflow_id,
@@ -8796,18 +8908,22 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertSession { session, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = upsert_agent_session_backend(backend, &session);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordAuditAction { action, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = record_audit_action_backend(backend, &action);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordPolicyDenialAudit { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = record_policy_denial_audit_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertActionUndo { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // upsert_action_undo direct-rusqlite path.
@@ -8820,11 +8936,13 @@ fn dispatch_write_command_raw(
             undone_by,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result =
                 mark_action_undone_backend(backend, audit_action_id, undone_at, &undone_by);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeAuditActions { before_ts, respond } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // purge_audit_actions direct-rusqlite path.
@@ -8832,6 +8950,7 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertApprovalToken { token, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = insert_approval_token_backend(backend, &token);
             respond_oneshot_best_effort(respond, result);
         }
@@ -8843,6 +8962,7 @@ fn dispatch_write_command_raw(
             action_fingerprint,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = consume_approval_token_backend(
                 backend,
                 &code_hash,
@@ -8858,18 +8978,22 @@ fn dispatch_write_command_raw(
             workspace_id,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = consume_approval_token_by_code_backend(backend, &code_hash, &workspace_id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordMaintenance { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = record_maintenance_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordSecretScanReport { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = record_secret_scan_report_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertSavedSearch { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = insert_saved_search_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
@@ -8880,6 +9004,7 @@ fn dispatch_write_command_raw(
             last_error,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = update_saved_search_run_backend(
                 backend,
                 &id,
@@ -8895,27 +9020,33 @@ fn dispatch_write_command_raw(
             schedule_interval_ms,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result =
                 update_saved_search_schedule_backend(backend, &id, enabled, schedule_interval_ms);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteSavedSearch { name, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = delete_saved_search_backend(backend, &name);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SyncFts { config, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = sync_fts_on_startup_backend(backend, &config);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RebuildFts { config, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = full_fts_rebuild_backend(backend, &config);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = prune_segments_backend(backend, before_ts);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Vacuum { respond } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // vacuum direct-rusqlite path.
@@ -8923,10 +9054,12 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Checkpoint { respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = checkpoint_backend(backend);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertAccount { account, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = upsert_account_backend(backend, &account);
             respond_oneshot_best_effort(respond, result);
         }
@@ -8936,6 +9069,7 @@ fn dispatch_write_command_raw(
             last_used_at,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result =
                 update_account_last_used_backend(backend, &service, &account_id, last_used_at);
             respond_oneshot_best_effort(respond, result);
@@ -8945,6 +9079,7 @@ fn dispatch_write_command_raw(
             account_id,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = delete_account_backend(backend, &service, &account_id);
             respond_oneshot_best_effort(respond, result);
         }
@@ -8956,6 +9091,7 @@ fn dispatch_write_command_raw(
             ttl_ms,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = create_reservation_backend(
                 backend,
                 pane_id,
@@ -8970,28 +9106,34 @@ fn dispatch_write_command_raw(
             reservation_id,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = release_reservation_backend(backend, reservation_id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ExpireStaleReservations { respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = expire_stale_reservations_backend(backend);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordUsageMetric { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = record_usage_metric_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordUsageMetricsBatch { records, respond } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: trait-typed bulk insert via execute_many
             // (was a direct rusqlite Transaction + prepare + loop).
             let result = record_usage_metrics_batch_backend(backend, &records);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = purge_usage_metrics_backend(backend, before_ts);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordNotification { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = record_notification_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
@@ -9001,6 +9143,7 @@ fn dispatch_write_command_raw(
             error_message,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result =
                 update_notification_status_backend(backend, id, status, error_message.as_deref());
             respond_oneshot_best_effort(respond, result);
@@ -9011,6 +9154,7 @@ fn dispatch_write_command_raw(
             action_taken,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = acknowledge_notification_backend(
                 backend,
                 id,
@@ -9020,10 +9164,12 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::IncrementNotificationRetry { id, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = increment_notification_retry_backend(backend, id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeNotificationHistory { before_ts, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = purge_notification_history_backend(backend, before_ts);
             respond_oneshot_best_effort(respond, result);
         }
@@ -9032,6 +9178,7 @@ fn dispatch_write_command_raw(
             batch_size,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = delete_events_before_backend(backend, before_ts, batch_size);
             respond_oneshot_best_effort(respond, result);
         }
@@ -9043,6 +9190,7 @@ fn dispatch_write_command_raw(
             batch_size,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = delete_events_by_tier_backend(
                 backend,
                 before_ts,
@@ -9054,18 +9202,22 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertPaneBookmark { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = insert_pane_bookmark_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeletePaneBookmark { alias, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = delete_pane_bookmark_backend(backend, &alias);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertAgentProfile { profile, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = insert_agent_profile_backend(backend, &profile);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::GetAgentProfile { name, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = get_agent_profile_backend(backend, &name);
             respond_oneshot_best_effort(respond, result);
         }
@@ -9073,10 +9225,12 @@ fn dispatch_write_command_raw(
             role_filter,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             let result = list_agent_profiles_backend(backend, role_filter.as_deref());
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteAgentProfile { name, respond } => {
+            let respond = WriterResultResponder::new(respond);
             let result = delete_agent_profile_backend(backend, &name);
             respond_oneshot_best_effort(respond, result);
         }
@@ -9087,6 +9241,7 @@ fn dispatch_write_command_raw(
             host_id,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // insert_mux_session direct-rusqlite path.
@@ -9109,6 +9264,7 @@ fn dispatch_write_command_raw(
             pane_states,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // insert_session_checkpoint direct-rusqlite transaction path.
@@ -9129,6 +9285,7 @@ fn dispatch_write_command_raw(
             retention,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // prune_session_checkpoints direct-rusqlite path.
@@ -9139,6 +9296,7 @@ fn dispatch_write_command_raw(
             session_id,
             respond,
         } => {
+            let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // mark_session_shutdown_clean direct-rusqlite path.
@@ -9146,10 +9304,12 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         #[cfg(test)]
-        WriteCommand::PanicForTest { respond: _respond } => {
+        WriteCommand::PanicForTest { respond } => {
+            let _respond = WriterResultResponder::new(respond);
             panic!("storage writer panic injection for test");
         }
         WriteCommand::Shutdown { respond } => {
+            let respond = WriterShutdownResponder::new(respond);
             flush_segment_redactors(segment_redactors);
             respond_oneshot_best_effort(respond, ());
             *should_break = true;
