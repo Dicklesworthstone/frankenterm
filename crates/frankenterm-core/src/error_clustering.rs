@@ -404,11 +404,22 @@ impl ErrorClusterer {
         for old_root in to_merge {
             if let Some(old_meta) = self.cluster_meta.remove(&old_root) {
                 if let Some(new_meta) = self.cluster_meta.get_mut(&new_root) {
-                    new_meta.size += old_meta.size;
-                    new_meta.first_seen_secs =
-                        new_meta.first_seen_secs.min(old_meta.first_seen_secs);
-                    new_meta.last_seen_secs = new_meta.last_seen_secs.max(old_meta.last_seen_secs);
-                    for pid in old_meta.pane_ids {
+                    let ClusterMeta {
+                        size,
+                        representative,
+                        samples,
+                        pane_ids,
+                        first_seen_secs,
+                        last_seen_secs,
+                    } = old_meta;
+
+                    new_meta.size += size;
+                    if first_seen_secs <= new_meta.first_seen_secs {
+                        new_meta.first_seen_secs = first_seen_secs;
+                        new_meta.representative = representative;
+                    }
+                    new_meta.last_seen_secs = new_meta.last_seen_secs.max(last_seen_secs);
+                    for pid in pane_ids {
                         if !new_meta.pane_ids.contains(&pid) {
                             new_meta.pane_ids.push(pid);
                         }
@@ -417,9 +428,7 @@ impl ErrorClusterer {
                         .config
                         .max_samples_per_cluster
                         .saturating_sub(new_meta.samples.len());
-                    new_meta
-                        .samples
-                        .extend(old_meta.samples.into_iter().take(remaining));
+                    new_meta.samples.extend(samples.into_iter().take(remaining));
                 }
             }
         }
@@ -577,10 +586,7 @@ mod tests {
         assert_eq!(cfg.num_bands, default.num_bands);
         assert_eq!(cfg.shingle_size, default.shingle_size);
         assert_eq!(cfg.max_clusters, default.max_clusters);
-        assert_eq!(
-            cfg.max_samples_per_cluster,
-            default.max_samples_per_cluster
-        );
+        assert_eq!(cfg.max_samples_per_cluster, default.max_samples_per_cluster);
     }
 
     #[test]
@@ -726,6 +732,20 @@ mod tests {
         let tc = timeout_cluster.unwrap();
         assert_eq!(tc.pane_ids.len(), 3);
         assert_eq!(tc.size, 3);
+    }
+
+    #[test]
+    fn clusterer_preserves_earliest_representative_when_merge_root_changes() {
+        let mut c = ErrorClusterer::with_defaults();
+        let first_text = "ConnectionRefusedError: port 5432";
+        let second_text = "ConnectionRefusedError: port 3306";
+        let first_id = c.insert(first_text, Some(1), 100);
+        let second_id = c.insert(second_text, Some(2), 200);
+
+        assert_eq!(c.union_find.find(first_id), c.union_find.find(second_id));
+        let info = c.cluster_info(second_id).unwrap();
+        assert_eq!(info.first_seen_secs, 100);
+        assert_eq!(info.representative, first_text);
     }
 
     #[test]

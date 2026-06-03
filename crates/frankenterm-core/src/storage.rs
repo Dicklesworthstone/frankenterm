@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
@@ -829,6 +829,11 @@ enum WriteCommand {
         session_id: String,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Test-only command that panics inside the writer dispatch path.
+    #[cfg(test)]
+    PanicForTest {
+        respond: oneshot::Sender<Result<()>>,
+    },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
 }
@@ -898,6 +903,8 @@ impl std::fmt::Debug for WriteCommand {
             Self::InsertSessionCheckpoint { .. } => "InsertSessionCheckpoint",
             Self::PruneSessionCheckpoints { .. } => "PruneSessionCheckpoints",
             Self::MarkSessionShutdownClean { .. } => "MarkSessionShutdownClean",
+            #[cfg(test)]
+            Self::PanicForTest { .. } => "PanicForTest",
             Self::Shutdown { .. } => "Shutdown",
         };
         write!(f, "WriteCommand::{variant}")
@@ -7400,6 +7407,19 @@ impl Default for SegmentScanQuery {
 /// Maximum commands to drain per batch iteration.
 const WRITER_BATCH_CAP: usize = 128;
 
+static STORAGE_WRITER_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of storage writer dispatch panics recovered in-process.
+#[must_use]
+pub fn storage_writer_panics_total() -> u64 {
+    STORAGE_WRITER_PANICS_TOTAL.load(AtomicOrdering::Relaxed)
+}
+
+#[cfg(test)]
+fn reset_storage_writer_panics_total_for_test() {
+    STORAGE_WRITER_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct MmapSegmentLine {
     id: i64,
@@ -7526,6 +7546,38 @@ impl StorageIoWriterGate {
         self.scheduler.pop_next(storage_io_now_ms())
     }
 
+    fn finish_batch(&mut self) {
+        if self.scheduler.aggregate_items() == 0 {
+            self.next_ordering_sequence_by_stream.clear();
+        }
+    }
+
+    fn reset_after_panic(&mut self) {
+        let queued_items = self.scheduler.aggregate_items();
+        if queued_items > 0 {
+            tracing::warn!(
+                queued_items,
+                "storage IO scheduler discarded queued work after writer dispatch panic"
+            );
+        }
+        let config = self.scheduler.config().clone();
+        self.scheduler = StorageIoScheduler::new(config);
+        self.next_ordering_sequence_by_stream.clear();
+    }
+
+    fn reset_after_scheduler_loss(&mut self) {
+        let queued_items = self.scheduler.aggregate_items();
+        if queued_items > 0 {
+            tracing::warn!(
+                queued_items,
+                "storage IO scheduler reset after losing dispatchable queued work"
+            );
+        }
+        let config = self.scheduler.config().clone();
+        self.scheduler = StorageIoScheduler::new(config);
+        self.next_ordering_sequence_by_stream.clear();
+    }
+
     fn work_item_for_command(&mut self, cmd: &WriteCommand) -> Option<StorageIoWorkItem> {
         match cmd {
             WriteCommand::AppendSegment {
@@ -7602,7 +7654,7 @@ impl StorageIoWriterGate {
 
 fn dispatch_write_command_batch(
     backend: &dyn StorageBackend,
-    batch: VecDeque<WriteCommand>,
+    mut batch: VecDeque<WriteCommand>,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, StreamingRedactor>,
@@ -7610,9 +7662,14 @@ fn dispatch_write_command_batch(
 ) {
     let mut pending_io = HashMap::<u64, WriteCommand>::new();
 
-    for cmd in batch {
+    while let Some(cmd) = batch.pop_front() {
         if *should_break {
-            break;
+            fail_undispatched_write_commands(
+                batch,
+                "storage writer shut down before dispatch".to_string(),
+            );
+            io_gate.finish_batch();
+            return;
         }
 
         if let Some((work_id, decision)) = io_gate.admit_command(&cmd) {
@@ -7644,27 +7701,60 @@ fn dispatch_write_command_batch(
             continue;
         }
 
-        flush_storage_io_pending_commands(
+        if let Some(message) = flush_storage_io_pending_commands(
             backend,
             &mut pending_io,
             should_break,
             mmap_mirror,
             segment_redactors,
             io_gate,
-        );
+        ) {
+            if fail_undispatched_write_commands(batch, message) {
+                *should_break = true;
+            }
+            io_gate.finish_batch();
+            return;
+        }
         if !*should_break {
-            dispatch_write_command_raw(backend, cmd, should_break, mmap_mirror, segment_redactors);
+            if let Some(message) = dispatch_write_command_raw_recovering(
+                backend,
+                cmd,
+                should_break,
+                mmap_mirror,
+                segment_redactors,
+            ) {
+                fail_pending_storage_io_commands(std::mem::take(&mut pending_io), message.clone());
+                if fail_undispatched_write_commands(batch, message) {
+                    *should_break = true;
+                }
+                io_gate.reset_after_panic();
+                return;
+            }
+        } else {
+            fail_undispatched_write_commands(
+                batch,
+                "storage writer shut down before dispatch".to_string(),
+            );
+            io_gate.finish_batch();
+            return;
         }
     }
 
-    flush_storage_io_pending_commands(
+    if let Some(message) = flush_storage_io_pending_commands(
         backend,
         &mut pending_io,
         should_break,
         mmap_mirror,
         segment_redactors,
         io_gate,
-    );
+    ) {
+        if fail_undispatched_write_commands(batch, message) {
+            *should_break = true;
+        }
+        io_gate.finish_batch();
+        return;
+    }
+    io_gate.finish_batch();
 }
 
 fn flush_storage_io_pending_commands(
@@ -7674,7 +7764,7 @@ fn flush_storage_io_pending_commands(
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, StreamingRedactor>,
     io_gate: &mut StorageIoWriterGate,
-) {
+) -> Option<String> {
     while !pending_io.is_empty() && !*should_break {
         let Some(dispatched) = io_gate.pop_next() else {
             let message =
@@ -7684,7 +7774,10 @@ fn flush_storage_io_pending_commands(
                 "storage IO scheduler returned no dispatchable work for queued commands"
             );
             fail_pending_storage_io_commands(std::mem::take(pending_io), message);
-            break;
+            io_gate.reset_after_scheduler_loss();
+            return Some(
+                "storage IO scheduler lost queued writer commands before dispatch".to_string(),
+            );
         };
 
         let work_id = dispatched.item.id;
@@ -7704,13 +7797,186 @@ fn flush_storage_io_pending_commands(
             queued_for_ms = dispatched.queued_for_ms,
             "storage IO scheduler dispatching writer command"
         );
-        dispatch_write_command_raw(backend, cmd, should_break, mmap_mirror, segment_redactors);
+        if let Some(message) = dispatch_write_command_raw_recovering(
+            backend,
+            cmd,
+            should_break,
+            mmap_mirror,
+            segment_redactors,
+        ) {
+            fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+            io_gate.reset_after_panic();
+            return Some(message);
+        }
     }
+    None
 }
 
 fn fail_pending_storage_io_commands(commands: HashMap<u64, WriteCommand>, message: String) {
     for (_, cmd) in commands {
-        respond_storage_io_rejection(cmd, message.clone());
+        fail_undispatched_write_command(cmd, message.clone());
+    }
+}
+
+fn fail_undispatched_write_commands(commands: VecDeque<WriteCommand>, message: String) -> bool {
+    let mut should_break = false;
+    for cmd in commands {
+        should_break |= fail_undispatched_write_command(cmd, message.clone());
+    }
+    should_break
+}
+
+fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
+    match cmd {
+        WriteCommand::AppendSegment { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::RecordGap { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::RecordEvent { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::MarkEventHandled { respond, .. }
+        | WriteCommand::SetEventNote { respond, .. }
+        | WriteCommand::UpsertEventMute { respond, .. }
+        | WriteCommand::UpsertPane { respond, .. }
+        | WriteCommand::UpsertWorkflow { respond, .. }
+        | WriteCommand::UpsertActionPlan { respond, .. }
+        | WriteCommand::InsertPreparedPlan { respond, .. }
+        | WriteCommand::InsertStepLog { respond, .. }
+        | WriteCommand::UpsertActionUndo { respond, .. }
+        | WriteCommand::InsertSavedSearch { respond, .. }
+        | WriteCommand::UpdateSavedSearchRun { respond, .. }
+        | WriteCommand::UpdateSavedSearchSchedule { respond, .. }
+        | WriteCommand::Vacuum { respond }
+        | WriteCommand::UpdateAccountLastUsed { respond, .. }
+        | WriteCommand::UpdateNotificationStatus { respond, .. }
+        | WriteCommand::AcknowledgeNotification { respond, .. }
+        | WriteCommand::IncrementNotificationRetry { respond, .. }
+        | WriteCommand::InsertMuxSession { respond, .. }
+        | WriteCommand::MarkSessionShutdownClean { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::SetEventTriageState { respond, .. }
+        | WriteCommand::AddEventLabel { respond, .. }
+        | WriteCommand::RemoveEventLabel { respond, .. }
+        | WriteCommand::DeleteEventMute { respond, .. }
+        | WriteCommand::MarkActionUndone { respond, .. }
+        | WriteCommand::DeleteAccount { respond, .. }
+        | WriteCommand::ReleaseReservation { respond, .. }
+        | WriteCommand::DeletePaneBookmark { respond, .. }
+        | WriteCommand::DeleteAgentProfile { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::ConsumePreparedPlan { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::UpsertSession { respond, .. }
+        | WriteCommand::RecordAuditAction { respond, .. }
+        | WriteCommand::RecordPolicyDenialAudit { respond, .. }
+        | WriteCommand::InsertApprovalToken { respond, .. }
+        | WriteCommand::RecordMaintenance { respond, .. }
+        | WriteCommand::RecordSecretScanReport { respond, .. }
+        | WriteCommand::RecordUsageMetric { respond, .. }
+        | WriteCommand::RecordNotification { respond, .. }
+        | WriteCommand::InsertPaneBookmark { respond, .. }
+        | WriteCommand::InsertSessionCheckpoint { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::PurgeAuditActions { respond, .. }
+        | WriteCommand::DeleteSavedSearch { respond, .. }
+        | WriteCommand::PruneSegments { respond, .. }
+        | WriteCommand::ExpireStaleReservations { respond }
+        | WriteCommand::RecordUsageMetricsBatch { respond, .. }
+        | WriteCommand::PurgeUsageMetrics { respond, .. }
+        | WriteCommand::PurgeNotificationHistory { respond, .. }
+        | WriteCommand::DeleteEventsBefore { respond, .. }
+        | WriteCommand::DeleteEventsByTier { respond, .. }
+        | WriteCommand::PruneSessionCheckpoints { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::ConsumeApprovalToken { respond, .. }
+        | WriteCommand::ConsumeApprovalTokenByCode { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::SyncFts { respond, .. } | WriteCommand::RebuildFts { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::Checkpoint { respond } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::UpsertAccount { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::CreateReservation { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::InsertAgentProfile { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::GetAgentProfile { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::ListAgentProfiles { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        #[cfg(test)]
+        WriteCommand::PanicForTest { respond } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::Shutdown { respond } => {
+            respond_oneshot_best_effort(respond, ());
+            return true;
+        }
+    }
+    false
+}
+
+fn writer_panic_error<T>(message: &str) -> Result<T> {
+    Err(StorageError::Database(message.to_string()).into())
+}
+
+fn dispatch_write_command_raw_recovering(
+    backend: &dyn StorageBackend,
+    cmd: WriteCommand,
+    should_break: &mut bool,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+) -> Option<String> {
+    let command_was_shutdown = matches!(cmd, WriteCommand::Shutdown { .. });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch_write_command_raw(backend, cmd, should_break, mmap_mirror, segment_redactors);
+    }));
+    match outcome {
+        Ok(()) => None,
+        Err(payload) => {
+            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            let message = format!(
+                "storage writer recovered from dispatch panic: {}",
+                panic_payload_summary(payload.as_ref())
+            );
+            tracing::error!(
+                writer_panics_total = storage_writer_panics_total(),
+                error = %message,
+                "storage writer dispatch panic recovered; failing undispatched batch commands"
+            );
+            flush_segment_redactors(segment_redactors);
+            if command_was_shutdown {
+                *should_break = true;
+            }
+            Some(message)
+        }
+    }
+}
+
+fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -8206,6 +8472,99 @@ mod writer_io_scheduler_tests {
         assert_eq!(first.item.class, StorageIoClass::FtsIncremental);
         assert_eq!(second.item.id, rebuild_id);
         assert_eq!(second.item.class, StorageIoClass::FtsRebuild);
+    }
+
+    #[test]
+    fn writer_io_gate_clears_ordering_sequences_after_batch_finishes() {
+        let mut gate = tiny_writer_gate();
+        let segment = segment_command(11, "first segment");
+        let gap = gap_command(12, "capture gap");
+
+        let (_, segment_decision) = gate.admit_command(&segment).unwrap();
+        let (_, gap_decision) = gate.admit_command(&gap).unwrap();
+
+        assert!(segment_decision.outcome.accepted());
+        assert!(gap_decision.outcome.accepted());
+        assert_eq!(gate.next_ordering_sequence_by_stream.len(), 2);
+
+        while gate.pop_next().is_some() {}
+        gate.finish_batch();
+
+        assert!(gate.next_ordering_sequence_by_stream.is_empty());
+
+        let next_segment = segment_command(11, "new batch segment");
+        let (_, next_decision) = gate.admit_command(&next_segment).unwrap();
+        assert!(next_decision.outcome.accepted());
+        let dispatched = gate.pop_next().unwrap();
+        let ordering = dispatched.item.ordering.unwrap();
+        assert_eq!(ordering.stream, "pane:11");
+        assert_eq!(ordering.sequence, 0);
+    }
+
+    #[test]
+    fn writer_batch_recovers_from_dispatch_panic_and_fails_undispatched_tail() {
+        reset_storage_writer_panics_total_for_test();
+
+        run_storage_async_test(async {
+            let backend = RusqliteBackend::new(rusqlite::Connection::open_in_memory().unwrap());
+            let mut gate = tiny_writer_gate();
+            let mut should_break = false;
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, StreamingRedactor>::new();
+            let (panic_tx, panic_rx) = oneshot::channel();
+            let (tail_tx, tail_rx) = oneshot::channel();
+            let mut batch = VecDeque::new();
+            batch.push_back(WriteCommand::PanicForTest { respond: panic_tx });
+            batch.push_back(WriteCommand::MarkEventHandled {
+                event_id: 42,
+                workflow_id: None,
+                status: "handled".to_string(),
+                respond: tail_tx,
+            });
+
+            dispatch_write_command_batch(
+                &backend,
+                batch,
+                &mut should_break,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+                &mut gate,
+            );
+
+            assert!(!should_break);
+            assert_eq!(storage_writer_panics_total(), 1);
+            assert_eq!(gate.scheduler.aggregate_items(), 0);
+            assert!(gate.next_ordering_sequence_by_stream.is_empty());
+            assert!(crate::runtime_async::oneshot_recv(panic_rx).await.is_err());
+            let tail_result = crate::runtime_async::oneshot_recv(tail_rx)
+                .await
+                .expect("undispatched tail command should receive a panic error");
+            let tail_error = tail_result.expect_err("tail command should fail closed");
+            assert!(
+                tail_error
+                    .to_string()
+                    .contains("storage writer recovered from dispatch panic"),
+                "{tail_error}"
+            );
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let mut shutdown_batch = VecDeque::new();
+            shutdown_batch.push_back(WriteCommand::Shutdown {
+                respond: shutdown_tx,
+            });
+            dispatch_write_command_batch(
+                &backend,
+                shutdown_batch,
+                &mut should_break,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+                &mut gate,
+            );
+            crate::runtime_async::oneshot_recv(shutdown_rx)
+                .await
+                .expect("writer should still process a later shutdown");
+            assert!(should_break);
+        });
     }
 }
 
@@ -8785,6 +9144,10 @@ fn dispatch_write_command_raw(
             // mark_session_shutdown_clean direct-rusqlite path.
             let result = mark_session_shutdown_clean_backend(backend, &session_id);
             respond_oneshot_best_effort(respond, result);
+        }
+        #[cfg(test)]
+        WriteCommand::PanicForTest { respond: _respond } => {
+            panic!("storage writer panic injection for test");
         }
         WriteCommand::Shutdown { respond } => {
             flush_segment_redactors(segment_redactors);
