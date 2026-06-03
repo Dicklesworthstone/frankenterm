@@ -121,38 +121,50 @@ impl ScriptingEngine for LuaEngine {
     }
 
     fn fire_event(&self, event: &str, payload: &Value) -> Result<Vec<Action>> {
-        let (mut handlers, lua) = {
+        let mut handlers = {
             let state = self.state_guard();
-            let handlers = state
+            state
                 .hooks
                 .values()
                 .filter(|(registered_event, handler)| {
                     registered_event == event && handler.matches_event(event)
                 })
                 .map(|(_, handler)| handler.clone())
-                .collect::<Vec<_>>();
-            (handlers, state.lua.clone())
+                .collect::<Vec<_>>()
         };
         handlers.sort_by_key(|handler| handler.priority);
 
         let mut actions = Vec::new();
+        // Run the Rust hook handlers with the state lock released. These are the
+        // re-entrancy-prone callbacks (a handler may call back into the engine),
+        // so they must not run while we hold `state`.
         for handler in handlers {
             let mut from_handler = handler.call(event, payload)?;
             actions.append(&mut from_handler);
         }
 
-        if let Some(lua) = lua.as_ref() {
-            let lua_payload = dynamic_to_lua_value(lua, payload.clone())
-                .context("converting fire_event payload to lua value")?;
-            let result = emit_sync_callback(lua, (event.to_string(), (lua_payload,)))
-                .with_context(|| format!("emit_sync_callback({event})"))?;
-            if !matches!(result, mlua::Value::Nil) {
-                let dyn_result = lua_value_to_dynamic(result)
-                    .context("converting lua callback result to dynamic value")?;
-                actions.push(Action::Custom {
-                    name: format!("lua:{event}"),
-                    payload: dyn_result,
-                });
+        // Emit the Lua-side `wezterm.on` handlers. `mlua::Lua` (0.9) is not
+        // `Clone`, and under the `send` feature it is `Send` but not `Sync`, so
+        // it cannot be cloned out of the lock or wrapped in `Arc`/`Rc` to drop
+        // the guard. We instead borrow it under a fresh, short-lived guard. This
+        // is safe against the non-reentrant `Mutex`: the callbacks execute inside
+        // the Lua VM and hold no handle back into `LuaEngine`, so they cannot
+        // re-enter `state_guard()`.
+        {
+            let state = self.state_guard();
+            if let Some(lua) = state.lua.as_ref() {
+                let lua_payload = dynamic_to_lua_value(lua, payload.clone())
+                    .context("converting fire_event payload to lua value")?;
+                let result = emit_sync_callback(lua, (event.to_string(), (lua_payload,)))
+                    .with_context(|| format!("emit_sync_callback({event})"))?;
+                if !matches!(result, mlua::Value::Nil) {
+                    let dyn_result = lua_value_to_dynamic(result)
+                        .context("converting lua callback result to dynamic value")?;
+                    actions.push(Action::Custom {
+                        name: format!("lua:{event}"),
+                        payload: dyn_result,
+                    });
+                }
             }
         }
 
