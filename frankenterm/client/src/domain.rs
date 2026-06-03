@@ -1331,15 +1331,41 @@ mod tests {
     /// finish within `secs`. Used to turn a *deadlock* regression into a fast,
     /// obvious failure instead of a hung test binary (CI would otherwise just
     /// time out the whole suite with no signal).
-    fn deadlock_watchdog(secs: u64, label: &'static str) {
+    /// Cancellable watchdog. Returns a guard; when the guard drops (test
+    /// finished, including on panic/unwind) the watchdog thread observes the
+    /// flag and exits cleanly. This is critical: a fire-and-forget watchdog that
+    /// outlives its test would `process::exit` during a *later* test if the whole
+    /// suite runs slower than the timeout (e.g. on a busy CI/swarm host), killing
+    /// the run spuriously. The watchdog only aborts if the guard is still alive
+    /// at the deadline (i.e. the test really hung).
+    #[must_use = "hold the guard for the duration of the test"]
+    fn deadlock_watchdog(secs: u64, label: &'static str) -> WatchdogGuard {
+        use std::sync::atomic::Ordering;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            eprintln!(
-                "WATCHDOG: `{label}` did not complete within {secs}s — likely a \
-                 mux-lock deadlock regression (read guard held across a write lock)."
-            );
-            std::process::exit(97);
+            for _ in 0..secs.saturating_mul(20) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+            if !flag.load(Ordering::SeqCst) {
+                eprintln!(
+                    "WATCHDOG: `{label}` did not complete within {secs}s — likely a \
+                     mux-lock deadlock regression (read guard held across a write lock)."
+                );
+                std::process::exit(97);
+            }
         });
+        WatchdogGuard(done)
+    }
+
+    struct WatchdogGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Regression guard for the remote-attach deadlock: `process_pane_list`
@@ -1350,7 +1376,8 @@ mod tests {
     /// regression fail fast instead of hanging.
     #[test]
     fn process_pane_list_seeds_spawned_client_pane_alt_screen_state() {
-        deadlock_watchdog(30, "process_pane_list_seeds_spawned_client_pane_alt_screen_state");
+        let _wd =
+            deadlock_watchdog(30, "process_pane_list_seeds_spawned_client_pane_alt_screen_state");
         let _lock = TEST_LOCK.lock().unwrap();
         ensure_test_scheduler();
         let mux = Arc::new(Mux::new(None));

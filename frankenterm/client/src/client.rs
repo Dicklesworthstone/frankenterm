@@ -1863,6 +1863,39 @@ mod tests {
             .block_on(future)
     }
 
+    /// Cancellable hang watchdog. Returns a guard; dropping it (test finished,
+    /// even on panic) stops the watchdog. A fire-and-forget watchdog that
+    /// outlived its test could `process::exit` during a *later* test if the
+    /// whole suite ran slower than the timeout (busy CI/swarm host), spuriously
+    /// killing the run. The watchdog only aborts if the guard is still alive at
+    /// the deadline (the test genuinely hung).
+    struct WatchdogGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[must_use = "hold the guard for the duration of the test"]
+    fn hang_watchdog(secs: u64, label: &'static str, exit_code: i32) -> WatchdogGuard {
+        use std::sync::atomic::Ordering;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            for _ in 0..secs.saturating_mul(20) {
+                std::thread::sleep(Duration::from_millis(50));
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+            if !flag.load(Ordering::SeqCst) {
+                eprintln!("WATCHDOG: `{label}` HUNG after {secs}s");
+                std::process::exit(exit_code);
+            }
+        });
+        WatchdogGuard(done)
+    }
+
     #[cfg(unix)]
     fn unique_handshake_socket_path() -> PathBuf {
         let nanos = SystemTime::now()
@@ -2086,11 +2119,7 @@ mod tests {
     fn reader_receives_delayed_handshake_reply_ft_connect_fix() {
         // Watchdog: if the reader never wakes, fail fast instead of waiting out
         // the 60s in-flight handshake timeout.
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(12));
-            eprintln!("WATCHDOG: delayed-handshake reader HUNG — readiness regression");
-            std::process::exit(98);
-        });
+        let _wd = hang_watchdog(12, "delayed-handshake reader (readiness regression)", 98);
 
         reset_test_logger();
         let socket_path = unique_handshake_socket_path();
@@ -2192,11 +2221,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn main_thread_pane_write_round_trips_ft_connect_fix() {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(12));
-            eprintln!("WATCHDOG: main-thread pane write HUNG — block_on/IO regression");
-            std::process::exit(96);
-        });
+        let _wd = hang_watchdog(12, "main-thread pane write (block_on/IO regression)", 96);
 
         reset_test_logger();
         let socket_path = unique_handshake_socket_path();
