@@ -79,12 +79,17 @@ impl ScriptingEngine for LuaEngine {
 
         let lua = make_lua_context(path)
             .with_context(|| format!("make_lua_context({})", path.display()))?;
-        let config_value: mlua::Value = promise::spawn::block_on(
-            lua.load(source.trim_start_matches('\u{FEFF}'))
-                .set_name(path.to_string_lossy())
-                .eval_async(),
-        )
-        .with_context(|| format!("executing lua config {}", path.display()))?;
+        // Synchronous, CPU-bound config eval: use the sync `eval()`, never
+        // `promise::spawn::block_on(eval_async())`. The latter panics if this is
+        // ever reached on the GUI main-thread spawn queue (the same class as the
+        // config.rs main-thread regression) and, on asupersync, `block_on` does
+        // not drive I/O for a directly-polled future. Sync eval avoids the async
+        // runtime entirely, which is what a synchronous config load wants.
+        let config_value: mlua::Value = lua
+            .load(source.trim_start_matches('\u{FEFF}'))
+            .set_name(path.to_string_lossy())
+            .eval()
+            .with_context(|| format!("executing lua config {}", path.display()))?;
 
         let cfg = Config::from_lua(config_value, &lua).with_context(|| {
             format!(
@@ -182,12 +187,12 @@ impl ScriptingEngine for LuaEngine {
             .lua
             .as_ref()
             .ok_or_else(|| anyhow!("lua state unexpectedly missing after initialization"))?;
-        promise::spawn::block_on(
-            lua.load(&source)
-                .set_name(path.to_string_lossy())
-                .exec_async(),
-        )
-        .with_context(|| format!("executing lua extension {}", path.display()))?;
+        // Synchronous extension load: sync `exec()`, not block_on(exec_async())
+        // (see eval_config above for the rationale).
+        lua.load(&source)
+            .set_name(path.to_string_lossy())
+            .exec()
+            .with_context(|| format!("executing lua extension {}", path.display()))?;
 
         let extension_id = state.next_extension_id;
         state.next_extension_id = state.next_extension_id.saturating_add(1);
