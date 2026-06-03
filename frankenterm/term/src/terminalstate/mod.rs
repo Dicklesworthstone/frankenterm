@@ -120,6 +120,11 @@ fn next_sequence_no(seqno: SequenceNo) -> SequenceNo {
 
 impl TabStop {
     fn new(screen_width: usize, tab_width: usize) -> Self {
+        // Clamp to >= 1: `i % tab_width` here (and in `resize`) is a
+        // mod-by-zero panic for a zero width. The only production caller
+        // passes the hardcoded default of 8 today, but the invariant lives
+        // with the field so future callers can't reintroduce the trap.
+        let tab_width = tab_width.max(1);
         let mut tabs = Vec::with_capacity(screen_width);
 
         for i in 0..screen_width {
@@ -3316,6 +3321,18 @@ mod tests {
         for i in 0..20 {
             assert_eq!(ts.tabs[i], i % 4 == 0, "col {} mismatch", i);
         }
+    }
+
+    #[test]
+    fn tabstop_zero_width_clamps_to_one_instead_of_mod_by_zero() {
+        // Pre-clamp, `i % tab_width` in the constructor (and `resize`) was a
+        // mod-by-zero panic for tab_width == 0. The clamp treats it as 1:
+        // every column is a tab stop, and resize stays panic-free.
+        let mut ts = TabStop::new(8, 0);
+        assert!(ts.tabs.iter().all(|&t| t), "width 1 → every column tabbed");
+        ts.resize(16);
+        assert_eq!(ts.tabs.len(), 16);
+        assert!(ts.tabs.iter().all(|&t| t));
     }
 
     #[test]
