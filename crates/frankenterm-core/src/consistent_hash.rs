@@ -237,17 +237,28 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
 
     /// Compute distribution statistics by looking up sample keys.
     fn compute_distribution(&self, sample_count: u64) -> (f64, f64, f64) {
-        let mut counts: HashMap<&N, u64> = HashMap::new();
+        // Seed every physical node at zero so starved nodes (those that receive
+        // no sample keys) are counted in the spread and minimum. Omitting them —
+        // as a `HashMap` populated only on first hit would — understates the
+        // variance and overstates `min_fraction`, making an uneven ring look
+        // more balanced than it actually is.
+        let mut counts: HashMap<&N, u64> = self
+            .node_positions
+            .keys()
+            .map(|node| (node, 0u64))
+            .collect();
+
+        if counts.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
 
         for i in 0..sample_count {
             let key = format!("sample-key-{}", i);
             if let Some(node) = self.get_node(&key) {
-                *counts.entry(node).or_insert(0) += 1;
+                if let Some(count) = counts.get_mut(node) {
+                    *count += 1;
+                }
             }
-        }
-
-        if counts.is_empty() {
-            return (0.0, 0.0, 0.0);
         }
 
         let n = self.node_positions.len() as f64;
@@ -261,16 +272,24 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
             .sum::<f64>()
             / n;
 
-        let stddev = variance.sqrt() / expected; // Normalized by expected
+        // Normalized by expected; guard the degenerate zero-sample case.
+        let stddev = if expected > 0.0 {
+            variance.sqrt() / expected
+        } else {
+            0.0
+        };
 
         let min_count = *counts.values().min().unwrap_or(&0) as f64;
         let max_count = *counts.values().max().unwrap_or(&0) as f64;
 
-        (
-            stddev,
-            min_count / sample_count as f64,
-            max_count / sample_count as f64,
-        )
+        let sample_count_f = sample_count as f64;
+        let (min_fraction, max_fraction) = if sample_count_f > 0.0 {
+            (min_count / sample_count_f, max_count / sample_count_f)
+        } else {
+            (0.0, 0.0)
+        };
+
+        (stddev, min_fraction, max_fraction)
     }
 }
 
@@ -570,6 +589,29 @@ mod tests {
         let stats = ring.stats();
         assert_eq!(stats.node_count, 0);
         assert!(stats.distribution_stddev.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_distribution_accounts_for_starved_nodes() {
+        // With fewer sample keys than physical nodes, the pigeonhole principle
+        // guarantees that at least (nodes - samples) nodes receive zero keys.
+        // The distribution stats must reflect those starved nodes: `min_fraction`
+        // is 0 because at least one node got nothing. Pre-fix, starved nodes were
+        // omitted from the tally and `min_fraction` was reported as > 0, hiding
+        // the imbalance and overstating ring health.
+        let nodes: Vec<String> = (0..10).map(|i| format!("node-{i}")).collect();
+        let ring = HashRing::with_nodes(50, nodes);
+
+        let (_stddev, min_fraction, max_fraction) = ring.compute_distribution(3);
+
+        assert_eq!(
+            min_fraction, 0.0,
+            "3 keys across 10 nodes leaves >=7 nodes starved; min must be 0"
+        );
+        assert!(
+            max_fraction > 0.0,
+            "the node(s) that did receive keys must show a positive fraction"
+        );
     }
 
     #[test]
