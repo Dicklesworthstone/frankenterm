@@ -1,12 +1,9 @@
 use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
-use finl_unicode::grapheme_clusters::Graphemes;
+pub use frankenterm_gui::status_text::{parse_status_text, parse_status_text_with_cell_limit};
 use mlua::FromLua;
 use termwiz::cell::{Cell, CellAttributes, unicode_column_width};
 use termwiz::color::{AnsiColor, ColorSpec};
-use termwiz::escape::csi::Sgr;
-use termwiz::escape::parser::Parser;
-use termwiz::escape::{Action, CSI, ControlCode};
 use termwiz::surface::SEQ_ZERO;
 use termwiz_funcs::{FormatColor, FormatItem, format_as_escapes};
 use wezterm_term::{Line, Progress};
@@ -449,7 +446,11 @@ impl TabBarState {
             Self::integrated_title_buttons(mouse_x, &mut x, config, &mut items, &mut line, &colors);
         }
 
-        let left_status_line = parse_status_text(left_status, black_cell.attrs().clone());
+        let left_status_line = parse_status_text_with_cell_limit(
+            left_status,
+            black_cell.attrs().clone(),
+            title_width.saturating_sub(x),
+        );
         if left_status_line.len() > 0 {
             items.push(TabEntry {
                 item: TabBarItem::LeftStatus,
@@ -498,13 +499,14 @@ impl TabBarState {
             let tab_start_idx = x;
 
             let esc = format_as_escapes(tab_title.items.clone()).expect("already parsed ok above");
-            let mut tab_line = parse_status_text(
+            let mut tab_line = parse_status_text_with_cell_limit(
                 &esc,
                 if config.use_fancy_tab_bar {
                     CellAttributes::default()
                 } else {
                     cell_attrs.clone()
                 },
+                tab_width_max,
             );
 
             let title = tab_line.clone();
@@ -597,7 +599,11 @@ impl TabBarState {
 
         let status_space_available = title_width.saturating_sub(x);
 
-        let mut right_status_line = parse_status_text(right_status, black_cell.attrs().clone());
+        let mut right_status_line = parse_status_text_with_cell_limit(
+            right_status,
+            black_cell.attrs().clone(),
+            status_space_available,
+        );
         items.push(TabEntry {
             item: TabBarItem::RightStatus,
             title: right_status_line.clone(),
@@ -640,111 +646,6 @@ impl TabBarState {
 
         items
     }
-}
-
-pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
-    let mut pen = default_cell.clone();
-    let mut cells = vec![];
-    let mut ignoring = false;
-    let mut print_buffer = String::new();
-
-    fn flush_print(buf: &mut String, cells: &mut Vec<Cell>, pen: &CellAttributes) {
-        for g in Graphemes::new(buf.as_str()) {
-            let cell = Cell::new_grapheme(g, pen.clone(), None);
-            let width = cell.width();
-            cells.push(cell);
-            for _ in 1..width {
-                // Line/Screen expect double wide graphemes to be followed by a blank in
-                // the next column position, otherwise we'll render incorrectly
-                cells.push(Cell::blank_with_attrs(pen.clone()));
-            }
-        }
-        buf.clear();
-    }
-
-    let mut parser = Parser::new();
-    parser.parse(text.as_bytes(), |action| {
-        if ignoring {
-            return;
-        }
-        match action {
-            Action::Print(c) => print_buffer.push(c),
-            Action::PrintString(s) => print_buffer.push_str(&s),
-            Action::Control(c) => {
-                flush_print(&mut print_buffer, &mut cells, &pen);
-                match c {
-                    ControlCode::CarriageReturn | ControlCode::LineFeed => {
-                        ignoring = true;
-                    }
-                    _ => {}
-                }
-            }
-            Action::CSI(csi) => {
-                flush_print(&mut print_buffer, &mut cells, &pen);
-                match csi {
-                    CSI::Sgr(sgr) => match sgr {
-                        Sgr::Reset => pen = default_cell.clone(),
-                        Sgr::Intensity(i) => {
-                            pen.set_intensity(i);
-                        }
-                        Sgr::Underline(u) => {
-                            pen.set_underline(u);
-                        }
-                        Sgr::Overline(o) => {
-                            pen.set_overline(o);
-                        }
-                        Sgr::VerticalAlign(o) => {
-                            pen.set_vertical_align(o);
-                        }
-                        Sgr::Blink(b) => {
-                            pen.set_blink(b);
-                        }
-                        Sgr::Italic(i) => {
-                            pen.set_italic(i);
-                        }
-                        Sgr::Inverse(inverse) => {
-                            pen.set_reverse(inverse);
-                        }
-                        Sgr::Invisible(invis) => {
-                            pen.set_invisible(invis);
-                        }
-                        Sgr::StrikeThrough(strike) => {
-                            pen.set_strikethrough(strike);
-                        }
-                        Sgr::Foreground(col) => {
-                            if let ColorSpec::Default = col {
-                                pen.set_foreground(default_cell.foreground());
-                            } else {
-                                pen.set_foreground(col);
-                            }
-                        }
-                        Sgr::Background(col) => {
-                            if let ColorSpec::Default = col {
-                                pen.set_background(default_cell.background());
-                            } else {
-                                pen.set_background(col);
-                            }
-                        }
-                        Sgr::UnderlineColor(col) => {
-                            pen.set_underline_color(col);
-                        }
-                        Sgr::Font(_) => {}
-                    },
-                    _ => {}
-                }
-            }
-            Action::OperatingSystemCommand(_)
-            | Action::DeviceControl(_)
-            | Action::Esc(_)
-            | Action::KittyImage(_)
-            | Action::XtGetTcap(_)
-            | Action::Sixel(_) => {
-                flush_print(&mut print_buffer, &mut cells, &pen);
-            }
-        }
-    });
-    flush_print(&mut print_buffer, &mut cells, &pen);
-    Line::from_cells(cells, SEQ_ZERO)
 }
 
 #[cfg(test)]

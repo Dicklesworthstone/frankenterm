@@ -183,10 +183,11 @@ impl SelectorState {
                 changes.push(Change::Text("    ".to_string()));
             }
 
-            let mut line = crate::tabbar::parse_status_text(&entry.label, attr.clone());
-            if line.len() > max_width {
-                line.resize(max_width, termwiz::surface::SEQ_ZERO);
-            }
+            let line = crate::tabbar::parse_status_text_with_cell_limit(
+                &entry.label,
+                attr.clone(),
+                max_width,
+            );
             changes.append(&mut line.changes(&attr));
             changes.push(Change::Text(" ".to_string()));
             if entry_idx == self.active_idx {

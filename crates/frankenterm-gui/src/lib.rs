@@ -13,6 +13,186 @@ pub mod osc8_gui;
 pub mod plugins;
 pub mod renderer_slo;
 pub mod rollout_env;
+pub mod status_text {
+    use finl_unicode::grapheme_clusters::Graphemes;
+    use termwiz::cell::{Cell, CellAttributes};
+    use termwiz::color::ColorSpec;
+    use termwiz::escape::csi::Sgr;
+    use termwiz::escape::parser::Parser;
+    use termwiz::escape::{Action, CSI, ControlCode};
+    use termwiz::surface::SEQ_ZERO;
+    use wezterm_term::Line;
+
+    const MAX_STATUS_PARSE_CELLS: usize = 4096;
+    const MAX_STATUS_PARSE_BYTES: usize = 64 * 1024;
+    const STATUS_BYTES_PER_CELL_BUDGET: usize = 64;
+
+    pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
+        parse_status_text_with_cell_limit(text, default_cell, MAX_STATUS_PARSE_CELLS)
+    }
+
+    pub fn parse_status_text_with_cell_limit(
+        text: &str,
+        default_cell: CellAttributes,
+        max_cells: usize,
+    ) -> Line {
+        let max_cells = max_cells.min(MAX_STATUS_PARSE_CELLS);
+        if max_cells == 0 {
+            return Line::with_width(0, SEQ_ZERO);
+        }
+
+        let max_bytes = max_cells
+            .saturating_mul(STATUS_BYTES_PER_CELL_BUDGET)
+            .clamp(1, MAX_STATUS_PARSE_BYTES);
+        let text = status_text_prefix(text, max_bytes);
+        let mut pen = default_cell.clone();
+        let mut cells = vec![];
+        let mut ignoring = false;
+        let mut print_buffer = String::new();
+
+        fn flush_print(
+            buf: &mut String,
+            cells: &mut Vec<Cell>,
+            pen: &CellAttributes,
+            max_cells: usize,
+        ) {
+            for g in Graphemes::new(buf.as_str()) {
+                if cells.len() >= max_cells {
+                    break;
+                }
+                let cell = Cell::new_grapheme(g, pen.clone(), None);
+                let width = cell.width();
+                if cells.len().saturating_add(width) > max_cells {
+                    break;
+                }
+                cells.push(cell);
+                for _ in 1..width {
+                    // Line/Screen expect double wide graphemes to be followed by a blank in
+                    // the next column position, otherwise we'll render incorrectly.
+                    cells.push(Cell::blank_with_attrs(pen.clone()));
+                }
+            }
+            buf.clear();
+        }
+
+        let mut parser = Parser::new();
+        parser.parse(text.as_bytes(), |action| {
+            if ignoring || cells.len() >= max_cells {
+                return;
+            }
+            match action {
+                Action::Print(c) => print_buffer.push(c),
+                Action::PrintString(s) => print_buffer.push_str(&s),
+                Action::Control(c) => {
+                    flush_print(&mut print_buffer, &mut cells, &pen, max_cells);
+                    match c {
+                        ControlCode::CarriageReturn | ControlCode::LineFeed => {
+                            ignoring = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Action::CSI(csi) => {
+                    flush_print(&mut print_buffer, &mut cells, &pen, max_cells);
+                    match csi {
+                        CSI::Sgr(sgr) => match sgr {
+                            Sgr::Reset => pen = default_cell.clone(),
+                            Sgr::Intensity(i) => {
+                                pen.set_intensity(i);
+                            }
+                            Sgr::Underline(u) => {
+                                pen.set_underline(u);
+                            }
+                            Sgr::Overline(o) => {
+                                pen.set_overline(o);
+                            }
+                            Sgr::VerticalAlign(o) => {
+                                pen.set_vertical_align(o);
+                            }
+                            Sgr::Blink(b) => {
+                                pen.set_blink(b);
+                            }
+                            Sgr::Italic(i) => {
+                                pen.set_italic(i);
+                            }
+                            Sgr::Inverse(inverse) => {
+                                pen.set_reverse(inverse);
+                            }
+                            Sgr::Invisible(invis) => {
+                                pen.set_invisible(invis);
+                            }
+                            Sgr::StrikeThrough(strike) => {
+                                pen.set_strikethrough(strike);
+                            }
+                            Sgr::Foreground(col) => {
+                                if let ColorSpec::Default = col {
+                                    pen.set_foreground(default_cell.foreground());
+                                } else {
+                                    pen.set_foreground(col);
+                                }
+                            }
+                            Sgr::Background(col) => {
+                                if let ColorSpec::Default = col {
+                                    pen.set_background(default_cell.background());
+                                } else {
+                                    pen.set_background(col);
+                                }
+                            }
+                            Sgr::UnderlineColor(col) => {
+                                pen.set_underline_color(col);
+                            }
+                            Sgr::Font(_) => {}
+                        },
+                        _ => {}
+                    }
+                }
+                Action::OperatingSystemCommand(_)
+                | Action::DeviceControl(_)
+                | Action::Esc(_)
+                | Action::KittyImage(_)
+                | Action::XtGetTcap(_)
+                | Action::Sixel(_) => {
+                    flush_print(&mut print_buffer, &mut cells, &pen, max_cells);
+                }
+            }
+        });
+        flush_print(&mut print_buffer, &mut cells, &pen, max_cells);
+        Line::from_cells(cells, SEQ_ZERO)
+    }
+
+    fn status_text_prefix(text: &str, max_bytes: usize) -> &str {
+        if text.len() <= max_bytes {
+            return text;
+        }
+
+        let mut end = max_bytes;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn status_text_parser_respects_cell_limit() {
+            let line = parse_status_text_with_cell_limit("abcdef", CellAttributes::default(), 3);
+
+            assert_eq!(line.len(), 3);
+            assert_eq!(line.as_str().as_ref(), "abc");
+        }
+
+        #[test]
+        fn status_text_parser_does_not_split_double_width_graphemes() {
+            let line =
+                parse_status_text_with_cell_limit("\u{1f600}abc", CellAttributes::default(), 1);
+
+            assert_eq!(line.len(), 0);
+        }
+    }
+}
 pub mod selector_math {
     pub fn selector_label_count(filtered_entries_len: usize, max_items: usize) -> usize {
         filtered_entries_len.min(max_items.saturating_add(1))
