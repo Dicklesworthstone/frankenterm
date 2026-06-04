@@ -258,8 +258,10 @@ pub struct MappedQuads<'a> {
 
 pub struct WebGpuMappedVertexBuffer {
     mapping: wgpu::BufferViewMut<'static>,
-    // Owner mapping, must be dropped after mapping
+    // Owner mapping, must be dropped after mapping.
     _slice: wgpu::BufferSlice<'static>,
+    // Drop the vertex buffer owner after the mapped view and slice.
+    _owner: RefMut<'static, VertexBuffer>,
 }
 
 pub struct WebGpuVertexBuffer {
@@ -286,18 +288,6 @@ impl WebGpuVertexBuffer {
             }),
             num_vertices,
             state: Rc::clone(state),
-        }
-    }
-
-    pub fn map(&self) -> WebGpuMappedVertexBuffer {
-        unsafe {
-            let slice = self.buf.slice(..).extend_lifetime();
-            let mapping = slice.get_mapped_range_mut();
-
-            WebGpuMappedVertexBuffer {
-                mapping,
-                _slice: slice,
-            }
         }
     }
 
@@ -492,7 +482,16 @@ impl TripleVertexBuffer {
                     mapping,
                 })
             }
-            VertexBuffer::WebGpu(vb) => MappedVertexBuffer::WebGpu(vb.map()),
+            VertexBuffer::WebGpu(vb) => {
+                let slice = unsafe { vb.buf.slice(..).extend_lifetime() };
+                let mapping = slice.get_mapped_range_mut();
+
+                MappedVertexBuffer::WebGpu(WebGpuMappedVertexBuffer {
+                    mapping,
+                    _slice: slice,
+                    _owner: bufs,
+                })
+            }
         };
 
         MappedQuads {
