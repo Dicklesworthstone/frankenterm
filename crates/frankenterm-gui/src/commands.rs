@@ -3,9 +3,11 @@ use KeyAssignment::*;
 use config::keyassignment::*;
 use config::window::WindowLevel;
 use config::{ConfigHandle, DeferredKeyCode};
+use frankenterm_gui::command_rules::{
+    compute_default_actions, domain_detach_command_is_available, pane_select_default_keys,
+};
 use mux::Mux;
 use mux::domain::DomainState;
-use ordered_float::NotNan;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::convert::TryFrom;
@@ -77,10 +79,6 @@ pub struct ExpandedCommand {
     pub keys: Vec<(Modifiers, KeyCode)>,
     pub menubar: &'static [&'static str],
     pub icon: Option<Cow<'static, str>>,
-}
-
-fn domain_detach_command_is_available(name: &str, state: DomainState, detachable: bool) -> bool {
-    state == DomainState::Attached && detachable && name != "local"
 }
 
 impl std::fmt::Debug for CommandDef {
@@ -865,7 +863,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Enter Pane selection mode".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "9".into())],
+            keys: pane_select_default_keys(PaneSelectMode::Activate),
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -876,7 +874,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Swap a pane with the active pane".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "0".into())],
+            keys: pane_select_default_keys(PaneSelectMode::SwapWithActive),
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -887,7 +885,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Swap a pane with the active pane, keeping focus".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "0".into())],
+            keys: pane_select_default_keys(PaneSelectMode::SwapWithActiveKeepFocus),
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -898,7 +896,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Move a pane into its own tab".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "t".into())],
+            keys: pane_select_default_keys(PaneSelectMode::MoveToNewTab),
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -909,7 +907,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Move a pane into its own window".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "y".into())],
+            keys: pane_select_default_keys(PaneSelectMode::MoveToNewWindow),
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -2121,260 +2119,4 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
     })
-}
-
-/// Returns a list of key assignment actions that should be
-/// included in the default key assignments and command palette.
-fn compute_default_actions() -> Vec<KeyAssignment> {
-    // These are ordered by their position within the various menus
-    return vec![
-        // ----------------- WezTerm
-        ReloadConfiguration,
-        #[cfg(target_os = "macos")]
-        HideApplication,
-        #[cfg(target_os = "macos")]
-        QuitApplication,
-        // ----------------- Shell
-        SpawnTab(SpawnTabDomain::CurrentPaneDomain),
-        SpawnWindow,
-        SplitVertical(SpawnCommand {
-            domain: SpawnTabDomain::CurrentPaneDomain,
-            ..Default::default()
-        }),
-        SplitHorizontal(SpawnCommand {
-            domain: SpawnTabDomain::CurrentPaneDomain,
-            ..Default::default()
-        }),
-        CloseCurrentTab { confirm: true },
-        CloseCurrentPane { confirm: true },
-        ResetTerminal,
-        // ----------------- Edit
-        #[cfg(not(target_os = "macos"))]
-        PasteFrom(ClipboardPasteSource::PrimarySelection),
-        #[cfg(not(target_os = "macos"))]
-        CopyTo(ClipboardCopyDestination::PrimarySelection),
-        CopyTo(ClipboardCopyDestination::Clipboard),
-        PasteFrom(ClipboardPasteSource::Clipboard),
-        ClearScrollback(ScrollbackEraseMode::ScrollbackOnly),
-        ClearScrollback(ScrollbackEraseMode::ScrollbackAndViewport),
-        QuickSelect,
-        CharSelect(CharSelectArguments::default()),
-        ActivateCopyMode,
-        ClearKeyTableStack,
-        ActivateCommandPalette,
-        // ----------------- View
-        DecreaseFontSize,
-        IncreaseFontSize,
-        ResetFontSize,
-        ResetFontAndWindowSize,
-        ScrollByPage(NotNan::new(-1.0).unwrap()),
-        ScrollByPage(NotNan::new(1.0).unwrap()),
-        ScrollToTop,
-        ScrollToBottom,
-        // ----------------- Window
-        ToggleFullScreen,
-        ToggleAlwaysOnTop,
-        ToggleAlwaysOnBottom,
-        SetWindowLevel(WindowLevel::AlwaysOnBottom),
-        SetWindowLevel(WindowLevel::Normal),
-        SetWindowLevel(WindowLevel::AlwaysOnTop),
-        Hide,
-        Search(Pattern::CurrentSelectionOrEmptyString),
-        PaneSelect(PaneSelectArguments {
-            alphabet: String::new(),
-            mode: PaneSelectMode::Activate,
-            show_pane_ids: false,
-        }),
-        PaneSelect(PaneSelectArguments {
-            alphabet: String::new(),
-            mode: PaneSelectMode::SwapWithActive,
-            show_pane_ids: false,
-        }),
-        PaneSelect(PaneSelectArguments {
-            alphabet: String::new(),
-            mode: PaneSelectMode::SwapWithActiveKeepFocus,
-            show_pane_ids: false,
-        }),
-        PaneSelect(PaneSelectArguments {
-            alphabet: String::new(),
-            mode: PaneSelectMode::MoveToNewTab,
-            show_pane_ids: false,
-        }),
-        PaneSelect(PaneSelectArguments {
-            alphabet: String::new(),
-            mode: PaneSelectMode::MoveToNewWindow,
-            show_pane_ids: false,
-        }),
-        RotatePanes(RotationDirection::Clockwise),
-        RotatePanes(RotationDirection::CounterClockwise),
-        // --- Swap Layouts & Floating Panes ---
-        SwapLayoutNext,
-        SwapLayoutPrev,
-        ToggleFloatingPane,
-        FloatingPaneCommand(FloatingPaneKeyCommand::SnapLeft),
-        FloatingPaneCommand(FloatingPaneKeyCommand::SnapRight),
-        FloatingPaneCommand(FloatingPaneKeyCommand::RaiseToTop),
-        FloatingPaneCommand(FloatingPaneKeyCommand::CycleOverlapping),
-        CycleStackForward,
-        CycleStackBackward,
-        // --- Agent swarm mass operations ---
-        KillStuckAgents,
-        PauseAllAgents,
-        FocusErrorPanes,
-        CycleAgentAutoLayout,
-        ToggleDashboard,
-        ActivateTab(0),
-        ActivateTab(1),
-        ActivateTab(2),
-        ActivateTab(3),
-        ActivateTab(4),
-        ActivateTab(5),
-        ActivateTab(6),
-        ActivateTab(7),
-        ActivateTab(-1),
-        ActivateTabRelative(-1),
-        ActivateTabRelative(1),
-        ActivateWindow(0),
-        ActivateWindow(1),
-        ActivateWindow(2),
-        ActivateWindow(3),
-        ActivateWindow(4),
-        ActivateWindow(5),
-        ActivateWindow(6),
-        ActivateWindow(7),
-        ActivateWindow(8),
-        ActivateWindow(9),
-        ActivateWindowRelative(-1),
-        ActivateWindowRelative(1),
-        MoveTabRelative(-1),
-        MoveTabRelative(1),
-        AdjustPaneSize(PaneDirection::Left, 1),
-        AdjustPaneSize(PaneDirection::Right, 1),
-        AdjustPaneSize(PaneDirection::Up, 1),
-        AdjustPaneSize(PaneDirection::Down, 1),
-        ActivatePaneDirection(PaneDirection::Left),
-        ActivatePaneDirection(PaneDirection::Right),
-        ActivatePaneDirection(PaneDirection::Up),
-        ActivatePaneDirection(PaneDirection::Down),
-        TogglePaneZoomState,
-        ActivateLastTab,
-        ShowLauncher,
-        ShowTabNavigator,
-        // ----------------- Help
-        OpenUri("https://github.com/Dicklesworthstone/frankenterm".to_string()),
-        OpenUri("https://github.com/Dicklesworthstone/frankenterm/discussions/".to_string()),
-        OpenUri("https://github.com/Dicklesworthstone/frankenterm/issues/".to_string()),
-        ShowDebugOverlay,
-        // ----------------- Misc
-        OpenLinkAtMouseCursor,
-    ];
-}
-
-#[cfg(test)]
-mod tests {
-    //! ft-z4wvi: pin the PaneSelect default-chord regression invariant
-    //! and the no-collision rule for default keybindings.
-
-    use super::*;
-
-    fn def(action: KeyAssignment) -> CommandDef {
-        derive_command_from_key_assignment(&action)
-            .expect("PaneSelect actions always derive a CommandDef")
-    }
-
-    /// Every `PaneSelect` mode must ship with at least one default chord.
-    /// Pre-fix the five rows had `keys: vec![]` and a "FIXME" comment, so a
-    /// freshly-installed user could only reach pane-management through the
-    /// menu / lua. This test fences that regression — adding a new
-    /// `PaneSelectMode` variant without a default keybinding will trip
-    /// here.
-    #[test]
-    fn pane_select_modes_all_carry_default_keybindings() {
-        for mode in [
-            PaneSelectMode::Activate,
-            PaneSelectMode::SwapWithActive,
-            PaneSelectMode::SwapWithActiveKeepFocus,
-            PaneSelectMode::MoveToNewTab,
-            PaneSelectMode::MoveToNewWindow,
-        ] {
-            let cmd = def(KeyAssignment::PaneSelect(PaneSelectArguments {
-                alphabet: String::new(),
-                mode,
-                show_pane_ids: false,
-            }));
-            assert!(
-                !cmd.keys.is_empty(),
-                "PaneSelectMode::{mode:?} ships without a default chord — \
-                 reverts the ft-z4wvi a11y fix",
-            );
-        }
-    }
-
-    /// The five `PaneSelect` defaults must all be distinct chords. A
-    /// silent collision would mean two modes fire on the same key press,
-    /// which is its own a11y bug.
-    #[test]
-    fn pane_select_default_chords_are_pairwise_distinct() {
-        let chords: Vec<_> = [
-            PaneSelectMode::Activate,
-            PaneSelectMode::SwapWithActive,
-            PaneSelectMode::SwapWithActiveKeepFocus,
-            PaneSelectMode::MoveToNewTab,
-            PaneSelectMode::MoveToNewWindow,
-        ]
-        .into_iter()
-        .map(|mode| {
-            let cmd = def(KeyAssignment::PaneSelect(PaneSelectArguments {
-                alphabet: String::new(),
-                mode,
-                show_pane_ids: false,
-            }));
-            cmd.keys[0].clone()
-        })
-        .collect();
-        let mut seen = std::collections::HashSet::new();
-        for (mods, key) in &chords {
-            let label = format!("{mods:?}+{key}");
-            assert!(
-                seen.insert(label.clone()),
-                "duplicate PaneSelect default chord: {label}"
-            );
-        }
-    }
-
-    #[test]
-    fn detach_domain_commands_require_detachable_attached_non_local_domain() {
-        assert!(domain_detach_command_is_available(
-            "remote",
-            DomainState::Attached,
-            true,
-        ));
-
-        assert!(!domain_detach_command_is_available(
-            "remote",
-            DomainState::Attached,
-            false,
-        ));
-        assert!(!domain_detach_command_is_available(
-            "remote",
-            DomainState::Detached,
-            true,
-        ));
-        assert!(!domain_detach_command_is_available(
-            "local",
-            DomainState::Attached,
-            true,
-        ));
-    }
-
-    #[test]
-    fn unqualified_current_domain_detach_is_not_a_default_palette_action() {
-        assert!(
-            !compute_default_actions()
-                .iter()
-                .any(|action| matches!(action, DetachDomain(SpawnTabDomain::CurrentPaneDomain))),
-            "CurrentPaneDomain detach depends on the active pane domain being detachable; \
-             generated domain-specific detach entries carry that runtime capability check"
-        );
-    }
 }
