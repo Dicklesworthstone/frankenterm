@@ -1,23 +1,23 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
+use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
-use asupersync::Cx;
-use async_channel::{bounded, unbounded, Receiver, Sender};
+use async_channel::{Receiver, Sender, bounded, unbounded};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
+use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
 use filedescriptor::FileDescriptor;
-use futures::future::{select, Either};
+use futures::future::{Either, select};
 use futures::pin_mut;
+use mux::Mux;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
-use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
@@ -387,11 +387,7 @@ fn client_thread(
     mut reconnectable: Reconnectable,
     local_domain_id: Option<DomainId>,
     mut rx: Receiver<ReaderMessage>,
-) -> (
-    anyhow::Result<()>,
-    Reconnectable,
-    Receiver<ReaderMessage>,
-) {
+) -> (anyhow::Result<()>, Reconnectable, Receiver<ReaderMessage>) {
     // The reader performs ALL of this connection's socket I/O, so it must run as
     // a scheduler-managed task (block_on_io) rather than a directly-polled
     // block_on future. asupersync only delivers socket-readiness wakeups to
@@ -2138,13 +2134,15 @@ mod tests {
                         first = false;
                     }
                     let response = match decoded.pdu {
-                        Pdu::GetCodecVersion(_) => Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                            codec_vers: CODEC_VERSION,
-                            version_string: "ft-connect-fix-delayed-server".to_string(),
-                            executable_path: PathBuf::from("/usr/local/bin/ft"),
-                            config_file_path: None,
-                            min_supported: CODEC_VERSION,
-                        }),
+                        Pdu::GetCodecVersion(_) => {
+                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                codec_vers: CODEC_VERSION,
+                                version_string: "ft-connect-fix-delayed-server".to_string(),
+                                executable_path: PathBuf::from("/usr/local/bin/ft"),
+                                config_file_path: None,
+                                min_supported: CODEC_VERSION,
+                            })
+                        }
                         Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                         other => panic!("unexpected client handshake PDU: {}", other.pdu_name()),
                     };
@@ -2169,8 +2167,7 @@ mod tests {
             write_timeout: Duration::from_secs(5),
             ..Default::default()
         };
-        let mut reconnectable =
-            Reconnectable::new(ClientDomainConfig::Unix(unix_domain), None);
+        let mut reconnectable = Reconnectable::new(ClientDomainConfig::Unix(unix_domain), None);
         reconnectable
             .connect(true, &mut ui, true)
             .expect("connect to local UDS handshake server");

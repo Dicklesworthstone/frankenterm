@@ -1,6 +1,6 @@
-use crate::domain::{lock_or_recover, ClientInner};
+use crate::domain::{ClientInner, lock_or_recover};
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
+use crate::pane::renderable::{RenderableInner, RenderableState, hydrate_lines};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -8,8 +8,8 @@ use config::configuration;
 use config::keyassignment::ScrollbackEraseMode;
 use mux::domain::DomainId;
 use mux::pane::{
-    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
-    Pattern, SearchResult, WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
+    SearchResult, WithPaneLines, alloc_pane_id,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -706,7 +706,10 @@ impl std::io::Write for PaneWriter {
         let data = data.to_vec();
         let len = data.len();
         promise::spawn::block_on_io(async move {
-            client.client.write_to_pane(WriteToPane { pane_id, data }).await
+            client
+                .client
+                .write_to_pane(WriteToPane { pane_id, data })
+                .await
         })
         .map_err(|e| std::io::Error::other(format!("{}", e)))?;
         Ok(len)
@@ -723,8 +726,8 @@ mod tests {
     use crate::client::Client;
     use crate::domain::ClientDomainConfig;
     use config::UnixDomain;
-    use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::Mux;
+    use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use promise::spawn::SimpleExecutor;
     use std::sync::{Mutex as StdMutex, Once};
 
