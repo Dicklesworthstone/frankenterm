@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::beads_types::{BeadReadinessReport, BeadResolverReasonCode, BeadStatusCounts};
+
 pub const OPERATING_ENVELOPE_CONTRACT_ID: &str = "ft.operating_envelope.v1";
 pub const OPERATING_ENVELOPE_SCHEMA_VERSION: u16 = 1;
 
@@ -36,6 +38,16 @@ pub enum OperatingEnvelopeProofState {
     Unavailable,
     SkippedNotProven,
     NotRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeCapacityPressureTier {
+    Green,
+    Yellow,
+    Red,
+    Black,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,6 +466,887 @@ pub struct OperatingEnvelopeInputDomains {
     pub robot_inventory: Option<OperatingEnvelopeSourceSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeSourceProvenance {
+    pub source_id: String,
+    pub command_or_api: String,
+    pub evidence_level: OperatingEnvelopeEvidenceLevel,
+    pub collected_at_ms: Option<u64>,
+    pub freshness_ms: Option<u64>,
+    pub freshness_state: OperatingEnvelopeFreshnessState,
+    pub artifact_paths: Vec<String>,
+}
+
+impl OperatingEnvelopeSourceProvenance {
+    #[must_use]
+    pub fn new(
+        source_id: impl Into<String>,
+        command_or_api: impl Into<String>,
+        evidence_level: OperatingEnvelopeEvidenceLevel,
+    ) -> Self {
+        Self {
+            source_id: bounded_string(source_id, "source.unknown"),
+            command_or_api: bounded_string(command_or_api, "operating_envelope.adapter"),
+            evidence_level,
+            collected_at_ms: None,
+            freshness_ms: None,
+            freshness_state: OperatingEnvelopeFreshnessState::Unknown,
+            artifact_paths: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn retained_artifact(
+        source_id: impl Into<String>,
+        command_or_api: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            source_id,
+            command_or_api,
+            OperatingEnvelopeEvidenceLevel::RetainedArtifact,
+        )
+    }
+
+    #[must_use]
+    pub fn live_command(source_id: impl Into<String>, command_or_api: impl Into<String>) -> Self {
+        Self::new(
+            source_id,
+            command_or_api,
+            OperatingEnvelopeEvidenceLevel::LiveCommand,
+        )
+    }
+
+    #[must_use]
+    pub fn with_freshness(
+        mut self,
+        collected_at_ms: Option<u64>,
+        freshness_ms: Option<u64>,
+        freshness_state: OperatingEnvelopeFreshnessState,
+    ) -> Self {
+        self.collected_at_ms = collected_at_ms;
+        self.freshness_ms = freshness_ms;
+        self.freshness_state = freshness_state;
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact_path(mut self, path: impl Into<String>) -> Self {
+        push_unique(
+            &mut self.artifact_paths,
+            bounded_string(path, "artifact.unknown"),
+        );
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeBeadsSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub ready_count: usize,
+    pub blocked_count: usize,
+    pub in_progress_count: usize,
+    pub stale_candidate_count: usize,
+    pub dependency_impact_count: usize,
+    pub graph_cycle_count: usize,
+    pub active_assignee_count: usize,
+    pub dirty_overlap_risk: bool,
+    pub partial_graph_data: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeBeadsSourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            ready_count: 0,
+            blocked_count: 0,
+            in_progress_count: 0,
+            stale_candidate_count: 0,
+            dependency_impact_count: 0,
+            graph_cycle_count: 0,
+            active_assignee_count: 0,
+            dirty_overlap_risk: false,
+            partial_graph_data: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_readiness_report(
+        provenance: OperatingEnvelopeSourceProvenance,
+        status_counts: &BeadStatusCounts,
+        readiness: &BeadReadinessReport,
+    ) -> Self {
+        let graph_cycle_count = usize::from(
+            readiness
+                .degraded_reason_codes
+                .contains(&BeadResolverReasonCode::CyclicDependencyGraph),
+        );
+        let partial_graph_data = readiness.degraded_reason_codes.iter().any(|reason| {
+            matches!(
+                reason,
+                BeadResolverReasonCode::MissingDependencyNode
+                    | BeadResolverReasonCode::PartialGraphData
+            )
+        });
+        let dependency_impact_count = readiness
+            .candidates
+            .iter()
+            .map(|candidate| candidate.transitive_unblock_count)
+            .sum();
+
+        Self {
+            provenance,
+            ready_count: readiness.ready_count(),
+            blocked_count: status_counts.blocked,
+            in_progress_count: status_counts.in_progress,
+            stale_candidate_count: 0,
+            dependency_impact_count,
+            graph_cycle_count,
+            active_assignee_count: 0,
+            dirty_overlap_risk: false,
+            partial_graph_data,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::Beads);
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsReadyQueue,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "beads unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        if self.ready_count == 0 {
+            push_unique(&mut snapshot.reason_codes, "beads.ready_empty".to_string());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsReadyQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                "ready=0",
+                "beads.ready_empty",
+            ));
+        } else {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.ready_available".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsReadyQueue,
+                OperatingEnvelopeEvidenceState::Pass,
+                format!("ready={}", self.ready_count),
+                "beads.ready_available",
+            ));
+        }
+
+        if self.blocked_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.blocked_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("blocked={}", self.blocked_count),
+                "beads.blocked_present",
+            ));
+        }
+
+        if self.in_progress_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.in_progress_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsInProgress,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("in_progress={}", self.in_progress_count),
+                "beads.in_progress_present",
+            ));
+        }
+
+        if self.active_assignee_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "assignee_overlap.active".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsInProgress,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!("active_assignees={}", self.active_assignee_count),
+                "assignee_overlap.active",
+            ));
+        }
+
+        if self.stale_candidate_count > 0 {
+            snapshot = snapshot.stale("beads.stale_candidate");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsStaleCandidate,
+                OperatingEnvelopeEvidenceState::Stale,
+                format!("stale_candidates={}", self.stale_candidate_count),
+                "beads.stale_candidate",
+            ));
+        }
+
+        if self.dependency_impact_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.dependency_impact_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("dependency_impact={}", self.dependency_impact_count),
+                "beads.dependency_impact_present",
+            ));
+        }
+
+        if self.graph_cycle_count > 0 {
+            snapshot = snapshot.degraded("beads.graph_cycles");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Fail,
+                format!("graph_cycles={}", self.graph_cycle_count),
+                "beads.graph_cycles",
+            ));
+        }
+
+        if self.partial_graph_data {
+            snapshot = snapshot.degraded("beads.partial_graph_data");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::BeadsBlockedQueue,
+                OperatingEnvelopeEvidenceState::Warn,
+                "partial graph data",
+                "beads.partial_graph_data",
+            ));
+        }
+
+        if self.dirty_overlap_risk {
+            snapshot = snapshot.blocked("dirty_overlap.present");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "beads.dirty_overlap_risk".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DirtyPathOverlap,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "beads dirty overlap",
+                "dirty_overlap.present",
+            ));
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeRchSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub healthy_worker_count: usize,
+    pub active_build_count: usize,
+    pub queued_build_count: usize,
+    pub no_workers_passed_health: bool,
+    pub active_project_exclusion: bool,
+    pub topology_preflight_failed: bool,
+    pub remote_cargo_reached: Option<bool>,
+    pub remote_cargo_verdict_pass: bool,
+    pub critical_pressure: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeRchSourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            healthy_worker_count: 0,
+            active_build_count: 0,
+            queued_build_count: 0,
+            no_workers_passed_health: false,
+            active_project_exclusion: false,
+            topology_preflight_failed: false,
+            remote_cargo_reached: None,
+            remote_cargo_verdict_pass: false,
+            critical_pressure: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::Rch);
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "rch unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        if self.healthy_worker_count > 0 {
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Pass,
+                format!("healthy_workers={}", self.healthy_worker_count),
+                "rch.workers_healthy",
+            ));
+        }
+
+        if self.active_build_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "rch.active_builds_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("active_builds={}", self.active_build_count),
+                "rch.active_builds_present",
+            ));
+        }
+
+        if self.queued_build_count > 0 {
+            push_unique(&mut snapshot.reason_codes, "rch.queue_present".to_string());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("queued_builds={}", self.queued_build_count),
+                "rch.queue_present",
+            ));
+        }
+
+        if self.no_workers_passed_health {
+            snapshot = snapshot.blocked("rch.no_workers_passed_health");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "worker=null",
+                "rch.no_workers_passed_health",
+            ));
+        }
+
+        if self.critical_pressure {
+            snapshot = snapshot.blocked("rch.no_admissible_workers.critical_pressure");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchWorkerSelection,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "critical pressure",
+                "rch.no_admissible_workers.critical_pressure",
+            ));
+        }
+
+        if self.active_project_exclusion {
+            snapshot = snapshot.blocked("rch.active_project_exclusion");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchActiveProjectExclusion,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "same project active",
+                "rch.active_project_exclusion",
+            ));
+        }
+
+        if self.topology_preflight_failed {
+            snapshot = snapshot.blocked("rch.topology_preflight_failed");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::RchTopologyPreflight,
+                OperatingEnvelopeEvidenceState::Fail,
+                "topology preflight",
+                "rch.topology_preflight_failed",
+            ));
+        }
+
+        match self.remote_cargo_reached {
+            Some(true) => {
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "rch.remote_cargo_reached_true".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::RchCargoReached,
+                    OperatingEnvelopeEvidenceState::Pass,
+                    "remote Cargo reached",
+                    "rch.remote_cargo_reached_true",
+                ));
+            }
+            Some(false) => {
+                snapshot = snapshot.degraded("proof.insufficient");
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "rch.remote_cargo_reached_false".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::RchCargoReached,
+                    OperatingEnvelopeEvidenceState::Fail,
+                    "remote Cargo not reached",
+                    "rch.remote_cargo_reached_false",
+                ));
+            }
+            None => {
+                snapshot = snapshot.degraded("proof.insufficient");
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "rch.remote_cargo_reached_unknown".to_string(),
+                );
+                snapshot.evidence.push(
+                    OperatingEnvelopeEvidenceItem::new(
+                        OperatingEnvelopeEvidenceCategory::RchCargoReached,
+                        OperatingEnvelopeEvidenceState::Unknown,
+                        "remote Cargo reach unknown",
+                    )
+                    .with_reason_code("rch.remote_cargo_reached_unknown"),
+                );
+            }
+        }
+
+        if self.remote_cargo_verdict_pass {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "rch.cargo_verdict.pass".to_string(),
+            );
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeAgentMailSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub available: bool,
+    pub degraded: bool,
+    pub database_error: bool,
+    pub ack_required_count: usize,
+    pub unread_count: usize,
+    pub forbidden_service_remediation_seen: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeAgentMailSourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            available: true,
+            degraded: false,
+            database_error: false,
+            ack_required_count: 0,
+            unread_count: 0,
+            forbidden_service_remediation_seen: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot =
+            adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::AgentMail);
+
+        if self.database_error {
+            snapshot = snapshot.unavailable("agent_mail.database_error");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.unavailable_after_retry".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "database durability error",
+                "agent_mail.database_error",
+            ));
+        } else if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref())
+        {
+            snapshot = snapshot.unavailable(reason.clone());
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.unavailable_after_retry".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "agent mail unavailable",
+                reason,
+            ));
+        } else if self.degraded || !self.available {
+            snapshot = snapshot.degraded("agent_mail.degraded");
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Warn,
+                "agent mail degraded",
+                "agent_mail.degraded",
+            ));
+        } else {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.available".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::AgentMailAvailability,
+                OperatingEnvelopeEvidenceState::Pass,
+                "agent mail available",
+                "agent_mail.available",
+            ));
+        }
+
+        if self.ack_required_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.ack_required_present".to_string(),
+            );
+        }
+        if self.unread_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.unread_present".to_string(),
+            );
+        }
+        if self.forbidden_service_remediation_seen {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "agent_mail.service_remediation_forbidden".to_string(),
+            );
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OperatingEnvelopeGitSourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub branch_name: String,
+    pub tracked_dirty_count: usize,
+    pub untracked_count: usize,
+    pub deleted_path_count: usize,
+    pub deleted_frankenterm_core_path_count: usize,
+    pub dirty_overlap_count: usize,
+    pub shared_tracker_dirty: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeGitSourceInput {
+    #[must_use]
+    pub fn new(
+        provenance: OperatingEnvelopeSourceProvenance,
+        branch_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            provenance,
+            branch_name: bounded_string(branch_name, "unknown"),
+            tracked_dirty_count: 0,
+            untracked_count: 0,
+            deleted_path_count: 0,
+            deleted_frankenterm_core_path_count: 0,
+            dirty_overlap_count: 0,
+            shared_tracker_dirty: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(&self.provenance, OperatingEnvelopeSourceKind::Git);
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitDirtyTree,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "git unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        snapshot.evidence.push(OperatingEnvelopeEvidenceItem::new(
+            OperatingEnvelopeEvidenceCategory::ManualNote,
+            OperatingEnvelopeEvidenceState::Pass,
+            format!("branch={}", self.branch_name),
+        ));
+
+        if self.deleted_frankenterm_core_path_count > 0 {
+            snapshot = snapshot.blocked("deletion_risk.frankenterm_core");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "deletion_risk.present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DeletionRisk,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!(
+                    "deleted_frankenterm_core_paths={}",
+                    self.deleted_frankenterm_core_path_count
+                ),
+                "deletion_risk.frankenterm_core",
+            ));
+        } else if self.deleted_path_count > 0 {
+            snapshot = snapshot.blocked("git.deleted_paths_present");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "deletion_risk.present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DeletionRisk,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!("deleted_paths={}", self.deleted_path_count),
+                "git.deleted_paths_present",
+            ));
+        }
+
+        if self.dirty_overlap_count > 0 {
+            snapshot = snapshot.blocked("dirty_overlap.present");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.dirty_overlap_risk".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::DirtyPathOverlap,
+                OperatingEnvelopeEvidenceState::Blocked,
+                format!("dirty_overlap_paths={}", self.dirty_overlap_count),
+                "dirty_overlap.present",
+            ));
+        }
+
+        if self.tracked_dirty_count > 0 || self.shared_tracker_dirty {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.dirty_non_overlap".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitDirtyTree,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("tracked_dirty={}", self.tracked_dirty_count),
+                "git.dirty_non_overlap",
+            ));
+        }
+
+        if self.shared_tracker_dirty {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.shared_tracker_dirty".to_string(),
+            );
+        }
+
+        if self.untracked_count > 0 {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.untracked_paths_present".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitUntrackedPaths,
+                OperatingEnvelopeEvidenceState::Warn,
+                format!("untracked={}", self.untracked_count),
+                "git.untracked_paths_present",
+            ));
+        }
+
+        if snapshot.reason_codes.is_empty() {
+            push_unique(
+                &mut snapshot.reason_codes,
+                "git.clean_for_scope".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::GitDirtyTree,
+                OperatingEnvelopeEvidenceState::Pass,
+                "clean",
+                "git.clean_for_scope",
+            ));
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeCapacitySourceInput {
+    pub provenance: OperatingEnvelopeSourceProvenance,
+    pub pressure_tier: OperatingEnvelopeCapacityPressureTier,
+    pub target_class_proof_state: OperatingEnvelopeProofState,
+    pub kill_switch_active: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl OperatingEnvelopeCapacitySourceInput {
+    #[must_use]
+    pub fn new(provenance: OperatingEnvelopeSourceProvenance) -> Self {
+        Self {
+            provenance,
+            pressure_tier: OperatingEnvelopeCapacityPressureTier::Unknown,
+            target_class_proof_state: OperatingEnvelopeProofState::Unavailable,
+            kill_switch_active: false,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to_source_snapshot(&self) -> OperatingEnvelopeSourceSnapshot {
+        let mut snapshot = adapter_snapshot(
+            &self.provenance,
+            OperatingEnvelopeSourceKind::CapacityResource,
+        );
+
+        if let Some(reason) = normalized_optional_reason(self.unavailable_reason.as_deref()) {
+            snapshot = snapshot.unavailable(reason.clone());
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::CapacityPressure,
+                OperatingEnvelopeEvidenceState::Unavailable,
+                "capacity unavailable",
+                reason,
+            ));
+            return snapshot;
+        }
+
+        let (pressure_reason, pressure_state) = match self.pressure_tier {
+            OperatingEnvelopeCapacityPressureTier::Green => {
+                ("capacity.green", OperatingEnvelopeEvidenceState::Pass)
+            }
+            OperatingEnvelopeCapacityPressureTier::Yellow => {
+                ("capacity.yellow", OperatingEnvelopeEvidenceState::Warn)
+            }
+            OperatingEnvelopeCapacityPressureTier::Red => {
+                ("capacity.red", OperatingEnvelopeEvidenceState::Fail)
+            }
+            OperatingEnvelopeCapacityPressureTier::Black => {
+                ("capacity.black", OperatingEnvelopeEvidenceState::Blocked)
+            }
+            OperatingEnvelopeCapacityPressureTier::Unknown => (
+                "capacity.pressure_unknown",
+                OperatingEnvelopeEvidenceState::Unknown,
+            ),
+        };
+        push_unique(&mut snapshot.reason_codes, pressure_reason.to_string());
+        if self.pressure_tier == OperatingEnvelopeCapacityPressureTier::Unknown {
+            snapshot = snapshot.degraded("capacity.pressure_unknown");
+            push_unique(&mut snapshot.reason_codes, "telemetry.stale".to_string());
+        }
+        snapshot.evidence.push(evidence(
+            OperatingEnvelopeEvidenceCategory::CapacityPressure,
+            pressure_state,
+            format!("pressure={:?}", self.pressure_tier),
+            pressure_reason,
+        ));
+
+        if self.kill_switch_active {
+            snapshot = snapshot.blocked("capacity.kill_switch_active");
+            push_unique(
+                &mut snapshot.reason_codes,
+                "policy.kill_switch_active".to_string(),
+            );
+            snapshot.evidence.push(evidence(
+                OperatingEnvelopeEvidenceCategory::CapacityPressure,
+                OperatingEnvelopeEvidenceState::Blocked,
+                "kill switch active",
+                "capacity.kill_switch_active",
+            ));
+        }
+
+        match self.target_class_proof_state {
+            OperatingEnvelopeProofState::Measured | OperatingEnvelopeProofState::NotRequired => {
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::TargetHardware,
+                    OperatingEnvelopeEvidenceState::Pass,
+                    "target class proof available",
+                    "target_hardware.proven_or_not_required",
+                ));
+            }
+            OperatingEnvelopeProofState::SkippedNotProven
+            | OperatingEnvelopeProofState::Unavailable => {
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "capacity.target_class_unproven".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::TargetHardware,
+                    OperatingEnvelopeEvidenceState::Unavailable,
+                    "target class proof unavailable",
+                    "capacity.target_class_unproven",
+                ));
+            }
+            OperatingEnvelopeProofState::Simulated | OperatingEnvelopeProofState::Stale => {
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "target_hardware.skipped_not_proven".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::TargetHardware,
+                    OperatingEnvelopeEvidenceState::Warn,
+                    "target class proof not measured",
+                    "target_hardware.skipped_not_proven",
+                ));
+            }
+        }
+
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeSourceAdapterInputs {
+    pub capacity_resource: OperatingEnvelopeCapacitySourceInput,
+    pub rch: OperatingEnvelopeRchSourceInput,
+    pub beads: OperatingEnvelopeBeadsSourceInput,
+    pub agent_mail: OperatingEnvelopeAgentMailSourceInput,
+    pub git: OperatingEnvelopeGitSourceInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub robot_inventory: Option<OperatingEnvelopeSourceSnapshot>,
+}
+
+impl OperatingEnvelopeSourceAdapterInputs {
+    #[must_use]
+    pub fn new(
+        capacity_resource: OperatingEnvelopeCapacitySourceInput,
+        rch: OperatingEnvelopeRchSourceInput,
+        beads: OperatingEnvelopeBeadsSourceInput,
+        agent_mail: OperatingEnvelopeAgentMailSourceInput,
+        git: OperatingEnvelopeGitSourceInput,
+    ) -> Self {
+        Self {
+            capacity_resource,
+            rch,
+            beads,
+            agent_mail,
+            git,
+            robot_inventory: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_robot_inventory(
+        mut self,
+        robot_inventory: OperatingEnvelopeSourceSnapshot,
+    ) -> Self {
+        self.robot_inventory = Some(robot_inventory);
+        self
+    }
+
+    #[must_use]
+    pub fn into_input_domains(self) -> OperatingEnvelopeInputDomains {
+        OperatingEnvelopeInputDomains {
+            capacity_resource: self.capacity_resource.to_source_snapshot(),
+            rch: self.rch.to_source_snapshot(),
+            beads: self.beads.to_source_snapshot(),
+            agent_mail: self.agent_mail.to_source_snapshot(),
+            git: self.git.to_source_snapshot(),
+            robot_inventory: self.robot_inventory,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatingEnvelopeBudgets {
     pub interactive_agents: u32,
@@ -717,6 +1610,7 @@ struct EnvelopeFacts {
     target_class_unproven: bool,
     stale_telemetry: bool,
     insufficient_proof: bool,
+    kill_switch_active: bool,
     /// A REQUIRED measurement source (capacity_resource or rch) is absent
     /// (NotCollected / Unavailable). Unlike `capacity.*`/`rch.*` reason-coded
     /// failures, an absent source may carry no failure reason code, so without
@@ -837,6 +1731,14 @@ impl EnvelopeFacts {
                     "local_cargo.forbidden",
                 ],
             ),
+            kill_switch_active: any_reason(
+                &sources,
+                &[
+                    "capacity.kill_switch_active",
+                    "policy.kill_switch_active",
+                    "kill_switch.active",
+                ],
+            ),
             // Fail-closed on ABSENT required telemetry. capacity_resource and rch
             // are required inputs; if either is NotCollected/Unavailable we must
             // not admit, even when the source reported no failure reason code.
@@ -873,6 +1775,17 @@ fn decision_for(
             )
         } else if facts.deletion_risk {
             push_unique(&mut reason_codes, "deletion_risk.present");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.kill_switch_active {
+            push_unique(&mut reason_codes, "capacity.kill_switch_active");
+            push_unique(&mut reason_codes, "policy.kill_switch_active");
             (
                 OperatingEnvelopeOutcome::Block,
                 OperatingEnvelopeTier::Black,
@@ -1315,6 +2228,40 @@ fn any_reason(sources: &[&OperatingEnvelopeSourceSnapshot], needles: &[&str]) ->
     })
 }
 
+fn adapter_snapshot(
+    provenance: &OperatingEnvelopeSourceProvenance,
+    source_kind: OperatingEnvelopeSourceKind,
+) -> OperatingEnvelopeSourceSnapshot {
+    let mut snapshot = OperatingEnvelopeSourceSnapshot::new(&provenance.source_id, source_kind)
+        .evidence_level(provenance.evidence_level);
+    snapshot
+        .command_or_api
+        .clone_from(&provenance.command_or_api);
+    snapshot.collected_at_ms = provenance.collected_at_ms;
+    snapshot.freshness_ms = provenance.freshness_ms;
+    snapshot.freshness_state = provenance.freshness_state;
+    snapshot.evidence.clear();
+    for artifact_path in &provenance.artifact_paths {
+        snapshot = snapshot.with_artifact_path(artifact_path.clone());
+    }
+    snapshot
+}
+
+fn evidence(
+    category: OperatingEnvelopeEvidenceCategory,
+    state: OperatingEnvelopeEvidenceState,
+    subject: impl Into<String>,
+    reason_code: impl Into<String>,
+) -> OperatingEnvelopeEvidenceItem {
+    OperatingEnvelopeEvidenceItem::new(category, state, subject).with_reason_code(reason_code)
+}
+
+fn normalized_optional_reason(reason: Option<&str>) -> Option<String> {
+    reason
+        .map(|reason| bounded_string(reason, "source.unavailable"))
+        .filter(|reason| !reason.is_empty())
+}
+
 fn dirty_tree_state(facts: &EnvelopeFacts) -> OperatingEnvelopeDirtyTreeState {
     if facts.dirty_overlap {
         OperatingEnvelopeDirtyTreeState::DirtyOverlap
@@ -1452,6 +2399,53 @@ mod tests {
                     .proof_state(OperatingEnvelopeProofState::Measured),
             )
             .budgets(OperatingEnvelopeBudgets::target_class())
+    }
+
+    fn provenance(source_id: &str, command_or_api: &str) -> OperatingEnvelopeSourceProvenance {
+        OperatingEnvelopeSourceProvenance::retained_artifact(source_id, command_or_api)
+            .with_freshness(
+                Some(NOW_MS),
+                Some(1_000),
+                OperatingEnvelopeFreshnessState::Fresh,
+            )
+    }
+
+    fn adapter_domains() -> OperatingEnvelopeInputDomains {
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-resource-retained",
+            "docs/attestations/proofs/resource-cockpit-target-class.json",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-status-retained",
+            "rch status --json",
+        ));
+        rch.healthy_worker_count = 3;
+        rch.remote_cargo_reached = Some(true);
+        rch.remote_cargo_verdict_pass = true;
+
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-bv-retained",
+            "bv --robot-triage",
+        ));
+        beads.ready_count = 4;
+        beads.blocked_count = 2;
+        beads.dependency_impact_count = 6;
+
+        let agent_mail = OperatingEnvelopeAgentMailSourceInput::new(provenance(
+            "agent-mail-inbox-retained",
+            "fetch_inbox",
+        ));
+
+        let git = OperatingEnvelopeGitSourceInput::new(
+            provenance("git-status-retained", "git status --short --branch"),
+            "main",
+        );
+
+        OperatingEnvelopeSourceAdapterInputs::new(capacity, rch, beads, agent_mail, git)
+            .into_input_domains()
     }
 
     fn plan_with(domains: OperatingEnvelopeInputDomains) -> OperatingEnvelopePlan {
@@ -1689,6 +2683,189 @@ mod tests {
             plan.decision
                 .reason_codes
                 .contains(&"target_hardware.skipped_not_proven".to_string())
+        );
+    }
+
+    #[test]
+    fn source_adapter_bundle_admits_only_with_known_green_evidence() {
+        let domains = adapter_domains();
+
+        for source in [
+            &domains.capacity_resource,
+            &domains.rch,
+            &domains.beads,
+            &domains.agent_mail,
+            &domains.git,
+        ] {
+            assert!(source.redacted);
+            assert!(!source.raw_pane_content_stored);
+            assert_eq!(
+                source.freshness_state,
+                OperatingEnvelopeFreshnessState::Fresh
+            );
+        }
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Green);
+        assert!(
+            plan.admission_windows[0]
+                .forbidden_action_classes
+                .contains(&OperatingEnvelopeActionClass::AgentMailRepair)
+        );
+        assert!(
+            plan.admission_windows[0]
+                .forbidden_action_classes
+                .contains(&OperatingEnvelopeActionClass::RawPaneContent)
+        );
+    }
+
+    #[test]
+    fn beads_adapter_stale_candidate_degrades_to_status_check() {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-stale-retained",
+            "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+        ));
+        beads.ready_count = 2;
+        beads.stale_candidate_count = 1;
+        domains.beads = beads.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"beads.stale_candidate".to_string())
+        );
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "stale_reopen_status_check"]
+        );
+    }
+
+    #[test]
+    fn rch_adapter_no_workers_and_no_cargo_reach_defers_proof() {
+        let mut domains = adapter_domains();
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-no-workers-retained",
+            "rch diagnose --json --dry-run",
+        ));
+        rch.no_workers_passed_health = true;
+        rch.remote_cargo_reached = Some(false);
+        domains.rch = rch.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert_eq!(
+            plan.decision.rch_proof_state,
+            OperatingEnvelopeProofState::Unavailable
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"rch.no_workers_passed_health".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_mail_adapter_database_error_uses_beads_only_fallback() {
+        let mut domains = adapter_domains();
+        let mut agent_mail = OperatingEnvelopeAgentMailSourceInput::new(provenance(
+            "agent-mail-db-error-retained",
+            "fetch_inbox",
+        ));
+        agent_mail.database_error = true;
+        agent_mail.forbidden_service_remediation_seen = true;
+        domains.agent_mail = agent_mail.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"fallback.beads_only".to_string())
+        );
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "admit_after_agent_mail_recovers"]
+        );
+        assert!(
+            plan.admission_windows[0]
+                .forbidden_action_classes
+                .contains(&OperatingEnvelopeActionClass::ServiceRestart)
+        );
+    }
+
+    #[test]
+    fn git_adapter_core_deletion_risk_blocks() {
+        let mut domains = adapter_domains();
+        let mut git = OperatingEnvelopeGitSourceInput::new(
+            provenance("git-core-deletion-retained", "git status --porcelain=v1"),
+            "main",
+        );
+        git.deleted_frankenterm_core_path_count = 1;
+        domains.git = git.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"deletion_risk.present".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_adapter_kill_switch_blocks_admission() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-kill-switch-retained",
+            "policy diagnostics",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.kill_switch_active = true;
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.kill_switch_active".to_string())
+        );
+    }
+
+    #[test]
+    fn source_adapters_fail_closed_on_unknown_required_evidence() {
+        let mut domains = adapter_domains();
+        let mut capacity =
+            OperatingEnvelopeCapacitySourceInput::new(provenance("capacity-unknown", "fixture"));
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        domains.capacity_resource = capacity.to_source_snapshot();
+        domains.rch = OperatingEnvelopeRchSourceInput::new(provenance("rch-unknown", "fixture"))
+            .to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_ne!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"proof.insufficient".to_string())
+                || plan
+                    .decision
+                    .reason_codes
+                    .contains(&"telemetry.stale".to_string())
         );
     }
 
