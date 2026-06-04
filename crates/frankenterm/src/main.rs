@@ -29,7 +29,7 @@ use frankenterm_core::context_horizon::{
     ContextHorizonFailureClass, ContextHorizonReport, context_horizon_unavailable_report,
     predict_context_horizon_from_sqlite,
 };
-use frankenterm_core::demo_scenarios::DemoScenarioManifest;
+use frankenterm_core::demo_scenarios::{DemoScenarioManifest, DemoScenarioSpec};
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
 use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
@@ -1811,6 +1811,7 @@ SEE ALSO:
     ft demo quickstart             Run quickstart demo
     ft demo quickstart --speed 2   Run at 2x speed
     ft demo quickstart --narrate   Show explanatory text
+    ft demo quickstart -f toon     Machine-readable TOON surface
 
 SEE ALSO:
     ft simulate   Run simulation scenarios
@@ -1818,6 +1819,14 @@ SEE ALSO:
     Demo {
         /// Demo name to run (omit to list available demos)
         name: Option<String>,
+
+        /// Demo scenario manifest path
+        #[arg(
+            long,
+            value_name = "MANIFEST",
+            default_value = "fixtures/demo-lab/manifest.v1.json"
+        )]
+        manifest: PathBuf,
 
         /// Playback speed multiplier
         #[arg(long, default_value = "1")]
@@ -1830,6 +1839,10 @@ SEE ALSO:
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', value_enum, default_value = "plain")]
+        format: DemoOutputFormat,
     },
 
     /// Verify a release attestation bundle (br-ft-syqcz.1.1).
@@ -2158,6 +2171,13 @@ enum SimulateCommands {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RehearsalOutputFormat {
+    Plain,
+    Json,
+    Toon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DemoOutputFormat {
     Plain,
     Json,
     Toon,
@@ -7681,6 +7701,351 @@ fn print_rehearsal_score_output(
         }
     }
     Ok(())
+}
+
+fn resolve_demo_manifest_path(workspace_root: &Path, manifest: &Path) -> PathBuf {
+    if manifest.is_absolute() {
+        manifest.to_path_buf()
+    } else {
+        workspace_root.join(manifest)
+    }
+}
+
+fn load_demo_manifest(
+    workspace_root: &Path,
+    manifest: &Path,
+) -> anyhow::Result<(PathBuf, DemoScenarioManifest)> {
+    let manifest_path = resolve_demo_manifest_path(workspace_root, manifest);
+    let raw = fs::read_to_string(&manifest_path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", manifest_path.display()))?;
+    let manifest = DemoScenarioManifest::from_json(&raw).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to parse demo scenario manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    Ok((manifest_path, manifest))
+}
+
+fn resolve_demo_output_format(format: DemoOutputFormat, json: bool) -> DemoOutputFormat {
+    if json { DemoOutputFormat::Json } else { format }
+}
+
+fn demo_display_path(workspace_root: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn demo_scenario_path(workspace_root: &Path, scenario: &DemoScenarioSpec) -> PathBuf {
+    workspace_root.join(&scenario.scenario_path)
+}
+
+fn demo_artifact_inventory(
+    workspace_root: &Path,
+    scenario: &DemoScenarioSpec,
+) -> Vec<serde_json::Value> {
+    scenario
+        .expected_artifacts
+        .iter()
+        .map(|artifact| {
+            let artifact_path = workspace_root.join(&artifact.path);
+            let metadata = fs::metadata(&artifact_path).ok();
+            let exists = metadata.is_some();
+            serde_json::json!({
+                "id": &artifact.id,
+                "kind": artifact.kind,
+                "path": &artifact.path,
+                "status": if exists { "available" } else { "declared_not_yet_emitted" },
+                "exists": exists,
+                "size_bytes": metadata.map(|metadata| metadata.len()),
+                "max_bytes": artifact.max_bytes,
+                "content_hash_required": artifact.content_hash_required,
+                "sha256": &artifact.sha256,
+            })
+        })
+        .collect()
+}
+
+fn demo_scenario_summary(workspace_root: &Path, scenario: &DemoScenarioSpec) -> serde_json::Value {
+    let scenario_path = demo_scenario_path(workspace_root, scenario);
+    let scenario_exists = scenario_path.exists();
+    serde_json::json!({
+        "id": &scenario.id,
+        "title": &scenario.title,
+        "purpose": &scenario.purpose,
+        "scenario_path": &scenario.scenario_path,
+        "status": if scenario_exists { "available" } else { "scenario_missing" },
+        "scenario_exists": scenario_exists,
+        "deterministic_seed": &scenario.deterministic_seed,
+        "required_features": &scenario.required_features,
+        "supported_outputs": &scenario.supported_outputs,
+        "redaction_tier": scenario.redaction_tier,
+        "proof_category": scenario.proof_category,
+        "max_output_bytes": scenario.max_output_bytes,
+        "expected_artifact_count": scenario.expected_artifacts.len(),
+    })
+}
+
+fn build_demo_list_payload(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    manifest: &DemoScenarioManifest,
+) -> serde_json::Value {
+    let scenarios: Vec<_> = manifest
+        .scenarios
+        .iter()
+        .map(|scenario| demo_scenario_summary(workspace_root, scenario))
+        .collect();
+    serde_json::json!({
+        "ok": true,
+        "schema_version": &manifest.schema_version,
+        "manifest_path": demo_display_path(workspace_root, manifest_path),
+        "title": &manifest.title,
+        "proof_boundary": &manifest.proof_boundary,
+        "scenario_count": scenarios.len(),
+        "scenarios": scenarios,
+        "side_effects_executed": false,
+        "live_mutation_allowed": false,
+        "external_services_called": false,
+    })
+}
+
+fn find_demo_scenario<'a>(
+    manifest: &'a DemoScenarioManifest,
+    name: &str,
+) -> Option<&'a DemoScenarioSpec> {
+    manifest
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.id == name)
+}
+
+fn load_demo_scenario_validation(
+    workspace_root: &Path,
+    scenario: &DemoScenarioSpec,
+) -> anyhow::Result<serde_json::Value> {
+    use frankenterm_core::simulation::Scenario;
+
+    let scenario_path = demo_scenario_path(workspace_root, scenario);
+    let loaded = Scenario::load(&scenario_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to validate demo scenario {} at {}: {error}",
+            scenario.id,
+            demo_display_path(workspace_root, &scenario_path)
+        )
+    })?;
+    let duration_ms = u64::try_from(loaded.duration.as_millis()).unwrap_or(u64::MAX);
+    let reproducibility_key = loaded.reproducibility_key();
+    Ok(serde_json::json!({
+        "valid": true,
+        "name": loaded.name,
+        "description": loaded.description,
+        "duration_ms": duration_ms,
+        "pane_count": loaded.panes.len(),
+        "event_count": loaded.events.len(),
+        "expectation_count": loaded.expectations.len(),
+        "metadata": loaded.metadata,
+        "reproducibility_key": reproducibility_key,
+    }))
+}
+
+fn build_demo_run_payload(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    manifest: &DemoScenarioManifest,
+    scenario: &DemoScenarioSpec,
+    speed: f64,
+    narrate: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let validation = load_demo_scenario_validation(workspace_root, scenario)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "status": "validated",
+        "execution_mode": "simulation_validate",
+        "demo": &scenario.id,
+        "manifest": {
+            "schema_version": &manifest.schema_version,
+            "path": demo_display_path(workspace_root, manifest_path),
+            "title": &manifest.title,
+            "proof_boundary": &manifest.proof_boundary,
+        },
+        "scenario": demo_scenario_summary(workspace_root, scenario),
+        "simulation": validation,
+        "artifacts": demo_artifact_inventory(workspace_root, scenario),
+        "degradation": &scenario.degradation,
+        "requested_options": {
+            "speed": speed,
+            "narrate": narrate,
+        },
+        "commands": {
+            "validate": format!("ft simulate validate {}", scenario.scenario_path),
+            "run": format!("ft simulate run {} --speed {}", scenario.scenario_path, speed),
+        },
+        "side_effects_executed": false,
+        "live_mutation_allowed": false,
+        "external_services_called": false,
+    }))
+}
+
+fn build_unknown_demo_payload(manifest: &DemoScenarioManifest, name: &str) -> serde_json::Value {
+    let available: Vec<_> = manifest
+        .scenarios
+        .iter()
+        .map(|scenario| scenario.id.as_str())
+        .collect();
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "unknown_demo",
+            "message": format!("Unknown demo: {name}"),
+        },
+        "available_demos": available,
+    })
+}
+
+fn print_demo_output(
+    payload: &serde_json::Value,
+    format: DemoOutputFormat,
+    plain: &str,
+) -> anyhow::Result<()> {
+    match format {
+        DemoOutputFormat::Plain => print!("{plain}"),
+        DemoOutputFormat::Json => println!("{}", serde_json::to_string_pretty(payload)?),
+        DemoOutputFormat::Toon => println!("{}", toon_rust::encode(payload.clone(), None)),
+    }
+    Ok(())
+}
+
+fn demo_value_str<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn render_demo_list_plain(payload: &serde_json::Value) -> String {
+    let mut out = String::new();
+    out.push_str("Available demos:\n\n");
+    if let Some(scenarios) = payload
+        .get("scenarios")
+        .and_then(serde_json::Value::as_array)
+    {
+        for scenario in scenarios {
+            out.push_str(&format!(
+                "  {:<20} {}\n",
+                demo_value_str(scenario, "id"),
+                demo_value_str(scenario, "title")
+            ));
+            out.push_str(&format!(
+                "    scenario: {}  status: {}\n",
+                demo_value_str(scenario, "scenario_path"),
+                demo_value_str(scenario, "status")
+            ));
+        }
+    }
+    out.push('\n');
+    out.push_str("Run a demo: ft demo <name>\n");
+    out.push_str("Machine output: ft demo <name> --format json|toon\n");
+    out
+}
+
+fn render_demo_run_plain(payload: &serde_json::Value) -> String {
+    let null = serde_json::Value::Null;
+    let scenario = payload.get("scenario").unwrap_or(&null);
+    let simulation = payload.get("simulation").unwrap_or(&null);
+    let requested_options = payload.get("requested_options").unwrap_or(&null);
+    let mut out = String::new();
+    out.push_str(&format!("Demo: {}\n", demo_value_str(payload, "demo")));
+    out.push_str(&format!("  Title: {}\n", demo_value_str(scenario, "title")));
+    out.push_str(&format!(
+        "  Status: {}\n",
+        demo_value_str(payload, "status")
+    ));
+    out.push_str(&format!(
+        "  Scenario: {}\n",
+        demo_value_str(scenario, "scenario_path")
+    ));
+    out.push_str(&format!(
+        "  Seed: {}\n",
+        demo_value_str(scenario, "deterministic_seed")
+    ));
+    out.push_str(&format!(
+        "  Proof: {}\n",
+        demo_value_str(scenario, "proof_category")
+    ));
+    out.push_str(&format!(
+        "  Redaction: {}\n",
+        demo_value_str(scenario, "redaction_tier")
+    ));
+    out.push_str(&format!(
+        "  Simulation: {} panes, {} events, {} expectations, {} ms\n",
+        simulation
+            .get("pane_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        simulation
+            .get("event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        simulation
+            .get("expectation_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        simulation
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    ));
+    out.push_str(&format!(
+        "  Reproducibility: {}\n",
+        demo_value_str(simulation, "reproducibility_key")
+    ));
+    out.push_str(&format!(
+        "  Speed: {}x\n",
+        requested_options
+            .get("speed")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1.0)
+    ));
+    out.push_str(&format!(
+        "  Narration: {}\n",
+        if requested_options
+            .get("narrate")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+    out.push_str("  Side effects: none; live panes and external services untouched\n");
+
+    if let Some(artifacts) = payload
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+    {
+        out.push_str("  Artifacts:\n");
+        for artifact in artifacts {
+            out.push_str(&format!(
+                "    {:<18} {:<24} {}\n",
+                demo_value_str(artifact, "id"),
+                demo_value_str(artifact, "status"),
+                demo_value_str(artifact, "path")
+            ));
+        }
+    }
+
+    if let Some(commands) = payload.get("commands") {
+        out.push_str(&format!(
+            "  Validate: {}\n",
+            demo_value_str(commands, "validate")
+        ));
+        out.push_str(&format!("  Run: {}\n", demo_value_str(commands, "run")));
+    }
+    out
 }
 
 fn render_rehearsal_score_plain(report: &RehearsalScoreSurfaceReport) -> String {
@@ -43373,63 +43738,44 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Demo {
             name,
+            manifest,
             speed,
             narrate,
             json,
+            format,
         }) => {
-            let demos: &[(&str, &str)] = &[
-                ("quickstart", "Basic ft setup and first detection"),
-                ("usage_limit", "Agent hits usage limit, ft auto-rotates"),
-                ("compaction", "Context compaction detection and handling"),
-            ];
+            let output_format = resolve_demo_output_format(format, json);
+            let (manifest_path, manifest) = load_demo_manifest(&workspace_root, &manifest)?;
 
             match name {
                 None => {
-                    if json {
-                        let list: Vec<_> = demos
-                            .iter()
-                            .map(|(name, desc)| {
-                                serde_json::json!({"name": name, "description": desc})
-                            })
-                            .collect();
-                        println!("{}", serde_json::to_string_pretty(&list)?);
-                    } else {
-                        println!("Available demos:");
-                        println!();
-                        for (name, desc) in demos {
-                            println!("  {name:<20} {desc}");
-                        }
-                        println!();
-                        println!("Run a demo: ft demo <name>");
-                        println!(
-                            "Note: Demo scenarios are not yet bundled. Use 'ft simulate run' with custom YAML."
-                        );
-                    }
+                    let payload =
+                        build_demo_list_payload(&workspace_root, &manifest_path, &manifest);
+                    let plain = render_demo_list_plain(&payload);
+                    print_demo_output(&payload, output_format, &plain)?;
                 }
                 Some(name) => {
-                    if demos.iter().any(|(n, _)| *n == name.as_str()) {
-                        if json {
-                            let msg = serde_json::json!({
-                                "demo": name,
-                                "status": "not_yet_bundled",
-                                "message": "Demo scenario files are not yet included. Use 'ft simulate run <file.yaml>' with a custom scenario."
-                            });
-                            println!("{}", serde_json::to_string_pretty(&msg)?);
-                        } else {
-                            println!("Demo: {name}");
-                            if narrate {
-                                println!("  (narration enabled)");
-                            }
-                            println!("  Speed: {speed}x");
-                            println!();
-                            println!("  Demo scenario files are not yet bundled.");
-                            println!("  Use 'ft simulate run <file.yaml>' with a custom scenario.");
-                        }
+                    if let Some(scenario) = find_demo_scenario(&manifest, &name) {
+                        let payload = build_demo_run_payload(
+                            &workspace_root,
+                            &manifest_path,
+                            &manifest,
+                            scenario,
+                            speed,
+                            narrate,
+                        )?;
+                        let plain = render_demo_run_plain(&payload);
+                        print_demo_output(&payload, output_format, &plain)?;
                     } else {
-                        eprintln!("Unknown demo: {name}");
-                        eprintln!("Available demos:");
-                        for (n, _) in demos {
-                            eprintln!("  {n}");
+                        let payload = build_unknown_demo_payload(&manifest, &name);
+                        if output_format == DemoOutputFormat::Plain {
+                            eprintln!("Unknown demo: {name}");
+                            eprintln!("Available demos:");
+                            for scenario in &manifest.scenarios {
+                                eprintln!("  {}", scenario.id);
+                            }
+                        } else {
+                            print_demo_output(&payload, output_format, "")?;
                         }
                         std::process::exit(1);
                     }
@@ -71528,6 +71874,133 @@ log_level = "debug"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_demo_manifest_and_format_parse() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "demo",
+            "quickstart",
+            "--manifest",
+            "fixtures/demo-lab/manifest.v1.json",
+            "--format",
+            "toon",
+            "--speed",
+            "2",
+            "--narrate",
+        ])
+        .expect("demo command should parse manifest and format");
+
+        match cli.command.map(|command| *command) {
+            Some(Commands::Demo {
+                name,
+                manifest,
+                speed,
+                narrate,
+                json,
+                format,
+            }) => {
+                assert_eq!(name.as_deref(), Some("quickstart"));
+                assert_eq!(
+                    manifest,
+                    PathBuf::from("fixtures/demo-lab/manifest.v1.json")
+                );
+                assert_eq!(speed, 2.0);
+                assert!(narrate);
+                assert!(!json);
+                assert_eq!(format, DemoOutputFormat::Toon);
+            }
+            _ => panic!("expected Commands::Demo"),
+        }
+    }
+
+    #[test]
+    fn cli_demo_list_payload_uses_bundled_manifest() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest_arg = PathBuf::from("fixtures/demo-lab/manifest.v1.json");
+        let (manifest_path, manifest) =
+            load_demo_manifest(&workspace_root, &manifest_arg).expect("manifest should load");
+        let payload = build_demo_list_payload(&workspace_root, &manifest_path, &manifest);
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["scenario_count"].as_u64(), Some(3));
+        assert!(!payload["side_effects_executed"].as_bool().unwrap_or(true));
+        assert!(!payload["live_mutation_allowed"].as_bool().unwrap_or(true));
+        assert!(
+            !payload["external_services_called"]
+                .as_bool()
+                .unwrap_or(true)
+        );
+        let plain = render_demo_list_plain(&payload);
+        assert!(plain.contains("quickstart"));
+        assert!(!plain.contains("not yet bundled"));
+        let toon = toon_rust::encode(payload, None);
+        assert_ne!(toon.trim_start().chars().next(), Some('{'));
+    }
+
+    #[test]
+    fn cli_demo_named_payload_validates_fixture_scenario() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest_arg = PathBuf::from("fixtures/demo-lab/manifest.v1.json");
+        let (manifest_path, manifest) =
+            load_demo_manifest(&workspace_root, &manifest_arg).expect("manifest should load");
+        let scenario =
+            find_demo_scenario(&manifest, "quickstart").expect("quickstart should be bundled");
+        let payload = build_demo_run_payload(
+            &workspace_root,
+            &manifest_path,
+            &manifest,
+            scenario,
+            2.0,
+            true,
+        )
+        .expect("quickstart should validate through simulation loader");
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["status"], "validated");
+        assert_eq!(payload["execution_mode"], "simulation_validate");
+        assert_eq!(payload["demo"], "quickstart");
+        assert_eq!(payload["scenario"]["id"], "quickstart");
+        assert_eq!(payload["requested_options"]["speed"].as_f64(), Some(2.0));
+        assert_eq!(
+            payload["requested_options"]["narrate"].as_bool(),
+            Some(true)
+        );
+        assert!(!payload["side_effects_executed"].as_bool().unwrap_or(true));
+        assert!(!payload["live_mutation_allowed"].as_bool().unwrap_or(true));
+        assert!(
+            !payload["external_services_called"]
+                .as_bool()
+                .unwrap_or(true)
+        );
+        assert!(payload["simulation"]["pane_count"].as_u64().unwrap_or(0) > 0);
+        assert!(payload["simulation"]["event_count"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            payload["simulation"]["expectation_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        let plain = render_demo_run_plain(&payload);
+        assert!(plain.contains("Status: validated"));
+        assert!(plain.contains("Side effects: none"));
+    }
+
+    #[test]
+    fn cli_demo_unknown_payload_lists_available_names() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest_arg = PathBuf::from("fixtures/demo-lab/manifest.v1.json");
+        let (_, manifest) =
+            load_demo_manifest(&workspace_root, &manifest_arg).expect("manifest should load");
+        let payload = build_unknown_demo_payload(&manifest, "missing_demo");
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["error"]["code"], "unknown_demo");
+        let available = payload["available_demos"]
+            .as_array()
+            .expect("available demos should be an array");
+        assert!(available.iter().any(|demo| demo == "quickstart"));
     }
 
     #[test]
