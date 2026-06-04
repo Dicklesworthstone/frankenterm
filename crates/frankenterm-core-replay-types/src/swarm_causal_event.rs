@@ -16,6 +16,18 @@ pub const SWARM_CAUSAL_EVENT_SCHEMA_VERSION_V1: &str = "ft.swarm.causal_event.v1
 /// Default payload byte ceiling for persisted operational event bodies.
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
+/// Default total payload byte ceiling for a reconstructed incident.
+pub const DEFAULT_MAX_INCIDENT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default event count ceiling for a reconstructed incident.
+pub const DEFAULT_MAX_INCIDENT_EVENTS: usize = 4096;
+
+/// Conservative payload byte ceiling for pane text snapshots.
+pub const DEFAULT_PANE_PAYLOAD_BYTES: usize = 16 * 1024;
+
+/// Conservative payload byte ceiling for large operational log snippets.
+pub const DEFAULT_LOG_PAYLOAD_BYTES: usize = 32 * 1024;
+
 /// Source subsystem that produced the causal event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +92,55 @@ pub enum CausalRetentionClass {
     Audit,
 }
 
+/// Machine-readable reason why raw payload content is absent or reduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalPayloadOmissionReason {
+    RedactedSecret,
+    TruncatedBySourceBudget,
+    HashOnlyByPolicy,
+    ExpiredByRetention,
+    SourceUnavailable,
+}
+
+/// Byte and retention budget applied to one event source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalSourceBudget {
+    pub max_payload_bytes: usize,
+    pub retention_seconds: Option<u64>,
+}
+
+/// Aggregate budget for incident replay/export envelopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalIncidentBudget {
+    pub max_total_payload_bytes: usize,
+    pub max_events: usize,
+}
+
+/// Caller-supplied privacy policy for building a causal event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CausalPrivacyPolicy {
+    pub max_payload_bytes: usize,
+    pub retention_seconds: Option<u64>,
+    pub omission_reason: Option<CausalPayloadOmissionReason>,
+    pub omitted_payload_hash_sha256: Option<String>,
+    pub omitted_payload_bytes: Option<usize>,
+}
+
+/// Payload-free privacy report for operator audit/export surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalPrivacyAudit {
+    pub source: SwarmCausalEventSource,
+    pub redaction_status: CausalRedactionStatus,
+    pub retention_class: CausalRetentionClass,
+    pub payload_bytes: usize,
+    pub max_payload_bytes: usize,
+    pub retention_seconds: Option<u64>,
+    pub omission_reason: Option<CausalPayloadOmissionReason>,
+    pub omitted_payload_hash_sha256: Option<String>,
+    pub omitted_payload_bytes: Option<usize>,
+}
+
 /// Durable reference to source evidence outside the event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CausalArtifactRef {
@@ -123,6 +184,16 @@ pub struct CausalPrivacy {
     pub retention_class: CausalRetentionClass,
     pub payload_hash_sha256: String,
     pub payload_bytes: usize,
+    #[serde(default = "default_max_payload_bytes")]
+    pub max_payload_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omission_reason: Option<CausalPayloadOmissionReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_payload_hash_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_payload_bytes: Option<usize>,
 }
 
 /// Versioned event envelope consumed by the flight-recorder incident DAG.
@@ -154,6 +225,12 @@ pub enum SwarmCausalEventError {
     PayloadHashMismatch { expected: String, actual: String },
     PayloadByteCountMismatch { expected: usize, actual: usize },
     SecretPayloadNotRedacted,
+    MissingOmissionReason { status: CausalRedactionStatus },
+    MissingOmittedPayloadReference { status: CausalRedactionStatus },
+    InvalidOmittedPayloadHash { hash: String },
+    InvalidPayloadBudget { max: usize },
+    SecretLikeIdentifier { field: String },
+    UnsafeArtifactUri { uri: String },
     MissingUnavailableReason,
     MissingCorrelationKey { source: SwarmCausalEventSource },
     EmptyArtifactUri,
@@ -194,6 +271,36 @@ impl std::fmt::Display for SwarmCausalEventError {
                     "secret-bearing payload must be redacted, hash-only, or unavailable"
                 )
             }
+            Self::MissingOmissionReason { status } => {
+                write!(f, "redaction status {status:?} requires an omission reason")
+            }
+            Self::MissingOmittedPayloadReference { status } => {
+                write!(
+                    f,
+                    "redaction status {status:?} requires omitted payload hash and byte count"
+                )
+            }
+            Self::InvalidOmittedPayloadHash { hash } => {
+                write!(
+                    f,
+                    "omitted payload hash is not a sha256 hex digest: {hash:?}"
+                )
+            }
+            Self::InvalidPayloadBudget { max } => {
+                write!(f, "payload budget must be non-zero, got {max}")
+            }
+            Self::SecretLikeIdentifier { field } => {
+                write!(
+                    f,
+                    "secret-like value is not allowed in identifier field {field}"
+                )
+            }
+            Self::UnsafeArtifactUri { uri } => {
+                write!(
+                    f,
+                    "artifact uri is not safe for persisted replay evidence: {uri:?}"
+                )
+            }
             Self::MissingUnavailableReason => {
                 write!(f, "unavailable source event must include payload.reason")
             }
@@ -210,6 +317,59 @@ impl std::fmt::Display for SwarmCausalEventError {
 
 impl std::error::Error for SwarmCausalEventError {}
 
+impl CausalRedactionStatus {
+    fn default_omission_reason(self) -> Option<CausalPayloadOmissionReason> {
+        match self {
+            Self::NotRequired => None,
+            Self::Redacted => Some(CausalPayloadOmissionReason::RedactedSecret),
+            Self::Truncated => Some(CausalPayloadOmissionReason::TruncatedBySourceBudget),
+            Self::HashOnly => Some(CausalPayloadOmissionReason::HashOnlyByPolicy),
+            Self::Unavailable => Some(CausalPayloadOmissionReason::SourceUnavailable),
+        }
+    }
+
+    fn requires_omission_reason(self) -> bool {
+        !matches!(self, Self::NotRequired)
+    }
+}
+
+impl CausalPrivacyPolicy {
+    pub fn for_source(
+        source: SwarmCausalEventSource,
+        retention_class: CausalRetentionClass,
+        redaction_status: CausalRedactionStatus,
+    ) -> Self {
+        let budget = default_source_budget(source, retention_class);
+        Self {
+            max_payload_bytes: budget.max_payload_bytes,
+            retention_seconds: budget.retention_seconds,
+            omission_reason: redaction_status.default_omission_reason(),
+            omitted_payload_hash_sha256: None,
+            omitted_payload_bytes: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_omitted_payload_ref(
+        mut self,
+        omitted_payload_hash_sha256: impl Into<String>,
+        omitted_payload_bytes: usize,
+    ) -> Self {
+        self.omitted_payload_hash_sha256 = Some(omitted_payload_hash_sha256.into());
+        self.omitted_payload_bytes = Some(omitted_payload_bytes);
+        self
+    }
+}
+
+impl Default for CausalIncidentBudget {
+    fn default() -> Self {
+        Self {
+            max_total_payload_bytes: DEFAULT_MAX_INCIDENT_PAYLOAD_BYTES,
+            max_events: DEFAULT_MAX_INCIDENT_EVENTS,
+        }
+    }
+}
+
 impl SwarmCausalEvent {
     /// Build a validated event and derive payload privacy metadata.
     #[allow(clippy::too_many_arguments)]
@@ -225,6 +385,42 @@ impl SwarmCausalEvent {
         sensitivity: CausalPayloadSensitivity,
         redaction_status: CausalRedactionStatus,
         retention_class: CausalRetentionClass,
+        artifacts: Vec<CausalArtifactRef>,
+        payload: Value,
+    ) -> Result<Self, SwarmCausalEventError> {
+        Self::new_with_privacy_policy(
+            event_id,
+            source,
+            event_class,
+            occurred_at_ms,
+            ingested_at_ms,
+            ingest_sequence,
+            correlation,
+            links,
+            sensitivity,
+            redaction_status,
+            retention_class,
+            CausalPrivacyPolicy::for_source(source, retention_class, redaction_status),
+            artifacts,
+            payload,
+        )
+    }
+
+    /// Build a validated event with an explicit source privacy policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_privacy_policy(
+        event_id: impl Into<String>,
+        source: SwarmCausalEventSource,
+        event_class: CausalEventClass,
+        occurred_at_ms: u64,
+        ingested_at_ms: u64,
+        ingest_sequence: u64,
+        correlation: CausalCorrelationKeys,
+        links: CausalLinks,
+        sensitivity: CausalPayloadSensitivity,
+        redaction_status: CausalRedactionStatus,
+        retention_class: CausalRetentionClass,
+        privacy_policy: CausalPrivacyPolicy,
         artifacts: Vec<CausalArtifactRef>,
         payload: Value,
     ) -> Result<Self, SwarmCausalEventError> {
@@ -246,17 +442,22 @@ impl SwarmCausalEvent {
                 retention_class,
                 payload_hash_sha256,
                 payload_bytes,
+                max_payload_bytes: privacy_policy.max_payload_bytes,
+                retention_seconds: privacy_policy.retention_seconds,
+                omission_reason: privacy_policy.omission_reason,
+                omitted_payload_hash_sha256: privacy_policy.omitted_payload_hash_sha256,
+                omitted_payload_bytes: privacy_policy.omitted_payload_bytes,
             },
             artifacts,
             payload,
         };
-        event.validate_with_max_payload(DEFAULT_MAX_PAYLOAD_BYTES)?;
+        event.validate()?;
         Ok(event)
     }
 
     /// Validate using the default payload byte ceiling.
     pub fn validate(&self) -> Result<(), SwarmCausalEventError> {
-        self.validate_with_max_payload(DEFAULT_MAX_PAYLOAD_BYTES)
+        self.validate_with_max_payload(self.privacy.max_payload_bytes)
     }
 
     /// Validate using a caller-supplied payload byte ceiling.
@@ -269,9 +470,21 @@ impl SwarmCausalEvent {
                 found: self.schema_version.clone(),
             });
         }
+        if max_payload_bytes == 0 {
+            return Err(SwarmCausalEventError::InvalidPayloadBudget {
+                max: max_payload_bytes,
+            });
+        }
+        if self.privacy.max_payload_bytes == 0 {
+            return Err(SwarmCausalEventError::InvalidPayloadBudget {
+                max: self.privacy.max_payload_bytes,
+            });
+        }
+        let effective_max_payload_bytes = max_payload_bytes.min(self.privacy.max_payload_bytes);
         if self.event_id.trim().is_empty() {
             return Err(SwarmCausalEventError::EmptyEventId);
         }
+        validate_graph_identifier("event_id", &self.event_id)?;
         if self.ingested_at_ms < self.occurred_at_ms {
             return Err(SwarmCausalEventError::IngestedBeforeOccurred);
         }
@@ -285,6 +498,9 @@ impl SwarmCausalEvent {
                 event_id: self.event_id.clone(),
             });
         }
+        for parent in &self.links.parent_event_ids {
+            validate_graph_identifier("links.parent_event_ids", parent)?;
+        }
         if self
             .links
             .caused_by_event_ids
@@ -295,12 +511,18 @@ impl SwarmCausalEvent {
                 event_id: self.event_id.clone(),
             });
         }
+        for caused_by in &self.links.caused_by_event_ids {
+            validate_graph_identifier("links.caused_by_event_ids", caused_by)?;
+        }
+        if let Some(root_event_id) = &self.links.root_event_id {
+            validate_graph_identifier("links.root_event_id", root_event_id)?;
+        }
 
         let actual_payload_bytes = serialized_payload_len(&self.payload);
-        if actual_payload_bytes > max_payload_bytes {
+        if actual_payload_bytes > effective_max_payload_bytes {
             return Err(SwarmCausalEventError::PayloadTooLarge {
                 actual: actual_payload_bytes,
-                max: max_payload_bytes,
+                max: effective_max_payload_bytes,
             });
         }
         let actual_hash = payload_hash(&self.payload);
@@ -316,13 +538,30 @@ impl SwarmCausalEvent {
                 actual: actual_payload_bytes,
             });
         }
-        if self.privacy.sensitivity == CausalPayloadSensitivity::SecretBearing
-            && !matches!(
-                self.privacy.redaction_status,
-                CausalRedactionStatus::Redacted
-                    | CausalRedactionStatus::HashOnly
-                    | CausalRedactionStatus::Unavailable
-            )
+        if self.privacy.redaction_status.requires_omission_reason()
+            && self.privacy.omission_reason.is_none()
+        {
+            return Err(SwarmCausalEventError::MissingOmissionReason {
+                status: self.privacy.redaction_status,
+            });
+        }
+        if matches!(
+            self.privacy.redaction_status,
+            CausalRedactionStatus::HashOnly
+        ) && (self.privacy.omitted_payload_hash_sha256.is_none()
+            || self.privacy.omitted_payload_bytes.is_none())
+        {
+            return Err(SwarmCausalEventError::MissingOmittedPayloadReference {
+                status: self.privacy.redaction_status,
+            });
+        }
+        if let Some(hash) = &self.privacy.omitted_payload_hash_sha256
+            && !is_sha256_hex(hash)
+        {
+            return Err(SwarmCausalEventError::InvalidOmittedPayloadHash { hash: hash.clone() });
+        }
+        if secret_payload_requires_redaction(self)
+            || payload_contains_unredacted_secret(&self.payload)
         {
             return Err(SwarmCausalEventError::SecretPayloadNotRedacted);
         }
@@ -336,14 +575,66 @@ impl SwarmCausalEvent {
             return Err(SwarmCausalEventError::MissingUnavailableReason);
         }
         validate_required_correlation(self.source, &self.correlation)?;
-        if self
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.uri.trim().is_empty())
-        {
-            return Err(SwarmCausalEventError::EmptyArtifactUri);
+        validate_correlation_strings(&self.correlation)?;
+        for artifact in &self.artifacts {
+            validate_artifact_ref(artifact)?;
         }
         Ok(())
+    }
+
+    /// Build a payload-free privacy audit record for operator/export surfaces.
+    pub fn privacy_audit(&self) -> CausalPrivacyAudit {
+        CausalPrivacyAudit {
+            source: self.source,
+            redaction_status: self.privacy.redaction_status,
+            retention_class: self.privacy.retention_class,
+            payload_bytes: self.privacy.payload_bytes,
+            max_payload_bytes: self.privacy.max_payload_bytes,
+            retention_seconds: self.privacy.retention_seconds,
+            omission_reason: self.privacy.omission_reason,
+            omitted_payload_hash_sha256: self.privacy.omitted_payload_hash_sha256.clone(),
+            omitted_payload_bytes: self.privacy.omitted_payload_bytes,
+        }
+    }
+}
+
+pub fn default_incident_budget() -> CausalIncidentBudget {
+    CausalIncidentBudget::default()
+}
+
+pub fn default_source_budget(
+    source: SwarmCausalEventSource,
+    retention_class: CausalRetentionClass,
+) -> CausalSourceBudget {
+    CausalSourceBudget {
+        max_payload_bytes: default_max_payload_bytes_for_source(source),
+        retention_seconds: default_retention_seconds(retention_class),
+    }
+}
+
+pub const fn default_max_payload_bytes_for_source(source: SwarmCausalEventSource) -> usize {
+    match source {
+        SwarmCausalEventSource::Pane => DEFAULT_PANE_PAYLOAD_BYTES,
+        SwarmCausalEventSource::Beads
+        | SwarmCausalEventSource::Rch
+        | SwarmCausalEventSource::AgentMail => DEFAULT_LOG_PAYLOAD_BYTES,
+        SwarmCausalEventSource::Git => DEFAULT_PANE_PAYLOAD_BYTES,
+        SwarmCausalEventSource::Robot
+        | SwarmCausalEventSource::Mcp
+        | SwarmCausalEventSource::Workflow
+        | SwarmCausalEventSource::Policy
+        | SwarmCausalEventSource::Operator
+        | SwarmCausalEventSource::Runtime
+        | SwarmCausalEventSource::SourceUnavailable => DEFAULT_MAX_PAYLOAD_BYTES,
+    }
+}
+
+pub const fn default_retention_seconds(retention_class: CausalRetentionClass) -> Option<u64> {
+    match retention_class {
+        CausalRetentionClass::Ephemeral => Some(24 * 60 * 60),
+        CausalRetentionClass::Standard => Some(30 * 24 * 60 * 60),
+        CausalRetentionClass::Proof => Some(180 * 24 * 60 * 60),
+        CausalRetentionClass::Audit => None,
     }
 }
 
@@ -374,6 +665,163 @@ fn validate_required_correlation(
 
 fn is_present(value: Option<&String>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn validate_correlation_strings(
+    correlation: &CausalCorrelationKeys,
+) -> Result<(), SwarmCausalEventError> {
+    for (field, value) in [
+        (
+            "correlation.workspace_id",
+            correlation.workspace_id.as_deref(),
+        ),
+        ("correlation.session_id", correlation.session_id.as_deref()),
+        (
+            "correlation.workflow_id",
+            correlation.workflow_id.as_deref(),
+        ),
+        ("correlation.bead_id", correlation.bead_id.as_deref()),
+        ("correlation.thread_id", correlation.thread_id.as_deref()),
+        (
+            "correlation.rch_build_id",
+            correlation.rch_build_id.as_deref(),
+        ),
+        (
+            "correlation.rch_worker_id",
+            correlation.rch_worker_id.as_deref(),
+        ),
+        ("correlation.git_commit", correlation.git_commit.as_deref()),
+        ("correlation.git_branch", correlation.git_branch.as_deref()),
+        ("correlation.command_id", correlation.command_id.as_deref()),
+    ] {
+        if let Some(value) = value {
+            reject_secret_like(field, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_graph_identifier(field: &str, value: &str) -> Result<(), SwarmCausalEventError> {
+    reject_secret_like(field, value)?;
+    if value.contains('/')
+        || value.contains('\\')
+        || value
+            .split(['.', ':'])
+            .any(|part| part == ".." || part.trim().is_empty())
+    {
+        return Err(SwarmCausalEventError::UnsafeArtifactUri {
+            uri: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_artifact_ref(artifact: &CausalArtifactRef) -> Result<(), SwarmCausalEventError> {
+    if artifact.uri.trim().is_empty() {
+        return Err(SwarmCausalEventError::EmptyArtifactUri);
+    }
+    reject_secret_like("artifact.kind", &artifact.kind)?;
+    reject_secret_like("artifact.uri", &artifact.uri)?;
+    if artifact.uri.starts_with('/')
+        || artifact.uri.contains('\\')
+        || artifact.uri.split('/').any(|part| part == "..")
+    {
+        return Err(SwarmCausalEventError::UnsafeArtifactUri {
+            uri: artifact.uri.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn reject_secret_like(field: &str, value: &str) -> Result<(), SwarmCausalEventError> {
+    if looks_secret_like(value) {
+        Err(SwarmCausalEventError::SecretLikeIdentifier {
+            field: field.to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn secret_payload_requires_redaction(event: &SwarmCausalEvent) -> bool {
+    event.privacy.sensitivity == CausalPayloadSensitivity::SecretBearing
+        && !matches!(
+            event.privacy.redaction_status,
+            CausalRedactionStatus::Redacted
+                | CausalRedactionStatus::HashOnly
+                | CausalRedactionStatus::Unavailable
+        )
+}
+
+fn payload_contains_unredacted_secret(payload: &Value) -> bool {
+    match payload {
+        Value::String(value) => looks_secret_like(value) && !is_redacted_marker(value),
+        Value::Array(values) => values.iter().any(payload_contains_unredacted_secret),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            let secret_key = key_looks_secret_like(key);
+            if secret_key && !value_is_redacted(value) {
+                true
+            } else {
+                payload_contains_unredacted_secret(value)
+            }
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn value_is_redacted(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => is_redacted_marker(value),
+        Value::Array(values) => values.iter().all(value_is_redacted),
+        Value::Object(values) => values.values().all(value_is_redacted),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn key_looks_secret_like(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("authorization")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("private_key")
+}
+
+fn looks_secret_like(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("authorization: bearer ")
+        || lower.contains("bearer sk-")
+        || lower.contains("bearer ghp_")
+        || lower.contains("password=")
+        || lower.contains("passwd=")
+        || lower.contains("secret=")
+        || lower.contains("token=")
+        || lower.contains("api_key=")
+        || lower.contains("apikey=")
+        || lower.contains("private_key=")
+        || lower.contains("aws_secret_access_key=")
+        || lower.contains("sk-live-")
+        || lower.contains("ghp_")
+}
+
+fn is_redacted_marker(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.eq_ignore_ascii_case("[redacted]")
+        || trimmed.eq_ignore_ascii_case("<redacted>")
+        || trimmed.eq_ignore_ascii_case("***redacted***")
+        || trimmed.eq_ignore_ascii_case("redacted")
+}
+
+fn is_sha256_hex(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn default_max_payload_bytes() -> usize {
+    DEFAULT_MAX_PAYLOAD_BYTES
 }
 
 fn payload_hash(payload: &Value) -> String {
@@ -740,6 +1188,230 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, SwarmCausalEventError::SecretPayloadNotRedacted);
+    }
+
+    #[test]
+    fn redacted_secret_payload_gets_audit_reason_without_raw_value() {
+        let event = SwarmCausalEvent::new(
+            "redacted-secret",
+            SwarmCausalEventSource::AgentMail,
+            CausalEventClass::Informational,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys {
+                thread_id: Some("ft-ogr3n.5".to_string()),
+                ..Default::default()
+            },
+            CausalLinks::default(),
+            CausalPayloadSensitivity::SecretBearing,
+            CausalRedactionStatus::Redacted,
+            CausalRetentionClass::Audit,
+            Vec::new(),
+            json!({"token": "[REDACTED]", "body": "safe"}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            event.privacy.omission_reason,
+            Some(CausalPayloadOmissionReason::RedactedSecret)
+        );
+        assert_eq!(event.privacy.retention_seconds, None);
+
+        let audit = serde_json::to_string(&event.privacy_audit()).unwrap();
+        assert!(!audit.contains("token"));
+        assert!(!audit.contains("[REDACTED]"));
+        assert!(audit.contains("redacted_secret"));
+    }
+
+    #[test]
+    fn rejects_secret_fixture_even_when_sensitivity_is_mislabeled() {
+        let err = SwarmCausalEvent::new(
+            "mislabeled-secret",
+            SwarmCausalEventSource::Rch,
+            CausalEventClass::SourceFailure,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys {
+                rch_build_id: Some("29844447185338425".to_string()),
+                ..Default::default()
+            },
+            CausalLinks::default(),
+            CausalPayloadSensitivity::Structural,
+            CausalRedactionStatus::NotRequired,
+            CausalRetentionClass::Proof,
+            Vec::new(),
+            json!({"headers": {"authorization": "Bearer sk-live-raw-secret"}}),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, SwarmCausalEventError::SecretPayloadNotRedacted);
+    }
+
+    #[test]
+    fn source_and_incident_budgets_are_machine_readable() {
+        let pane_budget = default_source_budget(
+            SwarmCausalEventSource::Pane,
+            CausalRetentionClass::Ephemeral,
+        );
+        assert_eq!(pane_budget.max_payload_bytes, DEFAULT_PANE_PAYLOAD_BYTES);
+        assert_eq!(pane_budget.retention_seconds, Some(24 * 60 * 60));
+
+        let rch_budget =
+            default_source_budget(SwarmCausalEventSource::Rch, CausalRetentionClass::Proof);
+        assert_eq!(rch_budget.max_payload_bytes, DEFAULT_LOG_PAYLOAD_BYTES);
+        assert_eq!(rch_budget.retention_seconds, Some(180 * 24 * 60 * 60));
+
+        let incident_budget = default_incident_budget();
+        assert_eq!(
+            incident_budget.max_total_payload_bytes,
+            DEFAULT_MAX_INCIDENT_PAYLOAD_BYTES
+        );
+        assert_eq!(incident_budget.max_events, DEFAULT_MAX_INCIDENT_EVENTS);
+
+        let mut event = base_event(SwarmCausalEventSource::Robot);
+        event.privacy.max_payload_bytes = 4;
+        assert!(matches!(
+            event.validate_with_max_payload(usize::MAX),
+            Err(SwarmCausalEventError::PayloadTooLarge { max: 4, .. })
+        ));
+
+        let err = SwarmCausalEvent::new(
+            "oversized-pane",
+            SwarmCausalEventSource::Pane,
+            CausalEventClass::Informational,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys {
+                pane_id: Some(7),
+                ..Default::default()
+            },
+            CausalLinks::default(),
+            CausalPayloadSensitivity::UserText,
+            CausalRedactionStatus::Truncated,
+            CausalRetentionClass::Ephemeral,
+            Vec::new(),
+            json!({"text": "x".repeat(DEFAULT_PANE_PAYLOAD_BYTES)}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SwarmCausalEventError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn hash_only_payload_requires_omitted_payload_reference() {
+        let err = SwarmCausalEvent::new(
+            "hash-only-missing-ref",
+            SwarmCausalEventSource::Beads,
+            CausalEventClass::Informational,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys {
+                bead_id: Some("ft-ogr3n.5".to_string()),
+                ..Default::default()
+            },
+            CausalLinks::default(),
+            CausalPayloadSensitivity::SecretBearing,
+            CausalRedactionStatus::HashOnly,
+            CausalRetentionClass::Audit,
+            Vec::new(),
+            json!({"omitted": true}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SwarmCausalEventError::MissingOmittedPayloadReference {
+                status: CausalRedactionStatus::HashOnly
+            }
+        );
+
+        let event = SwarmCausalEvent::new_with_privacy_policy(
+            "hash-only-with-ref",
+            SwarmCausalEventSource::Beads,
+            CausalEventClass::Informational,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys {
+                bead_id: Some("ft-ogr3n.5".to_string()),
+                ..Default::default()
+            },
+            CausalLinks::default(),
+            CausalPayloadSensitivity::SecretBearing,
+            CausalRedactionStatus::HashOnly,
+            CausalRetentionClass::Audit,
+            CausalPrivacyPolicy::for_source(
+                SwarmCausalEventSource::Beads,
+                CausalRetentionClass::Audit,
+                CausalRedactionStatus::HashOnly,
+            )
+            .with_omitted_payload_ref("a".repeat(64), 8192),
+            Vec::new(),
+            json!({"omitted": true}),
+        )
+        .unwrap();
+
+        assert_eq!(event.privacy.omitted_payload_bytes, Some(8192));
+        assert_eq!(
+            event.privacy.omission_reason,
+            Some(CausalPayloadOmissionReason::HashOnlyByPolicy)
+        );
+    }
+
+    #[test]
+    fn rejects_secret_like_identifiers_and_unsafe_artifact_uris() {
+        let err = SwarmCausalEvent::new(
+            "token=raw-secret",
+            SwarmCausalEventSource::Robot,
+            CausalEventClass::Informational,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys::default(),
+            CausalLinks::default(),
+            CausalPayloadSensitivity::Structural,
+            CausalRedactionStatus::NotRequired,
+            CausalRetentionClass::Standard,
+            Vec::new(),
+            json!({}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SwarmCausalEventError::SecretLikeIdentifier {
+                field: "event_id".to_string()
+            }
+        );
+
+        let err = SwarmCausalEvent::new(
+            "unsafe-artifact",
+            SwarmCausalEventSource::Robot,
+            CausalEventClass::Informational,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys::default(),
+            CausalLinks::default(),
+            CausalPayloadSensitivity::Structural,
+            CausalRedactionStatus::NotRequired,
+            CausalRetentionClass::Standard,
+            vec![CausalArtifactRef {
+                kind: "jsonl".to_string(),
+                uri: "logs/../secret.jsonl".to_string(),
+                sha256: None,
+                size_bytes: None,
+            }],
+            json!({}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SwarmCausalEventError::UnsafeArtifactUri {
+                uri: "logs/../secret.jsonl".to_string()
+            }
+        );
     }
 
     #[test]
