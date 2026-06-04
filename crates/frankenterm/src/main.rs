@@ -71906,7 +71906,7 @@ log_level = "debug"
                     manifest,
                     PathBuf::from("fixtures/demo-lab/manifest.v1.json")
                 );
-                assert_eq!(speed, 2.0);
+                assert!((speed - 2.0).abs() < f64::EPSILON);
                 assert!(narrate);
                 assert!(!json);
                 assert_eq!(format, DemoOutputFormat::Toon);
@@ -71962,7 +71962,10 @@ log_level = "debug"
         assert_eq!(payload["execution_mode"], "simulation_validate");
         assert_eq!(payload["demo"], "quickstart");
         assert_eq!(payload["scenario"]["id"], "quickstart");
-        assert_eq!(payload["requested_options"]["speed"].as_f64(), Some(2.0));
+        let requested_speed = payload["requested_options"]["speed"]
+            .as_f64()
+            .expect("speed should be numeric");
+        assert!((requested_speed - 2.0).abs() < f64::EPSILON);
         assert_eq!(
             payload["requested_options"]["narrate"].as_bool(),
             Some(true)
