@@ -928,9 +928,8 @@ fn mutation_check_serialize_screen_cells_distinguishes_content() {
 /// combining mark arrives standalone), and at arbitrary chunk sizes; all must
 /// yield byte-identical screen cells.
 ///
-/// Remaining out of scope (see `known_limitation_*` below, GA-FND-009): width-
-/// CHANGING marks (VS16 emoji-presentation) and multi-base ZWJ emoji sequences —
-/// those need width reflow / cross-call cluster buffering and are still divergent.
+/// FND-009's remainder has a dedicated regression below because it needs
+/// retroactive width expansion and ZWJ re-clustering across call boundaries.
 #[test]
 fn well_formed_unicode_cell_content_is_chunk_boundary_invariant() {
     let cases: &[&str] = &[
@@ -979,35 +978,57 @@ fn well_formed_unicode_cell_content_is_chunk_boundary_invariant() {
     }
 }
 
-/// FND-009 — REMAINING known gap (documented, not yet fixed): GA-FND-009.
+/// FND-009 remainder — width-changing marks and multi-base ZWJ sequences.
 ///
-/// Width-preserving combining marks split across `advance_bytes` calls are now
-/// fixed (see the positive test above). Two harder cases of zero-width joiners
-/// remain divergent across chunk boundaries and need deeper work:
-///   - width-CHANGING marks (VS16 `❤\u{FE0F}` turns a width-1 cell into width-2,
-///     which would have to claim the adjacent cell — the fix deliberately only
-///     attaches when column width is unchanged);
-///   - multi-base ZWJ emoji (`👨\u{200D}👩\u{200D}👧`) → a later base must JOIN
-///     the previous cell, needing cross-call grapheme-cluster buffering.
-///
-/// `#[ignore]`'d so the gap is recorded + runnable on demand without breaking CI;
-/// it documents (does not assert) the current divergent behavior.
+/// The performer reopens the committed cell at the cursor boundary when the
+/// next scalar still forms one grapheme cluster with it. That covers VS16
+/// widening (`❤\u{FE0F}`) and ZWJ emoji chains split across `advance_bytes`
+/// calls without holding arbitrary complete emoji in the print buffer.
 #[test]
-#[ignore = "FND-009: width-changing VS + multi-base ZWJ split across advance_bytes diverge; tracked GA-FND-009"]
-fn known_limitation_width_changing_and_zwj_chunk_divergence() {
+fn width_changing_and_zwj_clusters_are_chunk_boundary_invariant() {
     for case in ["❤\u{FE0F}", "👨\u{200D}👩\u{200D}👧"] {
         let bytes = case.as_bytes();
         let mut whole = make_term(8, 40);
         whole.advance_bytes(bytes);
         let expected = serialize_screen_cells(&whole);
+        let expected_cursor = whole.cursor_pos();
 
         let mut bb = make_term(8, 40);
         for b in bytes {
             bb.advance_bytes([*b]);
         }
-        // Documented current behavior: these MAY differ. We do not assert equality
-        // (that is the known gap); we just exercise the path so it stays runnable.
-        let _ = (serialize_screen_cells(&bb), expected);
+        assert_eq!(
+            serialize_screen_cells(&bb),
+            expected,
+            "FND-009 remainder {case:?} diverged under byte-by-byte chunking"
+        );
+        let cursor = bb.cursor_pos();
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (expected_cursor.x, expected_cursor.y),
+            "FND-009 remainder {case:?} cursor diverged under byte-by-byte chunking"
+        );
+
+        for &size in &[2usize, 3, 5, 7] {
+            let mut ch = make_term(8, 40);
+            let mut off = 0;
+            while off < bytes.len() {
+                let end = (off + size).min(bytes.len());
+                ch.advance_bytes(&bytes[off..end]);
+                off = end;
+            }
+            assert_eq!(
+                serialize_screen_cells(&ch),
+                expected,
+                "FND-009 remainder {case:?} diverged under chunk size {size}"
+            );
+            let cursor = ch.cursor_pos();
+            assert_eq!(
+                (cursor.x, cursor.y),
+                (expected_cursor.x, expected_cursor.y),
+                "FND-009 remainder {case:?} cursor diverged under chunk size {size}"
+            );
+        }
     }
 }
 

@@ -63,6 +63,81 @@ impl<'a> Performer<'a> {
         }
     }
 
+    fn recluster_at_cursor(&mut self, suffix: &str, require_prior_trailing_zwj: bool) -> bool {
+        let cursor_x = self.cursor.x;
+        let cursor_y = self.cursor.y;
+        let seqno = self.seqno;
+        let unicode_version = self.unicode_version.clone();
+        let pending_wrap = self.wrap_next;
+        let dec_auto_wrap = self.dec_auto_wrap;
+        let right_margin = self.left_and_right_margins.end;
+
+        let (cursor_x, wrap_next) = {
+            let screen = self.screen_mut();
+            let phys = screen.phys_row(cursor_y);
+            let line = screen.line_mut(phys);
+            let mut candidate = None;
+
+            for cell in line.visible_cells() {
+                let cell_index = cell.cell_index();
+                if pending_wrap && cell_index == cursor_x {
+                    candidate = Some((
+                        cell_index,
+                        cell.str().to_string(),
+                        cell.width(),
+                        cell.attrs().clone(),
+                    ));
+                    break;
+                }
+                if cell_index < cursor_x {
+                    candidate = Some((
+                        cell_index,
+                        cell.str().to_string(),
+                        cell.width(),
+                        cell.attrs().clone(),
+                    ));
+                } else {
+                    break;
+                }
+            }
+
+            let Some((idx, text, width, attrs)) = candidate else {
+                return false;
+            };
+            let old_end = idx.saturating_add(width);
+            let joins_at_cursor = old_end == cursor_x || (pending_wrap && idx == cursor_x);
+            if !joins_at_cursor {
+                return false;
+            }
+            if require_prior_trailing_zwj && !text.ends_with('\u{200d}') {
+                return false;
+            }
+
+            let combined = format!("{text}{suffix}");
+            if Graphemes::new(combined.as_str()).count() != 1 {
+                return false;
+            }
+
+            let combined_width = grapheme_column_width(&combined, Some(&unicode_version));
+            if !(width..=2).contains(&combined_width) {
+                return false;
+            }
+
+            line.set_cell_grapheme(idx, &combined, combined_width, attrs, seqno);
+
+            let next_x = idx.saturating_add(combined_width);
+            if next_x >= right_margin {
+                (idx, dec_auto_wrap)
+            } else {
+                (next_x, false)
+            }
+        };
+
+        self.cursor.x = cursor_x;
+        self.wrap_next = wrap_next;
+        true
+    }
+
     /// Apply character set related remapping to the input glyph if required
     fn remap_grapheme<'b>(&self, g: &'b str) -> &'b str {
         if (self.shift_out && self.g1_charset == CharSet::DecLineDrawing)
@@ -166,52 +241,23 @@ impl<'a> Performer<'a> {
                     // bytes rendered differently depending on chunk boundaries
                     // (`a` then `U+0301` -> `a` instead of `á`). Attach it to the
                     // previous cell IFF it genuinely clusters with that cell's
-                    // grapheme AND the cluster's column width is unchanged (so we
-                    // never have to claim an adjacent cell): re-running `Graphemes`
-                    // matches whole-buffer semantics exactly, and non-clustering or
-                    // width-changing zero-width controls (BIDI format chars, VS16
-                    // emoji-presentation) are still elided as before.
-                    let x = self.cursor.x;
-                    let y = self.cursor.y;
-                    let mut attached = false;
-                    if x > 0 {
-                        // Clone the unicode version out before borrowing the screen
-                        // mutably (width math below would otherwise re-borrow self).
-                        let unicode_version = self.unicode_version.clone();
-                        let screen = self.screen_mut();
-                        let phys = screen.phys_row(y);
-                        let line = screen.line_mut(phys);
-                        let mut idx = x;
-                        while idx > 0 {
-                            idx -= 1;
-                            let info = line
-                                .get_cell(idx)
-                                .map(|c| (c.str().to_string(), c.width(), c.attrs().clone()));
-                            match info {
-                                // Wide-char continuation cell (empty); walk left to
-                                // the glyph that owns this column pair.
-                                Some((s, _w, _a)) if s.is_empty() => continue,
-                                Some((s, w, a)) => {
-                                    let combined = format!("{s}{g}");
-                                    let combined_width =
-                                        grapheme_column_width(&combined, Some(&unicode_version));
-                                    if combined_width == w
-                                        && Graphemes::new(combined.as_str()).count() == 1
-                                    {
-                                        line.set_cell_grapheme(idx, &combined, w, a, seqno);
-                                        attached = true;
-                                    }
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-                    }
+                    // grapheme and the resulting cluster width is representable
+                    // by a terminal cell: re-running `Graphemes` matches
+                    // whole-buffer semantics exactly. Non-clustering zero-width
+                    // controls (for example BIDI format chars) are still elided
+                    // as before, while width-changing continuations such as VS16
+                    // can now expand the prior cell through the same line setter
+                    // used by normal double-width graphemes.
+                    let attached = self.recluster_at_cursor(g, false);
                     if !attached {
                         log::trace!("Eliding zero-width grapheme {:?}", g);
                     }
                     continue;
                 }
+            }
+
+            if g.len() > 1 && self.recluster_at_cursor(g, true) {
+                continue;
             }
 
             if self.wrap_next {
