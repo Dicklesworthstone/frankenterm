@@ -604,9 +604,9 @@ mod tests {
 
         let (_stddev, min_fraction, max_fraction) = ring.compute_distribution(3);
 
-        assert_eq!(
-            min_fraction, 0.0,
-            "3 keys across 10 nodes leaves >=7 nodes starved; min must be 0"
+        assert!(
+            min_fraction.abs() < f64::EPSILON,
+            "3 keys across 10 nodes leaves >=7 nodes starved; min must be 0; got {min_fraction}"
         );
         assert!(
             max_fraction > 0.0,
