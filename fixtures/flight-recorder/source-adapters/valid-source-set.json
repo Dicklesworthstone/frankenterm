@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.swarm.source_adapters.v1",
+  "generated_at_ms": 1778000100000,
+  "source_set_id": "ft-ogr3n2-valid",
+  "workspace_id": "frankenterm",
+  "pane_runtime": [
+    {
+      "source_id": "pane-42-runtime",
+      "pane_id": 42,
+      "session_id": "session-alpha",
+      "collected_at_ms": 1778000001000,
+      "capture_gap_count": 1,
+      "pattern_detection_count": 2,
+      "workflow_action_count": 1,
+      "redaction": {
+        "applied": true,
+        "raw_text_stored": false,
+        "policy_id": "ft.read_path.redaction.v1"
+      },
+      "reason_codes": [
+        "pane.capture_gap",
+        "source.redacted_summary_only"
+      ],
+      "artifact_paths": [
+        "tests/e2e/logs/pane-runtime-ft-ogr3n2.jsonl"
+      ],
+      "payload": {
+        "summary": "Pane emitted a redacted capture gap and two pattern detections.",
+        "env": {
+          "API_TOKEN": "ghp_examplefixturetoken"
+        },
+        "detected_patterns": [
+          "rate_limit",
+          "prompt_ready"
+        ]
+      }
+    }
+  ],
+  "beads": [
+    {
+      "source_id": "beads-ft-ogr3n2",
+      "issue_id": "ft-ogr3n.2",
+      "status": "in_progress",
+      "updated_at_ms": 1778000002000,
+      "dependency_ids": [
+        "ft-ogr3n.1",
+        "ft-ogr3n.5"
+      ],
+      "comment_count": 3,
+      "dirty_tree_guard_comment_count": 1,
+      "close_reason": null,
+      "reason_codes": [
+        "beads.claimed",
+        "git.dirty_tree_guard_present"
+      ],
+      "artifact_paths": [
+        ".beads/issues.jsonl"
+      ],
+      "payload": {
+        "summary": "Direct blockers are closed; parent remains blocked by convergence child."
+      }
+    }
+  ],
+  "rch": [
+    {
+      "source_id": "rch-proof-j-29871232832766246",
+      "build_id": "29871232832766246",
+      "worker_id": "vmi1227854",
+      "command_argv": [
+        "cargo",
+        "test",
+        "-p",
+        "frankenterm-core-replay-types",
+        "swarm_causal_event",
+        "--lib"
+      ],
+      "started_at_ms": 1778000003000,
+      "completed_at_ms": 1778000009000,
+      "location": "remote",
+      "exit_code": 0,
+      "cancellation_reason": null,
+      "preflight_refusal_reason": null,
+      "artifact_paths": [
+        "tests/e2e/logs/rch-ft-ogr3n2.json"
+      ],
+      "reason_codes": [
+        "rch.remote_worker_reached",
+        "rch.exit_zero"
+      ],
+      "payload": {
+        "duration_ms": 6000,
+        "remote_cargo_reached": true
+      }
+    }
+  ],
+  "git": [
+    {
+      "source_id": "git-status-main",
+      "head_commit": "ea967abe4",
+      "branch": "main",
+      "captured_at_ms": 1778000004000,
+      "staged_paths": [],
+      "dirty_paths": [
+        ".beads/issues.jsonl",
+        "crates/frankenterm-core-replay-types/src/source_adapters.rs"
+      ],
+      "branch_ahead": 0,
+      "branch_behind": 0,
+      "protected_deletion_warnings": [
+        "crates/frankenterm-core deletion guard clean"
+      ],
+      "artifact_paths": [
+        "tests/e2e/logs/git-status-ft-ogr3n2.json",
+        "../unsafe/status.json"
+      ],
+      "reason_codes": [
+        "git.dirty_tree_snapshot",
+        "git.protected_delete_guard_present"
+      ],
+      "payload": {
+        "summary": "Tracked dirty paths are captured without mutating the worktree."
+      }
+    }
+  ],
+  "agent_mail": [
+    {
+      "source_id": "agent-mail-thread-ft-ogr3n2",
+      "health_state": "available",
+      "thread_id": "thread-ft-ogr3n2",
+      "collected_at_ms": 1778000005000,
+      "message_count": 4,
+      "ack_count": 1,
+      "ack_required_count": 0,
+      "contact_count": 2,
+      "unavailable_reason": null,
+      "reason_codes": [
+        "agent_mail.healthy",
+        "source.metadata_only"
+      ],
+      "artifact_paths": [
+        "tests/e2e/logs/agent-mail-ft-ogr3n2.json"
+      ],
+      "payload": {
+        "summary": "Only message counters, ack counters, and contact counts are persisted."
+      }
+    }
+  ]
+}
