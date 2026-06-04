@@ -36,6 +36,11 @@ that bead, verify:
   `cargo test -p frankenterm-core --test swarm_capacity_resource_budget_model --no-default-features`
   and confirm `docs/attestations/perf/swarm-capacity-envelope.json` still keeps
   high-scale claims fail-closed unless the target-class artifact is non-skipped.
+- [ ] Rehearsal-score wording changes cite the retained receipt or golden matrix
+  path, preserve `blocked`, `missing_evidence`, `degraded`, `skipped`, and
+  `fixture_only` states, and do not turn `score_percent` into a release claim.
+  The optional manifest slot is `proofs/rehearsal-score`, currently backed by
+  `crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json`.
 - [ ] The closing comment cites the manifest slot category, artifact path,
   build/verify exit codes, and retained RCH artifact bundle path.
 
@@ -82,6 +87,12 @@ in [`docs/attestations/README.md`](../attestations/README.md)
 | `proofs/robot-contracts`            | `ft-0elb9`         | `br show ft-0elb9` reports closed |
 | `doctrine/agents-md-counts`         | `ft-tf6g3.2`       | `br show ft-tf6g3.2` reports closed |
 | `doctrine/cx-propagation`           | `ft-q0tz3`         | `br show ft-q0tz3` reports closed |
+
+Optional release-support slots are still hashed when present, but they do not
+appear in `required_categories` until the owning epic graduates them. For
+rehearsal-score closeout, confirm the `proofs/rehearsal-score` slot remains
+present and points at the golden matrix unless a later bead replaces it with a
+stronger retained no-mock receipt bundle.
 
 If any bead is **not closed**, the release MUST NOT proceed —
 the attestation bundle would either be partial (rejected by

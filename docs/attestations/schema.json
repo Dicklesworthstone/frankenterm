@@ -293,6 +293,7 @@
         "proofs/loom-runtime-async",
         "proofs/runtime-proof-trait",
         "proofs/robot-contracts",
+        "proofs/rehearsal-score",
         "proofs/tx-killswitch",
         "doctrine/agents-md-counts",
         "doctrine/vendored-provenance",

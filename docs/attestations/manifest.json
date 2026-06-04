@@ -146,6 +146,14 @@
       "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelopes, live profile/fleet mutation receipts, and backend-unavailable/policy/approval failure contracts (G2; originally introduced under ft-q5njp)."
     },
     {
+      "category": "proofs/rehearsal-score",
+      "path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-oohsx.5",
+      "proof_categories": [4],
+      "description": "Rehearsal-score receipt golden matrix for the ft.rehearsal_score_receipt.v1 contract. Optional until the rehearsal scorer epic graduates release-required scoring evidence; blocked, skipped, degraded, missing-evidence, fixture-only, and local-fallback rows remain visible and must not be promoted to production proof claims."
+    },
+    {
       "category": "proofs/tx-killswitch",
       "path": "docs/attestations/proofs/tx-killswitch.json",
       "media_type": "application/json",

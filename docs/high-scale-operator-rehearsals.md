@@ -126,6 +126,11 @@ must still include the pane id, sequence number, and response envelope type.
 
 Use these anchors when interpreting rehearsal output:
 
+- `crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json`
+  for the canonical rehearsal-score receipt cases. The matrix intentionally
+  includes pass, fail, blocked, missing-evidence, degraded, skipped, and
+  fixture-only examples so operator docs and release notes cannot collapse them
+  into one green proof bucket.
 - `docs/proposals/ft-tn6cw-proof-lane-evidence-contract.md` for proof states,
   reason codes, and invalid local-Cargo command shapes.
 - `docs/proposals/ft-tn6cw-proof-lane-evidence-taxonomy.md` for
@@ -140,6 +145,34 @@ Use these anchors when interpreting rehearsal output:
   rehearsal must emit `SKIPPED_NOT_PROVEN` rather than treating summary
   counters as retained raw proof.
 - `crates/frankenterm-core/src/runtime_health.rs` for the SLO cockpit model.
+
+### Rehearsal Score Receipts
+
+`ft rehearse score fixtures/demo-lab/manifest.v1.json --format json` and the
+matching MCP score surfaces emit `ft.rehearsal_score_receipt.v1` receipts. A
+receipt is a decision aid for a retained rehearsal artifact, not a blanket
+release claim. Operators must read both the aggregate verdict and each
+criterion's evidence state before citing the score in Beads, release notes, or
+attestation closeout.
+
+Use these interpretation rules:
+
+| Receipt field | Operator meaning | Release wording |
+| --- | --- | --- |
+| `aggregate_verdict=pass` with all required proof evidence `proven` | The scored scope passed. | "The retained rehearsal passed for this declared scope." |
+| `aggregate_verdict=blocked` | A required proof lane did not reach an admissible verdict. | "Blocked; no release claim for the blocked criterion." |
+| `aggregate_verdict=missing_evidence` | The scorer cannot find a required artifact. | "Missing evidence; attach the artifact or keep the claim absent." |
+| `aggregate_verdict=degraded` | The scenario ran with reduced evidence or degraded source state. | "Degraded rehearsal only; acceptable for runbook guidance, not proof of full support." |
+| `aggregate_verdict=skipped` or `SKIPPED_NOT_PROVEN` | The required predicate was intentionally absent. | "Skipped/not proven; claim remains fail-closed." |
+| Evidence state `fixture_only` | A checked-in fixture shaped the expected receipt. | "Fixture-backed contract coverage only." |
+| Evidence state `simulated` | A simulated path exercised the scorer. | "Simulation evidence only; live behavior remains unproven." |
+| Evidence state `redacted` | Raw data was intentionally withheld. | "Redacted evidence retained; do not request or paste raw secrets." |
+
+When a receipt has mixed criteria, the most severe failing or blocked criterion
+controls the operator action. Do not cite the numeric `score_percent` alone:
+`blocked`, `missing_evidence`, `degraded`, and `skipped` counters are the
+release gate. A high score with one blocked RCH proof is still blocked for that
+proof claim.
 
 Closeout wording must distinguish:
 
@@ -164,3 +197,7 @@ Closeout wording must distinguish:
    remote proof artifacts.
 6. Never promote a rehearsal pass into a high-scale performance claim unless
    the proof ledger has target-class hardware evidence.
+7. If citing a rehearsal score in a release or attestation comment, include the
+   receipt path, contract id, aggregate verdict, non-pass counters, proof command
+   or resource queried, and the manifest slot category that will hash the
+   retained artifact.

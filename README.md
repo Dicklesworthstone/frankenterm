@@ -469,7 +469,7 @@ The README claim-to-slot map is intentionally limited to populated manifest slot
 | Transaction kill-switch proof | [`proofs/tx-killswitch`](docs/attestations/proofs/tx-killswitch.json) | `ft-tf6g3.12` |
 <!-- attestation-claim-map:end -->
 
-The operating-envelope contract (`ft.operating_envelope.v1`) and the renderer SLO suite are tracked under [ft-tf6g3](#engineering-discipline) for inclusion in a future bundle; they don't yet have populated manifest slots.
+The operating-envelope contract (`ft.operating_envelope.v1`) and the renderer SLO suite are tracked under [ft-tf6g3](#engineering-discipline) for inclusion in a future bundle; they don't yet have populated manifest slots. The optional `proofs/rehearsal-score` slot hashes the rehearsal-score golden matrix so blocked, skipped, degraded, missing-evidence, and fixture-only score rows stay visible; it is not a production support claim unless the cited receipt criterion has proven evidence.
 
 Verify a release attestation bundle in one command, offline, without trusting GitHub or any registry:
 

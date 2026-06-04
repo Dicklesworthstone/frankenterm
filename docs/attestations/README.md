@@ -57,6 +57,14 @@ slot (`ft-tf6g3.24`, also under `tui/render-parity`) occupies the logical
 release-bundle `tui/topology-parity.json` slot for persistent-homology glyph
 parity. It is release evidence only after paired oracle/subject glyph bitmap
 runs report `glyphs_compared_total > 0` and `topology_failures_total == 0`.
+The `proofs/rehearsal-score` optional slot hashes
+`crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json`
+so release tooling can cite the rehearsal-score receipt contract without
+overstating it. Its cases cover successful, failed, blocked, missing-evidence,
+degraded, skipped, local-fallback, Agent Mail outage, dirty-overlap, and
+fixture-only states. A release claim may cite a concrete receipt only for the
+criteria whose evidence is proven; blocked, skipped, degraded, simulated, or
+fixture-only rows stay visible as non-production proof states.
 
 `proofs/tx-killswitch` hashes
 `docs/attestations/proofs/tx-killswitch.json`, which points at the
