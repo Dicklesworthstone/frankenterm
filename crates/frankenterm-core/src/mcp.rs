@@ -113,33 +113,35 @@ pub use mcp_proxy::{
     mcp_proxy_mount_failure_count, mcp_proxy_unaudited_degraded_skip_count,
 };
 use mcp_resources::{
-    WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
-    WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
-    WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaMissionObjectivePlanTemplateResource,
-    WaPanesResource, WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
-    WaProofHistoryTemplateResource, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
+    WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttentionCurrentResource,
+    WaAttentionItemTemplateResource, WaAttestationRetractionsResource, WaContextHorizonResource,
+    WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
+    WaHerdWaveResource, WaMissionObjectivePlanTemplateResource, WaPanesResource,
+    WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
+    WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
     WaRulesResource, WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource,
     WaWorkflowsResource,
 };
 use mcp_tools::{
-    WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
-    WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
-    WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
-    WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
-    WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
-    WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+    WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaCassSearchTool, WaCassStatusTool,
+    WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool,
+    WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool,
+    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool,
+    WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
+    WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
     WaWorkflowStatusTool,
 };
 pub use mcp_tools::{mcp_clock_anomaly_count, mcp_workflow_plan_serde_drop_count};
 #[cfg(feature = "fuzz")]
 use mcp_types::{
-    AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
-    EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams, GetTextParams,
-    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
-    MissionResumeParams, ReleaseParams, ReservationsParams, ReserveParams, RulesListParams,
-    RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
-    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
+    AccountsParams, AccountsRefreshParams, AttentionParams, CassSearchParams, CassStatusParams,
+    CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams,
+    GetTextParams, MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams,
+    MissionPauseParams, MissionResumeParams, ReleaseParams, ReservationsParams, ReserveParams,
+    RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams,
+    TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
+    WorkflowStatusParams,
 };
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
@@ -223,6 +225,7 @@ fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str 
             }
         }
         "wa.mission_objective_plan" => fuzz_parse_params::<MissionObjectivePlanParams>(arguments),
+        "wa.attention" => fuzz_parse_params_or_default::<AttentionParams>(arguments),
         "wa.mission_state" => fuzz_parse_params_or_default::<MissionStateParams>(arguments),
         "wa.mission_explain" => fuzz_parse_params_or_default::<MissionExplainParams>(arguments),
         "wa.mission_pause" => fuzz_parse_params::<MissionPauseParams>(arguments),
@@ -1497,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_with_db_exposes_expected_resources_and_templates() {
+    fn mcp_server_with_db_exposes_expected_attention_resources_and_templates() {
         let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
             .expect("build mcp server");
 
@@ -1517,6 +1520,8 @@ mod tests {
                 "wa://accounts".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://attention-router/current".to_string(),
+                "wa://attention-router/items/template".to_string(),
                 "wa://swarm-capacity/current".to_string(),
                 "wa://swarm-capacity/runs/template".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
@@ -1536,6 +1541,7 @@ mod tests {
                 "wa://events/unhandled/{limit}".to_string(),
                 "wa://accounts/{service}".to_string(),
                 "wa://rules/{agent_type}".to_string(),
+                "wa://attention-router/items/{item_id}".to_string(),
                 "wa://swarm-capacity/runs/{run_id}".to_string(),
                 "wa://reservations/{pane_id}".to_string(),
                 "wa://proof-history/{filter}/{value}/{limit}".to_string(),
@@ -1544,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_without_db_only_exposes_non_storage_resources() {
+    fn mcp_server_without_db_only_exposes_non_storage_attention_resources() {
         let server = build_server_degraded(&Config::default()).expect("build degraded mcp server");
 
         let resources = uri_set(server.resources().into_iter().map(|r| r.uri));
@@ -1561,6 +1567,8 @@ mod tests {
                 "wa://panes".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://attention-router/current".to_string(),
+                "wa://attention-router/items/template".to_string(),
                 "wa://swarm-capacity/current".to_string(),
                 "wa://swarm-capacity/runs/template".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
@@ -1575,6 +1583,7 @@ mod tests {
             templates,
             uri_set([
                 "wa://rules/{agent_type}".to_string(),
+                "wa://attention-router/items/{item_id}".to_string(),
                 "wa://swarm-capacity/runs/{run_id}".to_string(),
                 "wa://proof-history/{filter}/{value}/{limit}".to_string(),
             ])
@@ -1794,7 +1803,7 @@ mod tests {
     // ── Tool definition validation (wa-nu4.3.1.3) ────────────────────────
 
     #[test]
-    fn all_spec_tools_registered_with_db() {
+    fn all_spec_tools_registered_with_db_including_attention() {
         let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
             .expect("build mcp server");
         let tool_defs = server.tools();
@@ -1818,6 +1827,7 @@ mod tests {
             "wa.accounts_refresh",
             "wa.rules_list",
             "wa.rules_test",
+            "wa.attention",
             "wa.reservations",
             "wa.reserve",
             "wa.release",
@@ -1831,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn non_storage_tools_registered_without_db() {
+    fn non_storage_tools_registered_without_db_including_attention() {
         let server = build_server_degraded(&Config::default()).expect("build degraded mcp server");
         let tool_defs = server.tools();
         let tool_names: BTreeSet<String> = tool_defs.into_iter().map(|t| t.name).collect();
@@ -1848,6 +1858,7 @@ mod tests {
             "wa.cass_status",
             "wa.tx_plan",
             "wa.tx_show",
+            "wa.attention",
             "wa.mission_state",
             "wa.mission_explain",
         ];

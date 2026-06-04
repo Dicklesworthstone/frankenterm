@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
+use crate::attention_router::AttentionRouterSourceAdapterInput;
 use crate::config::PaneFilterConfig;
 use crate::policy::{InjectionResult, PaneCapabilities};
 use crate::query_contract::UnifiedSearchMode;
@@ -34,6 +35,21 @@ pub(super) struct StateParams {
     pub domain: Option<String>,
     pub agent: Option<String>,
     pub pane_id: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AttentionParams {
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub input: Option<AttentionRouterSourceAdapterInput>,
+    #[serde(default)]
+    pub generated_at_ms: Option<u64>,
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

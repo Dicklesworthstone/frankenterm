@@ -6,6 +6,7 @@
 use super::{
     AuditedToolHandler, Config, FormatAwareToolHandler, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
+    WaAttentionCurrentResource, WaAttentionItemTemplateResource, WaAttentionTool,
     WaAttestationRetractionsResource, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
     WaContextHorizonResource, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource,
     WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource,
@@ -45,6 +46,7 @@ pub const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.cass_status",
     "wa.tx_plan",
     "wa.tx_show",
+    "wa.attention",
     "wa.mission_objective_plan",
     "wa.mission_state",
     "wa.mission_explain",
@@ -264,6 +266,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             &config,
         ))))
         .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
+        .tool(FormatAwareToolHandler::new(WaAttentionTool))
         .tool(FormatAwareToolHandler::new(WaMissionStateTool::new(
             Arc::clone(&config),
         )))
@@ -277,6 +280,8 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaHerdWaveResource)
         .resource(WaMissionObjectivePlanTemplateResource)
+        .resource(WaAttentionCurrentResource)
+        .resource(WaAttentionItemTemplateResource)
         .resource(WaSwarmCapacityCurrentResource)
         .resource(WaSwarmCapacityRunTemplateResource)
         .resource(WaRendererInputToPhotonResource)

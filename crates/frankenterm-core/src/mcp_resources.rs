@@ -16,6 +16,11 @@ use crate::mcp_framework::{
     FrameworkResourceTemplate as ResourceTemplate, FrameworkToolHandler as ToolHandler,
 };
 
+use crate::attention_router::{
+    ATTENTION_ROUTER_MCP_CURRENT_URI, ATTENTION_ROUTER_MCP_ITEM_URI_TEMPLATE,
+    AttentionRouterSourceAdapterInput, AttentionRouterSurface,
+    build_attention_router_surface_payload,
+};
 use crate::context_horizon::predict_context_horizon_from_sqlite;
 use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_STORAGE};
 use crate::proof_lane::{
@@ -865,6 +870,117 @@ impl ResourceHandler for WaHerdWaveResource {
             "wa://herd-wave",
             McpEnvelope::success(report, elapsed_ms(start)),
         )
+    }
+}
+
+fn attention_router_resource_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn attention_router_resource_payload(
+    surface: AttentionRouterSurface,
+    item_id: Option<&str>,
+) -> crate::attention_router::AttentionRouterSurfacePayload {
+    let input = AttentionRouterSourceAdapterInput::new(attention_router_resource_now_ms(), ".");
+    build_attention_router_surface_payload(
+        &input,
+        surface,
+        "mcp.resource.attention_router",
+        item_id,
+    )
+}
+
+pub(super) struct WaAttentionCurrentResource;
+
+impl ResourceHandler for WaAttentionCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: ATTENTION_ROUTER_MCP_CURRENT_URI.to_string(),
+            name: "ft attention router current".to_string(),
+            description: Some(
+                "Read-only attention-router status surface with degraded source health".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attention".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let envelope = McpEnvelope::success(
+            attention_router_resource_payload(AttentionRouterSurface::Status, None),
+            elapsed_ms(start),
+        );
+        envelope_as_resource(ATTENTION_ROUTER_MCP_CURRENT_URI, envelope)
+    }
+}
+
+pub(super) struct WaAttentionItemTemplateResource;
+
+impl ResourceHandler for WaAttentionItemTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://attention-router/items/template".to_string(),
+            name: "ft attention router item template".to_string(),
+            description: Some(
+                "Template for read-only attention-router item explanations".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attention".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: ATTENTION_ROUTER_MCP_ITEM_URI_TEMPLATE.to_string(),
+            name: "ft attention router item".to_string(),
+            description: Some(
+                "Read-only explanation for a scored attention-router item".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attention".to_string(),
+                "operator".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let current = WaAttentionCurrentResource;
+        current.read(ctx)
+    }
+
+    fn read_with_uri(
+        &self,
+        _ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let item_id = params.get("item_id").map(String::as_str);
+        let envelope = McpEnvelope::success(
+            attention_router_resource_payload(AttentionRouterSurface::Explain, item_id),
+            elapsed_ms(start),
+        );
+        envelope_as_resource(uri, envelope)
     }
 }
 

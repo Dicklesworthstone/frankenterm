@@ -12,6 +12,10 @@ use std::time::Instant;
 
 use serde::de::DeserializeOwned;
 
+use crate::attention_router::{
+    AttentionRouterSourceAdapterInput, AttentionRouterSurface,
+    build_attention_router_surface_payload,
+};
 use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
 #[allow(unused_imports)]
 use crate::mcp_framework::{
@@ -35,19 +39,20 @@ use fs2::FileExt;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
 use super::mcp_types::{
-    self, AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams,
-    CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams,
-    GetTextParams, McpAccountInfo, McpAccountsData, McpAccountsRefreshData, McpEnvelope,
-    McpEventItem, McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
-    McpMissionExplainData, McpMissionStateData, McpPaneState, McpReleaseData, McpReservationInfo,
-    McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
-    McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData, McpTxPlanData,
-    McpTxRollbackData, McpTxRunData, McpTxShowData, McpWaitForData, McpWorkflowRunData,
-    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
-    MissionResumeParams, MissionStateParams, ReleaseParams, ReservationsParams, ReserveParams,
-    RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams,
-    TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
-    WorkflowStatusParams, apply_tail_truncation, now_ms,
+    self, AccountsParams, AccountsRefreshParams, AttentionParams, CassSearchParams,
+    CassStatusParams, CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams,
+    EventsTriageParams, GetTextParams, McpAccountInfo, McpAccountsData, McpAccountsRefreshData,
+    McpEnvelope, McpEventItem, McpEventMutationData, McpEventsData, McpGetTextData,
+    McpMissionControlData, McpMissionExplainData, McpMissionStateData, McpPaneState,
+    McpReleaseData, McpReservationInfo, McpReservationsData, McpReserveData, McpRuleItem,
+    McpRuleMatchItem, McpRuleTraceInfo, McpRulesListData, McpRulesTestData, McpSearchData,
+    McpSearchHit, McpSendData, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
+    McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
+    MissionObjectivePlanParams, MissionPauseParams, MissionResumeParams, MissionStateParams,
+    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
+    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
+    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams, apply_tail_truncation,
+    now_ms,
 };
 #[allow(unused_imports)]
 use super::{
@@ -1221,6 +1226,110 @@ fn set_cass_test_binary_override(binary: Option<String>) {
     *cass_test_binary_override_slot()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = binary;
+}
+
+fn parse_mcp_attention_surface(surface: Option<&str>) -> Option<AttentionRouterSurface> {
+    match surface
+        .unwrap_or("status")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "status" => Some(AttentionRouterSurface::Status),
+        "next" => Some(AttentionRouterSurface::Next),
+        "explain" => Some(AttentionRouterSurface::Explain),
+        _ => None,
+    }
+}
+
+fn mcp_attention_source(surface: AttentionRouterSurface) -> &'static str {
+    match surface {
+        AttentionRouterSurface::Status => "mcp.wa_attention.status",
+        AttentionRouterSurface::Next => "mcp.wa_attention.next",
+        AttentionRouterSurface::Explain => "mcp.wa_attention.explain",
+    }
+}
+
+// wa.attention tool
+pub(super) struct WaAttentionTool;
+
+impl ToolHandler for WaAttentionTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.attention".to_string(),
+            description: Some(
+                "Read attention-router status, next action, or item explanation from caller-supplied evidence (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "surface": { "type": "string", "enum": ["status", "next", "explain"], "default": "status" },
+                    "item_id": { "type": "string", "description": "Attention item id to explain when surface=explain" },
+                    "input": { "type": "object", "description": "AttentionRouterSourceAdapterInput object; omitted input yields an explicit degraded no-input snapshot" },
+                    "generated_at_ms": { "type": "integer", "minimum": 0 },
+                    "workspace": { "type": "string", "description": "Workspace label used only when input is omitted or workspace override is desired" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "attention".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: AttentionParams = if arguments.is_null() {
+            AttentionParams::default()
+        } else {
+            match parse_mcp_tool_params(
+                "wa.attention",
+                arguments,
+                "Expected object with optional surface, item_id, input, generated_at_ms, workspace",
+                start,
+            ) {
+                Ok(params) => params,
+                Err(response) => return response,
+            }
+        };
+
+        let Some(surface) = parse_mcp_attention_surface(params.surface.as_deref()) else {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "Unsupported attention surface",
+                Some("Use surface=status, surface=next, or surface=explain.".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        };
+
+        let mut input = params.input.unwrap_or_else(|| {
+            AttentionRouterSourceAdapterInput::new(
+                params.generated_at_ms.unwrap_or_else(now_ms),
+                params.workspace.clone().unwrap_or_else(|| ".".to_string()),
+            )
+        });
+        if let Some(generated_at_ms) = params.generated_at_ms {
+            input.generated_at_ms = generated_at_ms;
+        }
+        if let Some(workspace) = params
+            .workspace
+            .filter(|workspace| !workspace.trim().is_empty())
+        {
+            input.workspace = workspace;
+        }
+
+        let payload = build_attention_router_surface_payload(
+            &input,
+            surface,
+            mcp_attention_source(surface),
+            params.item_id.as_deref(),
+        );
+        envelope_to_content(McpEnvelope::success(payload, elapsed_ms(start)))
+    }
 }
 
 // wa.rules_list tool
@@ -7325,13 +7434,13 @@ mod tests {
         MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_SEARCH_QUERY_BYTES,
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS,
         MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
-        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool,
-        WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
-        WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-        WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
-        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
-        WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool,
+        WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
+        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
+        WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
+        WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
+        WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
         accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
@@ -7831,7 +7940,7 @@ mod tests {
         }
     }
 
-    /// Collect definitions for all 31 tools. Guarantees no panics during construction.
+    /// Collect definitions for all 32 tools. Guarantees no panics during construction.
     fn all_definitions() -> Vec<Tool> {
         let db = db_path();
         let cfg = config();
@@ -7859,6 +7968,7 @@ mod tests {
             WaAccountsTool::new(Arc::clone(&db)).definition(),
             WaAccountsRefreshTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaMissionObjectivePlanTool.definition(),
+            WaAttentionTool.definition(),
             WaMissionStateTool::new(Arc::clone(&cfg)).definition(),
             WaMissionExplainTool::new(Arc::clone(&cfg)).definition(),
             WaMissionPauseTool::new(Arc::clone(&cfg)).definition(),
@@ -7875,8 +7985,78 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn tool_count_is_31() {
-        assert_eq!(all_definitions().len(), 31);
+    fn tool_count_is_32() {
+        assert_eq!(all_definitions().len(), 32);
+    }
+
+    #[test]
+    fn wa_attention_tool_is_read_only_and_explains_inline_input() {
+        let tool = WaAttentionTool;
+        let status = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "surface": "status",
+                    "generated_at_ms": 1_770_000_300_000u64,
+                    "workspace": "/repo"
+                }),
+            )
+            .expect("wa.attention status should respond"),
+        );
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["data"]["surface"], "status");
+        assert_eq!(status["data"]["dry_run"], true);
+        assert_eq!(status["data"]["live_mutation_allowed"], false);
+        assert_eq!(status["data"]["side_effects_executed"], false);
+        assert_eq!(status["data"]["degraded_mode"]["active"], true);
+        assert_eq!(
+            status["data"]["mcp_resources"][0]["uri"],
+            crate::attention_router::ATTENTION_ROUTER_MCP_CURRENT_URI
+        );
+
+        let input = crate::attention_router::AttentionRouterSourceAdapterInput::new(
+            1_770_000_300_001,
+            "/repo",
+        )
+        .with_observation(
+            crate::attention_router::AttentionRouterSourceObservation::new(
+                "beads.ready",
+                crate::attention_router::AttentionRouterSourceKind::Beads,
+                crate::attention_router::AttentionRouterSourceHealth::Available,
+                "br ready --json",
+                "ready work",
+            )
+            .with_fact(
+                crate::attention_router::AttentionRouterSourceFact::new(
+                    crate::attention_router::AttentionRouterSourceFactKind::BeadsReady,
+                    "docs-only ready static slice",
+                )
+                .with_bead_id("ft-docs")
+                .with_reason_code("beads.ready_available"),
+            ),
+        );
+        let explain = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "surface": "explain",
+                    "item_id": "attention:ready_now:beads_ready:ft-docs",
+                    "input": input
+                }),
+            )
+            .expect("wa.attention explain should respond"),
+        );
+        assert_eq!(explain["ok"], true);
+        assert_eq!(explain["data"]["surface"], "explain");
+        assert_eq!(explain["data"]["explanation"]["matched"], true);
+        assert_eq!(
+            explain["data"]["selected_item"]["item_id"],
+            "attention:ready_now:beads_ready:ft-docs"
+        );
+        assert_eq!(
+            explain["data"]["selected_item"]["recommended_action"]["mutates"],
+            false
+        );
     }
 
     // ========================================================================
@@ -8537,6 +8717,7 @@ mod tests {
             "wa.workflow_run",
             "wa.workflow_status",
             "wa.accounts",
+            "wa.attention",
         ];
         let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
         for expected_name in &expected {
