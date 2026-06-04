@@ -14,6 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
+use frankenterm_core::attention_router::{
+    AttentionRouterSourceAdapterInput, AttentionRouterSurface, AttentionRouterSurfacePayload,
+    build_attention_router_surface_payload,
+};
 use frankenterm_core::blocker_radar::{
     BlockerRadarCollectorObservation, BlockerRadarInput, BlockerRadarObservationStatus,
     BlockerRadarReport, BlockerRadarSourceKind, blocker_radar_input_from_coordination_snapshot,
@@ -1624,6 +1628,24 @@ SEE ALSO:
         details: bool,
     },
 
+    /// Read-only attention-router status, next action, and item explanations
+    #[command(after_help = r#"EXAMPLES:
+    ft attention status --input fixtures/attention-router/source-adapter-input.ready.v1.json
+    ft attention next --format json
+    ft attention explain attention:ready_now:beads_ready:ft-docs --format toon
+
+NOTES:
+    This surface is input-backed and read-only. Without --input it emits a
+    degraded snapshot that explicitly marks required sources unavailable.
+
+SEE ALSO:
+    ft robot attention status
+    docs/robot-contracts/attention-router.md"#)]
+    Attention {
+        #[command(subcommand)]
+        command: AttentionCommands,
+    },
+
     /// Start the web server (requires --features web)
     #[cfg(feature = "web")]
     #[command(after_help = r#"EXAMPLES:
@@ -1878,6 +1900,87 @@ enum HandoffCommands {
         /// Output format for unavailable-context errors.
         #[arg(long, value_enum, default_value_t = HandoffInspectFormat::Text)]
         format: HandoffInspectFormat,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AttentionOutputFormat {
+    Plain,
+    Json,
+    Toon,
+}
+
+#[derive(Debug, Clone, Args)]
+struct AttentionSurfaceArgs {
+    /// Caller-supplied attention-router source adapter input JSON
+    #[arg(long, value_name = "PATH")]
+    input: Option<PathBuf>,
+
+    /// Stable generation timestamp for deterministic no-input snapshots
+    #[arg(long)]
+    generated_at_ms: Option<u64>,
+
+    /// Output format
+    #[arg(long, short = 'f', value_enum, default_value = "plain")]
+    format: AttentionOutputFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RobotAttentionSurfaceArgs {
+    /// Caller-supplied attention-router source adapter input JSON
+    #[arg(long, value_name = "PATH")]
+    input: Option<PathBuf>,
+
+    /// Stable generation timestamp for deterministic no-input snapshots
+    #[arg(long)]
+    generated_at_ms: Option<u64>,
+}
+
+#[derive(Subcommand)]
+enum AttentionCommands {
+    /// Emit the scored snapshot and degraded source health
+    Status {
+        #[command(flatten)]
+        args: AttentionSurfaceArgs,
+    },
+
+    /// Emit the highest-priority safe next action
+    Next {
+        #[command(flatten)]
+        args: AttentionSurfaceArgs,
+    },
+
+    /// Explain a scored attention item, or the current next item if no id is supplied
+    Explain {
+        /// Attention item id to explain
+        item_id: Option<String>,
+
+        #[command(flatten)]
+        args: AttentionSurfaceArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum RobotAttentionCommands {
+    /// Emit the scored snapshot and degraded source health
+    Status {
+        #[command(flatten)]
+        args: RobotAttentionSurfaceArgs,
+    },
+
+    /// Emit the highest-priority safe next action
+    Next {
+        #[command(flatten)]
+        args: RobotAttentionSurfaceArgs,
+    },
+
+    /// Explain a scored attention item, or the current next item if no id is supplied
+    Explain {
+        /// Attention item id to explain
+        item_id: Option<String>,
+
+        #[command(flatten)]
+        args: RobotAttentionSurfaceArgs,
     },
 }
 
@@ -3096,6 +3199,12 @@ enum RobotCommands {
         /// Swarm session name passed to the Agent Mail fallback producer
         #[arg(default_value = "frankenterm")]
         session: String,
+    },
+
+    /// Emit read-only attention-router status, next action, or item explanation
+    Attention {
+        #[command(subcommand)]
+        command: RobotAttentionCommands,
     },
 
     /// Resource-control what-if simulation endpoints
@@ -7559,6 +7668,202 @@ fn print_robot_response<T: serde::Serialize>(
         }
     }
 
+    Ok(())
+}
+
+fn attention_router_input_path(workspace_root: &Path, input_path: &Path) -> PathBuf {
+    if input_path.is_absolute() {
+        input_path.to_path_buf()
+    } else {
+        workspace_root.join(input_path)
+    }
+}
+
+fn load_attention_router_input(
+    workspace_root: &Path,
+    input_path: Option<&Path>,
+    generated_at_ms: Option<u64>,
+) -> anyhow::Result<AttentionRouterSourceAdapterInput> {
+    let mut input = match input_path {
+        Some(path) => {
+            let resolved = attention_router_input_path(workspace_root, path);
+            let data = fs::read_to_string(&resolved)
+                .map_err(|err| anyhow::anyhow!("read {}: {err}", resolved.display()))?;
+            serde_json::from_str::<AttentionRouterSourceAdapterInput>(&data)
+                .map_err(|err| anyhow::anyhow!("parse {}: {err}", resolved.display()))?
+        }
+        None => {
+            AttentionRouterSourceAdapterInput::new(now_ms(), workspace_root.display().to_string())
+        }
+    };
+
+    if let Some(generated_at_ms) = generated_at_ms {
+        input.generated_at_ms = generated_at_ms;
+    }
+    if input.workspace.trim().is_empty() {
+        input.workspace = workspace_root.display().to_string();
+    }
+    Ok(input)
+}
+
+fn build_cli_attention_router_payload(
+    workspace_root: &Path,
+    input_path: Option<&Path>,
+    generated_at_ms: Option<u64>,
+    surface: AttentionRouterSurface,
+    source: &'static str,
+    requested_item_id: Option<&str>,
+) -> anyhow::Result<AttentionRouterSurfacePayload> {
+    let input = load_attention_router_input(workspace_root, input_path, generated_at_ms)?;
+    Ok(build_attention_router_surface_payload(
+        &input,
+        surface,
+        source,
+        requested_item_id,
+    ))
+}
+
+fn attention_router_value_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn attention_router_optional_label(value: Option<&str>) -> &str {
+    value.unwrap_or("none")
+}
+
+fn attention_router_list_label(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn render_attention_router_plain(payload: &AttentionRouterSurfacePayload) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "attention {}",
+        attention_router_value_label(&payload.surface)
+    ));
+    lines.push(format!("generated_at_ms: {}", payload.generated_at_ms));
+    lines.push(format!("workspace: {}", payload.workspace));
+    lines.push(format!(
+        "degraded: {} ({})",
+        payload.degraded_mode.active, payload.degraded_mode.summary
+    ));
+    lines.push(format!("items: {}", payload.snapshot.items.len()));
+    if let Some(item) = &payload.selected_item {
+        lines.push(format!("selected_item: {}", item.item_id));
+        lines.push(format!(
+            "selected_classification: {}",
+            attention_router_value_label(&item.classification)
+        ));
+        lines.push(format!(
+            "selected_action: {}",
+            item.recommended_action.summary
+        ));
+        lines.push(format!(
+            "selected_nudge: {} urgency={} review_required={}",
+            attention_router_value_label(&item.nudge_plan_receipt.nudge.kind),
+            attention_router_value_label(&item.nudge_plan_receipt.nudge.urgency),
+            item.nudge_plan_receipt.nudge.review_required
+        ));
+        lines.push(format!(
+            "selected_nudge_recipient: {}",
+            attention_router_optional_label(item.nudge_plan_receipt.recipient.as_deref())
+        ));
+        lines.push(format!(
+            "selected_nudge_target: {} bead={} thread={} agent={} path={}",
+            attention_router_value_label(&item.nudge_plan_receipt.target.kind),
+            attention_router_optional_label(item.nudge_plan_receipt.target.bead_id.as_deref()),
+            attention_router_optional_label(item.nudge_plan_receipt.target.thread_ref.as_deref()),
+            attention_router_optional_label(item.nudge_plan_receipt.target.agent_name.as_deref()),
+            attention_router_optional_label(item.nudge_plan_receipt.target.path.as_deref())
+        ));
+        lines.push(format!(
+            "selected_nudge_safe_command: {}",
+            item.nudge_plan_receipt.nudge.safe_command_text
+        ));
+        lines.push(format!(
+            "selected_nudge_evidence: min_sources={} sources={} reasons={}",
+            item.nudge_plan_receipt.evidence.minimum_source_count,
+            attention_router_list_label(&item.nudge_plan_receipt.evidence.sources_checked),
+            attention_router_list_label(&item.nudge_plan_receipt.evidence.reason_codes)
+        ));
+        lines.push(format!(
+            "selected_nudge_escalation: status_check_before_force_release={} elapsed_time_alone_sufficient={} min_wait_minutes={}",
+            item.nudge_plan_receipt
+                .escalation
+                .status_check_before_force_release,
+            item.nudge_plan_receipt
+                .escalation
+                .elapsed_time_alone_sufficient,
+            item.nudge_plan_receipt
+                .escalation
+                .minimum_wait_minutes_after_status_check
+        ));
+        lines.push(format!(
+            "selected_nudge_side_effects: live_mutation_allowed={} side_effects_executed={}",
+            item.nudge_plan_receipt.live_mutation_allowed,
+            item.nudge_plan_receipt.side_effects_executed
+        ));
+    } else {
+        lines.push("selected_item: none".to_string());
+    }
+    lines.push(format!("explanation: {}", payload.explanation.summary));
+    if !payload.snapshot.source_health.is_empty() {
+        lines.push("source_health:".to_string());
+        for record in &payload.snapshot.source_health {
+            lines.push(format!(
+                "- {} {} {}",
+                attention_router_value_label(&record.source_kind),
+                attention_router_value_label(&record.health),
+                record.source_id
+            ));
+        }
+    }
+    if !payload.snapshot.items.is_empty() {
+        lines.push("attention_items:".to_string());
+        for item in &payload.snapshot.items {
+            lines.push(format!(
+                "- {} priority={} confidence={} action={}",
+                item.item_id,
+                item.priority,
+                attention_router_value_label(&item.confidence_label),
+                attention_router_value_label(&item.recommended_action.action)
+            ));
+        }
+    }
+    lines.push(format!("dry_run: {}", payload.dry_run));
+    lines.push(format!(
+        "live_mutation_allowed: {}",
+        payload.live_mutation_allowed
+    ));
+    lines.push(format!(
+        "side_effects_executed: {}",
+        payload.side_effects_executed
+    ));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn print_attention_router_payload(
+    payload: &AttentionRouterSurfacePayload,
+    format: AttentionOutputFormat,
+) -> anyhow::Result<()> {
+    match format {
+        AttentionOutputFormat::Plain => print!("{}", render_attention_router_plain(payload)),
+        AttentionOutputFormat::Json => println!("{}", serde_json::to_string_pretty(payload)?),
+        AttentionOutputFormat::Toon => {
+            println!(
+                "{}",
+                toon_rust::encode(serde_json::to_value(payload)?, None)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -18034,6 +18339,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Emit read-only blocker radar across Mail, Beads, git, RCH, and CI evidence",
             },
             RobotCommandInfo {
+                name: "attention",
+                description: "Emit read-only attention-router status, next action, and item explanations",
+            },
+            RobotCommandInfo {
                 name: "resource what-if",
                 description: "Run a read-only resource-control digital-twin simulation",
             },
@@ -18447,6 +18756,16 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot blocker-radar",
                     "ft robot --format toon blocker-radar frankenterm",
+                ],
+            },
+            QuickStartCommand {
+                name: "attention",
+                args: "status|next|explain [item-id] [--input <adapter.json>]",
+                summary: "Read attention-router status, next action, or item explanation from caller-supplied evidence",
+                examples: vec![
+                    "ft robot attention status",
+                    "ft robot attention next --input fixtures/attention-router/source-adapter-input.ready.v1.json",
+                    "ft robot --format toon attention explain attention:ready_now:beads_ready:ft-docs",
                 ],
             },
             QuickStartCommand {
@@ -25670,6 +25989,42 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(report, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::Attention { command } => {
+                    let payload = match command {
+                        RobotAttentionCommands::Status { args } => {
+                            build_cli_attention_router_payload(
+                                &workspace_root,
+                                args.input.as_deref(),
+                                args.generated_at_ms,
+                                AttentionRouterSurface::Status,
+                                "robot.attention.status",
+                                None,
+                            )?
+                        }
+                        RobotAttentionCommands::Next { args } => {
+                            build_cli_attention_router_payload(
+                                &workspace_root,
+                                args.input.as_deref(),
+                                args.generated_at_ms,
+                                AttentionRouterSurface::Next,
+                                "robot.attention.next",
+                                None,
+                            )?
+                        }
+                        RobotAttentionCommands::Explain { item_id, args } => {
+                            build_cli_attention_router_payload(
+                                &workspace_root,
+                                args.input.as_deref(),
+                                args.generated_at_ms,
+                                AttentionRouterSurface::Explain,
+                                "robot.attention.explain",
+                                item_id.as_deref(),
+                            )?
+                        }
+                    };
+                    let response = RobotResponse::success(payload, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 RobotCommands::Perf { command } => {
                     let payload = match command {
                         RobotPerfCommands::SloStatus { slo } => {
@@ -25697,6 +26052,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     match other {
                         RobotCommands::ProofCloseoutLint { .. } => unreachable!("handled above"),
                         RobotCommands::ProofHistory { .. } => unreachable!("handled above"),
+                        RobotCommands::Attention { .. } => unreachable!("handled above"),
                         RobotCommands::Perf { .. } => unreachable!("handled above"),
                         RobotCommands::State {
                             include_text,
@@ -41344,6 +41700,42 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Attention { command }) => match command {
+            AttentionCommands::Status { args } => {
+                let payload = build_cli_attention_router_payload(
+                    &workspace_root,
+                    args.input.as_deref(),
+                    args.generated_at_ms,
+                    AttentionRouterSurface::Status,
+                    "cli.attention.status",
+                    None,
+                )?;
+                print_attention_router_payload(&payload, args.format)?;
+            }
+            AttentionCommands::Next { args } => {
+                let payload = build_cli_attention_router_payload(
+                    &workspace_root,
+                    args.input.as_deref(),
+                    args.generated_at_ms,
+                    AttentionRouterSurface::Next,
+                    "cli.attention.next",
+                    None,
+                )?;
+                print_attention_router_payload(&payload, args.format)?;
+            }
+            AttentionCommands::Explain { item_id, args } => {
+                let payload = build_cli_attention_router_payload(
+                    &workspace_root,
+                    args.input.as_deref(),
+                    args.generated_at_ms,
+                    AttentionRouterSurface::Explain,
+                    "cli.attention.explain",
+                    item_id.as_deref(),
+                )?;
+                print_attention_router_payload(&payload, args.format)?;
+            }
+        },
+
         Some(Commands::Triage {
             format,
             severity,
@@ -44087,9 +44479,7 @@ fn handle_config_profile_command(
             };
 
             if !source_toml.trim().is_empty() {
-                let mut candidate = frankenterm_core::config::Config::from_toml(&source_toml)?;
-                candidate.normalize_paths();
-                candidate.validate()?;
+                frankenterm_core::config::Config::from_toml(&source_toml)?;
             }
 
             let tmp_path = profile_path.with_extension("toml.tmp");
@@ -44209,9 +44599,7 @@ fn load_and_merge_config_profile(
     let overlay_toml = std::fs::read_to_string(&profile_path)?;
     let merged_toml = merge_toml_documents(&base_toml, &overlay_toml)?;
 
-    let mut merged_config = Config::from_toml(&merged_toml)?;
-    merged_config.normalize_paths();
-    merged_config.validate()?;
+    Config::from_toml(&merged_toml)?;
 
     Ok((base_toml, merged_toml))
 }
@@ -54211,6 +54599,10 @@ fn format_size_short(bytes: u64) -> String {
 mod tests {
     use super::*;
     use frankenterm_core::approval::hash_allow_once_code;
+    use frankenterm_core::attention_router::{
+        AttentionRouterSourceFact, AttentionRouterSourceFactKind, AttentionRouterSourceHealth,
+        AttentionRouterSourceKind, AttentionRouterSourceObservation,
+    };
     use frankenterm_core::runtime_async::CompatRuntime;
     use frankenterm_core::storage::{
         ApprovalTokenRecord, PaneRecord, PreparedPlanRecord, StorageHandle,
@@ -58251,7 +58643,7 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn watcher_startup_frankensqlite_selected_via_config() {
-        let config = frankenterm_core::config::Config::from_toml(
+        let config = frankenterm_core::config::Config::from_toml_unvalidated(
             r#"
 [storage]
 recorder_backend = "frankensqlite"
@@ -70746,6 +71138,178 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_attention_and_robot_attention_parse() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "attention",
+            "explain",
+            "attention:ready_now:beads_ready:ft-docs",
+            "--input",
+            "fixtures/attention-router/source-adapter-input.ready.v1.json",
+            "--format",
+            "toon",
+            "--generated-at-ms",
+            "1770000000000",
+        ])
+        .expect("human attention explain should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Attention { command }) => match command {
+                AttentionCommands::Explain { item_id, args } => {
+                    assert_eq!(
+                        item_id.as_deref(),
+                        Some("attention:ready_now:beads_ready:ft-docs")
+                    );
+                    assert_eq!(args.format, AttentionOutputFormat::Toon);
+                    assert_eq!(args.generated_at_ms, Some(1_770_000_000_000));
+                    assert_eq!(
+                        args.input.as_deref(),
+                        Some(Path::new(
+                            "fixtures/attention-router/source-adapter-input.ready.v1.json"
+                        ))
+                    );
+                }
+                _ => panic!("expected AttentionCommands::Explain"),
+            },
+            _ => panic!("expected Attention command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "attention",
+            "next",
+            "--input",
+            "fixtures/attention-router/source-adapter-input.ready.v1.json",
+            "--generated-at-ms",
+            "1770000000001",
+        ])
+        .expect("robot attention next should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Attention {
+                    command: RobotAttentionCommands::Next { args },
+                }) => {
+                    assert_eq!(args.generated_at_ms, Some(1_770_000_000_001));
+                    assert_eq!(
+                        args.input.as_deref(),
+                        Some(Path::new(
+                            "fixtures/attention-router/source-adapter-input.ready.v1.json"
+                        ))
+                    );
+                }
+                _ => panic!("expected RobotCommands::Attention::Next"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    fn cli_attention_ready_input() -> AttentionRouterSourceAdapterInput {
+        fn healthy_observation(
+            source_id: &'static str,
+            source_kind: AttentionRouterSourceKind,
+            command_or_api: &'static str,
+            summary: &'static str,
+            reason_code: &'static str,
+        ) -> AttentionRouterSourceObservation {
+            AttentionRouterSourceObservation::new(
+                source_id,
+                source_kind,
+                AttentionRouterSourceHealth::Available,
+                command_or_api,
+                summary,
+            )
+            .with_fact(
+                AttentionRouterSourceFact::new(AttentionRouterSourceFactKind::Manual, summary)
+                    .with_reason_code(reason_code),
+            )
+            .items_seen(1)
+        }
+
+        AttentionRouterSourceAdapterInput::new(1_770_000_000_000, "/repo")
+            .with_observation(
+                AttentionRouterSourceObservation::new(
+                    "beads.ready",
+                    AttentionRouterSourceKind::Beads,
+                    AttentionRouterSourceHealth::Available,
+                    "br ready --json",
+                    "docs-only ready static slice",
+                )
+                .with_fact(
+                    AttentionRouterSourceFact::new(
+                        AttentionRouterSourceFactKind::BeadsReady,
+                        "docs-only ready static slice",
+                    )
+                    .count(1)
+                    .with_bead_id("ft-docs")
+                    .with_reason_code("beads.ready_available"),
+                )
+                .items_seen(1),
+            )
+            .with_observation(healthy_observation(
+                "agent_mail.healthy",
+                AttentionRouterSourceKind::AgentMail,
+                "mcp.agent_mail.fetch_inbox",
+                "no ack-required messages in reduced fixture metadata",
+                "agent_mail.no_ack_required",
+            ))
+            .with_observation(healthy_observation(
+                "git.healthy",
+                AttentionRouterSourceKind::Git,
+                "git status --short --branch",
+                "candidate paths are disjoint in reduced fixture metadata",
+                "git.no_candidate_overlap",
+            ))
+            .with_observation(healthy_observation(
+                "rch.healthy",
+                AttentionRouterSourceKind::Rch,
+                "rch remote-required proof metadata",
+                "remote proof is not required for this docs-only fixture",
+                "proof.static_only",
+            ))
+            .with_observation(healthy_observation(
+                "pane_state.healthy",
+                AttentionRouterSourceKind::PaneState,
+                "ft robot state --format toon",
+                "pane state has no stale-claim evidence in reduced fixture metadata",
+                "pane_state.no_stale_claim",
+            ))
+            .with_observation(healthy_observation(
+                "operating_envelope.healthy",
+                AttentionRouterSourceKind::OperatingEnvelope,
+                "ft operating-envelope snapshot",
+                "operating envelope is healthy for this static fixture",
+                "operating_envelope.static_slice_allowed",
+            ))
+    }
+
+    #[test]
+    fn cli_attention_plain_render_includes_nudge_plan_receipt_review_fields() {
+        let input = cli_attention_ready_input();
+        let payload = build_attention_router_surface_payload(
+            &input,
+            AttentionRouterSurface::Next,
+            "test.attention.next",
+            None,
+        );
+        let plain = render_attention_router_plain(&payload);
+
+        for needle in [
+            "selected_nudge: no_action urgency=normal review_required=false",
+            "selected_nudge_recipient: none",
+            "selected_nudge_target: none bead=ft-docs thread=ft-docs agent=none path=none",
+            "selected_nudge_safe_command: record the blocker or choose disjoint static work; do not send a broadcast or mutate services",
+            "selected_nudge_evidence: min_sources=4 sources=beads.ready,br.ready,bv.triage,rch.diagnose,beads.blocker_state",
+            "selected_nudge_escalation: status_check_before_force_release=true elapsed_time_alone_sufficient=false min_wait_minutes=0",
+            "selected_nudge_side_effects: live_mutation_allowed=false side_effects_executed=false",
+        ] {
+            assert!(
+                plain.contains(needle),
+                "plain attention output missing {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn cli_robot_blocker_radar_parses_default_and_alias_session() {
         let cli = Cli::try_parse_from(["ft", "robot", "blocker-radar"])
             .expect("robot blocker-radar should parse");
@@ -70783,6 +71347,9 @@ log_level = "debug"
             command.name == "swarm-capacity"
                 && command.description.contains("decision explanations")
         }));
+        assert!(help.commands.iter().any(|command| {
+            command.name == "attention" && command.description.contains("attention-router status")
+        }));
 
         let quick_start = build_robot_quick_start();
         let blocker_radar = quick_start
@@ -70812,6 +71379,19 @@ log_level = "debug"
                 .iter()
                 .any(|example| example == &"ft robot swarm-capacity plan --add-panes 16")
         );
+        let attention = quick_start
+            .commands
+            .iter()
+            .find(|command| command.name == "attention")
+            .expect("quick start should list attention");
+        assert_eq!(
+            attention.args,
+            "status|next|explain [item-id] [--input <adapter.json>]"
+        );
+        assert!(attention.examples.iter().any(|example| {
+            example
+                == &"ft robot attention next --input fixtures/attention-router/source-adapter-input.ready.v1.json"
+        }));
     }
 
     #[test]
