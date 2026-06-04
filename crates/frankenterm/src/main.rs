@@ -71940,54 +71940,86 @@ log_level = "debug"
     }
 
     #[test]
-    fn cli_demo_named_payload_validates_fixture_scenario() {
+    fn cli_demo_named_payload_validates_all_fixture_scenarios() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifest_arg = PathBuf::from("fixtures/demo-lab/manifest.v1.json");
         let (manifest_path, manifest) =
             load_demo_manifest(&workspace_root, &manifest_arg).expect("manifest should load");
-        let scenario =
-            find_demo_scenario(&manifest, "quickstart").expect("quickstart should be bundled");
-        let payload = build_demo_run_payload(
-            &workspace_root,
-            &manifest_path,
-            &manifest,
-            scenario,
-            2.0,
-            true,
-        )
-        .expect("quickstart should validate through simulation loader");
 
-        assert_eq!(payload["ok"], true);
-        assert_eq!(payload["status"], "validated");
-        assert_eq!(payload["execution_mode"], "simulation_validate");
-        assert_eq!(payload["demo"], "quickstart");
-        assert_eq!(payload["scenario"]["id"], "quickstart");
-        let requested_speed = payload["requested_options"]["speed"]
-            .as_f64()
-            .expect("speed should be numeric");
-        assert!((requested_speed - 2.0).abs() < f64::EPSILON);
-        assert_eq!(
-            payload["requested_options"]["narrate"].as_bool(),
-            Some(true)
-        );
-        assert!(!payload["side_effects_executed"].as_bool().unwrap_or(true));
-        assert!(!payload["live_mutation_allowed"].as_bool().unwrap_or(true));
-        assert!(
-            !payload["external_services_called"]
-                .as_bool()
-                .unwrap_or(true)
-        );
-        assert!(payload["simulation"]["pane_count"].as_u64().unwrap_or(0) > 0);
-        assert!(payload["simulation"]["event_count"].as_u64().unwrap_or(0) > 0);
-        assert!(
-            payload["simulation"]["expectation_count"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0
-        );
-        let plain = render_demo_run_plain(&payload);
-        assert!(plain.contains("Status: validated"));
-        assert!(plain.contains("Side effects: none"));
+        let scenario_ids: Vec<_> = manifest
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.id.as_str())
+            .collect();
+        assert_eq!(scenario_ids, ["quickstart", "usage_limit", "compaction"]);
+
+        for scenario in &manifest.scenarios {
+            let payload = build_demo_run_payload(
+                &workspace_root,
+                &manifest_path,
+                &manifest,
+                scenario,
+                2.0,
+                true,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} should validate through simulation loader: {error}",
+                    scenario.id
+                )
+            });
+
+            assert_eq!(payload["ok"], true);
+            assert_eq!(payload["status"], "validated");
+            assert_eq!(payload["execution_mode"], "simulation_validate");
+            assert_eq!(payload["demo"], scenario.id);
+            assert_eq!(payload["scenario"]["id"], scenario.id);
+            assert_eq!(payload["scenario"]["scenario_path"], scenario.scenario_path);
+            let requested_speed = payload["requested_options"]["speed"]
+                .as_f64()
+                .expect("speed should be numeric");
+            assert!((requested_speed - 2.0).abs() < f64::EPSILON);
+            assert_eq!(
+                payload["requested_options"]["narrate"].as_bool(),
+                Some(true)
+            );
+            assert!(!payload["side_effects_executed"].as_bool().unwrap_or(true));
+            assert!(!payload["live_mutation_allowed"].as_bool().unwrap_or(true));
+            assert!(
+                !payload["external_services_called"]
+                    .as_bool()
+                    .unwrap_or(true)
+            );
+            assert!(payload["simulation"]["pane_count"].as_u64().unwrap_or(0) > 0);
+            assert!(payload["simulation"]["event_count"].as_u64().unwrap_or(0) > 0);
+            assert!(
+                payload["simulation"]["expectation_count"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0
+            );
+            let artifacts = payload["artifacts"]
+                .as_array()
+                .expect("artifacts should be an array");
+            assert!(artifacts.iter().any(|artifact| {
+                artifact["id"] == "proof_ledger"
+                    && artifact["kind"] == "structured_log"
+                    && artifact["exists"].as_bool() == Some(true)
+            }));
+            assert!(artifacts.iter().any(|artifact| {
+                artifact["id"] == "proof_summary"
+                    && artifact["kind"] == "proof_summary"
+                    && artifact["exists"].as_bool() == Some(true)
+            }));
+            let plain = render_demo_run_plain(&payload);
+            assert!(plain.contains("Status: validated"));
+            assert!(plain.contains("Side effects: none"));
+            assert!(!plain.contains("not yet bundled"));
+            assert_ne!(
+                toon_rust::encode(payload, None).trim_start().chars().next(),
+                Some('{')
+            );
+        }
     }
 
     #[test]

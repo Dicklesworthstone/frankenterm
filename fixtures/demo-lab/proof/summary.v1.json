@@ -1,0 +1,50 @@
+{
+  "schema_version": "ft.demo-lab.proof-summary.v1",
+  "contract_id": "ft.demo_lab.proof_summary.v1",
+  "bead_id": "ft-lecbn.4",
+  "manifest": {
+    "path": "fixtures/demo-lab/manifest.v1.json",
+    "sha256": "e72704817598b2e28b1ec6b3676c173eeaa964010076931fe397345293b246af"
+  },
+  "proof_ledger": {
+    "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+    "sha256": "022c2e197ee6b8e0f74c69a333d1619fe1f3c40f59b74a9ce34b793a86af1392",
+    "contract_id": "ft.demo_lab.proof_ledger.v1",
+    "entries": 3
+  },
+  "scenario_ids": [
+    "quickstart",
+    "usage_limit",
+    "compaction"
+  ],
+  "commands_per_scenario": [
+    "ft demo <scenario> --manifest fixtures/demo-lab/manifest.v1.json --format json",
+    "ft demo <scenario> --manifest fixtures/demo-lab/manifest.v1.json --format toon",
+    "ft simulate validate <scenario_path> --json"
+  ],
+  "proof_state": {
+    "execution_mode": "retained_static_fixture",
+    "remote_cargo_reached": false,
+    "remote_rustc_reached": false,
+    "test_binary_reached": false,
+    "local_cargo_counted": false,
+    "target_dir": "not_applicable_static_fixture",
+    "worker_id": "not_applicable_static_fixture"
+  },
+  "side_effects": {
+    "live_panes_mutated": false,
+    "external_services_called": false,
+    "agent_mail_repair_attempted": false,
+    "rch_worker_mutated": false,
+    "file_deleted": false
+  },
+  "negative_coverage": [
+    "unsupported-schema-version",
+    "absolute-scenario-path",
+    "parent-relative-artifact-path",
+    "missing-degradation-reason",
+    "duplicate-scenario-id",
+    "target-class-proof-overclaim"
+  ],
+  "operator_summary": "Retained demo-lab artifacts prove deterministic bundled fixture and CLI/simulation command contracts only. They do not prove remote Cargo, target-class capacity, live-pane mutation, or production-scale behavior."
+}

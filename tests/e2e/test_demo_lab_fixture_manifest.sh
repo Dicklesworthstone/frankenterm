@@ -7,6 +7,8 @@ cd "${ROOT}"
 
 MANIFEST="fixtures/demo-lab/manifest.v1.json"
 INVALID_FIXTURES="fixtures/demo-lab/invalid/manifest-fragments.v1.json"
+PROOF_LEDGER="fixtures/demo-lab/proof/proof-ledger.v1.jsonl"
+PROOF_SUMMARY="fixtures/demo-lab/proof/summary.v1.json"
 REQUIRED_SCENARIOS=(quickstart usage_limit compaction)
 REQUIRED_DEGRADATIONS=(
   "agent_mail_unavailable"
@@ -54,21 +56,29 @@ require_command ruby
 require_command shasum
 require_file "${MANIFEST}"
 require_file "${INVALID_FIXTURES}"
+require_file "${PROOF_LEDGER}"
+require_file "${PROOF_SUMMARY}"
 
 mapfile -t scenario_paths < <(jq -r '.scenarios[].scenario_path' "${MANIFEST}")
 mapfile -t json_golden_paths < <(jq -r '.scenarios[].expected_artifacts[] | select(.kind == "golden_json") | .path' "${MANIFEST}")
 mapfile -t toon_golden_paths < <(jq -r '.scenarios[].expected_artifacts[] | select(.kind == "golden_toon") | .path' "${MANIFEST}")
+mapfile -t structured_log_paths < <(jq -r '.scenarios[].expected_artifacts[] | select(.kind == "structured_log") | .path' "${MANIFEST}")
+mapfile -t proof_summary_paths < <(jq -r '.scenarios[].expected_artifacts[] | select(.kind == "proof_summary") | .path' "${MANIFEST}")
 
-all_json=("${MANIFEST}" "${INVALID_FIXTURES}" "${json_golden_paths[@]}")
-for path in "${all_json[@]}" "${scenario_paths[@]}" "${toon_golden_paths[@]}"; do
+all_json=("${MANIFEST}" "${INVALID_FIXTURES}" "${PROOF_SUMMARY}" "${json_golden_paths[@]}")
+for path in "${all_json[@]}" "${scenario_paths[@]}" "${toon_golden_paths[@]}" "${structured_log_paths[@]}" "${proof_summary_paths[@]}"; do
   require_repo_relative_path "${path}"
 done
 
 jq empty "${all_json[@]}"
+jq -s 'length > 0' "${PROOF_LEDGER}" >/dev/null || fail "proof ledger has no JSONL entries"
 ruby -ryaml -e 'ARGV.each { |path| YAML.safe_load(File.read(path), permitted_classes: [], aliases: false); }' \
   "${scenario_paths[@]}"
 
-jq -e --argjson required "$(printf '%s\n' "${REQUIRED_SCENARIOS[@]}" | jq -R . | jq -s .)" '
+jq -e \
+  --arg proof_ledger "${PROOF_LEDGER}" \
+  --arg proof_summary "${PROOF_SUMMARY}" \
+  --argjson required "$(printf '%s\n' "${REQUIRED_SCENARIOS[@]}" | jq -R . | jq -s .)" '
   .schema_version == "ft.demo.scenario-manifest.v1"
   and (.title | type == "string" and length > 0)
   and (.proof_boundary | type == "string" and contains("not target-class high-scale production capacity evidence"))
@@ -85,6 +95,10 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_SCENARIOS[@]}" | jq -R . |
     and (.proof_category | IN("conformance", "golden", "e2e"))
     and (.max_output_bytes | type == "number" and . > 0)
     and (.expected_artifacts | type == "array" and length > 0)
+    and any(.expected_artifacts[];
+      .id == "proof_ledger" and .kind == "structured_log" and .path == $proof_ledger)
+    and any(.expected_artifacts[];
+      .id == "proof_summary" and .kind == "proof_summary" and .path == $proof_summary)
     and all(.expected_artifacts[];
       (.id | type == "string" and length > 0)
       and (.kind | IN("manifest", "scenario_yaml", "golden_json", "golden_toon", "structured_log", "proof_summary"))
@@ -204,12 +218,24 @@ for scenario_id in "${REQUIRED_SCENARIOS[@]}"; do
     bytes="$(wc -c < "${path}" | tr -d ' ')"
     ((bytes <= max_bytes)) || fail "${path} exceeds max_bytes ${max_bytes}"
 
-    if [[ "${kind}" != "manifest" ]]; then
-      [[ "${expected_sha}" =~ ^[0-9a-f]{64}$ ]] || fail "${path} missing manifest-pinned sha256"
-      actual_sha="$(sha256_file "${path}")"
-      [[ "${actual_sha}" == "${expected_sha}" ]] ||
-        fail "${path} sha256 drifted: expected ${expected_sha}, got ${actual_sha}"
-    fi
+    case "${kind}" in
+      manifest)
+        ;;
+      structured_log|proof_summary)
+        if [[ -n "${expected_sha}" ]]; then
+          [[ "${expected_sha}" =~ ^[0-9a-f]{64}$ ]] || fail "${path} has invalid manifest-pinned sha256"
+          actual_sha="$(sha256_file "${path}")"
+          [[ "${actual_sha}" == "${expected_sha}" ]] ||
+            fail "${path} sha256 drifted: expected ${expected_sha}, got ${actual_sha}"
+        fi
+        ;;
+      *)
+        [[ "${expected_sha}" =~ ^[0-9a-f]{64}$ ]] || fail "${path} missing manifest-pinned sha256"
+        actual_sha="$(sha256_file "${path}")"
+        [[ "${actual_sha}" == "${expected_sha}" ]] ||
+          fail "${path} sha256 drifted: expected ${expected_sha}, got ${actual_sha}"
+        ;;
+    esac
 
     case "${kind}" in
       golden_json)
@@ -237,6 +263,105 @@ for scenario_id in "${REQUIRED_SCENARIOS[@]}"; do
   done
 done
 
+manifest_hash="$(sha256_file "${MANIFEST}")"
+ledger_hash="$(sha256_file "${PROOF_LEDGER}")"
+mapfile -t ledger_scenarios < <(jq -r '.scenario_id' "${PROOF_LEDGER}" | sort)
+expected_scenarios="$(printf '%s\n' "${REQUIRED_SCENARIOS[@]}" | sort)"
+actual_scenarios="$(printf '%s\n' "${ledger_scenarios[@]}")"
+[[ "${actual_scenarios}" == "${expected_scenarios}" ]] || fail "proof ledger scenario ids mismatch"
+
+for scenario_id in "${REQUIRED_SCENARIOS[@]}"; do
+  scenario_path="$(jq -r --arg id "${scenario_id}" '.scenarios[] | select(.id == $id) | .scenario_path' "${MANIFEST}")"
+  seed="$(jq -r --arg id "${scenario_id}" '.scenarios[] | select(.id == $id) | .deterministic_seed' "${MANIFEST}")"
+  proof_category="$(jq -r --arg id "${scenario_id}" '.scenarios[] | select(.id == $id) | .proof_category' "${MANIFEST}")"
+  scenario_hash="$(sha256_file "${scenario_path}")"
+  pane_count="$(ruby -ryaml -e 'doc = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [], aliases: false); puts doc.fetch("panes").length' "${scenario_path}")"
+  event_count="$(ruby -ryaml -e 'doc = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [], aliases: false); puts doc.fetch("events").length' "${scenario_path}")"
+  expectation_count="$(ruby -ryaml -e 'doc = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [], aliases: false); puts doc.fetch("expectations").length' "${scenario_path}")"
+  entry_count="$(jq -r --arg id "${scenario_id}" 'select(.scenario_id == $id) | .scenario_id' "${PROOF_LEDGER}" | wc -l | tr -d ' ')"
+  [[ "${entry_count}" == "1" ]] || fail "${scenario_id} must have exactly one proof ledger entry"
+
+  jq -e \
+    --arg id "${scenario_id}" \
+    --arg manifest "${MANIFEST}" \
+    --arg manifest_hash "${manifest_hash}" \
+    --arg scenario_path "${scenario_path}" \
+    --arg scenario_hash "${scenario_hash}" \
+    --arg seed "${seed}" \
+    --arg proof_category "${proof_category}" \
+    --arg pane_count "${pane_count}" \
+    --arg event_count "${event_count}" \
+    --arg expectation_count "${expectation_count}" \
+    --argjson required_invalid "$(printf '%s\n' "${REQUIRED_INVALID_CASES[@]}" | jq -R . | jq -s .)" '
+      select(.scenario_id == $id)
+      | .schema_version == "ft.demo-lab.proof-ledger.v1"
+        and .contract_id == "ft.demo_lab.proof_ledger.v1"
+        and .bead_id == "ft-lecbn.4"
+        and .manifest.path == $manifest
+        and .manifest.sha256 == $manifest_hash
+        and .scenario.path == $scenario_path
+        and .scenario.sha256 == $scenario_hash
+        and .scenario.deterministic_seed == $seed
+        and .scenario.proof_category == $proof_category
+        and ([.commands[].kind] | sort) == (["demo_json", "demo_toon", "simulate_validate_json"] | sort)
+        and all(.commands[]; .exit_code == 0 and .normalized_stderr.status == "empty")
+        and any(.commands[];
+          .kind == "simulate_validate_json"
+          and .normalized_stdout.status == "scenario_contract_validated"
+          and (.normalized_stdout.pane_count | tostring) == $pane_count
+          and (.normalized_stdout.event_count | tostring) == $event_count
+          and (.normalized_stdout.expectation_count | tostring) == $expectation_count)
+        and .proof.execution_mode == "retained_static_fixture"
+        and .proof.target_dir == "not_applicable_static_fixture"
+        and .proof.worker_id == "not_applicable_static_fixture"
+        and .proof.remote_cargo_reached == false
+        and .proof.remote_rustc_reached == false
+        and .proof.test_binary_reached == false
+        and .proof.local_cargo_counted == false
+        and .proof.rch_status == "not_run_static_fixture"
+        and .side_effects.live_panes_mutated == false
+        and .side_effects.external_services_called == false
+        and .side_effects.agent_mail_repair_attempted == false
+        and .side_effects.rch_worker_mutated == false
+        and .side_effects.file_deleted == false
+        and (.negative_coverage | sort) == ($required_invalid | sort)
+    ' "${PROOF_LEDGER}" >/dev/null || fail "${scenario_id} proof ledger entry mismatch"
+done
+
+jq -e \
+  --arg manifest "${MANIFEST}" \
+  --arg manifest_hash "${manifest_hash}" \
+  --arg proof_ledger "${PROOF_LEDGER}" \
+  --arg ledger_hash "${ledger_hash}" \
+  --argjson required "$(printf '%s\n' "${REQUIRED_SCENARIOS[@]}" | jq -R . | jq -s .)" \
+  --argjson required_invalid "$(printf '%s\n' "${REQUIRED_INVALID_CASES[@]}" | jq -R . | jq -s .)" '
+    .schema_version == "ft.demo-lab.proof-summary.v1"
+    and .contract_id == "ft.demo_lab.proof_summary.v1"
+    and .bead_id == "ft-lecbn.4"
+    and .manifest.path == $manifest
+    and .manifest.sha256 == $manifest_hash
+    and .proof_ledger.path == $proof_ledger
+    and .proof_ledger.sha256 == $ledger_hash
+    and .proof_ledger.contract_id == "ft.demo_lab.proof_ledger.v1"
+    and .proof_ledger.entries == ($required | length)
+    and (.scenario_ids | sort) == ($required | sort)
+    and (.commands_per_scenario | length) == 3
+    and .proof_state.execution_mode == "retained_static_fixture"
+    and .proof_state.remote_cargo_reached == false
+    and .proof_state.remote_rustc_reached == false
+    and .proof_state.test_binary_reached == false
+    and .proof_state.local_cargo_counted == false
+    and .proof_state.target_dir == "not_applicable_static_fixture"
+    and .proof_state.worker_id == "not_applicable_static_fixture"
+    and .side_effects.live_panes_mutated == false
+    and .side_effects.external_services_called == false
+    and .side_effects.agent_mail_repair_attempted == false
+    and .side_effects.rch_worker_mutated == false
+    and .side_effects.file_deleted == false
+    and (.negative_coverage | sort) == ($required_invalid | sort)
+    and (.operator_summary | contains("do not prove remote Cargo"))
+  ' "${PROOF_SUMMARY}" >/dev/null || fail "proof summary metadata mismatch"
+
 if rg -n --hidden --glob '!*.md' \
   '(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|Bearer [A-Za-z0-9._-]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
   fixtures/demo-lab >/tmp/ft-demo-lab-secret-scan.txt; then
@@ -245,6 +370,7 @@ if rg -n --hidden --glob '!*.md' \
 fi
 
 invalid_case_count="$(jq '.cases | length' "${INVALID_FIXTURES}")"
+ledger_entry_count="$(jq -s 'length' "${PROOF_LEDGER}")"
 
-printf 'demo-lab fixture manifest: static verifier passed (%d scenarios, %d json goldens, %d toon goldens, %d invalid cases)\n' \
-  "${#REQUIRED_SCENARIOS[@]}" "${#json_golden_paths[@]}" "${#toon_golden_paths[@]}" "${invalid_case_count}"
+printf 'demo-lab fixture manifest: static verifier passed (%d scenarios, %d json goldens, %d toon goldens, %d invalid cases, %d proof-ledger entries)\n' \
+  "${#REQUIRED_SCENARIOS[@]}" "${#json_golden_paths[@]}" "${#toon_golden_paths[@]}" "${invalid_case_count}" "${ledger_entry_count}"

@@ -54,6 +54,20 @@
           "max_bytes": 131072,
           "content_hash_required": true,
           "sha256": "ba37430a0878469e96489219149c724e3166eb5c9f6a6ddfdb5fc9263e581e28"
+        },
+        {
+          "id": "proof_ledger",
+          "kind": "structured_log",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        },
+        {
+          "id": "proof_summary",
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
+          "max_bytes": 262144,
+          "content_hash_required": true
         }
       ],
       "degradation": [
@@ -118,9 +132,16 @@
           "sha256": "4c70fad0c14a94616637b5c71a6587558cce851668098f61e063d076edae19b1"
         },
         {
-          "id": "structured_log",
+          "id": "proof_ledger",
           "kind": "structured_log",
-          "path": "tests/e2e/logs/demo-lab/usage_limit.proof-ledger.jsonl",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        },
+        {
+          "id": "proof_summary",
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
           "max_bytes": 262144,
           "content_hash_required": true
         }
@@ -187,9 +208,16 @@
           "sha256": "d515a387a2766e746b00951b4d5d287ed6dd0fdee4902e73772be0eee1f466c6"
         },
         {
+          "id": "proof_ledger",
+          "kind": "structured_log",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "max_bytes": 262144,
+          "content_hash_required": true
+        },
+        {
           "id": "proof_summary",
           "kind": "proof_summary",
-          "path": "tests/e2e/artifacts/demo-lab/compaction/summary.json",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
           "max_bytes": 262144,
           "content_hash_required": true
         }

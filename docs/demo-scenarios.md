@@ -48,9 +48,32 @@ Each scenario declares:
   byte budgets and content-hash requirements. Committed artifacts other than
   the self-referential manifest entry must carry a pinned lowercase SHA-256
   hash in `sha256`; the static verifier compares that pin to the file on disk.
-  Future retained proof artifacts may omit the pin until the artifact exists.
+  Retained proof-ledger and proof-summary artifacts may omit the manifest-level
+  `sha256` pin because they record the current manifest hash internally; the
+  static verifier compares those internal hashes to the live files and compares
+  the proof-summary ledger hash to the ledger on disk.
 - `degradation`: explicit behavior for Agent Mail unavailable, disabled
   features, RCH proof unavailable, and unsupported platforms.
+
+## Retained Proof Harness
+
+The no-mock retained proof harness lives in
+`tests/e2e/test_demo_lab_fixture_manifest.sh`. It validates the manifest,
+scenario YAML, retained JSON/TOON goldens, negative fragments, and the shared
+proof artifacts:
+
+- `fixtures/demo-lab/proof/proof-ledger.v1.jsonl`
+- `fixtures/demo-lab/proof/summary.v1.json`
+
+The proof ledger has one JSONL entry per bundled scenario. Each entry records
+the normalized `ft demo <scenario> --format json`, `ft demo <scenario>
+--format toon`, and `ft simulate validate <scenario> --json` command shapes,
+exit codes, stdout/stderr retention state, manifest hash, scenario hash,
+target-dir/worker placeholders, whether remote Cargo/rustc/test was reached,
+and side-effect flags. The summary records the ledger hash and makes the proof
+boundary explicit: these artifacts prove deterministic fixture and
+CLI/simulation command contracts only. They do not prove remote Cargo,
+target-class capacity, live-pane mutation, or production-scale behavior.
 
 ## Versioning
 
