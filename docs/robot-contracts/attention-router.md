@@ -2,11 +2,13 @@
 
 Tracking bead: `ft-x3nsb.1`
 
-Status: planned contract with an initial source-adapter substrate. This
-document defines the target behavior for a future side-effect-free
-attention-router surface. `frankenterm_core::attention_router` provides
-bounded read-only source snapshot DTOs, but this document does not claim a
-shipped CLI, Robot Mode, or MCP implementation.
+Status: live read-only surface with caller-supplied source-adapter input.
+`frankenterm_core::attention_router` scores bounded source snapshots and the
+same surface payload is exposed through `ft attention ...`, `ft robot attention
+...`, MCP tool `wa.attention`, and MCP resources
+`wa://attention-router/current` plus `wa://attention-router/items/{item_id}`.
+Without explicit input the surface emits an explicit degraded no-input
+snapshot; it does not collect live state or mutate project state.
 
 Operator runbook: `docs/operator-runbook.md` section 2C.
 
@@ -72,18 +74,24 @@ Each item is one candidate requiring attention.
     "title": "[idea-wizard][attention-router] Contract, overlap audit, and JSON/TOON sketch"
   },
   "classification": "ready_now",
-  "priority": 2,
+  "priority": 3,
   "confidence": 0.92,
   "evidence": [
     {
-      "source": "beads",
-      "fact": "br_ready",
-      "detail": "issue has no blocking dependencies"
+      "source_kind": "beads",
+      "source_id": "beads.ready",
+      "fact": "beads_ready",
+      "detail": "issue has no blocking dependencies",
+      "bead_ids": ["ft-x3nsb.1"],
+      "agent_names": [],
+      "affected_paths": [],
+      "reason_codes": ["beads.ready_available"]
     }
   ],
   "recommended_action": {
-    "action": "claim_or_continue",
-    "command_hint": "br update ft-x3nsb.1 --status=in_progress --assignee <agent>",
+    "action": "claim_ready_static_slice_reserve_paths_and_run_static_checks",
+    "summary": "Claim the ready static slice, reserve its paths, and run the required static checks.",
+    "command_hint": "br show ft-x3nsb.1 --json",
     "mutates": false
   }
 }
@@ -94,72 +102,103 @@ itself mutates state. For this contract, all router commands are read-only, so
 it is always `false`. Command hints are advisory text for a human or agent to
 review and run separately.
 
-## Snapshot Envelope
-
-Robot/CLI/MCP implementations should preserve this logical envelope.
+Each scored item also carries `nudge_plan_receipt`, a side-effect-free planning
+receipt for communication or stale-work follow-up. The receipt uses the static
+inventory contract in
+`fixtures/attention-router/nudge-plan-receipts.v1.json` as its vocabulary and
+adds the live trigger item id:
 
 ```json
 {
-  "schema": "ft.attention_router.snapshot.v1",
-  "contract_id": "ft.attention_router.v1",
-  "generated_at_ms": 1778980000000,
-  "workspace": "/Users/jemanuel/projects/frankenterm",
-  "sources": {
-    "beads": { "health": "available", "items_seen": 128 },
-    "agent_mail": { "health": "degraded", "reason": "fallback_available" },
-    "git": { "health": "available", "dirty_paths": 3 },
-    "rch": { "health": "degraded", "reason": "no_admissible_workers" },
-    "pane_state": { "health": "not_configured" },
-    "operating_envelope": { "health": "degraded", "reason": "rch.no_admissible_workers" }
+  "schema": "ft.attention_router.nudge_plan_receipt.v1",
+  "contract_id": "ft.attention_router.nudge_plan_receipts.v1",
+  "trigger_classification": "stale_claim",
+  "recipient": "bead-thread:ft-x3nsb.5",
+  "target": {
+    "kind": "bead",
+    "bead_id": "ft-x3nsb.5"
   },
-  "items": [],
-  "next_action": {
-    "item_id": "attention:ft-x3nsb.1",
-    "summary": "Continue docs-only contract work while RCH proof lanes remain blocked",
-    "mutates": false
+  "nudge": {
+    "kind": "status_check",
+    "command_hint": "draft status check for ft-x3nsb.5; send only by explicit caller action before any force-release review",
+    "safe_command_text": "draft status check for ft-x3nsb.5; send only by explicit caller action before any force-release review",
+    "urgency": "normal",
+    "mutates": false,
+    "review_required": true
   },
-  "warnings": [
-    "local Cargo output is not closeout proof",
-    "bv recommendation points at blocked ft-4tp7g; br state controls actionability"
-  ]
+  "escalation": {
+    "status_check_before_force_release": true,
+    "elapsed_time_alone_sufficient": false,
+    "human_review_required_for_mutation": true
+  },
+  "live_mutation_allowed": false,
+  "side_effects_executed": false
 }
 ```
 
-TOON output should carry the same fields and enum values. Field order should be
+Live nudge kinds are `acknowledge_request`, `reply_to_thread`, `status_check`,
+`handoff_request`, `force_release_review`, and `no_action`. `command_hint` and
+`safe_command_text` are draft text only; the router never sends mail,
+acknowledges messages, comments on Beads, releases reservations, force-releases
+owners, restarts services, cancels builds, deletes files, or treats local Cargo
+as proof.
+
+## Surface Envelope
+
+Robot/CLI/MCP implementations preserve this logical surface envelope. The
+retained input-backed JSON and TOON examples for the ready status surface are:
+
+- `fixtures/attention-router/source-adapter-input.ready.v1.json`
+- `fixtures/attention-router/surface-status.golden.json`
+- `fixtures/attention-router/surface-status.golden.toon`
+
+The current JSON payload is an object with `schema =
+ft.attention_router.surface.v1`, the source snapshot, selected/next item
+fields, degraded-mode reason codes, and MCP resource descriptors. The snapshot
+embedded inside the surface keeps the scored `ft.attention_router.snapshot.v1`
+object.
+
+```json
+{
+  "schema": "ft.attention_router.surface.v1",
+  "contract_id": "ft.attention_router.v1",
+  "surface": "status",
+  "generated_at_ms": 1770000300001,
+  "workspace": "/Users/jemanuel/projects/frankenterm",
+  "dry_run": true,
+  "live_mutation_allowed": false,
+  "side_effects_executed": false,
+  "degraded_mode": {
+    "active": false,
+    "reason_codes": []
+  },
+  "snapshot": {
+    "schema": "ft.attention_router.snapshot.v1",
+    "items": [],
+    "side_effects_executed": false
+  }
+}
+```
+
+TOON output carries the same fields and enum values. Field order should be
 stable enough for golden tests, but callers must parse by key, not by display
 position. A representative TOON sketch:
 
 ```toon
-schema: ft.attention_router.snapshot.v1
+schema: ft.attention_router.surface.v1
 contract_id: ft.attention_router.v1
-generated_at_ms: 1778980000000
+surface: status
+generated_at_ms: 1770000300001
 workspace: /Users/jemanuel/projects/frankenterm
-sources:
-  beads:
-    health: available
-    items_seen: 128
-  agent_mail:
-    health: degraded
-    reason: fallback_available
-  git:
-    health: available
-    dirty_paths: 3
-  rch:
-    health: degraded
-    reason: no_admissible_workers
-  pane_state:
-    health: not_configured
-  operating_envelope:
-    health: degraded
-    reason: rch.no_admissible_workers
-items[0]:
-next_action:
-  item_id: attention:ft-x3nsb.1
-  summary: Continue docs-only contract work while RCH proof lanes remain blocked
-  mutates: false
-warnings[2]:
-  - local Cargo output is not closeout proof
-  - bv recommendation points at blocked ft-4tp7g; br state controls actionability
+dry_run: true
+live_mutation_allowed: false
+side_effects_executed: false
+degraded_mode:
+  active: false
+  reason_codes[0]:
+snapshot:
+  schema: ft.attention_router.snapshot.v1
+  side_effects_executed: false
 ```
 
 ## Classifications
@@ -224,9 +263,16 @@ The attention router must never perform these actions:
 - Automatic Beads reopen/force-release or Agent Mail broadcast without a future
   explicit policy-gated mutating command.
 
-## Proof Plan
+## Proof And Goldens
 
-The first implementation pass should add golden fixtures for:
+The implementation pass retains the live surface examples in:
+
+- `fixtures/attention-router/source-adapter-input.ready.v1.json`
+- `fixtures/attention-router/surface-status.golden.json`
+- `fixtures/attention-router/surface-status.golden.toon`
+
+The broader scenario inventory in `fixtures/attention-router/scenarios.v1.json`
+continues to cover:
 
 1. Empty `br ready` with `bv` recommending blocked `ft-4tp7g`.
 2. Agent Mail degraded/unavailable fallback.
@@ -237,6 +283,11 @@ The first implementation pass should add golden fixtures for:
 7. Reservation firewall cases where leases, dirty paths, Beads ownership, and
    publication state disagree or have not all cleared.
 
+`tests/e2e/test_attention_router_scenarios.sh` validates that inventory and
+emits JSONL proof records for each retained scenario, including the expected
+classification, safe action, source reason codes, explanation terms, and
+volatility level.
+
 Any Rust code, generated JSON/TOON golden tests, or docs tests that compile
-code must run through RCH only. Static markdown and JSON checks are sufficient
-for this planned-contract slice.
+code must run through RCH only. Static markdown and JSON checks may supplement
+the RCH proof, but local Cargo output is not closeout proof.

@@ -78,22 +78,23 @@
       ]
     },
     {
-      "claim_id": "robot_contracts.attention_router_planned",
+      "claim_id": "robot_contracts.attention_router_live_read_only",
       "surface_path": "docs/robot-contracts/attention-router.md",
-      "claim_type": "planned_contract",
-      "selector": "Status: planned contract",
-      "claim_text": "The attention-router contract is explicitly planned, not advertised as a live supported router.",
-      "wording_state": "planned",
-      "source_of_truth_command": "jq empty fixtures/attention-router/scenarios.v1.json docs/json-schema/ft-attention-router-scenarios.json",
-      "expected_artifact_path": "fixtures/attention-router/scenarios.v1.json",
-      "producing_bead": "ft-x3nsb.6.1",
+      "claim_type": "supported_read_only_contract",
+      "selector": "Status: live read-only surface",
+      "claim_text": "The attention-router contract is exposed as a live read-only CLI, Robot, and MCP surface backed by retained JSON/TOON surface goldens.",
+      "wording_state": "supported_read_only",
+      "source_of_truth_command": "jq empty fixtures/attention-router/scenarios.v1.json docs/json-schema/ft-attention-router-scenarios.json fixtures/attention-router/surface-status.golden.json",
+      "expected_artifact_path": "fixtures/attention-router/surface-status.golden.json",
+      "producing_bead": "ft-x3nsb.4",
       "proof_category": "proofs/robot-contracts",
-      "freshness_rule": "Planned wording may cite static fixtures, but cannot be upgraded to supported until a future implementation bead publishes live router evidence.",
+      "freshness_rule": "Supported read-only wording must keep the CLI/Robot/MCP surface code, retained surface goldens, and RCH test evidence in sync.",
       "release_source_required": false,
       "dirty_worktree_measurement_allowed": false,
       "required_terms": [
-        "Status: planned contract",
-        "planned-contract slice"
+        "Status: live read-only surface",
+        "surface-status.golden.json",
+        "wa.attention"
       ]
     },
     {

@@ -384,5 +384,21 @@ grep -Fq "Read \`bv --robot-triage\` only as an advisory ranking snapshot." \
 grep -Fq "PageRank, unblock count, and \"available for work\" language are never enough" \
   "${BLOCKER_RADAR_RUNBOOK}" || fail "blocker-radar runbook no longer rejects BV-only claims"
 
+jq -c '
+  .scenarios[]
+  | {
+      event: "attention_router_scenario_verified",
+      scenario_id,
+      classification: .expected.classification,
+      recommended_safe_action: .expected.recommended_safe_action,
+      confidence: .expected.confidence,
+      source_count: (.source_fixture_requirements | length),
+      reason_codes: ([.source_fixture_requirements[].required_reason_codes[]] | unique),
+      forbidden_action_count: (.forbidden_actions | length),
+      explanation_terms: .expected.explanation_must_include,
+      volatility_level: .volatility.level
+    }
+' "${INVENTORY}"
+
 scenario_count="$(jq -r '.scenarios | length' "${INVENTORY}")"
 printf 'attention-router scenario inventory: static verifier passed (%s scenarios)\n' "${scenario_count}"

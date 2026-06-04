@@ -1,11 +1,12 @@
 # Attention Router Nudge-Plan Receipts
 
-Tracking bead: `ft-x3nsb.5.1`
+Tracking bead: `ft-x3nsb.5`
 
-Status: static supplement for the planned `ft.attention_router.v1` contract.
-This document defines the receipt shape for side-effect-free nudge
-recommendations. It does not claim a shipped CLI, Robot Mode, MCP, or automatic
-messaging implementation.
+Status: live read-only supplement for the `ft.attention_router.v1` contract.
+The static receipt inventory was seeded under `ft-x3nsb.5.1`; `ft-x3nsb.5`
+embeds a `nudge_plan_receipt` on each scored attention item for the CLI, Robot,
+and MCP attention surfaces. The router still performs no automatic messaging or
+ownership mutation.
 
 Canonical schema: `docs/json-schema/ft-attention-router-nudge-plan-receipt.json`
 
@@ -19,8 +20,8 @@ shape: why communication is needed, who or what it targets, what command text
 an operator could review, and which mutations remain forbidden.
 
 The receipt is evidence, not an action. `nudge.mutates` is always `false`.
-Command hints are advisory text for a human or agent to review and run
-separately.
+`nudge.command_hint` and `nudge.safe_command_text` are advisory text for a
+human or agent to review and run separately.
 
 ## Receipt Types
 
@@ -61,9 +62,28 @@ Nudge-plan generation must never:
 - Store raw pane text, secret material, or full Agent Mail message bodies in
   retained fixtures.
 
-## Static Verification
+## Live Surface Fields
 
-This pre-code contract is verified with fixture-local static checks:
+Every live `AttentionRouterItem` carries one `nudge_plan_receipt` with:
+
+- `recipient`, `target`, and `trigger_item_id` for the item that caused the
+  recommendation.
+- `evidence.sources_checked`, `evidence.reason_codes`,
+  `evidence.minimum_source_count`, and a bounded summary.
+- `nudge.kind`, `nudge.command_hint`, `nudge.safe_command_text`,
+  `nudge.urgency`, `nudge.mutates=false`, and `nudge.review_required`.
+- Escalation guardrails that require status-check-before-force-release, reject
+  elapsed-time-only evidence, and keep mutation behind human review.
+- Redaction and side-effect flags that keep raw pane text, full mail bodies,
+  secret material, live mutation, and executed side effects out of the receipt.
+
+Plain CLI output shows the selected item's nudge recipient, target, safe command
+text, evidence sources, reason codes, escalation thresholds, and side-effect
+flags. JSON and TOON output preserve the full receipt object.
+
+## Verification
+
+The retained static receipt inventory is checked with:
 
 ```bash
 bash fixtures/attention-router/verify-nudge-plan-receipts.sh
@@ -71,6 +91,8 @@ git diff --check -- docs/json-schema/ft-attention-router-nudge-plan-receipt.json
 br dep cycles --json
 ```
 
-If a future implementation turns these receipts into generated JSON/TOON
-goldens, compiled tests and e2e proof must run through RCH. This static slice
-does not require local Cargo or RCH material proof.
+The live implementation and generated JSON/TOON goldens are covered by
+`frankenterm_core::attention_router` tests plus the `ft` CLI attention rendering
+tests. Any Rust code, generated JSON/TOON golden tests, or docs tests that
+compile code must run through RCH only. Static markdown and JSON checks may
+supplement that proof, but local Cargo output is not closeout proof.

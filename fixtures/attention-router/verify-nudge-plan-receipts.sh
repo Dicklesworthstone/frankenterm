@@ -106,6 +106,8 @@ jq -e '
     and (.evidence.summary | type == "string" and length > 0)
     and (.nudge.kind | known_kind)
     and (.nudge.command_hint | type == "string" and length > 0)
+    and (.nudge.safe_command_text | type == "string" and length > 0)
+    and (.nudge.safe_command_text == .nudge.command_hint)
     and (.nudge.urgency | IN("low", "normal", "high", "urgent"))
     and (.nudge.mutates == false)
     and (.nudge.review_required | type == "boolean")

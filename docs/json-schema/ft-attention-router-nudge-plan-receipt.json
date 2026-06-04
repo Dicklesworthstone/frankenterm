@@ -370,6 +370,7 @@
           "required": [
             "kind",
             "command_hint",
+            "safe_command_text",
             "urgency",
             "mutates",
             "review_required"
@@ -380,6 +381,10 @@
               "$ref": "#/$defs/nudge_kind"
             },
             "command_hint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "safe_command_text": {
               "type": "string",
               "minLength": 1
             },

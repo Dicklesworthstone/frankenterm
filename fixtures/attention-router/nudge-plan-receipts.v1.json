@@ -51,6 +51,7 @@
       "nudge": {
         "kind": "acknowledge_request",
         "command_hint": "acknowledge_message(project_key, agent_name, message_id)",
+        "safe_command_text": "acknowledge_message(project_key, agent_name, message_id)",
         "urgency": "high",
         "mutates": false,
         "review_required": false
@@ -104,6 +105,7 @@
       "nudge": {
         "kind": "status_check",
         "command_hint": "br comment ft-x3nsb.5 'status check: still active?'",
+        "safe_command_text": "br comment ft-x3nsb.5 'status check: still active?'",
         "urgency": "normal",
         "mutates": false,
         "review_required": true
@@ -157,6 +159,7 @@
       "nudge": {
         "kind": "handoff_request",
         "command_hint": "send_message(owner, subject='handoff request', body='Can you confirm path ownership?')",
+        "safe_command_text": "send_message(owner, subject='handoff request', body='Can you confirm path ownership?')",
         "urgency": "normal",
         "mutates": false,
         "review_required": true
@@ -211,6 +214,7 @@
       "nudge": {
         "kind": "force_release_review",
         "command_hint": "prepare evidence for operator review; do not run force-release automatically",
+        "safe_command_text": "prepare evidence for operator review; do not run force-release automatically",
         "urgency": "high",
         "mutates": false,
         "review_required": true
@@ -265,6 +269,7 @@
       "nudge": {
         "kind": "no_action",
         "command_hint": "record the RCH blocker or choose disjoint static work; do not send a broadcast or run local Cargo as proof",
+        "safe_command_text": "record the RCH blocker or choose disjoint static work; do not send a broadcast or run local Cargo as proof",
         "urgency": "normal",
         "mutates": false,
         "review_required": false
