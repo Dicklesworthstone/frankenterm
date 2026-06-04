@@ -1,6 +1,6 @@
-use crate::domain::{ClientInner, lock_or_recover};
+use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{RenderableInner, RenderableState, hydrate_lines};
+use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -8,8 +8,8 @@ use config::configuration;
 use config::keyassignment::ScrollbackEraseMode;
 use mux::domain::DomainId;
 use mux::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
-    SearchResult, WithPaneLines, alloc_pane_id,
+    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
+    Pattern, SearchResult, WithPaneLines,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -726,8 +726,8 @@ mod tests {
     use crate::client::Client;
     use crate::domain::ClientDomainConfig;
     use config::UnixDomain;
-    use mux::Mux;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
+    use mux::Mux;
     use promise::spawn::SimpleExecutor;
     use std::sync::{Mutex as StdMutex, Once};
 

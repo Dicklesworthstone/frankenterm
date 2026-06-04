@@ -1,13 +1,13 @@
 use crate::client::Client;
 use crate::pane::ClientPane;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::client::ClientId;
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
+use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitRequest, Tab, TabId};
 use mux::window::WindowId;
@@ -1448,11 +1448,10 @@ mod tests {
         assert_eq!(resolved_window_id, local_window_id);
         assert_eq!(inner.remote_to_local_tab_id(51), Some(tab.tab_id()));
         assert_eq!(inner.remote_to_local_pane_id(61), Some(pane.pane_id()));
-        assert!(
-            pane.downcast_ref::<ClientPane>()
-                .expect("resolved pane should be a client pane")
-                .is_alt_screen_active()
-        );
+        assert!(pane
+            .downcast_ref::<ClientPane>()
+            .expect("resolved pane should be a client pane")
+            .is_alt_screen_active());
     }
 
     #[test]
