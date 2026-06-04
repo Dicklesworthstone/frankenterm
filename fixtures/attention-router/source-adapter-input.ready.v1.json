@@ -1,0 +1,164 @@
+{
+  "generated_at_ms": 1770000300001,
+  "workspace": "/Users/jemanuel/projects/frankenterm",
+  "observations": [
+    {
+      "source_id": "beads.ready",
+      "source_kind": "beads",
+      "health": "available",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "br ready --json",
+      "live": false,
+      "redaction_posture": "redacted",
+      "source_summary": "docs-only ready static slice",
+      "reason_codes": [],
+      "facts": [
+        {
+          "fact": "beads_ready",
+          "summary": "docs-only ready static slice",
+          "count": 1,
+          "bead_ids": [
+            "ft-docs"
+          ],
+          "agent_names": [],
+          "affected_paths": [],
+          "reason_codes": [
+            "beads.ready_available"
+          ]
+        }
+      ],
+      "items_seen": 1
+    },
+    {
+      "source_id": "agent_mail.healthy",
+      "source_kind": "agent_mail",
+      "health": "available",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "mcp.agent_mail.fetch_inbox",
+      "live": false,
+      "redaction_posture": "redacted",
+      "source_summary": "no ack-required messages in reduced fixture metadata",
+      "reason_codes": [],
+      "facts": [
+        {
+          "fact": "manual",
+          "summary": "agent mail metadata is healthy for this fixture",
+          "count": null,
+          "bead_ids": [],
+          "agent_names": [],
+          "affected_paths": [],
+          "reason_codes": [
+            "agent_mail.no_ack_required"
+          ]
+        }
+      ],
+      "items_seen": 1
+    },
+    {
+      "source_id": "git.healthy",
+      "source_kind": "git",
+      "health": "available",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "git status --short --branch",
+      "live": false,
+      "redaction_posture": "redacted",
+      "source_summary": "candidate paths are disjoint in reduced fixture metadata",
+      "reason_codes": [],
+      "facts": [
+        {
+          "fact": "manual",
+          "summary": "git metadata is healthy for this fixture",
+          "count": null,
+          "bead_ids": [],
+          "agent_names": [],
+          "affected_paths": [],
+          "reason_codes": [
+            "git.no_candidate_overlap"
+          ]
+        }
+      ],
+      "items_seen": 1
+    },
+    {
+      "source_id": "rch.healthy",
+      "source_kind": "rch",
+      "health": "available",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "rch remote-required proof metadata",
+      "live": false,
+      "redaction_posture": "redacted",
+      "source_summary": "RCH is not required for this static fixture",
+      "reason_codes": [],
+      "facts": [
+        {
+          "fact": "manual",
+          "summary": "remote proof is not required for this docs-only fixture",
+          "count": null,
+          "bead_ids": [],
+          "agent_names": [],
+          "affected_paths": [],
+          "reason_codes": [
+            "proof.static_only"
+          ]
+        }
+      ],
+      "items_seen": 1
+    },
+    {
+      "source_id": "pane_state.healthy",
+      "source_kind": "pane_state",
+      "health": "available",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "ft robot state --format toon",
+      "live": false,
+      "redaction_posture": "summary_only",
+      "source_summary": "pane state has no stale-claim evidence in reduced fixture metadata",
+      "reason_codes": [],
+      "facts": [
+        {
+          "fact": "manual",
+          "summary": "pane state metadata is healthy for this fixture",
+          "count": null,
+          "bead_ids": [],
+          "agent_names": [],
+          "affected_paths": [],
+          "reason_codes": [
+            "pane_state.no_stale_claim"
+          ]
+        }
+      ],
+      "items_seen": 1
+    },
+    {
+      "source_id": "operating_envelope.healthy",
+      "source_kind": "operating_envelope",
+      "health": "available",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "ft operating-envelope snapshot",
+      "live": false,
+      "redaction_posture": "redacted",
+      "source_summary": "operating envelope is healthy for this static fixture",
+      "reason_codes": [],
+      "facts": [
+        {
+          "fact": "manual",
+          "summary": "operating envelope metadata is healthy for this fixture",
+          "count": null,
+          "bead_ids": [],
+          "agent_names": [],
+          "affected_paths": [],
+          "reason_codes": [
+            "operating_envelope.static_slice_allowed"
+          ]
+        }
+      ],
+      "items_seen": 1
+    }
+  ]
+}

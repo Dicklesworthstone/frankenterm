@@ -1,0 +1,64 @@
+schema: ft.attention_router.surface.v1
+contract_id: ft.attention_router.v1
+surface: status
+generated_at_ms: 1770000300001
+workspace: /Users/jemanuel/projects/frankenterm
+source: cli.attention.status
+dry_run: true
+raw_pane_content_stored: false
+raw_message_bodies_stored: false
+live_mutation_allowed: false
+side_effects_executed: false
+degraded_mode:
+  active: false
+  summary: all required attention-router sources are healthy
+  reason_codes[0]:
+selected_item: null
+next_action:
+  action: claim_ready_static_slice_reserve_paths_and_run_static_checks
+  command_hint: br show ft-docs --json
+  mutates: false
+explanation:
+  status: status
+  matched: false
+  summary: 1 attention item(s) scored
+mcp_resources[2]:
+  - name: current
+    uri: wa://attention-router/current
+    uri_template: null
+    read_only: true
+    live_mutation_allowed: false
+  - name: item
+    uri: null
+    uri_template: wa://attention-router/items/{item_id}
+    read_only: true
+    live_mutation_allowed: false
+snapshot:
+  schema: ft.attention_router.snapshot.v1
+  contract_id: ft.attention_router.v1
+  source_health[0]:
+  warnings[0]:
+  items[1]:
+    - item_id: attention:ready_now:beads_ready:ft-docs
+      kind: ready_work
+      classification: ready_now
+      priority: 3
+      confidence_label: high
+      recommended_action:
+        action: claim_ready_static_slice_reserve_paths_and_run_static_checks
+        command_hint: br show ft-docs --json
+        mutates: false
+      nudge_plan_receipt:
+        schema: ft.attention_router.nudge_plan_receipt.v1
+        contract_id: ft.attention_router.nudge_plan_receipts.v1
+        receipt_id: nudge-no-action-attention-ready-now-beads-ready-ft-docs
+        trigger_classification: ready_now
+        recipient: null
+        nudge:
+          kind: no_action
+          urgency: normal
+          mutates: false
+          review_required: false
+        live_mutation_allowed: false
+        side_effects_executed: false
+  side_effects_executed: false

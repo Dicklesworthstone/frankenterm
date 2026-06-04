@@ -1,0 +1,372 @@
+{
+  "schema": "ft.attention_router.surface.v1",
+  "contract_id": "ft.attention_router.v1",
+  "surface": "status",
+  "generated_at_ms": 1770000300001,
+  "workspace": "/Users/jemanuel/projects/frankenterm",
+  "source": "cli.attention.status",
+  "dry_run": true,
+  "raw_pane_content_stored": false,
+  "raw_message_bodies_stored": false,
+  "live_mutation_allowed": false,
+  "side_effects_executed": false,
+  "degraded_mode": {
+    "active": false,
+    "summary": "all required attention-router sources are healthy",
+    "reason_codes": []
+  },
+  "selected_item": null,
+  "next_action": {
+    "action": "claim_ready_static_slice_reserve_paths_and_run_static_checks",
+    "summary": "Claim the ready static slice, reserve its paths, and run the required static checks.",
+    "command_hint": "br show ft-docs --json",
+    "mutates": false
+  },
+  "explanation": {
+    "status": "status",
+    "requested_item_id": null,
+    "matched_item_id": null,
+    "matched": false,
+    "summary": "1 attention item(s) scored",
+    "reason_codes": [
+      "attention_router.status.snapshot"
+    ]
+  },
+  "mcp_resources": [
+    {
+      "name": "current",
+      "uri": "wa://attention-router/current",
+      "uri_template": null,
+      "description": "Read-only current attention-router surface",
+      "mime_type": "application/json",
+      "read_only": true,
+      "live_mutation_allowed": false
+    },
+    {
+      "name": "item",
+      "uri": null,
+      "uri_template": "wa://attention-router/items/{item_id}",
+      "description": "Read-only attention-router item explanation template",
+      "mime_type": "application/json",
+      "read_only": true,
+      "live_mutation_allowed": false
+    }
+  ],
+  "snapshot": {
+    "schema": "ft.attention_router.snapshot.v1",
+    "contract_id": "ft.attention_router.v1",
+    "generated_at_ms": 1770000300001,
+    "workspace": "/Users/jemanuel/projects/frankenterm",
+    "sources": [
+      {
+        "source_id": "beads.ready",
+        "source_kind": "beads",
+        "health": "available",
+        "collected_at_ms": null,
+        "freshness_ms": null,
+        "command_or_api": "br ready --json",
+        "live": false,
+        "redaction_posture": "redacted",
+        "source_summary": "docs-only ready static slice",
+        "redacted": true,
+        "reason_codes": [
+          "source.beads.available",
+          "beads.ready_available"
+        ],
+        "facts": [
+          {
+            "fact": "beads_ready",
+            "summary": "docs-only ready static slice",
+            "count": 1,
+            "bead_ids": [
+              "ft-docs"
+            ],
+            "agent_names": [],
+            "affected_paths": [],
+            "reason_codes": [
+              "beads.ready_available"
+            ]
+          }
+        ],
+        "items_seen": 1
+      },
+      {
+        "source_id": "agent_mail.healthy",
+        "source_kind": "agent_mail",
+        "health": "available",
+        "collected_at_ms": null,
+        "freshness_ms": null,
+        "command_or_api": "mcp.agent_mail.fetch_inbox",
+        "live": false,
+        "redaction_posture": "redacted",
+        "source_summary": "no ack-required messages in reduced fixture metadata",
+        "redacted": true,
+        "reason_codes": [
+          "source.agent_mail.available",
+          "agent_mail.no_ack_required"
+        ],
+        "facts": [
+          {
+            "fact": "manual",
+            "summary": "agent mail metadata is healthy for this fixture",
+            "count": null,
+            "bead_ids": [],
+            "agent_names": [],
+            "affected_paths": [],
+            "reason_codes": [
+              "agent_mail.no_ack_required"
+            ]
+          }
+        ],
+        "items_seen": 1
+      },
+      {
+        "source_id": "git.healthy",
+        "source_kind": "git",
+        "health": "available",
+        "collected_at_ms": null,
+        "freshness_ms": null,
+        "command_or_api": "git status --short --branch",
+        "live": false,
+        "redaction_posture": "redacted",
+        "source_summary": "candidate paths are disjoint in reduced fixture metadata",
+        "redacted": true,
+        "reason_codes": [
+          "source.git.available",
+          "git.no_candidate_overlap"
+        ],
+        "facts": [
+          {
+            "fact": "manual",
+            "summary": "git metadata is healthy for this fixture",
+            "count": null,
+            "bead_ids": [],
+            "agent_names": [],
+            "affected_paths": [],
+            "reason_codes": [
+              "git.no_candidate_overlap"
+            ]
+          }
+        ],
+        "items_seen": 1
+      },
+      {
+        "source_id": "rch.healthy",
+        "source_kind": "rch",
+        "health": "available",
+        "collected_at_ms": null,
+        "freshness_ms": null,
+        "command_or_api": "rch remote-required proof metadata",
+        "live": false,
+        "redaction_posture": "redacted",
+        "source_summary": "RCH is not required for this static fixture",
+        "redacted": true,
+        "reason_codes": [
+          "source.rch.available",
+          "proof.static_only"
+        ],
+        "facts": [
+          {
+            "fact": "manual",
+            "summary": "remote proof is not required for this docs-only fixture",
+            "count": null,
+            "bead_ids": [],
+            "agent_names": [],
+            "affected_paths": [],
+            "reason_codes": [
+              "proof.static_only"
+            ]
+          }
+        ],
+        "items_seen": 1
+      },
+      {
+        "source_id": "pane_state.healthy",
+        "source_kind": "pane_state",
+        "health": "available",
+        "collected_at_ms": null,
+        "freshness_ms": null,
+        "command_or_api": "ft robot state --format toon",
+        "live": false,
+        "redaction_posture": "summary_only",
+        "source_summary": "pane state has no stale-claim evidence in reduced fixture metadata",
+        "redacted": true,
+        "reason_codes": [
+          "source.pane_state.available",
+          "pane_state.no_stale_claim"
+        ],
+        "facts": [
+          {
+            "fact": "manual",
+            "summary": "pane state metadata is healthy for this fixture",
+            "count": null,
+            "bead_ids": [],
+            "agent_names": [],
+            "affected_paths": [],
+            "reason_codes": [
+              "pane_state.no_stale_claim"
+            ]
+          }
+        ],
+        "items_seen": 1
+      },
+      {
+        "source_id": "operating_envelope.healthy",
+        "source_kind": "operating_envelope",
+        "health": "available",
+        "collected_at_ms": null,
+        "freshness_ms": null,
+        "command_or_api": "ft operating-envelope snapshot",
+        "live": false,
+        "redaction_posture": "redacted",
+        "source_summary": "operating envelope is healthy for this static fixture",
+        "redacted": true,
+        "reason_codes": [
+          "source.operating_envelope.available",
+          "operating_envelope.static_slice_allowed"
+        ],
+        "facts": [
+          {
+            "fact": "manual",
+            "summary": "operating envelope metadata is healthy for this fixture",
+            "count": null,
+            "bead_ids": [],
+            "agent_names": [],
+            "affected_paths": [],
+            "reason_codes": [
+              "operating_envelope.static_slice_allowed"
+            ]
+          }
+        ],
+        "items_seen": 1
+      }
+    ],
+    "source_health": [],
+    "warnings": [],
+    "items": [
+      {
+        "schema": "ft.attention_router.item.v1",
+        "item_id": "attention:ready_now:beads_ready:ft-docs",
+        "kind": "ready_work",
+        "subject": {
+          "bead_id": "ft-docs",
+          "title": null,
+          "path": null,
+          "agent_name": null
+        },
+        "classification": "ready_now",
+        "priority": 3,
+        "confidence": 0.92,
+        "confidence_label": "high",
+        "evidence": [
+          {
+            "source_kind": "beads",
+            "source_id": "beads.ready",
+            "fact": "beads_ready",
+            "detail": "docs-only ready static slice",
+            "bead_ids": [
+              "ft-docs"
+            ],
+            "agent_names": [],
+            "affected_paths": [],
+            "reason_codes": [
+              "source.beads.available",
+              "beads.ready_available"
+            ]
+          }
+        ],
+        "reason_codes": [
+          "source.beads.available",
+          "beads.ready_available"
+        ],
+        "recommended_action": {
+          "action": "claim_ready_static_slice_reserve_paths_and_run_static_checks",
+          "summary": "Claim the ready static slice, reserve its paths, and run the required static checks.",
+          "command_hint": "br show ft-docs --json",
+          "mutates": false
+        },
+        "nudge_plan_receipt": {
+          "schema": "ft.attention_router.nudge_plan_receipt.v1",
+          "contract_id": "ft.attention_router.nudge_plan_receipts.v1",
+          "receipt_id": "nudge-no-action-attention-ready-now-beads-ready-ft-docs",
+          "trigger_item_id": "attention:ready_now:beads_ready:ft-docs",
+          "trigger_classification": "ready_now",
+          "recipient": null,
+          "target": {
+            "kind": "none",
+            "bead_id": "ft-docs",
+            "thread_ref": "ft-docs",
+            "agent_name": null,
+            "path": null
+          },
+          "evidence": {
+            "sources_checked": [
+              "beads.ready",
+              "br.ready",
+              "bv.triage",
+              "rch.diagnose",
+              "beads.blocker_state"
+            ],
+            "reason_codes": [
+              "source.beads.available",
+              "beads.ready_available"
+            ],
+            "subjects": [
+              "ft-docs"
+            ],
+            "minimum_source_count": 4,
+            "summary": "take no communication action from this receipt: docs-only ready static slice"
+          },
+          "nudge": {
+            "kind": "no_action",
+            "command_hint": "record the blocker or choose disjoint static work; do not send a broadcast or mutate services",
+            "safe_command_text": "record the blocker or choose disjoint static work; do not send a broadcast or mutate services",
+            "urgency": "normal",
+            "mutates": false,
+            "review_required": false
+          },
+          "escalation": {
+            "status_check_before_force_release": true,
+            "elapsed_time_alone_sufficient": false,
+            "human_review_required_for_mutation": true,
+            "minimum_evidence_sources": 4,
+            "minimum_wait_minutes_after_status_check": 0
+          },
+          "redaction": {
+            "body_handling": "metadata_only",
+            "raw_pane_text_allowed": false,
+            "full_message_body_allowed": false,
+            "secret_material_allowed": false
+          },
+          "forbidden_actions": [
+            "claim_without_reservation",
+            "run_local_cargo_as_proof",
+            "edit_overlapping_dirty_paths",
+            "agent_mail_repair",
+            "agent_mail_restart",
+            "rch_service_restart",
+            "worker_mutation",
+            "delete_files",
+            "delete_targets",
+            "stash_or_revert_unrelated_dirty_work",
+            "local_cargo_proof"
+          ],
+          "live_mutation_allowed": false,
+          "side_effects_executed": false
+        },
+        "forbidden_actions": [
+          "claim_without_reservation",
+          "run_local_cargo_as_proof",
+          "edit_overlapping_dirty_paths"
+        ]
+      }
+    ],
+    "next_action": {
+      "action": "claim_ready_static_slice_reserve_paths_and_run_static_checks",
+      "summary": "Claim the ready static slice, reserve its paths, and run the required static checks.",
+      "command_hint": "br show ft-docs --json",
+      "mutates": false
+    },
+    "side_effects_executed": false
+  }
+}
