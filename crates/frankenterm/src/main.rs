@@ -29,6 +29,7 @@ use frankenterm_core::context_horizon::{
     ContextHorizonFailureClass, ContextHorizonReport, context_horizon_unavailable_report,
     predict_context_horizon_from_sqlite,
 };
+use frankenterm_core::demo_scenarios::DemoScenarioManifest;
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
 use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
@@ -50,6 +51,10 @@ use frankenterm_core::proof_lane::{
     ProofCloseoutLintInput, ProofFindingSeverity, ProofHistoryArtifactInput, ProofHistoryIndex,
     ProofHistoryQuery, ProofRedactionStatus, ProofReleaseScoreboard, ProofReleaseScoreboardRow,
     ProofScope, ProofState, lint_proof_closeout, validate_proof_record,
+};
+use frankenterm_core::rehearsal_score::{
+    REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
+    RehearsalVerdict,
 };
 use frankenterm_core::runtime_telemetry::{
     HealthTier, ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID, SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
@@ -1745,6 +1750,27 @@ SEE ALSO:
         command: SimulateCommands,
     },
 
+    /// Score or explain demo rehearsal manifests
+    #[command(
+        visible_alias = "rehearsal",
+        after_help = r#"EXAMPLES:
+    ft rehearse score fixtures/demo-lab/manifest.v1.json
+    ft rehearse score --format json
+    ft rehearse explain --format toon
+
+NOTES:
+    This surface consumes retained demo/rehearsal artifacts. It does not run
+    scenarios, start proof lanes, mutate panes, repair services, or update Beads.
+
+SEE ALSO:
+    ft demo       Interactive demo mode
+    ft robot rehearsal  Machine-readable rehearsal score surface"#
+    )]
+    Rehearse {
+        #[command(subcommand)]
+        command: RehearsalCommands,
+    },
+
     /// Display a unified event timeline with cross-pane correlations
     #[command(after_help = r#"EXAMPLES:
     ft timeline                       Recent events (last 30m)
@@ -2128,6 +2154,65 @@ enum SimulateCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RehearsalOutputFormat {
+    Plain,
+    Json,
+    Toon,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RehearsalScoreInputArgs {
+    /// Demo scenario manifest path
+    #[arg(
+        value_name = "MANIFEST",
+        default_value = "fixtures/demo-lab/manifest.v1.json"
+    )]
+    manifest: PathBuf,
+
+    /// Stable rehearsal id to write into the score receipt
+    #[arg(long, default_value = "rehearsal-demo-manifest")]
+    rehearsal_id: String,
+
+    /// Stable scenario id to write into the score receipt
+    #[arg(long, default_value = "demo_lab.manifest")]
+    scenario_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RehearsalScoreArgs {
+    #[command(flatten)]
+    input: RehearsalScoreInputArgs,
+
+    /// Output format: plain, json, or toon
+    #[arg(long, short = 'f', value_enum, default_value = "plain")]
+    format: RehearsalOutputFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RobotRehearsalScoreArgs {
+    #[command(flatten)]
+    input: RehearsalScoreInputArgs,
+}
+
+#[derive(Subcommand)]
+enum RehearsalCommands {
+    /// Emit the compact rehearsal score receipt and next-action hints
+    Score(RehearsalScoreArgs),
+
+    /// Include evaluator logs that explain every criterion verdict
+    Explain(RehearsalScoreArgs),
+}
+
+#[derive(Subcommand)]
+enum RobotRehearsalCommands {
+    /// Emit the compact rehearsal score receipt and next-action hints
+    Score(RobotRehearsalScoreArgs),
+
+    /// Include evaluator logs that explain every criterion verdict
+    Explain(RobotRehearsalScoreArgs),
 }
 
 #[derive(Subcommand)]
@@ -3205,6 +3290,13 @@ enum RobotCommands {
     Attention {
         #[command(subcommand)]
         command: RobotAttentionCommands,
+    },
+
+    /// Score or explain demo rehearsal manifests
+    #[command(visible_alias = "rehearse")]
+    Rehearsal {
+        #[command(subcommand)]
+        command: RobotRehearsalCommands,
     },
 
     /// Resource-control what-if simulation endpoints
@@ -7537,6 +7629,144 @@ fn print_proof_closeout_lint_plain(payload: &serde_json::Value) {
             );
         }
     }
+}
+
+fn resolve_rehearsal_manifest_path(workspace_root: &Path, manifest: &Path) -> PathBuf {
+    if manifest.is_absolute() {
+        manifest.to_path_buf()
+    } else {
+        workspace_root.join(manifest)
+    }
+}
+
+fn build_rehearsal_score_surface_report(
+    workspace_root: &Path,
+    args: &RehearsalScoreInputArgs,
+    surface: RehearsalScoreSurface,
+) -> anyhow::Result<RehearsalScoreSurfaceReport> {
+    let manifest_path = resolve_rehearsal_manifest_path(workspace_root, &args.manifest);
+    let raw = fs::read_to_string(&manifest_path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", manifest_path.display()))?;
+    let manifest = DemoScenarioManifest::from_json(&raw).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to parse demo scenario manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let source_ref = args.manifest.to_string_lossy().to_string();
+    let report = RehearsalScoreSurfaceReport::from_demo_scenario_manifest(
+        &manifest,
+        source_ref,
+        args.rehearsal_id.clone(),
+        args.scenario_id.clone(),
+        surface,
+    );
+    debug_assert_eq!(report.contract_id, REHEARSAL_SCORE_SURFACE_CONTRACT_ID);
+    Ok(report)
+}
+
+fn print_rehearsal_score_output(
+    report: &RehearsalScoreSurfaceReport,
+    format: RehearsalOutputFormat,
+) -> anyhow::Result<()> {
+    match format {
+        RehearsalOutputFormat::Plain => {
+            print!("{}", render_rehearsal_score_plain(report));
+        }
+        RehearsalOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+        }
+        RehearsalOutputFormat::Toon => {
+            println!("{}", toon_rust::encode(serde_json::to_value(report)?, None));
+        }
+    }
+    Ok(())
+}
+
+fn render_rehearsal_score_plain(report: &RehearsalScoreSurfaceReport) -> String {
+    let receipt = &report.receipt;
+    let score = &receipt.aggregate_score;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "rehearsal-score: {} score={} confidence={} surface={}\n",
+        receipt.aggregate_verdict.as_str(),
+        score.score_percent,
+        report.aggregate_confidence_percent,
+        report.surface.as_str()
+    ));
+    out.push_str(&format!("manifest: {}\n", report.source_ref));
+    out.push_str(&format!(
+        "criteria: total={} pass={} fail={} blocked={} missing={} degraded={} skipped={}\n",
+        score.total_criteria,
+        score.passed,
+        score.failed,
+        score.blocked,
+        score.missing_evidence,
+        score.degraded,
+        score.skipped
+    ));
+
+    let mut wrote_blockers = false;
+    for criterion in receipt.criteria.iter().filter(|criterion| {
+        matches!(
+            criterion.verdict,
+            RehearsalVerdict::Fail
+                | RehearsalVerdict::Blocked
+                | RehearsalVerdict::MissingEvidence
+                | RehearsalVerdict::Degraded
+        )
+    }) {
+        if !wrote_blockers {
+            out.push_str("blockers:\n");
+            wrote_blockers = true;
+        }
+        let detail = if criterion.blockers.is_empty() {
+            criterion.note.clone()
+        } else {
+            criterion.blockers.join("; ")
+        };
+        out.push_str(&format!(
+            "  - {} {} {}",
+            criterion.criterion_id,
+            criterion.kind.as_str(),
+            criterion.verdict.as_str()
+        ));
+        if !detail.is_empty() {
+            out.push_str(&format!(": {detail}"));
+        }
+        out.push('\n');
+    }
+    if !wrote_blockers {
+        out.push_str("blockers: none\n");
+    }
+
+    if report.next_action_hints.is_empty() {
+        out.push_str("next: none\n");
+    } else {
+        out.push_str("next:\n");
+        for hint in &report.next_action_hints {
+            out.push_str(&format!(
+                "  {}. {} [{}: {}]\n",
+                hint.rank, hint.action, hint.criterion_id, hint.reason
+            ));
+        }
+    }
+
+    if !report.evaluation_log.is_empty() {
+        out.push_str("evaluation:\n");
+        for entry in &report.evaluation_log {
+            out.push_str(&format!(
+                "  {} evaluator={} verdict={} confidence={}% contribution={}\n",
+                entry.criterion_id,
+                entry.evaluator,
+                entry.verdict.as_str(),
+                entry.confidence_percent,
+                entry.rollup_contribution.as_str()
+            ));
+        }
+    }
+
+    out
 }
 
 fn parse_coordination_risk_snapshot(raw: &[u8]) -> Result<serde_json::Value, String> {
@@ -18343,6 +18573,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Emit read-only attention-router status, next action, and item explanations",
             },
             RobotCommandInfo {
+                name: "rehearsal",
+                description: "Score or explain demo rehearsal manifests without side effects",
+            },
+            RobotCommandInfo {
                 name: "resource what-if",
                 description: "Run a read-only resource-control digital-twin simulation",
             },
@@ -18584,6 +18818,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot resource what-if --trace fixtures/scale-lab/resource-what-if-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-candidate.v1.toml",
                     "ft robot --format toon resource what-if --trace trace.json --override-package candidate.toml",
+                ],
+            },
+            QuickStartCommand {
+                name: "rehearsal score",
+                args: "[manifest]",
+                summary: "Score a demo rehearsal manifest and emit the receipt contract",
+                examples: vec![
+                    "ft robot rehearsal score fixtures/demo-lab/manifest.v1.json",
+                    "ft robot --format toon rehearsal explain",
                 ],
             },
             QuickStartCommand {
@@ -26025,6 +26268,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(payload, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::Rehearsal { command } => {
+                    let (surface, input) = match command {
+                        RobotRehearsalCommands::Score(args) => {
+                            (RehearsalScoreSurface::Score, args.input)
+                        }
+                        RobotRehearsalCommands::Explain(args) => {
+                            (RehearsalScoreSurface::Explain, args.input)
+                        }
+                    };
+                    let payload =
+                        build_rehearsal_score_surface_report(&workspace_root, &input, surface)?;
+                    let response = RobotResponse::success(payload, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 RobotCommands::Perf { command } => {
                     let payload = match command {
                         RobotPerfCommands::SloStatus { slo } => {
@@ -26053,6 +26310,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::ProofCloseoutLint { .. } => unreachable!("handled above"),
                         RobotCommands::ProofHistory { .. } => unreachable!("handled above"),
                         RobotCommands::Attention { .. } => unreachable!("handled above"),
+                        RobotCommands::Rehearsal { .. } => unreachable!("handled above"),
                         RobotCommands::Perf { .. } => unreachable!("handled above"),
                         RobotCommands::State {
                             include_text,
@@ -43102,6 +43360,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
         },
+
+        Some(Commands::Rehearse { command }) => {
+            let (surface, args) = match command {
+                RehearsalCommands::Score(args) => (RehearsalScoreSurface::Score, args),
+                RehearsalCommands::Explain(args) => (RehearsalScoreSurface::Explain, args),
+            };
+            let report =
+                build_rehearsal_score_surface_report(&workspace_root, &args.input, surface)?;
+            print_rehearsal_score_output(&report, args.format)?;
+        }
 
         Some(Commands::Demo {
             name,
@@ -71201,6 +71469,101 @@ log_level = "debug"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_rehearse_and_robot_rehearsal_parse() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "rehearse",
+            "score",
+            "fixtures/demo-lab/manifest.v1.json",
+            "--format",
+            "toon",
+            "--rehearsal-id",
+            "parse-human",
+            "--scenario-id",
+            "demo_lab.manifest",
+        ])
+        .expect("human rehearsal score should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Rehearse {
+                command: RehearsalCommands::Score(args),
+            }) => {
+                assert_eq!(args.format, RehearsalOutputFormat::Toon);
+                assert_eq!(
+                    args.input.manifest,
+                    PathBuf::from("fixtures/demo-lab/manifest.v1.json")
+                );
+                assert_eq!(args.input.rehearsal_id, "parse-human");
+                assert_eq!(args.input.scenario_id, "demo_lab.manifest");
+            }
+            _ => panic!("expected Commands::Rehearse::Score"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "rehearsal",
+            "explain",
+            "fixtures/demo-lab/manifest.v1.json",
+            "--rehearsal-id",
+            "parse-robot",
+        ])
+        .expect("robot rehearsal explain should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Rehearsal {
+                    command: RobotRehearsalCommands::Explain(args),
+                }) => {
+                    assert_eq!(
+                        args.input.manifest,
+                        PathBuf::from("fixtures/demo-lab/manifest.v1.json")
+                    );
+                    assert_eq!(args.input.rehearsal_id, "parse-robot");
+                }
+                _ => panic!("expected RobotCommands::Rehearsal::Explain"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_rehearsal_surface_payload_is_toon_safe_and_read_only() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let args = RehearsalScoreInputArgs {
+            manifest: PathBuf::from("fixtures/demo-lab/manifest.v1.json"),
+            rehearsal_id: "cli-surface-test".to_string(),
+            scenario_id: "demo_lab.manifest".to_string(),
+        };
+        let report = build_rehearsal_score_surface_report(
+            &workspace_root,
+            &args,
+            RehearsalScoreSurface::Explain,
+        )
+        .expect("fixture manifest should score");
+
+        assert_eq!(report.contract_id, REHEARSAL_SCORE_SURFACE_CONTRACT_ID);
+        assert_eq!(report.surface, RehearsalScoreSurface::Explain);
+        assert_eq!(
+            report.receipt.aggregate_verdict,
+            frankenterm_core::rehearsal_score::RehearsalVerdict::MissingEvidence
+        );
+        assert!(!report.raw_pane_content_stored);
+        assert!(!report.live_mutation_allowed);
+        assert!(!report.side_effects_executed);
+        assert!(!report.evaluation_log.is_empty());
+        let plain = render_rehearsal_score_plain(&report);
+        assert!(plain.contains("rehearsal-score: missing_evidence"));
+        assert!(plain.contains("blockers:"));
+        assert!(plain.contains("next:"));
+        let toon = toon_rust::encode(
+            serde_json::to_value(&report).expect("serialize report"),
+            None,
+        );
+        assert_ne!(toon.trim_start().chars().next(), Some('{'));
     }
 
     fn cli_attention_ready_input() -> AttentionRouterSourceAdapterInput {

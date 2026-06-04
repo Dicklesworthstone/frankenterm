@@ -27,6 +27,9 @@ use crate::proof_lane::{
     ProofHistoryArtifactInput, ProofHistoryIndex, ProofHistoryQuery, ProofReleaseScoreboard,
     ProofState,
 };
+use crate::rehearsal_score::{
+    REHEARSAL_SCORE_MCP_CURRENT_URI, REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE,
+};
 use crate::render_quality::{
     RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_MCP_RESOURCE_URI,
     renderer_slos_doctor_report,
@@ -40,8 +43,8 @@ use crate::swarm_scheduler::{
 };
 
 use super::mcp_tools::{
-    WaAccountsTool, WaEventsTool, WaMissionObjectivePlanTool, WaReservationsTool, WaRulesListTool,
-    WaStateTool,
+    WaAccountsTool, WaEventsTool, WaMissionObjectivePlanTool, WaRehearsalScoreTool,
+    WaReservationsTool, WaRulesListTool, WaStateTool,
 };
 use super::{McpEnvelope, McpWorkflowItem, McpWorkflowsData, builtin_workflows, elapsed_ms};
 use crate::config::{Config, PaneFilterConfig};
@@ -144,6 +147,17 @@ fn read_mission_objective_plan_resource(
             "source_unavailable": ["agent-mail", "rch"],
         }),
     )?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_rehearsal_score_resource(
+    ctx: &McpContext,
+    config: &Arc<Config>,
+    uri: &str,
+    surface: &str,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaRehearsalScoreTool::new(Arc::clone(config));
+    let contents = tool.call(ctx, serde_json::json!({ "surface": surface }))?;
     tool_output_as_resource(uri, contents)
 }
 
@@ -765,6 +779,103 @@ impl ResourceHandler for WaMissionObjectivePlanTemplateResource {
             .map(String::as_str)
             .unwrap_or("continue current operator objective");
         read_mission_objective_plan_resource(ctx, uri, objective)
+    }
+}
+
+pub(super) struct WaRehearsalScoreCurrentResource {
+    config: Arc<Config>,
+}
+
+impl WaRehearsalScoreCurrentResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaRehearsalScoreCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: REHEARSAL_SCORE_MCP_CURRENT_URI.to_string(),
+            name: "ft rehearsal score current".to_string(),
+            description: Some(
+                "Read-only rehearsal score receipt from the default demo manifest".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "rehearsal".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_rehearsal_score_resource(ctx, &self.config, REHEARSAL_SCORE_MCP_CURRENT_URI, "score")
+    }
+}
+
+pub(super) struct WaRehearsalScoreSurfaceTemplateResource {
+    config: Arc<Config>,
+}
+
+impl WaRehearsalScoreSurfaceTemplateResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaRehearsalScoreSurfaceTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://rehearsal-score/template".to_string(),
+            name: "ft rehearsal score surface template".to_string(),
+            description: Some(
+                "Template for read-only rehearsal score/explain receipts".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "rehearsal".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE.to_string(),
+            name: "ft rehearsal score surface".to_string(),
+            description: Some(
+                "Read-only score or explain receipt using the default demo manifest".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "rehearsal".to_string(),
+                "operator".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let current = WaRehearsalScoreCurrentResource::new(Arc::clone(&self.config));
+        current.read(ctx)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let surface = params.get("surface").map_or("score", String::as_str);
+        read_rehearsal_score_resource(ctx, &self.config, uri, surface)
     }
 }
 
@@ -1636,7 +1747,8 @@ mod tests {
         WaEventsUnhandledTemplateResource, WaHerdWaveResource,
         WaMissionObjectivePlanTemplateResource, WaPanesResource,
         WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
-        WaProofHistoryTemplateResource, WaRendererInputToPhotonResource,
+        WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
+        WaRehearsalScoreSurfaceTemplateResource, WaRendererInputToPhotonResource,
         WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
         WaRulesByAgentTemplateResource, WaRulesResource, WaSwarmCapacityCurrentResource,
         WaSwarmCapacityRunTemplateResource, WaWorkflowsResource, envelope_as_resource,
@@ -1840,6 +1952,27 @@ mod tests {
             template.uri_template,
             "wa://mission/objective-plan/{objective}"
         );
+    }
+
+    #[test]
+    fn rehearsal_score_resources_define_current_and_surface_template() {
+        let config = Arc::new(Config::default());
+        let current = WaRehearsalScoreCurrentResource::new(Arc::clone(&config)).definition();
+        assert_eq!(
+            current.uri,
+            crate::rehearsal_score::REHEARSAL_SCORE_MCP_CURRENT_URI
+        );
+        assert!(current.tags.contains(&"rehearsal".to_string()));
+        assert!(current.tags.contains(&"operator".to_string()));
+
+        let template = WaRehearsalScoreSurfaceTemplateResource::new(config)
+            .template()
+            .expect("rehearsal score surface template");
+        assert_eq!(
+            template.uri_template,
+            crate::rehearsal_score::REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE
+        );
+        assert!(template.tags.contains(&"rehearsal".to_string()));
     }
 
     #[test]
@@ -2232,6 +2365,12 @@ mod tests {
             WaProofHistoryTemplateResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
             WaAttestationRetractionsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
@@ -2281,6 +2420,12 @@ mod tests {
             WaProofHistoryTemplateResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
             WaAttestationRetractionsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
@@ -2316,6 +2461,8 @@ mod tests {
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config)).definition(),
             WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
             WaMissionObjectivePlanTemplateResource.definition(),
             WaContextHorizonResource::new(Arc::clone(&db)).definition(),
@@ -2351,6 +2498,8 @@ mod tests {
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreCurrentResource::new(Arc::clone(&config)).definition(),
+            WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(&config)).definition(),
             WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
             WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),

@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 
 use crate::attention_router::AttentionRouterSourceAdapterInput;
 use crate::config::PaneFilterConfig;
+use crate::demo_scenarios::DemoScenarioManifest;
 use crate::policy::{InjectionResult, PaneCapabilities};
 use crate::query_contract::UnifiedSearchMode;
 use crate::storage::PaneRecord;
@@ -50,6 +51,37 @@ pub(super) struct AttentionParams {
     pub generated_at_ms: Option<u64>,
     #[serde(default)]
     pub workspace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RehearsalScoreParams {
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default = "default_rehearsal_manifest_path")]
+    pub manifest_path: String,
+    #[serde(default)]
+    pub manifest: Option<DemoScenarioManifest>,
+    #[serde(default)]
+    pub rehearsal_id: Option<String>,
+    #[serde(default)]
+    pub scenario_id: Option<String>,
+}
+
+impl Default for RehearsalScoreParams {
+    fn default() -> Self {
+        Self {
+            surface: None,
+            manifest_path: default_rehearsal_manifest_path(),
+            manifest: None,
+            rehearsal_id: None,
+            scenario_id: None,
+        }
+    }
+}
+
+pub(super) fn default_rehearsal_manifest_path() -> String {
+    "fixtures/demo-lab/manifest.v1.json".to_string()
 }
 
 #[derive(Debug, Deserialize)]

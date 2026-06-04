@@ -22,6 +22,7 @@ pub use fastmcp::testing::TestClient as FrameworkTestClient;
 pub use fastmcp::{
     Content as FrameworkContent, McpContext as FrameworkMcpContext, McpError as FrameworkMcpError,
     McpResult as FrameworkMcpResult, Tool as FrameworkTool,
+    ToolAnnotations as FrameworkToolAnnotations,
 };
 
 #[cfg(feature = "mcp-client")]

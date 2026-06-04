@@ -16,11 +16,13 @@ use crate::attention_router::{
     AttentionRouterSourceAdapterInput, AttentionRouterSurface,
     build_attention_router_surface_payload,
 };
+use crate::demo_scenarios::DemoScenarioManifest;
 use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
-    FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
+    FrameworkMcpResult as McpResult, FrameworkTool as Tool,
+    FrameworkToolAnnotations as ToolAnnotations, FrameworkToolHandler as ToolHandler,
 };
 use crate::mission_objective_plan::{
     MissionObjectiveCandidateReadiness, MissionObjectiveCandidateWork,
@@ -30,6 +32,9 @@ use crate::mission_objective_plan::{
     build_mission_objective_plan_surface_data, plan_mission_objective,
 };
 use crate::policy::PolicySurface;
+use crate::rehearsal_score::{
+    REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
+};
 use crate::robot_types::{
     WorkflowActionPlan, WorkflowStatusData, WorkflowStatusDetailData, WorkflowStatusListData,
     WorkflowStepLog,
@@ -49,10 +54,10 @@ use super::mcp_types::{
     McpSearchHit, McpSendData, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
     McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
     MissionObjectivePlanParams, MissionPauseParams, MissionResumeParams, MissionStateParams,
-    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
-    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
-    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams, apply_tail_truncation,
-    now_ms,
+    RehearsalScoreParams, ReleaseParams, ReservationsParams, ReserveParams, RulesListParams,
+    RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
+    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
+    apply_tail_truncation, now_ms,
 };
 #[allow(unused_imports)]
 use super::{
@@ -1250,6 +1255,66 @@ fn mcp_attention_source(surface: AttentionRouterSurface) -> &'static str {
     }
 }
 
+fn parse_mcp_rehearsal_score_surface(surface: Option<&str>) -> Option<RehearsalScoreSurface> {
+    match surface
+        .unwrap_or("score")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "score" => Some(RehearsalScoreSurface::Score),
+        "explain" => Some(RehearsalScoreSurface::Explain),
+        _ => None,
+    }
+}
+
+fn resolve_mcp_rehearsal_manifest_path(
+    config: &Config,
+    manifest_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    let trimmed = manifest_path.trim();
+    if trimmed.is_empty() {
+        return Err("manifest_path must not be empty".to_string());
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("manifest_path must be workspace-relative for MCP calls".to_string());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return Err("manifest_path must not traverse outside the workspace".to_string());
+    }
+
+    let layout = config
+        .workspace_layout(None)
+        .map_err(|error| format!("resolve workspace layout: {error}"))?;
+    Ok(layout.root.join(path))
+}
+
+fn load_mcp_rehearsal_manifest(
+    config: &Config,
+    params: &RehearsalScoreParams,
+) -> std::result::Result<(DemoScenarioManifest, String), String> {
+    if let Some(manifest) = params.manifest.clone() {
+        manifest
+            .validate()
+            .map_err(|error| format!("validate inline manifest: {error}"))?;
+        return Ok((manifest, "inline_manifest".to_string()));
+    }
+
+    let path = resolve_mcp_rehearsal_manifest_path(config, &params.manifest_path)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("read manifest {}: {error}", path.display()))?;
+    let manifest = DemoScenarioManifest::from_json(&raw)
+        .map_err(|error| format!("parse manifest {}: {error}", path.display()))?;
+    Ok((manifest, params.manifest_path.clone()))
+}
+
 // wa.attention tool
 pub(super) struct WaAttentionTool;
 
@@ -1329,6 +1394,115 @@ impl ToolHandler for WaAttentionTool {
             params.item_id.as_deref(),
         );
         envelope_to_content(McpEnvelope::success(payload, elapsed_ms(start)))
+    }
+}
+
+// wa.rehearsal_score tool
+pub(super) struct WaRehearsalScoreTool {
+    config: Arc<Config>,
+}
+
+impl WaRehearsalScoreTool {
+    #[must_use]
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaRehearsalScoreTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.rehearsal_score".to_string(),
+            description: Some(
+                "Score or explain a demo rehearsal manifest without mutating panes, services, Beads, or storage (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "surface": { "type": "string", "enum": ["score", "explain"], "default": "score" },
+                    "manifest_path": { "type": "string", "default": "fixtures/demo-lab/manifest.v1.json", "description": "Workspace-relative demo scenario manifest path" },
+                    "manifest": { "type": "object", "description": "Inline DemoScenarioManifest object; overrides manifest_path when supplied" },
+                    "rehearsal_id": { "type": "string", "default": "rehearsal-demo-manifest" },
+                    "scenario_id": { "type": "string", "default": "demo_lab.manifest" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "rehearsal".to_string(),
+                "demo".to_string(),
+            ],
+            annotations: Some(
+                ToolAnnotations::new()
+                    .read_only(true)
+                    .destructive(false)
+                    .idempotent(true),
+            ),
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: RehearsalScoreParams = if arguments.is_null() {
+            RehearsalScoreParams::default()
+        } else {
+            match parse_mcp_tool_params(
+                "wa.rehearsal_score",
+                arguments,
+                "Expected object with optional surface, manifest_path, manifest, rehearsal_id, scenario_id",
+                start,
+            ) {
+                Ok(params) => params,
+                Err(response) => return response,
+            }
+        };
+
+        let Some(surface) = parse_mcp_rehearsal_score_surface(params.surface.as_deref()) else {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "Unsupported rehearsal score surface",
+                Some("Use surface=score or surface=explain.".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        };
+
+        let (manifest, source_ref) = match load_mcp_rehearsal_manifest(&self.config, &params) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    error,
+                    Some(
+                        "Pass a valid inline manifest object or a workspace-relative manifest_path."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let rehearsal_id = params
+            .rehearsal_id
+            .unwrap_or_else(|| "rehearsal-demo-manifest".to_string());
+        let scenario_id = params
+            .scenario_id
+            .unwrap_or_else(|| "demo_lab.manifest".to_string());
+        let report = RehearsalScoreSurfaceReport::from_demo_scenario_manifest(
+            &manifest,
+            source_ref,
+            rehearsal_id,
+            scenario_id,
+            surface,
+        );
+        debug_assert_eq!(report.contract_id, REHEARSAL_SCORE_SURFACE_CONTRACT_ID);
+
+        envelope_to_content(McpEnvelope::success(report, elapsed_ms(start)))
     }
 }
 
@@ -7438,18 +7612,18 @@ mod tests {
         WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
         WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
         WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
-        WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-        WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_output_secrets,
-        redact_mcp_pane_state_fields, redact_mcp_wait_pattern_for_output,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
-        validate_cass_timeout_secs,
+        WaMissionStateTool, WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
+        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
+        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        redact_mcp_output_secrets, redact_mcp_pane_state_fields,
+        redact_mcp_wait_pattern_for_output, serialize_mcp_audit_decision_context,
+        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -7940,7 +8114,7 @@ mod tests {
         }
     }
 
-    /// Collect definitions for all 32 tools. Guarantees no panics during construction.
+    /// Collect definitions for all 33 tools. Guarantees no panics during construction.
     fn all_definitions() -> Vec<Tool> {
         let db = db_path();
         let cfg = config();
@@ -7969,6 +8143,7 @@ mod tests {
             WaAccountsRefreshTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaMissionObjectivePlanTool.definition(),
             WaAttentionTool.definition(),
+            WaRehearsalScoreTool::new(Arc::clone(&cfg)).definition(),
             WaMissionStateTool::new(Arc::clone(&cfg)).definition(),
             WaMissionExplainTool::new(Arc::clone(&cfg)).definition(),
             WaMissionPauseTool::new(Arc::clone(&cfg)).definition(),
@@ -7985,8 +8160,8 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn tool_count_is_32() {
-        assert_eq!(all_definitions().len(), 32);
+    fn tool_count_is_33() {
+        assert_eq!(all_definitions().len(), 33);
     }
 
     #[test]
@@ -8056,6 +8231,47 @@ mod tests {
         assert_eq!(
             explain["data"]["selected_item"]["recommended_action"]["mutates"],
             false
+        );
+    }
+
+    #[test]
+    fn wa_rehearsal_score_tool_scores_inline_manifest_and_explains_log() {
+        let tool = WaRehearsalScoreTool::new(config());
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/demo-lab/manifest.v1.json"
+        )))
+        .expect("demo manifest fixture should parse as JSON");
+        let response = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "surface": "explain",
+                    "manifest": manifest,
+                    "rehearsal_id": "mcp-rehearsal-test",
+                    "scenario_id": "demo_lab.manifest"
+                }),
+            )
+            .expect("wa.rehearsal_score explain should respond"),
+        );
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["data"]["contract_id"],
+            crate::rehearsal_score::REHEARSAL_SCORE_SURFACE_CONTRACT_ID
+        );
+        assert_eq!(response["data"]["surface"], "explain");
+        assert_eq!(response["data"]["raw_pane_content_stored"], false);
+        assert_eq!(response["data"]["live_mutation_allowed"], false);
+        assert_eq!(response["data"]["side_effects_executed"], false);
+        assert_eq!(
+            response["data"]["receipt"]["aggregate_verdict"],
+            "missing_evidence"
+        );
+        assert!(
+            response["data"]["evaluation_log"]
+                .as_array()
+                .is_some_and(|log| !log.is_empty())
         );
     }
 

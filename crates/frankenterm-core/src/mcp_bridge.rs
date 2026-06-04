@@ -14,6 +14,7 @@ use super::{
     WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool, WaMissionPauseTool,
     WaMissionResumeTool, WaMissionStateTool, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
+    WaRehearsalScoreCurrentResource, WaRehearsalScoreSurfaceTemplateResource, WaRehearsalScoreTool,
     WaReleaseTool, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
@@ -47,6 +48,7 @@ pub const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.tx_plan",
     "wa.tx_show",
     "wa.attention",
+    "wa.rehearsal_score",
     "wa.mission_objective_plan",
     "wa.mission_state",
     "wa.mission_explain",
@@ -267,6 +269,9 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         ))))
         .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
         .tool(FormatAwareToolHandler::new(WaAttentionTool))
+        .tool(FormatAwareToolHandler::new(WaRehearsalScoreTool::new(
+            Arc::clone(&config),
+        )))
         .tool(FormatAwareToolHandler::new(WaMissionStateTool::new(
             Arc::clone(&config),
         )))
@@ -282,6 +287,10 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .resource(WaMissionObjectivePlanTemplateResource)
         .resource(WaAttentionCurrentResource)
         .resource(WaAttentionItemTemplateResource)
+        .resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config)))
+        .resource(WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(
+            &config,
+        )))
         .resource(WaSwarmCapacityCurrentResource)
         .resource(WaSwarmCapacityRunTemplateResource)
         .resource(WaRendererInputToPhotonResource)

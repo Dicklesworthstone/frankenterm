@@ -118,6 +118,7 @@ use mcp_resources::{
     WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
     WaHerdWaveResource, WaMissionObjectivePlanTemplateResource, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
+    WaRehearsalScoreCurrentResource, WaRehearsalScoreSurfaceTemplateResource,
     WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
     WaRulesResource, WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource,
@@ -127,10 +128,10 @@ use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaCassSearchTool, WaCassStatusTool,
     WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool,
     WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool,
-    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool,
-    WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
-    WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
-    WaWorkflowStatusTool,
+    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaRehearsalScoreTool,
+    WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
+    WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
+    WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
 };
 pub use mcp_tools::{mcp_clock_anomaly_count, mcp_workflow_plan_serde_drop_count};
 #[cfg(feature = "fuzz")]
@@ -138,10 +139,10 @@ use mcp_types::{
     AccountsParams, AccountsRefreshParams, AttentionParams, CassSearchParams, CassStatusParams,
     CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams,
     GetTextParams, MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams,
-    MissionPauseParams, MissionResumeParams, ReleaseParams, ReservationsParams, ReserveParams,
-    RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams,
-    TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
-    WorkflowStatusParams,
+    MissionPauseParams, MissionResumeParams, RehearsalScoreParams, ReleaseParams,
+    ReservationsParams, ReserveParams, RulesListParams, RulesTestParams, SearchParams, SendParams,
+    StateParams, TxPlanParams, TxRollbackParams, TxRunParams, TxShowParams, WaitForParams,
+    WorkflowRunParams, WorkflowStatusParams,
 };
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
@@ -226,6 +227,7 @@ fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str 
         }
         "wa.mission_objective_plan" => fuzz_parse_params::<MissionObjectivePlanParams>(arguments),
         "wa.attention" => fuzz_parse_params_or_default::<AttentionParams>(arguments),
+        "wa.rehearsal_score" => fuzz_parse_params_or_default::<RehearsalScoreParams>(arguments),
         "wa.mission_state" => fuzz_parse_params_or_default::<MissionStateParams>(arguments),
         "wa.mission_explain" => fuzz_parse_params_or_default::<MissionExplainParams>(arguments),
         "wa.mission_pause" => fuzz_parse_params::<MissionPauseParams>(arguments),
@@ -1521,14 +1523,13 @@ mod tests {
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
                 "wa://attention-router/current".to_string(),
-                "wa://attention-router/items/template".to_string(),
+                "wa://herd-wave".to_string(),
                 "wa://swarm-capacity/current".to_string(),
-                "wa://swarm-capacity/runs/template".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
                 "wa://perf/renderer-slo/ssim_parity".to_string(),
                 "wa://proof-history".to_string(),
                 "wa://proof-history/release-blocking".to_string(),
-                "wa://proof-history/template".to_string(),
+                "wa://rehearsal-score/current".to_string(),
                 "wa://attestation/retractions".to_string(),
                 "wa://context/horizon".to_string(),
                 "wa://reservations".to_string(),
@@ -1542,6 +1543,8 @@ mod tests {
                 "wa://accounts/{service}".to_string(),
                 "wa://rules/{agent_type}".to_string(),
                 "wa://attention-router/items/{item_id}".to_string(),
+                "wa://mission/objective-plan/{objective}".to_string(),
+                "wa://rehearsal-score/{surface}".to_string(),
                 "wa://swarm-capacity/runs/{run_id}".to_string(),
                 "wa://reservations/{pane_id}".to_string(),
                 "wa://proof-history/{filter}/{value}/{limit}".to_string(),
@@ -1568,14 +1571,13 @@ mod tests {
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
                 "wa://attention-router/current".to_string(),
-                "wa://attention-router/items/template".to_string(),
+                "wa://herd-wave".to_string(),
                 "wa://swarm-capacity/current".to_string(),
-                "wa://swarm-capacity/runs/template".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
                 "wa://perf/renderer-slo/ssim_parity".to_string(),
                 "wa://proof-history".to_string(),
                 "wa://proof-history/release-blocking".to_string(),
-                "wa://proof-history/template".to_string(),
+                "wa://rehearsal-score/current".to_string(),
                 "wa://attestation/retractions".to_string(),
             ])
         );
@@ -1584,6 +1586,8 @@ mod tests {
             uri_set([
                 "wa://rules/{agent_type}".to_string(),
                 "wa://attention-router/items/{item_id}".to_string(),
+                "wa://mission/objective-plan/{objective}".to_string(),
+                "wa://rehearsal-score/{surface}".to_string(),
                 "wa://swarm-capacity/runs/{run_id}".to_string(),
                 "wa://proof-history/{filter}/{value}/{limit}".to_string(),
             ])
@@ -1828,6 +1832,7 @@ mod tests {
             "wa.rules_list",
             "wa.rules_test",
             "wa.attention",
+            "wa.rehearsal_score",
             "wa.reservations",
             "wa.reserve",
             "wa.release",
@@ -1859,6 +1864,7 @@ mod tests {
             "wa.tx_plan",
             "wa.tx_show",
             "wa.attention",
+            "wa.rehearsal_score",
             "wa.mission_state",
             "wa.mission_explain",
         ];
@@ -1967,10 +1973,10 @@ mod tests {
         let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
             .expect("build mcp server");
         let count = server.tools().len();
-        // 9 non-storage + 12 storage-dependent = 21 total
+        // Non-storage plus storage-dependent surfaces; exact count is pinned in mcp_bridge.
         assert!(
-            count >= 21,
-            "Expected at least 21 tools with DB, got {count}"
+            count >= 22,
+            "Expected at least 22 tools with DB, got {count}"
         );
     }
 
