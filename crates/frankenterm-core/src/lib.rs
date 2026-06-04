@@ -462,6 +462,7 @@ pub mod redactor;
 pub mod redactor_coverage_matrix;
 pub mod redraw_predicate_telemetry;
 pub mod reduce_motion_probe;
+pub mod rehearsal_score;
 pub mod release_readiness_gates;
 pub mod resource_pressure_chaos;
 pub mod resource_pressure_chaos_runner;

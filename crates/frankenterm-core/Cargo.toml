@@ -129,7 +129,12 @@ toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)
 fastapi = { workspace = true, optional = true }
 # Sync (optional, behind feature)
-asupersync = { workspace = true, features = ["tls"] }
+#
+# FrankenTerm's cx adapter still exposes `for_testing` / `for_request` as the
+# migration fallback for legacy Cx-threading call sites. Keep the asupersync
+# constructor feature explicit so `--no-default-features` proof lanes do not
+# accidentally hide that dependency.
+asupersync = { workspace = true, features = ["test-internals", "tls"] }
 # Distributed mode (optional, behind feature)
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }

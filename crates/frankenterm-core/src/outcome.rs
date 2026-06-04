@@ -234,7 +234,7 @@ pub fn severity_to_log_level(severity: Severity) -> tracing::Level {
 pub fn cancel_user(message: &'static str) -> CancelReason {
     CancelReason {
         kind: CancelKind::User,
-        origin_region: asupersync::RegionId::new_ephemeral(),
+        origin_region: asupersync::RegionId::testing_default(),
         origin_task: None,
         timestamp: asupersync::Time::ZERO,
         message: Some(message.to_string()),
@@ -249,7 +249,7 @@ pub fn cancel_user(message: &'static str) -> CancelReason {
 pub fn cancel_timeout(message: &'static str) -> CancelReason {
     CancelReason {
         kind: CancelKind::Timeout,
-        origin_region: asupersync::RegionId::new_ephemeral(),
+        origin_region: asupersync::RegionId::testing_default(),
         origin_task: None,
         timestamp: asupersync::Time::ZERO,
         message: Some(message.to_string()),
@@ -264,7 +264,7 @@ pub fn cancel_timeout(message: &'static str) -> CancelReason {
 pub fn cancel_shutdown(message: &'static str) -> CancelReason {
     CancelReason {
         kind: CancelKind::Shutdown,
-        origin_region: asupersync::RegionId::new_ephemeral(),
+        origin_region: asupersync::RegionId::testing_default(),
         origin_task: None,
         timestamp: asupersync::Time::ZERO,
         message: Some(message.to_string()),
@@ -342,7 +342,7 @@ mod tests {
     fn test_cancel(kind: CancelKind) -> CancelReason {
         CancelReason {
             kind,
-            origin_region: asupersync::RegionId::new_ephemeral(),
+            origin_region: asupersync::RegionId::testing_default(),
             origin_task: None,
             timestamp: asupersync::Time::ZERO,
             message: None,
@@ -725,7 +725,7 @@ mod proptests {
     fn arb_cancel_reason() -> impl Strategy<Value = CancelReason> {
         arb_cancel_kind().prop_map(|kind| CancelReason {
             kind,
-            origin_region: asupersync::RegionId::new_ephemeral(),
+            origin_region: asupersync::RegionId::testing_default(),
             origin_task: None,
             timestamp: asupersync::Time::ZERO,
             message: None,
@@ -765,7 +765,7 @@ mod proptests {
         fn map_identity_preserves_cancelled(kind in arb_cancel_kind()) {
             let reason = CancelReason {
                 kind,
-                origin_region: asupersync::RegionId::new_ephemeral(),
+                origin_region: asupersync::RegionId::testing_default(),
                 origin_task: None,
                 timestamp: asupersync::Time::ZERO,
                 message: None,
@@ -848,7 +848,7 @@ mod proptests {
                 Severity::Err => Outcome::err("e".to_string()),
                 Severity::Cancelled => Outcome::cancelled(CancelReason {
                     kind: CancelKind::User,
-                    origin_region: asupersync::RegionId::new_ephemeral(),
+                    origin_region: asupersync::RegionId::testing_default(),
                     origin_task: None,
                     timestamp: asupersync::Time::ZERO,
                     message: None,

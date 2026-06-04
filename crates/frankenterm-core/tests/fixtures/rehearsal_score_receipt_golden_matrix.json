@@ -1,0 +1,321 @@
+{
+  "schema_version": 1,
+  "generated_by": "ft-oohsx.1-rehearsal-score-contract",
+  "proof_target": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-oohsx1-rehearsal-score-min-test cargo test -p frankenterm-core --no-default-features rehearsal_score --lib -- --nocapture",
+  "cases": [
+    {
+      "name": "blocked_remote_proof",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-blocked-rch",
+        "scenario_id": "demo_lab.remote_proof",
+        "aggregate_verdict": "blocked",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 1,
+          "missing_evidence": 0,
+          "degraded": 0,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "scenario.completed",
+            "kind": "scenario_completion",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "demo_lab",
+                "reference": "artifact://demo-lab/rehearsal.jsonl",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "proof.remote",
+            "kind": "rch_proof",
+            "verdict": "blocked",
+            "confidence_percent": 80,
+            "evidence": [
+              {
+                "source": "rch",
+                "reference": "rch://vmi1293453/j-29870718577541150",
+                "state": "blocked",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "rch.ssh_timeout"
+            ],
+            "next_actions": [
+              "rerun focused proof on a warmed remote worker"
+            ],
+            "note": "remote proof did not return a terminal verdict"
+          }
+        ],
+        "source_artifacts": [
+          {
+            "source": "agent_mail",
+            "reference": "thread://coordination-2026-06-03-purplecanyon",
+            "state": "proven",
+            "digest": null
+          }
+        ],
+        "generated_at": "2026-06-03T05:18:56Z",
+        "notes": [
+          "blocked proof remains visible in the aggregate rollup"
+        ]
+      }
+    },
+    {
+      "name": "privacy_redaction_fail",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-redaction-fail",
+        "scenario_id": "policy_lab.redaction_guard",
+        "aggregate_verdict": "fail",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 1,
+          "blocked": 0,
+          "missing_evidence": 0,
+          "degraded": 0,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "policy.applied",
+            "kind": "safety_policy",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "policy_audit",
+                "reference": "audit://policy-denial/wa-mcp-0006",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "redaction.secret_absent",
+            "kind": "redaction_privacy",
+            "verdict": "fail",
+            "confidence_percent": 95,
+            "evidence": [
+              {
+                "source": "read_path_matrix",
+                "reference": "docs/security/read-path-redaction-matrix.md",
+                "state": "redacted",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "secret token remained visible after outbound read"
+            ],
+            "next_actions": [
+              "capture failing payload and tighten redactor rule"
+            ],
+            "note": "hard privacy failures dominate aggregate verdicts"
+          }
+        ],
+        "source_artifacts": [],
+        "generated_at": "2026-06-03T05:19:00Z",
+        "notes": []
+      }
+    },
+    {
+      "name": "toon_contract_shape",
+      "format": "toon",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-toon-contract",
+        "scenario_id": "operator_loop.toon_surface",
+        "aggregate_verdict": "skipped",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 0,
+          "missing_evidence": 0,
+          "degraded": 0,
+          "skipped": 1,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "artifact.integrity",
+            "kind": "artifact_integrity",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "fixture_matrix",
+                "reference": "tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
+                "state": "fixture_only",
+                "digest": "sha256:fixture-contract"
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "agent_mail.coordination",
+            "kind": "agent_mail_coordination",
+            "verdict": "skipped",
+            "confidence_percent": 60,
+            "evidence": [],
+            "blockers": [
+              "agent mail outage during rehearsal setup"
+            ],
+            "next_actions": [
+              "retry once and continue with bead/git handoff if still down"
+            ],
+            "note": ""
+          }
+        ],
+        "source_artifacts": [],
+        "generated_at": "2026-06-03T05:19:10Z",
+        "notes": [
+          "TOON output must preserve the same typed receipt vocabulary"
+        ]
+      }
+    },
+    {
+      "name": "source_adapter_missing_evidence",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-source-adapters",
+        "scenario_id": "artifact_bundle.proof_replay",
+        "aggregate_verdict": "blocked",
+        "aggregate_score": {
+          "total_criteria": 3,
+          "scorable_criteria": 3,
+          "passed": 0,
+          "failed": 0,
+          "blocked": 1,
+          "missing_evidence": 1,
+          "degraded": 0,
+          "skipped": 1,
+          "not_applicable": 0,
+          "score_percent": 0
+        },
+        "criteria": [
+          {
+            "criterion_id": "proof.replay.remote_verdict",
+            "kind": "rch_proof",
+            "verdict": "blocked",
+            "confidence_percent": 85,
+            "evidence": [
+              {
+                "source": "proof_replay",
+                "reference": "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json#case.critical_pressure",
+                "state": "blocked",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "rch.critical_pressure"
+            ],
+            "next_actions": [
+              "wait for operator-approved RCH worker recovery"
+            ],
+            "note": "deferred proof replay receipt records blocked state rather than green proof"
+          },
+          {
+            "criterion_id": "envelope.target_class",
+            "kind": "resource_envelope",
+            "verdict": "skipped",
+            "confidence_percent": 80,
+            "evidence": [
+              {
+                "source": "operating_envelope",
+                "reference": "fixtures/operating-envelope/valid/target-hardware-skipped.json",
+                "state": "fixture_only",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "target_hardware.skipped_not_proven"
+            ],
+            "next_actions": [
+              "retain skipped state until target-class proof artifact exists"
+            ],
+            "note": "operating envelope fixture is advisory until target-class proof graduates"
+          },
+          {
+            "criterion_id": "agent_mail.delivery_receipt",
+            "kind": "agent_mail_coordination",
+            "verdict": "missing_evidence",
+            "confidence_percent": 70,
+            "evidence": [
+              {
+                "source": "agent_mail_fallback",
+                "reference": "artifacts/agent-mail/outbox/replay.json",
+                "state": "missing",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "agent_mail.replay_receipt_missing"
+            ],
+            "next_actions": [
+              "retry Agent Mail once, then record Beads/git fallback handoff"
+            ],
+            "note": ""
+          }
+        ],
+        "source_artifacts": [
+          {
+            "source": "proof_replay",
+            "reference": "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json",
+            "state": "fixture_only",
+            "digest": null
+          },
+          {
+            "source": "operating_envelope",
+            "reference": "fixtures/operating-envelope/valid/target-hardware-skipped.json",
+            "state": "fixture_only",
+            "digest": null
+          },
+          {
+            "source": "agent_mail_fallback",
+            "reference": "artifacts/agent-mail/outbox/replay.json",
+            "state": "missing",
+            "digest": null
+          }
+        ],
+        "generated_at": "2026-06-03T07:30:00Z",
+        "notes": [
+          "source adapters preserve blocked, skipped, and missing evidence without side effects"
+        ]
+      }
+    }
+  ]
+}
