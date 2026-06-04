@@ -882,6 +882,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     fn base_event(source: SwarmCausalEventSource) -> SwarmCausalEvent {
@@ -1297,6 +1298,92 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SwarmCausalEventError::PayloadTooLarge { .. }));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn arbitrary_pane_payloads_respect_source_byte_budget(text in "\\PC{0,4096}") {
+            let result = SwarmCausalEvent::new_with_privacy_policy(
+                "bounded-pane-payload",
+                SwarmCausalEventSource::Pane,
+                CausalEventClass::Informational,
+                1,
+                2,
+                1,
+                CausalCorrelationKeys {
+                    pane_id: Some(7),
+                    ..Default::default()
+                },
+                CausalLinks::default(),
+                CausalPayloadSensitivity::UserText,
+                CausalRedactionStatus::Truncated,
+                CausalRetentionClass::Ephemeral,
+                CausalPrivacyPolicy {
+                    max_payload_bytes: 512,
+                    retention_seconds: Some(24 * 60 * 60),
+                    omission_reason: Some(CausalPayloadOmissionReason::TruncatedBySourceBudget),
+                    omitted_payload_hash_sha256: None,
+                    omitted_payload_bytes: None,
+                },
+                Vec::new(),
+                json!({"text": text}),
+            );
+
+            match result {
+                Ok(event) => {
+                    prop_assert!(event.privacy.payload_bytes <= 512);
+                    let audit = serde_json::to_string(&event.privacy_audit()).unwrap();
+                    prop_assert!(!audit.contains("\"payload\""));
+                    prop_assert!(!audit.contains("\"text\""));
+                }
+                Err(SwarmCausalEventError::PayloadTooLarge { actual, max }) => {
+                    prop_assert!(actual > max);
+                    prop_assert_eq!(max, 512);
+                }
+                Err(SwarmCausalEventError::SecretPayloadNotRedacted) => {}
+                Err(err) => prop_assert!(false, "unexpected causal event error: {err:?}"),
+            }
+        }
+
+        #[test]
+        fn arbitrary_artifact_path_traversal_is_rejected(
+            prefix in "[A-Za-z0-9]{0,32}",
+            suffix in "[A-Za-z0-9]{0,32}",
+        ) {
+            let unsafe_uris = [
+                format!("/{prefix}/{suffix}.jsonl"),
+                format!("{prefix}/../{suffix}.jsonl"),
+                format!("{prefix}\\{suffix}.jsonl"),
+            ];
+
+            for uri in unsafe_uris {
+                let err = SwarmCausalEvent::new(
+                    "unsafe-artifact-property",
+                    SwarmCausalEventSource::Robot,
+                    CausalEventClass::Informational,
+                    1,
+                    2,
+                    1,
+                    CausalCorrelationKeys::default(),
+                    CausalLinks::default(),
+                    CausalPayloadSensitivity::Structural,
+                    CausalRedactionStatus::NotRequired,
+                    CausalRetentionClass::Standard,
+                    vec![CausalArtifactRef {
+                        kind: "jsonl".to_string(),
+                        uri: uri.clone(),
+                        sha256: None,
+                        size_bytes: None,
+                    }],
+                    json!({}),
+                )
+                .unwrap_err();
+
+                prop_assert_eq!(err, SwarmCausalEventError::UnsafeArtifactUri { uri });
+            }
+        }
     }
 
     #[test]
