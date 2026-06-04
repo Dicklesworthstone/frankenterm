@@ -79,6 +79,81 @@
       }
     },
     {
+      "name": "rch_no_local_fallback",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-rch-no-local-fallback",
+        "scenario_id": "demo_lab.remote_required",
+        "aggregate_verdict": "blocked",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 1,
+          "missing_evidence": 0,
+          "degraded": 0,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "scenario.completed",
+            "kind": "scenario_completion",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "demo_lab",
+                "reference": "artifact://demo-lab/run.jsonl",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "proof.remote",
+            "kind": "rch_proof",
+            "verdict": "blocked",
+            "confidence_percent": 85,
+            "evidence": [
+              {
+                "source": "rch",
+                "reference": "job://proof-output#[RCH] local worker=null",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "rch.remote_proof_not_admissible"
+            ],
+            "next_actions": [
+              "rerun proof with RCH_REQUIRE_REMOTE=1 and retain only remote worker output"
+            ],
+            "note": "local fallback path did not reach a remote worker"
+          }
+        ],
+        "source_artifacts": [
+          {
+            "source": "rch_admission",
+            "reference": "rch://admission/no-admissible-workers",
+            "state": "blocked",
+            "digest": null
+          }
+        ],
+        "generated_at": "2026-06-04T06:35:00Z",
+        "notes": [
+          "local fallback output is retained as a blocker, not proof"
+        ]
+      }
+    },
+    {
       "name": "privacy_redaction_fail",
       "format": "json",
       "receipt": {
@@ -206,6 +281,81 @@
       }
     },
     {
+      "name": "agent_mail_outage_fallback",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-agent-mail-outage",
+        "scenario_id": "coordination.agent_mail_outage_fallback",
+        "aggregate_verdict": "degraded",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 0,
+          "missing_evidence": 0,
+          "degraded": 1,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "fallback.handoff_recorded",
+            "kind": "scenario_completion",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "swarm_tick",
+                "reference": "fallback://agent-mail-unavailable/frankenterm",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": "Beads/git handoff was retained while Agent Mail was unavailable"
+          },
+          {
+            "criterion_id": "agent_mail.outage",
+            "kind": "agent_mail_coordination",
+            "verdict": "degraded",
+            "confidence_percent": 75,
+            "evidence": [
+              {
+                "source": "agent_mail",
+                "reference": "health://mcp-agent-mail/unreachable-after-one-retry",
+                "state": "degraded",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "agent_mail.unavailable_after_retry"
+            ],
+            "next_actions": [
+              "continue with scripts/swarm-tick.sh --agent-mail-fallback frankenterm and Beads/git handoff"
+            ],
+            "note": "fallback is acceptable only after one retry and retained fallback evidence"
+          }
+        ],
+        "source_artifacts": [
+          {
+            "source": "swarm_tick",
+            "reference": "fallback://agent-mail-unavailable/frankenterm",
+            "state": "proven",
+            "digest": null
+          }
+        ],
+        "generated_at": "2026-06-04T06:35:30Z",
+        "notes": [
+          "Agent Mail fallback remains visible instead of being collapsed into pass"
+        ]
+      }
+    },
+    {
       "name": "source_adapter_missing_evidence",
       "format": "json",
       "receipt": {
@@ -315,6 +465,382 @@
         "notes": [
           "source adapters preserve blocked, skipped, and missing evidence without side effects"
         ]
+      }
+    },
+    {
+      "name": "successful_bundled_rehearsal",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-bundled-success",
+        "scenario_id": "demo_lab.quickstart.no_mock",
+        "aggregate_verdict": "pass",
+        "aggregate_score": {
+          "total_criteria": 4,
+          "scorable_criteria": 4,
+          "passed": 4,
+          "failed": 0,
+          "blocked": 0,
+          "missing_evidence": 0,
+          "degraded": 0,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 100
+        },
+        "criteria": [
+          {
+            "criterion_id": "scenario.completed",
+            "kind": "scenario_completion",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "demo_lab",
+                "reference": "fixtures/demo-lab/golden/quickstart.json",
+                "state": "proven",
+                "digest": "sha256:17c1881cb23c0fd4997968cb575a10568f5aa9c88aba8e8e5318cf10f4081be4"
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "proof.remote",
+            "kind": "rch_proof",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "rch",
+                "reference": "rch://vmi1293453/j-29871232832766187#[RCH] remote vmi1293453",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "agent_mail.coordination",
+            "kind": "agent_mail_coordination",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "agent_mail",
+                "reference": "thread://ft-oohsx.5/claim",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "resource.envelope",
+            "kind": "resource_envelope",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "operating_envelope",
+                "reference": "docs/attestations/proofs/resource-cockpit-target-class.json",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          }
+        ],
+        "source_artifacts": [
+          {
+            "source": "demo_scenario_manifest",
+            "reference": "fixtures/demo-lab/manifest.v1.json#scenario.quickstart",
+            "state": "fixture_only",
+            "digest": null
+          }
+        ],
+        "generated_at": "2026-06-04T06:30:00Z",
+        "notes": [
+          "no-mock harness uses the bundled demo manifest and retained quickstart golden"
+        ]
+      }
+    },
+    {
+      "name": "dirty_overlap_ownership_risk",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-dirty-overlap",
+        "scenario_id": "coordination.dirty_overlap",
+        "aggregate_verdict": "blocked",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 1,
+          "missing_evidence": 0,
+          "degraded": 0,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "scenario.claimed",
+            "kind": "scenario_completion",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "beads",
+                "reference": "bead://ft-oohsx.5/status/in_progress",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "git.dirty_overlap",
+            "kind": "dirty_overlap_ownership",
+            "verdict": "blocked",
+            "confidence_percent": 80,
+            "evidence": [
+              {
+                "source": "git_status",
+                "reference": "git://status#crates/frankenterm-core/src/rehearsal_score.rs",
+                "state": "blocked",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "dirty_overlap.owner_unclear"
+            ],
+            "next_actions": [
+              "confirm ownership or narrow the patch before claiming proof"
+            ],
+            "note": "shared dirty files must block ownership-sensitive rehearsals"
+          }
+        ],
+        "source_artifacts": [
+          {
+            "source": "swarm_tick",
+            "reference": "fallback://agent-mail-unavailable/beads-only",
+            "state": "proven",
+            "digest": null
+          }
+        ],
+        "generated_at": "2026-06-04T06:31:00Z",
+        "notes": []
+      }
+    },
+    {
+      "name": "policy_require_approval",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-policy-approval",
+        "scenario_id": "policy.require_approval",
+        "aggregate_verdict": "blocked",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 1,
+          "missing_evidence": 0,
+          "degraded": 0,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "policy.deny_recorded",
+            "kind": "safety_policy",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "policy_audit",
+                "reference": "audit://policy-denial/wa-mcp-approval-required",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": "deny or require-approval decisions are acceptable when retained"
+          },
+          {
+            "criterion_id": "policy.requires_operator",
+            "kind": "safety_policy",
+            "verdict": "blocked",
+            "confidence_percent": 85,
+            "evidence": [
+              {
+                "source": "policy_audit",
+                "reference": "audit://policy-denial/wa-mcp-approval-required#operator",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "policy.require_approval"
+            ],
+            "next_actions": [
+              "request explicit operator approval before executing the action"
+            ],
+            "note": ""
+          }
+        ],
+        "source_artifacts": [],
+        "generated_at": "2026-06-04T06:32:00Z",
+        "notes": []
+      }
+    },
+    {
+      "name": "redaction_missing_evidence",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-redaction-missing",
+        "scenario_id": "privacy.redaction_missing",
+        "aggregate_verdict": "missing_evidence",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 0,
+          "missing_evidence": 1,
+          "degraded": 0,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "redaction.intent",
+            "kind": "redaction_privacy",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "read_path_matrix",
+                "reference": "docs/security/read-path-redaction-matrix.md",
+                "state": "redacted",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "redaction.audit_artifact",
+            "kind": "redaction_privacy",
+            "verdict": "missing_evidence",
+            "confidence_percent": 70,
+            "evidence": [
+              {
+                "source": "redaction_audit",
+                "reference": "artifacts/rehearsal-score/redaction-audit.json",
+                "state": "missing",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "redaction.audit_missing"
+            ],
+            "next_actions": [
+              "attach redaction audit evidence before treating the rehearsal as proven"
+            ],
+            "note": ""
+          }
+        ],
+        "source_artifacts": [],
+        "generated_at": "2026-06-04T06:33:00Z",
+        "notes": []
+      }
+    },
+    {
+      "name": "resource_pressure_degraded",
+      "format": "json",
+      "receipt": {
+        "schema_version": 1,
+        "contract_id": "ft.rehearsal_score_receipt.v1",
+        "rehearsal_id": "rehearsal-resource-pressure",
+        "scenario_id": "operating_envelope.resource_pressure",
+        "aggregate_verdict": "degraded",
+        "aggregate_score": {
+          "total_criteria": 2,
+          "scorable_criteria": 2,
+          "passed": 1,
+          "failed": 0,
+          "blocked": 0,
+          "missing_evidence": 0,
+          "degraded": 1,
+          "skipped": 0,
+          "not_applicable": 0,
+          "score_percent": 50
+        },
+        "criteria": [
+          {
+            "criterion_id": "scenario.completed",
+            "kind": "scenario_completion",
+            "verdict": "pass",
+            "confidence_percent": 100,
+            "evidence": [
+              {
+                "source": "demo_lab",
+                "reference": "fixtures/demo-lab/golden/usage_limit.json",
+                "state": "proven",
+                "digest": null
+              }
+            ],
+            "blockers": [],
+            "next_actions": [],
+            "note": ""
+          },
+          {
+            "criterion_id": "resource.pressure",
+            "kind": "resource_envelope",
+            "verdict": "degraded",
+            "confidence_percent": 75,
+            "evidence": [
+              {
+                "source": "operating_envelope",
+                "reference": "metrics://resource-envelope/memory-pressure",
+                "state": "degraded",
+                "digest": null
+              }
+            ],
+            "blockers": [
+              "resource.pressure_degraded"
+            ],
+            "next_actions": [
+              "rerun with retained resource envelope below pressure thresholds"
+            ],
+            "note": ""
+          }
+        ],
+        "source_artifacts": [],
+        "generated_at": "2026-06-04T06:34:00Z",
+        "notes": []
       }
     }
   ]

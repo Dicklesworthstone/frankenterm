@@ -14,6 +14,10 @@ use crate::demo_scenarios::{
 use serde::{Deserialize, Serialize};
 
 pub const REHEARSAL_SCORE_RECEIPT_CONTRACT_ID: &str = "ft.rehearsal_score_receipt.v1";
+pub const REHEARSAL_SCORE_SURFACE_CONTRACT_ID: &str = "ft.rehearsal_score_surface.v1";
+pub const REHEARSAL_SCORE_HARNESS_LOG_CONTRACT_ID: &str = "ft.rehearsal_score_harness_log.v1";
+pub const REHEARSAL_SCORE_MCP_CURRENT_URI: &str = "wa://rehearsal-score/current";
+pub const REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE: &str = "wa://rehearsal-score/{surface}";
 pub const REHEARSAL_SCORE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +415,185 @@ pub struct RehearsalScoringResult {
     pub next_action_hints: Vec<RehearsalNextActionHint>,
     #[serde(default)]
     pub log: Vec<RehearsalCriterionEvaluationLog>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RehearsalScoreSurface {
+    Score,
+    Explain,
+}
+
+impl RehearsalScoreSurface {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Score => "score",
+            Self::Explain => "explain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RehearsalScoreSurfaceReport {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub surface: RehearsalScoreSurface,
+    pub source_adapter: RehearsalSourceAdapterKind,
+    pub source_ref: String,
+    pub source_schema_version: String,
+    pub source_adapter_log: RehearsalAdapterExtractionLog,
+    pub receipt: RehearsalScoreReceipt,
+    pub aggregate_confidence_percent: u8,
+    #[serde(default)]
+    pub next_action_hints: Vec<RehearsalNextActionHint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evaluation_log: Vec<RehearsalCriterionEvaluationLog>,
+    pub raw_pane_content_stored: bool,
+    pub live_mutation_allowed: bool,
+    pub side_effects_executed: bool,
+}
+
+impl RehearsalScoreSurfaceReport {
+    #[must_use]
+    pub fn from_demo_scenario_manifest(
+        manifest: &DemoScenarioManifest,
+        source_ref: impl Into<String>,
+        rehearsal_id: impl Into<String>,
+        scenario_id: impl Into<String>,
+        surface: RehearsalScoreSurface,
+    ) -> Self {
+        let extraction =
+            RehearsalAdapterExtraction::from_demo_scenario_manifest(manifest, source_ref);
+        let source_adapter = extraction.adapter_kind;
+        let source_ref = extraction.source_ref.clone();
+        let source_schema_version = extraction.source_schema_version.clone();
+        let source_adapter_log = extraction.log.clone();
+        let result =
+            RehearsalScoringEngine::score_extraction(extraction, rehearsal_id, scenario_id);
+        let evaluation_log = if surface == RehearsalScoreSurface::Explain {
+            result.log
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            schema_version: REHEARSAL_SCORE_SCHEMA_VERSION,
+            contract_id: REHEARSAL_SCORE_SURFACE_CONTRACT_ID.to_string(),
+            surface,
+            source_adapter,
+            source_ref,
+            source_schema_version,
+            source_adapter_log,
+            receipt: result.receipt,
+            aggregate_confidence_percent: result.aggregate_confidence_percent,
+            next_action_hints: result.next_action_hints,
+            evaluation_log,
+            raw_pane_content_stored: false,
+            live_mutation_allowed: false,
+            side_effects_executed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RehearsalHarnessProofStatus {
+    Proven,
+    Failed,
+    Blocked,
+    MissingEvidence,
+    Degraded,
+    Skipped,
+    NotApplicable,
+}
+
+impl RehearsalHarnessProofStatus {
+    #[must_use]
+    pub fn from_verdict(verdict: RehearsalVerdict) -> Self {
+        match verdict {
+            RehearsalVerdict::Pass => Self::Proven,
+            RehearsalVerdict::Fail => Self::Failed,
+            RehearsalVerdict::Blocked => Self::Blocked,
+            RehearsalVerdict::MissingEvidence => Self::MissingEvidence,
+            RehearsalVerdict::Degraded => Self::Degraded,
+            RehearsalVerdict::Skipped => Self::Skipped,
+            RehearsalVerdict::NotApplicable => Self::NotApplicable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RehearsalHarnessCriterionInput {
+    pub criterion_id: String,
+    pub kind: RehearsalCriterionKind,
+    pub verdict: RehearsalVerdict,
+    pub evidence_states: Vec<RehearsalEvidenceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RehearsalScoreHarnessLogEntry {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub scenario_id: String,
+    pub source_artifact_ids: Vec<String>,
+    pub commands_or_resources_queried: Vec<String>,
+    pub criterion_inputs: Vec<RehearsalHarnessCriterionInput>,
+    pub score_receipt: RehearsalScoreReceipt,
+    pub elapsed_ms: u64,
+    pub resource_notes: Vec<String>,
+    pub proof_status: RehearsalHarnessProofStatus,
+}
+
+impl RehearsalScoreHarnessLogEntry {
+    #[must_use]
+    pub fn from_surface_report(
+        report: &RehearsalScoreSurfaceReport,
+        commands_or_resources_queried: Vec<String>,
+        elapsed_ms: u64,
+        resource_notes: Vec<String>,
+    ) -> Self {
+        let source_artifact_ids = report
+            .receipt
+            .source_artifacts
+            .iter()
+            .map(|artifact| format!("{}:{}", artifact.source, artifact.reference))
+            .collect();
+        let criterion_inputs = report
+            .receipt
+            .criteria
+            .iter()
+            .map(|criterion| RehearsalHarnessCriterionInput {
+                criterion_id: criterion.criterion_id.clone(),
+                kind: criterion.kind,
+                verdict: criterion.verdict,
+                evidence_states: criterion
+                    .evidence
+                    .iter()
+                    .map(|evidence| evidence.state)
+                    .collect(),
+            })
+            .collect();
+
+        Self {
+            schema_version: REHEARSAL_SCORE_SCHEMA_VERSION,
+            contract_id: REHEARSAL_SCORE_HARNESS_LOG_CONTRACT_ID.to_string(),
+            scenario_id: report.receipt.scenario_id.clone(),
+            source_artifact_ids,
+            commands_or_resources_queried,
+            criterion_inputs,
+            score_receipt: report.receipt.clone(),
+            elapsed_ms,
+            resource_notes,
+            proof_status: RehearsalHarnessProofStatus::from_verdict(
+                report.receipt.aggregate_verdict,
+            ),
+        }
+    }
+
+    pub fn to_jsonl_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1422,6 +1605,48 @@ mod tests {
         .with_note("blocked proof remains visible in the aggregate rollup")
     }
 
+    fn rch_no_local_fallback_receipt() -> RehearsalScoreReceipt {
+        RehearsalScoreReceipt::new(
+            "rehearsal-rch-no-local-fallback",
+            "demo_lab.remote_required",
+            vec![
+                RehearsalCriterionReceipt::new(
+                    "scenario.completed",
+                    RehearsalCriterionKind::ScenarioCompletion,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "demo_lab",
+                    "artifact://demo-lab/run.jsonl",
+                    RehearsalEvidenceState::Proven,
+                )),
+                RehearsalCriterionReceipt::new(
+                    "proof.remote",
+                    RehearsalCriterionKind::RchProof,
+                    RehearsalVerdict::Blocked,
+                )
+                .with_confidence_percent(85)
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "rch",
+                    "job://proof-output#[RCH] local worker=null",
+                    RehearsalEvidenceState::Proven,
+                ))
+                .with_blocker("rch.remote_proof_not_admissible")
+                .with_next_action(
+                    "rerun proof with RCH_REQUIRE_REMOTE=1 and retain only remote worker output",
+                )
+                .with_note("local fallback path did not reach a remote worker"),
+            ],
+        )
+        .with_source_artifact(RehearsalEvidenceRef::new(
+            "rch_admission",
+            "rch://admission/no-admissible-workers",
+            RehearsalEvidenceState::Blocked,
+        ))
+        .with_generated_at("2026-06-04T06:35:00Z")
+        .with_note("local fallback output is retained as a blocker, not proof")
+    }
+
     fn privacy_redaction_fail_receipt() -> RehearsalScoreReceipt {
         RehearsalScoreReceipt::new(
             "rehearsal-redaction-fail",
@@ -1486,6 +1711,51 @@ mod tests {
         )
         .with_generated_at("2026-06-03T05:19:10Z")
         .with_note("TOON output must preserve the same typed receipt vocabulary")
+    }
+
+    fn agent_mail_outage_fallback_receipt() -> RehearsalScoreReceipt {
+        RehearsalScoreReceipt::new(
+            "rehearsal-agent-mail-outage",
+            "coordination.agent_mail_outage_fallback",
+            vec![
+                RehearsalCriterionReceipt::new(
+                    "fallback.handoff_recorded",
+                    RehearsalCriterionKind::ScenarioCompletion,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "swarm_tick",
+                    "fallback://agent-mail-unavailable/frankenterm",
+                    RehearsalEvidenceState::Proven,
+                ))
+                .with_note("Beads/git handoff was retained while Agent Mail was unavailable"),
+                RehearsalCriterionReceipt::new(
+                    "agent_mail.outage",
+                    RehearsalCriterionKind::AgentMailCoordination,
+                    RehearsalVerdict::Degraded,
+                )
+                .with_confidence_percent(75)
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "agent_mail",
+                    "health://mcp-agent-mail/unreachable-after-one-retry",
+                    RehearsalEvidenceState::Degraded,
+                ))
+                .with_blocker("agent_mail.unavailable_after_retry")
+                .with_next_action(
+                    "continue with scripts/swarm-tick.sh --agent-mail-fallback frankenterm and Beads/git handoff",
+                )
+                .with_note(
+                    "fallback is acceptable only after one retry and retained fallback evidence",
+                ),
+            ],
+        )
+        .with_source_artifact(RehearsalEvidenceRef::new(
+            "swarm_tick",
+            "fallback://agent-mail-unavailable/frankenterm",
+            RehearsalEvidenceState::Proven,
+        ))
+        .with_generated_at("2026-06-04T06:35:30Z")
+        .with_note("Agent Mail fallback remains visible instead of being collapsed into pass")
     }
 
     fn source_adapter_missing_evidence_receipt() -> RehearsalScoreReceipt {
@@ -1561,12 +1831,223 @@ mod tests {
         .with_note("source adapters preserve blocked, skipped, and missing evidence without side effects")
     }
 
+    fn successful_bundled_rehearsal_receipt() -> RehearsalScoreReceipt {
+        RehearsalScoreReceipt::new(
+            "rehearsal-bundled-success",
+            "demo_lab.quickstart.no_mock",
+            vec![
+                RehearsalCriterionReceipt::new(
+                    "scenario.completed",
+                    RehearsalCriterionKind::ScenarioCompletion,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(
+                    RehearsalEvidenceRef::new(
+                        "demo_lab",
+                        "fixtures/demo-lab/golden/quickstart.json",
+                        RehearsalEvidenceState::Proven,
+                    )
+                    .with_digest(
+                        "sha256:17c1881cb23c0fd4997968cb575a10568f5aa9c88aba8e8e5318cf10f4081be4",
+                    ),
+                ),
+                RehearsalCriterionReceipt::new(
+                    "proof.remote",
+                    RehearsalCriterionKind::RchProof,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "rch",
+                    "rch://vmi1293453/j-29871232832766187#[RCH] remote vmi1293453",
+                    RehearsalEvidenceState::Proven,
+                )),
+                RehearsalCriterionReceipt::new(
+                    "agent_mail.coordination",
+                    RehearsalCriterionKind::AgentMailCoordination,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "agent_mail",
+                    "thread://ft-oohsx.5/claim",
+                    RehearsalEvidenceState::Proven,
+                )),
+                RehearsalCriterionReceipt::new(
+                    "resource.envelope",
+                    RehearsalCriterionKind::ResourceEnvelope,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "operating_envelope",
+                    "docs/attestations/proofs/resource-cockpit-target-class.json",
+                    RehearsalEvidenceState::Proven,
+                )),
+            ],
+        )
+        .with_source_artifact(RehearsalEvidenceRef::new(
+            "demo_scenario_manifest",
+            "fixtures/demo-lab/manifest.v1.json#scenario.quickstart",
+            RehearsalEvidenceState::FixtureOnly,
+        ))
+        .with_generated_at("2026-06-04T06:30:00Z")
+        .with_note("no-mock harness uses the bundled demo manifest and retained quickstart golden")
+    }
+
+    fn dirty_overlap_ownership_risk_receipt() -> RehearsalScoreReceipt {
+        RehearsalScoreReceipt::new(
+            "rehearsal-dirty-overlap",
+            "coordination.dirty_overlap",
+            vec![
+                RehearsalCriterionReceipt::new(
+                    "scenario.claimed",
+                    RehearsalCriterionKind::ScenarioCompletion,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "beads",
+                    "bead://ft-oohsx.5/status/in_progress",
+                    RehearsalEvidenceState::Proven,
+                )),
+                RehearsalCriterionReceipt::new(
+                    "git.dirty_overlap",
+                    RehearsalCriterionKind::DirtyOverlapOwnership,
+                    RehearsalVerdict::Blocked,
+                )
+                .with_confidence_percent(80)
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "git_status",
+                    "git://status#crates/frankenterm-core/src/rehearsal_score.rs",
+                    RehearsalEvidenceState::Blocked,
+                ))
+                .with_blocker("dirty_overlap.owner_unclear")
+                .with_next_action("confirm ownership or narrow the patch before claiming proof")
+                .with_note("shared dirty files must block ownership-sensitive rehearsals"),
+            ],
+        )
+        .with_source_artifact(RehearsalEvidenceRef::new(
+            "swarm_tick",
+            "fallback://agent-mail-unavailable/beads-only",
+            RehearsalEvidenceState::Proven,
+        ))
+        .with_generated_at("2026-06-04T06:31:00Z")
+    }
+
+    fn policy_require_approval_receipt() -> RehearsalScoreReceipt {
+        RehearsalScoreReceipt::new(
+            "rehearsal-policy-approval",
+            "policy.require_approval",
+            vec![
+                RehearsalCriterionReceipt::new(
+                    "policy.deny_recorded",
+                    RehearsalCriterionKind::SafetyPolicy,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "policy_audit",
+                    "audit://policy-denial/wa-mcp-approval-required",
+                    RehearsalEvidenceState::Proven,
+                ))
+                .with_note("deny or require-approval decisions are acceptable when retained"),
+                RehearsalCriterionReceipt::new(
+                    "policy.requires_operator",
+                    RehearsalCriterionKind::SafetyPolicy,
+                    RehearsalVerdict::Blocked,
+                )
+                .with_confidence_percent(85)
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "policy_audit",
+                    "audit://policy-denial/wa-mcp-approval-required#operator",
+                    RehearsalEvidenceState::Proven,
+                ))
+                .with_blocker("policy.require_approval")
+                .with_next_action("request explicit operator approval before executing the action"),
+            ],
+        )
+        .with_generated_at("2026-06-04T06:32:00Z")
+    }
+
+    fn redaction_missing_evidence_receipt() -> RehearsalScoreReceipt {
+        RehearsalScoreReceipt::new(
+            "rehearsal-redaction-missing",
+            "privacy.redaction_missing",
+            vec![
+                RehearsalCriterionReceipt::new(
+                    "redaction.intent",
+                    RehearsalCriterionKind::RedactionPrivacy,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "read_path_matrix",
+                    "docs/security/read-path-redaction-matrix.md",
+                    RehearsalEvidenceState::Redacted,
+                )),
+                RehearsalCriterionReceipt::new(
+                    "redaction.audit_artifact",
+                    RehearsalCriterionKind::RedactionPrivacy,
+                    RehearsalVerdict::MissingEvidence,
+                )
+                .with_confidence_percent(70)
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "redaction_audit",
+                    "artifacts/rehearsal-score/redaction-audit.json",
+                    RehearsalEvidenceState::Missing,
+                ))
+                .with_blocker("redaction.audit_missing")
+                .with_next_action(
+                    "attach redaction audit evidence before treating the rehearsal as proven",
+                ),
+            ],
+        )
+        .with_generated_at("2026-06-04T06:33:00Z")
+    }
+
+    fn resource_pressure_degraded_receipt() -> RehearsalScoreReceipt {
+        RehearsalScoreReceipt::new(
+            "rehearsal-resource-pressure",
+            "operating_envelope.resource_pressure",
+            vec![
+                RehearsalCriterionReceipt::new(
+                    "scenario.completed",
+                    RehearsalCriterionKind::ScenarioCompletion,
+                    RehearsalVerdict::Pass,
+                )
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "demo_lab",
+                    "fixtures/demo-lab/golden/usage_limit.json",
+                    RehearsalEvidenceState::Proven,
+                )),
+                RehearsalCriterionReceipt::new(
+                    "resource.pressure",
+                    RehearsalCriterionKind::ResourceEnvelope,
+                    RehearsalVerdict::Degraded,
+                )
+                .with_confidence_percent(75)
+                .with_evidence(RehearsalEvidenceRef::new(
+                    "operating_envelope",
+                    "metrics://resource-envelope/memory-pressure",
+                    RehearsalEvidenceState::Degraded,
+                ))
+                .with_blocker("resource.pressure_degraded")
+                .with_next_action(
+                    "rerun with retained resource envelope below pressure thresholds",
+                ),
+            ],
+        )
+        .with_generated_at("2026-06-04T06:34:00Z")
+    }
+
     fn expected_receipt(case_name: &str) -> RehearsalScoreReceipt {
         match case_name {
             "blocked_remote_proof" => blocked_remote_proof_receipt(),
+            "rch_no_local_fallback" => rch_no_local_fallback_receipt(),
             "privacy_redaction_fail" => privacy_redaction_fail_receipt(),
             "toon_contract_shape" => toon_contract_shape_receipt(),
+            "agent_mail_outage_fallback" => agent_mail_outage_fallback_receipt(),
             "source_adapter_missing_evidence" => source_adapter_missing_evidence_receipt(),
+            "successful_bundled_rehearsal" => successful_bundled_rehearsal_receipt(),
+            "dirty_overlap_ownership_risk" => dirty_overlap_ownership_risk_receipt(),
+            "policy_require_approval" => policy_require_approval_receipt(),
+            "redaction_missing_evidence" => redaction_missing_evidence_receipt(),
+            "resource_pressure_degraded" => resource_pressure_degraded_receipt(),
             other => panic!("unexpected rehearsal score golden case {other}"),
         }
     }
@@ -2157,6 +2638,132 @@ mod tests {
     }
 
     #[test]
+    fn score_surface_reports_read_only_contract_and_explain_log() {
+        let manifest = load_demo_manifest();
+        let score = RehearsalScoreSurfaceReport::from_demo_scenario_manifest(
+            &manifest,
+            "fixtures/demo-lab/manifest.v1.json",
+            "surface-score-test",
+            "demo_lab.manifest",
+            RehearsalScoreSurface::Score,
+        );
+        let explain = RehearsalScoreSurfaceReport::from_demo_scenario_manifest(
+            &manifest,
+            "fixtures/demo-lab/manifest.v1.json",
+            "surface-explain-test",
+            "demo_lab.manifest",
+            RehearsalScoreSurface::Explain,
+        );
+
+        assert_eq!(score.contract_id, REHEARSAL_SCORE_SURFACE_CONTRACT_ID);
+        assert_eq!(score.surface, RehearsalScoreSurface::Score);
+        assert_eq!(
+            score.receipt.aggregate_verdict,
+            RehearsalVerdict::MissingEvidence
+        );
+        assert!(score.evaluation_log.is_empty());
+        assert!(!explain.evaluation_log.is_empty());
+        assert_eq!(explain.evaluation_log.len(), explain.receipt.criteria.len());
+        assert!(!score.raw_pane_content_stored);
+        assert!(!score.live_mutation_allowed);
+        assert!(!score.side_effects_executed);
+        assert_eq!(
+            explain.source_adapter_log.adapter_id,
+            "demo_scenario_manifest.v1"
+        );
+    }
+
+    #[test]
+    fn no_mock_bundled_demo_manifest_harness_log_records_jsonl_and_toon_surface() {
+        let manifest = load_demo_manifest();
+        let report = RehearsalScoreSurfaceReport::from_demo_scenario_manifest(
+            &manifest,
+            "fixtures/demo-lab/manifest.v1.json",
+            "harness-no-mock-demo-manifest",
+            "demo_lab.manifest",
+            RehearsalScoreSurface::Score,
+        );
+        let log = RehearsalScoreHarnessLogEntry::from_surface_report(
+            &report,
+            vec![
+                "ft rehearse score fixtures/demo-lab/manifest.v1.json --format json".to_string(),
+                REHEARSAL_SCORE_MCP_CURRENT_URI.to_string(),
+            ],
+            12,
+            vec![
+                "bundled demo manifest path; side-effect-free no-mock adapter".to_string(),
+                "raw pane content is never stored by the scoring surface".to_string(),
+            ],
+        );
+
+        assert_eq!(log.contract_id, REHEARSAL_SCORE_HARNESS_LOG_CONTRACT_ID);
+        assert_eq!(log.scenario_id, "demo_lab.manifest");
+        assert_eq!(log.source_artifact_ids.len(), 1);
+        assert!(log.commands_or_resources_queried.iter().any(|command| {
+            command.starts_with("ft rehearse score fixtures/demo-lab/manifest.v1.json")
+        }));
+        assert!(
+            log.commands_or_resources_queried
+                .contains(&REHEARSAL_SCORE_MCP_CURRENT_URI.to_string())
+        );
+        assert_eq!(log.elapsed_ms, 12);
+        assert!(
+            log.resource_notes
+                .iter()
+                .any(|note| note.contains("side-effect-free no-mock adapter"))
+        );
+        assert_eq!(
+            log.score_receipt.contract_id,
+            REHEARSAL_SCORE_RECEIPT_CONTRACT_ID
+        );
+        assert_eq!(
+            log.proof_status,
+            RehearsalHarnessProofStatus::MissingEvidence
+        );
+        assert!(
+            log.criterion_inputs
+                .iter()
+                .any(|input| input.kind == RehearsalCriterionKind::RchProof)
+        );
+        assert!(
+            log.score_receipt
+                .notes
+                .iter()
+                .any(|note| note.contains("score_engine evaluated adapter"))
+        );
+
+        let jsonl = log.to_jsonl_line().expect("serialize harness JSONL");
+        assert!(
+            !jsonl.contains('\n'),
+            "one harness entry must serialize as exactly one JSONL line"
+        );
+        let decoded: RehearsalScoreHarnessLogEntry =
+            serde_json::from_str(&jsonl).expect("decode harness JSONL line");
+        assert_eq!(decoded, log);
+
+        let surface_json = serde_json::to_value(&report).expect("serialize surface report");
+        let surface_toon = toon_rust::encode(surface_json.clone(), None);
+        let decoded_toon = toon_rust::try_decode(&surface_toon, None).expect("decode surface TOON");
+        let decoded_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_toon, 0).join("\n");
+        let mut decoded_surface: Value =
+            serde_json::from_str(&decoded_json).expect("surface TOON decoded JSON");
+        normalize_integral_toon_numbers(&mut decoded_surface);
+
+        assert_eq!(decoded_surface["contract_id"], surface_json["contract_id"]);
+        assert_eq!(decoded_surface["surface"], surface_json["surface"]);
+        assert_eq!(
+            decoded_surface["side_effects_executed"],
+            surface_json["side_effects_executed"]
+        );
+        assert_ne!(
+            surface_toon.trim_start().chars().next(),
+            Some('{'),
+            "surface TOON output must not collapse back to JSON text"
+        );
+    }
+
+    #[test]
     fn golden_fixture_matrix_is_current_and_covers_json_and_toon() {
         let matrix = load_golden_matrix();
 
@@ -2180,10 +2787,17 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         for expected in [
+            ("successful_bundled_rehearsal", "json"),
             ("blocked_remote_proof", "json"),
+            ("rch_no_local_fallback", "json"),
             ("privacy_redaction_fail", "json"),
             ("toon_contract_shape", "toon"),
+            ("agent_mail_outage_fallback", "json"),
             ("source_adapter_missing_evidence", "json"),
+            ("dirty_overlap_ownership_risk", "json"),
+            ("policy_require_approval", "json"),
+            ("redaction_missing_evidence", "json"),
+            ("resource_pressure_degraded", "json"),
         ] {
             assert!(
                 case_keys.contains(&expected),
