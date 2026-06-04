@@ -1,0 +1,230 @@
+{
+  "contract_id": "ft.swarm.incident_dag.fixture.v1",
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "scenario_id": "rch_mirror_failure_before_cargo",
+      "source_set": {
+        "schema_version": 1,
+        "contract_id": "ft.swarm.source_adapters.v1",
+        "generated_at_ms": 1778000200000,
+        "source_set_id": "scenario-rch-mirror-failure",
+        "workspace_id": "frankenterm",
+        "beads": [
+          {
+            "source_id": "bead-rch-failure",
+            "issue_id": "ft-ogr3n.3",
+            "status": "in_progress",
+            "updated_at_ms": 1778000200100,
+            "comment_count": 1,
+            "reason_codes": ["beads.claimed"],
+            "artifact_paths": [".beads/issues.jsonl"],
+            "payload": {
+              "note": "claimed causality engine work before RCH proof"
+            }
+          }
+        ],
+        "rch": [
+          {
+            "source_id": "rch-preflight",
+            "build_id": "29871232832766280",
+            "command_argv": [
+              "cargo",
+              "test",
+              "-p",
+              "frankenterm-core-replay-types"
+            ],
+            "started_at_ms": 1778000200200,
+            "completed_at_ms": null,
+            "location": "local",
+            "exit_code": null,
+            "preflight_refusal_reason": "no admissible workers: hard_preflight=2",
+            "reason_codes": ["rch.no_admissible_workers"],
+            "artifact_paths": ["tests/e2e/logs/rch-preflight-ft-ogr3n3.json"],
+            "payload": {
+              "cargo_reached": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "admissible": false,
+        "min_nodes": 2,
+        "required_classes": ["infrastructure_failure"],
+        "required_edge_kinds": ["temporal_proximity"]
+      }
+    },
+    {
+      "scenario_id": "dirty_tree_proof_contamination",
+      "source_set": {
+        "schema_version": 1,
+        "contract_id": "ft.swarm.source_adapters.v1",
+        "generated_at_ms": 1778000300000,
+        "source_set_id": "scenario-dirty-tree",
+        "workspace_id": "frankenterm",
+        "git": [
+          {
+            "source_id": "git-dirty",
+            "head_commit": "abcdef1234567890",
+            "branch": "main",
+            "captured_at_ms": 1778000300100,
+            "staged_paths": ["crates/frankenterm-core-replay-types/src/incident_dag.rs"],
+            "dirty_paths": ["crates/frankenterm-core/src/runtime.rs"],
+            "branch_ahead": 1,
+            "branch_behind": 0,
+            "protected_deletion_warnings": [],
+            "artifact_paths": ["tests/e2e/logs/git-status-ft-ogr3n3.json"],
+            "reason_codes": ["git.unrelated_dirty_tree"],
+            "payload": {
+              "proof_contaminated": true
+            }
+          }
+        ],
+        "rch": [
+          {
+            "source_id": "rch-pass-dirty",
+            "build_id": "29871232832766281",
+            "worker_id": "vmi1149989",
+            "command_argv": [
+              "cargo",
+              "clippy",
+              "-p",
+              "frankenterm-core-replay-types"
+            ],
+            "started_at_ms": 1778000300200,
+            "completed_at_ms": 1778000305000,
+            "location": "remote",
+            "exit_code": 0,
+            "reason_codes": ["rch.remote_exit_zero"],
+            "artifact_paths": ["tests/e2e/logs/rch-pass-dirty-ft-ogr3n3.json"],
+            "payload": {
+              "cargo_reached": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "admissible": false,
+        "min_nodes": 2,
+        "required_classes": ["dirty_tree_contamination"],
+        "required_edge_kinds": ["temporal_proximity"]
+      }
+    },
+    {
+      "scenario_id": "agent_mail_outage_with_beads_fallback",
+      "source_set": {
+        "schema_version": 1,
+        "contract_id": "ft.swarm.source_adapters.v1",
+        "generated_at_ms": 1778000400000,
+        "source_set_id": "scenario-mail-outage",
+        "workspace_id": "frankenterm",
+        "agent_mail": [
+          {
+            "source_id": "mail-unavailable",
+            "health_state": "unavailable",
+            "collected_at_ms": 1778000400100,
+            "unavailable_reason": "database unavailable after allowed retry",
+            "reason_codes": ["agent_mail.database_error"],
+            "artifact_paths": ["tests/e2e/logs/agent-mail-unavailable-ft-ogr3n3.json"],
+            "payload": {
+              "retry_count": 1
+            }
+          }
+        ],
+        "beads": [
+          {
+            "source_id": "beads-fallback",
+            "issue_id": "ft-ogr3n.3",
+            "status": "in_progress",
+            "updated_at_ms": 1778000400200,
+            "comment_count": 2,
+            "dirty_tree_guard_comment_count": 0,
+            "reason_codes": ["beads.fallback_surface"],
+            "artifact_paths": [".beads/issues.jsonl"],
+            "payload": {
+              "mail_fallback": "beads comment recorded coordination"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "admissible": false,
+        "min_nodes": 2,
+        "required_classes": ["communication_outage"],
+        "required_edge_kinds": ["temporal_proximity"]
+      }
+    },
+    {
+      "scenario_id": "clean_remote_proof_pass",
+      "source_set": {
+        "schema_version": 1,
+        "contract_id": "ft.swarm.source_adapters.v1",
+        "generated_at_ms": 1778000500000,
+        "source_set_id": "scenario-clean-remote-proof",
+        "workspace_id": "frankenterm",
+        "beads": [
+          {
+            "source_id": "bead-close",
+            "issue_id": "ft-ogr3n.3",
+            "status": "closed",
+            "updated_at_ms": 1778000500100,
+            "comment_count": 3,
+            "close_reason": "RCH remote proof passed",
+            "reason_codes": ["beads.closeout"],
+            "artifact_paths": [".beads/issues.jsonl"],
+            "payload": {
+              "proof_cited": true
+            }
+          }
+        ],
+        "git": [
+          {
+            "source_id": "git-clean",
+            "head_commit": "fedcba0987654321",
+            "branch": "main",
+            "captured_at_ms": 1778000500200,
+            "staged_paths": [],
+            "dirty_paths": [],
+            "branch_ahead": 0,
+            "branch_behind": 0,
+            "protected_deletion_warnings": [],
+            "artifact_paths": ["tests/e2e/logs/git-clean-ft-ogr3n3.json"],
+            "reason_codes": ["git.clean"],
+            "payload": {
+              "worktree_clean": true
+            }
+          }
+        ],
+        "rch": [
+          {
+            "source_id": "rch-clean-pass",
+            "build_id": "29871232832766282",
+            "worker_id": "vmi1149989",
+            "command_argv": [
+              "cargo",
+              "test",
+              "-p",
+              "frankenterm-core-replay-types",
+              "incident_dag"
+            ],
+            "started_at_ms": 1778000500300,
+            "completed_at_ms": 1778000509000,
+            "location": "remote",
+            "exit_code": 0,
+            "reason_codes": ["rch.remote_exit_zero"],
+            "artifact_paths": ["tests/e2e/logs/rch-clean-pass-ft-ogr3n3.json"],
+            "payload": {
+              "cargo_reached": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "admissible": true,
+        "min_nodes": 3,
+        "required_classes": ["source_pass"],
+        "required_edge_kinds": ["temporal_proximity"]
+      }
+    }
+  ]
+}
