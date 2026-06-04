@@ -1,4 +1,4 @@
-//! Criterion benchmarks for config parsing and pane filter/priority hot paths.
+//! Criterion benchmarks for config loading and pane filter/priority hot paths.
 //!
 //! These functions are called on every ingest event, so their performance
 //! directly impacts observation loop latency.
@@ -8,7 +8,7 @@ use frankenterm_core::config::{Config, PaneFilterConfig, PaneFilterRule, PanePri
 use std::hint::black_box;
 
 // =============================================================================
-// Minimal TOML for parsing benchmarks
+// Minimal TOML for config loading benchmarks
 // =============================================================================
 
 fn minimal_toml() -> &'static str {
@@ -42,15 +42,15 @@ fn large_toml() -> String {
 }
 
 // =============================================================================
-// Benchmark: Config::from_toml parsing
+// Benchmark: Config::from_toml production loading
 // =============================================================================
 
-fn bench_config_parse(c: &mut Criterion) {
+fn bench_config_load(c: &mut Criterion) {
     let minimal = minimal_toml().to_string();
     let medium = medium_toml();
     let large = large_toml();
 
-    let mut group = c.benchmark_group("config/parse");
+    let mut group = c.benchmark_group("config/load");
 
     group.bench_with_input(BenchmarkId::new("toml", "minimal"), &minimal, |b, toml| {
         b.iter(|| Config::from_toml(black_box(toml)).unwrap());
@@ -228,7 +228,7 @@ fn bench_config_roundtrip(c: &mut Criterion) {
         b.iter(|| black_box(&config).to_toml().unwrap());
     });
 
-    group.bench_function("deserialize", |b| {
+    group.bench_function("deserialize_validate", |b| {
         b.iter(|| Config::from_toml(black_box(&toml_str)).unwrap());
     });
 
@@ -237,7 +237,7 @@ fn bench_config_roundtrip(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_config_parse,
+    bench_config_load,
     bench_check_pane,
     bench_priority_for_pane,
     bench_config_roundtrip,

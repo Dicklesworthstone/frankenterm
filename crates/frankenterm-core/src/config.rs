@@ -4521,17 +4521,29 @@ pub fn default_config_dir() -> PathBuf {
 }
 
 impl Config {
-    /// Load configuration from default locations
+    /// Load validated configuration from default locations.
     ///
     /// Search order:
     /// 1. ./ft.toml (current directory)
     /// 2. $XDG_CONFIG_HOME/ft/ft.toml or ~/.config/ft/ft.toml
     /// 3. Default values
     pub fn load() -> crate::Result<Self> {
+        let mut config = Self::load_unvalidated()?;
+        config.normalize_paths();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load configuration from default locations without semantic validation.
+    ///
+    /// This is for parse/inspect flows that must preserve invalid config long
+    /// enough to report or edit it. Runtime callers should use [`Self::load`]
+    /// or [`Self::load_with_overrides`].
+    pub fn load_unvalidated() -> crate::Result<Self> {
         // Check current directory first
         let cwd_config = std::path::Path::new("ft.toml");
         if cwd_config.exists() {
-            return Self::load_from(cwd_config);
+            return Self::load_from_unvalidated(cwd_config);
         }
 
         // Check XDG config directory
@@ -4539,7 +4551,7 @@ impl Config {
         if let Some(ref dir) = config_dir {
             let config_path = dir.join("ft.toml");
             if config_path.exists() {
-                return Self::load_from(&config_path);
+                return Self::load_from_unvalidated(&config_path);
             }
         }
 
@@ -4547,17 +4559,36 @@ impl Config {
         Ok(Self::default())
     }
 
-    /// Load configuration from a specific path
+    /// Load validated configuration from a specific path.
     pub fn load_from(path: &std::path::Path) -> crate::Result<Self> {
+        let mut config = Self::load_from_unvalidated(path)?;
+        config.normalize_paths();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load configuration from a specific path without semantic validation.
+    pub fn load_from_unvalidated(path: &std::path::Path) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
             crate::error::ConfigError::ReadFailed(path.display().to_string(), e.to_string())
         })?;
 
-        Self::from_toml(&content)
+        Self::from_toml_unvalidated(&content)
     }
 
-    /// Parse configuration from TOML string
+    /// Parse, normalize, and validate configuration from a TOML string.
     pub fn from_toml(content: &str) -> crate::Result<Self> {
+        let mut config = Self::from_toml_unvalidated(content)?;
+        config.normalize_paths();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Parse configuration from a TOML string without semantic validation.
+    ///
+    /// Use this only for config inspection, editing, or tests that deliberately
+    /// assert the boundary between deserialization and validation.
+    pub fn from_toml_unvalidated(content: &str) -> crate::Result<Self> {
         toml::from_str(content)
             .map_err(|e| crate::error::ConfigError::ParseFailed(e.to_string()).into())
     }
@@ -4579,7 +4610,7 @@ impl Config {
         let mut config = match config_path {
             Some(path) => {
                 if path.exists() {
-                    Self::load_from(path)?
+                    Self::load_from_unvalidated(path)?
                 } else if strict {
                     return Err(crate::error::ConfigError::FileNotFound(
                         path.display().to_string(),
@@ -4589,7 +4620,7 @@ impl Config {
                     Self::default()
                 }
             }
-            None => Self::load()?,
+            None => Self::load_unvalidated()?,
         };
 
         let env_overrides = EnvOverrides::from_env()?;
@@ -5355,6 +5386,40 @@ key = "value"
     }
 
     #[test]
+    fn from_toml_rejects_semantically_invalid_config() {
+        let err = Config::from_toml(
+            r"
+[search]
+quality_weight = 1.5
+",
+        )
+        .expect_err("validated from_toml must reject invalid semantic config")
+        .to_string();
+
+        assert!(
+            err.contains("search.quality_weight"),
+            "validated parser must surface validation error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn from_toml_unvalidated_preserves_parse_only_inspection() {
+        let config = Config::from_toml_unvalidated(
+            r"
+[search]
+quality_weight = 1.5
+",
+        )
+        .expect("unvalidated parser must preserve parse-only inspection");
+
+        assert!((config.search.quality_weight - 1.5).abs() < f64::EPSILON);
+        assert!(
+            config.validate().is_err(),
+            "unvalidated parser must not silently make invalid config valid",
+        );
+    }
+
+    #[test]
     fn pack_overrides_work() {
         let toml = r#"
 [patterns]
@@ -5571,6 +5636,32 @@ db_path = "/tmp/attacker.db"
             msg.contains("must be relative") || msg.contains("db_path"),
             "validate error must reference db_path containment, got: {msg}",
         );
+    }
+
+    #[test]
+    fn load_with_overrides_validates_after_cli_overrides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("ft.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[storage]
+db_path = "/tmp/attacker.db"
+"#,
+        )
+        .expect("write ft.toml");
+
+        let config = Config::load_with_overrides(
+            Some(&config_path),
+            true,
+            &ConfigOverrides {
+                storage_db_path: Some("ft.db".to_string()),
+                ..ConfigOverrides::default()
+            },
+        )
+        .expect("CLI override must be applied before validation");
+
+        assert_eq!(config.storage.db_path, "ft.db");
     }
 
     #[test]
@@ -7089,11 +7180,10 @@ log_level = "debug"
 
     #[test]
     fn storage_recorder_backend_toml_rejects_frankensqlite_and_legacy_alias() {
-        // `from_toml` only parses; the not-yet-implemented backend is rejected in
-        // `validate()` (StorageConfig::validate), which the production load path
-        // runs (main.rs calls `config.validate()` after `Config::load`). Parse
-        // then validate, and match the actual error text.
-        let err = Config::from_toml(
+        // The not-yet-implemented backend is still deserializable so config
+        // inspection can report it precisely, but the validated production
+        // path must reject it.
+        let err = Config::from_toml_unvalidated(
             r#"
 [storage]
 recorder_backend = "frankensqlite"
@@ -7109,7 +7199,7 @@ recorder_backend = "frankensqlite"
         );
         assert!(err.contains("append_log"), "unexpected error: {err}");
 
-        let legacy = Config::from_toml(
+        let legacy = Config::from_toml_unvalidated(
             r#"
 [storage]
 recorder_backend = "franken_sqlite"

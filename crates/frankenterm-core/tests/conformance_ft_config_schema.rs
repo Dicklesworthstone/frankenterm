@@ -85,9 +85,8 @@ fn fixture_as_json() -> Value {
         .unwrap_or_else(|err| panic!("TOML→JSON conversion failed: {err}"))
 }
 
-/// Extract the README's canonical TOML block — the lines between
-/// `## Configuration` and `### Environment Variables` that fall
-/// inside a ```toml fence.
+/// Extract the README's canonical TOML block: the first ```toml fence under
+/// `## Configuration`.
 fn extract_readme_toml() -> String {
     let readme = fs::read_to_string(readme_path())
         .unwrap_or_else(|err| panic!("failed to read README: {err}"));
@@ -101,25 +100,27 @@ fn extract_readme_toml() -> String {
             in_section = true;
             continue;
         }
-        if line == "### Environment Variables" {
-            break;
-        }
         if !in_section {
             continue;
         }
 
-        if line == "```toml" {
-            in_fence = true;
+        if !in_fence {
+            if line == "```toml" {
+                in_fence = true;
+            }
             continue;
         }
+
         if line == "```" {
-            in_fence = false;
-            continue;
+            break;
         }
-        if in_fence {
-            out.push(line);
-        }
+        out.push(line);
     }
+
+    assert!(
+        !out.is_empty(),
+        "README Configuration section did not contain a canonical TOML fence",
+    );
 
     let mut joined = out.join("\n");
     joined.push('\n');
@@ -152,17 +153,16 @@ const README_DOCUMENTED_SECTIONS: &[&str] = &[
 /// where the README↔code reconciliation is tracked.
 const README_DOCUMENTED_BUT_UNREACHABLE: &[(&str, &str)] = &[];
 
-/// Step 1: The README's canonical TOML block must parse through the
-/// production loader without erroring. If serde's deserializer
-/// hard-fails on a documented key, the README is lying about that
-/// key's name or shape.
+/// Step 1: The README's canonical TOML block must deserialize without
+/// erroring. If serde's deserializer hard-fails on a documented key,
+/// the README is lying about that key's name or shape.
 #[test]
-fn readme_canonical_toml_parses_through_production_loader() {
+fn readme_canonical_toml_deserializes_through_raw_loader() {
     let toml_str = load_fixture_toml();
-    let result = frankenterm_core::config::Config::from_toml(&toml_str);
+    let result = frankenterm_core::config::Config::from_toml_unvalidated(&toml_str);
     assert!(
         result.is_ok(),
-        "Config::from_toml rejected the README's canonical config block:\n  {:?}",
+        "Config::from_toml_unvalidated rejected the README's canonical config block:\n  {:?}",
         result.err()
     );
 }
@@ -175,10 +175,7 @@ fn readme_canonical_toml_parses_through_production_loader() {
 #[test]
 fn readme_canonical_toml_validates_through_production_loader() {
     let toml_str = load_fixture_toml();
-    let mut cfg = frankenterm_core::config::Config::from_toml(&toml_str)
-        .expect("README canonical config must parse");
-    cfg.normalize_paths();
-    cfg.validate()
+    frankenterm_core::config::Config::from_toml(&toml_str)
         .expect("README canonical config must pass semantic validation");
 }
 
