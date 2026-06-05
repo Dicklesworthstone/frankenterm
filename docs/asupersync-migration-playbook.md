@@ -119,7 +119,8 @@ Use Agent Mail file reservations aggressively around those files, and prefer “
 
 ## Validation Policy Reminder
 
-- Heavy compile/test/clippy workloads must run via `rch exec -- <command>`.
+- Heavy compile/test/clippy workloads must run via
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- <command>`.
 - Keep command records and artifact paths in bead evidence/comments for auditability.
 - Validation logs must follow structured fields and secret-safe redaction gates.
 - Enforce classifier/evidence rules via:

@@ -148,7 +148,7 @@ find_ft_binary() {
 
   echo "Could not find ft binary." >&2
   echo "[INFO] Build through RCH first, for example:" >&2
-  echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-782hw-4-proof cargo build -p frankenterm --bin ft" >&2
+  echo "[INFO]   RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-782hw-4-proof cargo build -p frankenterm --bin ft" >&2
   echo "[INFO] Then rerun with FT_BINARY=/tmp/ft-782hw-4-proof/debug/ft." >&2
   return 1
 }
@@ -228,7 +228,7 @@ run_proof_doctor() {
   if [[ "${command_shape}" == "local-cargo" ]]; then
     cmd+=(-- cargo test proof_lane)
   else
-    cmd+=(-- rch exec -- env "CARGO_TARGET_DIR=${REMOTE_TARGET_DIR}" cargo test proof_lane)
+    cmd+=(-- RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env "CARGO_TARGET_DIR=${REMOTE_TARGET_DIR}" cargo test proof_lane)
   fi
 
   record_command "${cmd[@]}"

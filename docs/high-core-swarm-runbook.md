@@ -103,7 +103,7 @@ Use `rch` and an isolated target directory for cargo work:
 
 ```bash
 export CARGO_TARGET_DIR=/tmp/ft-high-core-gauntlet-target
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo test -p frankenterm-core --test large_swarm_replay_corpus \
     release_evidence --no-default-features -- --nocapture \
   | tee "$FT_HIGH_CORE_RUN_DIR/release-evidence.log"
@@ -194,9 +194,9 @@ Run the fixed proof contract through `rch` with an isolated target directory:
 
 ```bash
 export CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target
-RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false \
-  rch exec -- bash -lc \
-  'env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target cargo test -p frankenterm --bin ft resource_what_if_proof_manifest -- --nocapture'
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+  rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target \
+  cargo test -p frankenterm --bin ft resource_what_if_proof_manifest -- --nocapture
 ```
 
 Build the CLI and run the command-level smoke. The script emits a final JSON
@@ -205,9 +205,9 @@ status, hardware predicate, and high-scale gate:
 
 ```bash
 export CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target
-RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false \
-  rch exec -- bash -lc \
-  'env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target cargo build -p frankenterm --bin ft'
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+  rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target \
+  cargo build -p frankenterm --bin ft
 
 FT_BIN=/tmp/ft-resource-what-if-proof-target/debug/ft \
   bash tests/e2e/test_resource_what_if.sh \

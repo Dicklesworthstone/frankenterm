@@ -207,7 +207,7 @@
       "proof_kind": "rch_cargo",
       "required": false,
       "status": "blocked",
-      "command": "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
       "artifact_paths": [
         "fixtures/mission-planner/objective-plan/rch-degraded.json"
       ]

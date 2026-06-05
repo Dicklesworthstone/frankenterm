@@ -410,7 +410,9 @@ fn terminal_conformance_manifest_is_well_formed() -> TestResult {
     let root = fixture_root();
     let manifest = load_json(&root.join("manifest.json"))?;
     let proof_command = string_field("manifest", &manifest, "proof_command")?;
-    if !proof_command.contains("RCH_REQUIRE_REMOTE=1 rch exec --") {
+    if !proof_command
+        .contains("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --")
+    {
         return Err("manifest proof command must require remote RCH execution".into());
     }
 
@@ -450,7 +452,7 @@ fn terminal_conformance_manifest_is_well_formed() -> TestResult {
         }
 
         if !string_field(scenario_id, scenario, "proof_command")?
-            .contains("RCH_REQUIRE_REMOTE=1 rch exec --")
+            .contains("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --")
         {
             return Err(format!(
                 "{scenario_id}: proof command must require remote RCH execution"

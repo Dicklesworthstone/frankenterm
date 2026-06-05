@@ -314,7 +314,7 @@ Initial robot error codes:
 Valid RCH-required proof intent:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target cargo test -p <crate> <filter> -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target cargo test -p <crate> <filter> -- --nocapture
 ```
 
 Valid fail-closed harness intent:

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "bead": "ft-hme39.3",
   "contract": "docs/terminal-conformance-contract.md",
-  "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+  "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
   "minimized_cases": [
     "minimized/tc-minimized-synthetic-failure-001.json"
   ],
@@ -14,7 +14,7 @@
       "source": "manual synthetic transcript, reviewed for parser-level escape/action coverage",
       "input_artifact": "transcripts/tc-resize-wrap-001.hex",
       "expected_artifact": "expected/tc-resize-wrap-001.json",
-      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
       "no_mock_boundary": "Parser-only transcript fixture; no-mock PTY/mux reflow assertion is deferred to ft-hme39.2 and ft-hme39.5.",
       "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
       "follow_up_bead": "ft-hme39.2"
@@ -26,7 +26,7 @@
       "source": "manual synthetic transcript using DEC private modes and paste delimiters",
       "input_artifact": "transcripts/tc-bracketed-paste-focus-001.hex",
       "expected_artifact": "expected/tc-bracketed-paste-focus-001.json",
-      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
       "no_mock_boundary": "Parser-only mode/action assertion; no-mock pane IO is deferred to ft-hme39.2.",
       "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
       "follow_up_bead": "ft-hme39.2"
@@ -38,7 +38,7 @@
       "source": "manual synthetic transcript using xterm OSC 8 start/end hyperlink",
       "input_artifact": "transcripts/tc-osc8-hyperlink-001.hex",
       "expected_artifact": "expected/tc-osc8-hyperlink-001.json",
-      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
       "no_mock_boundary": "Parser-only hyperlink action assertion; robot read-surface metadata proof is deferred to ft-hme39.2.",
       "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
       "follow_up_bead": "ft-hme39.2"
@@ -50,7 +50,7 @@
       "source": "manual synthetic transcript using alternate screen and cursor visibility modes",
       "input_artifact": "transcripts/tc-alt-screen-001.hex",
       "expected_artifact": "expected/tc-alt-screen-001.json",
-      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
       "no_mock_boundary": "Parser-only mode/action assertion; no-mock scrollback/screen state proof is deferred to ft-hme39.2.",
       "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
       "follow_up_bead": "ft-hme39.2"
@@ -62,7 +62,7 @@
       "source": "manual synthetic transcript with combining mark, emoji ZWJ sequence, and CJK text",
       "input_artifact": "transcripts/tc-utf8-grapheme-001.hex",
       "expected_artifact": "expected/tc-utf8-grapheme-001.json",
-      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
       "no_mock_boundary": "Parser-only UTF-8 action assertion; cell-width/render proof is deferred to ft-hme39.2 and ft-hme39.5.",
       "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
       "follow_up_bead": "ft-hme39.2"
@@ -74,7 +74,7 @@
       "source": "manual synthetic transcript using cursor shape, autowrap, and grapheme clustering modes",
       "input_artifact": "transcripts/tc-cursor-mode-001.hex",
       "expected_artifact": "expected/tc-cursor-mode-001.json",
-      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
       "no_mock_boundary": "Parser-only mode/action assertion; visible cursor/render proof is deferred to ft-hme39.2.",
       "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
       "follow_up_bead": "ft-hme39.2"
@@ -86,7 +86,7 @@
       "source": "manual synthetic malformed Kitty APC plus malformed sixel DCS transcript",
       "input_artifact": "transcripts/tc-graphics-negative-001.hex",
       "expected_artifact": "expected/tc-graphics-negative-001.json",
-      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
       "no_mock_boundary": "Parser-only safe-rejection assertion; image/render artifact proof is deferred to ft-hme39.2.",
       "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
       "follow_up_bead": "ft-hme39.2"

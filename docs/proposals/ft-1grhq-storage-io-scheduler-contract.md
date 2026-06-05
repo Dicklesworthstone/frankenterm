@@ -323,9 +323,9 @@ Implementation beads must use RCH for Cargo proof. The closeout lane should
 include focused commands such as:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-1grhq-storage-io cargo test -p frankenterm-core storage_io_scheduler
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-1grhq-storage-io cargo test -p frankenterm-core ft_lmg3g_storage_io
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-1grhq-storage-io cargo clippy -p frankenterm-core --all-targets -- -D warnings
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-1grhq-storage-io cargo test -p frankenterm-core storage_io_scheduler
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-1grhq-storage-io cargo test -p frankenterm-core ft_lmg3g_storage_io
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-1grhq-storage-io cargo clippy -p frankenterm-core --all-targets -- -D warnings
 ```
 
 Until `ft-tn6cw.1` is unblocked, failed RCH wrapper proof must be reported

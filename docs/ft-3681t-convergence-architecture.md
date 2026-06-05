@@ -296,7 +296,8 @@ For this architecture and each dependent bead:
 4. Structured logs carrying timestamp, subsystem, correlation ID, scenario ID,
    inputs, decisions, outcomes, reason/error code.
 5. Artifact bundles (stdout/stderr/logs/snapshots/reports), documented command
-   list, and heavy compute through `rch exec -- ...`.
+   list, and heavy compute through
+   `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...`.
 
 ## 9. Current Merge Points From Discovery Beads
 

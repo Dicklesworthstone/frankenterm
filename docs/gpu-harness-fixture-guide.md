@@ -132,7 +132,7 @@ duplicate the fixture scene in this file.
 Generate goldens with the explicit update gate:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target SET_GOLDEN=1 \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target SET_GOLDEN=1 \
   cargo test -p frankenterm-gui --features headless-render \
   --test gpu_regression -- --update-goldens --nocapture
 ```
@@ -156,7 +156,7 @@ fixture before committing.
 Run the harness again without `SET_GOLDEN=1` and without `--update-goldens`:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target \
   cargo test -p frankenterm-gui --features headless-render \
   --test gpu_regression -- --nocapture
 ```

@@ -91,7 +91,7 @@
       "fixture_path": "crates/frankenterm/tests/fixtures/golden_artifacts/robot_state_toon/local_single_pane.toon",
       "schema_path": "docs/json-schema/wa-robot-state.json",
       "doc_path": "README.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-cli-goldens cargo test -p frankenterm --test cli_golden_artifacts robot_state_toon_local_single_pane_matches_golden -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-cli-goldens cargo test -p frankenterm --test cli_golden_artifacts robot_state_toon_local_single_pane_matches_golden -- --nocapture",
       "notes": "Pins the stable TOON Robot success envelope for pane discovery."
     },
     {
@@ -107,7 +107,7 @@
       "fixture_path": "tests/goldens/toon/robot_get_text.toon",
       "schema_path": "docs/json-schema/wa-robot-get-text.json",
       "doc_path": "README.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_robot_get_text_matches_golden -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_robot_get_text_matches_golden -- --nocapture",
       "notes": "The degraded case is an ok envelope with data.truncated=true and truncation_info present."
     },
     {
@@ -123,7 +123,7 @@
       "fixture_path": "tests/goldens/toon/robot_search_results.toon",
       "schema_path": "docs/json-schema/wa-robot-search.json",
       "doc_path": "README.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_robot_search_results_matches_golden -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_robot_search_results_matches_golden -- --nocapture",
       "notes": "Pins lexical/semantic result fields including optional metrics."
     },
     {
@@ -139,7 +139,7 @@
       "fixture_path": null,
       "schema_path": "docs/json-schema/wa-robot-events.json",
       "doc_path": "README.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-schema cargo test -p frankenterm-core --test schema_golden -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-schema cargo test -p frankenterm-core --test schema_golden -- --nocapture",
       "notes": "Schema row for event fanout envelopes; dynamic event bodies are scrubbed by schema-level proof."
     },
     {
@@ -155,7 +155,7 @@
       "fixture_path": null,
       "schema_path": "docs/json-schema/wa-robot-rules-list.json",
       "doc_path": "README.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-schema cargo test -p frankenterm-core --test schema_golden -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-schema cargo test -p frankenterm-core --test schema_golden -- --nocapture",
       "notes": "Schema row for pattern-rule inventory envelopes."
     },
     {
@@ -171,7 +171,7 @@
       "fixture_path": null,
       "schema_path": null,
       "doc_path": "docs/robot-contracts/profile.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-profile cargo test -p frankenterm-core --lib robot_profile_handler::tests::apply_non_dry_run_returns_spawn_failed -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-profile cargo test -p frankenterm-core --lib robot_profile_handler::tests::apply_non_dry_run_returns_spawn_failed -- --nocapture",
       "notes": "Read and dry-run profile paths are wired; non-dry-run apply is typed unsupported until daemon-mediated pane spawning is connected."
     },
     {
@@ -187,7 +187,7 @@
       "fixture_path": null,
       "schema_path": null,
       "doc_path": "docs/robot-contracts/checkpoint.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-checkpoint cargo test -p frankenterm --bin ft robot_checkpoint_rollback_dry_run_and_approval_envelopes -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-checkpoint cargo test -p frankenterm --bin ft robot_checkpoint_rollback_dry_run_and_approval_envelopes -- --nocapture",
       "notes": "Pins the approval-required Robot envelope for mutating rollback without dry-run."
     },
     {
@@ -203,7 +203,7 @@
       "fixture_path": null,
       "schema_path": null,
       "doc_path": "docs/robot-contracts/context.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-ntm-gap cargo test -p frankenterm --test robot_ntm_gap_contract_tests robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-ntm-gap cargo test -p frankenterm --test robot_ntm_gap_contract_tests robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture",
       "notes": "Live context dispatch must stay native and never regress to robot.not_implemented."
     },
     {
@@ -219,7 +219,7 @@
       "fixture_path": null,
       "schema_path": null,
       "doc_path": "docs/robot-contracts/work.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-ntm-gap cargo test -p frankenterm --test robot_ntm_gap_contract_tests robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-ntm-gap cargo test -p frankenterm --test robot_ntm_gap_contract_tests robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture",
       "notes": "Live work dispatch must stay native and never regress to robot.not_implemented."
     },
     {
@@ -235,7 +235,7 @@
       "fixture_path": null,
       "schema_path": null,
       "doc_path": "docs/robot-contracts/fleet.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-fleet cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-fleet cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
       "notes": "Pins the native agent-inventory fleet status success path."
     },
     {
@@ -251,7 +251,7 @@
       "fixture_path": null,
       "schema_path": null,
       "doc_path": "docs/robot-contracts/fleet.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-fleet cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-fleet cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
       "notes": "Pins unavailable inventory as a typed backend error without reverting to the retired mutation stub."
     },
     {
@@ -267,7 +267,7 @@
       "fixture_path": "tests/goldens/toon/mcp_state_envelope.toon",
       "schema_path": "docs/json-schema/wa-mcp-envelope.json",
       "doc_path": "README.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_mcp_state_envelope_matches_golden -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_mcp_state_envelope_matches_golden -- --nocapture",
       "notes": "Pins the MCP success envelope shape for state-like tool responses."
     },
     {
@@ -283,7 +283,7 @@
       "fixture_path": "tests/goldens/toon/mcp_error_envelope.toon",
       "schema_path": "docs/json-schema/wa-mcp-envelope.json",
       "doc_path": "docs/security/read-path-redaction-matrix.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_mcp_error_envelope_matches_golden -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_mcp_error_envelope_matches_golden -- --nocapture",
       "notes": "Pins a representative blocked MCP error envelope with stable FT-MCP code and hint fields."
     },
     {
@@ -299,7 +299,7 @@
       "fixture_path": null,
       "schema_path": "docs/json-schema/wa-mcp-envelope.json",
       "doc_path": "docs/security/policy-denial-audit-wiring-matrix.md",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-mcp-policy cargo test -p frankenterm-core --lib mcp_tools::tests::mcp_authorize_mutation_tx_run_require_approval_is_fail_closed_ft_6h1rv -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-mcp-policy cargo test -p frankenterm-core --lib mcp_tools::tests::mcp_authorize_mutation_tx_run_require_approval_is_fail_closed_ft_6h1rv -- --nocapture",
       "notes": "MCP mutation surfaces fail closed when policy returns RequireApproval and no allow-once approval flow is available."
     }
   ]

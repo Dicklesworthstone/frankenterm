@@ -137,7 +137,8 @@ sufficient disk:
 export CARGO_TARGET_DIR=/tmp/ft-onheq-capacity-target
 export FT_CAPACITY_ARTIFACT_ROOT=tests/e2e/artifacts/ft-onheq/capacity-baseline/$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$FT_CAPACITY_ARTIFACT_ROOT"
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" bash -lc '<command>'
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+  cargo <subcommand> ...
 ```
 
 If free disk is below 20 GiB, record a blocked summary instead of starting a
@@ -157,7 +158,7 @@ Smallest local smoke once disk is healthy:
 
 ```bash
 export CARGO_TARGET_DIR=/tmp/ft-codex-ft5bdc5-target
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo test -p frankenterm-core --test capacity_governor_integration -- --nocapture
 ```
 
@@ -165,11 +166,11 @@ Target-class smoke:
 
 ```bash
 export CARGO_TARGET_DIR=/tmp/ft-onheq-capacity-target
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo test -p frankenterm-core --test capacity_governor_integration -- --nocapture
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo test -p frankenterm-core --test proptest_continuous_backpressure -- --nocapture
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo test -p frankenterm-core --test golden_workflow_execution -- --nocapture
 ```
 
@@ -177,11 +178,11 @@ Target-class benchmark lane:
 
 ```bash
 export CARGO_TARGET_DIR=/tmp/ft-onheq-capacity-target
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo bench -p frankenterm-core --bench delta_extraction
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo bench -p frankenterm-core --bench wal_throughput
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   cargo bench -p frankenterm-core --bench mcp_response
 ```
 
@@ -327,4 +328,4 @@ Regression-budget smoke gate (`ft-onheq.10`):
   `baseline_update_mode = requested`; the report emits a refresh instruction
   and hashes but does not mutate or rewrite any baseline artifact.
 - Bounded smoke command:
-  `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod5-target cargo test -p frankenterm-core --lib --no-default-features swarm_capacity_regression_budget`
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-cod5-target cargo test -p frankenterm-core --lib --no-default-features swarm_capacity_regression_budget`

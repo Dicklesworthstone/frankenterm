@@ -3846,7 +3846,7 @@ mod tests {
     #[test]
     fn proof_closeout_linter_accepts_complete_text_with_artifact_path() {
         let input = proof_closeout_lint_input(
-            "Proof-doctor: passed; selected_worker vmi-proof; command: rch exec -- cargo test; remote Cargo reached; rustc reached; test binary passed; proof lane passed; closeout safe.",
+            "Proof-doctor: passed; selected_worker vmi-proof; command: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test; remote Cargo reached; rustc reached; test binary passed; proof lane passed; closeout safe.",
             vec![ProofCloseoutLintArtifact {
                 artifact_path: "tests/e2e/artifacts/proof-closeout-text.json".into(),
                 records: Vec::new(),

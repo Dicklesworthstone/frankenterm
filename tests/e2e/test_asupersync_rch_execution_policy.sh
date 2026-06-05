@@ -241,6 +241,32 @@ if [[ "$(jq -r '.is_heavy' <<<"${timeout_wrapped_rch}")" != "true" || "$(jq -r '
   exit 1
 fi
 
+canonical_direct_rch="$("${VALIDATOR}" --classify "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo check --workspace --all-targets")"
+if [[ "$(jq -r '.is_heavy' <<<"${canonical_direct_rch}")" != "true" || "$(jq -r '.used_rch' <<<"${canonical_direct_rch}")" != "true" || "$(jq -r '.policy_violation' <<<"${canonical_direct_rch}")" != "false" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "canonical direct rch cargo command should be heavy, rch-backed, and policy-compliant"
+  exit 1
+fi
+
+bare_direct_rch="$("${VALIDATOR}" --classify "rch exec -- cargo test --workspace")"
+if [[ "$(jq -r '.is_heavy' <<<"${bare_direct_rch}")" != "true" || "$(jq -r '.used_rch' <<<"${bare_direct_rch}")" != "false" || "$(jq -r '.policy_violation' <<<"${bare_direct_rch}")" != "true" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "bare rch exec cargo command must not count as fail-closed proof"
+  exit 1
+fi
+
 light_cmd="$("${VALIDATOR}" --classify "cargo fmt --check")"
 if [[ "$(jq -r '.is_heavy' <<<"${light_cmd}")" != "false" ]]; then
   emit_log \
@@ -268,7 +294,7 @@ if [[ "$(jq -r '.is_heavy' <<<"${dry_run_diagnose}")" != "false" || "$(jq -r '.p
 fi
 
 dry_run_words_after_exec="$("${VALIDATOR}" --classify "rch exec -- cargo test diagnose --dry-run")"
-if [[ "$(jq -r '.is_heavy' <<<"${dry_run_words_after_exec}")" != "true" || "$(jq -r '.used_rch' <<<"${dry_run_words_after_exec}")" != "true" || "$(jq -r '.policy_violation' <<<"${dry_run_words_after_exec}")" != "false" ]]; then
+if [[ "$(jq -r '.is_heavy' <<<"${dry_run_words_after_exec}")" != "true" || "$(jq -r '.used_rch' <<<"${dry_run_words_after_exec}")" != "false" || "$(jq -r '.policy_violation' <<<"${dry_run_words_after_exec}")" != "true" ]]; then
   emit_log \
     "failed" \
     "unit_classifier" \
@@ -276,7 +302,7 @@ if [[ "$(jq -r '.is_heavy' <<<"${dry_run_words_after_exec}")" != "true" || "$(jq
     "classifier_mismatch" \
     "unexpected_classifier_result" \
     "$(basename "${VALIDATOR}")" \
-    "dry-run words after rch exec must not hide a real cargo test"
+    "dry-run words after bare rch exec must not hide a fail-open cargo test"
   exit 1
 fi
 

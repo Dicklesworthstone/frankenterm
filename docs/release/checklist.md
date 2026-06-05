@@ -55,12 +55,12 @@ catch common omissions.
    context-horizon behavior, verify the contract, schema, fixture, and
    read surfaces as repository evidence before tagging. At minimum run:
    ```bash
-   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-docs \
+   RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-docs \
      cargo test -p frankenterm --test docs_smoke \
      context_horizon_contract_docs_truth_gate -- --nocapture
-   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-core \
+   RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-core \
      cargo test -p frankenterm-core --lib context_horizon -- --nocapture
-   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-ft \
+   RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-ft \
      cargo test -p frankenterm --bin ft context_horizon -- --nocapture
    ```
    Retain the exact commands, selected worker/runtime reachability,
@@ -72,7 +72,7 @@ catch common omissions.
    caveated or `target_hardware_skipped` unless the high-scale evidence
    gate below also retains a target-class artifact.
 9. **Run the high-scale release evidence gate through RCH.** Ensure
-   `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-evidence cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features`
+   `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-release-evidence cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features`
    passes before publishing any 64-core / 256 GiB swarm-performance
    claim. Synthetic/local smoke manifests must render
    `SKIPPED_NOT_PROVEN`; only a real-hardware proof-gauntlet manifest
@@ -99,7 +99,7 @@ catch common omissions.
 
 - **Run the headline-claim benches through RCH.**
   ```bash
-  rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-headline-benches \
+  RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-release-headline-benches \
     cargo bench -p frankenterm-core
   ```
   Then review `target/criterion/wa-bench-distributions.jsonl` for any
@@ -115,7 +115,7 @@ catch common omissions.
   drift before users do.
 - **Test the e2e workflow trigger through RCH.**
   ```bash
-  rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-e2e-workflow \
+  RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-release-e2e-workflow \
     cargo test -p frankenterm --test e2e_workflow_trigger -- --nocapture
   ```
   Run this against the renamed binaries to confirm end-to-end paths still

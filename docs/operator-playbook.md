@@ -283,7 +283,7 @@ because a context-horizon row exists.
 6) Preserve proof accurately. For docs/schema changes, the focused truth gate is:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-r920m-6-docs-smoke \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-r920m-6-docs-smoke \
   cargo test -p frankenterm --test docs_smoke \
   context_horizon_contract_docs_truth_gate -- --nocapture
 ```

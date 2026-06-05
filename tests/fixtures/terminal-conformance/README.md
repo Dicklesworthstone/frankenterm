@@ -32,5 +32,5 @@ that consumes the promoted fixture.
 Proof command:
 
 ```bash
-RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture
 ```

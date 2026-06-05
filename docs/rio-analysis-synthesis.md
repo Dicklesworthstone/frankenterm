@@ -298,8 +298,8 @@ Scenario-specific required fields:
 For each mapped implementation bead, downstream agents must run:
 
 ```bash
-rch exec -- cargo test --workspace --all-targets
-rch exec -- cargo clippy --workspace --all-targets -- -D warnings
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace --all-targets
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 tests/e2e/rio/<scenario_script>.sh --fixtures fixtures/rio/<scenario_fixture> --run-id <run_id>
 ```

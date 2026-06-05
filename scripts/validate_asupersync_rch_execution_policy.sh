@@ -22,7 +22,18 @@ has_rch_prefix() {
   local cmd="$1"
   local trimmed
   trimmed="$(printf '%s' "${cmd}" | sed -E 's/^[[:space:]]+//')"
-  [[ "${trimmed}" =~ ^([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*(env[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*)?rch[[:space:]]+exec[[:space:]]+--([[:space:]]|$) ]]
+  [[ "${trimmed}" =~ ^([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*(env[[:space:]]+([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)*)?rch([[:space:]]+--[A-Za-z0-9][A-Za-z0-9_-]*(=[^[:space:]]+)*)*[[:space:]]+exec[[:space:]]+--([[:space:]]|$) ]]
+}
+
+has_fail_closed_rch_prefix() {
+  local cmd="$1"
+  local trimmed
+  trimmed="$(printf '%s' "${cmd}" | sed -E 's/^[[:space:]]+//')"
+
+  has_rch_prefix "${cmd}" || return 1
+  [[ "${trimmed}" =~ (^|[[:space:]])RCH_REQUIRE_REMOTE=1([[:space:]]|$) ]] || return 1
+  [[ "${trimmed}" =~ (^|[[:space:]])RCH_NO_SELF_HEALING=1([[:space:]]|$) ]] || return 1
+  [[ "${trimmed}" =~ (^|[[:space:]])rch([[:space:]]+--[A-Za-z0-9][A-Za-z0-9_-]*(=[^[:space:]]+)*)*[[:space:]]+--no-self-healing([[:space:]]+--[A-Za-z0-9][A-Za-z0-9_-]*(=[^[:space:]]+)*)*[[:space:]]+exec[[:space:]]+--([[:space:]]|$) ]]
 }
 
 has_rch_cargo_wrapper() {
@@ -72,13 +83,25 @@ classify_command_json() {
   local heavy="false"
   local used_rch="false"
   local requires_rch="false"
+  local direct_rch="false"
+  local fail_closed_direct_rch="false"
+  local wrapper_rch="false"
 
   if is_heavy_command "${cmd}"; then
     command_class="heavy"
     heavy="true"
     requires_rch="true"
   fi
-  if has_rch_prefix "${cmd}" || has_rch_cargo_wrapper "${cmd}"; then
+  if has_rch_prefix "${cmd}"; then
+    direct_rch="true"
+  fi
+  if has_fail_closed_rch_prefix "${cmd}"; then
+    fail_closed_direct_rch="true"
+  fi
+  if has_rch_cargo_wrapper "${cmd}"; then
+    wrapper_rch="true"
+  fi
+  if [[ "${wrapper_rch}" == "true" ]] || [[ "${fail_closed_direct_rch}" == "true" ]] || [[ "${heavy}" == "false" && "${direct_rch}" == "true" ]]; then
     used_rch="true"
   fi
 
@@ -1062,8 +1085,22 @@ run_self_test() {
   }
 
   out="$(classify_command_json "rch exec -- cargo test --workspace")"
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "false" ]] || {
+    echo "self-test failed: bare rch exec cargo must not count as fail-closed rch usage" >&2
+    return 1
+  }
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: bare rch exec cargo should be a policy violation" >&2
+    return 1
+  }
+
+  out="$(classify_command_json "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo test --workspace")"
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: canonical direct rch cargo should count as rch usage" >&2
+    return 1
+  }
   [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
-    echo "self-test failed: rch-wrapped heavy command should not be violation" >&2
+    echo "self-test failed: canonical direct rch cargo should not be violation" >&2
     return 1
   }
 
@@ -1072,22 +1109,22 @@ run_self_test() {
     echo "self-test failed: dry-run words after rch exec must not hide a cargo test" >&2
     return 1
   }
-  [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
-    echo "self-test failed: dry-run words after rch exec should still count as rch usage" >&2
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "false" ]] || {
+    echo "self-test failed: bare rch exec cargo with dry-run words must not count as fail-closed rch usage" >&2
     return 1
   }
-  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
-    echo "self-test failed: rch exec cargo test with dry-run words should remain policy-compliant" >&2
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: bare rch exec cargo test with dry-run words should be violation" >&2
     return 1
   }
 
   out="$(classify_command_json "TMPDIR=/tmp rch exec -- cargo test --workspace")"
-  [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
-    echo "self-test failed: env-prefixed rch command should still count as rch usage" >&2
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "false" ]] || {
+    echo "self-test failed: env-prefixed bare rch command must not count as fail-closed rch usage" >&2
     return 1
   }
-  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
-    echo "self-test failed: env-prefixed rch heavy command should not be violation" >&2
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: env-prefixed bare rch heavy command should be violation" >&2
     return 1
   }
 
@@ -1151,7 +1188,7 @@ run_self_test() {
   local remote_cmd remote_worker remote_target light_cmd_value light_worker light_target
   local remote_cmd_fp remote_worker_fp remote_target_fp light_cmd_fp light_worker_fp light_target_fp
   local artifact_paths_fp empty_fp remote_repo_snapshot
-  remote_cmd="rch exec -- cargo test --workspace"
+  remote_cmd="RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace"
   remote_worker="worker=mock-1"
   remote_target="/tmp/ft-kvs1e-rch-target"
   light_cmd_value="cargo fmt --check"

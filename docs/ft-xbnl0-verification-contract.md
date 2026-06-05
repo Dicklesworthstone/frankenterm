@@ -23,7 +23,9 @@ If a lower-level spec conflicts with this document, follow the more specific rul
 Every non-planning finish-line bead must satisfy all of these:
 
 1. Closure claims must be backed by artifacts on disk, not by chat memory.
-2. Heavy compile, clippy, test, bench, or E2E verification must run through `rch exec -- ...` or through a harness that fails closed via `tests/e2e/lib_rch_guards.sh`.
+2. Heavy compile, clippy, test, bench, or E2E verification must run through
+   `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...`
+   or through a harness that fails closed via `tests/e2e/lib_rch_guards.sh`.
 3. A bead may close only if its proof includes exact commands, exact artifact paths, and enough logs to diagnose failure without rerunning from scratch.
 4. If a lane narrows scope instead of implementing behavior, the code, docs, and tests must all reflect the narrower contract explicitly.
 5. Consuming a dependency bead's evidence is allowed, but the closing note must cite the exact upstream artifact bundle instead of vaguely referring to earlier work.
@@ -45,7 +47,9 @@ Required for every implementation bead.
 
 Required for every finish-line bead that runs Cargo verification.
 
-- Run the required Cargo commands via `rch exec -- ...` or a fail-closed harness.
+- Run the required Cargo commands via
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...`
+  or a fail-closed harness.
 - Use explicit target dirs such as `target/rch-<bead>-<purpose>`.
 - Record the exact remote commands in the closing comment or artifact manifest.
 - Retain and cite proof-ledger JSONL plus the aggregate report when the lane
@@ -86,10 +90,10 @@ Required only for operator-facing lanes such as docs, first-run setup, doctor/di
 The default command style for finish-line work is:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo test -p <crate> <filter> -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo check -p <crate> --all-targets
-rch exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo clippy --no-deps -p <crate> --all-targets -- -D warnings
-rch exec -- cargo fmt --check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo test -p <crate> <filter> -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo check -p <crate> --all-targets
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo clippy --no-deps -p <crate> --all-targets -- -D warnings
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo fmt --check
 ```
 
 If a lane needs a shell harness, it must fail closed on `rch` fallback and record the same commands inside its logs. Placeholder-remediation harnesses under `tests/e2e/` using `lib_rch_guards.sh` already satisfy this pattern and should be treated as the model.
@@ -156,10 +160,10 @@ The minimum remote-verification profile is:
 Representative remote command set for substrate validation:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=target/rch-<bead>-build cargo build -p frankenterm --bin ft
-rch exec -- env CARGO_TARGET_DIR=target/rch-<bead>-test cargo test -p frankenterm-ssh match_exec -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=target/rch-<bead>-lint cargo clippy --no-deps -p frankenterm-ssh --all-targets -- -D warnings
-rch exec -- cargo fmt --check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-build cargo build -p frankenterm --bin ft
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-test cargo test -p frankenterm-ssh match_exec -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-lint cargo clippy --no-deps -p frankenterm-ssh --all-targets -- -D warnings
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo fmt --check
 bash tests/e2e/test_ft_akx00_7_4_ssh_match_exec.sh
 ```
 
@@ -395,7 +399,7 @@ Every finish-line closeout should be able to answer this template directly:
 Bead: <id>
 Claim: <what is now true>
 Exact commands:
-- rch exec -- ...
+- RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...
 - bash tests/e2e/...
 Artifacts:
 - <absolute artifact dir>

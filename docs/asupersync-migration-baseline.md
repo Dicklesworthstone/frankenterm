@@ -200,9 +200,9 @@ bash scripts/validate_asupersync_cutover_runtime_guards.sh --self-test
 bash tests/e2e/test_ft_e34d9_10_8_2_cutover_runtime_guards.sh
 
 # For heavy compile/test/clippy runs, offload with rch
-rch exec -- cargo check --workspace --all-targets
-rch exec -- cargo clippy --workspace --all-targets -- -D warnings
-rch exec -- cargo test --workspace
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check --workspace --all-targets
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo clippy --workspace --all-targets -- -D warnings
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace
 ```
 
 ### Current blocker note

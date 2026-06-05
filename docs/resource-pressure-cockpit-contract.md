@@ -341,8 +341,8 @@ Required proof posture for future implementation:
 | Claim | Minimum proof |
 | --- | --- |
 | Schema/doc shape only | Local static checks such as `jq empty`, markdown grep, and `git diff --check`. |
-| Rust type or CLI emission compiles | `rch exec -- cargo check ...` with retained command output. |
-| Robot/doctor output emits the cockpit | `rch exec -- cargo test ...` or RCH-backed e2e harness with artifact paths retained. |
+| Rust type or CLI emission compiles | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check ...` with retained command output. |
+| Robot/doctor output emits the cockpit | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test ...` or RCH-backed e2e harness with artifact paths retained. |
 | High-scale or 200+ pane cockpit claim | Target hardware predicate from `ft doctor --json`: at least 64 logical CPUs and 256 GiB memory, plus retained artifacts. Otherwise report `skipped_not_proven`. |
 | Auto-tuning or live mutation | Fresh measured cockpit, proof gate not `skipped_proof`, action receipts retained, rollback/cooldown behavior tested. |
 

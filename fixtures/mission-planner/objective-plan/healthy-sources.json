@@ -375,7 +375,7 @@
       "proof_kind": "rch_cargo",
       "required": true,
       "status": "passed",
-      "command": "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo check -p frankenterm-core --lib",
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo check -p frankenterm-core --lib",
       "artifact_paths": [
         "fixtures/mission-planner/objective-plan/healthy-sources.json"
       ]

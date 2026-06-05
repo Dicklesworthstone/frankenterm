@@ -545,6 +545,6 @@
       "error_code",
       "artifact_path"
     ],
-    "heavy_compute_policy": "rch exec -- <command>"
+    "heavy_compute_policy": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- <command>"
   }
 }

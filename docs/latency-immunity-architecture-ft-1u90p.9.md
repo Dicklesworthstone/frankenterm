@@ -254,9 +254,9 @@ Only recommendations with `EV >= 2.0` are implementation candidates.
 All CPU-intensive checks for this track must use `rch`:
 
 ```bash
-rch exec -- cargo check --workspace --all-targets
-rch exec -- cargo clippy --workspace --all-targets -- -D warnings
-rch exec -- cargo test --workspace
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check --workspace --all-targets
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo clippy --workspace --all-targets -- -D warnings
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace
 ```
 
 ## Rollback and Safety

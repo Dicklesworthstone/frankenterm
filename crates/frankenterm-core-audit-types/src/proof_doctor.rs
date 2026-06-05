@@ -1011,7 +1011,7 @@ fn classify_command_shape(
                 ProofDoctorBlockerKind::CommandShape,
                 "proof.command.shell_wrapped_rch_unclassified",
                 "Shell-wrapped RCH Cargo cannot be claimed as remote proof without positive remote-Cargo evidence.",
-                "Use direct `rch exec -- env CARGO_TARGET_DIR=... cargo ...` or retain metadata proving remote Cargo started.",
+                "Use direct `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=... cargo ...` or retain metadata proving remote Cargo started.",
             )
             .with_evidence("intended_command"),
         );
@@ -1023,7 +1023,7 @@ fn classify_command_shape(
             ProofDoctorBlocker::block(
                 ProofDoctorBlockerKind::CommandShape,
                 "proof.command.rch_cargo_shape_required",
-                "RCH-required proof must be a direct `rch exec -- ... cargo ...` command.",
+                "RCH-required proof must be a direct `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ... cargo ...` command.",
                 "Rewrite the command into direct RCH Cargo argv form before using it as proof.",
             )
             .with_evidence("intended_command"),

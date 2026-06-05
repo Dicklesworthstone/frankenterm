@@ -376,7 +376,7 @@ fn target_dir() -> PathBuf {
 
 fn proof_command(target_dir: &std::path::Path, test_name: &str) -> String {
     format!(
-        "rch exec -- env CARGO_TARGET_DIR={} cargo test -p frankenterm-core --test scale_lab_smoke_harness --no-default-features {test_name} -- --nocapture",
+        "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR={} cargo test -p frankenterm-core --test scale_lab_smoke_harness --no-default-features {test_name} -- --nocapture",
         target_dir.display(),
     )
 }

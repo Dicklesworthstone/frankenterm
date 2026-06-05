@@ -99,7 +99,7 @@ The script must include:
 Heavy compile/test/clippy/benchmark workloads for runtime migration must run via:
 
 ```bash
-rch exec -- <command>
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- <command>
 ```
 
 ## Consequences

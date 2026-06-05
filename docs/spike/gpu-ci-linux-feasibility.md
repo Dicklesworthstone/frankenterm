@@ -59,7 +59,7 @@ determinism or cross-platform golden reuse by itself.
 All Cargo probes use the required isolated target dir:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target \
   cargo test -p frankenterm-gui --features headless-render \
   --test gpu_regression -- --headless-render-self-test --nocapture
 ```
@@ -67,7 +67,7 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target \
 The corresponding fixture-only scaffold command is:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-cod_3-target \
   cargo test -p frankenterm-gui --test gpu_regression -- --self-test --nocapture
 ```
 
@@ -84,7 +84,7 @@ initializes. It cannot yet prove macOS Metal and Linux Mesa can share one
 golden set because there are no real headless terminal fixtures and no
 cross-runner artifact pair to compare.
 
-The required `rch exec` probe executed on the local Darwin host rather than a
+The required fail-closed RCH probe executed on the local Darwin host rather than a
 Linux worker for this non-standard test invocation (`rch exec -- uname -a`
 reported `Darwin Mac-mini-max 25.2.0 ... arm64`). That makes the Metal
 repeatability result concrete, but leaves Linux llvmpipe/lavapipe unmeasured.

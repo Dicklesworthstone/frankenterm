@@ -141,7 +141,7 @@ surface:
 
 | Output field | Analyzer source |
 |---|---|
-| `command.normalized` | The `cargo ...` suffix after wrappers such as `rch exec --` or `env`. |
+| `command.normalized` | The `cargo ...` suffix after wrappers such as `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --` or `env`. |
 | `command.classification` | Cargo subcommand family such as `cargo_test`, `cargo_check`, `cargo_clippy`, or `cargo_build`. |
 | `command.target_dir` | `CARGO_TARGET_DIR`, `--target-dir VALUE`, or `--target-dir=VALUE`. |
 | `cargo_jobs` | Explicit `cargo -j`, `cargo --jobs`, or `CARGO_BUILD_JOBS` value when present. |

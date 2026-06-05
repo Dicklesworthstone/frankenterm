@@ -159,7 +159,7 @@ Use remote offload for cargo-heavy checks:
 
 ```bash
 rch workers probe --json --all
-rch exec -- cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture
 tests/e2e/test_ft_3681t_1_5_1_traceability_matrix.sh
 ```
 

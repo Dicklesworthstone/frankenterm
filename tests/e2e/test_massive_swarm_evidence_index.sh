@@ -89,7 +89,7 @@ jq -e \
     and (.evidence.cpu_count | type == "number" and . < $target_cpu)
     and (.evidence.memory_bytes | type == "number" and . < $target_memory)
     and (.evidence.command | type == "string" and length > 0)
-    and (.evidence.command | startswith("rch exec --"))
+    and (.evidence.command | startswith("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --"))
     and ((.evidence.command | startswith("cargo test ")) | not)
     and (.evidence.elapsed_ms | type == "number" and . > 0)
     and (.evidence.git_commit | type == "string" and length > 0)
@@ -98,13 +98,13 @@ jq -e \
     .scenario_id == "synthetic_1k_churn"
     and .status == "PASSED"
     and .evidence_source == "synthetic"
-    and (.evidence.command | startswith("rch exec --"))
+    and (.evidence.command | startswith("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --"))
   )
   and any(.proofs[];
     .scenario_id == "synthetic_5k_event_storm"
     and .status == "PASSED"
     and .evidence_source == "rch_remote"
-    and (.evidence.command | startswith("rch exec --"))
+    and (.evidence.command | startswith("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --"))
   )
 ' "${INDEX}" >/dev/null || fail "reduced synthetic/RCH proof rows are incomplete or overclaim target hardware"
 

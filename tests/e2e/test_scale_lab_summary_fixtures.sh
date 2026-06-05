@@ -278,7 +278,7 @@ fail!("workload catalog pane count drifted") unless pane_count == catalog["targe
 fail!("workload catalog must stay below target-class CPU") unless catalog.dig("host", "cpu_cores") < TARGET_CPU_COUNT
 fail!("workload catalog must stay below target-class memory") unless catalog.dig("host", "memory_gib") < 256
 fail!("workload catalog must not claim live mux") unless catalog.dig("host", "live_mux_available") == false
-fail!("workload command must stay RCH-offloaded") unless catalog.dig("command", "command_line").start_with?("rch exec --")
+fail!("workload command must stay fail-closed RCH-offloaded") unless catalog.dig("command", "command_line").start_with?("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --")
 fail!("workload catalog should use no-default-features") unless catalog.dig("command", "feature_flags", "default_features") == false
 fail!("workload events must stay lossless") unless catalog.dig("events", "dropped_events") == 0 &&
   catalog.dig("events", "capture_gaps") == 0

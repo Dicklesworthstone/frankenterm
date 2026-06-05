@@ -8606,7 +8606,7 @@ mod tests {
     #[test]
     fn handle_on_error_format_cass_hint_basic() {
         let hit_record = CassSearchHit {
-            content: Some("Fix: use rch exec -- cargo test instead of direct cargo".to_string()),
+            content: Some("Fix: use RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test instead of direct cargo".to_string()),
             source_path: Some("/tmp/session.jsonl".to_string()),
             line_number: Some(42),
             ..Default::default()

@@ -257,11 +257,11 @@ Compiled proof must run through RCH, not local Cargo. The implementation bead
 should retain logs for these lanes:
 
 ```bash
-rch exec -- cargo test -p frankenterm-core --lib redactor::
-rch exec -- cargo test -p frankenterm-core --lib scrollback_cold_tier_pipeline::
-rch exec -- cargo test -p frankenterm-core --lib scrollback_mmap_writer::
-rch exec -- cargo test -p frankenterm-core --test cold_tier_privacy_integration
-rch exec -- cargo check -p frankenterm-core --lib
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --lib redactor::
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --lib scrollback_cold_tier_pipeline::
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --lib scrollback_mmap_writer::
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --test cold_tier_privacy_integration
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check -p frankenterm-core --lib
 ```
 
 Static proof before the RCH lanes:

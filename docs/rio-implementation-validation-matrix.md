@@ -45,11 +45,11 @@ All implementation beads mapped above must include these command classes in note
 
 1. Unit/integration:
 ```bash
-rch exec -- cargo test --workspace --all-targets
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace --all-targets
 ```
 2. Lint:
 ```bash
-rch exec -- cargo clippy --workspace --all-targets -- -D warnings
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
 3. Formatting:
 ```bash

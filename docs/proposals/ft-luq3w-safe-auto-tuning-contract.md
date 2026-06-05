@@ -269,7 +269,7 @@ RCH_NO_UPDATE_CHECK=1 \
 RCH_EXTERNAL_TIMEOUT_ENABLED=false \
 RCH_BUILD_TIMEOUT_SEC=3600 \
 RCH_TEST_TIMEOUT_SEC=3600 \
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-luq3w-auto-tune-target \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-luq3w-auto-tune-target \
   cargo test -p frankenterm-core --lib --no-default-features auto_tune -- --nocapture
 ```
 

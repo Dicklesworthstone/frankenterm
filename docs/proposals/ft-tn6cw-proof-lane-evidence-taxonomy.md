@@ -16,7 +16,7 @@ Existing repo contracts already require remote and artifact-backed proof:
 
 | Surface | Current anchor | Contract relevance |
 | --- | --- | --- |
-| Finish-line proof | `docs/ft-xbnl0-verification-contract.md` | Requires exact commands, retained artifacts, `rch exec -- ...` for heavy Cargo verification, and honest artifact paths before closing implementation beads. |
+| Finish-line proof | `docs/ft-xbnl0-verification-contract.md` | Requires exact commands, retained artifacts, `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...` for heavy Cargo verification, and honest artifact paths before closing implementation beads. |
 | Test artifact logs | `docs/test-logging-contract.md` | Defines `summary.json`, `structured.log`, command capture, redaction, and `*.rch_meta.json` sidecars for RCH-aware harnesses. |
 | RCH fail-closed shell library | `tests/e2e/lib_rch_guards.sh` | Existing extraction and metadata precedent for selected worker, worker probe, sync duration, remote exit code, wrapper exit code, timeout, and fail-open detection. |
 | High-core proof | `docs/high-core-swarm-runbook.md` | Separates local or undersized smoke from real 64-core / 256 GiB proof and requires `skipped_not_proven` when the predicate is absent. |
@@ -147,7 +147,7 @@ being hidden behind later success-looking text.
 The direct form is the normal remote proof shape:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target \
   cargo test -p <crate> <filter> -- --nocapture
 ```
 
@@ -305,7 +305,7 @@ closing comments must not imply workspace Cargo health.
   "git_head": "abcdef123456",
   "branch": "main",
   "dirty_tree_summary": "owned paths only",
-  "command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-example-target cargo test -p frankenterm-core --lib example_filter -- --nocapture",
+  "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-example-target cargo test -p frankenterm-core --lib example_filter -- --nocapture",
   "working_dir": "/Users/jemanuel/projects/frankenterm",
   "target_dir": "/tmp/ft-example-target",
   "proof_scope": "cargo_test",
@@ -351,7 +351,7 @@ closing comments must not imply workspace Cargo health.
   "git_head": "abcdef123456",
   "branch": "main",
   "dirty_tree_summary": "shared tree dirty outside owned paths",
-  "command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-example-target cargo check -p frankenterm-core --lib",
+  "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-example-target cargo check -p frankenterm-core --lib",
   "working_dir": "/Users/jemanuel/projects/frankenterm",
   "target_dir": "/tmp/ft-example-target",
   "proof_scope": "cargo_check",
@@ -463,7 +463,7 @@ closing comments must not imply workspace Cargo health.
   "artifact_retrieval_status": "not_applicable",
   "proof_state": "LOCAL_INVALID",
   "reason_code": "local_invalid_shell_wrapped_rch",
-  "operator_interpretation": "Shell-wrapped RCH command was not valid remote Cargo proof; rerun with direct `rch exec -- env CARGO_TARGET_DIR=... cargo ...`.",
+  "operator_interpretation": "Shell-wrapped RCH command was not valid remote Cargo proof; rerun with direct `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=... cargo ...`.",
   "safe_to_close": false,
   "high_scale_predicate": null,
   "stdout_artifact": null,
@@ -480,7 +480,7 @@ closing comments must not imply workspace Cargo health.
 `ft-tn6cw.3` must include unit tests for every v1 taxonomy state and reason
 code. The fixtures must cover at least:
 
-- direct `rch exec -- env CARGO_TARGET_DIR=... cargo test ...` with
+- direct `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=... cargo test ...` with
   `remote_exit_code=0` -> `PASS`;
 - remote Cargo/rustc compile error -> `SOURCE_COMPILE_FAIL`;
 - remote test assertion failure -> `TEST_FAIL`;

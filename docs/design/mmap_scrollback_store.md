@@ -68,7 +68,10 @@ Store API in `mmap_store.rs` includes:
 
 - `tests/e2e/test_ft_8vla_mmap_scrollback.sh`
 - Emits structured JSONL logs (`tests/e2e/logs/ft_8vla_mmap_scrollback_*.jsonl`) with nominal, failure-injection, recovery, and benchmark-compile checks.
-- Executes cargo workloads through `rch exec -- ...` and now fails closed if workers are unreachable or `rch` falls back to local execution.
+- Executes cargo workloads through
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...`
+  and now fails closed if workers are unreachable or `rch` falls back to local
+  execution.
 - Uses a repo-relative `target/rch-e2e-ft-8vla-<run_id>` target dir for repeated remote legs so `rch` can keep the same artifact tree stable across steps; this avoids the `/tmp`-scoped dep-info churn that can break later remote `cargo test` invocations.
 - Uses `cargo check -p frankenterm-core --bench mmap_scrollback --message-format short` for the benchmark compile contract. This matches the repo's other bench guards, stays on `rch`'s remote-only path, and avoids the unstable full remote bench-link path that was failing independently of the mmap logic.
 - On macOS, forces `TMPDIR=/tmp` for `rch` invocations to avoid ControlMaster socket path-length failures from masquerading as remote-offload success.

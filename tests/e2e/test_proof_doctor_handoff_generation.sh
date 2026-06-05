@@ -32,7 +32,9 @@ PASS=0
 FAIL=0
 
 proof_command=(
-  rch exec --
+  RCH_REQUIRE_REMOTE=1
+  RCH_NO_SELF_HEALING=1
+  rch --no-self-healing exec --
   env CARGO_INCREMENTAL=0 "CARGO_TARGET_DIR=${REMOTE_TARGET_DIR}"
   cargo test -p frankenterm-core-caut-types --lib proof_doctor_handoff_fixture -- --nocapture
 )
@@ -336,7 +338,9 @@ run_proof_doctor "observed_skipped_not_proven" "skipped_not_proven" --evidence-a
 # This probe is intentionally tolerant: in a clean checkout it should be
 # runnable; in a shared dirty checkout it must classify as dirty_tree_blocked.
 dirty_command=(
-  rch exec --
+  RCH_REQUIRE_REMOTE=1
+  RCH_NO_SELF_HEALING=1
+  rch --no-self-healing exec --
   env CARGO_INCREMENTAL=0 "CARGO_TARGET_DIR=${REMOTE_TARGET_DIR}"
   cargo test -p frankenterm-core --lib swarm_scheduler_dirty_probe -- --nocapture
 )

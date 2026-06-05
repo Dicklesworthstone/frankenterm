@@ -16,20 +16,61 @@ LIVE_RCH_SURFACES=(
   "crates/frankenterm-core/src/test_artifacts.rs"
   "crates/frankenterm-core-replay/src/replay_decision_diff.rs"
   "crates/frankenterm-core-replay/src/replay_resource_digital_twin.rs"
+  "crates/frankenterm-core-audit-types/src/proof_doctor.rs"
+  "crates/frankenterm-core-audit-types/src/proof_lane.rs"
+  "crates/frankenterm-core/src/workflows/handlers.rs"
   "crates/frankenterm-core/tests/fixtures/blocker_radar/claimability_cases.json"
   "crates/frankenterm-core/tests/fixtures/blocker_radar/conformance_cases.json"
   "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json"
   "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json"
+  "crates/frankenterm-core/tests/scale_lab_smoke_harness.rs"
+  "frankenterm/escape-parser/tests/terminal_conformance_corpus.rs"
+  "tests/e2e/test_ft_782hw_4_proof_doctor_handoff.sh"
+  "tests/e2e/test_proof_doctor_handoff_generation.sh"
+  "tests/fixtures/terminal-conformance/manifest.json"
+  "tests/fixtures/terminal-conformance/README.md"
+  "tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json"
 )
 DOCS=(
+  "docs/adr/0012-asupersync-runtime-doctrine.md"
+  "docs/asupersync-migration-baseline.md"
+  "docs/asupersync-migration-playbook.md"
+  "docs/asupersync-migration-scoreboard.json"
+  "docs/asupersync-migration-scoreboard.md"
   "docs/asupersync-rch-execution-policy.md"
+  "docs/design/mmap_scrollback_store.md"
+  "docs/design/ntm-fcp-convergence-architecture.md"
+  "docs/ft-3681t-convergence-architecture.md"
+  "docs/ft-xbnl0-verification-contract.md"
+  "docs/gpu-harness-fixture-guide.md"
+  "docs/high-core-swarm-runbook.md"
+  "docs/high-scale-operator-rehearsals.md"
+  "docs/latency-immunity-architecture-ft-1u90p.9.md"
+  "docs/operator-playbook.md"
   "docs/operator-runbook.md"
+  "docs/perf/swarm-capacity-baseline.md"
+  "docs/proposals/ft-1grhq-storage-io-scheduler-contract.md"
+  "docs/proposals/ft-luq3w-safe-auto-tuning-contract.md"
+  "docs/rch-admission-contract.md"
+  "docs/release/checklist.md"
+  "docs/resource-pressure-cockpit-contract.md"
   "docs/terminal-conformance-contract.md"
+  "docs/test-logging-contract.md"
+  "docs/rio-analysis-synthesis.md"
+  "docs/rio-implementation-validation-matrix.md"
   "docs/robot-contracts/api-surface-coverage.md"
   "docs/robot-contracts/checkpoint.md"
   "docs/robot-contracts/current-ntm-gap-dispatch.md"
   "docs/robot-contracts/fleet.md"
   "docs/robot-contracts/work.md"
+  "docs/security/redaction-evidence-byte-semantics.md"
+  "docs/spike/gpu-ci-linux-feasibility.md"
+  "docs/tuning-reference.md"
+)
+DOCS_WITH_INTENTIONAL_INVALID_RCH_EXAMPLES=(
+  "docs/proposals/ft-tn6cw-proof-lane-evidence-contract.md"
+  "docs/proposals/ft-tn6cw-proof-lane-evidence-taxonomy.md"
+  "docs/proposals/ft-wik9p-proof-doctor-verdict-schema.md"
 )
 
 fail() {
@@ -55,6 +96,9 @@ done
 for doc in "${DOCS[@]}"; do
   require_file "${doc}"
 done
+for doc in "${DOCS_WITH_INTENTIONAL_INVALID_RCH_EXAMPLES[@]}"; do
+  require_file "${doc}"
+done
 
 ruby <<'RUBY'
 AGENTS = "AGENTS.md"
@@ -68,20 +112,61 @@ LIVE_RCH_SURFACES = [
   "crates/frankenterm-core/src/test_artifacts.rs",
   "crates/frankenterm-core-replay/src/replay_decision_diff.rs",
   "crates/frankenterm-core-replay/src/replay_resource_digital_twin.rs",
+  "crates/frankenterm-core-audit-types/src/proof_doctor.rs",
+  "crates/frankenterm-core-audit-types/src/proof_lane.rs",
+  "crates/frankenterm-core/src/workflows/handlers.rs",
   "crates/frankenterm-core/tests/fixtures/blocker_radar/claimability_cases.json",
   "crates/frankenterm-core/tests/fixtures/blocker_radar/conformance_cases.json",
   "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
-  "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json"
+  "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+  "crates/frankenterm-core/tests/scale_lab_smoke_harness.rs",
+  "frankenterm/escape-parser/tests/terminal_conformance_corpus.rs",
+  "tests/e2e/test_ft_782hw_4_proof_doctor_handoff.sh",
+  "tests/e2e/test_proof_doctor_handoff_generation.sh",
+  "tests/fixtures/terminal-conformance/manifest.json",
+  "tests/fixtures/terminal-conformance/README.md",
+  "tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json"
 ]
 CONTRACT_DOCS = [
+  "docs/adr/0012-asupersync-runtime-doctrine.md",
+  "docs/asupersync-migration-baseline.md",
+  "docs/asupersync-migration-playbook.md",
+  "docs/asupersync-migration-scoreboard.json",
+  "docs/asupersync-migration-scoreboard.md",
   "docs/asupersync-rch-execution-policy.md",
+  "docs/design/mmap_scrollback_store.md",
+  "docs/design/ntm-fcp-convergence-architecture.md",
+  "docs/ft-3681t-convergence-architecture.md",
+  "docs/ft-xbnl0-verification-contract.md",
+  "docs/gpu-harness-fixture-guide.md",
+  "docs/high-core-swarm-runbook.md",
+  "docs/high-scale-operator-rehearsals.md",
+  "docs/latency-immunity-architecture-ft-1u90p.9.md",
+  "docs/operator-playbook.md",
   "docs/operator-runbook.md",
+  "docs/perf/swarm-capacity-baseline.md",
+  "docs/proposals/ft-1grhq-storage-io-scheduler-contract.md",
+  "docs/proposals/ft-luq3w-safe-auto-tuning-contract.md",
+  "docs/rch-admission-contract.md",
+  "docs/release/checklist.md",
+  "docs/resource-pressure-cockpit-contract.md",
   "docs/terminal-conformance-contract.md",
+  "docs/test-logging-contract.md",
+  "docs/rio-analysis-synthesis.md",
+  "docs/rio-implementation-validation-matrix.md",
   "docs/robot-contracts/api-surface-coverage.md",
   "docs/robot-contracts/checkpoint.md",
   "docs/robot-contracts/current-ntm-gap-dispatch.md",
   "docs/robot-contracts/fleet.md",
-  "docs/robot-contracts/work.md"
+  "docs/robot-contracts/work.md",
+  "docs/security/redaction-evidence-byte-semantics.md",
+  "docs/spike/gpu-ci-linux-feasibility.md",
+  "docs/tuning-reference.md"
+]
+INTENTIONAL_INVALID_RCH_DOCS = [
+  "docs/proposals/ft-tn6cw-proof-lane-evidence-contract.md",
+  "docs/proposals/ft-tn6cw-proof-lane-evidence-taxonomy.md",
+  "docs/proposals/ft-wik9p-proof-doctor-verdict-schema.md"
 ]
 
 def fail!(message)
@@ -139,6 +224,16 @@ CONTRACT_DOCS.each do |path|
   end
   if doc.match?(/(^|\s)rch exec --\s+env\s+CARGO_TARGET_DIR=/)
     fail!("#{path} still has bare rch exec")
+  end
+  if doc.match?(/(^|\s)RCH_REQUIRE_REMOTE=1\s+rch exec --/)
+    fail!("#{path} still omits --no-self-healing")
+  end
+end
+
+INTENTIONAL_INVALID_RCH_DOCS.each do |path|
+  doc = File.read(path)
+  required_snippets.each do |snippet|
+    fail!("#{path} missing #{snippet}") unless doc.include?(snippet)
   end
   if doc.match?(/(^|\s)RCH_REQUIRE_REMOTE=1\s+rch exec --/)
     fail!("#{path} still omits --no-self-healing")

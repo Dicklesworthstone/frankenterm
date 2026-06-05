@@ -102,7 +102,8 @@ Each harness must append:
 - the `ensure_rch_ready` invocation, including whether smoke preflight was
   skipped
 - every material local shell command
-- every `rch exec -- ...` command exactly as launched
+- every `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- ...`
+  command exactly as launched
 
 If a failure can only be understood from metadata, `summary.json` must point to
 the corresponding `*.rch_meta.json` sidecar rather than relying on a prose-only
