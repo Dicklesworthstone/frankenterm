@@ -57,6 +57,13 @@ fn strip_code_ticks(value: &str) -> String {
         .to_string()
 }
 
+fn is_fail_closed_rch_cargo_lane(command: &str) -> bool {
+    command.contains("RCH_REQUIRE_REMOTE=1")
+        && command.contains("RCH_NO_SELF_HEALING=1")
+        && command.contains("rch --no-self-healing exec -- env ")
+        && !command.contains("rch exec -- env ")
+}
+
 fn parse_rows(markdown: &str) -> Result<Vec<CoverageRow>, Vec<String>> {
     let mut in_matrix = false;
     let mut rows = Vec::new();
@@ -322,9 +329,9 @@ fn validate_artifact_references(rows: &[CoverageRow]) -> Result<(), Vec<String>>
             }
         }
 
-        if !row.proof_lane.starts_with("rch exec -- env ") {
+        if !is_fail_closed_rch_cargo_lane(&row.proof_lane) {
             errors.push(format!(
-                "{} proof lane must run through rch: {}",
+                "{} proof lane must use fail-closed RCH: {}",
                 row.surface, row.proof_lane
             ));
         }
@@ -404,7 +411,7 @@ fn matrix_parser_rejects_omitted_surface() {
 
 | Surface | Category | Robot CLI | MCP surface | Schema artifact | Docs artifact | Golden or matrix artifact | Proof lane | Status |
 |---|---|---|---|---|---|---|---|---|
-| `get-text` | `pane` | `ft robot get-text <pane_id>` | `wa.get_text` | `docs/json-schema/wa-robot-get-text.json` | `docs/cli-reference.md` | `crates/frankenterm-core/tests/golden_robot_envelope/wa_get_text.json` | `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-b7ysg-api-surface cargo test -p frankenterm-core --test conformance_robot_api_surface_coverage -- --nocapture` | COVERED |
+| `get-text` | `pane` | `ft robot get-text <pane_id>` | `wa.get_text` | `docs/json-schema/wa-robot-get-text.json` | `docs/cli-reference.md` | `crates/frankenterm-core/tests/golden_robot_envelope/wa_get_text.json` | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-b7ysg-api-surface cargo test -p frankenterm-core --test conformance_robot_api_surface_coverage -- --nocapture` | COVERED |
 ";
     let rows = parse_rows(markdown).expect("fixture matrix should parse");
     let errors = validate_surface_set(&rows).expect_err("omitted surfaces must fail");

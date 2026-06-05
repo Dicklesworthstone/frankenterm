@@ -2770,8 +2770,13 @@ mod tests {
         assert_eq!(matrix.schema_version, REHEARSAL_SCORE_SCHEMA_VERSION);
         assert_eq!(matrix.generated_by, "ft-oohsx.1-rehearsal-score-contract");
         assert!(
-            matrix.proof_target.starts_with("rch exec -- env "),
-            "proof target must use rch: {}",
+            matrix.proof_target.contains("RCH_REQUIRE_REMOTE=1")
+                && matrix.proof_target.contains("RCH_NO_SELF_HEALING=1")
+                && matrix
+                    .proof_target
+                    .contains("rch --no-self-healing exec -- env ")
+                && !matrix.proof_target.contains("rch exec -- env "),
+            "proof target must use fail-closed RCH: {}",
             matrix.proof_target
         );
         assert!(

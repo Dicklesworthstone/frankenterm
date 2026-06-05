@@ -1280,7 +1280,7 @@ operator explicitly requests an emergency local diagnostic, record it as
 non-closeout context only; it is not proof for the bead, and the bead remains
 open or blocked until RCH produces retained remote Cargo artifacts.
 
-**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously while keeping proof lanes fail-closed.
 
 ---
 

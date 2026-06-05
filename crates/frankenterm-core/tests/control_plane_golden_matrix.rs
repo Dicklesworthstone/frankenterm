@@ -59,6 +59,25 @@ fn load_matrix() -> GoldenMatrix {
     serde_json::from_str(MATRIX_JSON).expect("control-plane golden matrix must be valid JSON")
 }
 
+fn assert_fail_closed_rch_cargo_command(label: &str, command: &str) {
+    assert!(
+        command.contains("RCH_REQUIRE_REMOTE=1"),
+        "{label} must require a remote RCH worker: {command}"
+    );
+    assert!(
+        command.contains("RCH_NO_SELF_HEALING=1"),
+        "{label} must disable RCH self-healing/local fallback: {command}"
+    );
+    assert!(
+        command.contains("rch --no-self-healing exec -- env "),
+        "{label} must use direct fail-closed RCH env/Cargo form: {command}"
+    );
+    assert!(
+        !command.contains("rch exec -- env "),
+        "{label} must not use the legacy fail-open RCH wrapper: {command}"
+    );
+}
+
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -184,11 +203,7 @@ fn matrix_metadata_is_current_and_rch_backed() {
         matrix.generated_by,
         "ft-bsfb9.5-control-plane-golden-matrix"
     );
-    assert!(
-        matrix.proof_target.starts_with("rch exec -- env "),
-        "top-level proof target must use rch: {}",
-        matrix.proof_target
-    );
+    assert_fail_closed_rch_cargo_command("top-level proof target", &matrix.proof_target);
     assert!(
         matrix.proof_target.contains(TARGET_DIR),
         "top-level proof target must preserve the bead target dir: {}",
@@ -218,11 +233,9 @@ fn matrix_entries_are_unique_and_have_remote_proofs() {
             "duplicate matrix key for {}",
             entry.id
         );
-        assert!(
-            entry.proof_command.starts_with("rch exec -- env "),
-            "{} proof must use rch: {}",
-            entry.id,
-            entry.proof_command
+        assert_fail_closed_rch_cargo_command(
+            &format!("{} proof command", entry.id),
+            &entry.proof_command,
         );
         assert!(
             entry.proof_command.contains(TARGET_DIR),

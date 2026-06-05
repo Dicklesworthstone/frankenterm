@@ -991,7 +991,7 @@ SEE ALSO:
 
     /// Explain proof-lane command intent before running expensive RCH proof
     #[command(after_help = r#"EXAMPLES:
-    ft proof-doctor --bead ft-wik9p.2 -- rch exec -- env CARGO_TARGET_DIR=/tmp/ft-wik9p-target cargo test -p frankenterm --bin ft proof_doctor
+    ft proof-doctor --bead ft-wik9p.2 -- RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-wik9p-target cargo test -p frankenterm --bin ft proof_doctor
     ft proof-doctor -f json --bead ft-wik9p.2 -- cargo test -p frankenterm
 
 NOTES:
@@ -57172,7 +57172,7 @@ reason = "overly conservative pending threshold"
                 storage_class: "nvme".to_string(),
                 os: "linux".to_string(),
                 worker_id: "worker-proof".to_string(),
-                command: "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-target cargo test -p frankenterm --bin ft resource_what_if".to_string(),
+                command: "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-target cargo test -p frankenterm --bin ft resource_what_if".to_string(),
                 elapsed_ms: 12_345,
                 git_commit: "3273cf755".to_string(),
             }),

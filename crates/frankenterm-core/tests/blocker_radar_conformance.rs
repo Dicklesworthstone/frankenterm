@@ -148,6 +148,25 @@ fn load_matrix() -> ConformanceMatrix {
     serde_json::from_str(MATRIX_JSON).expect("blocker-radar conformance matrix must be valid JSON")
 }
 
+fn assert_fail_closed_rch_cargo_command(label: &str, command: &str) {
+    assert!(
+        command.contains("RCH_REQUIRE_REMOTE=1"),
+        "{label} must require a remote RCH worker: {command}"
+    );
+    assert!(
+        command.contains("RCH_NO_SELF_HEALING=1"),
+        "{label} must disable RCH self-healing/local fallback: {command}"
+    );
+    assert!(
+        command.contains("rch --no-self-healing exec -- env "),
+        "{label} must use direct fail-closed RCH env/Cargo form: {command}"
+    );
+    assert!(
+        !command.contains("rch exec -- env "),
+        "{label} must not use the legacy fail-open RCH wrapper: {command}"
+    );
+}
+
 fn load_claimability_matrix() -> ClaimabilityMatrix {
     serde_json::from_str(CLAIMABILITY_JSON).expect("claimability fixture matrix must be valid JSON")
 }
@@ -631,11 +650,7 @@ fn blocker_radar_conformance_matrix_metadata_is_remote_and_deterministic() {
     let matrix = load_matrix();
     assert_eq!(matrix.schema_version, 1);
     assert_eq!(matrix.generated_by, "ft-9ntud.4-blocker-radar-conformance");
-    assert!(
-        matrix.proof_target.starts_with("rch exec -- env "),
-        "proof target must use rch: {}",
-        matrix.proof_target
-    );
+    assert_fail_closed_rch_cargo_command("blocker-radar proof target", &matrix.proof_target);
     assert!(
         matrix.proof_target.contains(TARGET_DIR),
         "proof target must preserve isolated target dir: {}",
@@ -700,11 +715,7 @@ fn claimability_fixture_matrix_metadata_is_remote_and_deterministic() {
     let matrix = load_claimability_matrix();
     assert_eq!(matrix.schema_version, 1);
     assert_eq!(matrix.generated_by, "ft-htcwc.2-claimability-fixtures");
-    assert!(
-        matrix.proof_target.starts_with("rch exec -- env "),
-        "claimability proof target must use rch: {}",
-        matrix.proof_target
-    );
+    assert_fail_closed_rch_cargo_command("claimability proof target", &matrix.proof_target);
     assert!(
         matrix.proof_target.contains(CLAIMABILITY_TARGET_DIR),
         "claimability proof target must preserve isolated target dir: {}",

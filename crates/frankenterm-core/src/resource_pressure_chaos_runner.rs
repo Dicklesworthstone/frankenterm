@@ -31,10 +31,10 @@ use crate::resource_pressure_storage_io_search_chaos::{
 pub const RESOURCE_PRESSURE_CHAOS_RUNNER_SCHEMA_VERSION: u32 = 1;
 
 /// Focused reduced-mode RCH proof command for this runner.
-pub const RESOURCE_PRESSURE_CHAOS_REDUCED_RCH_COMMAND: &str = "env -u CARGO_TARGET_DIR RCH_DAEMON_TIMEOUT_MS=120000 rch exec -- cargo test -p frankenterm-core --lib --no-default-features resource_pressure_chaos_reduced_report";
+pub const RESOURCE_PRESSURE_CHAOS_REDUCED_RCH_COMMAND: &str = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_DAEMON_TIMEOUT_MS=120000 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-pressure-chaos-reduced cargo test -p frankenterm-core --lib --no-default-features resource_pressure_chaos_reduced_report";
 
 /// Focused high-scale truthfulness RCH proof command for this runner.
-pub const RESOURCE_PRESSURE_CHAOS_HIGH_SCALE_RCH_COMMAND: &str = "env -u CARGO_TARGET_DIR RCH_DAEMON_TIMEOUT_MS=120000 rch exec -- cargo test -p frankenterm-core --lib --no-default-features resource_pressure_chaos_high_scale_report";
+pub const RESOURCE_PRESSURE_CHAOS_HIGH_SCALE_RCH_COMMAND: &str = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_DAEMON_TIMEOUT_MS=120000 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-pressure-chaos-high-scale cargo test -p frankenterm-core --lib --no-default-features resource_pressure_chaos_high_scale_report";
 
 /// Suite-level verdict for an aggregated resource-pressure chaos report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

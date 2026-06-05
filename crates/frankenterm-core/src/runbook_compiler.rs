@@ -636,7 +636,7 @@ mod tests {
             target_dir_prefix: "/tmp/ft-runbook".to_string(),
             timeout_seconds: 300,
             command_templates: vec![
-                "rch exec -- env CARGO_TARGET_DIR={target_dir} bash -lc 'cargo test -p frankenterm-core --lib --no-default-features {bead_id}'".to_string(),
+                "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR={target_dir} cargo test -p frankenterm-core --lib --no-default-features {bead_id}".to_string(),
                 "rustfmt --edition 2024 --check crates/frankenterm-core/src/runbook_compiler.rs".to_string(),
             ],
         }
@@ -784,7 +784,11 @@ mod tests {
         }
         assert!(compilation.orders.iter().all(|order| {
             order.exact_commands.iter().any(|command| {
-                command.contains("rch exec -- env CARGO_TARGET_DIR=/tmp/ft-runbook-")
+                command.contains("RCH_REQUIRE_REMOTE=1")
+                    && command.contains("RCH_NO_SELF_HEALING=1")
+                    && command.contains(
+                        "rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-runbook-",
+                    )
                     && command.contains("cargo test -p frankenterm-core")
             })
         }));

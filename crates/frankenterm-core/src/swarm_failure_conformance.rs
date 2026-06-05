@@ -18,7 +18,7 @@ use crate::resource_pressure_chaos_runner::resource_pressure_chaos_reduced_repor
 pub const SWARM_FAILURE_CONFORMANCE_SCHEMA_VERSION: u32 = 1;
 
 /// Focused RCH command for the reduced conformance lab.
-pub const SWARM_FAILURE_CONFORMANCE_RCH_COMMAND: &str = "rch exec -- bash -lc 'CARGO_TARGET_DIR=/tmp/ft-bsfb9-chaos-recovery cargo test -p frankenterm-core --test swarm_failure_conformance -- --nocapture'";
+pub const SWARM_FAILURE_CONFORMANCE_RCH_COMMAND: &str = "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-chaos-recovery cargo test -p frankenterm-core --test swarm_failure_conformance -- --nocapture";
 
 /// Failure mode covered by the conformance matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

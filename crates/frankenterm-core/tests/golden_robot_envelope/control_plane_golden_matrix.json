@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated_by": "ft-bsfb9.5-control-plane-golden-matrix",
-  "proof_target": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+  "proof_target": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
   "nondeterministic_fields": [
     "elapsed_ms",
     "now",
@@ -26,7 +26,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": "wa_state.json",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test wa_state_mcp_conformance --no-default-features --features mcp,asupersync-runtime",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test wa_state_mcp_conformance --no-default-features --features mcp,asupersync-runtime",
       "notes": "Pins the MCP state success envelope and input schema."
     },
     {
@@ -40,7 +40,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": "wa_get_text.json",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
       "notes": "Core-tool proof decodes TOON and compares it with the JSON golden semantics."
     },
     {
@@ -54,7 +54,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": "wa_search.json",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
       "notes": "The fixture pins hybrid search falling back to lexical with semantic_no_hits metrics."
     },
     {
@@ -68,7 +68,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": "wa_send.json",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
       "notes": "Pins wa.send dry-run as a policy-evaluated success envelope with no pane mutation."
     },
     {
@@ -82,7 +82,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": "wa_send.json",
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
       "notes": "mcp_conformance_core_tools decodes wa.send TOON and checks parity with the JSON golden semantics."
     },
     {
@@ -96,7 +96,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance --no-default-features --features mcp,asupersync-runtime",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance --no-default-features --features mcp,asupersync-runtime",
       "envelope": {
         "ok": true,
         "data": {
@@ -122,7 +122,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance --no-default-features --features mcp,asupersync-runtime",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance --no-default-features --features mcp,asupersync-runtime",
       "notes": "mcp_conformance decodes wa.rules_list TOON and checks documented semantics."
     },
     {
@@ -136,7 +136,7 @@
       "status": "error",
       "expected_code": "robot.policy_denied",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
       "envelope": {
         "ok": false,
         "error": "Policy denied by rule policy.test.block",
@@ -159,7 +159,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --test cli_contract_tests contract_no_mock_control_plane_receipts_cover_read_and_policy_gated_robot_paths",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --test cli_contract_tests contract_no_mock_control_plane_receipts_cover_read_and_policy_gated_robot_paths",
       "envelope": {
         "ok": true,
         "data": {
@@ -204,7 +204,7 @@
       "status": "error",
       "expected_code": "robot.require_approval",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
       "envelope": {
         "ok": false,
         "error": "Command requires human approval",
@@ -227,7 +227,7 @@
       "status": "error",
       "expected_code": "robot.pane_not_found",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix matrix_covers_representative_contract_cases -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix matrix_covers_representative_contract_cases -- --nocapture",
       "envelope": {
         "ok": false,
         "error": "Pane 424242 not found",
@@ -250,7 +250,7 @@
       "status": "error",
       "expected_code": "robot.timeout",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix matrix_covers_representative_contract_cases -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix matrix_covers_representative_contract_cases -- --nocapture",
       "envelope": {
         "ok": false,
         "error": "Timeout waiting for pattern 'ready>' after 1000ms (5 polls)",
@@ -273,7 +273,7 @@
       "status": "error",
       "expected_code": "FT-MCP-0006",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits -- --nocapture",
       "envelope": {
         "ok": false,
         "error": "ft-hp70k denied get-text drill",
@@ -297,7 +297,7 @@
       "status": "error",
       "expected_code": "FT-MCP-0006",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits -- --nocapture",
       "envelope": {
         "ok": false,
         "error": "ft-hp70k require approval search drill",
@@ -321,7 +321,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
       "envelope": {
         "ok": true,
         "data": {
@@ -454,7 +454,7 @@
       "status": "error",
       "expected_code": "robot.fleet.inventory_unavailable",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
       "envelope": {
         "ok": false,
         "error": "ft robot fleet scale cannot compute a safe delta because running agent inventory is unavailable",
@@ -514,7 +514,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
       "envelope": {
         "ok": true,
         "data": {
@@ -686,7 +686,7 @@
       "status": "error",
       "expected_code": "robot.feature_not_available",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test conformance_robot_envelope_schema",
       "envelope": {
         "ok": false,
         "error": "agent inventory feature is not available in this build",
@@ -709,7 +709,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -748,7 +748,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -778,7 +778,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -805,7 +805,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -831,7 +831,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -860,7 +860,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -886,7 +886,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -911,7 +911,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -936,7 +936,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -966,7 +966,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -992,7 +992,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1021,7 +1021,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1046,7 +1046,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1072,7 +1072,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1097,7 +1097,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1126,7 +1126,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1158,7 +1158,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1198,7 +1198,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1223,7 +1223,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1250,7 +1250,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1275,7 +1275,7 @@
       "status": "ok",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
       "envelope": {
         "ok": true,
         "data": {
@@ -1300,7 +1300,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1314,7 +1314,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1328,7 +1328,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1342,7 +1342,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1356,7 +1356,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1370,7 +1370,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1384,7 +1384,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1398,7 +1398,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1412,7 +1412,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1426,7 +1426,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1440,7 +1440,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1454,7 +1454,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1468,7 +1468,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1482,7 +1482,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1496,7 +1496,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1510,7 +1510,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1524,7 +1524,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1538,7 +1538,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     },
     {
@@ -1552,7 +1552,7 @@
       "status": "contract",
       "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test robot_family_conformance",
       "notes": "Schema-driven NTM-family action tracked by robot_family_contract."
     }
   ]

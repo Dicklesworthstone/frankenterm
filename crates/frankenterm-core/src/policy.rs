@@ -6819,12 +6819,24 @@ impl PolicyEngine {
                     if matches!(
                         rch_proof_safety,
                         crate::build_coord::RchProofCommandSafety::ShellWrappedRemoteCargo
+                            | crate::build_coord::RchProofCommandSafety::FailOpenRemoteCargo
                     ) {
                         let prefix = crate::build_coord::recommended_rch_prefix();
-                        let reason = format!(
-                            "Heavy cargo proof commands from {} actions must pass Cargo directly to `{prefix}`; shell payloads under `rch exec --` are diagnostic-only because they can fall out of the remote compilation path",
-                            input.actor.as_str()
-                        );
+                        let reason = match rch_proof_safety {
+                            crate::build_coord::RchProofCommandSafety::ShellWrappedRemoteCargo => {
+                                format!(
+                                    "Heavy cargo proof commands from {} actions must pass Cargo directly to `{prefix}`; shell payloads under `rch exec --` are diagnostic-only because they can fall out of the remote compilation path",
+                                    input.actor.as_str()
+                                )
+                            }
+                            crate::build_coord::RchProofCommandSafety::FailOpenRemoteCargo => {
+                                format!(
+                                    "Heavy cargo proof commands from {} actions must use fail-closed RCH prefix `{prefix}` so local fallback or self-healing cannot be counted as proof",
+                                    input.actor.as_str()
+                                )
+                            }
+                            _ => unreachable!("matched non-blocking RCH proof safety state"),
+                        };
                         context.record_rule(
                             RCH_HEAVY_COMPUTE_RULE_ID,
                             true,
@@ -9562,11 +9574,10 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
-        assert!(
-            decision
-                .reason()
-                .is_some_and(|reason| reason.contains("rch exec"))
-        );
+        assert!(decision.reason().is_some_and(|reason| {
+            reason.contains("RCH_REQUIRE_REMOTE=1")
+                && reason.contains("rch --no-self-healing exec --")
+        }));
     }
 
     #[test]
@@ -9588,10 +9599,26 @@ mod tests {
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
             .with_capabilities(PaneCapabilities::prompt())
-            .with_command_text("TMPDIR=/tmp rch exec -- cargo check --help");
+            .with_command_text("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check --help");
 
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn robot_fail_open_rch_proof_prefix_requires_approval() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("TMPDIR=/tmp rch exec -- cargo check --help");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
+        assert!(decision.reason().is_some_and(|reason| {
+            reason.contains("fail-closed RCH prefix") && reason.contains("RCH_REQUIRE_REMOTE=1")
+        }));
     }
 
     #[test]
@@ -9843,7 +9870,7 @@ mod tests {
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
             .with_capabilities(PaneCapabilities::prompt())
-            .with_command_text("cd /tmp && TMPDIR=/tmp rch exec -- cargo check --help");
+            .with_command_text("cd /tmp && RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check --help");
 
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
@@ -9859,11 +9886,10 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
-        assert!(
-            decision
-                .reason()
-                .is_some_and(|reason| reason.contains("rch exec"))
-        );
+        assert!(decision.reason().is_some_and(|reason| {
+            reason.contains("RCH_REQUIRE_REMOTE=1")
+                && reason.contains("rch --no-self-healing exec --")
+        }));
     }
 
     #[test]
@@ -9871,7 +9897,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
             .with_surface(PolicySurface::Mcp)
-            .with_command_text("TMPDIR=/tmp rch exec -- cargo check --help");
+            .with_command_text("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check --help");
 
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());

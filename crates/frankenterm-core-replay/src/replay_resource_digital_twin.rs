@@ -2109,7 +2109,7 @@ author = "test"
             os: "linux".to_string(),
             worker_id: "worker-proof".to_string(),
             command:
-                "rch exec -- bash -lc 'cargo test -p frankenterm-core-replay --lib digital_twin'"
+                "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-digital-twin cargo test -p frankenterm-core-replay --lib digital_twin"
                     .to_string(),
             elapsed_ms: 12_345,
             git_commit: "482ab202c".to_string(),

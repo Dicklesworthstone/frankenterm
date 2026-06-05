@@ -1851,7 +1851,7 @@ fn proof_requirement_for_lane(
             proof_kind: "rch_cargo".to_string(),
             required: true,
             status: "pending".to_string(),
-            command: "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core --lib mission_objective_plan".to_string(),
+            command: "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-mission-objective-plan CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core --lib mission_objective_plan".to_string(),
             artifact_paths: Vec::new(),
         },
         MissionObjectiveProofLane::Blocked => MissionObjectiveProofRequirementArtifact {
@@ -1859,7 +1859,7 @@ fn proof_requirement_for_lane(
             proof_kind: "rch_cargo".to_string(),
             required: true,
             status: "blocked".to_string(),
-            command: "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core --lib mission_objective_plan".to_string(),
+            command: "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-mission-objective-plan CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test -p frankenterm-core --lib mission_objective_plan".to_string(),
             artifact_paths: Vec::new(),
         },
         MissionObjectiveProofLane::StaticSchema => MissionObjectiveProofRequirementArtifact {

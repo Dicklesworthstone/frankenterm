@@ -7,6 +7,20 @@ cd "${ROOT}"
 
 AGENTS="AGENTS.md"
 README="README.md"
+MAIN_RS="crates/frankenterm/src/main.rs"
+LIVE_RCH_SURFACES=(
+  "crates/frankenterm-core/src/mission_objective_plan.rs"
+  "crates/frankenterm-core/src/resource_pressure_chaos_runner.rs"
+  "crates/frankenterm-core/src/runbook_compiler.rs"
+  "crates/frankenterm-core/src/swarm_failure_conformance.rs"
+  "crates/frankenterm-core/src/test_artifacts.rs"
+  "crates/frankenterm-core-replay/src/replay_decision_diff.rs"
+  "crates/frankenterm-core-replay/src/replay_resource_digital_twin.rs"
+  "crates/frankenterm-core/tests/fixtures/blocker_radar/claimability_cases.json"
+  "crates/frankenterm-core/tests/fixtures/blocker_radar/conformance_cases.json"
+  "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json"
+  "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json"
+)
 DOCS=(
   "docs/asupersync-rch-execution-policy.md"
   "docs/operator-runbook.md"
@@ -34,6 +48,10 @@ require_file() {
 require_command ruby
 require_file "${AGENTS}"
 require_file "${README}"
+require_file "${MAIN_RS}"
+for surface in "${LIVE_RCH_SURFACES[@]}"; do
+  require_file "${surface}"
+done
 for doc in "${DOCS[@]}"; do
   require_file "${doc}"
 done
@@ -41,6 +59,20 @@ done
 ruby <<'RUBY'
 AGENTS = "AGENTS.md"
 README = "README.md"
+MAIN_RS = "crates/frankenterm/src/main.rs"
+LIVE_RCH_SURFACES = [
+  "crates/frankenterm-core/src/mission_objective_plan.rs",
+  "crates/frankenterm-core/src/resource_pressure_chaos_runner.rs",
+  "crates/frankenterm-core/src/runbook_compiler.rs",
+  "crates/frankenterm-core/src/swarm_failure_conformance.rs",
+  "crates/frankenterm-core/src/test_artifacts.rs",
+  "crates/frankenterm-core-replay/src/replay_decision_diff.rs",
+  "crates/frankenterm-core-replay/src/replay_resource_digital_twin.rs",
+  "crates/frankenterm-core/tests/fixtures/blocker_radar/claimability_cases.json",
+  "crates/frankenterm-core/tests/fixtures/blocker_radar/conformance_cases.json",
+  "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
+  "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json"
+]
 CONTRACT_DOCS = [
   "docs/asupersync-rch-execution-policy.md",
   "docs/operator-runbook.md",
@@ -59,6 +91,7 @@ end
 
 text = File.read(AGENTS)
 readme = File.read(README)
+main_rs = File.read(MAIN_RS)
 
 compiler = text[/## Compiler Checks \(CRITICAL\).*?---/m]
 fail!("missing Compiler Checks section") unless compiler
@@ -109,6 +142,28 @@ CONTRACT_DOCS.each do |path|
   end
   if doc.match?(/(^|\s)RCH_REQUIRE_REMOTE=1\s+rch exec --/)
     fail!("#{path} still omits --no-self-healing")
+  end
+end
+
+if main_rs.match?(/(^|\s)rch exec --\s+env\s+CARGO_TARGET_DIR=/)
+  fail!("#{MAIN_RS} still has bare rch exec")
+end
+if main_rs.match?(/(^|\s)RCH_REQUIRE_REMOTE=1\s+rch exec --/)
+  fail!("#{MAIN_RS} still omits --no-self-healing")
+end
+
+LIVE_RCH_SURFACES.each do |path|
+  surface = File.read(path)
+  if surface.match?(/(^|\s)rch exec --\s+(?:env\s+CARGO_TARGET_DIR=|cargo|bash\s+-lc)/)
+    fail!("#{path} still has a fail-open live RCH command surface")
+  end
+  if surface.match?(/(^|\s)RCH_REQUIRE_REMOTE=1\s+rch exec --/)
+    fail!("#{path} still omits --no-self-healing")
+  end
+  next unless surface.include?("rch")
+
+  required_snippets.each do |snippet|
+    fail!("#{path} missing #{snippet}") unless surface.include?(snippet)
   end
 end
 

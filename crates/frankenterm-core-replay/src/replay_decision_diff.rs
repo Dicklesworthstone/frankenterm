@@ -552,7 +552,7 @@ impl Default for MissionReplayAttachmentContract {
                 "replay_run_ids".into(),
             ],
             proof_command_hint:
-                "rch exec -- bash -lc 'CARGO_TARGET_DIR=/tmp/ft-bsfb9-9-mission-diff cargo test -p frankenterm-core-replay --lib replay_decision_diff::tests::mission -- --nocapture'"
+                "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-9-mission-diff cargo test -p frankenterm-core-replay --lib replay_decision_diff::tests::mission -- --nocapture"
                     .into(),
         }
     }

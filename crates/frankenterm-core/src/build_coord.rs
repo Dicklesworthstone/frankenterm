@@ -443,8 +443,10 @@ pub fn requires_rch_offload(command: &str) -> bool {
 pub enum RchProofCommandSafety {
     /// The command does not contain a heavy Cargo workload.
     NoCargoWork,
-    /// Heavy Cargo work is directly routed through `rch exec --`.
+    /// Heavy Cargo work is directly routed through fail-closed RCH.
     ValidRemoteCargo,
+    /// Heavy Cargo work is routed through RCH without fail-closed guards.
+    FailOpenRemoteCargo,
     /// Heavy Cargo work appears without an `rch exec --` wrapper.
     MissingRch,
     /// A shell wrapper encloses heavy Cargo, hiding the actual execution shape.
@@ -464,6 +466,7 @@ impl RchProofCommandSafety {
         match self {
             Self::NoCargoWork => "proof.skipped.no_heavy_cargo",
             Self::ValidRemoteCargo => "proof.command_shape.valid_remote_cargo",
+            Self::FailOpenRemoteCargo => "proof.local_invalid.fail_open_rch",
             Self::MissingRch => "proof.local_invalid.missing_rch_exec",
             Self::ShellWrappedRemoteCargo => "proof.local_invalid.shell_wrapped_cargo",
         }
@@ -531,6 +534,7 @@ fn classify_rch_proof_segment(
     inherited_uses_rch: bool,
 ) -> RchProofCommandSafety {
     let (idx, uses_rch) = segment_command_start(tokens, segment_start, inherited_uses_rch);
+    let fail_closed_rch = segment_has_fail_closed_rch(tokens, segment_start, inherited_uses_rch);
 
     if let Some(shell_command) = shell_command_payload(tokens, idx) {
         let nested = classify_rch_proof_command_shape(shell_command);
@@ -549,7 +553,11 @@ fn classify_rch_proof_segment(
     }
 
     if uses_rch {
-        RchProofCommandSafety::ValidRemoteCargo
+        if fail_closed_rch {
+            RchProofCommandSafety::ValidRemoteCargo
+        } else {
+            RchProofCommandSafety::FailOpenRemoteCargo
+        }
     } else {
         RchProofCommandSafety::MissingRch
     }
@@ -560,12 +568,13 @@ fn combine_rch_proof_safety(
     next: RchProofCommandSafety,
 ) -> RchProofCommandSafety {
     use RchProofCommandSafety::{
-        MissingRch, NoCargoWork, ShellWrappedRemoteCargo, ValidRemoteCargo,
+        FailOpenRemoteCargo, MissingRch, NoCargoWork, ShellWrappedRemoteCargo, ValidRemoteCargo,
     };
 
     match (current, next) {
         (ShellWrappedRemoteCargo, _) | (_, ShellWrappedRemoteCargo) => ShellWrappedRemoteCargo,
         (MissingRch, _) | (_, MissingRch) => MissingRch,
+        (FailOpenRemoteCargo, _) | (_, FailOpenRemoteCargo) => FailOpenRemoteCargo,
         (ValidRemoteCargo, _) | (_, ValidRemoteCargo) => ValidRemoteCargo,
         (NoCargoWork, NoCargoWork) => NoCargoWork,
     }
@@ -578,11 +587,7 @@ fn nested_mentions_heavy_cargo(safety: RchProofCommandSafety) -> bool {
 /// Recommended `rch` prefix for the current platform.
 #[must_use]
 pub const fn recommended_rch_prefix() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "TMPDIR=/tmp rch exec --"
-    } else {
-        "rch exec --"
-    }
+    "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --"
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -629,13 +634,9 @@ fn segment_command_start(
     let mut idx = skip_command_prefixes(tokens, segment_start);
     let mut uses_rch = inherited_uses_rch;
 
-    if matches!(
-        (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
-        (Some(cmd), Some(exec), Some(sep))
-            if is_rch_binary(cmd) && exec == "exec" && sep == "--"
-    ) {
+    if let Some((payload_idx, _no_self_healing)) = rch_exec_payload_start(tokens, idx) {
         uses_rch = true;
-        idx += 3;
+        idx = payload_idx;
     }
 
     if let Some(payload_idx) = rch_cargo_wrapper_payload_start(tokens, idx) {
@@ -702,6 +703,75 @@ fn rch_cargo_wrapper_payload_start(tokens: &[String], idx: usize) -> Option<usiz
         _ => None,
     }
     .filter(|payload_idx| *payload_idx <= tokens.len())
+}
+
+fn segment_has_fail_closed_rch(
+    tokens: &[String],
+    segment_start: usize,
+    inherited_uses_rch: bool,
+) -> bool {
+    if inherited_uses_rch {
+        return true;
+    }
+
+    let prefix_idx = skip_command_prefixes(tokens, segment_start);
+    if rch_cargo_wrapper_payload_start(tokens, prefix_idx).is_some() {
+        return true;
+    }
+
+    let Some((_payload_idx, no_self_healing_flag)) = rch_exec_payload_start(tokens, prefix_idx)
+    else {
+        return false;
+    };
+
+    no_self_healing_flag
+        && segment_prefix_has_env_assignment(
+            tokens,
+            segment_start,
+            prefix_idx,
+            "RCH_REQUIRE_REMOTE=1",
+        )
+        && segment_prefix_has_env_assignment(
+            tokens,
+            segment_start,
+            prefix_idx,
+            "RCH_NO_SELF_HEALING=1",
+        )
+}
+
+fn rch_exec_payload_start(tokens: &[String], idx: usize) -> Option<(usize, bool)> {
+    let cmd = tokens.get(idx).map(String::as_str)?;
+    if !is_rch_binary(cmd) {
+        return None;
+    }
+
+    let mut cursor = idx + 1;
+    let mut no_self_healing = false;
+    while let Some(token) = tokens.get(cursor).map(String::as_str) {
+        match token {
+            "--no-self-healing" => {
+                no_self_healing = true;
+                cursor += 1;
+            }
+            "exec" if matches!(tokens.get(cursor + 1).map(String::as_str), Some("--")) => {
+                return Some((cursor + 2, no_self_healing));
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn segment_prefix_has_env_assignment(
+    tokens: &[String],
+    segment_start: usize,
+    prefix_end: usize,
+    assignment: &str,
+) -> bool {
+    tokens
+        .get(segment_start..prefix_end)
+        .is_some_and(|prefix| prefix.iter().any(|token| token == assignment))
 }
 
 fn is_cargo_toolchain_override(token: &str) -> bool {
@@ -1380,6 +1450,9 @@ mod tests {
     fn command_uses_rch_detects_common_prefix_shapes() {
         assert!(command_uses_rch("rch exec -- cargo test --workspace"));
         assert!(command_uses_rch(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace"
+        ));
+        assert!(command_uses_rch(
             "TMPDIR=/tmp rch exec -- cargo check --help"
         ));
         assert!(command_uses_rch(
@@ -1463,6 +1536,9 @@ mod tests {
             "TMPDIR=/tmp rch exec -- cargo test --workspace"
         ));
         assert!(!requires_rch_offload(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace"
+        ));
+        assert!(!requires_rch_offload(
             "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace"
         ));
         assert!(!requires_rch_offload(
@@ -1519,10 +1595,10 @@ mod tests {
     #[test]
     fn rch_proof_command_shape_accepts_direct_remote_cargo() {
         for command in [
-            "rch exec -- cargo test --workspace",
-            "TMPDIR=/tmp rch exec -- cargo check -p frankenterm-core",
-            "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo clippy --all-targets",
-            "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo run --bin frankenterm -- --version",
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace",
+            "TMPDIR=/tmp RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check -p frankenterm-core",
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo clippy --all-targets",
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo run --bin frankenterm -- --version",
             "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace",
             "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo install --locked --path crates/frankenterm",
             "run_rch_cargo_logged_with_timeout 120 target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace",
@@ -1534,6 +1610,27 @@ mod tests {
                 safety.reason_code(),
                 "proof.command_shape.valid_remote_cargo"
             );
+        }
+    }
+
+    #[test]
+    fn rch_proof_command_shape_rejects_fail_open_remote_cargo() {
+        for command in [
+            "rch exec -- cargo test --workspace",
+            "TMPDIR=/tmp rch exec -- cargo check -p frankenterm-core",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo clippy --all-targets",
+            "RCH_REQUIRE_REMOTE=1 rch --no-self-healing exec -- cargo test --workspace",
+            "RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace",
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- cargo test --workspace",
+        ] {
+            let safety = classify_rch_proof_command_shape(command);
+            assert_eq!(
+                safety,
+                RchProofCommandSafety::FailOpenRemoteCargo,
+                "{command}"
+            );
+            assert!(!safety.is_valid_remote_proof_shape(), "{command}");
+            assert_eq!(safety.reason_code(), "proof.local_invalid.fail_open_rch");
         }
     }
 

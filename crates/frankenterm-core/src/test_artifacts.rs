@@ -828,7 +828,7 @@ mod tests {
                 live_mux_available: false,
             }),
             command: Some(ScaleLabCommandEvidence {
-                command_line: "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-s6h49-silverharbor-target cargo test -p frankenterm-core scale_lab_workload_catalog --lib --no-default-features".to_string(),
+                command_line: "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-s6h49-silverharbor-target cargo test -p frankenterm-core scale_lab_workload_catalog --lib --no-default-features".to_string(),
                 target_dir: "/tmp/ft-s6h49-silverharbor-target".to_string(),
                 feature_flags: ScaleLabFeatureFlags {
                     default_features: false,
