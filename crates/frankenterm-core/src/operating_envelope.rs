@@ -1755,6 +1755,17 @@ impl EnvelopeFacts {
             ),
         }
     }
+
+    fn rch_unavailable_or_insufficient(&self) -> bool {
+        self.rch_no_worker
+            || self.rch_topology_failure
+            || self.rch_active_project_exclusion
+            || self.insufficient_proof
+    }
+
+    fn rch_contradiction(&self) -> bool {
+        self.rch_recovered && self.rch_unavailable_or_insufficient()
+    }
 }
 
 fn decision_for(
@@ -1800,6 +1811,17 @@ fn decision_for(
                 OperatingEnvelopeOutcome::Shed,
                 OperatingEnvelopeTier::Black,
                 OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
+        } else if facts.rch_contradiction() {
+            push_unique(&mut reason_codes, "fail_closed.block_contradiction");
+            push_unique(&mut reason_codes, "rch.evidence_contradictory");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Unavailable,
                 dirty_tree_state(facts),
                 0,
                 0,
@@ -2295,14 +2317,10 @@ fn wait_reason_codes(facts: &EnvelopeFacts) -> Vec<&'static str> {
 }
 
 fn rch_proof_state(facts: &EnvelopeFacts) -> OperatingEnvelopeProofState {
-    if facts.rch_recovered {
-        OperatingEnvelopeProofState::Measured
-    } else if facts.rch_no_worker
-        || facts.rch_topology_failure
-        || facts.rch_active_project_exclusion
-        || facts.insufficient_proof
-    {
+    if facts.rch_unavailable_or_insufficient() {
         OperatingEnvelopeProofState::Unavailable
+    } else if facts.rch_recovered {
+        OperatingEnvelopeProofState::Measured
     } else {
         OperatingEnvelopeProofState::NotRequired
     }
@@ -2616,6 +2634,38 @@ mod tests {
             window_ids(&plan),
             vec!["docs_only", "admit_after_rch_recovers"]
         );
+    }
+
+    #[test]
+    fn contradictory_rch_evidence_blocks_and_keeps_proof_unavailable() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-contradictory",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.remote_cargo_reached_true",
+        )
+        .with_reason_code("rch.no_workers_passed_health")
+        .blocked("rch.no_workers_passed_health");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert_eq!(
+            plan.decision.rch_proof_state,
+            OperatingEnvelopeProofState::Unavailable
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"fail_closed.block_contradiction".to_string())
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"rch.evidence_contradictory".to_string())
+        );
+        assert_eq!(window_ids(&plan), vec!["emergency_stop_recommended"]);
     }
 
     #[test]
