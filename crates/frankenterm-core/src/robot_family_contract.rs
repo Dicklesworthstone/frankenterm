@@ -2588,6 +2588,275 @@ pub fn context_family_contract() -> FamilyContract {
     }
 }
 
+/// Schema-DSL declaration for the read-only `mission_twin` family.
+///
+/// This family is contract-first: the implementation consumes retained
+/// mission-twin snapshot artifacts and returns a side-effect-free surface report
+/// from `crate::mission_twin_replay`. The robot/CLI/MCP names deliberately avoid
+/// implying live coordination authority.
+#[must_use]
+pub fn mission_twin_family_contract() -> FamilyContract {
+    FamilyContract {
+        family_name: "mission_twin".to_string(),
+        description:
+            "Mission-twin replay surfaces — current plan, simulate, explain-step, explain-reason."
+                .to_string(),
+        concurrency: ConcurrencyModel::Parallel,
+        actions: vec![
+            ActionContract {
+                action: "current_plan".to_string(),
+                robot_command: "robot mission-twin current-plan".to_string(),
+                mcp_tool_name: "ft.mission_twin.current_plan".to_string(),
+                description: "Return the current retained mission-twin plan.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: mission_twin_snapshot_request_schema(),
+                response_schema: mission_twin_surface_response_schema(),
+                request_proptest: vec![],
+                invariants: mission_twin_read_only_invariants("current_plan"),
+            },
+            ActionContract {
+                action: "simulate".to_string(),
+                robot_command: "robot mission-twin simulate".to_string(),
+                mcp_tool_name: "ft.mission_twin.simulate".to_string(),
+                description: "Return safe counterfactual and ownership simulations.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "snapshot_paths".to_string(),
+                            kind: SchemaKind::Array,
+                            required: false,
+                            description: Some(
+                                "Retained mission-twin snapshot artifacts to replay.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "counterfactual_requests".to_string(),
+                            kind: SchemaKind::Array,
+                            required: false,
+                            description: Some(
+                                "Allowlisted counterfactual requests; never live mutations."
+                                    .to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "ownership_request".to_string(),
+                            kind: SchemaKind::Object,
+                            required: false,
+                            description: Some(
+                                "Optional dirty-overlap / handoff simulation request.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: mission_twin_surface_response_schema(),
+                request_proptest: vec![],
+                invariants: mission_twin_read_only_invariants("simulate"),
+            },
+            ActionContract {
+                action: "explain_step".to_string(),
+                robot_command: "robot mission-twin explain-step".to_string(),
+                mcp_tool_name: "ft.mission_twin.explain_step".to_string(),
+                description: "Explain one retained mission-twin plan step.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "snapshot_paths".to_string(),
+                            kind: SchemaKind::Array,
+                            required: false,
+                            description: Some(
+                                "Retained mission-twin snapshot artifacts to replay.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "explain_step".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "Candidate id, target bead id, or rank to explain.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: mission_twin_surface_response_schema(),
+                request_proptest: vec![ProptestField {
+                    name: "explain_step".to_string(),
+                    strategy: ProptestStrategyHint::AsciiString { max_len: 64 },
+                }],
+                invariants: mission_twin_read_only_invariants("explain_step"),
+            },
+            ActionContract {
+                action: "explain_reason".to_string(),
+                robot_command: "robot mission-twin explain-reason".to_string(),
+                mcp_tool_name: "ft.mission_twin.explain_reason".to_string(),
+                description: "Explain where one mission-twin reason code appears.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "snapshot_paths".to_string(),
+                            kind: SchemaKind::Array,
+                            required: false,
+                            description: Some(
+                                "Retained mission-twin snapshot artifacts to replay.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "explain_reason".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Reason code to locate.".to_string()),
+                        },
+                    ],
+                },
+                response_schema: mission_twin_surface_response_schema(),
+                request_proptest: vec![ProptestField {
+                    name: "explain_reason".to_string(),
+                    strategy: ProptestStrategyHint::AsciiString { max_len: 96 },
+                }],
+                invariants: mission_twin_read_only_invariants("explain_reason"),
+            },
+        ],
+    }
+}
+
+fn mission_twin_snapshot_request_schema() -> SchemaShape {
+    SchemaShape {
+        kind: SchemaKind::Object,
+        fields: vec![SchemaField {
+            name: "snapshot_paths".to_string(),
+            kind: SchemaKind::Array,
+            required: false,
+            description: Some("Retained mission-twin snapshot artifacts to replay.".to_string()),
+        }],
+    }
+}
+
+fn mission_twin_surface_response_schema() -> SchemaShape {
+    SchemaShape {
+        kind: SchemaKind::Object,
+        fields: vec![
+            SchemaField {
+                name: "contract_id".to_string(),
+                kind: SchemaKind::String,
+                required: true,
+                description: Some("Stable mission-twin surface contract id.".to_string()),
+            },
+            SchemaField {
+                name: "schema_version".to_string(),
+                kind: SchemaKind::Integer,
+                required: true,
+                description: Some("Surface schema version.".to_string()),
+            },
+            SchemaField {
+                name: "action".to_string(),
+                kind: SchemaKind::String,
+                required: true,
+                description: Some(
+                    "One of current_plan, simulate, explain_step, explain_reason.".to_string(),
+                ),
+            },
+            SchemaField {
+                name: "action_contract".to_string(),
+                kind: SchemaKind::Object,
+                required: true,
+                description: Some("Robot/CLI/MCP descriptor for this action.".to_string()),
+            },
+            SchemaField {
+                name: "simulated".to_string(),
+                kind: SchemaKind::Boolean,
+                required: true,
+                description: Some("True only for explicit simulation actions.".to_string()),
+            },
+            SchemaField {
+                name: "side_effects_executed".to_string(),
+                kind: SchemaKind::Boolean,
+                required: true,
+                description: Some("Always false for mission-twin surfaces.".to_string()),
+            },
+            SchemaField {
+                name: "raw_pane_content_stored".to_string(),
+                kind: SchemaKind::Boolean,
+                required: true,
+                description: Some("Always false; snapshots are redacted.".to_string()),
+            },
+            SchemaField {
+                name: "forbidden_actions".to_string(),
+                kind: SchemaKind::Array,
+                required: true,
+                description: Some("Actions the surface must not perform.".to_string()),
+            },
+            SchemaField {
+                name: "artifact_paths".to_string(),
+                kind: SchemaKind::Array,
+                required: true,
+                description: Some("Retained artifacts that support the report.".to_string()),
+            },
+            SchemaField {
+                name: "reason_codes".to_string(),
+                kind: SchemaKind::Array,
+                required: true,
+                description: Some("Stable machine-readable explanation codes.".to_string()),
+            },
+            SchemaField {
+                name: "plan_surface".to_string(),
+                kind: SchemaKind::Object,
+                required: true,
+                description: Some("Current retained mission-twin plan surface.".to_string()),
+            },
+            SchemaField {
+                name: "counterfactual_report".to_string(),
+                kind: SchemaKind::Object,
+                required: false,
+                description: Some("Simulation details when requested.".to_string()),
+            },
+            SchemaField {
+                name: "ownership_report".to_string(),
+                kind: SchemaKind::Object,
+                required: false,
+                description: Some("Ownership handoff details when requested.".to_string()),
+            },
+        ],
+    }
+}
+
+fn mission_twin_read_only_invariants(action: &str) -> Vec<ContractInvariant> {
+    vec![
+        ContractInvariant {
+            name: format!("{action}_is_deterministic"),
+            kind: InvariantKind::Determinism,
+            description:
+                "Same retained snapshots and request parameters produce the same surface report."
+                    .to_string(),
+        },
+        ContractInvariant {
+            name: format!("{action}_response_shape"),
+            kind: InvariantKind::ResponseShape,
+            description: "Response data validates against the mission-twin surface schema."
+                .to_string(),
+        },
+        ContractInvariant {
+            name: format!("{action}_is_read_only"),
+            kind: InvariantKind::Idempotence,
+            description:
+                "Repeating the action performs no Agent Mail, Beads, RCH, pane, or file mutation."
+                    .to_string(),
+        },
+    ]
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2791,6 +3060,58 @@ mod tests {
         assert!(
             !apply.side_effects.is_read_only(),
             "apply must declare side-effects"
+        );
+    }
+
+    #[test]
+    fn mission_twin_family_contract_validates_and_is_read_only() {
+        let contract = mission_twin_family_contract();
+        let errs = contract.validate();
+        assert!(
+            errs.is_empty(),
+            "mission_twin family contract violations: {errs:?}"
+        );
+        assert_eq!(contract.family_name, "mission_twin");
+        assert_eq!(contract.action_count(), 4);
+        for action in ["current_plan", "simulate", "explain_step", "explain_reason"] {
+            let action = contract.action(action).expect("mission_twin action exists");
+            assert!(action.side_effects.is_read_only());
+            assert_eq!(action.idempotency, IdempotencyClass::Idempotent);
+            assert!(
+                action.mcp_tool_name.starts_with("ft.mission_twin."),
+                "unexpected MCP tool name {}",
+                action.mcp_tool_name
+            );
+            assert!(
+                action
+                    .response_schema
+                    .fields
+                    .iter()
+                    .any(|field| field.name == "forbidden_actions" && field.required),
+                "mission_twin action must expose forbidden_actions"
+            );
+        }
+    }
+
+    #[test]
+    fn mission_twin_family_explain_requests_require_query_fields() {
+        let contract = mission_twin_family_contract();
+        let explain_step = contract.action("explain_step").unwrap();
+        let explain_reason = contract.action("explain_reason").unwrap();
+
+        assert!(
+            explain_step
+                .request_schema
+                .fields
+                .iter()
+                .any(|field| field.name == "explain_step" && field.required)
+        );
+        assert!(
+            explain_reason
+                .request_schema
+                .fields
+                .iter()
+                .any(|field| field.name == "explain_reason" && field.required)
         );
     }
 

@@ -42,6 +42,9 @@ pub const MISSION_TWIN_OWNERSHIP_SIMULATOR_CONTRACT_ID: &str =
     "ft.mission_twin_ownership_handoff.v1";
 pub const MISSION_TWIN_OWNERSHIP_SIMULATOR_SCHEMA_VERSION: u16 = 1;
 pub const MISSION_TWIN_OWNERSHIP_SIMULATOR_SOURCE_BEAD: &str = "ft-u7r37.4";
+pub const MISSION_TWIN_SURFACE_CONTRACT_ID: &str = "ft.mission_twin.robot_mcp_cli_surface.v1";
+pub const MISSION_TWIN_SURFACE_SCHEMA_VERSION: u16 = 1;
+pub const MISSION_TWIN_SURFACE_SOURCE_BEAD: &str = "ft-u7r37.5";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissionTwinReplayError {
@@ -52,6 +55,10 @@ pub enum MissionTwinReplayError {
     },
     InvalidCounterfactual {
         scenario_id: String,
+        reason: String,
+    },
+    InvalidSurfaceRequest {
+        action: String,
         reason: String,
     },
 }
@@ -74,6 +81,9 @@ impl std::fmt::Display for MissionTwinReplayError {
                     "invalid mission twin counterfactual {scenario_id}: {reason}"
                 )
             }
+            Self::InvalidSurfaceRequest { action, reason } => {
+                write!(f, "invalid mission twin surface request {action}: {reason}")
+            }
         }
     }
 }
@@ -84,6 +94,7 @@ impl std::error::Error for MissionTwinReplayError {
             Self::EmptySnapshotSet => None,
             Self::InvalidSnapshot { error, .. } => Some(error),
             Self::InvalidCounterfactual { .. } => None,
+            Self::InvalidSurfaceRequest { .. } => None,
         }
     }
 }
@@ -286,6 +297,138 @@ pub struct MissionTwinOwnershipSimulationReport {
     pub reason_codes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTwinSurfaceAction {
+    CurrentPlan,
+    Simulate,
+    ExplainStep,
+    ExplainReason,
+}
+
+impl MissionTwinSurfaceAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentPlan => "current_plan",
+            Self::Simulate => "simulate",
+            Self::ExplainStep => "explain_step",
+            Self::ExplainReason => "explain_reason",
+        }
+    }
+
+    const fn robot_command(self) -> &'static str {
+        match self {
+            Self::CurrentPlan => "robot mission-twin current-plan",
+            Self::Simulate => "robot mission-twin simulate",
+            Self::ExplainStep => "robot mission-twin explain-step",
+            Self::ExplainReason => "robot mission-twin explain-reason",
+        }
+    }
+
+    const fn cli_command(self) -> &'static str {
+        match self {
+            Self::CurrentPlan => "mission-twin current-plan",
+            Self::Simulate => "mission-twin simulate",
+            Self::ExplainStep => "mission-twin explain-step",
+            Self::ExplainReason => "mission-twin explain-reason",
+        }
+    }
+
+    const fn mcp_tool_name(self) -> &'static str {
+        match self {
+            Self::CurrentPlan => "ft.mission_twin.current_plan",
+            Self::Simulate => "ft.mission_twin.simulate",
+            Self::ExplainStep => "ft.mission_twin.explain_step",
+            Self::ExplainReason => "ft.mission_twin.explain_reason",
+        }
+    }
+
+    const fn mcp_resource_uri(self) -> &'static str {
+        match self {
+            Self::CurrentPlan => "ft://mission-twin/current-plan",
+            Self::Simulate => "ft://mission-twin/simulate",
+            Self::ExplainStep => "ft://mission-twin/explain-step",
+            Self::ExplainReason => "ft://mission-twin/explain-reason",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::CurrentPlan => "Return the current retained mission-twin plan.",
+            Self::Simulate => "Return safe counterfactual and ownership simulations.",
+            Self::ExplainStep => "Explain one retained mission-twin plan step.",
+            Self::ExplainReason => "Explain where one mission-twin reason code appears.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTwinSurfaceActionContract {
+    pub action: MissionTwinSurfaceAction,
+    pub robot_command: String,
+    pub cli_command: String,
+    pub mcp_tool_name: String,
+    pub mcp_resource_uri: String,
+    pub response_payload: String,
+    pub read_only: bool,
+    pub idempotent: bool,
+    pub description: String,
+}
+
+impl MissionTwinSurfaceActionContract {
+    #[must_use]
+    pub fn for_action(action: MissionTwinSurfaceAction) -> Self {
+        Self {
+            action,
+            robot_command: action.robot_command().to_string(),
+            cli_command: action.cli_command().to_string(),
+            mcp_tool_name: action.mcp_tool_name().to_string(),
+            mcp_resource_uri: action.mcp_resource_uri().to_string(),
+            response_payload: "MissionTwinSurfaceReport".to_string(),
+            read_only: true,
+            idempotent: true,
+            description: action.description().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTwinSurfaceRequest {
+    pub action: MissionTwinSurfaceAction,
+    #[serde(default)]
+    pub snapshot_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_reason: Option<String>,
+    #[serde(default)]
+    pub counterfactual_requests: Vec<MissionTwinCounterfactualRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_request: Option<MissionTwinOwnershipSimulationRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissionTwinSurfaceReport {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub source_bead: String,
+    pub action: MissionTwinSurfaceAction,
+    pub action_contract: MissionTwinSurfaceActionContract,
+    pub simulated: bool,
+    pub side_effects_executed: bool,
+    pub raw_pane_content_stored: bool,
+    pub forbidden_actions: Vec<String>,
+    pub snapshot_paths: Vec<String>,
+    pub artifact_paths: Vec<String>,
+    pub reason_codes: Vec<String>,
+    pub plan_surface: MissionObjectivePlanSurfaceData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterfactual_report: Option<MissionTwinCounterfactualReplayReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ownership_report: Option<MissionTwinOwnershipSimulationReport>,
+}
+
 #[must_use]
 pub fn mission_twin_replay_source_id(snapshot_id: &str, source_name: &str) -> String {
     format!("mission_twin.{snapshot_id}.{source_name}")
@@ -346,6 +489,85 @@ pub fn build_mission_twin_replay_surface_data(
         explain_step,
         explain_reason,
     ))
+}
+
+#[must_use]
+pub fn mission_twin_surface_action_contracts() -> Vec<MissionTwinSurfaceActionContract> {
+    [
+        MissionTwinSurfaceAction::CurrentPlan,
+        MissionTwinSurfaceAction::Simulate,
+        MissionTwinSurfaceAction::ExplainStep,
+        MissionTwinSurfaceAction::ExplainReason,
+    ]
+    .into_iter()
+    .map(MissionTwinSurfaceActionContract::for_action)
+    .collect()
+}
+
+pub fn build_mission_twin_surface_report(
+    snapshots: &[MissionTwinSnapshotEnvelope],
+    request: &MissionTwinSurfaceRequest,
+) -> Result<MissionTwinSurfaceReport, MissionTwinReplayError> {
+    validate_surface_request(request)?;
+    let explain_step = match request.action {
+        MissionTwinSurfaceAction::ExplainStep => request.explain_step.as_deref(),
+        MissionTwinSurfaceAction::CurrentPlan
+        | MissionTwinSurfaceAction::Simulate
+        | MissionTwinSurfaceAction::ExplainReason => None,
+    };
+    let explain_reason = match request.action {
+        MissionTwinSurfaceAction::ExplainReason => request.explain_reason.as_deref(),
+        MissionTwinSurfaceAction::CurrentPlan
+        | MissionTwinSurfaceAction::Simulate
+        | MissionTwinSurfaceAction::ExplainStep => None,
+    };
+    let plan_surface =
+        build_mission_twin_replay_surface_data(snapshots, explain_step, explain_reason)?;
+    let counterfactual_report = if request.action == MissionTwinSurfaceAction::Simulate
+        && !request.counterfactual_requests.is_empty()
+    {
+        Some(simulate_mission_twin_counterfactuals(
+            snapshots,
+            &request.counterfactual_requests,
+        )?)
+    } else {
+        None
+    };
+    let ownership_report = if request.action == MissionTwinSurfaceAction::Simulate {
+        request
+            .ownership_request
+            .as_ref()
+            .map(|ownership_request| {
+                simulate_mission_twin_ownership_handoff(snapshots, ownership_request)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let reason_codes = mission_twin_surface_reason_codes(
+        request.action,
+        &plan_surface,
+        counterfactual_report.as_ref(),
+        ownership_report.as_ref(),
+    );
+
+    Ok(MissionTwinSurfaceReport {
+        schema_version: MISSION_TWIN_SURFACE_SCHEMA_VERSION,
+        contract_id: MISSION_TWIN_SURFACE_CONTRACT_ID.to_string(),
+        source_bead: MISSION_TWIN_SURFACE_SOURCE_BEAD.to_string(),
+        action: request.action,
+        action_contract: MissionTwinSurfaceActionContract::for_action(request.action),
+        simulated: request.action == MissionTwinSurfaceAction::Simulate,
+        side_effects_executed: false,
+        raw_pane_content_stored: false,
+        forbidden_actions: mission_twin_forbidden_action_names(),
+        snapshot_paths: safe_unique_repo_paths(&request.snapshot_paths),
+        artifact_paths: mission_twin_surface_artifact_paths(snapshots, &request.snapshot_paths),
+        reason_codes,
+        plan_surface,
+        counterfactual_report,
+        ownership_report,
+    })
 }
 
 pub fn simulate_mission_twin_counterfactuals(
@@ -892,6 +1114,118 @@ fn mission_twin_forbidden_action_names() -> Vec<String> {
         "raw_pane_content_storage".to_string(),
         "beads_mutation".to_string(),
     ]
+}
+
+fn validate_surface_request(
+    request: &MissionTwinSurfaceRequest,
+) -> Result<(), MissionTwinReplayError> {
+    match request.action {
+        MissionTwinSurfaceAction::CurrentPlan => Ok(()),
+        MissionTwinSurfaceAction::Simulate => Ok(()),
+        MissionTwinSurfaceAction::ExplainStep => require_non_empty_surface_query(
+            request,
+            request.explain_step.as_deref(),
+            "explain_step",
+        ),
+        MissionTwinSurfaceAction::ExplainReason => require_non_empty_surface_query(
+            request,
+            request.explain_reason.as_deref(),
+            "explain_reason",
+        ),
+    }
+}
+
+fn require_non_empty_surface_query(
+    request: &MissionTwinSurfaceRequest,
+    value: Option<&str>,
+    field: &str,
+) -> Result<(), MissionTwinReplayError> {
+    if value.is_some_and(|query| !query.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(MissionTwinReplayError::InvalidSurfaceRequest {
+        action: request.action.as_str().to_string(),
+        reason: format!("{field} is required"),
+    })
+}
+
+fn mission_twin_surface_artifact_paths(
+    snapshots: &[MissionTwinSnapshotEnvelope],
+    requested_snapshot_paths: &[String],
+) -> Vec<String> {
+    let mut paths = safe_unique_repo_paths(requested_snapshot_paths);
+    for snapshot in snapshots {
+        for path in &snapshot.artifact_paths {
+            if is_safe_repo_relative_path(path) {
+                push_unique(&mut paths, path.clone());
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn safe_unique_repo_paths(paths: &[String]) -> Vec<String> {
+    let mut safe_paths = Vec::new();
+    for path in paths {
+        let path = path.trim();
+        if is_safe_repo_relative_path(path) {
+            push_unique(&mut safe_paths, path.to_string());
+        }
+    }
+    safe_paths.sort();
+    safe_paths
+}
+
+fn mission_twin_surface_reason_codes(
+    action: MissionTwinSurfaceAction,
+    plan_surface: &MissionObjectivePlanSurfaceData,
+    counterfactual_report: Option<&MissionTwinCounterfactualReplayReport>,
+    ownership_report: Option<&MissionTwinOwnershipSimulationReport>,
+) -> Vec<String> {
+    let mut reason_codes = vec![
+        "mission_twin.surface.read_only".to_string(),
+        "mission_twin.surface.side_effect_free".to_string(),
+        format!("mission_twin.surface.action.{}", action.as_str()),
+    ];
+    for reason_code in &plan_surface.reason_codes {
+        push_unique(&mut reason_codes, reason_code.clone());
+    }
+    if let Some(explain) = &plan_surface.explain {
+        push_unique(
+            &mut reason_codes,
+            format!(
+                "mission_twin.surface.explain.{}",
+                explain_mode_name(explain.mode)
+            ),
+        );
+        if explain.matched {
+            push_unique(&mut reason_codes, "mission_twin.surface.explain.matched");
+        } else {
+            push_unique(&mut reason_codes, "mission_twin.surface.explain.unmatched");
+        }
+    }
+    if let Some(report) = counterfactual_report {
+        for reason_code in &report.reason_codes {
+            push_unique(&mut reason_codes, reason_code.clone());
+        }
+    }
+    if let Some(report) = ownership_report {
+        for reason_code in &report.reason_codes {
+            push_unique(&mut reason_codes, reason_code.clone());
+        }
+    }
+    reason_codes.sort();
+    reason_codes
+}
+
+fn explain_mode_name(
+    mode: crate::mission_objective_plan::MissionObjectivePlanExplainMode,
+) -> &'static str {
+    match mode {
+        crate::mission_objective_plan::MissionObjectivePlanExplainMode::Step => "step",
+        crate::mission_objective_plan::MissionObjectivePlanExplainMode::Reason => "reason",
+    }
 }
 
 fn validate_counterfactual_request(
@@ -2133,6 +2467,146 @@ mod tests {
     }
 
     #[test]
+    fn surface_report_current_plan_preserves_read_only_contract() {
+        let snapshot = valid_snapshot("healthy");
+        let request = surface_request(MissionTwinSurfaceAction::CurrentPlan)
+            .with_snapshot_paths(vec!["fixtures/mission-twin/snapshot/valid/healthy.json"]);
+
+        let report =
+            build_mission_twin_surface_report(&[snapshot], &request).expect("surface builds");
+
+        assert_eq!(report.contract_id, MISSION_TWIN_SURFACE_CONTRACT_ID);
+        assert_eq!(report.source_bead, MISSION_TWIN_SURFACE_SOURCE_BEAD);
+        assert_eq!(report.action, MissionTwinSurfaceAction::CurrentPlan);
+        assert_eq!(
+            report.action_contract.robot_command,
+            "robot mission-twin current-plan"
+        );
+        assert_eq!(
+            report.action_contract.mcp_tool_name,
+            "ft.mission_twin.current_plan"
+        );
+        assert!(report.action_contract.read_only);
+        assert!(report.action_contract.idempotent);
+        assert!(!report.simulated);
+        assert!(!report.side_effects_executed);
+        assert!(!report.raw_pane_content_stored);
+        assert!(
+            report
+                .artifact_paths
+                .iter()
+                .any(|path| path == "fixtures/mission-twin/snapshot/valid/healthy.json")
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&"mission_twin.surface.read_only".to_string())
+        );
+    }
+
+    #[test]
+    fn surface_report_explains_steps_and_reasons() {
+        let snapshot = valid_snapshot("healthy");
+        let step_request = surface_request(MissionTwinSurfaceAction::ExplainStep)
+            .with_explain_step("mission-twin.healthy.ready-work");
+        let step_report =
+            build_mission_twin_surface_report(std::slice::from_ref(&snapshot), &step_request)
+                .expect("step explain surface builds");
+
+        let step_explain = step_report
+            .plan_surface
+            .explain
+            .as_ref()
+            .expect("step explanation present");
+        assert_eq!(
+            step_explain.mode,
+            crate::mission_objective_plan::MissionObjectivePlanExplainMode::Step
+        );
+        assert!(step_explain.matched);
+        assert!(
+            step_report
+                .reason_codes
+                .contains(&"mission_twin.surface.explain.step".to_string())
+        );
+
+        let reason_request = surface_request(MissionTwinSurfaceAction::ExplainReason)
+            .with_explain_reason("planner.status.actionable");
+        let reason_report = build_mission_twin_surface_report(&[snapshot], &reason_request)
+            .expect("reason explain surface builds");
+
+        let reason_explain = reason_report
+            .plan_surface
+            .explain
+            .as_ref()
+            .expect("reason explanation present");
+        assert_eq!(
+            reason_explain.mode,
+            crate::mission_objective_plan::MissionObjectivePlanExplainMode::Reason
+        );
+        assert!(reason_explain.matched);
+        assert!(
+            reason_report
+                .reason_codes
+                .contains(&"mission_twin.surface.explain.reason".to_string())
+        );
+    }
+
+    #[test]
+    fn surface_report_simulate_embeds_counterfactual_and_ownership_reports() {
+        let snapshot = valid_snapshot("surface-simulate");
+        let request = surface_request(MissionTwinSurfaceAction::Simulate)
+            .with_counterfactual_requests(vec![counterfactual_request(
+                "surface-mail-recovered",
+                vec![MissionTwinCounterfactualToggle::AgentMailRecovered],
+                None,
+            )])
+            .with_ownership_request(ownership_request(
+                "mission-twin.surface-simulate.ready-work",
+                None,
+                vec!["docs/surface.md"],
+                DEFAULT_STALE_AFTER_SECONDS,
+                false,
+            ));
+
+        let report =
+            build_mission_twin_surface_report(&[snapshot], &request).expect("surface builds");
+
+        assert_eq!(report.action, MissionTwinSurfaceAction::Simulate);
+        assert!(report.simulated);
+        assert!(report.counterfactual_report.is_some());
+        assert!(report.ownership_report.is_some());
+        assert!(
+            report
+                .reason_codes
+                .contains(&"mission_twin.surface.action.simulate".to_string())
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&"mission_twin.counterfactual.agent_mail_recovered".to_string())
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&"mission_twin.ownership.side_effect_free".to_string())
+        );
+    }
+
+    #[test]
+    fn surface_report_rejects_empty_explain_queries() {
+        let snapshot = valid_snapshot("invalid-surface");
+        let request = surface_request(MissionTwinSurfaceAction::ExplainStep);
+
+        let err = build_mission_twin_surface_report(&[snapshot], &request)
+            .expect_err("missing explain_step must fail");
+
+        assert!(matches!(
+            err,
+            MissionTwinReplayError::InvalidSurfaceRequest { .. }
+        ));
+    }
+
+    #[test]
     fn ownership_overlap_classifier_handles_exact_parent_child_glob_like_and_empty() {
         assert_eq!(
             classify_mission_twin_owned_path_overlap(
@@ -2704,6 +3178,61 @@ mod tests {
             owned_paths: owned_paths.into_iter().map(str::to_string).collect(),
             stale_after_seconds,
             fallback_only_coordination,
+        }
+    }
+
+    fn surface_request(action: MissionTwinSurfaceAction) -> MissionTwinSurfaceRequest {
+        MissionTwinSurfaceRequest {
+            action,
+            snapshot_paths: Vec::new(),
+            explain_step: None,
+            explain_reason: None,
+            counterfactual_requests: Vec::new(),
+            ownership_request: None,
+        }
+    }
+
+    trait SurfaceRequestExt {
+        fn with_snapshot_paths(self, paths: Vec<&str>) -> Self;
+        fn with_explain_step(self, query: &str) -> Self;
+        fn with_explain_reason(self, query: &str) -> Self;
+        fn with_counterfactual_requests(
+            self,
+            requests: Vec<MissionTwinCounterfactualRequest>,
+        ) -> Self;
+        fn with_ownership_request(self, request: MissionTwinOwnershipSimulationRequest) -> Self;
+    }
+
+    impl SurfaceRequestExt for MissionTwinSurfaceRequest {
+        fn with_snapshot_paths(mut self, paths: Vec<&str>) -> Self {
+            self.snapshot_paths = paths.into_iter().map(str::to_string).collect();
+            self
+        }
+
+        fn with_explain_step(mut self, query: &str) -> Self {
+            self.explain_step = Some(query.to_string());
+            self
+        }
+
+        fn with_explain_reason(mut self, query: &str) -> Self {
+            self.explain_reason = Some(query.to_string());
+            self
+        }
+
+        fn with_counterfactual_requests(
+            mut self,
+            requests: Vec<MissionTwinCounterfactualRequest>,
+        ) -> Self {
+            self.counterfactual_requests = requests;
+            self
+        }
+
+        fn with_ownership_request(
+            mut self,
+            request: MissionTwinOwnershipSimulationRequest,
+        ) -> Self {
+            self.ownership_request = Some(request);
+            self
         }
     }
 

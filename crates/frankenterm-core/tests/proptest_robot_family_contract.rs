@@ -4,21 +4,23 @@ use proptest::prelude::*;
 
 use frankenterm_core::robot_family_contract::{
     FamilyContract, ProptestStrategyHint, SchemaKind, checkpoint_family_contract,
-    context_family_contract, fleet_family_contract, profile_family_contract, work_family_contract,
+    context_family_contract, fleet_family_contract, mission_twin_family_contract,
+    profile_family_contract, work_family_contract,
 };
 
 fn family_contract_by_index(index: usize) -> FamilyContract {
-    match index % 5 {
+    match index % 6 {
         0 => profile_family_contract(),
         1 => checkpoint_family_contract(),
         2 => work_family_contract(),
         3 => fleet_family_contract(),
-        _ => context_family_contract(),
+        4 => context_family_contract(),
+        _ => mission_twin_family_contract(),
     }
 }
 
 fn family_index_strategy() -> impl Strategy<Value = usize> {
-    0usize..5
+    0usize..6
 }
 
 fn action_index_strategy() -> impl Strategy<Value = usize> {

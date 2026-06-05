@@ -7,6 +7,50 @@
   "counterfactual_source_bead": "ft-u7r37.3",
   "ownership_contract_id": "ft.mission_twin_ownership_handoff.v1",
   "ownership_source_bead": "ft-u7r37.4",
+  "surface_contract_id": "ft.mission_twin.robot_mcp_cli_surface.v1",
+  "surface_source_bead": "ft-u7r37.5",
+  "surface_actions": [
+    {
+      "action": "current_plan",
+      "robot_command": "robot mission-twin current-plan",
+      "cli_command": "mission-twin current-plan",
+      "mcp_tool_name": "ft.mission_twin.current_plan",
+      "mcp_resource_uri": "ft://mission-twin/current-plan",
+      "response_payload": "MissionTwinSurfaceReport",
+      "read_only": true,
+      "idempotent": true
+    },
+    {
+      "action": "simulate",
+      "robot_command": "robot mission-twin simulate",
+      "cli_command": "mission-twin simulate",
+      "mcp_tool_name": "ft.mission_twin.simulate",
+      "mcp_resource_uri": "ft://mission-twin/simulate",
+      "response_payload": "MissionTwinSurfaceReport",
+      "read_only": true,
+      "idempotent": true
+    },
+    {
+      "action": "explain_step",
+      "robot_command": "robot mission-twin explain-step",
+      "cli_command": "mission-twin explain-step",
+      "mcp_tool_name": "ft.mission_twin.explain_step",
+      "mcp_resource_uri": "ft://mission-twin/explain-step",
+      "response_payload": "MissionTwinSurfaceReport",
+      "read_only": true,
+      "idempotent": true
+    },
+    {
+      "action": "explain_reason",
+      "robot_command": "robot mission-twin explain-reason",
+      "cli_command": "mission-twin explain-reason",
+      "mcp_tool_name": "ft.mission_twin.explain_reason",
+      "mcp_resource_uri": "ft://mission-twin/explain-reason",
+      "response_payload": "MissionTwinSurfaceReport",
+      "read_only": true,
+      "idempotent": true
+    }
+  ],
   "scrub_rules": [
     {
       "field": "generated_at_ms",
@@ -306,6 +350,120 @@
           "mission_twin.ownership.side_effect_free",
           "mission_twin.ownership.dirty_overlap",
           "mission_twin.ownership.reservation_overlap",
+          "mission_twin.ownership.state.unsafe_overlap"
+        ]
+      }
+    }
+  ],
+  "surface_cases": [
+    {
+      "case_id": "current-plan-healthy",
+      "base_case_id": "healthy",
+      "request": {
+        "action": "current_plan",
+        "snapshot_paths": [
+          "fixtures/mission-twin/snapshot/valid/healthy.json"
+        ]
+      },
+      "expected": {
+        "simulated": false,
+        "explain_mode": null,
+        "explain_matched": false,
+        "counterfactual_report": false,
+        "ownership_report": false,
+        "reason_codes_include": [
+          "mission_twin.surface.read_only",
+          "mission_twin.surface.side_effect_free",
+          "mission_twin.surface.action.current_plan",
+          "planner.status.actionable"
+        ]
+      }
+    },
+    {
+      "case_id": "explain-step-active-owner",
+      "base_case_id": "active-owner",
+      "request": {
+        "action": "explain_step",
+        "snapshot_paths": [
+          "fixtures/mission-twin/snapshot/valid/active-owner.json"
+        ],
+        "explain_step": "mission-twin.active-owner.owner.ft-u7r37.7"
+      },
+      "expected": {
+        "simulated": false,
+        "explain_mode": "step",
+        "explain_matched": true,
+        "counterfactual_report": false,
+        "ownership_report": false,
+        "reason_codes_include": [
+          "mission_twin.surface.read_only",
+          "mission_twin.surface.action.explain_step",
+          "mission_twin.surface.explain.step",
+          "mission_twin.surface.explain.matched"
+        ]
+      }
+    },
+    {
+      "case_id": "explain-reason-dirty-overlap",
+      "base_case_id": "dirty-overlap",
+      "request": {
+        "action": "explain_reason",
+        "snapshot_paths": [
+          "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
+        ],
+        "explain_reason": "mission_twin.dirty_overlap"
+      },
+      "expected": {
+        "simulated": false,
+        "explain_mode": "reason",
+        "explain_matched": true,
+        "counterfactual_report": false,
+        "ownership_report": false,
+        "reason_codes_include": [
+          "mission_twin.surface.read_only",
+          "mission_twin.surface.action.explain_reason",
+          "mission_twin.surface.explain.reason",
+          "mission_twin.surface.explain.matched"
+        ]
+      }
+    },
+    {
+      "case_id": "simulate-dirty-overlap-with-ownership",
+      "base_case_id": "dirty-overlap",
+      "request": {
+        "action": "simulate",
+        "snapshot_paths": [
+          "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
+        ],
+        "counterfactual_requests": [
+          {
+            "scenario_id": "surface-dirty-overlap-cleared",
+            "toggles": [
+              "dirty_overlap_cleared"
+            ]
+          }
+        ],
+        "ownership_request": {
+          "candidate_id": "mission-twin.dirty-overlap.ready-work",
+          "target_bead_id": "ft-0kvfc",
+          "owned_paths": [
+            "crates/frankenterm-core/src/mission_twin_snapshot.rs"
+          ],
+          "stale_after_seconds": 7200,
+          "fallback_only_coordination": false
+        }
+      },
+      "expected": {
+        "simulated": true,
+        "explain_mode": null,
+        "explain_matched": false,
+        "counterfactual_report": true,
+        "ownership_report": true,
+        "reason_codes_include": [
+          "mission_twin.surface.read_only",
+          "mission_twin.surface.action.simulate",
+          "mission_twin.counterfactual.dirty_overlap_cleared",
+          "mission_twin.ownership.dirty_overlap",
           "mission_twin.ownership.state.unsafe_overlap"
         ]
       }

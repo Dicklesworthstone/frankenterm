@@ -7,6 +7,7 @@ cd "${ROOT}"
 
 REPLAY_MODULE="crates/frankenterm-core/src/mission_twin_replay.rs"
 REPLAY_TEST="crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs"
+ROBOT_CONTRACT_MODULE="crates/frankenterm-core/src/robot_family_contract.rs"
 MANIFEST="fixtures/mission-twin/replay/manifest.json"
 PLAN_SCHEMA="docs/json-schema/ft-mission-objective-plan.json"
 SNAPSHOT_DIR="fixtures/mission-twin/snapshot/valid"
@@ -51,6 +52,18 @@ REQUIRED_COUNTERFACTUAL_TOGGLES=(
 REQUIRED_OWNERSHIP_CASES=(
   "active-owner-handoff-required"
   "dirty-overlap-unsafe-overlap"
+)
+REQUIRED_SURFACE_ACTIONS=(
+  "current_plan"
+  "explain_reason"
+  "explain_step"
+  "simulate"
+)
+REQUIRED_SURFACE_CASES=(
+  "current-plan-healthy"
+  "explain-reason-dirty-overlap"
+  "explain-step-active-owner"
+  "simulate-dirty-overlap-with-ownership"
 )
 
 fail() {
@@ -99,6 +112,7 @@ require_command shasum
 
 require_file "${REPLAY_MODULE}"
 require_file "${REPLAY_TEST}"
+require_file "${ROBOT_CONTRACT_MODULE}"
 require_file "${MANIFEST}"
 require_file "${PLAN_SCHEMA}"
 
@@ -144,6 +158,8 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
   and .counterfactual_source_bead == "ft-u7r37.3"
   and .ownership_contract_id == "ft.mission_twin_ownership_handoff.v1"
   and .ownership_source_bead == "ft-u7r37.4"
+  and .surface_contract_id == "ft.mission_twin.robot_mcp_cli_surface.v1"
+  and .surface_source_bead == "ft-u7r37.5"
   and ([.cases[].case_id] | sort) == ($required | sort)
   and (.scrub_rules | type == "array" and length >= 5)
   and all(.scrub_rules[];
@@ -295,6 +311,72 @@ jq -e \
   )
 ' "${MANIFEST}" >/dev/null || fail "manifest ownership cases are incomplete"
 
+jq -e \
+  --argjson required_actions "$(printf '%s\n' "${REQUIRED_SURFACE_ACTIONS[@]}" | jq -R . | jq -s .)" \
+  --argjson required_cases "$(printf '%s\n' "${REQUIRED_SURFACE_CASES[@]}" | jq -R . | jq -s .)" '
+  def repo_relative_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not);
+
+  . as $root
+  |
+  (.surface_actions | type == "array" and length == ($required_actions | length))
+  and ([.surface_actions[].action] | sort) == ($required_actions | sort)
+  and all(.surface_actions[];
+    (.action | IN("current_plan", "simulate", "explain_step", "explain_reason"))
+    and (.robot_command | type == "string" and startswith("robot mission-twin "))
+    and (.cli_command | type == "string" and startswith("mission-twin "))
+    and (.mcp_tool_name | type == "string" and startswith("ft.mission_twin."))
+    and (.mcp_resource_uri | type == "string" and startswith("ft://mission-twin/"))
+    and .response_payload == "MissionTwinSurfaceReport"
+    and .read_only == true
+    and .idempotent == true
+  )
+  and (.surface_cases | type == "array" and length == ($required_cases | length))
+  and ([.surface_cases[].case_id] | sort) == ($required_cases | sort)
+  and all(.surface_cases[];
+    . as $case
+    | (.case_id | type == "string" and length > 0)
+    and (.base_case_id | type == "string" and length > 0)
+    and any($root.cases[].case_id; . == $case.base_case_id)
+    and (.request.action | IN("current_plan", "simulate", "explain_step", "explain_reason"))
+    and (.request.snapshot_paths | type == "array" and length > 0)
+    and all(.request.snapshot_paths[]; repo_relative_path_ok)
+    and (
+      (.request.action != "explain_step")
+      or (.request.explain_step | type == "string" and length > 0)
+    )
+    and (
+      (.request.action != "explain_reason")
+      or (.request.explain_reason | type == "string" and length > 0)
+    )
+    and (
+      (.request.action != "simulate")
+      or ((.request.counterfactual_requests | type == "array" and length > 0)
+        or (.request.ownership_request | type == "object"))
+    )
+    and (.expected.simulated | type == "boolean")
+    and ((.expected.explain_mode == null) or (.expected.explain_mode | IN("step", "reason")))
+    and (.expected.explain_matched | type == "boolean")
+    and (.expected.counterfactual_report | type == "boolean")
+    and (.expected.ownership_report | type == "boolean")
+    and (.expected.reason_codes_include | type == "array" and length >= 4)
+    and all(.expected.reason_codes_include[]; type == "string" and length > 0)
+  )
+' "${MANIFEST}" >/dev/null || fail "manifest surface actions or cases are incomplete"
+
 for field in "${REQUIRED_SCRUB_FIELDS[@]}"; do
   jq -e --arg field "${field}" '
     any(.scrub_rules[];
@@ -319,20 +401,29 @@ while IFS=$'\t' read -r case_id snapshot_path fixture_sha256; do
     || fail "snapshot hash drift for ${case_id}: expected ${fixture_sha256}, got ${actual_sha256}"
 done < <(jq -r '.cases[] | [.case_id, .snapshot_path, .snapshot_sha256] | @tsv' "${MANIFEST}")
 
+while IFS=$'\t' read -r case_id snapshot_path; do
+  require_repo_relative_path "${snapshot_path}"
+  require_file "${snapshot_path}"
+done < <(jq -r '.surface_cases[] | .case_id as $case_id | .request.snapshot_paths[] | [$case_id, .] | @tsv' "${MANIFEST}")
+
 for needle in \
   "MissionTwinSnapshotEnvelope" \
   "MissionObjectivePlannerInput" \
   "plan_mission_objective" \
   "build_mission_twin_replay_surface_data" \
+  "build_mission_twin_surface_report" \
+  "mission_twin_surface_action_contracts" \
+  "MissionTwinSurfaceReport" \
   "simulate_mission_twin_counterfactuals" \
   "simulate_mission_twin_ownership_handoff" \
   "classify_mission_twin_owned_path_overlap" \
   "MissionTwinCounterfactualToggle" \
   "MissionTwinProofLaneClass" \
   "MissionTwinOwnershipHandoffState" \
+  "mission_twin_family_contract" \
   "MissionTwinReplayError::EmptySnapshotSet" \
   "side-effect-free"; do
-  rg -q "${needle}" "${REPLAY_MODULE}" "${REPLAY_TEST}" \
+  rg -q "${needle}" "${REPLAY_MODULE}" "${REPLAY_TEST}" "${ROBOT_CONTRACT_MODULE}" \
     || fail "replay source/test missing required text: ${needle}"
 done
 
@@ -340,4 +431,4 @@ if rg -n 'std::process|Command::new|remove_file|remove_dir|am service|doctor fix
   fail "replay module contains forbidden mutating command surface"
 fi
 
-emit "mission_twin_replay.manifest" "status=ok" "cases=${#REQUIRED_CASES[@]}" "ownership_cases=${#REQUIRED_OWNERSHIP_CASES[@]}" "path=${MANIFEST}"
+emit "mission_twin_replay.manifest" "status=ok" "cases=${#REQUIRED_CASES[@]}" "ownership_cases=${#REQUIRED_OWNERSHIP_CASES[@]}" "surface_cases=${#REQUIRED_SURFACE_CASES[@]}" "path=${MANIFEST}"
