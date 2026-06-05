@@ -116,6 +116,9 @@ docs/formal/*.tlc.log
 # Remote compilation helper cache and build artifacts
 .rch/
 .rch-target/
+# Per-job RCH worker target dirs synced back into the checkout
+# (e.g. .rch-target-vmi1227854-job-<id>-<nonce>-0/)
+.rch-target-*/
 
 # Agent mail SQLite databases (runtime state, not project data)
 storage.sqlite3
