@@ -362,6 +362,99 @@ jq -e \
     and (.operator_summary | contains("do not prove remote Cargo"))
   ' "${PROOF_SUMMARY}" >/dev/null || fail "proof summary metadata mismatch"
 
+mapfile -t closeout_children < <(printf '%s\n' \
+  "ft-lecbn.1" \
+  "ft-lecbn.2" \
+  "ft-lecbn.3" \
+  "ft-lecbn.4" \
+  "ft-lecbn.5" \
+  "ft-lecbn.7" \
+  "ft-lecbn.8")
+
+jq -e \
+  --arg manifest "${MANIFEST}" \
+  --arg manifest_hash "${manifest_hash}" \
+  --arg proof_ledger "${PROOF_LEDGER}" \
+  --arg ledger_hash "${ledger_hash}" \
+  --argjson required "$(printf '%s\n' "${REQUIRED_SCENARIOS[@]}" | jq -R . | jq -s .)" \
+  --argjson closeout_children "$(printf '%s\n' "${closeout_children[@]}" | jq -R . | jq -s .)" '
+    .convergence_closeout.bead_id == "ft-lecbn.6"
+    and .convergence_closeout.parent_epic == "ft-lecbn"
+    and .convergence_closeout.all_children_closed == true
+    and .convergence_closeout.attestation_slot.status == "not_added_schema_category_absent"
+    and .convergence_closeout.attestation_slot.manifest_path == "docs/attestations/manifest.json"
+    and .convergence_closeout.attestation_slot.schema_path == "docs/attestations/schema.json"
+    and .convergence_closeout.attestation_slot.manifest_mutated == false
+    and .convergence_closeout.attestation_slot.readme_claim_graduated == false
+    and ([.child_acceptance_evidence[].bead_id] | sort) == ($closeout_children | sort)
+    and all(.child_acceptance_evidence[];
+      .status == "closed"
+      and (.acceptance | type == "string" and length > 0)
+      and (.artifact_paths | type == "array" and length > 0)
+      and (.proof_commands | type == "array" and length > 0)
+      and all(.proof_commands[];
+        (.command | type == "string" and length > 0)
+        and (.worker_id | type == "string" and length > 0)
+        and (.target_dir | type == "string" and length > 0)
+        and (.exit_code == 0)
+        and (.cargo_reached | type == "boolean")
+        and (.test_reached | type == "boolean")
+        and .local_cargo_counted == false
+        and (.output_summary | type == "string" and length > 0)
+      )
+    )
+    and any(.convergence_closeout.verification_commands[];
+      .command == "bash tests/e2e/test_demo_lab_fixture_manifest.sh"
+      and .exit_code == 0
+      and .local_cargo_counted == false)
+    and any(.convergence_closeout.verification_commands[];
+      .command == "br dep cycles --json"
+      and .exit_code == 0
+      and .local_cargo_counted == false)
+    and any(.convergence_closeout.verification_commands[];
+      (.command | startswith("git diff --check -- "))
+      and .exit_code == 0
+      and .local_cargo_counted == false)
+    and all(.convergence_closeout.forbidden_actions[]; . == false)
+    and (.scenario_artifact_hashes | length) == ($required | length)
+    and all(.scenario_artifact_hashes[];
+      .scenario_id as $scenario_id
+      | ($required | index($scenario_id) != null)
+        and any(.shared_artifacts[];
+          .kind == "manifest" and .path == $manifest and .sha256 == $manifest_hash)
+        and any(.shared_artifacts[];
+          .kind == "proof_ledger" and .path == $proof_ledger and .sha256 == $ledger_hash)
+        and any(.shared_artifacts[];
+          .kind == "proof_summary"
+          and .path == "fixtures/demo-lab/proof/summary.v1.json"
+          and .sha256 == "recorded_in_bead_closeout_comment_to_avoid_self_hash_cycle")
+    )
+  ' "${PROOF_SUMMARY}" >/dev/null || fail "proof summary convergence closeout mismatch"
+
+for scenario_id in "${REQUIRED_SCENARIOS[@]}"; do
+  scenario_path="$(jq -r --arg id "${scenario_id}" '.scenarios[] | select(.id == $id) | .scenario_path' "${MANIFEST}")"
+  scenario_hash="$(sha256_file "${scenario_path}")"
+
+  jq -e --arg id "${scenario_id}" --arg path "${scenario_path}" --arg hash "${scenario_hash}" '
+    any(.scenario_artifact_hashes[];
+      .scenario_id == $id and .scenario.path == $path and .scenario.sha256 == $hash)
+  ' "${PROOF_SUMMARY}" >/dev/null || fail "${scenario_id} closeout scenario hash mismatch"
+
+  mapfile -t closeout_golden_rows < <(jq -r --arg id "${scenario_id}" '
+    .scenarios[] | select(.id == $id) | .expected_artifacts[] |
+    select(.kind == "golden_json" or .kind == "golden_toon") |
+    [.kind, .path, .sha256] | @tsv
+  ' "${MANIFEST}")
+
+  for row in "${closeout_golden_rows[@]}"; do
+    IFS=$'\t' read -r kind path expected_sha <<<"${row}"
+    jq -e --arg id "${scenario_id}" --arg kind "${kind}" --arg path "${path}" --arg hash "${expected_sha}" '
+      any(.scenario_artifact_hashes[] | select(.scenario_id == $id) | .goldens[];
+        .kind == $kind and .path == $path and .sha256 == $hash)
+    ' "${PROOF_SUMMARY}" >/dev/null || fail "${scenario_id} closeout ${kind} hash mismatch"
+  done
+done
+
 if rg -n --hidden --glob '!*.md' \
   '(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|Bearer [A-Za-z0-9._-]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' \
   fixtures/demo-lab >/tmp/ft-demo-lab-secret-scan.txt; then

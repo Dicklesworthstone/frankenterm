@@ -22,6 +22,35 @@ delete or mutate remote source mirrors, perform destructive git cleanup, or
 send input to live panes unless a later explicitly approval-gated live-demo
 bead adds that behavior.
 
+## Operator Workflow
+
+The bundled demo surface is intentionally conservative:
+
+```bash
+ft demo
+ft demo quickstart
+ft demo quickstart --format json
+ft demo quickstart --format toon
+ft demo quickstart --manifest fixtures/demo-lab/manifest.v1.json
+```
+
+Omitting the demo name lists the manifest scenarios and their availability.
+Running a named demo validates the selected scenario through the same
+`Scenario::load` contract used by `ft simulate validate`; it does not send
+input to live panes, call external providers, repair services, or start proof
+lanes. The named demo output includes the exact follow-up command shapes:
+
+```bash
+ft simulate validate fixtures/demo-lab/scenarios/quickstart.yaml
+ft simulate run fixtures/demo-lab/scenarios/quickstart.yaml --speed 1
+```
+
+Use `ft demo <name>` for onboarding and retained artifact discovery. Use
+`ft simulate validate <scenario>.yaml --json` when you only need scenario
+syntax/metadata validation, and use `ft simulate run <scenario>.yaml` when you
+want the mock-WezTerm simulation playback path. None of these demo-lab commands
+is target-class capacity proof.
+
 ## Manifest Fields
 
 Each manifest declares:
@@ -75,6 +104,30 @@ boundary explicit: these artifacts prove deterministic fixture and
 CLI/simulation command contracts only. They do not prove remote Cargo,
 target-class capacity, live-pane mutation, or production-scale behavior.
 
+## Bundled Scenarios and Artifacts
+
+| Demo | Scenario | Retained artifacts | Proof commands |
+|---|---|---|---|
+| `quickstart` | `fixtures/demo-lab/scenarios/quickstart.yaml` | `fixtures/demo-lab/golden/quickstart.json`, `fixtures/demo-lab/golden/quickstart.toon`, `fixtures/demo-lab/proof/proof-ledger.v1.jsonl`, `fixtures/demo-lab/proof/summary.v1.json` | `ft demo quickstart --manifest fixtures/demo-lab/manifest.v1.json --format json`; `ft demo quickstart --manifest fixtures/demo-lab/manifest.v1.json --format toon`; `ft simulate validate fixtures/demo-lab/scenarios/quickstart.yaml --json` |
+| `usage_limit` | `fixtures/demo-lab/scenarios/usage_limit.yaml` | `fixtures/demo-lab/golden/usage_limit.json`, `fixtures/demo-lab/proof/proof-ledger.v1.jsonl`, `fixtures/demo-lab/proof/summary.v1.json` | `ft demo usage_limit --manifest fixtures/demo-lab/manifest.v1.json --format json`; `ft demo usage_limit --manifest fixtures/demo-lab/manifest.v1.json --format toon`; `ft simulate validate fixtures/demo-lab/scenarios/usage_limit.yaml --json` |
+| `compaction` | `fixtures/demo-lab/scenarios/compaction.yaml` | `fixtures/demo-lab/golden/compaction.toon`, `fixtures/demo-lab/proof/proof-ledger.v1.jsonl`, `fixtures/demo-lab/proof/summary.v1.json` | `ft demo compaction --manifest fixtures/demo-lab/manifest.v1.json --format json`; `ft demo compaction --manifest fixtures/demo-lab/manifest.v1.json --format toon`; `ft simulate validate fixtures/demo-lab/scenarios/compaction.yaml --json` |
+
+The proof ledger records that some JSON or TOON stdout shapes are retained as
+goldens and others are only normalized command contracts. Treat the table above
+as an artifact index, not as a promise that every format for every scenario has
+a committed golden file.
+
+## Degradation Behavior
+
+Every scenario must define the same four degradation classes:
+
+| Reason | Status | Required behavior |
+|---|---|---|
+| `agent_mail_unavailable` | `degraded` | Continue with Beads and git evidence; do not repair, reconstruct, stop, or restart Agent Mail. |
+| `disabled_feature` | `unavailable` | Return the disabled feature in the machine envelope and skip execution without side effects. |
+| `rch_proof_unavailable` | `proof_blocked` | Retain preflight/static evidence only; do not count local Cargo output as proof. |
+| `unsupported_platform` | `unavailable` | Report the target/platform and leave the scenario unrun. |
+
 ## Versioning
 
 `ft.demo.scenario-manifest.v1` is a pre-1.0 contract. A breaking field rename,
@@ -95,12 +148,14 @@ The core validator rejects:
 - empty required lists
 - missing degradation reason codes
 - zero or oversized artifact budgets
+- malformed pinned artifact SHA-256 values
 - secret-shaped text in manifest strings
+- manifest proof boundaries that overclaim target-class production capacity
 
-When the demo runner later wires this contract into `ft demo`, validation
-failure should surface as a typed machine-readable error. It should not fall
-back to a marketing demo, ignore missing artifacts, or count local Cargo output
-as RCH proof.
+`ft demo` loads and validates the manifest before listing or running a scenario.
+Validation failure must surface as a typed machine-readable error. It must not
+fall back to a marketing demo, ignore missing artifacts, or count local Cargo
+output as RCH proof.
 
 ## Negative Fixtures
 

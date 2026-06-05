@@ -269,6 +269,7 @@ ft attestation show docs/attestations/0.2.0.json            # pretty-print witho
 - **[Robot Mode (JSON API)](#robot-mode-json-api)** — the full call contract AI agents use to drive other AI agents
 - **[Operating Envelope](#operating-envelope)** — the fail-closed safety surface that gates new pane admission
 - **[Commands](#commands)** — every `ft` subcommand with examples
+- **[Bundled Demo Scenarios](docs/demo-scenarios.md)** — side-effect-free onboarding/regression fixtures with retained artifacts
 - **[Configuration](#configuration)** — `ft.toml` reference for tuning poll intervals, retention, redaction tiers
 - **[Operator Playbook](#operator-playbook-excerpts)** — what to do when things break
 
@@ -952,6 +953,31 @@ ft attestation verify docs/attestations/0.2.0.json --json
 ft attestation verify docs/attestations/0.2.0.json --strict-required
 ft attestation show docs/attestations/0.2.0.json
 ```
+
+### Bundled demo scenarios
+
+`ft demo` is the side-effect-free onboarding and regression surface for the
+bundled demo-lab fixtures. It validates the manifest-backed scenarios
+(`quickstart`, `usage_limit`, and `compaction`) and reports retained artifact
+links and follow-up simulation commands without sending input to live panes,
+repairing Agent Mail, mutating RCH workers, or claiming production-capacity
+proof.
+
+```bash
+ft demo                                           # list available demos
+ft demo quickstart                                # validate one demo scenario
+ft demo quickstart --format json                  # machine-readable JSON
+ft demo quickstart --format toon                  # machine-readable TOON
+ft demo quickstart --manifest fixtures/demo-lab/manifest.v1.json
+
+ft simulate validate fixtures/demo-lab/scenarios/quickstart.yaml --json
+ft simulate run fixtures/demo-lab/scenarios/quickstart.yaml --speed 1
+```
+
+The retained artifacts live under `fixtures/demo-lab/` and are indexed in
+[`docs/demo-scenarios.md`](docs/demo-scenarios.md). They prove deterministic
+fixture and CLI/simulation command contracts only; they do not prove remote
+Cargo, target-class capacity, live-pane mutation, or production-scale behavior.
 
 ### Web API (feature-gated)
 

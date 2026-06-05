@@ -46,5 +46,350 @@
     "duplicate-scenario-id",
     "target-class-proof-overclaim"
   ],
-  "operator_summary": "Retained demo-lab artifacts prove deterministic bundled fixture and CLI/simulation command contracts only. They do not prove remote Cargo, target-class capacity, live-pane mutation, or production-scale behavior."
+  "operator_summary": "Retained demo-lab artifacts prove deterministic bundled fixture and CLI/simulation command contracts only. They do not prove remote Cargo, target-class capacity, live-pane mutation, or production-scale behavior.",
+  "convergence_closeout": {
+    "bead_id": "ft-lecbn.6",
+    "parent_epic": "ft-lecbn",
+    "generated_at": "2026-06-05T02:31:06Z",
+    "all_children_closed": true,
+    "attestation_slot": {
+      "status": "not_added_schema_category_absent",
+      "manifest_path": "docs/attestations/manifest.json",
+      "schema_path": "docs/attestations/schema.json",
+      "manifest_mutated": false,
+      "readme_claim_graduated": false,
+      "reason": "The attestation manifest schema enum has no demo-lab category, and the existing release categories do not honestly represent retained onboarding fixture evidence without widening release claims."
+    },
+    "verification_commands": [
+      {
+        "command": "bash tests/e2e/test_demo_lab_fixture_manifest.sh",
+        "exit_code": 0,
+        "output_summary": "demo-lab fixture manifest: static verifier passed (3 scenarios, 2 json goldens, 2 toon goldens, 6 invalid cases, 3 proof-ledger entries)",
+        "worker_id": "not_applicable_static_fixture",
+        "target_dir": "not_applicable_static_fixture",
+        "cargo_reached": false,
+        "test_reached": false,
+        "local_cargo_counted": false
+      },
+      {
+        "command": "br dep cycles --json",
+        "exit_code": 0,
+        "output_summary": "{\"cycles\":[],\"count\":0}",
+        "worker_id": "not_applicable_beads_graph",
+        "target_dir": "not_applicable_beads_graph",
+        "cargo_reached": false,
+        "test_reached": false,
+        "local_cargo_counted": false
+      },
+      {
+        "command": "git diff --check -- fixtures/demo-lab/proof/summary.v1.json tests/e2e/test_demo_lab_fixture_manifest.sh docs/attestations/manifest.json README.md docs/demo-scenarios.md .beads/issues.jsonl",
+        "exit_code": 0,
+        "output_summary": "no whitespace errors",
+        "worker_id": "not_applicable_static_diff",
+        "target_dir": "not_applicable_static_diff",
+        "cargo_reached": false,
+        "test_reached": false,
+        "local_cargo_counted": false
+      }
+    ],
+    "forbidden_actions": {
+      "agent_mail_service_repair_or_restart": false,
+      "remote_source_deletion_or_mutation": false,
+      "destructive_git_cleanup": false,
+      "local_heavy_cargo_fallback": false,
+      "live_pane_mutation": false,
+      "external_provider_call": false
+    }
+  },
+  "child_acceptance_evidence": [
+    {
+      "bead_id": "ft-lecbn.1",
+      "status": "closed",
+      "acceptance": "Scenario manifest contract, fail-closed validation, bounded/redacted fixtures, and target-class overclaim rejection.",
+      "artifact_paths": [
+        "crates/frankenterm-core/src/demo_scenarios.rs",
+        "fixtures/demo-lab/manifest.v1.json",
+        "fixtures/demo-lab/invalid/manifest-fragments.v1.json",
+        "docs/demo-scenarios.md"
+      ],
+      "proof_commands": [
+        {
+          "command": "cargo test --locked -p frankenterm-core demo_scenarios -- --nocapture",
+          "rch_job_id": "j-29863355577532523",
+          "worker_id": "vmi1227854",
+          "target_dir": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1227854-job-29863355577532523-1780091588132847000-0",
+          "exit_code": 0,
+          "cargo_reached": true,
+          "test_reached": true,
+          "local_cargo_counted": false,
+          "output_summary": "13 demo_scenarios tests passed; RCH remote."
+        }
+      ]
+    },
+    {
+      "bead_id": "ft-lecbn.2",
+      "status": "closed",
+      "acceptance": "Bundled quickstart, usage_limit, and compaction assets are deterministic, safe, and content-addressable.",
+      "artifact_paths": [
+        "fixtures/demo-lab/manifest.v1.json",
+        "fixtures/demo-lab/scenarios/quickstart.yaml",
+        "fixtures/demo-lab/scenarios/usage_limit.yaml",
+        "fixtures/demo-lab/scenarios/compaction.yaml",
+        "fixtures/demo-lab/golden/quickstart.json",
+        "fixtures/demo-lab/golden/quickstart.toon",
+        "fixtures/demo-lab/golden/usage_limit.json",
+        "fixtures/demo-lab/golden/compaction.toon"
+      ],
+      "proof_commands": [
+        {
+          "command": "cargo test -p frankenterm-core demo_scenarios --lib -- --nocapture",
+          "rch_job_id": "j-29871232832766270",
+          "worker_id": "vmi1149989",
+          "target_dir": "/tmp/ft-lecbn2-demo-scenarios",
+          "exit_code": 0,
+          "cargo_reached": true,
+          "test_reached": true,
+          "local_cargo_counted": false,
+          "output_summary": "13 demo_scenarios tests passed; RCH remote."
+        }
+      ]
+    },
+    {
+      "bead_id": "ft-lecbn.3",
+      "status": "closed",
+      "acceptance": "ft demo is manifest-backed, validates bundled scenarios through Scenario::load, and emits plain/JSON/TOON read-only surfaces.",
+      "artifact_paths": [
+        "crates/frankenterm/src/main.rs",
+        "fixtures/demo-lab/manifest.v1.json",
+        "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+        "fixtures/demo-lab/proof/summary.v1.json"
+      ],
+      "proof_commands": [
+        {
+          "command": "cargo test -p frankenterm cli_demo --bin ft -- --nocapture",
+          "rch_job_id": "j-29871232832766276",
+          "worker_id": "vmi1149989",
+          "target_dir": "/tmp/ft-lecbn3-demo-cli-test",
+          "exit_code": 0,
+          "cargo_reached": true,
+          "test_reached": true,
+          "local_cargo_counted": false,
+          "output_summary": "4 cli_demo tests passed; RCH remote."
+        },
+        {
+          "command": "cargo clippy -p frankenterm --bin ft -- -D warnings",
+          "rch_job_id": "j-29871232832766282",
+          "worker_id": "vmi1149989",
+          "target_dir": "/tmp/ft-lecbn3-demo-cli-clippy",
+          "exit_code": 0,
+          "cargo_reached": true,
+          "test_reached": false,
+          "local_cargo_counted": false,
+          "output_summary": "clippy passed with -D warnings; RCH remote."
+        }
+      ]
+    },
+    {
+      "bead_id": "ft-lecbn.4",
+      "status": "closed",
+      "acceptance": "No-mock retained proof harness records per-scenario command shapes, hashes, exit codes, proof state, degradation state, and no side effects.",
+      "artifact_paths": [
+        "tests/e2e/test_demo_lab_fixture_manifest.sh",
+        "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+        "fixtures/demo-lab/proof/summary.v1.json",
+        "fixtures/demo-lab/manifest.v1.json"
+      ],
+      "proof_commands": [
+        {
+          "command": "cargo test -p frankenterm --bin ft cli_demo -- --nocapture",
+          "rch_job_id": "j-29871232832766342",
+          "worker_id": "vmi1227854",
+          "target_dir": "not_reported_in_bead_comment",
+          "exit_code": 0,
+          "cargo_reached": true,
+          "test_reached": true,
+          "local_cargo_counted": false,
+          "output_summary": "4 cli_demo tests passed, including all fixture scenarios; RCH remote."
+        },
+        {
+          "command": "cargo clippy -p frankenterm --bin ft -- -D warnings",
+          "rch_job_id": "j-29871232832766346",
+          "worker_id": "vmi1227854",
+          "target_dir": "not_reported_in_bead_comment",
+          "exit_code": 0,
+          "cargo_reached": true,
+          "test_reached": false,
+          "local_cargo_counted": false,
+          "output_summary": "clippy passed with -D warnings; RCH remote."
+        }
+      ]
+    },
+    {
+      "bead_id": "ft-lecbn.5",
+      "status": "closed",
+      "acceptance": "Operator docs explain ft demo workflows, simulate relationship, artifact links, degradation behavior, and conservative proof boundaries.",
+      "artifact_paths": [
+        "README.md",
+        "docs/demo-scenarios.md"
+      ],
+      "proof_commands": [
+        {
+          "command": "bash tests/e2e/test_demo_lab_fixture_manifest.sh",
+          "rch_job_id": "not_applicable_static_docs",
+          "worker_id": "not_applicable_static_docs",
+          "target_dir": "not_applicable_static_docs",
+          "exit_code": 0,
+          "cargo_reached": false,
+          "test_reached": false,
+          "local_cargo_counted": false,
+          "output_summary": "static verifier passed for scenarios, goldens, invalid cases, and proof ledger."
+        }
+      ]
+    },
+    {
+      "bead_id": "ft-lecbn.7",
+      "status": "closed",
+      "acceptance": "Static manifest verifier prevents manifest, scenario YAML, retained JSON/TOON golden, path, degradation, hash, and secret-scan drift.",
+      "artifact_paths": [
+        "tests/e2e/test_demo_lab_fixture_manifest.sh",
+        "README.md"
+      ],
+      "proof_commands": [
+        {
+          "command": "bash -n tests/e2e/test_demo_lab_fixture_manifest.sh && tests/e2e/test_demo_lab_fixture_manifest.sh",
+          "rch_job_id": "not_applicable_static_fixture",
+          "worker_id": "not_applicable_static_fixture",
+          "target_dir": "not_applicable_static_fixture",
+          "exit_code": 0,
+          "cargo_reached": false,
+          "test_reached": false,
+          "local_cargo_counted": false,
+          "output_summary": "static verifier passed; no Cargo or RCH material proof required."
+        }
+      ]
+    },
+    {
+      "bead_id": "ft-lecbn.8",
+      "status": "closed",
+      "acceptance": "Negative manifest corpus covers unsupported schema versions, absolute paths, parent-relative artifacts, missing degradation reasons, duplicate ids, and target-class overclaims.",
+      "artifact_paths": [
+        "fixtures/demo-lab/invalid/manifest-fragments.v1.json",
+        "tests/e2e/test_demo_lab_fixture_manifest.sh",
+        "docs/demo-scenarios.md"
+      ],
+      "proof_commands": [
+        {
+          "command": "bash tests/e2e/test_demo_lab_fixture_manifest.sh",
+          "rch_job_id": "not_applicable_static_fixture",
+          "worker_id": "not_applicable_static_fixture",
+          "target_dir": "not_applicable_static_fixture",
+          "exit_code": 0,
+          "cargo_reached": false,
+          "test_reached": false,
+          "local_cargo_counted": false,
+          "output_summary": "static verifier passed for the retained invalid fixture corpus."
+        }
+      ]
+    }
+  ],
+  "scenario_artifact_hashes": [
+    {
+      "scenario_id": "quickstart",
+      "scenario": {
+        "path": "fixtures/demo-lab/scenarios/quickstart.yaml",
+        "sha256": "7f33c947552bbecf774a3172200b44fd9e014c0a1b7365e37bbea04a9b1c845b"
+      },
+      "goldens": [
+        {
+          "kind": "golden_json",
+          "path": "fixtures/demo-lab/golden/quickstart.json",
+          "sha256": "17c1881cb23c0fd4997968cb575a10568f5aa9c88aba8e8e5318cf10f4081be4"
+        },
+        {
+          "kind": "golden_toon",
+          "path": "fixtures/demo-lab/golden/quickstart.toon",
+          "sha256": "ba37430a0878469e96489219149c724e3166eb5c9f6a6ddfdb5fc9263e581e28"
+        }
+      ],
+      "shared_artifacts": [
+        {
+          "kind": "manifest",
+          "path": "fixtures/demo-lab/manifest.v1.json",
+          "sha256": "e72704817598b2e28b1ec6b3676c173eeaa964010076931fe397345293b246af"
+        },
+        {
+          "kind": "proof_ledger",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "sha256": "022c2e197ee6b8e0f74c69a333d1619fe1f3c40f59b74a9ce34b793a86af1392"
+        },
+        {
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
+          "sha256": "recorded_in_bead_closeout_comment_to_avoid_self_hash_cycle"
+        }
+      ]
+    },
+    {
+      "scenario_id": "usage_limit",
+      "scenario": {
+        "path": "fixtures/demo-lab/scenarios/usage_limit.yaml",
+        "sha256": "7c33f4ae15bace7246f67d0220c61b8bbc75e908e324f4a0b28c5232043f01d1"
+      },
+      "goldens": [
+        {
+          "kind": "golden_json",
+          "path": "fixtures/demo-lab/golden/usage_limit.json",
+          "sha256": "4c70fad0c14a94616637b5c71a6587558cce851668098f61e063d076edae19b1"
+        }
+      ],
+      "shared_artifacts": [
+        {
+          "kind": "manifest",
+          "path": "fixtures/demo-lab/manifest.v1.json",
+          "sha256": "e72704817598b2e28b1ec6b3676c173eeaa964010076931fe397345293b246af"
+        },
+        {
+          "kind": "proof_ledger",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "sha256": "022c2e197ee6b8e0f74c69a333d1619fe1f3c40f59b74a9ce34b793a86af1392"
+        },
+        {
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
+          "sha256": "recorded_in_bead_closeout_comment_to_avoid_self_hash_cycle"
+        }
+      ]
+    },
+    {
+      "scenario_id": "compaction",
+      "scenario": {
+        "path": "fixtures/demo-lab/scenarios/compaction.yaml",
+        "sha256": "9aedeec0f804e01cb24f8ad97e9960c991504957cccd7f6b0e03e3ad5d40821e"
+      },
+      "goldens": [
+        {
+          "kind": "golden_toon",
+          "path": "fixtures/demo-lab/golden/compaction.toon",
+          "sha256": "d515a387a2766e746b00951b4d5d287ed6dd0fdee4902e73772be0eee1f466c6"
+        }
+      ],
+      "shared_artifacts": [
+        {
+          "kind": "manifest",
+          "path": "fixtures/demo-lab/manifest.v1.json",
+          "sha256": "e72704817598b2e28b1ec6b3676c173eeaa964010076931fe397345293b246af"
+        },
+        {
+          "kind": "proof_ledger",
+          "path": "fixtures/demo-lab/proof/proof-ledger.v1.jsonl",
+          "sha256": "022c2e197ee6b8e0f74c69a333d1619fe1f3c40f59b74a9ce34b793a86af1392"
+        },
+        {
+          "kind": "proof_summary",
+          "path": "fixtures/demo-lab/proof/summary.v1.json",
+          "sha256": "recorded_in_bead_closeout_comment_to_avoid_self_hash_cycle"
+        }
+      ]
+    }
+  ]
 }
