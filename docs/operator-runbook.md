@@ -621,6 +621,59 @@ producing Bead and keep it separate from the proof artifact. An envelope may
 explain why a proof lane was deferred, but it does not prove the code under
 test.
 
+### 2A.5 Swarm capacity doctor remediation
+
+The swarm-capacity operator surface is the read-only capacity view for large
+swarm admission. Its contract is
+[`docs/robot-contracts/swarm-capacity.md`](robot-contracts/swarm-capacity.md),
+the retained doctor-remediation fixture is
+`crates/frankenterm/tests/fixtures/golden_artifacts/swarm_capacity_operator/doctor-remediation.json`,
+and the static verifier is
+`tests/e2e/test_swarm_capacity_doctor_remediation.sh`.
+
+Use these commands as diagnostics only:
+
+```bash
+ft robot swarm-capacity status --format json --level 3
+ft robot swarm-capacity plan --add-panes 12 --format json --level 3
+ft robot swarm-capacity explain <decision-id> --format json
+ft doctor --json
+ft status --health
+```
+
+| Doctor state | Trigger | Safe remediation | Forbidden interpretation |
+| --- | --- | --- | --- |
+| `stale_telemetry` | Runtime health or capacity summary is missing, stale, or redacted. | Refresh read-only status with `ft robot swarm-capacity status`, `ft doctor --json`, and `ft status --health`; keep admission closed until fresh evidence exists. | Do not guess headroom, start panes, restart Agent Mail, mutate RCH workers, or count local Cargo as proof. |
+| `capacity_refused` | The planner returns `defer`, `shed`, `capacity.red`, or `capacity.black`. | Reduce the requested pane count, split the work into a smaller window, or choose docs/static/status work that needs no new capacity. | Do not override the refusal, spawn panes, or convert a dry-run plan into execution. |
+| `target_class_unavailable` | `docs/attestations/perf/swarm-capacity-envelope.json` or the target-class summary is `skipped_not_proven`. | Cite `docs/perf/target-class-hardware.md` and keep high-scale wording blocked until a non-skipped Linux high-core artifact is retained. | Do not claim 64 CPU / 256 GiB or 200+ pane production capacity from benchmark-lane or skipped evidence. |
+| `resource_pressure` | Resource cockpit, workload admission, storage, memory, or RCH pressure is red/black/unavailable. | Pause new admission and preserve the pressure artifact; continue only read-only/status work or already-admitted proof lanes whose evidence remains attributable. | Do not cancel builds, drain workers, clean files, or repair services without explicit operator approval. |
+
+Local-only swarm example: run
+`ft robot swarm-capacity plan --add-panes 4 --format json --level 3` before
+opening another local pane. If the doctor reports `stale_telemetry`, refresh
+only with `ft robot swarm-capacity status --format json --level 3`,
+`ft doctor --json`, and `ft status --health`. If it reports
+`capacity_refused`, keep the local swarm size fixed and switch to docs/static,
+Beads-comment, or status-only work that does not require extra panes.
+
+RCH-assisted build-heavy swarm example: run
+`ft robot swarm-capacity plan --add-panes 12 --format json --level 3` before
+admitting another batch of remote proof lanes. If the doctor reports
+`target_class_unavailable`, cite
+`docs/attestations/perf/swarm-capacity-envelope.json` and
+`docs/perf/target-class-hardware.md`, then keep high-scale release wording
+blocked. If it reports `resource_pressure`, preserve the pressure artifact,
+pause new admission, and allow only already-admitted RCH jobs with attributable
+worker/job evidence to continue.
+
+Capacity closeouts should cite the state and artifact explicitly:
+
+```text
+Swarm-capacity: contract ft.robot.swarm_capacity.operator.v1; state <state>; action <admit|defer|shed|pause>; reason_codes <codes>; artifact <path-or-command>; dry_run true; side_effects_executed false; raw_pane_content_stored false.
+Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
+Target-dir lifecycle: not applicable; no Cargo/RCH target dir created.
+```
+
 ---
 
 ## 2B. Mission Objective Planner Safety Gate
@@ -641,9 +694,10 @@ Current status: the dry-run CLI, Robot, and MCP surfaces are shipped. The
 reviewed golden corpus lives under
 `fixtures/mission-planner/objective-plan-corpus/`, and `ft-auy2g.5` closed the
 no-mock harness proof in commit `4027f0ed3`. This section is operator guidance
-for the shipped dry-run surface. Release-bundle attestation wiring remains the
-separate `ft-auy2g.7` convergence task; do not treat this runbook as a release
-attestation slot.
+for the shipped dry-run surface. Release-bundle attestation wiring now lives in
+`docs/attestations/proofs/mission-objective-plan.json` through the existing
+`proofs/robot-contracts` manifest slot; do not treat this runbook itself as a
+release attestation artifact.
 
 ### 2B.1 Trust boundaries
 
