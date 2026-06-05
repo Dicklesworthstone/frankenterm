@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Static verifier for the mission-twin replay golden corpus.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${ROOT}"
+
+REPLAY_MODULE="crates/frankenterm-core/src/mission_twin_replay.rs"
+REPLAY_TEST="crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs"
+MANIFEST="fixtures/mission-twin/replay/manifest.json"
+PLAN_SCHEMA="docs/json-schema/ft-mission-objective-plan.json"
+SNAPSHOT_DIR="fixtures/mission-twin/snapshot/valid"
+REQUIRED_CASES=(
+  "active-owner"
+  "agent-mail-red"
+  "dirty-overlap"
+  "healthy"
+  "no-ready-work"
+  "rch-critical-pressure-5"
+)
+REQUIRED_SCRUB_FIELDS=(
+  "elapsed_ms"
+  "generated_at_ms"
+  "machine_id"
+  "worker_id"
+  "workspace_root"
+)
+REQUIRED_REASON_CODES=(
+  "agent_mail.red"
+  "beads.dependency_blocked"
+  "beads.owner_active"
+  "dirty_overlap.owned_surface_blocked"
+  "mission_twin.no_ready_work"
+  "mission_twin.owner_handoff_required"
+  "rch.critical_pressure"
+  "rch.proof_substrate_blocked"
+)
+
+fail() {
+  printf '{"event":"mission_twin_replay.error","status":"fail","message":%s}\n' "$(ruby -rjson -e 'print JSON.generate(ARGV.fetch(0))' "$*")" >&2
+  exit 1
+}
+
+emit() {
+  ruby -rjson -e 'event = ARGV.shift; fields = Hash[ARGV.map { |pair| pair.split("=", 2) }]; puts JSON.generate({ "event" => event }.merge(fields))' "$@"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"
+}
+
+require_file() {
+  [[ -f "$1" ]] || fail "missing file: $1"
+}
+
+require_repo_relative_path() {
+  local path="$1"
+
+  [[ -n "${path}" ]] || fail "empty path"
+  [[ "${path}" != /* ]] || fail "absolute path is forbidden: ${path}"
+  [[ "${path}" != "." ]] || fail "bare dot path is forbidden: ${path}"
+  [[ "${path}" != ".." ]] || fail "parent-relative path is forbidden: ${path}"
+  [[ "${path}" != ./* ]] || fail "dot-prefixed path is forbidden: ${path}"
+  [[ "${path}" != ../* ]] || fail "parent-relative path is forbidden: ${path}"
+  [[ "${path}" != */../* ]] || fail "parent-relative path is forbidden: ${path}"
+  [[ "${path}" != */./* ]] || fail "embedded dot segment is forbidden: ${path}"
+  [[ "${path}" != */.. ]] || fail "trailing parent-relative segment is forbidden: ${path}"
+  [[ "${path}" != */. ]] || fail "trailing dot segment is forbidden: ${path}"
+  [[ "${path}" != ".git" ]] || fail ".git path is forbidden: ${path}"
+  [[ "${path}" != .git/* ]] || fail ".git path is forbidden: ${path}"
+  [[ "${path}" != */.git/* ]] || fail ".git path is forbidden: ${path}"
+}
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+require_command jq
+require_command rg
+require_command ruby
+require_command shasum
+
+require_file "${REPLAY_MODULE}"
+require_file "${REPLAY_TEST}"
+require_file "${MANIFEST}"
+require_file "${PLAN_SCHEMA}"
+
+mapfile -t manifest_snapshot_paths < <(jq -r '.cases[].snapshot_path' "${MANIFEST}" | sort)
+mapfile -t actual_snapshot_paths < <(find "${SNAPSHOT_DIR}" -type f -name '*.json' | sort)
+
+for path in "${MANIFEST}" "${PLAN_SCHEMA}" "${manifest_snapshot_paths[@]}"; do
+  require_repo_relative_path "${path}"
+  require_file "${path}"
+done
+
+jq empty "${MANIFEST}" "${PLAN_SCHEMA}" "${manifest_snapshot_paths[@]}"
+
+diff -u <(printf '%s\n' "${manifest_snapshot_paths[@]}") <(printf '%s\n' "${actual_snapshot_paths[@]}") \
+  >/dev/null || fail "manifest snapshot paths do not match ${SNAPSHOT_DIR}/*.json"
+
+jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq -s .)" '
+  def repo_relative_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not);
+  def snapshot_path_ok:
+    repo_relative_path_ok
+    and startswith("fixtures/mission-twin/snapshot/valid/")
+    and endswith(".json");
+
+  .schema_version == 1
+  and .contract_id == "ft.mission_twin_replay.golden_corpus.v1"
+  and .source_bead == "ft-u7r37.2"
+  and .planner_contract_id == "ft.mission_objective_plan.v1"
+  and ([.cases[].case_id] | sort) == ($required | sort)
+  and (.scrub_rules | type == "array" and length >= 5)
+  and all(.scrub_rules[];
+    (.field | type == "string" and length > 0)
+    and (.replacement | type == "string" and length > 0)
+    and (.reason | type == "string" and length > 0)
+  )
+  and all(.cases[];
+    (.case_id | type == "string" and length > 0)
+    and (.snapshot_path | snapshot_path_ok)
+    and (.snapshot_sha256 | test("^[0-9a-f]{64}$"))
+    and (.expected.plan_status | IN(
+      "actionable",
+      "degraded",
+      "dirty_overlap",
+      "no_ready_work",
+      "rch_substrate_blocked",
+      "waiting_owner"
+    ))
+    and (.expected.risk_level | IN("low", "medium", "high", "blocked"))
+    and (.expected.top_step_candidate_id | type == "string" and length > 0)
+    and (.expected.top_step_action_kind | IN(
+      "choose_ready_bead",
+      "file_followup_bead",
+      "run_bv_robot_triage",
+      "wait_for_owner"
+    ))
+    and (.expected.top_step_status | IN(
+      "actionable",
+      "dirty_overlap",
+      "no_ready_work",
+      "rch_substrate_blocked",
+      "waiting_owner"
+    ))
+    and (.expected.top_step_proof_lane | IN("blocked", "not_required"))
+    and (.expected.reason_codes_include | type == "array" and length >= 3)
+    and all(.expected.reason_codes_include[]; type == "string" and length > 0)
+  )
+' "${MANIFEST}" >/dev/null || fail "manifest metadata or case entries are incomplete"
+
+for field in "${REQUIRED_SCRUB_FIELDS[@]}"; do
+  jq -e --arg field "${field}" '
+    any(.scrub_rules[];
+      .field == $field
+      and (.replacement | type == "string" and length > 0)
+      and (.reason | type == "string" and length > 0)
+    )
+  ' "${MANIFEST}" >/dev/null || fail "manifest missing scrub rule for ${field}"
+done
+
+for reason_code in "${REQUIRED_REASON_CODES[@]}"; do
+  jq -e --arg reason_code "${reason_code}" '
+    any(.cases[].expected.reason_codes_include[]; . == $reason_code)
+  ' "${MANIFEST}" >/dev/null || fail "manifest missing expected replay reason code ${reason_code}"
+done
+
+while IFS=$'\t' read -r case_id snapshot_path fixture_sha256; do
+  require_repo_relative_path "${snapshot_path}"
+  require_file "${snapshot_path}"
+  actual_sha256="$(sha256_file "${snapshot_path}")"
+  [[ "${actual_sha256}" == "${fixture_sha256}" ]] \
+    || fail "snapshot hash drift for ${case_id}: expected ${fixture_sha256}, got ${actual_sha256}"
+done < <(jq -r '.cases[] | [.case_id, .snapshot_path, .snapshot_sha256] | @tsv' "${MANIFEST}")
+
+for needle in \
+  "MissionTwinSnapshotEnvelope" \
+  "MissionObjectivePlannerInput" \
+  "plan_mission_objective" \
+  "build_mission_twin_replay_surface_data" \
+  "MissionTwinReplayError::EmptySnapshotSet" \
+  "side-effect-free"; do
+  rg -q "${needle}" "${REPLAY_MODULE}" "${REPLAY_TEST}" \
+    || fail "replay source/test missing required text: ${needle}"
+done
+
+if rg -n 'std::process|Command::new|remove_file|remove_dir|am service|doctor fix|doctor repair|git reset|git clean|kill ' "${REPLAY_MODULE}"; then
+  fail "replay module contains forbidden mutating command surface"
+fi
+
+emit "mission_twin_replay.manifest" "status=ok" "cases=${#REQUIRED_CASES[@]}" "path=${MANIFEST}"

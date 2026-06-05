@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.golden_corpus.v1",
+  "source_bead": "ft-u7r37.2",
+  "planner_contract_id": "ft.mission_objective_plan.v1",
+  "scrub_rules": [
+    {
+      "field": "generated_at_ms",
+      "replacement": "retained snapshot timestamp",
+      "reason": "replay must derive time from retained snapshots, not wall clock"
+    },
+    {
+      "field": "workspace_root",
+      "replacement": "unknown",
+      "reason": "developer checkout paths differ across machines"
+    },
+    {
+      "field": "worker_id",
+      "replacement": "redacted-worker",
+      "reason": "RCH worker identities are machine-local and non-contractual"
+    },
+    {
+      "field": "machine_id",
+      "replacement": "redacted-machine",
+      "reason": "host identity must not be part of the golden"
+    },
+    {
+      "field": "elapsed_ms",
+      "replacement": "omitted from replay input",
+      "reason": "source command runtime is non-contractual"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "healthy",
+      "snapshot_path": "fixtures/mission-twin/snapshot/valid/healthy.json",
+      "snapshot_sha256": "766d94e22dbc0ec7c32cb4c4ab23e00ade535ac5f272a7f47b34017fa4865883",
+      "expected": {
+        "plan_status": "actionable",
+        "risk_level": "low",
+        "top_step_candidate_id": "mission-twin.healthy.ready-work",
+        "top_step_action_kind": "choose_ready_bead",
+        "top_step_status": "actionable",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.actionable",
+          "mission_twin.replay.ready_work_available",
+          "reservations.exclusive_active"
+        ]
+      }
+    },
+    {
+      "case_id": "agent-mail-red",
+      "snapshot_path": "fixtures/mission-twin/snapshot/valid/agent-mail-red.json",
+      "snapshot_sha256": "c3cc23129d240dc71468cd21b96fecf8c605ea2a61a70d73a7638769b108174d",
+      "expected": {
+        "plan_status": "degraded",
+        "risk_level": "medium",
+        "top_step_candidate_id": "mission-twin.agent-mail-red.ready-work",
+        "top_step_action_kind": "choose_ready_bead",
+        "top_step_status": "actionable",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.degraded",
+          "agent_mail.red",
+          "swarm_tick_fallback",
+          "agent_mail.beads_fallback_available",
+          "mission_twin.mail_fallback_mode"
+        ]
+      }
+    },
+    {
+      "case_id": "rch-critical-pressure-5",
+      "snapshot_path": "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json",
+      "snapshot_sha256": "988c82f53bb9da0e2972e1c954d46269db17405389e36872057bfb03231b8b03",
+      "expected": {
+        "plan_status": "rch_substrate_blocked",
+        "risk_level": "blocked",
+        "top_step_candidate_id": "mission-twin.rch-critical-pressure-5.ready-work",
+        "top_step_action_kind": "file_followup_bead",
+        "top_step_status": "rch_substrate_blocked",
+        "top_step_proof_lane": "blocked",
+        "reason_codes_include": [
+          "planner.status.rch_substrate_blocked",
+          "rch.critical_pressure",
+          "rch.proof_substrate_blocked",
+          "rch.proof_substrate_unavailable",
+          "operating_envelope.shed"
+        ]
+      }
+    },
+    {
+      "case_id": "active-owner",
+      "snapshot_path": "fixtures/mission-twin/snapshot/valid/active-owner.json",
+      "snapshot_sha256": "230b29851420309f4a654aeed2983fc57e0792c0e7238beffd254ba8629eeaf3",
+      "expected": {
+        "plan_status": "waiting_owner",
+        "risk_level": "high",
+        "top_step_candidate_id": "mission-twin.active-owner.owner.ft-u7r37.7",
+        "top_step_action_kind": "wait_for_owner",
+        "top_step_status": "waiting_owner",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.waiting_owner",
+          "mission_twin.owner_handoff_required",
+          "beads.owner_active",
+          "recent_closeout",
+          "reservations.exclusive_active"
+        ]
+      }
+    },
+    {
+      "case_id": "dirty-overlap",
+      "snapshot_path": "fixtures/mission-twin/snapshot/valid/dirty-overlap.json",
+      "snapshot_sha256": "ec63135172c692f70cbd1ca9289db725b5a8528a9e101d4676e660f5609929f9",
+      "expected": {
+        "plan_status": "dirty_overlap",
+        "risk_level": "blocked",
+        "top_step_candidate_id": "mission-twin.dirty-overlap.ready-work",
+        "top_step_action_kind": "wait_for_owner",
+        "top_step_status": "dirty_overlap",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.dirty_overlap",
+          "mission_twin.dirty_overlap",
+          "dirty_overlap.owned_surface_blocked",
+          "git.dirty_paths_present",
+          "reservations.exclusive_active"
+        ]
+      }
+    },
+    {
+      "case_id": "no-ready-work",
+      "snapshot_path": "fixtures/mission-twin/snapshot/valid/no-ready-work.json",
+      "snapshot_sha256": "9cda4b2ffd2f921633fb91ed405e077513d40e35e6b7fe77e3ef0a33d9290c78",
+      "expected": {
+        "plan_status": "no_ready_work",
+        "risk_level": "medium",
+        "top_step_candidate_id": "fallback.bv_robot_triage.1771376400000",
+        "top_step_action_kind": "run_bv_robot_triage",
+        "top_step_status": "no_ready_work",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.no_ready_work",
+          "mission_twin.no_ready_work",
+          "mission_twin.snapshot_contract_required",
+          "beads.dependency_blocked",
+          "beads.robot_triage_fallback"
+        ]
+      }
+    }
+  ]
+}
