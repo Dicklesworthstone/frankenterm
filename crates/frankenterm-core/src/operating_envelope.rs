@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "subprocess-bridge")]
 use crate::beads_types::{BeadReadinessReport, BeadResolverReasonCode, BeadStatusCounts};
 
 pub const OPERATING_ENVELOPE_CONTRACT_ID: &str = "ft.operating_envelope.v1";
@@ -574,6 +575,7 @@ impl OperatingEnvelopeBeadsSourceInput {
     }
 
     #[must_use]
+    #[cfg(feature = "subprocess-bridge")]
     pub fn from_readiness_report(
         provenance: OperatingEnvelopeSourceProvenance,
         status_counts: &BeadStatusCounts,
