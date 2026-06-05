@@ -5,6 +5,8 @@
   "planner_contract_id": "ft.mission_objective_plan.v1",
   "counterfactual_contract_id": "ft.mission_twin_counterfactual_replay.v1",
   "counterfactual_source_bead": "ft-u7r37.3",
+  "ownership_contract_id": "ft.mission_twin_ownership_handoff.v1",
+  "ownership_source_bead": "ft-u7r37.4",
   "scrub_rules": [
     {
       "field": "generated_at_ms",
@@ -240,6 +242,71 @@
         ],
         "unblocked_reason_codes_include": [
           "mission_twin.counterfactual.owner_handoff_accepted"
+        ]
+      }
+    }
+  ],
+  "ownership_cases": [
+    {
+      "case_id": "active-owner-handoff-required",
+      "base_case_id": "active-owner",
+      "request": {
+        "candidate_id": "mission-twin.active-owner.owner.ft-u7r37.7",
+        "target_bead_id": "ft-u7r37.7",
+        "owned_paths": [
+          "docs/mission-twin-privacy-safety.md"
+        ],
+        "stale_after_seconds": 7200,
+        "fallback_only_coordination": false
+      },
+      "expected": {
+        "handoff_state": "handoff_required",
+        "dirty_overlap_count": 0,
+        "reservation_overlap_count": 1,
+        "owner_count": 1,
+        "next_actions_include": [
+          "ask_owner",
+          "comment",
+          "choose_planning_only_work"
+        ],
+        "reason_codes_include": [
+          "mission_twin.ownership.simulated",
+          "mission_twin.ownership.side_effect_free",
+          "mission_twin.ownership.active_owner_handoff",
+          "mission_twin.ownership.reservation_overlap",
+          "mission_twin.ownership.state.handoff_required"
+        ]
+      }
+    },
+    {
+      "case_id": "dirty-overlap-unsafe-overlap",
+      "base_case_id": "dirty-overlap",
+      "request": {
+        "candidate_id": "mission-twin.dirty-overlap.ready-work",
+        "target_bead_id": "ft-0kvfc",
+        "owned_paths": [
+          "crates/frankenterm-core/src/mission_twin_snapshot.rs"
+        ],
+        "stale_after_seconds": 7200,
+        "fallback_only_coordination": false
+      },
+      "expected": {
+        "handoff_state": "unsafe_overlap",
+        "dirty_overlap_count": 1,
+        "reservation_overlap_count": 1,
+        "owner_count": 0,
+        "next_actions_include": [
+          "wait",
+          "ask_owner",
+          "choose_planning_only_work",
+          "run_static_only_verifier"
+        ],
+        "reason_codes_include": [
+          "mission_twin.ownership.simulated",
+          "mission_twin.ownership.side_effect_free",
+          "mission_twin.ownership.dirty_overlap",
+          "mission_twin.ownership.reservation_overlap",
+          "mission_twin.ownership.state.unsafe_overlap"
         ]
       }
     }

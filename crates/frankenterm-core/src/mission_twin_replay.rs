@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 
 use crate::mission_objective_plan::{
-    MissionObjectiveActionKind, MissionObjectiveApprovalRequirement,
+    DEFAULT_STALE_AFTER_SECONDS, MissionObjectiveActionKind, MissionObjectiveApprovalRequirement,
     MissionObjectiveCandidateReadiness, MissionObjectiveCandidateWork,
     MissionObjectiveCapacityPosture, MissionObjectiveDirtyPath, MissionObjectiveEvidenceCategory,
     MissionObjectiveEvidenceItem, MissionObjectiveFreshnessState, MissionObjectivePlan,
@@ -26,6 +26,7 @@ use crate::mission_twin_snapshot::{
     MissionTwinSnapshotEnvelope, MissionTwinSnapshotError, OperatingEnvelopeMissionTwinSnapshot,
     OperatingEnvelopeVerdict, OwnerState, RchAdmissionState, RchMissionTwinSnapshot,
     ReservationsMissionTwinSnapshot, SourceEvidence, SourceStatus, StaleOwnerCandidate,
+    is_safe_repo_relative_path,
 };
 
 pub const MISSION_TWIN_REPLAY_SOURCE_BEAD: &str = "ft-u7r37.2";
@@ -37,6 +38,10 @@ pub const MISSION_TWIN_COUNTERFACTUAL_CONTRACT_ID: &str =
 pub const MISSION_TWIN_COUNTERFACTUAL_SCHEMA_VERSION: u16 = 1;
 pub const MISSION_TWIN_COUNTERFACTUAL_SOURCE_BEAD: &str = "ft-u7r37.3";
 pub const MAX_COUNTERFACTUAL_PROOF_LANES: u8 = 64;
+pub const MISSION_TWIN_OWNERSHIP_SIMULATOR_CONTRACT_ID: &str =
+    "ft.mission_twin_ownership_handoff.v1";
+pub const MISSION_TWIN_OWNERSHIP_SIMULATOR_SCHEMA_VERSION: u16 = 1;
+pub const MISSION_TWIN_OWNERSHIP_SIMULATOR_SOURCE_BEAD: &str = "ft-u7r37.4";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissionTwinReplayError {
@@ -184,6 +189,103 @@ pub struct MissionTwinCounterfactualReplayReport {
     pub counterfactual_plans: Vec<MissionTwinCounterfactualPlan>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTwinOwnershipSimulationRequest {
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bead_id: Option<String>,
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
+    #[serde(default = "default_mission_twin_ownership_stale_after_seconds")]
+    pub stale_after_seconds: u64,
+    #[serde(default)]
+    pub fallback_only_coordination: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTwinOwnershipOverlapSource {
+    DirtyPath,
+    Reservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTwinOwnershipOverlapKind {
+    Exact,
+    ParentChild,
+    GlobLike,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTwinOwnershipPathOverlap {
+    pub source: MissionTwinOwnershipOverlapSource,
+    pub overlap_kind: MissionTwinOwnershipOverlapKind,
+    pub owned_path: String,
+    pub matched_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    pub exclusive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTwinOwnershipOwnerSummary {
+    pub bead_id: String,
+    pub assignee: String,
+    pub owner_state: OwnerState,
+    pub age_seconds: u64,
+    pub stale_after_seconds: u64,
+    pub stale: bool,
+    pub last_activity_source: String,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTwinOwnershipHandoffState {
+    Active,
+    StaleCheckNeeded,
+    HandoffRequired,
+    SafeToOpen,
+    UnsafeOverlap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTwinOwnershipNextAction {
+    Wait,
+    Comment,
+    AskOwner,
+    ChoosePlanningOnlyWork,
+    RunStaticOnlyVerifier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissionTwinOwnershipSimulationReport {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub source_bead: String,
+    pub simulated: bool,
+    pub side_effects_executed: bool,
+    pub raw_pane_content_stored: bool,
+    pub forbidden_actions: Vec<String>,
+    pub candidate_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_bead_id: Option<String>,
+    pub owned_paths: Vec<String>,
+    pub stale_after_seconds: u64,
+    pub fallback_only_coordination: bool,
+    pub active_agents: Vec<String>,
+    pub owner_summaries: Vec<MissionTwinOwnershipOwnerSummary>,
+    pub dirty_overlaps: Vec<MissionTwinOwnershipPathOverlap>,
+    pub reservation_overlaps: Vec<MissionTwinOwnershipPathOverlap>,
+    pub handoff_state: MissionTwinOwnershipHandoffState,
+    pub next_actions: Vec<MissionTwinOwnershipNextAction>,
+    pub reason_codes: Vec<String>,
+}
+
 #[must_use]
 pub fn mission_twin_replay_source_id(snapshot_id: &str, source_name: &str) -> String {
     format!("mission_twin.{snapshot_id}.{source_name}")
@@ -297,18 +399,7 @@ pub fn simulate_mission_twin_counterfactuals(
         simulated: true,
         side_effects_executed: false,
         raw_pane_content_stored: false,
-        forbidden_actions: vec![
-            "agent_mail_service_repair_restart".to_string(),
-            "rch_service_repair_restart".to_string(),
-            "worker_mutation".to_string(),
-            "build_cancellation".to_string(),
-            "file_deletion".to_string(),
-            "destructive_git".to_string(),
-            "local_cargo_proof".to_string(),
-            "pane_mutation".to_string(),
-            "raw_pane_content_storage".to_string(),
-            "beads_mutation".to_string(),
-        ],
+        forbidden_actions: mission_twin_forbidden_action_names(),
         reason_codes,
         live_plan,
         counterfactual_plans,
@@ -333,6 +424,474 @@ pub fn classify_mission_twin_proof_lanes(
         simulated: true,
         decisions,
     }
+}
+
+pub fn simulate_mission_twin_ownership_handoff(
+    snapshots: &[MissionTwinSnapshotEnvelope],
+    request: &MissionTwinOwnershipSimulationRequest,
+) -> Result<MissionTwinOwnershipSimulationReport, MissionTwinReplayError> {
+    let ordered = ordered_validated_snapshots(snapshots)?;
+    let owned_paths = normalized_unique_owned_paths(&request.owned_paths);
+    let stale_after_seconds = request.stale_after_seconds.max(60);
+    let fallback_only_coordination = request.fallback_only_coordination
+        || ordered.iter().any(|snapshot| {
+            snapshot.sources.agent_mail.availability_state != AgentMailAvailabilityState::Healthy
+        });
+
+    let mut active_agents = Vec::new();
+    let mut owner_summaries = Vec::new();
+    let mut dirty_overlaps = Vec::new();
+    let mut reservation_overlaps = Vec::new();
+
+    for snapshot in ordered {
+        extend_active_agents(&mut active_agents, snapshot);
+        extend_owner_summaries(
+            &mut owner_summaries,
+            snapshot,
+            request.target_bead_id.as_deref(),
+            stale_after_seconds,
+        );
+        extend_dirty_overlaps(&mut dirty_overlaps, snapshot, &owned_paths);
+        extend_reservation_overlaps(&mut reservation_overlaps, snapshot, &owned_paths);
+    }
+
+    active_agents.sort();
+    owner_summaries.sort_by(|left, right| {
+        left.bead_id
+            .cmp(&right.bead_id)
+            .then(left.assignee.cmp(&right.assignee))
+            .then(left.age_seconds.cmp(&right.age_seconds))
+    });
+    owner_summaries.dedup();
+    dirty_overlaps.sort_by(compare_ownership_overlaps);
+    dirty_overlaps.dedup();
+    reservation_overlaps.sort_by(compare_ownership_overlaps);
+    reservation_overlaps.dedup();
+
+    let handoff_state = mission_twin_ownership_handoff_state(
+        &owner_summaries,
+        &dirty_overlaps,
+        &reservation_overlaps,
+        fallback_only_coordination,
+        !active_agents.is_empty(),
+    );
+    let next_actions =
+        mission_twin_ownership_next_actions(handoff_state, fallback_only_coordination);
+    let reason_codes = mission_twin_ownership_reason_codes(
+        handoff_state,
+        &owned_paths,
+        &owner_summaries,
+        &dirty_overlaps,
+        &reservation_overlaps,
+        fallback_only_coordination,
+    );
+
+    Ok(MissionTwinOwnershipSimulationReport {
+        schema_version: MISSION_TWIN_OWNERSHIP_SIMULATOR_SCHEMA_VERSION,
+        contract_id: MISSION_TWIN_OWNERSHIP_SIMULATOR_CONTRACT_ID.to_string(),
+        source_bead: MISSION_TWIN_OWNERSHIP_SIMULATOR_SOURCE_BEAD.to_string(),
+        simulated: true,
+        side_effects_executed: false,
+        raw_pane_content_stored: false,
+        forbidden_actions: mission_twin_forbidden_action_names(),
+        candidate_id: if request.candidate_id.trim().is_empty() {
+            "candidate.unknown".to_string()
+        } else {
+            request.candidate_id.clone()
+        },
+        target_bead_id: request.target_bead_id.clone(),
+        owned_paths,
+        stale_after_seconds,
+        fallback_only_coordination,
+        active_agents,
+        owner_summaries,
+        dirty_overlaps,
+        reservation_overlaps,
+        handoff_state,
+        next_actions,
+        reason_codes,
+    })
+}
+
+#[must_use]
+pub fn classify_mission_twin_owned_path_overlap(
+    owned_path: &str,
+    observed_path: &str,
+) -> Option<MissionTwinOwnershipOverlapKind> {
+    let owned_path = normalized_overlap_path(owned_path)?;
+    let observed_path = normalized_overlap_path(observed_path)?;
+
+    if owned_path == observed_path {
+        return Some(MissionTwinOwnershipOverlapKind::Exact);
+    }
+    if glob_like_path_overlap(&owned_path, &observed_path) {
+        return Some(MissionTwinOwnershipOverlapKind::GlobLike);
+    }
+    if parent_child_path_overlap(&owned_path, &observed_path) {
+        return Some(MissionTwinOwnershipOverlapKind::ParentChild);
+    }
+    None
+}
+
+#[must_use]
+pub const fn default_mission_twin_ownership_stale_after_seconds() -> u64 {
+    DEFAULT_STALE_AFTER_SECONDS
+}
+
+fn normalized_unique_owned_paths(paths: &[String]) -> Vec<String> {
+    let mut normalized_paths = Vec::new();
+    for path in paths {
+        if let Some(path) = normalized_overlap_path(path) {
+            if is_safe_repo_relative_path(&path) {
+                push_unique(&mut normalized_paths, path);
+            }
+        }
+    }
+    normalized_paths.sort();
+    normalized_paths
+}
+
+fn extend_active_agents(active_agents: &mut Vec<String>, snapshot: &MissionTwinSnapshotEnvelope) {
+    for agent in &snapshot.sources.agent_mail.active_agents {
+        push_unique(active_agents, agent.agent_name.clone());
+    }
+}
+
+fn extend_owner_summaries(
+    owner_summaries: &mut Vec<MissionTwinOwnershipOwnerSummary>,
+    snapshot: &MissionTwinSnapshotEnvelope,
+    target_bead_id: Option<&str>,
+    stale_after_seconds: u64,
+) {
+    for owner in &snapshot.sources.beads.owner_states {
+        if !owner_matches_target(&owner.bead_id, target_bead_id) {
+            continue;
+        }
+        let stale = owner.owner_state == OwnerState::StaleCandidate
+            || owner.age_seconds >= stale_after_seconds;
+        push_unique_owner_summary(
+            owner_summaries,
+            MissionTwinOwnershipOwnerSummary {
+                bead_id: owner.bead_id.clone(),
+                assignee: owner.assignee.clone(),
+                owner_state: owner.owner_state,
+                age_seconds: owner.age_seconds,
+                stale_after_seconds,
+                stale,
+                last_activity_source: owner.last_activity_source.clone(),
+                reason_codes: sorted_reason_codes(owner.reason_codes.clone()),
+            },
+        );
+    }
+
+    for owner in &snapshot.sources.beads.stale_owner_candidates {
+        if !owner_matches_target(&owner.bead_id, target_bead_id) {
+            continue;
+        }
+        push_unique_owner_summary(
+            owner_summaries,
+            MissionTwinOwnershipOwnerSummary {
+                bead_id: owner.bead_id.clone(),
+                assignee: owner.assignee.clone(),
+                owner_state: OwnerState::StaleCandidate,
+                age_seconds: owner.age_seconds,
+                stale_after_seconds,
+                stale: true,
+                last_activity_source: owner.last_activity_source.clone(),
+                reason_codes: sorted_reason_codes(owner.reason_codes.clone()),
+            },
+        );
+    }
+}
+
+fn extend_dirty_overlaps(
+    dirty_overlaps: &mut Vec<MissionTwinOwnershipPathOverlap>,
+    snapshot: &MissionTwinSnapshotEnvelope,
+    owned_paths: &[String],
+) {
+    for owned_path in owned_paths {
+        for dirty_path in &snapshot.sources.git.dirty_paths {
+            if let Some(overlap_kind) =
+                classify_mission_twin_owned_path_overlap(owned_path, &dirty_path.path)
+            {
+                push_unique_overlap(
+                    dirty_overlaps,
+                    MissionTwinOwnershipPathOverlap {
+                        source: MissionTwinOwnershipOverlapSource::DirtyPath,
+                        overlap_kind,
+                        owned_path: owned_path.clone(),
+                        matched_path: dirty_path.path.clone(),
+                        status: Some(dirty_path.status.clone()),
+                        holder: None,
+                        exclusive: false,
+                    },
+                );
+            }
+        }
+
+        for overlap_path in &snapshot.sources.git.overlap_paths {
+            if let Some(overlap_kind) =
+                classify_mission_twin_owned_path_overlap(owned_path, overlap_path)
+            {
+                push_unique_overlap(
+                    dirty_overlaps,
+                    MissionTwinOwnershipPathOverlap {
+                        source: MissionTwinOwnershipOverlapSource::DirtyPath,
+                        overlap_kind,
+                        owned_path: owned_path.clone(),
+                        matched_path: overlap_path.clone(),
+                        status: None,
+                        holder: None,
+                        exclusive: false,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn extend_reservation_overlaps(
+    reservation_overlaps: &mut Vec<MissionTwinOwnershipPathOverlap>,
+    snapshot: &MissionTwinSnapshotEnvelope,
+    owned_paths: &[String],
+) {
+    for owned_path in owned_paths {
+        for reservation in &snapshot.sources.reservations.active_reservations {
+            if let Some(overlap_kind) =
+                classify_mission_twin_owned_path_overlap(owned_path, &reservation.path_pattern)
+            {
+                push_unique_overlap(
+                    reservation_overlaps,
+                    MissionTwinOwnershipPathOverlap {
+                        source: MissionTwinOwnershipOverlapSource::Reservation,
+                        overlap_kind,
+                        owned_path: owned_path.clone(),
+                        matched_path: reservation.path_pattern.clone(),
+                        status: None,
+                        holder: Some(reservation.holder.clone()),
+                        exclusive: reservation.exclusive,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn mission_twin_ownership_handoff_state(
+    owner_summaries: &[MissionTwinOwnershipOwnerSummary],
+    dirty_overlaps: &[MissionTwinOwnershipPathOverlap],
+    reservation_overlaps: &[MissionTwinOwnershipPathOverlap],
+    fallback_only_coordination: bool,
+    active_agents_present: bool,
+) -> MissionTwinOwnershipHandoffState {
+    if !dirty_overlaps.is_empty() {
+        return MissionTwinOwnershipHandoffState::UnsafeOverlap;
+    }
+    if owner_summaries.iter().any(|owner| owner.stale) {
+        return MissionTwinOwnershipHandoffState::StaleCheckNeeded;
+    }
+    if !reservation_overlaps.is_empty() || !owner_summaries.is_empty() {
+        return MissionTwinOwnershipHandoffState::HandoffRequired;
+    }
+    if fallback_only_coordination && active_agents_present {
+        return MissionTwinOwnershipHandoffState::Active;
+    }
+    MissionTwinOwnershipHandoffState::SafeToOpen
+}
+
+fn mission_twin_ownership_next_actions(
+    state: MissionTwinOwnershipHandoffState,
+    fallback_only_coordination: bool,
+) -> Vec<MissionTwinOwnershipNextAction> {
+    match state {
+        MissionTwinOwnershipHandoffState::UnsafeOverlap => vec![
+            MissionTwinOwnershipNextAction::Wait,
+            MissionTwinOwnershipNextAction::AskOwner,
+            MissionTwinOwnershipNextAction::ChoosePlanningOnlyWork,
+            MissionTwinOwnershipNextAction::RunStaticOnlyVerifier,
+        ],
+        MissionTwinOwnershipHandoffState::StaleCheckNeeded => vec![
+            MissionTwinOwnershipNextAction::Comment,
+            MissionTwinOwnershipNextAction::AskOwner,
+            MissionTwinOwnershipNextAction::RunStaticOnlyVerifier,
+        ],
+        MissionTwinOwnershipHandoffState::HandoffRequired if fallback_only_coordination => vec![
+            MissionTwinOwnershipNextAction::Comment,
+            MissionTwinOwnershipNextAction::ChoosePlanningOnlyWork,
+            MissionTwinOwnershipNextAction::RunStaticOnlyVerifier,
+        ],
+        MissionTwinOwnershipHandoffState::HandoffRequired => vec![
+            MissionTwinOwnershipNextAction::AskOwner,
+            MissionTwinOwnershipNextAction::Comment,
+            MissionTwinOwnershipNextAction::ChoosePlanningOnlyWork,
+        ],
+        MissionTwinOwnershipHandoffState::Active => vec![
+            MissionTwinOwnershipNextAction::Wait,
+            MissionTwinOwnershipNextAction::ChoosePlanningOnlyWork,
+            MissionTwinOwnershipNextAction::RunStaticOnlyVerifier,
+        ],
+        MissionTwinOwnershipHandoffState::SafeToOpen => {
+            vec![MissionTwinOwnershipNextAction::RunStaticOnlyVerifier]
+        }
+    }
+}
+
+fn mission_twin_ownership_reason_codes(
+    state: MissionTwinOwnershipHandoffState,
+    owned_paths: &[String],
+    owner_summaries: &[MissionTwinOwnershipOwnerSummary],
+    dirty_overlaps: &[MissionTwinOwnershipPathOverlap],
+    reservation_overlaps: &[MissionTwinOwnershipPathOverlap],
+    fallback_only_coordination: bool,
+) -> Vec<String> {
+    let mut reason_codes = vec![
+        "mission_twin.ownership.simulated".to_string(),
+        "mission_twin.ownership.side_effect_free".to_string(),
+        format!(
+            "mission_twin.ownership.state.{}",
+            ownership_state_name(state)
+        ),
+    ];
+
+    if owned_paths.is_empty() {
+        push_unique(
+            &mut reason_codes,
+            "mission_twin.ownership.empty_owned_paths",
+        );
+    }
+    if !dirty_overlaps.is_empty() {
+        push_unique(&mut reason_codes, "mission_twin.ownership.dirty_overlap");
+    }
+    if !reservation_overlaps.is_empty() {
+        push_unique(
+            &mut reason_codes,
+            "mission_twin.ownership.reservation_overlap",
+        );
+    }
+    if owner_summaries.iter().any(|owner| owner.stale) {
+        push_unique(
+            &mut reason_codes,
+            "mission_twin.ownership.stale_check_needed",
+        );
+    } else if !owner_summaries.is_empty() {
+        push_unique(
+            &mut reason_codes,
+            "mission_twin.ownership.active_owner_handoff",
+        );
+    }
+    if fallback_only_coordination {
+        push_unique(
+            &mut reason_codes,
+            "mission_twin.ownership.fallback_only_coordination",
+        );
+    }
+    reason_codes.sort();
+    reason_codes
+}
+
+fn ownership_state_name(state: MissionTwinOwnershipHandoffState) -> &'static str {
+    match state {
+        MissionTwinOwnershipHandoffState::Active => "active",
+        MissionTwinOwnershipHandoffState::StaleCheckNeeded => "stale_check_needed",
+        MissionTwinOwnershipHandoffState::HandoffRequired => "handoff_required",
+        MissionTwinOwnershipHandoffState::SafeToOpen => "safe_to_open",
+        MissionTwinOwnershipHandoffState::UnsafeOverlap => "unsafe_overlap",
+    }
+}
+
+fn owner_matches_target(owner_bead_id: &str, target_bead_id: Option<&str>) -> bool {
+    match target_bead_id {
+        Some(target_bead_id) => owner_bead_id == target_bead_id,
+        None => true,
+    }
+}
+
+fn compare_ownership_overlaps(
+    left: &MissionTwinOwnershipPathOverlap,
+    right: &MissionTwinOwnershipPathOverlap,
+) -> Ordering {
+    ownership_overlap_source_name(left.source)
+        .cmp(ownership_overlap_source_name(right.source))
+        .then(left.owned_path.cmp(&right.owned_path))
+        .then(left.matched_path.cmp(&right.matched_path))
+        .then(left.holder.cmp(&right.holder))
+        .then(left.exclusive.cmp(&right.exclusive))
+}
+
+fn ownership_overlap_source_name(source: MissionTwinOwnershipOverlapSource) -> &'static str {
+    match source {
+        MissionTwinOwnershipOverlapSource::DirtyPath => "dirty_path",
+        MissionTwinOwnershipOverlapSource::Reservation => "reservation",
+    }
+}
+
+fn push_unique_overlap(
+    overlaps: &mut Vec<MissionTwinOwnershipPathOverlap>,
+    overlap: MissionTwinOwnershipPathOverlap,
+) {
+    if !overlaps.iter().any(|existing| {
+        existing.source == overlap.source
+            && existing.owned_path == overlap.owned_path
+            && existing.matched_path == overlap.matched_path
+            && existing.holder == overlap.holder
+            && existing.exclusive == overlap.exclusive
+    }) {
+        overlaps.push(overlap);
+    }
+}
+
+fn push_unique_owner_summary(
+    owner_summaries: &mut Vec<MissionTwinOwnershipOwnerSummary>,
+    owner_summary: MissionTwinOwnershipOwnerSummary,
+) {
+    if !owner_summaries.contains(&owner_summary) {
+        owner_summaries.push(owner_summary);
+    }
+}
+
+fn normalized_overlap_path(path: &str) -> Option<String> {
+    let path = path.trim().trim_start_matches("./").trim_end_matches('/');
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn glob_like_path_overlap(left: &str, right: &str) -> bool {
+    glob_pattern_matches(left, right) || glob_pattern_matches(right, left)
+}
+
+fn glob_pattern_matches(pattern: &str, path: &str) -> bool {
+    let Some(prefix) = pattern.strip_suffix("/*") else {
+        return false;
+    };
+    let Some(prefix) = normalized_overlap_path(prefix) else {
+        return false;
+    };
+    path.strip_prefix(&prefix)
+        .is_some_and(|tail| tail.starts_with('/') && tail.len() > 1)
+}
+
+fn parent_child_path_overlap(left: &str, right: &str) -> bool {
+    let left_prefix = format!("{left}/");
+    let right_prefix = format!("{right}/");
+    right.starts_with(&left_prefix) || left.starts_with(&right_prefix)
+}
+
+fn mission_twin_forbidden_action_names() -> Vec<String> {
+    vec![
+        "agent_mail_service_repair_restart".to_string(),
+        "rch_service_repair_restart".to_string(),
+        "worker_mutation".to_string(),
+        "build_cancellation".to_string(),
+        "file_deletion".to_string(),
+        "destructive_git".to_string(),
+        "local_cargo_proof".to_string(),
+        "pane_mutation".to_string(),
+        "raw_pane_content_storage".to_string(),
+        "beads_mutation".to_string(),
+    ]
 }
 
 fn validate_counterfactual_request(
@@ -1574,6 +2133,222 @@ mod tests {
     }
 
     #[test]
+    fn ownership_overlap_classifier_handles_exact_parent_child_glob_like_and_empty() {
+        assert_eq!(
+            classify_mission_twin_owned_path_overlap(
+                "crates/frankenterm-core/src/mission_twin_replay.rs",
+                "crates/frankenterm-core/src/mission_twin_replay.rs",
+            ),
+            Some(MissionTwinOwnershipOverlapKind::Exact)
+        );
+        assert_eq!(
+            classify_mission_twin_owned_path_overlap(
+                "crates/frankenterm-core",
+                "crates/frankenterm-core/src/mission_twin_replay.rs",
+            ),
+            Some(MissionTwinOwnershipOverlapKind::ParentChild)
+        );
+        assert_eq!(
+            classify_mission_twin_owned_path_overlap(
+                "crates/frankenterm-core/*",
+                "crates/frankenterm-core/src/mission_twin_replay.rs",
+            ),
+            Some(MissionTwinOwnershipOverlapKind::GlobLike)
+        );
+        assert_eq!(
+            classify_mission_twin_owned_path_overlap(
+                "",
+                "crates/frankenterm-core/src/mission_twin_replay.rs",
+            ),
+            None
+        );
+        assert_eq!(
+            classify_mission_twin_owned_path_overlap(
+                "crates/frankenterm-core/src/mission_twin_replay.rs",
+                "",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ownership_simulator_marks_dirty_overlap_as_unsafe_without_side_effects() {
+        let mut snapshot = valid_snapshot("dirty-ownership");
+        snapshot.sources.git.dirty_paths.push(DirtyPathSummary {
+            path: "crates/frankenterm-core/src/mission_twin_replay.rs".to_string(),
+            status: "M".to_string(),
+            overlaps_owned_path: true,
+        });
+        snapshot
+            .sources
+            .reservations
+            .active_reservations
+            .push(ReservationSummary {
+                holder: "PinkTrout".to_string(),
+                path_pattern: "crates/frankenterm-core/src/*".to_string(),
+                exclusive: true,
+                reason: "mission twin snapshot contract".to_string(),
+            });
+
+        let report = simulate_mission_twin_ownership_handoff(
+            &[snapshot],
+            &ownership_request(
+                "mission-twin.dirty-ownership.ready-work",
+                Some("ft-0kvfc"),
+                vec!["crates/frankenterm-core/src/mission_twin_replay.rs"],
+                DEFAULT_STALE_AFTER_SECONDS,
+                false,
+            ),
+        )
+        .expect("ownership simulation succeeds");
+
+        assert_eq!(
+            report.handoff_state,
+            MissionTwinOwnershipHandoffState::UnsafeOverlap
+        );
+        assert_eq!(report.dirty_overlaps.len(), 1);
+        assert_eq!(report.reservation_overlaps.len(), 1);
+        assert!(report.simulated);
+        assert!(!report.side_effects_executed);
+        assert!(!report.raw_pane_content_stored);
+        assert!(
+            report
+                .next_actions
+                .contains(&MissionTwinOwnershipNextAction::AskOwner)
+        );
+        assert!(
+            report
+                .next_actions
+                .contains(&MissionTwinOwnershipNextAction::RunStaticOnlyVerifier)
+        );
+    }
+
+    #[test]
+    fn ownership_simulator_marks_active_owner_reservation_as_handoff_required() {
+        let mut snapshot = valid_snapshot("active-owner-handoff");
+        snapshot.sources.beads.owner_states.push(BeadOwnerState {
+            bead_id: "ft-u7r37.7".to_string(),
+            assignee: "SilverTrout".to_string(),
+            owner_state: OwnerState::Active,
+            age_seconds: 48,
+            last_activity_source: "agent_mail".to_string(),
+            reason_codes: vec!["recent_closeout".to_string()],
+        });
+        snapshot
+            .sources
+            .reservations
+            .active_reservations
+            .push(ReservationSummary {
+                holder: "SilverTrout".to_string(),
+                path_pattern: "docs/mission-twin-privacy-safety.md".to_string(),
+                exclusive: true,
+                reason: "safety policy closeout".to_string(),
+            });
+
+        let report = simulate_mission_twin_ownership_handoff(
+            &[snapshot],
+            &ownership_request(
+                "mission-twin.active-owner.owner.ft-u7r37.7",
+                Some("ft-u7r37.7"),
+                vec!["docs/mission-twin-privacy-safety.md"],
+                DEFAULT_STALE_AFTER_SECONDS,
+                false,
+            ),
+        )
+        .expect("ownership simulation succeeds");
+
+        assert_eq!(
+            report.handoff_state,
+            MissionTwinOwnershipHandoffState::HandoffRequired
+        );
+        assert_eq!(report.owner_summaries.len(), 1);
+        assert_eq!(report.reservation_overlaps.len(), 1);
+        assert!(
+            report
+                .next_actions
+                .contains(&MissionTwinOwnershipNextAction::AskOwner)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&"mission_twin.ownership.active_owner_handoff".to_string())
+        );
+    }
+
+    #[test]
+    fn ownership_simulator_prefers_stale_check_after_threshold() {
+        let mut snapshot = valid_snapshot("stale-owner-check");
+        snapshot.sources.beads.owner_states.push(BeadOwnerState {
+            bead_id: "ft-stale".to_string(),
+            assignee: "GreyRiver".to_string(),
+            owner_state: OwnerState::Active,
+            age_seconds: DEFAULT_STALE_AFTER_SECONDS,
+            last_activity_source: "beads".to_string(),
+            reason_codes: vec!["owner_age_at_threshold".to_string()],
+        });
+
+        let report = simulate_mission_twin_ownership_handoff(
+            &[snapshot],
+            &ownership_request(
+                "mission-twin.stale-owner.owner.ft-stale",
+                Some("ft-stale"),
+                vec!["docs/stale-owner.md"],
+                DEFAULT_STALE_AFTER_SECONDS,
+                false,
+            ),
+        )
+        .expect("ownership simulation succeeds");
+
+        assert_eq!(
+            report.handoff_state,
+            MissionTwinOwnershipHandoffState::StaleCheckNeeded
+        );
+        assert!(
+            report
+                .next_actions
+                .contains(&MissionTwinOwnershipNextAction::Comment)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&"mission_twin.ownership.stale_check_needed".to_string())
+        );
+    }
+
+    #[test]
+    fn ownership_simulator_keeps_empty_owned_paths_safe_and_non_matching() {
+        let mut snapshot = valid_snapshot("empty-owned-paths");
+        snapshot.sources.git.dirty_paths.push(DirtyPathSummary {
+            path: "crates/frankenterm-core/src/mission_twin_replay.rs".to_string(),
+            status: "M".to_string(),
+            overlaps_owned_path: true,
+        });
+
+        let report = simulate_mission_twin_ownership_handoff(
+            &[snapshot],
+            &ownership_request(
+                "mission-twin.empty-owned-paths.ready-work",
+                None,
+                Vec::<&str>::new(),
+                DEFAULT_STALE_AFTER_SECONDS,
+                false,
+            ),
+        )
+        .expect("ownership simulation succeeds");
+
+        assert_eq!(
+            report.handoff_state,
+            MissionTwinOwnershipHandoffState::SafeToOpen
+        );
+        assert!(report.dirty_overlaps.is_empty());
+        assert!(
+            report
+                .reason_codes
+                .contains(&"mission_twin.ownership.empty_owned_paths".to_string())
+        );
+    }
+
+    #[test]
     fn counterfactual_rch_recovered_unblocks_waiting_rch() {
         let mut snapshot = valid_snapshot("rch-recovered");
         snapshot.sources.rch.admission_state = RchAdmissionState::NotReady;
@@ -1913,6 +2688,22 @@ mod tests {
             scenario_id: scenario_id.to_string(),
             toggles,
             proof_lane_budget,
+        }
+    }
+
+    fn ownership_request(
+        candidate_id: &str,
+        target_bead_id: Option<&str>,
+        owned_paths: Vec<&str>,
+        stale_after_seconds: u64,
+        fallback_only_coordination: bool,
+    ) -> MissionTwinOwnershipSimulationRequest {
+        MissionTwinOwnershipSimulationRequest {
+            candidate_id: candidate_id.to_string(),
+            target_bead_id: target_bead_id.map(str::to_string),
+            owned_paths: owned_paths.into_iter().map(str::to_string).collect(),
+            stale_after_seconds,
+            fallback_only_coordination,
         }
     }
 

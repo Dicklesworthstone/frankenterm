@@ -48,6 +48,10 @@ REQUIRED_COUNTERFACTUAL_TOGGLES=(
   "proof_lanes_budgeted"
   "rch_recovered"
 )
+REQUIRED_OWNERSHIP_CASES=(
+  "active-owner-handoff-required"
+  "dirty-overlap-unsafe-overlap"
+)
 
 fail() {
   printf '{"event":"mission_twin_replay.error","status":"fail","message":%s}\n' "$(ruby -rjson -e 'print JSON.generate(ARGV.fetch(0))' "$*")" >&2
@@ -138,6 +142,8 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
   and .planner_contract_id == "ft.mission_objective_plan.v1"
   and .counterfactual_contract_id == "ft.mission_twin_counterfactual_replay.v1"
   and .counterfactual_source_bead == "ft-u7r37.3"
+  and .ownership_contract_id == "ft.mission_twin_ownership_handoff.v1"
+  and .ownership_source_bead == "ft-u7r37.4"
   and ([.cases[].case_id] | sort) == ($required | sort)
   and (.scrub_rules | type == "array" and length >= 5)
   and all(.scrub_rules[];
@@ -233,6 +239,62 @@ jq -e \
   )
 ' "${MANIFEST}" >/dev/null || fail "manifest counterfactual cases are incomplete"
 
+jq -e \
+  --argjson required_cases "$(printf '%s\n' "${REQUIRED_OWNERSHIP_CASES[@]}" | jq -R . | jq -s .)" '
+  def repo_relative_path_ok:
+    type == "string"
+    and length > 0
+    and . != "."
+    and . != ".."
+    and (startswith("/") | not)
+    and (startswith("./") | not)
+    and (startswith("../") | not)
+    and (contains("/../") | not)
+    and (contains("/./") | not)
+    and (endswith("/..") | not)
+    and (endswith("/.") | not)
+    and . != ".git"
+    and (startswith(".git/") | not)
+    and (contains("/.git/") | not);
+
+  . as $root
+  |
+  (.ownership_cases | type == "array" and length == ($required_cases | length))
+  and ([.ownership_cases[].case_id] | sort) == ($required_cases | sort)
+  and all(.ownership_cases[];
+    . as $case
+    | (.case_id | type == "string" and length > 0)
+    and (.base_case_id | type == "string" and length > 0)
+    and any($root.cases[].case_id; . == $case.base_case_id)
+    and (.request.candidate_id | type == "string" and length > 0)
+    and (.request.target_bead_id | type == "string" and length > 0)
+    and (.request.owned_paths | type == "array" and length > 0)
+    and all(.request.owned_paths[]; repo_relative_path_ok)
+    and (.request.stale_after_seconds | type == "number" and . >= 60)
+    and (.request.fallback_only_coordination | type == "boolean")
+    and (.expected.handoff_state | IN(
+      "active",
+      "stale_check_needed",
+      "handoff_required",
+      "safe_to_open",
+      "unsafe_overlap"
+    ))
+    and (.expected.dirty_overlap_count | type == "number")
+    and (.expected.reservation_overlap_count | type == "number")
+    and (.expected.owner_count | type == "number")
+    and (.expected.next_actions_include | type == "array" and length > 0)
+    and all(.expected.next_actions_include[]; IN(
+      "wait",
+      "comment",
+      "ask_owner",
+      "choose_planning_only_work",
+      "run_static_only_verifier"
+    ))
+    and (.expected.reason_codes_include | type == "array" and length >= 3)
+    and all(.expected.reason_codes_include[]; type == "string" and length > 0)
+  )
+' "${MANIFEST}" >/dev/null || fail "manifest ownership cases are incomplete"
+
 for field in "${REQUIRED_SCRUB_FIELDS[@]}"; do
   jq -e --arg field "${field}" '
     any(.scrub_rules[];
@@ -263,8 +325,11 @@ for needle in \
   "plan_mission_objective" \
   "build_mission_twin_replay_surface_data" \
   "simulate_mission_twin_counterfactuals" \
+  "simulate_mission_twin_ownership_handoff" \
+  "classify_mission_twin_owned_path_overlap" \
   "MissionTwinCounterfactualToggle" \
   "MissionTwinProofLaneClass" \
+  "MissionTwinOwnershipHandoffState" \
   "MissionTwinReplayError::EmptySnapshotSet" \
   "side-effect-free"; do
   rg -q "${needle}" "${REPLAY_MODULE}" "${REPLAY_TEST}" \
@@ -275,4 +340,4 @@ if rg -n 'std::process|Command::new|remove_file|remove_dir|am service|doctor fix
   fail "replay module contains forbidden mutating command surface"
 fi
 
-emit "mission_twin_replay.manifest" "status=ok" "cases=${#REQUIRED_CASES[@]}" "path=${MANIFEST}"
+emit "mission_twin_replay.manifest" "status=ok" "cases=${#REQUIRED_CASES[@]}" "ownership_cases=${#REQUIRED_OWNERSHIP_CASES[@]}" "path=${MANIFEST}"

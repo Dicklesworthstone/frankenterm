@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use frankenterm_core::mission_objective_plan::{
     MissionObjectivePlanStep, MissionObjectivePlanSurfaceData,
 };
+use frankenterm_core::mission_twin_replay::MissionTwinOwnershipSimulationRequest;
 use frankenterm_core::mission_twin_replay::{
     MissionTwinCounterfactualRequest, build_mission_twin_replay_surface_data,
-    simulate_mission_twin_counterfactuals,
+    simulate_mission_twin_counterfactuals, simulate_mission_twin_ownership_handoff,
 };
 use frankenterm_core::mission_twin_snapshot::MissionTwinSnapshotEnvelope;
 use jsonschema::Validator;
@@ -28,9 +29,12 @@ struct ReplayManifest {
     planner_contract_id: String,
     counterfactual_contract_id: String,
     counterfactual_source_bead: String,
+    ownership_contract_id: String,
+    ownership_source_bead: String,
     scrub_rules: Vec<ScrubRule>,
     cases: Vec<ReplayCase>,
     counterfactual_cases: Vec<CounterfactualCase>,
+    ownership_cases: Vec<OwnershipCase>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +78,24 @@ struct ExpectedCounterfactualFields {
     top_lane_class: String,
     live_blockers_include: Vec<String>,
     unblocked_reason_codes_include: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnershipCase {
+    case_id: String,
+    base_case_id: String,
+    request: MissionTwinOwnershipSimulationRequest,
+    expected: ExpectedOwnershipFields,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedOwnershipFields {
+    handoff_state: String,
+    dirty_overlap_count: usize,
+    reservation_overlap_count: usize,
+    owner_count: usize,
+    next_actions_include: Vec<String>,
+    reason_codes_include: Vec<String>,
 }
 
 fn workspace_root() -> PathBuf {
@@ -179,8 +201,14 @@ fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
         "ft.mission_twin_counterfactual_replay.v1"
     );
     assert_eq!(manifest.counterfactual_source_bead, "ft-u7r37.3");
+    assert_eq!(
+        manifest.ownership_contract_id,
+        "ft.mission_twin_ownership_handoff.v1"
+    );
+    assert_eq!(manifest.ownership_source_bead, "ft-u7r37.4");
     assert_eq!(manifest.cases.len(), 6);
     assert_eq!(manifest.counterfactual_cases.len(), 4);
+    assert_eq!(manifest.ownership_cases.len(), 2);
 
     for required_rule in [
         "generated_at_ms",
@@ -409,6 +437,102 @@ fn mission_twin_counterfactual_corpus_compares_live_and_simulated_fields() {
         assert_eq!(
             json_once, json_twice,
             "{}: counterfactual JSON must be deterministic",
+            case.case_id
+        );
+    }
+}
+
+#[test]
+fn mission_twin_ownership_corpus_matches_active_owner_and_dirty_overlap_golden_fields() {
+    let manifest = load_manifest();
+    assert_eq!(
+        manifest.ownership_contract_id,
+        "ft.mission_twin_ownership_handoff.v1"
+    );
+    assert_eq!(manifest.ownership_source_bead, "ft-u7r37.4");
+
+    for case in &manifest.ownership_cases {
+        let base_case = manifest
+            .cases
+            .iter()
+            .find(|candidate| candidate.case_id == case.base_case_id)
+            .unwrap_or_else(|| panic!("{}: missing base case {}", case.case_id, case.base_case_id));
+        let snapshot = load_snapshot(base_case);
+        let report = simulate_mission_twin_ownership_handoff(&[snapshot], &case.request)
+            .unwrap_or_else(|err| panic!("{}: ownership simulation failed: {err}", case.case_id));
+
+        assert_eq!(report.contract_id, manifest.ownership_contract_id);
+        assert_eq!(report.source_bead, manifest.ownership_source_bead);
+        assert!(
+            report.simulated,
+            "{}: ownership report must be simulated",
+            case.case_id
+        );
+        assert!(
+            !report.side_effects_executed,
+            "{}: ownership simulation must not execute side effects",
+            case.case_id
+        );
+        assert!(
+            !report.raw_pane_content_stored,
+            "{}: ownership simulation must not store raw pane content",
+            case.case_id
+        );
+        assert_eq!(
+            serialize_enum(report.handoff_state),
+            case.expected.handoff_state,
+            "{}: handoff state changed",
+            case.case_id
+        );
+        assert_eq!(
+            report.dirty_overlaps.len(),
+            case.expected.dirty_overlap_count,
+            "{}: dirty overlap count changed",
+            case.case_id
+        );
+        assert_eq!(
+            report.reservation_overlaps.len(),
+            case.expected.reservation_overlap_count,
+            "{}: reservation overlap count changed",
+            case.case_id
+        );
+        assert_eq!(
+            report.owner_summaries.len(),
+            case.expected.owner_count,
+            "{}: owner count changed",
+            case.case_id
+        );
+
+        let action_names = report
+            .next_actions
+            .iter()
+            .map(serialize_enum)
+            .collect::<Vec<_>>();
+        for action in &case.expected.next_actions_include {
+            assert!(
+                action_names.iter().any(|item| item == action),
+                "{}: missing expected next action {action}",
+                case.case_id
+            );
+        }
+        for reason_code in &case.expected.reason_codes_include {
+            assert!(
+                report.reason_codes.iter().any(|item| item == reason_code),
+                "{}: missing ownership reason code {reason_code}",
+                case.case_id
+            );
+        }
+
+        let report_value = serde_json::to_value(&report)
+            .unwrap_or_else(|err| panic!("{}: serialize ownership report: {err}", case.case_id));
+        let json_once = serde_json::to_string_pretty(&report_value)
+            .unwrap_or_else(|err| panic!("{}: ownership JSON encode failed: {err}", case.case_id));
+        let json_twice = serde_json::to_string_pretty(&report_value).unwrap_or_else(|err| {
+            panic!("{}: ownership JSON re-encode failed: {err}", case.case_id)
+        });
+        assert_eq!(
+            json_once, json_twice,
+            "{}: ownership JSON must be deterministic",
             case.case_id
         );
     }
