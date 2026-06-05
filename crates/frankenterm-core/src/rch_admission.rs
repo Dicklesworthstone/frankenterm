@@ -1456,7 +1456,10 @@ mod tests {
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
         assert_eq!(
             report.reason_codes,
-            vec![RchAdmissionReasonCode::LocalEnoSpace]
+            vec![
+                RchAdmissionReasonCode::LocalEnoSpace,
+                RchAdmissionReasonCode::TelemetryGap,
+            ]
         );
         assert!(report.advisory_only);
         assert!(
