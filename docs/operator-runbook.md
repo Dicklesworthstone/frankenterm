@@ -761,11 +761,18 @@ for the harness, `jq empty` over the schema/manifest/input fixtures, the static
 manifest verifier above, `git diff --check`, and `br dep cycles --json`
 returning zero cycles.
 
-Until `ft-auy2g.7` adds a release-attestation slot, cite these corpus paths and
-the RCH job in Beads comments or Agent Mail handoffs. If a later change updates
-the manifest, retained fixtures, schema, or harness, rerun the static verifier
-and the focused RCH harness proof before claiming the corpus still proves the
-contract.
+`ft-auy2g.7` wires the retained corpus into the release bundle through the
+`proofs/robot-contracts` manifest slot at
+`docs/attestations/proofs/mission-objective-plan.json`. Its convergence proof
+reran the same focused corpus harness through RCH on worker `vmi1152480` as job
+`j-29871232832766479`; the command returned `2 passed / 0 failed` with remote
+target directory
+`.rch-target-vmi1152480-job-29871232832766479-1780671414361355000-0`.
+
+If a later change updates the manifest, retained fixtures, schema, harness,
+operator runbook, or robot contract, rerun the static verifier, the focused RCH
+harness proof, and the attestation manifest checks before claiming the corpus
+still proves the contract.
 
 Do not cite `ft mission objective-plan` as proof that target-class capacity,
 source correctness, RCH health, or Beads ownership is green. It is an

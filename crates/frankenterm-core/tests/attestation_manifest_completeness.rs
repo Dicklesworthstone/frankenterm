@@ -19,6 +19,7 @@ const MANIFEST_PRODUCER_FALLBACK_ISSUES_JSONL: &str = r#"{"id":"ft-0elb9","statu
 {"id":"ft-35yac.1.2","status":"closed","dependencies":[]}
 {"id":"ft-35yac.2","status":"closed","dependencies":[]}
 {"id":"ft-43x69","status":"closed","dependencies":[]}
+{"id":"ft-auy2g.7","status":"closed","dependencies":[]}
 {"id":"ft-b94bx.8","status":"closed","dependencies":[]}
 {"id":"ft-e87u6.12","status":"closed","dependencies":[]}
 {"id":"ft-e87u6.9","status":"closed","dependencies":[]}

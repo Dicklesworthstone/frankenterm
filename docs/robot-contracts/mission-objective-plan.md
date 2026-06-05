@@ -149,9 +149,14 @@ cargo test -p frankenterm-core --no-default-features --test mission_objective_pl
 It passed with `2 passed / 0 failed`. Static companion checks are the corpus
 manifest verifier in `tests/e2e/test_mission_objective_plan_corpus_manifest.sh`,
 `jq empty` over the schema and corpus JSON, rustfmt for the harness, diff
-checking, and dependency-cycle checking. Release-bundle attestation wiring is
-deferred to the `ft-auy2g.7` convergence bead; this contract should cite the
-corpus proof without inventing a manifest slot.
+checking, and dependency-cycle checking.
+
+`ft-auy2g.7` adds release-bundle wiring through the existing
+`proofs/robot-contracts` category because this is a Robot/MCP/CLI planning
+contract. The attestation artifact is
+`docs/attestations/proofs/mission-objective-plan.json`; its convergence proof
+reran the corpus harness through RCH on worker `vmi1152480` as job
+`j-29871232832766479`, again returning `2 passed / 0 failed`.
 
 ## Shipped Surface
 

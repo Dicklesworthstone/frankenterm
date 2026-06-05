@@ -146,6 +146,14 @@
       "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelopes, live profile/fleet mutation receipts, and backend-unavailable/policy/approval failure contracts (G2; originally introduced under ft-q5njp)."
     },
     {
+      "category": "proofs/robot-contracts",
+      "path": "docs/attestations/proofs/mission-objective-plan.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-auy2g.7",
+      "proof_categories": [4],
+      "description": "Mission objective-plan dry-run contract, reviewed golden corpus, no-mock harness, operator runbook, and Robot/MCP/CLI planning-surface convergence proof. Uses the existing robot-contracts release category because ft.mission_objective_plan.v1 is a schema-backed machine planning contract, not a new release taxonomy category."
+    },
+    {
       "category": "proofs/rehearsal-score",
       "path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
       "media_type": "application/json",
