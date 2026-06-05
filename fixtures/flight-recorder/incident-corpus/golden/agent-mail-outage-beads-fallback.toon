@@ -1,0 +1,8 @@
+schema_version: ft.flight_recorder.incident_golden.v1
+scenario_id: agent_mail_outage_beads_fallback
+incident_id: ft-ogr3n6-agent-mail-outage-beads-fallback
+outcome: source_unavailable
+proof_admissible: false
+frame_count: 2
+mail: unavailable_after_retry,no_service_repair=true,beads_fallback=true
+local_cargo_counted: false

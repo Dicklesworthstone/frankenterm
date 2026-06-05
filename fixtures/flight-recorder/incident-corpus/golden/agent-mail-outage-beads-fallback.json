@@ -1,0 +1,51 @@
+{
+  "schema_version": "ft.flight_recorder.incident_golden.v1",
+  "contract_id": "ft.flight_recorder.incident_golden.v1",
+  "bead_id": "ft-ogr3n.6",
+  "scenario_id": "agent_mail_outage_beads_fallback",
+  "source_set_path": "fixtures/flight-recorder/incident-corpus/source-sets/agent-mail-outage-beads-fallback.json",
+  "surface_contract_id": "ft.swarm.incident_surfaces.v1",
+  "expected": {
+    "incident_id": "ft-ogr3n6-agent-mail-outage-beads-fallback",
+    "outcome": "source_unavailable",
+    "proof_admissible": false,
+    "frame_count": 2,
+    "required_sources": [
+      "beads",
+      "source_unavailable"
+    ],
+    "required_causal_classes": [
+      "communication_outage",
+      "source_pass"
+    ],
+    "required_inadmissible_reason_codes": [
+      "proof.no_remote_rch_pass",
+      "proof.source_unavailable"
+    ],
+    "required_error_codes": [
+      "agent_mail.unavailable"
+    ],
+    "required_frame_reason_codes": [
+      "agent_mail.no_service_repair",
+      "beads.fallback_surface",
+      "agent_mail.unavailable"
+    ],
+    "required_artifact_uris": [
+      ".beads/issues.jsonl",
+      "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
+    ],
+    "required_rch_build_ids": [],
+    "required_rch_worker_ids": [],
+    "required_source_set_substrings": [
+      "\"repair_attempted\": false",
+      "\"service_restart_attempted\": false",
+      "\"mail_fallback_used\": true"
+    ],
+    "forbidden_substrings": [
+      "ghp_",
+      "API_TOKEN",
+      "sk-live-",
+      "password="
+    ]
+  }
+}

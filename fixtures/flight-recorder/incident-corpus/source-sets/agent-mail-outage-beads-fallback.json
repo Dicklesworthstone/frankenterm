@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.swarm.source_adapters.v1",
+  "generated_at_ms": 1780696830000,
+  "source_set_id": "ft-ogr3n6-agent-mail-outage-beads-fallback",
+  "workspace_id": "frankenterm",
+  "agent_mail": [
+    {
+      "source_id": "agent-mail-unavailable-after-retry",
+      "health_state": "unavailable",
+      "thread_id": null,
+      "collected_at_ms": 1780696828000,
+      "message_count": 0,
+      "ack_count": 0,
+      "ack_required_count": 0,
+      "contact_count": 0,
+      "unavailable_reason": "Agent Mail database unavailable after one allowed retry",
+      "reason_codes": [
+        "agent_mail.unavailable_after_retry",
+        "agent_mail.no_service_repair"
+      ],
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
+      ],
+      "payload": {
+        "retry_count": 1,
+        "repair_attempted": false,
+        "service_restart_attempted": false
+      }
+    }
+  ],
+  "beads": [
+    {
+      "source_id": "beads-mail-fallback",
+      "issue_id": "ft-ogr3n.6",
+      "status": "in_progress",
+      "updated_at_ms": 1780696829000,
+      "dependency_ids": [
+        "ft-ogr3n.4"
+      ],
+      "comment_count": 4,
+      "dirty_tree_guard_comment_count": 0,
+      "close_reason": null,
+      "reason_codes": [
+        "beads.fallback_surface",
+        "beads.coordination_comment",
+        "agent_mail.no_service_repair"
+      ],
+      "artifact_paths": [
+        ".beads/issues.jsonl"
+      ],
+      "payload": {
+        "summary": "Coordination continued through Beads while Agent Mail remained unavailable.",
+        "mail_fallback_used": true,
+        "agent_mail_repair_attempted": false
+      }
+    }
+  ]
+}

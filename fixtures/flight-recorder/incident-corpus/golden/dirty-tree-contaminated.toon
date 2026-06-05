@@ -1,0 +1,8 @@
+schema_version: ft.flight_recorder.incident_golden.v1
+scenario_id: dirty_tree_contaminated
+incident_id: ft-ogr3n6-dirty-tree-contaminated
+outcome: contaminated_proof_attempt
+proof_admissible: false
+frame_count: 2
+dirty_paths[2]: crates/frankenterm-core/src/operating_envelope.rs,crates/frankenterm-core-replay-types/src/incident_causality.rs
+local_cargo_counted: false

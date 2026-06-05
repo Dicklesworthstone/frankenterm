@@ -1,0 +1,51 @@
+{
+  "schema_version": "ft.flight_recorder.incident_golden.v1",
+  "contract_id": "ft.flight_recorder.incident_golden.v1",
+  "bead_id": "ft-ogr3n.6",
+  "scenario_id": "dirty_tree_contaminated",
+  "source_set_path": "fixtures/flight-recorder/incident-corpus/source-sets/dirty-tree-contaminated.json",
+  "surface_contract_id": "ft.swarm.incident_surfaces.v1",
+  "expected": {
+    "incident_id": "ft-ogr3n6-dirty-tree-contaminated",
+    "outcome": "contaminated_proof_attempt",
+    "proof_admissible": false,
+    "frame_count": 2,
+    "required_sources": [
+      "git",
+      "rch"
+    ],
+    "required_causal_classes": [
+      "dirty_tree_contamination",
+      "source_pass"
+    ],
+    "required_inadmissible_reason_codes": [
+      "proof.dirty_tree_contamination"
+    ],
+    "required_error_codes": [],
+    "required_frame_reason_codes": [
+      "git.unrelated_tracked_dirty",
+      "proof.contaminated_dirty_tree",
+      "proof.requires_clean_git"
+    ],
+    "required_artifact_uris": [
+      "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl",
+      "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json"
+    ],
+    "required_rch_build_ids": [
+      "j-29871232832766541"
+    ],
+    "required_rch_worker_ids": [
+      "vmi1293453"
+    ],
+    "required_source_set_substrings": [
+      "crates/frankenterm-core/src/operating_envelope.rs",
+      "crates/frankenterm-core-replay-types/src/incident_causality.rs"
+    ],
+    "forbidden_substrings": [
+      "ghp_",
+      "API_TOKEN",
+      "sk-live-",
+      "password="
+    ]
+  }
+}

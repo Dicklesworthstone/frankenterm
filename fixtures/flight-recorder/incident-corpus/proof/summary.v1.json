@@ -1,0 +1,69 @@
+{
+  "schema_version": "ft.flight_recorder.incident_corpus.proof_summary.v1",
+  "contract_id": "ft.flight_recorder.incident_corpus.proof_summary.v1",
+  "bead_id": "ft-ogr3n.6",
+  "manifest": {
+    "path": "fixtures/flight-recorder/incident-corpus/manifest.v1.json",
+    "sha256": "2cbdaf0cdc6d410a88f401aa6a11f8340bbd6405e41f7e62a7ff47e588980ddd"
+  },
+  "invalid_fragments": {
+    "path": "fixtures/flight-recorder/incident-corpus/invalid/fragments.v1.json",
+    "sha256": "c68669e6f394f8c92c6d100c990fb27739413b14ad6b1752910b32f25e38c103",
+    "entries": 7
+  },
+  "proof_ledger": {
+    "path": "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl",
+    "sha256": "ce217016e7bc1926de5721b19046d995a4c10c77b3e41109bb98c2c4c33c9f8f",
+    "entries": 5,
+    "contract_id": "ft.flight_recorder.incident_corpus.proof_log.v1"
+  },
+  "scenario_ids": [
+    "rch_mirror_before_cargo",
+    "remote_cargo_pass",
+    "dirty_tree_contaminated",
+    "agent_mail_outage_beads_fallback",
+    "bead_closeout_mirror"
+  ],
+  "outcome_counts": {
+    "source_pass": 2,
+    "infrastructure_block": 1,
+    "contaminated_proof_attempt": 1,
+    "source_unavailable": 1
+  },
+  "proof_state": {
+    "execution_mode": "retained_source_set_replay_fixture",
+    "remote_metadata_scenarios": [
+      "remote_cargo_pass",
+      "dirty_tree_contaminated",
+      "bead_closeout_mirror"
+    ],
+    "pre_cargo_block_scenarios": [
+      "rch_mirror_before_cargo"
+    ],
+    "agent_mail_fallback_scenarios": [
+      "agent_mail_outage_beads_fallback"
+    ],
+    "local_cargo_counted": false,
+    "live_services_called": false,
+    "target_dir": "not_applicable_static_fixture_summary",
+    "worker_id": "mixed_retained_metadata"
+  },
+  "negative_coverage": [
+    "missing-source-set-artifact",
+    "duplicate-scenario-id",
+    "absolute-artifact-path",
+    "parent-relative-artifact-path",
+    "local-cargo-counted",
+    "agent-mail-service-repair",
+    "remote-pass-missing-worker"
+  ],
+  "side_effects": {
+    "live_panes_mutated": false,
+    "external_services_called": false,
+    "agent_mail_repair_attempted": false,
+    "agent_mail_service_restarted": false,
+    "rch_worker_mutated": false,
+    "file_deleted": false
+  },
+  "operator_summary": "The retained corpus proves deterministic replay from persisted artifacts across RCH pre-Cargo blocks, remote RCH pass metadata, dirty-tree contamination, Agent Mail outage fallback, and closeout mirror evidence. It does not count local Cargo and does not perform live Agent Mail, RCH, pane, git, or Beads mutation."
+}

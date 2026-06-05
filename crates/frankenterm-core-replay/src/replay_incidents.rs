@@ -1169,6 +1169,8 @@ mod tests {
         include_str!("../../../fixtures/flight-recorder/source-adapters/valid-source-set.json");
     const GOLDEN_SCENARIOS: &str =
         include_str!("../../../fixtures/flight-recorder/incident-dag/golden-scenarios.v1.json");
+    const INCIDENT_CORPUS_MANIFEST: &str =
+        include_str!("../../../fixtures/flight-recorder/incident-corpus/manifest.v1.json");
 
     #[derive(Debug, Deserialize)]
     struct GoldenFixture {
@@ -1181,6 +1183,58 @@ mod tests {
         source_set: serde_json::Value,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct IncidentCorpusManifest {
+        contract_id: String,
+        bead_id: String,
+        scenarios: Vec<IncidentCorpusScenario>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct IncidentCorpusScenario {
+        id: String,
+        source_set: IncidentCorpusArtifact,
+        golden_json: IncidentCorpusArtifact,
+        golden_toon: IncidentCorpusArtifact,
+        expected_outcome: IncidentOutcome,
+        expected_proof_admissible: bool,
+        material_remote_rch_metadata: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct IncidentCorpusArtifact {
+        path: String,
+        sha256: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct IncidentGoldenArtifact {
+        contract_id: String,
+        bead_id: String,
+        scenario_id: String,
+        source_set_path: String,
+        surface_contract_id: String,
+        expected: IncidentGoldenExpected,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct IncidentGoldenExpected {
+        incident_id: String,
+        outcome: IncidentOutcome,
+        proof_admissible: bool,
+        frame_count: usize,
+        required_sources: Vec<SwarmCausalEventSource>,
+        required_causal_classes: Vec<CausalEventClass>,
+        required_inadmissible_reason_codes: Vec<String>,
+        required_error_codes: Vec<String>,
+        required_frame_reason_codes: Vec<String>,
+        required_artifact_uris: Vec<String>,
+        required_rch_build_ids: Vec<String>,
+        required_rch_worker_ids: Vec<String>,
+        required_source_set_substrings: Vec<String>,
+        forbidden_substrings: Vec<String>,
+    }
+
     fn store(input: &str) -> IncidentSurfaceStore {
         IncidentSurfaceStore::from_source_set_json(
             input,
@@ -1190,6 +1244,51 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn fixture_path(path: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path)
+    }
+
+    fn fixture_string(path: &str) -> String {
+        std::fs::read_to_string(fixture_path(path))
+            .unwrap_or_else(|error| panic!("read fixture {path}: {error}"))
+    }
+
+    fn sha256_hex(input: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(input);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn assert_contains_all<T>(actual: &[T], required: &[T], scenario_id: &str, field: &str)
+    where
+        T: std::fmt::Debug + PartialEq,
+    {
+        for item in required {
+            assert!(
+                actual.contains(item),
+                "{scenario_id} missing {field} {item:?}; actual={actual:?}"
+            );
+        }
+    }
+
+    fn assert_rendered_does_not_contain(
+        scenario_id: &str,
+        forbidden: &[String],
+        values: &[serde_json::Value],
+    ) {
+        let rendered = serde_json::to_string(values).unwrap();
+        for needle in forbidden {
+            assert!(
+                !rendered.contains(needle),
+                "{scenario_id} leaked forbidden substring {needle}: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1279,6 +1378,209 @@ mod tests {
             outcomes["clean_remote_proof_pass"],
             IncidentOutcome::SourcePass
         );
+    }
+
+    #[test]
+    fn incident_golden_corpus_matches_replay_surfaces() {
+        let manifest: IncidentCorpusManifest =
+            serde_json::from_str(INCIDENT_CORPUS_MANIFEST).unwrap();
+        assert_eq!(
+            manifest.contract_id,
+            "ft.flight_recorder.incident_corpus.v1"
+        );
+        assert_eq!(manifest.bead_id, "ft-ogr3n.6");
+        assert_eq!(manifest.scenarios.len(), 5);
+
+        for scenario in manifest.scenarios {
+            let source_set = fixture_string(&scenario.source_set.path);
+            assert_eq!(
+                sha256_hex(source_set.as_bytes()),
+                scenario.source_set.sha256,
+                "{} source-set hash drifted",
+                scenario.id
+            );
+            let golden_json = fixture_string(&scenario.golden_json.path);
+            assert_eq!(
+                sha256_hex(golden_json.as_bytes()),
+                scenario.golden_json.sha256,
+                "{} golden JSON hash drifted",
+                scenario.id
+            );
+            let golden_toon = fixture_string(&scenario.golden_toon.path);
+            assert_eq!(
+                sha256_hex(golden_toon.as_bytes()),
+                scenario.golden_toon.sha256,
+                "{} golden TOON hash drifted",
+                scenario.id
+            );
+
+            let golden: IncidentGoldenArtifact = serde_json::from_str(&golden_json)
+                .unwrap_or_else(|error| panic!("{} golden JSON: {error}", scenario.id));
+            assert_eq!(golden.contract_id, "ft.flight_recorder.incident_golden.v1");
+            assert_eq!(golden.bead_id, "ft-ogr3n.6");
+            assert_eq!(golden.scenario_id, scenario.id);
+            assert_eq!(golden.source_set_path, scenario.source_set.path);
+            assert_eq!(golden.surface_contract_id, INCIDENT_SURFACE_CONTRACT_ID_V1);
+            assert_eq!(golden.expected.outcome, scenario.expected_outcome);
+            assert_eq!(
+                golden.expected.proof_admissible,
+                scenario.expected_proof_admissible
+            );
+
+            let store = IncidentSurfaceStore::from_source_set_json(
+                &source_set,
+                IncidentSurfaceBuildOptions {
+                    source_artifact: Some(scenario.source_set.path.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{} store build: {error}", scenario.id));
+            let list = store
+                .list_payload(IncidentSurfaceFilter::default())
+                .unwrap_or_else(|error| panic!("{} list payload: {error}", scenario.id));
+            assert_eq!(list.incident_count, 1, "{}", scenario.id);
+            let incident = &list.incidents[0];
+            assert_eq!(incident.incident_id, golden.expected.incident_id);
+            assert_eq!(incident.outcome, golden.expected.outcome);
+            assert_eq!(incident.proof_admissible, golden.expected.proof_admissible);
+            assert_eq!(list.contract_id, INCIDENT_SURFACE_CONTRACT_ID_V1);
+            assert!(list.dry_run);
+            assert!(list.read_only);
+            assert!(!list.live_mutation_allowed);
+            assert!(!list.side_effects_executed);
+            assert_contains_all(
+                &incident.sources,
+                &golden.expected.required_sources,
+                &scenario.id,
+                "source",
+            );
+            assert_contains_all(
+                &incident.causal_classes,
+                &golden.expected.required_causal_classes,
+                &scenario.id,
+                "causal class",
+            );
+            assert_contains_all(
+                &incident.rch_build_ids,
+                &golden.expected.required_rch_build_ids,
+                &scenario.id,
+                "RCH build id",
+            );
+            assert_contains_all(
+                &incident.rch_worker_ids,
+                &golden.expected.required_rch_worker_ids,
+                &scenario.id,
+                "RCH worker id",
+            );
+
+            let show = store
+                .show_payload(&golden.expected.incident_id)
+                .unwrap_or_else(|error| panic!("{} show payload: {error}", scenario.id));
+            let explain = store
+                .explain_payload(&golden.expected.incident_id)
+                .unwrap_or_else(|error| panic!("{} explain payload: {error}", scenario.id));
+            let replay = store
+                .replay_payload(&golden.expected.incident_id)
+                .unwrap_or_else(|error| panic!("{} replay payload: {error}", scenario.id));
+            assert_eq!(explain.outcome, golden.expected.outcome);
+            assert_eq!(
+                show.proof_coverage.admissible,
+                golden.expected.proof_admissible
+            );
+            assert_eq!(replay.frame_count, golden.expected.frame_count);
+            assert!(show.read_only);
+            assert!(explain.read_only);
+            assert!(replay.read_only);
+            assert!(!show.live_mutation_allowed);
+            assert!(!explain.live_mutation_allowed);
+            assert!(!replay.live_mutation_allowed);
+            assert!(!show.side_effects_executed);
+            assert!(!explain.side_effects_executed);
+            assert!(!replay.side_effects_executed);
+            assert!(!show.raw_pane_content_stored);
+            assert!(!explain.raw_pane_content_stored);
+            assert!(!replay.raw_pane_content_stored);
+            assert_eq!(
+                replay.deterministic_order,
+                "occurred_at_ms,ingested_at_ms,ingest_sequence,event_id"
+            );
+            assert_contains_all(
+                &show.proof_coverage.inadmissible_reason_codes,
+                &golden.expected.required_inadmissible_reason_codes,
+                &scenario.id,
+                "inadmissible reason",
+            );
+            let error_codes = list
+                .error_envelopes
+                .iter()
+                .map(|envelope| envelope.code.clone())
+                .collect::<Vec<_>>();
+            assert_contains_all(
+                &error_codes,
+                &golden.expected.required_error_codes,
+                &scenario.id,
+                "error code",
+            );
+            let frame_reason_codes = replay
+                .frames
+                .iter()
+                .flat_map(|frame| frame.reason_codes.clone())
+                .collect::<Vec<_>>();
+            assert_contains_all(
+                &frame_reason_codes,
+                &golden.expected.required_frame_reason_codes,
+                &scenario.id,
+                "frame reason code",
+            );
+            let artifact_uris = show
+                .evidence_refs
+                .iter()
+                .map(|artifact| artifact.uri.clone())
+                .collect::<Vec<_>>();
+            assert_contains_all(
+                &artifact_uris,
+                &golden.expected.required_artifact_uris,
+                &scenario.id,
+                "artifact uri",
+            );
+            for required in &golden.expected.required_source_set_substrings {
+                assert!(
+                    source_set.contains(required),
+                    "{} missing retained source-set substring {required}",
+                    scenario.id
+                );
+            }
+            if scenario.material_remote_rch_metadata {
+                assert!(
+                    incident
+                        .rch_worker_ids
+                        .iter()
+                        .any(|worker| worker.starts_with("vmi")),
+                    "{} missing retained remote worker metadata",
+                    scenario.id
+                );
+                assert!(
+                    incident
+                        .rch_build_ids
+                        .iter()
+                        .any(|build| build.starts_with("j-")),
+                    "{} missing retained RCH job/build metadata",
+                    scenario.id
+                );
+            }
+            assert!(golden_toon.contains("local_cargo_counted: false"));
+            assert!(golden_toon.contains(&format!("scenario_id: {}", scenario.id)));
+            assert_rendered_does_not_contain(
+                &scenario.id,
+                &golden.expected.forbidden_substrings,
+                &[
+                    serde_json::to_value(&list).unwrap(),
+                    serde_json::to_value(&show).unwrap(),
+                    serde_json::to_value(&explain).unwrap(),
+                    serde_json::to_value(&replay).unwrap(),
+                ],
+            );
+        }
     }
 
     #[test]

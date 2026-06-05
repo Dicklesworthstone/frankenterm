@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.swarm.source_adapters.v1",
+  "generated_at_ms": 1780696800000,
+  "source_set_id": "ft-ogr3n6-rch-mirror-before-cargo",
+  "workspace_id": "frankenterm",
+  "beads": [
+    {
+      "source_id": "bead-ft-ogr3n6-rch-mirror-before-cargo",
+      "issue_id": "ft-ogr3n.6",
+      "status": "in_progress",
+      "updated_at_ms": 1780696798000,
+      "dependency_ids": [
+        "ft-ogr3n.4"
+      ],
+      "comment_count": 2,
+      "dirty_tree_guard_comment_count": 0,
+      "close_reason": null,
+      "reason_codes": [
+        "beads.claimed",
+        "beads.remote_proof_pending"
+      ],
+      "artifact_paths": [
+        ".beads/issues.jsonl"
+      ],
+      "payload": {
+        "summary": "Incident corpus lane claimed before proof admission; no source verdict has been produced."
+      }
+    }
+  ],
+  "rch": [
+    {
+      "source_id": "rch-mirror-stale-before-cargo",
+      "build_id": "j-29871232832766560",
+      "worker_id": null,
+      "command_argv": [
+        "cargo",
+        "test",
+        "-p",
+        "frankenterm-core-replay",
+        "replay_incidents",
+        "--lib"
+      ],
+      "started_at_ms": 1780696799000,
+      "completed_at_ms": null,
+      "location": "local",
+      "exit_code": null,
+      "cancellation_reason": null,
+      "preflight_refusal_reason": "remote worker mirror missing or stale before Cargo admission",
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
+      ],
+      "reason_codes": [
+        "rch.worker_mirror_stale",
+        "rch.cargo_not_reached",
+        "proof.source_verdict_unavailable"
+      ],
+      "payload": {
+        "cargo_reached": false,
+        "remote_rustc_reached": false,
+        "test_binary_reached": false,
+        "source_verdict": "unavailable_no_cargo",
+        "operator_summary": "RCH blocked before Cargo; replay must not infer a source failure or pass."
+      }
+    }
+  ]
+}

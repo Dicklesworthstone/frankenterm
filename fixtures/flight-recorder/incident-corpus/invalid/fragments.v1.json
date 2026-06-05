@@ -1,0 +1,102 @@
+{
+  "schema_version": "ft.flight_recorder.incident_corpus.invalid_fragments.v1",
+  "contract_id": "ft.flight_recorder.incident_corpus.invalid_fragments.v1",
+  "bead_id": "ft-ogr3n.6",
+  "manifest_path": "fixtures/flight-recorder/incident-corpus/manifest.v1.json",
+  "verification_command": "bash tests/e2e/test_flight_recorder_incident_corpus.sh",
+  "cases": [
+    {
+      "case_id": "missing-source-set-artifact",
+      "expected_failure": "source_set_artifact_must_exist",
+      "reason_codes": [
+        "incident_corpus.source_set_missing"
+      ],
+      "invalid_fragment": {
+        "scenario": {
+          "id": "missing_source",
+          "source_set": {
+            "path": "fixtures/flight-recorder/incident-corpus/source-sets/missing.json"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "duplicate-scenario-id",
+      "expected_failure": "scenario_ids_must_be_unique",
+      "reason_codes": [
+        "incident_corpus.duplicate_scenario_id"
+      ],
+      "invalid_fragment": {
+        "scenarios": [
+          {
+            "id": "remote_cargo_pass"
+          },
+          {
+            "id": "remote_cargo_pass"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "absolute-artifact-path",
+      "expected_failure": "artifact_path_must_be_repo_relative",
+      "reason_codes": [
+        "incident_corpus.absolute_path_forbidden"
+      ],
+      "invalid_fragment": {
+        "path": "/tmp/frankenterm-proof.json"
+      }
+    },
+    {
+      "case_id": "parent-relative-artifact-path",
+      "expected_failure": "artifact_path_must_not_escape_repo",
+      "reason_codes": [
+        "incident_corpus.parent_relative_path_forbidden"
+      ],
+      "invalid_fragment": {
+        "path": "../proof.json"
+      }
+    },
+    {
+      "case_id": "local-cargo-counted",
+      "expected_failure": "local_cargo_must_not_count_as_proof",
+      "reason_codes": [
+        "incident_corpus.local_cargo_counted_forbidden"
+      ],
+      "invalid_fragment": {
+        "proof": {
+          "execution_mode": "local_cargo",
+          "local_cargo_counted": true
+        }
+      }
+    },
+    {
+      "case_id": "agent-mail-service-repair",
+      "expected_failure": "agent_mail_repair_or_restart_forbidden",
+      "reason_codes": [
+        "incident_corpus.agent_mail_repair_forbidden"
+      ],
+      "invalid_fragment": {
+        "side_effects": {
+          "agent_mail_repair_attempted": true,
+          "agent_mail_service_restarted": true
+        }
+      }
+    },
+    {
+      "case_id": "remote-pass-missing-worker",
+      "expected_failure": "remote_rch_pass_must_cite_worker",
+      "reason_codes": [
+        "incident_corpus.remote_worker_missing"
+      ],
+      "invalid_fragment": {
+        "scenario_id": "remote_cargo_pass",
+        "rch": {
+          "location": "remote",
+          "exit_code": 0,
+          "worker_id": null
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.swarm.source_adapters.v1",
+  "generated_at_ms": 1780696840000,
+  "source_set_id": "ft-ogr3n6-bead-closeout-mirror",
+  "workspace_id": "frankenterm",
+  "beads": [
+    {
+      "source_id": "bead-closeout-with-dep-cycle-check",
+      "issue_id": "ft-ogr3n.6",
+      "status": "closed",
+      "updated_at_ms": 1780696837000,
+      "dependency_ids": [
+        "ft-ogr3n.4",
+        "ft-ogr3n.5"
+      ],
+      "comment_count": 6,
+      "dirty_tree_guard_comment_count": 0,
+      "close_reason": "Golden corpus verifier passed with dep-cycle check and branch mirror evidence",
+      "reason_codes": [
+        "beads.closeout",
+        "beads.dep_cycles_zero",
+        "beads.branch_mirror_cited"
+      ],
+      "artifact_paths": [
+        ".beads/issues.jsonl"
+      ],
+      "payload": {
+        "dep_cycles_count": 0,
+        "main_push": "passed",
+        "legacy_branch_mirror": "main_synced_to_master"
+      }
+    }
+  ],
+  "git": [
+    {
+      "source_id": "git-main-master-mirror",
+      "head_commit": "21a264542",
+      "branch": "main",
+      "captured_at_ms": 1780696838000,
+      "staged_paths": [],
+      "dirty_paths": [],
+      "branch_ahead": 0,
+      "branch_behind": 0,
+      "protected_deletion_warnings": [],
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json"
+      ],
+      "reason_codes": [
+        "git.clean",
+        "git.main_pushed",
+        "git.legacy_branch_mirror_synced"
+      ],
+      "payload": {
+        "remote_main": "origin/main",
+        "remote_legacy_mirror": "origin/master",
+        "mirror_command": "git push origin main:master"
+      }
+    }
+  ],
+  "rch": [
+    {
+      "source_id": "rch-closeout-verifier-pass",
+      "build_id": "j-29871232832766580",
+      "worker_id": "vmi1227854",
+      "command_argv": [
+        "cargo",
+        "test",
+        "-p",
+        "frankenterm-core-replay",
+        "replay_incidents",
+        "--lib"
+      ],
+      "started_at_ms": 1780696839000,
+      "completed_at_ms": 1780696849000,
+      "location": "remote",
+      "exit_code": 0,
+      "cancellation_reason": null,
+      "preflight_refusal_reason": null,
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
+      ],
+      "reason_codes": [
+        "rch.remote_worker_reached",
+        "rch.test_binary_reached",
+        "rch.exit_zero"
+      ],
+      "payload": {
+        "duration_ms": 10000,
+        "target_dir": "/tmp/ft-ogr3n6-replay-incidents",
+        "remote_cargo_reached": true,
+        "remote_rustc_reached": true,
+        "test_binary_reached": true
+      }
+    }
+  ]
+}
