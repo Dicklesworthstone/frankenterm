@@ -637,11 +637,13 @@ grant. A plan can recommend a Beads claim, Beads comment, docs/static slice, or
 RCH proof lane, but the operator or agent still has to perform the normal claim,
 reservation, ownership, and proof gates before mutating anything.
 
-Current status: the dry-run CLI, Robot, and MCP surfaces are shipped, and the
-golden corpus exists under `fixtures/mission-planner/objective-plan-corpus/`.
-The corpus/proof Bead `ft-auy2g.5` still blocks final runbook closeout, so this
-section is operating guidance for the shipped dry-run surface, not a release
-attestation.
+Current status: the dry-run CLI, Robot, and MCP surfaces are shipped. The
+reviewed golden corpus lives under
+`fixtures/mission-planner/objective-plan-corpus/`, and `ft-auy2g.5` closed the
+no-mock harness proof in commit `4027f0ed3`. This section is operator guidance
+for the shipped dry-run surface. Release-bundle attestation wiring remains the
+separate `ft-auy2g.7` convergence task; do not treat this runbook as a release
+attestation slot.
 
 ### 2B.1 Trust boundaries
 
@@ -724,6 +726,46 @@ For docs/static prework on a dependency-blocked planner Bead, pair it with:
 Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
 Target-dir lifecycle: not applicable; no Cargo/RCH target dir created.
 ```
+
+### 2B.5 Corpus evidence and attestation handoff
+
+The retained corpus is the current evidence anchor for this surface:
+
+- Manifest:
+  `fixtures/mission-planner/objective-plan-corpus/manifest.json`.
+- Harness:
+  `crates/frankenterm-core/tests/mission_objective_plan_golden_corpus.rs`.
+- Static verifier:
+  `tests/e2e/test_mission_objective_plan_corpus_manifest.sh`.
+- Reviewed cases: clean ready queue, no-ready fallback, Agent Mail
+  unavailable, RCH degraded, dirty path overlap, stale in-progress work, and a
+  blocked proof lane.
+
+The closeout proof for `ft-auy2g.5` was:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 \
+  rch --no-self-healing exec -- env \
+  CARGO_TARGET_DIR=/tmp/ft-auy2g5-mission-corpus-proof3-20260605-yellowhorse \
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true \
+  GIT_TERMINAL_PROMPT=0 \
+  cargo test -p frankenterm-core --no-default-features \
+    --test mission_objective_plan_golden_corpus -- --nocapture
+```
+
+It ran remotely on `vmi1227854` as job `j-29871232832766473` and returned
+`2 passed / 0 failed`. The supporting docs/static checks were `rustfmt --check`
+for the harness, `jq empty` over the schema/manifest/input fixtures, the static
+manifest verifier above, `git diff --check`, and `br dep cycles --json`
+returning zero cycles.
+
+Until `ft-auy2g.7` adds a release-attestation slot, cite these corpus paths and
+the RCH job in Beads comments or Agent Mail handoffs. If a later change updates
+the manifest, retained fixtures, schema, or harness, rerun the static verifier
+and the focused RCH harness proof before claiming the corpus still proves the
+contract.
 
 Do not cite `ft mission objective-plan` as proof that target-class capacity,
 source correctness, RCH health, or Beads ownership is green. It is an

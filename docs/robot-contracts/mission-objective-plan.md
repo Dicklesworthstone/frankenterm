@@ -138,6 +138,21 @@ that forbid raw pane content storage. The
 through the real dry-run planner, validates generated plan JSON against the
 schema, and verifies deterministic TOON encoding.
 
+The current retained proof for this corpus is `ft-auy2g.5`, commit
+`4027f0ed3`. The focused RCH proof ran on worker `vmi1227854` as job
+`j-29871232832766473`:
+
+```text
+cargo test -p frankenterm-core --no-default-features --test mission_objective_plan_golden_corpus -- --nocapture
+```
+
+It passed with `2 passed / 0 failed`. Static companion checks are the corpus
+manifest verifier in `tests/e2e/test_mission_objective_plan_corpus_manifest.sh`,
+`jq empty` over the schema and corpus JSON, rustfmt for the harness, diff
+checking, and dependency-cycle checking. Release-bundle attestation wiring is
+deferred to the `ft-auy2g.7` convergence bead; this contract should cite the
+corpus proof without inventing a manifest slot.
+
 ## Shipped Surface
 
 The same dry-run contract is exposed through human CLI, Robot mode, and MCP:
