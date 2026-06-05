@@ -130,7 +130,7 @@ fn ordered_validated_snapshots(
     }
 
     let mut ordered = snapshots.iter().collect::<Vec<_>>();
-    ordered.sort_by(compare_snapshots);
+    ordered.sort_by(|left, right| compare_snapshots(left, right));
 
     for snapshot in &ordered {
         snapshot
@@ -145,8 +145,8 @@ fn ordered_validated_snapshots(
 }
 
 fn compare_snapshots(
-    left: &&MissionTwinSnapshotEnvelope,
-    right: &&MissionTwinSnapshotEnvelope,
+    left: &MissionTwinSnapshotEnvelope,
+    right: &MissionTwinSnapshotEnvelope,
 ) -> Ordering {
     left.snapshot_id
         .cmp(&right.snapshot_id)
@@ -532,7 +532,7 @@ fn source_snapshot_from_evidence(
 ) -> MissionObjectiveSourceSnapshot {
     let reason_codes = sorted_reason_codes(reason_codes);
     let mut evidence_item = MissionObjectiveEvidenceItem::new(category, summary);
-    evidence_item.reason_codes = reason_codes.clone();
+    evidence_item.reason_codes.clone_from(&reason_codes);
 
     let mut snapshot = MissionObjectiveSourceSnapshot::new(source_id, kind);
     snapshot.state = source_state(evidence.status);
