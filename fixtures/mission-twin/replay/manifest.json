@@ -3,6 +3,8 @@
   "contract_id": "ft.mission_twin_replay.golden_corpus.v1",
   "source_bead": "ft-u7r37.2",
   "planner_contract_id": "ft.mission_objective_plan.v1",
+  "counterfactual_contract_id": "ft.mission_twin_counterfactual_replay.v1",
+  "counterfactual_source_bead": "ft-u7r37.3",
   "scrub_rules": [
     {
       "field": "generated_at_ms",
@@ -146,6 +148,98 @@
           "mission_twin.snapshot_contract_required",
           "beads.dependency_blocked",
           "beads.robot_triage_fallback"
+        ]
+      }
+    }
+  ],
+  "counterfactual_cases": [
+    {
+      "case_id": "rch-recovered-with-proof-budget",
+      "base_case_id": "rch-critical-pressure-5",
+      "request": {
+        "scenario_id": "rch-recovered-with-proof-budget",
+        "toggles": [
+          "rch_recovered",
+          "proof_lanes_budgeted"
+        ],
+        "proof_lane_budget": {
+          "remote_cargo_lanes": 2,
+          "static_verifier_lanes": 1
+        }
+      },
+      "expected": {
+        "live_plan_status": "rch_substrate_blocked",
+        "simulated_plan_status": "actionable",
+        "top_lane_class": "not_required",
+        "live_blockers_include": [
+          "rch.recovery_required"
+        ],
+        "unblocked_reason_codes_include": [
+          "mission_twin.counterfactual.rch_recovered",
+          "mission_twin.counterfactual.proof_lanes_budgeted"
+        ]
+      }
+    },
+    {
+      "case_id": "agent-mail-recovered",
+      "base_case_id": "agent-mail-red",
+      "request": {
+        "scenario_id": "agent-mail-recovered",
+        "toggles": [
+          "agent_mail_recovered"
+        ]
+      },
+      "expected": {
+        "live_plan_status": "degraded",
+        "simulated_plan_status": "actionable",
+        "top_lane_class": "not_required",
+        "live_blockers_include": [
+          "agent_mail.recovery_required"
+        ],
+        "unblocked_reason_codes_include": [
+          "mission_twin.counterfactual.agent_mail_recovered"
+        ]
+      }
+    },
+    {
+      "case_id": "dirty-overlap-cleared",
+      "base_case_id": "dirty-overlap",
+      "request": {
+        "scenario_id": "dirty-overlap-cleared",
+        "toggles": [
+          "dirty_overlap_cleared"
+        ]
+      },
+      "expected": {
+        "live_plan_status": "dirty_overlap",
+        "simulated_plan_status": "actionable",
+        "top_lane_class": "not_required",
+        "live_blockers_include": [
+          "dirty_overlap.clear_required"
+        ],
+        "unblocked_reason_codes_include": [
+          "mission_twin.counterfactual.dirty_overlap_cleared"
+        ]
+      }
+    },
+    {
+      "case_id": "owner-handoff-accepted",
+      "base_case_id": "active-owner",
+      "request": {
+        "scenario_id": "owner-handoff-accepted",
+        "toggles": [
+          "owner_handoff_accepted"
+        ]
+      },
+      "expected": {
+        "live_plan_status": "waiting_owner",
+        "simulated_plan_status": "actionable",
+        "top_lane_class": "not_required",
+        "live_blockers_include": [
+          "owner_handoff.required"
+        ],
+        "unblocked_reason_codes_include": [
+          "mission_twin.counterfactual.owner_handoff_accepted"
         ]
       }
     }

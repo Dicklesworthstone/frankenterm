@@ -35,6 +35,19 @@ REQUIRED_REASON_CODES=(
   "rch.critical_pressure"
   "rch.proof_substrate_blocked"
 )
+REQUIRED_COUNTERFACTUAL_CASES=(
+  "agent-mail-recovered"
+  "dirty-overlap-cleared"
+  "owner-handoff-accepted"
+  "rch-recovered-with-proof-budget"
+)
+REQUIRED_COUNTERFACTUAL_TOGGLES=(
+  "agent_mail_recovered"
+  "dirty_overlap_cleared"
+  "owner_handoff_accepted"
+  "proof_lanes_budgeted"
+  "rch_recovered"
+)
 
 fail() {
   printf '{"event":"mission_twin_replay.error","status":"fail","message":%s}\n' "$(ruby -rjson -e 'print JSON.generate(ARGV.fetch(0))' "$*")" >&2
@@ -123,6 +136,8 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
   and .contract_id == "ft.mission_twin_replay.golden_corpus.v1"
   and .source_bead == "ft-u7r37.2"
   and .planner_contract_id == "ft.mission_objective_plan.v1"
+  and .counterfactual_contract_id == "ft.mission_twin_counterfactual_replay.v1"
+  and .counterfactual_source_bead == "ft-u7r37.3"
   and ([.cases[].case_id] | sort) == ($required | sort)
   and (.scrub_rules | type == "array" and length >= 5)
   and all(.scrub_rules[];
@@ -163,6 +178,61 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
   )
 ' "${MANIFEST}" >/dev/null || fail "manifest metadata or case entries are incomplete"
 
+jq -e \
+  --argjson required_cases "$(printf '%s\n' "${REQUIRED_COUNTERFACTUAL_CASES[@]}" | jq -R . | jq -s .)" \
+  --argjson required_toggles "$(printf '%s\n' "${REQUIRED_COUNTERFACTUAL_TOGGLES[@]}" | jq -R . | jq -s .)" '
+  . as $root
+  |
+  (.counterfactual_cases | type == "array" and length == ($required_cases | length))
+  and ([.counterfactual_cases[].case_id] | sort) == ($required_cases | sort)
+  and (
+    [.counterfactual_cases[].request.toggles[]] | unique | sort
+  ) == ($required_toggles | sort)
+  and all(.counterfactual_cases[];
+    . as $cf
+    | (.case_id | type == "string" and length > 0)
+    and (.base_case_id | type == "string" and length > 0)
+    and any($root.cases[].case_id; . == $cf.base_case_id)
+    and (.request.scenario_id == .case_id)
+    and (.request.toggles | type == "array" and length > 0)
+    and all(.request.toggles[]; IN(
+      "rch_recovered",
+      "agent_mail_recovered",
+      "dirty_overlap_cleared",
+      "owner_handoff_accepted",
+      "target_class_proof_available",
+      "proof_lanes_budgeted"
+    ))
+    and (
+      ((.request.toggles | index("proof_lanes_budgeted")) == null and (.request.proof_lane_budget | not))
+      or
+      ((.request.toggles | index("proof_lanes_budgeted")) != null
+        and (.request.proof_lane_budget.remote_cargo_lanes | type == "number")
+        and (.request.proof_lane_budget.static_verifier_lanes | type == "number")
+        and ((.request.proof_lane_budget.remote_cargo_lanes + .request.proof_lane_budget.static_verifier_lanes) > 0))
+    )
+    and (.expected.live_plan_status | IN(
+      "actionable",
+      "degraded",
+      "dirty_overlap",
+      "no_ready_work",
+      "rch_substrate_blocked",
+      "waiting_owner"
+    ))
+    and (.expected.simulated_plan_status | IN("actionable", "degraded", "dirty_overlap", "waiting_owner"))
+    and (.expected.top_lane_class | IN(
+      "remote_cargo",
+      "static_verifier",
+      "coordination_only",
+      "waiting_owner",
+      "waiting_rch",
+      "not_required"
+    ))
+    and (.expected.live_blockers_include | type == "array" and length > 0)
+    and (.expected.unblocked_reason_codes_include | type == "array" and length > 0)
+  )
+' "${MANIFEST}" >/dev/null || fail "manifest counterfactual cases are incomplete"
+
 for field in "${REQUIRED_SCRUB_FIELDS[@]}"; do
   jq -e --arg field "${field}" '
     any(.scrub_rules[];
@@ -192,6 +262,9 @@ for needle in \
   "MissionObjectivePlannerInput" \
   "plan_mission_objective" \
   "build_mission_twin_replay_surface_data" \
+  "simulate_mission_twin_counterfactuals" \
+  "MissionTwinCounterfactualToggle" \
+  "MissionTwinProofLaneClass" \
   "MissionTwinReplayError::EmptySnapshotSet" \
   "side-effect-free"; do
   rg -q "${needle}" "${REPLAY_MODULE}" "${REPLAY_TEST}" \
