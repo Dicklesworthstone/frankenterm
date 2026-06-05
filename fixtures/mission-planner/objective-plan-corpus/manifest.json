@@ -74,7 +74,7 @@
           "artifact_kind": "objective_plan_json",
           "source_command": "bv --robot-triage",
           "exit_code": 0,
-          "fixture_sha256": "9c95f59b0f91e7e667878c60fa8bfd41515fe200afb576e2cfaf4e21c0b08555"
+          "fixture_sha256": "1b6bd23ad625d7c95c1f738125092a7546c96224f10abce2da8f9e6c485bacb2"
         }
       ],
       "expected": {
@@ -126,7 +126,7 @@
           "artifact_kind": "objective_plan_json",
           "source_command": "rch diagnose --json",
           "exit_code": 0,
-          "fixture_sha256": "08404011650ed15426009828a19bbb896fc617e7a357fe705c302425d19a7817"
+          "fixture_sha256": "9f97b83b0926c4b5874e2e4404ac122043ffbde3700c17aa18a305e3a24dfc45"
         }
       ],
       "expected": {

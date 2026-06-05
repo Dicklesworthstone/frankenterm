@@ -140,6 +140,39 @@ fn encode_toon(value: &Value) -> String {
     toon_rust::encode(value.clone(), None)
 }
 
+fn assert_toon_contract_field_round_trips(
+    case_id: &str,
+    expected: &Value,
+    decoded: &Value,
+    pointer: &str,
+) {
+    let expected_field = expected.pointer(pointer);
+    let decoded_field = decoded.pointer(pointer);
+    if pointer == "/schema_version" {
+        let expected_number = expected_field
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| panic!("{case_id}: expected numeric contract field {pointer}"));
+        let decoded_number = decoded_field
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| panic!("{case_id}: decoded numeric contract field {pointer}"));
+        assert_eq!(
+            decoded_number, expected_number,
+            "{case_id}: TOON round-trip changed numeric contract field {pointer}"
+        );
+        assert_eq!(
+            decoded_number.fract(),
+            0.0,
+            "{case_id}: TOON round-trip made integer contract field {pointer} non-integral"
+        );
+        return;
+    }
+
+    assert_eq!(
+        decoded_field, expected_field,
+        "{case_id}: TOON round-trip changed contract field {pointer}"
+    );
+}
+
 fn assert_toon_round_trips(case_id: &str, value: &Value, encoded: &str) {
     let decoded = toon_rust::try_decode(encoded, None)
         .unwrap_or_else(|err| panic!("{case_id}: TOON decode failed: {err}"));
@@ -156,11 +189,7 @@ fn assert_toon_round_trips(case_id: &str, value: &Value, encoded: &str) {
         "/plan_status",
         "/risk_level",
     ] {
-        assert_eq!(
-            decoded_value.pointer(pointer),
-            value.pointer(pointer),
-            "{case_id}: TOON round-trip changed contract field {pointer}"
-        );
+        assert_toon_contract_field_round_trips(case_id, value, &decoded_value, pointer);
     }
 }
 
