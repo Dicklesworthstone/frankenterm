@@ -107,7 +107,7 @@
 
 **Tests:** ⏳ `cargo test` blocked on cache/artifact locks after downloading; will rerun in finalize stage.
 
-### toon_rust: git master (4df74c0a → 788589d7)
+### toon_rust: git main (4df74c0a → 788589d7)
 
 **Changelog:** git commit update (no tagged release)
 
