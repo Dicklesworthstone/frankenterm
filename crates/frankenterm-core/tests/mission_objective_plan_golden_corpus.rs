@@ -140,6 +140,32 @@ fn encode_toon(value: &Value) -> String {
     toon_rust::encode(value.clone(), None)
 }
 
+fn integer_contract_field(case_id: &str, value: &Value, role: &str, pointer: &str) -> u64 {
+    let number = value
+        .pointer(pointer)
+        .and_then(Value::as_number)
+        .unwrap_or_else(|| panic!("{case_id}: {role} numeric contract field {pointer}"));
+    if let Some(unsigned) = number.as_u64() {
+        return unsigned;
+    }
+    if let Some(signed) = number.as_i64() {
+        return u64::try_from(signed)
+            .unwrap_or_else(|_| panic!("{case_id}: {role} contract field {pointer} is negative"));
+    }
+
+    let text = number.to_string();
+    let (whole, fraction) = text
+        .split_once('.')
+        .unwrap_or_else(|| panic!("{case_id}: {role} contract field {pointer} is not integral"));
+    assert!(
+        !fraction.bytes().any(|digit| digit != b'0'),
+        "{case_id}: {role} contract field {pointer} is not integral",
+    );
+    whole
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("{case_id}: {role} contract field {pointer} is out of range"))
+}
+
 fn assert_toon_contract_field_round_trips(
     case_id: &str,
     expected: &Value,
@@ -149,20 +175,11 @@ fn assert_toon_contract_field_round_trips(
     let expected_field = expected.pointer(pointer);
     let decoded_field = decoded.pointer(pointer);
     if pointer == "/schema_version" {
-        let expected_number = expected_field
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| panic!("{case_id}: expected numeric contract field {pointer}"));
-        let decoded_number = decoded_field
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| panic!("{case_id}: decoded numeric contract field {pointer}"));
+        let expected_number = integer_contract_field(case_id, expected, "expected", pointer);
+        let decoded_number = integer_contract_field(case_id, decoded, "decoded", pointer);
         assert_eq!(
             decoded_number, expected_number,
             "{case_id}: TOON round-trip changed numeric contract field {pointer}"
-        );
-        assert_eq!(
-            decoded_number.fract(),
-            0.0,
-            "{case_id}: TOON round-trip made integer contract field {pointer} non-integral"
         );
         return;
     }

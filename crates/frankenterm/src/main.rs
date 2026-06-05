@@ -2235,6 +2235,87 @@ enum RobotRehearsalCommands {
     Explain(RobotRehearsalScoreArgs),
 }
 
+#[derive(Debug, Clone, Args)]
+struct RobotIncidentSourceArgs {
+    /// Persisted flight-recorder source-set JSON artifact
+    #[arg(long, value_name = "PATH")]
+    source_set: PathBuf,
+
+    /// Override the incident id when the source-set lacks a stable id
+    #[arg(long = "source-incident-id")]
+    source_incident_id: Option<String>,
+
+    /// Stable generated-at timestamp for deterministic replay surfaces
+    #[arg(long)]
+    generated_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RobotIncidentListArgs {
+    #[command(flatten)]
+    source: RobotIncidentSourceArgs,
+
+    /// Filter by Beads issue id
+    #[arg(long)]
+    bead: Option<String>,
+
+    /// Filter by pane id
+    #[arg(long)]
+    pane: Option<u64>,
+
+    /// Filter by RCH worker id
+    #[arg(long)]
+    worker: Option<String>,
+
+    /// Filter by RCH build id
+    #[arg(long)]
+    build_id: Option<String>,
+
+    /// Filter by source kind, e.g. beads, rch, git, agent-mail
+    #[arg(long)]
+    source_kind: Option<String>,
+
+    /// Only include incidents with an event at or after this epoch-ms timestamp
+    #[arg(long)]
+    since_ms: Option<u64>,
+
+    /// Only include incidents with an event at or before this epoch-ms timestamp
+    #[arg(long)]
+    until_ms: Option<u64>,
+
+    /// Filter by causal class, e.g. source-pass, infrastructure-failure
+    #[arg(long)]
+    causal_class: Option<String>,
+
+    /// Maximum incidents to return
+    #[arg(long, default_value = "50")]
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RobotIncidentReadArgs {
+    /// Incident id to read from the source-set artifact
+    incident_id: String,
+
+    #[command(flatten)]
+    source: RobotIncidentSourceArgs,
+}
+
+#[derive(Subcommand)]
+enum RobotIncidentCommands {
+    /// List incidents from a persisted source-set artifact
+    List(RobotIncidentListArgs),
+
+    /// Show DAG, evidence refs, roots, proof coverage, and gaps
+    Show(RobotIncidentReadArgs),
+
+    /// Explain an incident outcome for agent-to-agent handoff
+    Explain(RobotIncidentReadArgs),
+
+    /// Emit deterministic read-only structural replay frames
+    Replay(RobotIncidentReadArgs),
+}
+
 #[derive(Subcommand)]
 enum PanesCommands {
     /// Set/clear a runtime pane capture priority override (watcher only)
@@ -3317,6 +3398,12 @@ enum RobotCommands {
     Rehearsal {
         #[command(subcommand)]
         command: RobotRehearsalCommands,
+    },
+
+    /// Read-only incident DAG, explanation, and replay surfaces
+    Incidents {
+        #[command(subcommand)]
+        command: RobotIncidentCommands,
     },
 
     /// Resource-control what-if simulation endpoints
@@ -5658,6 +5745,9 @@ const ROBOT_ERR_WORK_ITEM_CONFLICT: &str = "robot.work_item_conflict";
 const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
 const ROBOT_ERR_RESOURCE_WHAT_IF: &str = "robot.resource.what_if_error";
 const ROBOT_ERR_COORDINATION_RISK: &str = "robot.coordination_risk_unavailable";
+const ROBOT_ERR_INCIDENT_NOT_FOUND: &str = "robot.incident.not_found";
+const ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE: &str = "robot.incident.source_unavailable";
+const ROBOT_ERR_INCIDENT_DAG: &str = "robot.incident.dag_error";
 const ROBOT_APPROVAL_RECOVERY_HINT: &str = "Run `ft watch` so approvals can be issued, then validate any issued token with `ft approve <CODE>` before retrying.";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
     "Live get-text is unavailable for distributed panes";
@@ -7683,6 +7773,154 @@ fn build_rehearsal_score_surface_report(
     );
     debug_assert_eq!(report.contract_id, REHEARSAL_SCORE_SURFACE_CONTRACT_ID);
     Ok(report)
+}
+
+fn build_robot_incident_store(
+    args: &RobotIncidentSourceArgs,
+) -> Result<
+    frankenterm_core_replay::replay_incidents::IncidentSurfaceStore,
+    frankenterm_core_replay::replay_incidents::IncidentSurfaceError,
+> {
+    frankenterm_core_replay::replay_incidents::IncidentSurfaceStore::from_source_set_path(
+        &args.source_set,
+        frankenterm_core_replay::replay_incidents::IncidentSurfaceBuildOptions {
+            incident_id: args.source_incident_id.clone(),
+            generated_at_ms: args.generated_at_ms,
+            source_artifact: Some(args.source_set.display().to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+fn build_robot_incident_filter(
+    args: &RobotIncidentListArgs,
+) -> Result<
+    frankenterm_core_replay::replay_incidents::IncidentSurfaceFilter,
+    frankenterm_core_replay::replay_incidents::IncidentSurfaceError,
+> {
+    Ok(
+        frankenterm_core_replay::replay_incidents::IncidentSurfaceFilter {
+            bead: args.bead.clone(),
+            pane: args.pane,
+            worker: args.worker.clone(),
+            build_id: args.build_id.clone(),
+            source_kind: args
+                .source_kind
+                .as_deref()
+                .map(frankenterm_core_replay::replay_incidents::parse_source_kind)
+                .transpose()?,
+            since_ms: args.since_ms,
+            until_ms: args.until_ms,
+            causal_class: args
+                .causal_class
+                .as_deref()
+                .map(frankenterm_core_replay::replay_incidents::parse_causal_class)
+                .transpose()?,
+            limit: args.limit,
+        },
+    )
+}
+
+fn robot_incident_error_code(
+    error: &frankenterm_core_replay::replay_incidents::IncidentSurfaceError,
+) -> &'static str {
+    use frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind;
+
+    match error.kind() {
+        IncidentSurfaceErrorKind::NoIncidentFound => ROBOT_ERR_INCIDENT_NOT_FOUND,
+        IncidentSurfaceErrorKind::InvalidFilter => ROBOT_ERR_INVALID_ARGS,
+        IncidentSurfaceErrorKind::DagBuildFailed => ROBOT_ERR_INCIDENT_DAG,
+        IncidentSurfaceErrorKind::SourceUnavailable
+        | IncidentSurfaceErrorKind::MalformedSourceSet
+        | IncidentSurfaceErrorKind::RedactedContent
+        | IncidentSurfaceErrorKind::RetentionExpired => ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE,
+    }
+}
+
+fn robot_incident_error_response(
+    error: frankenterm_core_replay::replay_incidents::IncidentSurfaceError,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    let hint = match error.kind() {
+        frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind::NoIncidentFound => {
+            Some("Run `ft robot incidents list --source-set <PATH>` and use an incident_id from data.incidents.".to_string())
+        }
+        frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind::InvalidFilter => {
+            Some("Check incident filter spelling and time bounds; source kind and causal class accept snake_case or dash-case.".to_string())
+        }
+        frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind::DagBuildFailed => {
+            Some("Inspect the persisted source-set artifact; malformed causal links fail closed.".to_string())
+        }
+        frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind::SourceUnavailable
+        | frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind::MalformedSourceSet
+        | frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind::RedactedContent
+        | frankenterm_core_replay::replay_incidents::IncidentSurfaceErrorKind::RetentionExpired => {
+            Some("Use persisted Beads/RCH/git artifacts when live Agent Mail or pane sources are unavailable.".to_string())
+        }
+    };
+    RobotResponse::<serde_json::Value>::error_with_code(
+        robot_incident_error_code(&error),
+        error.to_string(),
+        hint,
+        elapsed_ms,
+    )
+}
+
+fn handle_robot_incident_command(
+    command: &RobotIncidentCommands,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    let result = match command {
+        RobotIncidentCommands::List(args) => {
+            let store = match build_robot_incident_store(&args.source) {
+                Ok(store) => store,
+                Err(error) => return robot_incident_error_response(error, elapsed_ms),
+            };
+            let filter = match build_robot_incident_filter(args) {
+                Ok(filter) => filter,
+                Err(error) => return robot_incident_error_response(error, elapsed_ms),
+            };
+            store.list_payload(filter).map(serde_json::to_value)
+        }
+        RobotIncidentCommands::Show(args) => {
+            let store = match build_robot_incident_store(&args.source) {
+                Ok(store) => store,
+                Err(error) => return robot_incident_error_response(error, elapsed_ms),
+            };
+            store
+                .show_payload(&args.incident_id)
+                .map(serde_json::to_value)
+        }
+        RobotIncidentCommands::Explain(args) => {
+            let store = match build_robot_incident_store(&args.source) {
+                Ok(store) => store,
+                Err(error) => return robot_incident_error_response(error, elapsed_ms),
+            };
+            store
+                .explain_payload(&args.incident_id)
+                .map(serde_json::to_value)
+        }
+        RobotIncidentCommands::Replay(args) => {
+            let store = match build_robot_incident_store(&args.source) {
+                Ok(store) => store,
+                Err(error) => return robot_incident_error_response(error, elapsed_ms),
+            };
+            store
+                .replay_payload(&args.incident_id)
+                .map(serde_json::to_value)
+        }
+    };
+
+    match result {
+        Ok(Ok(value)) => RobotResponse::success(value, elapsed_ms),
+        Ok(Err(error)) => RobotResponse::<serde_json::Value>::error_with_code(
+            ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE,
+            format!("failed to serialize incident surface payload: {error}"),
+            Some("Incident output serialization failed before printing.".to_string()),
+            elapsed_ms,
+        ),
+        Err(error) => robot_incident_error_response(error, elapsed_ms),
+    }
 }
 
 fn print_rehearsal_score_output(
@@ -18942,6 +19180,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Score or explain demo rehearsal manifests without side effects",
             },
             RobotCommandInfo {
+                name: "incidents",
+                description: "List, show, explain, or replay persisted incident source-set artifacts",
+            },
+            RobotCommandInfo {
                 name: "resource what-if",
                 description: "Run a read-only resource-control digital-twin simulation",
             },
@@ -19192,6 +19434,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot rehearsal score fixtures/demo-lab/manifest.v1.json",
                     "ft robot --format toon rehearsal explain",
+                ],
+            },
+            QuickStartCommand {
+                name: "incidents",
+                args: "list|show|explain|replay --source-set <source-set.json>",
+                summary: "Read incident DAG, explanation, and deterministic replay surfaces from persisted artifacts",
+                examples: vec![
+                    "ft robot incidents list --source-set fixtures/flight-recorder/source-adapters/valid-source-set.json",
+                    "ft robot --format toon incidents replay ft-ogr3n2-valid --source-set fixtures/flight-recorder/source-adapters/valid-source-set.json",
                 ],
             },
             QuickStartCommand {
@@ -26647,6 +26898,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(payload, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::Incidents { command } => {
+                    let response = handle_robot_incident_command(&command, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 RobotCommands::Perf { command } => {
                     let payload = match command {
                         RobotPerfCommands::SloStatus { slo } => {
@@ -26676,6 +26931,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::ProofHistory { .. } => unreachable!("handled above"),
                         RobotCommands::Attention { .. } => unreachable!("handled above"),
                         RobotCommands::Rehearsal { .. } => unreachable!("handled above"),
+                        RobotCommands::Incidents { .. } => unreachable!("handled above"),
                         RobotCommands::Perf { .. } => unreachable!("handled above"),
                         RobotCommands::State {
                             include_text,
@@ -71621,6 +71877,172 @@ log_level = "debug"
             assert_eq!(toon_fixture["live_mutation_allowed"].as_bool(), Some(false));
             assert_eq!(toon_fixture["side_effects_executed"].as_bool(), Some(false));
         }
+    }
+
+    #[test]
+    fn cli_robot_incidents_parses_list_show_explain_replay() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "incidents",
+            "list",
+            "--source-set",
+            "fixtures/flight-recorder/source-adapters/valid-source-set.json",
+            "--bead",
+            "ft-ogr3n.2",
+            "--pane",
+            "42",
+            "--worker",
+            "vmi1227854",
+            "--build-id",
+            "29871232832766246",
+            "--source-kind",
+            "agent-mail",
+            "--since-ms",
+            "1778000000000",
+            "--until-ms",
+            "1778000010000",
+            "--causal-class",
+            "dirty-tree-contamination",
+            "--limit",
+            "5",
+        ])
+        .expect("robot incidents list should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Incidents {
+                    command: RobotIncidentCommands::List(args),
+                }) => {
+                    assert_eq!(args.bead.as_deref(), Some("ft-ogr3n.2"));
+                    assert_eq!(args.pane, Some(42));
+                    assert_eq!(args.worker.as_deref(), Some("vmi1227854"));
+                    assert_eq!(args.build_id.as_deref(), Some("29871232832766246"));
+                    assert_eq!(args.source_kind.as_deref(), Some("agent-mail"));
+                    assert_eq!(args.limit, 5);
+                }
+                _ => panic!("expected RobotCommands::Incidents::List"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+
+        for surface in ["show", "explain", "replay"] {
+            let cli = Cli::try_parse_from([
+                "ft",
+                "robot",
+                "incidents",
+                surface,
+                "ft-ogr3n2-valid",
+                "--source-set",
+                "fixtures/flight-recorder/source-adapters/valid-source-set.json",
+            ])
+            .unwrap_or_else(|err| panic!("robot incidents {surface} should parse: {err}"));
+            match cli.command.map(|b| *b) {
+                Some(Commands::Robot { command, .. }) => match (surface, command) {
+                    (
+                        "show",
+                        Some(RobotCommands::Incidents {
+                            command: RobotIncidentCommands::Show(args),
+                        }),
+                    )
+                    | (
+                        "explain",
+                        Some(RobotCommands::Incidents {
+                            command: RobotIncidentCommands::Explain(args),
+                        }),
+                    )
+                    | (
+                        "replay",
+                        Some(RobotCommands::Incidents {
+                            command: RobotIncidentCommands::Replay(args),
+                        }),
+                    ) => assert_eq!(args.incident_id, "ft-ogr3n2-valid"),
+                    _ => panic!("expected RobotCommands::Incidents::{surface}"),
+                },
+                _ => panic!("expected Robot command"),
+            }
+        }
+    }
+
+    #[test]
+    fn robot_incidents_payloads_are_read_only_redacted_and_toon_safe() {
+        let source_set = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("flight-recorder")
+            .join("source-adapters")
+            .join("valid-source-set.json");
+        let source = RobotIncidentSourceArgs {
+            source_set: source_set.clone(),
+            source_incident_id: None,
+            generated_at_ms: Some(1_778_000_100_000),
+        };
+        let list = handle_robot_incident_command(
+            &RobotIncidentCommands::List(RobotIncidentListArgs {
+                source: source.clone(),
+                bead: Some("ft-ogr3n.2".to_string()),
+                pane: Some(42),
+                worker: Some("vmi1227854".to_string()),
+                build_id: Some("29871232832766246".to_string()),
+                source_kind: Some("rch".to_string()),
+                since_ms: None,
+                until_ms: None,
+                causal_class: None,
+                limit: 50,
+            }),
+            11,
+        );
+        assert!(list.ok);
+        let list_value = serde_json::to_value(&list).expect("list response serializes");
+        assert_eq!(list_value["data"]["incident_count"].as_u64(), Some(1));
+        assert_eq!(
+            list_value["data"]["incidents"][0]["outcome"].as_str(),
+            Some("contaminated_proof_attempt")
+        );
+        assert_eq!(list_value["data"]["dry_run"].as_bool(), Some(true));
+        assert_eq!(
+            list_value["data"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            list_value["data"]["side_effects_executed"].as_bool(),
+            Some(false)
+        );
+
+        let replay = handle_robot_incident_command(
+            &RobotIncidentCommands::Replay(RobotIncidentReadArgs {
+                incident_id: "ft-ogr3n2-valid".to_string(),
+                source,
+            }),
+            12,
+        );
+        assert!(replay.ok);
+        let replay_value = serde_json::to_value(&replay).expect("replay response serializes");
+        assert_eq!(replay_value["data"]["surface"].as_str(), Some("replay"));
+        assert_eq!(replay_value["data"]["frame_count"].as_u64(), Some(5));
+        let rendered = serde_json::to_string(&replay_value).expect("render replay json");
+        for forbidden in [
+            "ghp_examplefixturetoken",
+            "API_TOKEN",
+            "password=",
+            "sk-live-",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "incident replay JSON leaked {forbidden}: {rendered}"
+            );
+        }
+
+        let roundtripped = toon_roundtrip_json(&replay_value);
+        assert_eq!(roundtripped["data"]["surface"].as_str(), Some("replay"));
+        assert_eq!(
+            roundtripped["data"]["mcp_resources"][3]["uri"].as_str(),
+            Some("wa://incidents/ft-ogr3n2-valid/replay")
+        );
+        assert_eq!(
+            roundtripped["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
