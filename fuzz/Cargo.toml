@@ -424,6 +424,3 @@ name = "contract_resource_cockpit"
 path = "contract_resource_cockpit/fuzz_target.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
-
-[profile.release]
-debug = 1

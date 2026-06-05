@@ -585,6 +585,15 @@ panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols (size-optimized CLI release; deadlock guards landed in 9fba0d14b/f17d35c72)
 debug = false       # No debuginfo in release artifacts
 
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+debug = "line-tables-only"
+strip = "none"
+
+[profile.release.package.frankenterm-fuzz]
+debug = 1
+
 # Provide git-based versions of crates that upstream repos (fastmcp_rust, fastapi_rust)
 # reference as path deps pointing outside their own repo (../asupersync, ../rich_rust).
 # Without these patches, cargo cannot resolve those transitive path deps when fetching
