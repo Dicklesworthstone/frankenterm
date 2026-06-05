@@ -154,6 +154,14 @@
       "description": "Mission objective-plan dry-run contract, reviewed golden corpus, no-mock harness, operator runbook, and Robot/MCP/CLI planning-surface convergence proof. Uses the existing robot-contracts release category because ft.mission_objective_plan.v1 is a schema-backed machine planning contract, not a new release taxonomy category."
     },
     {
+      "category": "proofs/robot-contracts",
+      "path": "docs/attestations/proofs/swarm-capacity-readiness.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-b94bx.10",
+      "proof_categories": [4, 5],
+      "description": "Swarm-capacity completion readiness dashboard mapping each capacity child claim to implementation surfaces, tests, retained artifacts, target-class proof state, and release-attestation posture. The artifact is release evidence for the read-only Robot/MCP operator contract and keeps high-scale capacity wording blocked while target-class proof remains skipped_not_proven."
+    },
+    {
       "category": "proofs/rehearsal-score",
       "path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
       "media_type": "application/json",
