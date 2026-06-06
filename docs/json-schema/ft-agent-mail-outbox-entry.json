@@ -357,8 +357,10 @@
         "agent_mail_unavailable",
         "database_recovery_notice",
         "api_unreachable",
+        "api_error",
         "registration_failed",
         "contact_permission_blocked",
+        "ack_unavailable",
         "timeout",
         "unknown"
       ]

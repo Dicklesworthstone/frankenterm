@@ -52,6 +52,7 @@ EXPECTED_FIXTURE_IDS = %w[
   reservation-intent
   beads-fallback-closeout
   stale-owner-handoff
+  writer-adapter-queued-send
 ].freeze
 EXPECTED_STATES = %w[
   queued
@@ -75,8 +76,10 @@ EXPECTED_FAILURE_CLASSES = %w[
   agent_mail_unavailable
   database_recovery_notice
   api_unreachable
+  api_error
   registration_failed
   contact_permission_blocked
+  ack_unavailable
   timeout
   unknown
 ].freeze

@@ -4,7 +4,7 @@
 //! Mail is unavailable after the single allowed retry. They deliberately do not
 //! claim delivery; replay state is recorded separately and remains auditable.
 
-use chrono::DateTime;
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -20,6 +20,23 @@ pub const MAX_ATTACHMENT_REF_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RECIPIENTS: usize = 64;
 pub const MIN_RESERVATION_TTL_SECONDS: u64 = 60;
 pub const MAX_RESERVATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+pub const AGENT_MAIL_RETRY_LIMIT: u32 = 1;
+pub const DEFAULT_RETENTION_DAYS: i64 = 30;
+pub const OUTBOX_WRITER_DELIVERY_UNCLAIMED_NOTE: &str = "Queued in the Agent Mail fallback outbox after the allowed retry; Agent Mail delivery is not claimed until a replay receipt records delivery.";
+pub const OUTBOX_WRITER_FALLBACK_GUIDANCE: [&str; 3] = [
+    "Retry the Agent Mail operation once before queueing fallback intent.",
+    "Persist the queued outbox entry with body digest or redacted preview only.",
+    OUTBOX_WRITER_DELIVERY_UNCLAIMED_NOTE,
+];
+pub const FORBIDDEN_AGENT_MAIL_RECOVERY_COMMANDS: [&str; 7] = [
+    "am service restart",
+    "am service stop",
+    "am doctor fix",
+    "am doctor repair",
+    "am doctor reconstruct",
+    "kill am",
+    "kill mcp-agent-mail",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMailOutboxEntry {
@@ -297,8 +314,10 @@ pub enum FailureClass {
     AgentMailUnavailable,
     DatabaseRecoveryNotice,
     ApiUnreachable,
+    ApiError,
     RegistrationFailed,
     ContactPermissionBlocked,
+    AckUnavailable,
     Timeout,
     Unknown,
 }
@@ -314,6 +333,22 @@ pub enum SourceOperation {
     BeadsCloseoutComment,
     StaleOwnerHandoffNotice,
     CoordinationNotice,
+}
+
+impl SourceOperation {
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::SendMessage => "send_message",
+            Self::ReplyMessage => "reply_message",
+            Self::FileReservation => "file_reservation",
+            Self::ReleaseReservation => "release_reservation",
+            Self::BeadsStatusComment => "beads_status_comment",
+            Self::BeadsCloseoutComment => "beads_closeout_comment",
+            Self::StaleOwnerHandoffNotice => "stale_owner_handoff_notice",
+            Self::CoordinationNotice => "coordination_notice",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,7 +545,189 @@ pub struct ReplayIdSeed<'a> {
     pub recipients_digest: &'a str,
     pub subject_digest: &'a str,
     pub body_digest: &'a str,
+    pub source_operation: SourceOperation,
     pub created_at_bucket: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMailOutboxWriteRequest {
+    pub agent: OutboxAgentIdentity,
+    pub thread_id: Option<String>,
+    pub recipients: OutboxRecipients,
+    pub subject: String,
+    pub body_markdown: String,
+    pub body_preview_redacted: Option<String>,
+    pub importance: OutboxImportance,
+    pub ack_required: bool,
+    pub attachments: Vec<AttachmentRef>,
+    pub source_operation: SourceOperation,
+    pub reservation_intent: Option<ReservationIntent>,
+    pub beads_fallback: Option<BeadsFallbackSummary>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMailOutboxFailure {
+    pub class: FailureClass,
+    pub summary: String,
+    pub retry_count: u32,
+    pub last_attempt_at: String,
+}
+
+impl AgentMailOutboxFailure {
+    #[must_use]
+    pub fn classified(
+        summary: impl Into<String>,
+        retry_count: u32,
+        last_attempt_at: impl Into<String>,
+    ) -> Self {
+        let summary = summary.into();
+        Self {
+            class: classify_agent_mail_failure(&summary),
+            summary,
+            retry_count,
+            last_attempt_at: last_attempt_at.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentMailRetryPolicy {
+    retry_limit: u32,
+}
+
+impl AgentMailRetryPolicy {
+    #[must_use]
+    pub const fn one_retry() -> Self {
+        Self {
+            retry_limit: AGENT_MAIL_RETRY_LIMIT,
+        }
+    }
+
+    #[must_use]
+    pub const fn retry_limit(self) -> u32 {
+        self.retry_limit
+    }
+
+    #[must_use]
+    pub const fn retry_remaining(self, retry_count: u32) -> bool {
+        retry_count < self.retry_limit
+    }
+}
+
+impl Default for AgentMailRetryPolicy {
+    fn default() -> Self {
+        Self::one_retry()
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AgentMailOutboxWriterError {
+    #[error(
+        "Agent Mail retry budget still has {remaining} retry attempt(s); queueing would skip the required retry"
+    )]
+    RetryBudgetRemaining {
+        retry_count: u32,
+        retry_limit: u32,
+        remaining: u32,
+    },
+    #[error("invalid UTC RFC3339 timestamp in {field}: {value}")]
+    InvalidTimestamp { field: &'static str, value: String },
+    #[error("reservation_intent is required for {operation:?}")]
+    MissingReservationIntent { operation: SourceOperation },
+    #[error(transparent)]
+    Validation(#[from] AgentMailOutboxValidationError),
+}
+
+pub fn build_queued_outbox_entry(
+    request: AgentMailOutboxWriteRequest,
+    failure: AgentMailOutboxFailure,
+) -> Result<AgentMailOutboxEntry, AgentMailOutboxWriterError> {
+    build_queued_outbox_entry_with_policy(request, failure, AgentMailRetryPolicy::default())
+}
+
+pub fn build_queued_outbox_entry_with_policy(
+    request: AgentMailOutboxWriteRequest,
+    failure: AgentMailOutboxFailure,
+    retry_policy: AgentMailRetryPolicy,
+) -> Result<AgentMailOutboxEntry, AgentMailOutboxWriterError> {
+    if retry_policy.retry_remaining(failure.retry_count) {
+        return Err(AgentMailOutboxWriterError::RetryBudgetRemaining {
+            retry_count: failure.retry_count,
+            retry_limit: retry_policy.retry_limit(),
+            remaining: retry_policy.retry_limit() - failure.retry_count,
+        });
+    }
+    if matches!(
+        request.source_operation,
+        SourceOperation::FileReservation | SourceOperation::ReleaseReservation
+    ) && request.reservation_intent.is_none()
+    {
+        return Err(AgentMailOutboxWriterError::MissingReservationIntent {
+            operation: request.source_operation,
+        });
+    }
+
+    let created_at = parse_utc_timestamp("created_at", &request.created_at)?;
+    parse_utc_timestamp("failure_reason.last_attempt_at", &failure.last_attempt_at)?;
+    let body_digest = sha256_hex(request.body_markdown.as_bytes());
+    let recipients_digest = recipients_digest(&request.recipients);
+    let subject_digest = sha256_hex(request.subject.as_bytes());
+    let replay_id = deterministic_replay_id(&ReplayIdSeed {
+        project_key: &request.agent.project_key,
+        agent_name: &request.agent.name,
+        thread_id: request.thread_id.as_deref(),
+        recipients_digest: &recipients_digest,
+        subject_digest: &subject_digest,
+        body_digest: &body_digest,
+        source_operation: request.source_operation,
+        created_at_bucket: &created_at_bucket(created_at),
+    });
+    let redaction = retention_redactions(&request);
+
+    let entry = AgentMailOutboxEntry {
+        schema_version: SCHEMA_VERSION,
+        contract_id: CONTRACT_ID.to_owned(),
+        source_bead: SOURCE_BEAD.to_owned(),
+        replay_id,
+        created_at: request.created_at,
+        agent: request.agent,
+        thread_id: request.thread_id,
+        recipients: request.recipients,
+        subject: request.subject,
+        body_policy: BodyPolicy {
+            body_sha256: body_digest,
+            body_storage: BodyStoragePolicy::DigestOnly,
+            body_preview_redacted: request.body_preview_redacted,
+            body_byte_count: request.body_markdown.len() as u64,
+            max_retained_bytes: MAX_BODY_RETAINED_BYTES,
+            raw_body_retained: false,
+        },
+        importance: request.importance,
+        ack_required: request.ack_required,
+        attachments: request.attachments,
+        source_operation: request.source_operation,
+        failure_reason: FailureReason {
+            class: failure.class,
+            summary: failure.summary,
+            retry_count: failure.retry_count,
+            retry_limit: retry_policy.retry_limit(),
+            last_attempt_at: failure.last_attempt_at,
+        },
+        state: OutboxState::Queued,
+        state_reason: None,
+        operator_decision: None,
+        replay_receipt: None,
+        retention: RetentionPolicy {
+            retain_until: retain_until(created_at),
+            automatic_discard: false,
+            redaction,
+        },
+        reservation_intent: request.reservation_intent,
+        beads_fallback: request.beads_fallback,
+    };
+    entry.validate()?;
+    Ok(entry)
 }
 
 #[must_use]
@@ -524,6 +741,7 @@ pub fn deterministic_replay_id(seed: &ReplayIdSeed<'_>) -> String {
         seed.recipients_digest,
         seed.subject_digest,
         seed.body_digest,
+        seed.source_operation.wire_name(),
         seed.created_at_bucket,
     ] {
         hasher.update(part.len().to_string().as_bytes());
@@ -538,6 +756,93 @@ pub fn deterministic_replay_id(seed: &ReplayIdSeed<'_>) -> String {
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[must_use]
+pub fn classify_agent_mail_failure(summary: &str) -> FailureClass {
+    let lower = summary.to_ascii_lowercase();
+    if lower.contains("contact") && (lower.contains("blocked") || lower.contains("permission")) {
+        FailureClass::ContactPermissionBlocked
+    } else if lower.contains("ack")
+        && (lower.contains("unavailable") || lower.contains("missing") || lower.contains("failed"))
+    {
+        FailureClass::AckUnavailable
+    } else if lower.contains("database")
+        && (lower.contains("recovery") || lower.contains("recover"))
+    {
+        FailureClass::DatabaseRecoveryNotice
+    } else if lower.contains("registration") && lower.contains("fail") {
+        FailureClass::RegistrationFailed
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        FailureClass::Timeout
+    } else if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("unreachable")
+    {
+        FailureClass::ApiUnreachable
+    } else if lower.contains("agent mail") && lower.contains("unavailable") {
+        FailureClass::AgentMailUnavailable
+    } else if lower.contains("api")
+        && (lower.contains("error") || lower.contains("failed") || lower.contains("unavailable"))
+    {
+        FailureClass::ApiError
+    } else {
+        FailureClass::Unknown
+    }
+}
+
+fn parse_utc_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<DateTime<Utc>, AgentMailOutboxWriterError> {
+    if !value.ends_with('Z') {
+        return Err(AgentMailOutboxWriterError::InvalidTimestamp {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| AgentMailOutboxWriterError::InvalidTimestamp {
+            field,
+            value: value.to_owned(),
+        })
+}
+
+fn created_at_bucket(created_at: DateTime<Utc>) -> String {
+    created_at.format("%Y-%m-%dT%H:%MZ").to_string()
+}
+
+fn retain_until(created_at: DateTime<Utc>) -> String {
+    (created_at + Duration::days(DEFAULT_RETENTION_DAYS)).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn recipients_digest(recipients: &OutboxRecipients) -> String {
+    let mut parts = Vec::new();
+    push_recipient_parts(&mut parts, "to", &recipients.to);
+    push_recipient_parts(&mut parts, "cc", &recipients.cc);
+    push_recipient_parts(&mut parts, "bcc", &recipients.bcc);
+    sha256_hex(parts.join("\n").as_bytes())
+}
+
+fn push_recipient_parts(parts: &mut Vec<String>, role: &str, recipients: &[String]) {
+    let mut recipients = recipients.to_vec();
+    recipients.sort();
+    for recipient in recipients {
+        parts.push(format!("{role}:{recipient}"));
+    }
+}
+
+fn retention_redactions(request: &AgentMailOutboxWriteRequest) -> Vec<RetentionRedaction> {
+    let mut redactions = vec![RetentionRedaction::BodyDigestOnly];
+    if request.body_preview_redacted.is_some() {
+        redactions.push(RetentionRedaction::BodyPreviewRedacted);
+    }
+    redactions.push(RetentionRedaction::AttachmentRefsOnly);
+    if !request.recipients.bcc.is_empty() {
+        redactions.push(RetentionRedaction::BccAllowedForReplay);
+    }
+    redactions
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -824,6 +1129,36 @@ mod tests {
         }
     }
 
+    fn valid_write_request() -> AgentMailOutboxWriteRequest {
+        AgentMailOutboxWriteRequest {
+            agent: OutboxAgentIdentity {
+                name: "IvoryCreek".to_owned(),
+                program: "codex-cli".to_owned(),
+                model: "gpt-5-codex".to_owned(),
+                project_key: "/Users/jemanuel/projects/frankenterm".to_owned(),
+            },
+            thread_id: Some("ft-dezx8.2".to_owned()),
+            recipients: OutboxRecipients {
+                to: vec!["SapphireCardinal".to_owned()],
+                cc: vec!["YellowHorse".to_owned()],
+                bcc: Vec::new(),
+            },
+            subject: "ft-dezx8.2 fallback coordination".to_owned(),
+            body_markdown: "Agent Mail send failed after retry; queueing fallback intent."
+                .to_owned(),
+            body_preview_redacted: Some(
+                "Agent Mail send failed after retry; queueing fallback intent.".to_owned(),
+            ),
+            importance: OutboxImportance::Normal,
+            ack_required: false,
+            attachments: Vec::new(),
+            source_operation: SourceOperation::SendMessage,
+            reservation_intent: None,
+            beads_fallback: None,
+            created_at: "2026-05-29T14:05:33Z".to_owned(),
+        }
+    }
+
     #[test]
     fn valid_fixture_entries_pass_validation() {
         for fixture in [
@@ -841,6 +1176,9 @@ mod tests {
             include_str!(
                 "../../../fixtures/agent-mail-outage-spool/valid/stale-owner-handoff.json"
             ),
+            include_str!(
+                "../../../fixtures/agent-mail-outage-spool/valid/writer-adapter-queued-send.json"
+            ),
         ] {
             let entry: AgentMailOutboxEntry =
                 serde_json::from_str(fixture).expect("fixture parses");
@@ -857,14 +1195,146 @@ mod tests {
             recipients_digest: "to:SapphireCardinal",
             subject_digest: "subject",
             body_digest: "body",
+            source_operation: SourceOperation::SendMessage,
             created_at_bucket: "2026-05-29T13:35Z",
         };
         let first = deterministic_replay_id(&seed);
         let second = deterministic_replay_id(&seed);
+        let mut reply_seed = seed.clone();
+        reply_seed.source_operation = SourceOperation::ReplyMessage;
 
         assert_eq!(first, second);
+        assert_ne!(first, deterministic_replay_id(&reply_seed));
         assert!(first.starts_with("amq1-"));
         assert_eq!(first.len(), 29);
+    }
+
+    #[test]
+    fn writer_adapter_queues_failed_send_after_allowed_retry() {
+        let request = valid_write_request();
+        let failure = AgentMailOutboxFailure::classified(
+            "API error: Agent Mail send returned HTTP 503",
+            AGENT_MAIL_RETRY_LIMIT,
+            "2026-05-29T14:05:38Z",
+        );
+
+        let entry = build_queued_outbox_entry(request.clone(), failure.clone())
+            .expect("failed send queues after retry");
+        let repeat =
+            build_queued_outbox_entry(request.clone(), failure).expect("same write repeats");
+
+        assert_eq!(entry.replay_id, repeat.replay_id);
+        assert_eq!(entry.state, OutboxState::Queued);
+        assert_eq!(entry.source_operation, SourceOperation::SendMessage);
+        assert_eq!(entry.failure_reason.class, FailureClass::ApiError);
+        assert_eq!(
+            entry.failure_reason.summary,
+            "API error: Agent Mail send returned HTTP 503"
+        );
+        assert_eq!(entry.failure_reason.retry_count, AGENT_MAIL_RETRY_LIMIT);
+        assert_eq!(entry.failure_reason.retry_limit, AGENT_MAIL_RETRY_LIMIT);
+        assert_eq!(
+            entry.body_policy.body_sha256,
+            sha256_hex(request.body_markdown.as_bytes())
+        );
+        assert_eq!(
+            entry.body_policy.body_storage,
+            BodyStoragePolicy::DigestOnly
+        );
+        assert!(!entry.body_policy.raw_body_retained);
+        assert_eq!(entry.retention.retain_until, "2026-06-28T14:05:33Z");
+        assert!(
+            entry
+                .retention
+                .redaction
+                .contains(&RetentionRedaction::BodyDigestOnly)
+        );
+        assert!(
+            entry
+                .retention
+                .redaction
+                .contains(&RetentionRedaction::BodyPreviewRedacted)
+        );
+        entry.validate().expect("queued entry validates");
+    }
+
+    #[test]
+    fn writer_adapter_refuses_to_queue_before_retry_is_exhausted() {
+        let failure = AgentMailOutboxFailure::classified(
+            "connection refused while sending Agent Mail message",
+            0,
+            "2026-05-29T14:05:38Z",
+        );
+
+        assert!(matches!(
+            build_queued_outbox_entry(valid_write_request(), failure),
+            Err(AgentMailOutboxWriterError::RetryBudgetRemaining {
+                retry_count: 0,
+                retry_limit: AGENT_MAIL_RETRY_LIMIT,
+                remaining: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn writer_adapter_classifies_failures_without_rewriting_summary() {
+        for (summary, class) in [
+            (
+                "connection refused while sending Agent Mail message",
+                FailureClass::ApiUnreachable,
+            ),
+            ("Agent Mail request timed out", FailureClass::Timeout),
+            (
+                "Contact permission blocked by policy",
+                FailureClass::ContactPermissionBlocked,
+            ),
+            (
+                "ack unavailable for ack_required message",
+                FailureClass::AckUnavailable,
+            ),
+            (
+                "API error: Agent Mail send returned HTTP 503",
+                FailureClass::ApiError,
+            ),
+        ] {
+            let failure = AgentMailOutboxFailure::classified(
+                summary,
+                AGENT_MAIL_RETRY_LIMIT,
+                "2026-05-29T14:05:38Z",
+            );
+            assert_eq!(failure.class, class);
+            assert_eq!(failure.summary, summary);
+        }
+    }
+
+    #[test]
+    fn writer_adapter_requires_reservation_intent_for_reservation_operations() {
+        let mut request = valid_write_request();
+        request.source_operation = SourceOperation::FileReservation;
+        let failure = AgentMailOutboxFailure::classified(
+            "Agent Mail unavailable while reserving files",
+            AGENT_MAIL_RETRY_LIMIT,
+            "2026-05-29T14:05:38Z",
+        );
+
+        assert!(matches!(
+            build_queued_outbox_entry(request, failure),
+            Err(AgentMailOutboxWriterError::MissingReservationIntent {
+                operation: SourceOperation::FileReservation
+            })
+        ));
+    }
+
+    #[test]
+    fn writer_guidance_does_not_authorize_agent_mail_repair_or_restart() {
+        let guidance = OUTBOX_WRITER_FALLBACK_GUIDANCE
+            .join("\n")
+            .to_ascii_lowercase();
+
+        for command in FORBIDDEN_AGENT_MAIL_RECOVERY_COMMANDS {
+            assert!(!guidance.contains(command));
+        }
+        assert!(guidance.contains("delivery is not claimed"));
     }
 
     #[test]
