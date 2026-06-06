@@ -516,6 +516,24 @@ pub(super) struct MissionObjectivePlanParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub(super) struct OperatingEnvelopeParams {
+    #[serde(default)]
+    pub scenario: Option<String>,
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default)]
+    pub explain_reason: Option<String>,
+    #[serde(default)]
+    pub envelope_id: Option<String>,
+    #[serde(default)]
+    pub objective_id: Option<String>,
+    #[serde(default)]
+    pub generated_at_ms: Option<u64>,
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct MissionStateParams {
     #[serde(default)]
     pub mission_file: Option<String>,

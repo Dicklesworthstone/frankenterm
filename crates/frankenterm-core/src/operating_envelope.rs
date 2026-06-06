@@ -6,6 +6,8 @@
 
 #![allow(clippy::similar_names)]
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "subprocess-bridge")]
@@ -13,6 +15,84 @@ use crate::beads_types::{BeadReadinessReport, BeadResolverReasonCode, BeadStatus
 
 pub const OPERATING_ENVELOPE_CONTRACT_ID: &str = "ft.operating_envelope.v1";
 pub const OPERATING_ENVELOPE_SCHEMA_VERSION: u16 = 1;
+pub const OPERATING_ENVELOPE_MCP_CURRENT_URI: &str = "wa://operating-envelope/current";
+pub const OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE: &str = "wa://operating-envelope/runs/{run_id}";
+pub const OPERATING_ENVELOPE_SURFACE_SAFETY_NOTICE: &str = "read-only plan; not permission to mutate panes, claim Beads, repair or restart services, \
+     cancel RCH work, count local Cargo as proof, capture raw pane content, or drain workers";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperatingEnvelopeScenario {
+    Current,
+    Healthy,
+    Degraded,
+    Blocked,
+    Emergency,
+}
+
+impl OperatingEnvelopeScenario {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Blocked => "blocked",
+            Self::Emergency => "emergency",
+        }
+    }
+
+    #[must_use]
+    pub fn from_token(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "" | "current" | "current-unavailable" | "unavailable" => Some(Self::Current),
+            "healthy" | "green" => Some(Self::Healthy),
+            "degraded" | "agent-mail-unavailable" | "yellow" => Some(Self::Degraded),
+            "blocked" | "rch-blocked" | "black" => Some(Self::Blocked),
+            "emergency" | "kill-switch" | "capacity-black" => Some(Self::Emergency),
+            _ => None,
+        }
+    }
+}
+
+impl Default for OperatingEnvelopeScenario {
+    fn default() -> Self {
+        Self::Current
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingEnvelopeSurface {
+    Status,
+    Explain,
+}
+
+impl OperatingEnvelopeSurface {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Explain => "explain",
+        }
+    }
+
+    #[must_use]
+    pub fn from_token(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "" | "status" | "summary" => Some(Self::Status),
+            "explain" | "reason" | "reason_code" => Some(Self::Explain),
+            _ => None,
+        }
+    }
+}
+
+impl Default for OperatingEnvelopeSurface {
+    fn default() -> Self {
+        Self::Status
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1590,6 +1670,447 @@ pub fn plan_operating_envelope(input: OperatingEnvelopePlannerInput) -> Operatin
         reason_codes: decision.reason_codes,
         artifact_paths: input.artifact_paths,
     }
+}
+
+#[must_use]
+pub fn operating_envelope_run_id(generated_at_ms: u64) -> String {
+    format!("operating-envelope-{generated_at_ms}")
+}
+
+#[must_use]
+pub fn operating_envelope_run_uri(run_id: &str) -> String {
+    format!("wa://operating-envelope/runs/{run_id}")
+}
+
+#[must_use]
+pub fn operating_envelope_mcp_resources(generated_at_ms: u64) -> serde_json::Value {
+    let run_id = operating_envelope_run_id(generated_at_ms);
+    serde_json::json!([
+        {
+            "kind": "current",
+            "uri": OPERATING_ENVELOPE_MCP_CURRENT_URI,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        },
+        {
+            "kind": "run_artifact",
+            "uri": operating_envelope_run_uri(&run_id),
+            "uri_template": OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
+            "run_id": run_id,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        }
+    ])
+}
+
+#[must_use]
+pub fn operating_envelope_input_for_scenario(
+    generated_at_ms: u64,
+    envelope_id: impl Into<String>,
+    objective_id: impl Into<String>,
+    scenario: OperatingEnvelopeScenario,
+) -> OperatingEnvelopePlannerInput {
+    let input_domains = match scenario {
+        OperatingEnvelopeScenario::Current => current_unavailable_domains(generated_at_ms),
+        OperatingEnvelopeScenario::Healthy => scenario_domains(generated_at_ms, scenario),
+        OperatingEnvelopeScenario::Degraded => scenario_domains(generated_at_ms, scenario),
+        OperatingEnvelopeScenario::Blocked => scenario_domains(generated_at_ms, scenario),
+        OperatingEnvelopeScenario::Emergency => scenario_domains(generated_at_ms, scenario),
+    };
+
+    OperatingEnvelopePlannerInput::new(generated_at_ms, envelope_id, objective_id, input_domains)
+}
+
+#[must_use]
+pub fn build_operating_envelope_surface_data(
+    plan: &OperatingEnvelopePlan,
+    surface: OperatingEnvelopeSurface,
+    source: &str,
+    explain_reason_code: Option<&str>,
+) -> serde_json::Value {
+    let explain = (surface == OperatingEnvelopeSurface::Explain)
+        .then(|| operating_envelope_explain(plan, explain_reason_code.and_then(non_empty_trimmed)));
+
+    serde_json::json!({
+        "schema_version": plan.schema_version,
+        "contract_id": plan.contract_id,
+        "surface": surface.as_str(),
+        "generated_at_ms": plan.generated_at_ms,
+        "source": source,
+        "dry_run": true,
+        "raw_pane_content_stored": plan.raw_pane_content_stored,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+        "safety_notice": OPERATING_ENVELOPE_SURFACE_SAFETY_NOTICE,
+        "summary": operating_envelope_summary(plan),
+        "decision": plan.decision,
+        "admission_windows": plan.admission_windows,
+        "mcp_resources": operating_envelope_mcp_resources(plan.generated_at_ms),
+        "source_states": operating_envelope_source_states(plan),
+        "proof_requirements": operating_envelope_proof_requirements(plan),
+        "required_approvals": operating_envelope_required_approvals(),
+        "forbidden_action_classes": operating_envelope_forbidden_action_classes(plan),
+        "explain": explain,
+    })
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn current_unavailable_domains(generated_at_ms: u64) -> OperatingEnvelopeInputDomains {
+    OperatingEnvelopeInputDomains {
+        capacity_resource: not_collected_snapshot(
+            "current.capacity_resource",
+            OperatingEnvelopeSourceKind::CapacityResource,
+            "capacity.current_unavailable",
+            generated_at_ms,
+        ),
+        rch: not_collected_snapshot(
+            "current.rch",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.current_unavailable",
+            generated_at_ms,
+        ),
+        beads: not_collected_snapshot(
+            "current.beads",
+            OperatingEnvelopeSourceKind::Beads,
+            "beads.current_unavailable",
+            generated_at_ms,
+        ),
+        agent_mail: not_collected_snapshot(
+            "current.agent_mail",
+            OperatingEnvelopeSourceKind::AgentMail,
+            "agent_mail.current_unavailable",
+            generated_at_ms,
+        ),
+        git: not_collected_snapshot(
+            "current.git",
+            OperatingEnvelopeSourceKind::Git,
+            "git.current_unavailable",
+            generated_at_ms,
+        ),
+        robot_inventory: None,
+    }
+}
+
+fn not_collected_snapshot(
+    source_id: &'static str,
+    source_kind: OperatingEnvelopeSourceKind,
+    reason_code: &'static str,
+    generated_at_ms: u64,
+) -> OperatingEnvelopeSourceSnapshot {
+    let mut snapshot =
+        OperatingEnvelopeSourceSnapshot::new(source_id, source_kind).not_collected(reason_code);
+    snapshot.command_or_api = "ft swarm envelope current".to_string();
+    snapshot.collected_at_ms = Some(generated_at_ms);
+    snapshot
+}
+
+fn scenario_domains(
+    generated_at_ms: u64,
+    scenario: OperatingEnvelopeScenario,
+) -> OperatingEnvelopeInputDomains {
+    let mut capacity = OperatingEnvelopeCapacitySourceInput::new(fixture_provenance(
+        "fixture.capacity_resource",
+        "ft robot swarm-capacity status --level 2",
+        generated_at_ms,
+    ));
+    capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+    capacity.target_class_proof_state = OperatingEnvelopeProofState::NotRequired;
+
+    let mut rch = OperatingEnvelopeRchSourceInput::new(fixture_provenance(
+        "fixture.rch",
+        "rch status --json",
+        generated_at_ms,
+    ));
+    rch.healthy_worker_count = 2;
+    rch.remote_cargo_reached = Some(true);
+    rch.remote_cargo_verdict_pass = true;
+
+    let mut beads = OperatingEnvelopeBeadsSourceInput::new(fixture_provenance(
+        "fixture.beads",
+        "bv --robot-triage",
+        generated_at_ms,
+    ));
+    beads.ready_count = 4;
+
+    let mut agent_mail = OperatingEnvelopeAgentMailSourceInput::new(fixture_provenance(
+        "fixture.agent_mail",
+        "mcp.agent_mail.fetch_inbox",
+        generated_at_ms,
+    ));
+
+    let mut git = OperatingEnvelopeGitSourceInput::new(
+        fixture_provenance(
+            "fixture.git",
+            "git status --short --branch",
+            generated_at_ms,
+        ),
+        "main",
+    );
+
+    match scenario {
+        OperatingEnvelopeScenario::Current | OperatingEnvelopeScenario::Healthy => {}
+        OperatingEnvelopeScenario::Degraded => {
+            agent_mail.unavailable_reason = Some("agent_mail.unavailable_after_retry".to_string());
+        }
+        OperatingEnvelopeScenario::Blocked => {
+            rch.healthy_worker_count = 0;
+            rch.remote_cargo_reached = Some(false);
+            rch.topology_preflight_failed = true;
+        }
+        OperatingEnvelopeScenario::Emergency => {
+            capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Black;
+            capacity.kill_switch_active = true;
+            git.deleted_path_count = 1;
+        }
+    }
+
+    OperatingEnvelopeSourceAdapterInputs::new(capacity, rch, beads, agent_mail, git)
+        .into_input_domains()
+}
+
+fn fixture_provenance(
+    source_id: &'static str,
+    command_or_api: &'static str,
+    generated_at_ms: u64,
+) -> OperatingEnvelopeSourceProvenance {
+    OperatingEnvelopeSourceProvenance::live_command(source_id, command_or_api).with_freshness(
+        Some(generated_at_ms),
+        Some(0),
+        OperatingEnvelopeFreshnessState::Fresh,
+    )
+}
+
+fn operating_envelope_summary(plan: &OperatingEnvelopePlan) -> serde_json::Value {
+    let next_safe_window = plan
+        .admission_windows
+        .iter()
+        .find(|window| {
+            !matches!(
+                window.window_class,
+                OperatingEnvelopeWindowClass::Wait | OperatingEnvelopeWindowClass::Blocked
+            ) && (window.max_parallel_agents > 0 || window.max_parallel_proofs > 0)
+        })
+        .map(operating_envelope_window_summary);
+
+    serde_json::json!({
+        "envelope_tier": plan.decision.envelope_tier,
+        "outcome": plan.decision.outcome,
+        "confidence": plan.decision.confidence,
+        "admission_count": {
+            "max_parallel_agents": plan.decision.max_parallel_agents,
+            "max_parallel_proofs": plan.decision.max_parallel_proofs,
+            "window_count": plan.admission_windows.len(),
+        },
+        "paused_action_classes": operating_envelope_paused_action_classes(plan),
+        "blocked_reason_codes": plan.decision.reason_codes,
+        "next_safe_window": next_safe_window,
+        "required_approvals": operating_envelope_required_approvals(),
+        "proof_requirements": operating_envelope_proof_requirements(plan),
+        "forbidden_action_classes": operating_envelope_forbidden_action_classes(plan),
+        "raw_pane_content_stored": plan.raw_pane_content_stored,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+    })
+}
+
+fn operating_envelope_window_summary(
+    window: &OperatingEnvelopeAdmissionWindow,
+) -> serde_json::Value {
+    serde_json::json!({
+        "window_id": window.window_id,
+        "window_class": window.window_class,
+        "starts_at_ms": window.starts_at_ms,
+        "expires_at_ms": window.expires_at_ms,
+        "max_parallel_agents": window.max_parallel_agents,
+        "max_parallel_proofs": window.max_parallel_proofs,
+        "permitted_action_classes": window.permitted_action_classes,
+        "reason_codes": window.reason_codes,
+    })
+}
+
+fn operating_envelope_source_states(plan: &OperatingEnvelopePlan) -> Vec<serde_json::Value> {
+    std::iter::once(plan.input_domains.capacity_resource.clone())
+        .chain(std::iter::once(plan.input_domains.rch.clone()))
+        .chain(std::iter::once(plan.input_domains.beads.clone()))
+        .chain(std::iter::once(plan.input_domains.agent_mail.clone()))
+        .chain(std::iter::once(plan.input_domains.git.clone()))
+        .chain(plan.input_domains.robot_inventory.clone())
+        .map(|source| {
+            serde_json::json!({
+                "source_id": source.source_id,
+                "source_kind": source.source_kind,
+                "state": source.state,
+                "freshness_state": source.freshness_state,
+                "evidence_level": source.evidence_level,
+                "redacted": source.redacted,
+                "raw_pane_content_stored": source.raw_pane_content_stored,
+                "reason_codes": source.reason_codes,
+                "artifact_paths": source.artifact_paths,
+            })
+        })
+        .collect()
+}
+
+fn operating_envelope_paused_action_classes(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    if plan.decision.outcome == OperatingEnvelopeOutcome::Admit {
+        return Vec::new();
+    }
+    operating_envelope_forbidden_action_classes(plan)
+}
+
+fn operating_envelope_forbidden_action_classes(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    for window in &plan.admission_windows {
+        for action_class in &window.forbidden_action_classes {
+            values.insert(action_class_name(*action_class));
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn operating_envelope_proof_requirements(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    let mut requirements = BTreeSet::from([
+        "remote_rch_required_for_cargo_proof".to_string(),
+        "local_cargo_output_not_counted_as_proof".to_string(),
+    ]);
+    if plan.decision.max_parallel_proofs == 0 {
+        requirements.insert("no_remote_proof_lane_admitted_currently".to_string());
+    }
+    if matches!(
+        plan.decision.target_hardware_state,
+        OperatingEnvelopeProofState::Unavailable | OperatingEnvelopeProofState::SkippedNotProven
+    ) {
+        requirements.insert("target_class_claim_requires_non_skipped_artifact".to_string());
+    }
+    requirements.into_iter().collect()
+}
+
+fn operating_envelope_required_approvals() -> Vec<String> {
+    vec![
+        "beads_claim_requires_separate_operator_action".to_string(),
+        "pane_mutation_requires_separate_approval".to_string(),
+        "service_repair_or_restart_is_not_approved".to_string(),
+        "rch_cancellation_is_not_approved".to_string(),
+    ]
+}
+
+fn action_class_name(action_class: OperatingEnvelopeActionClass) -> String {
+    serde_json::to_value(action_class)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{action_class:?}"))
+}
+
+fn operating_envelope_explain(
+    plan: &OperatingEnvelopePlan,
+    reason_code: Option<&str>,
+) -> serde_json::Value {
+    let entries = operating_envelope_explain_entries(plan, reason_code);
+    let matched = reason_code.is_none() || !entries.is_empty();
+    serde_json::json!({
+        "matched": matched,
+        "query_reason_code": reason_code,
+        "entries": entries,
+        "operator_action": if matched {
+            "inspect the matched reason-code entries; this explain call executed no mutation"
+        } else {
+            "refresh ft robot swarm envelope --surface status and choose a reason code from data.summary.blocked_reason_codes"
+        },
+    })
+}
+
+fn operating_envelope_explain_entries(
+    plan: &OperatingEnvelopePlan,
+    reason_code: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    if reason_code_matches(&plan.decision.reason_codes, reason_code) {
+        entries.push(serde_json::json!({
+            "scope": "decision",
+            "subject_id": plan.decision.decision_id,
+            "outcome": plan.decision.outcome,
+            "envelope_tier": plan.decision.envelope_tier,
+            "reason_codes": matching_reason_codes(&plan.decision.reason_codes, reason_code),
+        }));
+    }
+    for window in &plan.admission_windows {
+        if reason_code_matches(&window.reason_codes, reason_code) {
+            entries.push(serde_json::json!({
+                "scope": "admission_window",
+                "subject_id": window.window_id,
+                "window_class": window.window_class,
+                "max_parallel_agents": window.max_parallel_agents,
+                "max_parallel_proofs": window.max_parallel_proofs,
+                "reason_codes": matching_reason_codes(&window.reason_codes, reason_code),
+            }));
+        }
+    }
+    for source in operating_envelope_sources(plan) {
+        if reason_code_matches(&source.reason_codes, reason_code) {
+            entries.push(serde_json::json!({
+                "scope": "source",
+                "subject_id": source.source_id,
+                "source_kind": source.source_kind,
+                "state": source.state,
+                "freshness_state": source.freshness_state,
+                "reason_codes": matching_reason_codes(&source.reason_codes, reason_code),
+            }));
+        }
+        for evidence in &source.evidence {
+            if reason_code_matches(&evidence.reason_codes, reason_code) {
+                entries.push(serde_json::json!({
+                    "scope": "evidence",
+                    "subject_id": evidence.evidence_id,
+                    "source_id": source.source_id,
+                    "category": evidence.category,
+                    "state": evidence.state,
+                    "reason_codes": matching_reason_codes(&evidence.reason_codes, reason_code),
+                }));
+            }
+        }
+    }
+    entries
+}
+
+fn operating_envelope_sources(
+    plan: &OperatingEnvelopePlan,
+) -> Vec<&OperatingEnvelopeSourceSnapshot> {
+    let mut sources = vec![
+        &plan.input_domains.capacity_resource,
+        &plan.input_domains.rch,
+        &plan.input_domains.beads,
+        &plan.input_domains.agent_mail,
+        &plan.input_domains.git,
+    ];
+    if let Some(robot_inventory) = &plan.input_domains.robot_inventory {
+        sources.push(robot_inventory);
+    }
+    sources
+}
+
+fn reason_code_matches(reason_codes: &[String], reason_code: Option<&str>) -> bool {
+    reason_code.is_none_or(|needle| reason_codes.iter().any(|reason| reason == needle))
+}
+
+fn matching_reason_codes(reason_codes: &[String], reason_code: Option<&str>) -> Vec<String> {
+    reason_code.map_or_else(
+        || reason_codes.to_vec(),
+        |needle| {
+            reason_codes
+                .iter()
+                .filter(|reason| reason.as_str() == needle)
+                .cloned()
+                .collect()
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

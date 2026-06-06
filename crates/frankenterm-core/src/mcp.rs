@@ -116,22 +116,22 @@ use mcp_resources::{
     WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttentionCurrentResource,
     WaAttentionItemTemplateResource, WaAttestationRetractionsResource, WaContextHorizonResource,
     WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
-    WaHerdWaveResource, WaMissionObjectivePlanTemplateResource, WaPanesResource,
-    WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
-    WaRehearsalScoreCurrentResource, WaRehearsalScoreSurfaceTemplateResource,
-    WaRendererInputToPhotonResource, WaRendererSsimParityResource,
-    WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
-    WaRulesResource, WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource,
-    WaWorkflowsResource,
+    WaHerdWaveResource, WaMissionObjectivePlanTemplateResource, WaOperatingEnvelopeCurrentResource,
+    WaOperatingEnvelopeRunTemplateResource, WaPanesResource, WaProofHistoryReleaseBlockingResource,
+    WaProofHistoryResource, WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
+    WaRehearsalScoreSurfaceTemplateResource, WaRendererInputToPhotonResource,
+    WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
+    WaRulesByAgentTemplateResource, WaRulesResource, WaSwarmCapacityCurrentResource,
+    WaSwarmCapacityRunTemplateResource, WaWorkflowsResource,
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaCassSearchTool, WaCassStatusTool,
     WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool,
     WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool,
-    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaRehearsalScoreTool,
-    WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
-    WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-    WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeTool,
+    WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
 };
 pub use mcp_tools::{mcp_clock_anomaly_count, mcp_workflow_plan_serde_drop_count};
 #[cfg(feature = "fuzz")]
@@ -139,10 +139,10 @@ use mcp_types::{
     AccountsParams, AccountsRefreshParams, AttentionParams, CassSearchParams, CassStatusParams,
     CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams,
     GetTextParams, MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams,
-    MissionPauseParams, MissionResumeParams, RehearsalScoreParams, ReleaseParams,
-    ReservationsParams, ReserveParams, RulesListParams, RulesTestParams, SearchParams, SendParams,
-    StateParams, TxPlanParams, TxRollbackParams, TxRunParams, TxShowParams, WaitForParams,
-    WorkflowRunParams, WorkflowStatusParams,
+    MissionPauseParams, MissionResumeParams, OperatingEnvelopeParams, RehearsalScoreParams,
+    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
+    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
+    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
 };
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
@@ -226,6 +226,9 @@ fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str 
             }
         }
         "wa.mission_objective_plan" => fuzz_parse_params::<MissionObjectivePlanParams>(arguments),
+        "wa.operating_envelope" => {
+            fuzz_parse_params_or_default::<OperatingEnvelopeParams>(arguments)
+        }
         "wa.attention" => fuzz_parse_params_or_default::<AttentionParams>(arguments),
         "wa.rehearsal_score" => fuzz_parse_params_or_default::<RehearsalScoreParams>(arguments),
         "wa.mission_state" => fuzz_parse_params_or_default::<MissionStateParams>(arguments),

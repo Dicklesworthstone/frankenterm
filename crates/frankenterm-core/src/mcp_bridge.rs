@@ -12,7 +12,8 @@ use super::{
     WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource,
     WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool,
     WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool, WaMissionPauseTool,
-    WaMissionResumeTool, WaMissionStateTool, WaPanesResource,
+    WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeCurrentResource,
+    WaOperatingEnvelopeRunTemplateResource, WaOperatingEnvelopeTool, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
     WaRehearsalScoreCurrentResource, WaRehearsalScoreSurfaceTemplateResource, WaRehearsalScoreTool,
     WaReleaseTool, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
@@ -50,6 +51,7 @@ pub const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.attention",
     "wa.rehearsal_score",
     "wa.mission_objective_plan",
+    "wa.operating_envelope",
     "wa.mission_state",
     "wa.mission_explain",
     "wa.get_text",
@@ -268,6 +270,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             &config,
         ))))
         .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
+        .tool(FormatAwareToolHandler::new(WaOperatingEnvelopeTool))
         .tool(FormatAwareToolHandler::new(WaAttentionTool))
         .tool(FormatAwareToolHandler::new(WaRehearsalScoreTool::new(
             Arc::clone(&config),
@@ -285,6 +288,8 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaHerdWaveResource)
         .resource(WaMissionObjectivePlanTemplateResource)
+        .resource(WaOperatingEnvelopeCurrentResource)
+        .resource(WaOperatingEnvelopeRunTemplateResource)
         .resource(WaAttentionCurrentResource)
         .resource(WaAttentionItemTemplateResource)
         .resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config)))

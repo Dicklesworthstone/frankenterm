@@ -31,6 +31,10 @@ use crate::mission_objective_plan::{
     MissionObjectiveSourceKind, MissionObjectiveSourceSnapshot, MissionObjectiveStrictness,
     build_mission_objective_plan_surface_data, plan_mission_objective,
 };
+use crate::operating_envelope::{
+    OperatingEnvelopeScenario, OperatingEnvelopeSurface, build_operating_envelope_surface_data,
+    operating_envelope_input_for_scenario, plan_operating_envelope,
+};
 use crate::policy::PolicySurface;
 use crate::rehearsal_score::{
     REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
@@ -54,10 +58,10 @@ use super::mcp_types::{
     McpSearchHit, McpSendData, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
     McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
     MissionObjectivePlanParams, MissionPauseParams, MissionResumeParams, MissionStateParams,
-    RehearsalScoreParams, ReleaseParams, ReservationsParams, ReserveParams, RulesListParams,
-    RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
-    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
-    apply_tail_truncation, now_ms,
+    OperatingEnvelopeParams, RehearsalScoreParams, ReleaseParams, ReservationsParams,
+    ReserveParams, RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams,
+    TxPlanParams, TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
+    WorkflowStatusParams, apply_tail_truncation, now_ms,
 };
 #[allow(unused_imports)]
 use super::{
@@ -6174,6 +6178,163 @@ impl ToolHandler for WaMissionObjectivePlanTool {
     }
 }
 
+fn parse_operating_envelope_scenario(
+    value: Option<&str>,
+) -> std::result::Result<OperatingEnvelopeScenario, McpToolError> {
+    value.map_or(Ok(OperatingEnvelopeScenario::Current), |raw| {
+        OperatingEnvelopeScenario::from_token(raw).ok_or_else(|| {
+            McpToolError::new(
+                MCP_ERR_INVALID_ARGS,
+                format!("unknown operating-envelope scenario '{raw}'"),
+                Some("Use one of: current, healthy, degraded, blocked, emergency.".to_string()),
+            )
+        })
+    })
+}
+
+fn parse_operating_envelope_surface(
+    value: Option<&str>,
+    explain_reason: Option<&str>,
+) -> std::result::Result<OperatingEnvelopeSurface, McpToolError> {
+    value.map_or(
+        Ok(if explain_reason.is_some() {
+            OperatingEnvelopeSurface::Explain
+        } else {
+            OperatingEnvelopeSurface::Status
+        }),
+        |raw| {
+            OperatingEnvelopeSurface::from_token(raw).ok_or_else(|| {
+                McpToolError::new(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("unknown operating-envelope surface '{raw}'"),
+                    Some("Use status or explain.".to_string()),
+                )
+            })
+        },
+    )
+}
+
+fn build_mcp_operating_envelope_surface(
+    params: OperatingEnvelopeParams,
+) -> std::result::Result<serde_json::Value, McpToolError> {
+    if params.execute {
+        return Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            "wa.operating_envelope is dry-run only and cannot execute actions".to_string(),
+            Some(
+                "Remove execute=true; this tool only returns read-only envelope status."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let explain_reason = mcp_non_empty_option(params.explain_reason, "explain_reason")?;
+    let scenario = parse_operating_envelope_scenario(params.scenario.as_deref())?;
+    let surface =
+        parse_operating_envelope_surface(params.surface.as_deref(), explain_reason.as_deref())?;
+    let generated_at_ms = params.generated_at_ms.unwrap_or_else(now_ms);
+    let envelope_id = mcp_non_empty_option(params.envelope_id, "envelope_id")?
+        .unwrap_or_else(|| format!("wa-operating-envelope-{}", scenario.as_str()));
+    let objective_id = mcp_non_empty_option(params.objective_id, "objective_id")?
+        .unwrap_or_else(|| "operator.current_safety".to_string());
+    let input =
+        operating_envelope_input_for_scenario(generated_at_ms, envelope_id, objective_id, scenario);
+    let plan = plan_operating_envelope(input);
+    Ok(build_operating_envelope_surface_data(
+        &plan,
+        surface,
+        "mcp.operating_envelope",
+        explain_reason.as_deref(),
+    ))
+}
+
+// wa.operating_envelope tool
+pub(super) struct WaOperatingEnvelopeTool;
+
+impl ToolHandler for WaOperatingEnvelopeTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.operating_envelope".to_string(),
+            description: Some(
+                "Read the dry-run swarm operating envelope and optional reason-code explanation"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scenario": {
+                        "type": "string",
+                        "enum": ["current", "healthy", "degraded", "blocked", "emergency"],
+                        "default": "current",
+                        "description": "Deterministic redacted source scenario; current fails closed when live collectors are unavailable"
+                    },
+                    "surface": {
+                        "type": "string",
+                        "enum": ["status", "explain"],
+                        "default": "status"
+                    },
+                    "explain_reason": {
+                        "type": "string",
+                        "description": "Reason code to drill into when surface=explain"
+                    },
+                    "envelope_id": { "type": "string" },
+                    "objective_id": { "type": "string" },
+                    "generated_at_ms": { "type": "integer", "minimum": 0 },
+                    "execute": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Always rejected; operating-envelope surfaces are read-only"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "swarm".to_string(),
+                "operating-envelope".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: OperatingEnvelopeParams = if arguments.is_null() {
+            OperatingEnvelopeParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some(
+                            "Expected object with optional scenario, surface, and explain_reason"
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        match build_mcp_operating_envelope_surface(params) {
+            Ok(data) => envelope_to_content(McpEnvelope::success(data, elapsed_ms(start))),
+            Err(err) => envelope_to_content(McpEnvelope::<()>::error(
+                err.code,
+                err.message,
+                err.hint,
+                elapsed_ms(start),
+            )),
+        }
+    }
+}
+
 // wa.mission_state tool
 pub(super) struct WaMissionStateTool {
     config: Arc<Config>,
@@ -7612,18 +7773,19 @@ mod tests {
         WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
         WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
         WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
-        WaMissionStateTool, WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
-        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
-        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
-        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
-        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
-        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
-        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
-        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
-        redact_mcp_output_secrets, redact_mcp_pane_state_fields,
-        redact_mcp_wait_pattern_for_output, serialize_mcp_audit_decision_context,
-        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
+        WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool,
+        WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
+        WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
+        WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
+        authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
+        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
+        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        merge_distributed_remote_mcp_states, redact_mcp_output_secrets,
+        redact_mcp_pane_state_fields, redact_mcp_wait_pattern_for_output,
+        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
+        validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -8114,7 +8276,7 @@ mod tests {
         }
     }
 
-    /// Collect definitions for all 33 tools. Guarantees no panics during construction.
+    /// Collect definitions for all 34 tools. Guarantees no panics during construction.
     fn all_definitions() -> Vec<Tool> {
         let db = db_path();
         let cfg = config();
@@ -8142,6 +8304,7 @@ mod tests {
             WaAccountsTool::new(Arc::clone(&db)).definition(),
             WaAccountsRefreshTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaMissionObjectivePlanTool.definition(),
+            WaOperatingEnvelopeTool.definition(),
             WaAttentionTool.definition(),
             WaRehearsalScoreTool::new(Arc::clone(&cfg)).definition(),
             WaMissionStateTool::new(Arc::clone(&cfg)).definition(),
@@ -8160,8 +8323,8 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn tool_count_is_33() {
-        assert_eq!(all_definitions().len(), 33);
+    fn tool_count_is_34() {
+        assert_eq!(all_definitions().len(), 34);
     }
 
     #[test]
@@ -9310,6 +9473,95 @@ mod tests {
                 }),
             )
             .expect("mission objective plan call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            crate::mcp_error::MCP_ERR_INVALID_ARGS
+        );
+        assert!(envelope["error"].as_str().unwrap().contains("dry-run only"));
+    }
+
+    #[test]
+    fn operating_envelope_tool_returns_dry_run_status() {
+        let tool = WaOperatingEnvelopeTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "scenario": "degraded",
+                    "generated_at_ms": 123,
+                }),
+            )
+            .expect("operating envelope call"),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["dry_run"], true);
+        assert_eq!(envelope["data"]["side_effects_executed"], false);
+        assert_eq!(envelope["data"]["live_mutation_allowed"], false);
+        assert_eq!(envelope["data"]["raw_pane_content_stored"], false);
+        assert_eq!(
+            envelope["data"]["contract_id"],
+            crate::operating_envelope::OPERATING_ENVELOPE_CONTRACT_ID
+        );
+        assert_eq!(envelope["data"]["surface"], "status");
+        assert_eq!(
+            envelope["data"]["summary"]["envelope_tier"].as_str(),
+            Some("yellow")
+        );
+        assert!(
+            envelope["data"]["safety_notice"]
+                .as_str()
+                .expect("safety notice")
+                .contains("not permission")
+        );
+    }
+
+    #[test]
+    fn operating_envelope_tool_explains_reason_code() {
+        let tool = WaOperatingEnvelopeTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "scenario": "blocked",
+                    "surface": "explain",
+                    "explain_reason": "rch.topology_preflight_failed",
+                    "generated_at_ms": 123,
+                }),
+            )
+            .expect("operating envelope explain call"),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["surface"], "explain");
+        assert_eq!(envelope["data"]["explain"]["matched"], true);
+        assert!(
+            envelope["data"]["explain"]["entries"]
+                .as_array()
+                .expect("explain entries")
+                .iter()
+                .any(|entry| entry["scope"] == "source" || entry["scope"] == "evidence")
+        );
+    }
+
+    #[test]
+    fn operating_envelope_tool_rejects_execute_attempt() {
+        let tool = WaOperatingEnvelopeTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "scenario": "healthy",
+                    "execute": true
+                }),
+            )
+            .expect("operating envelope call"),
         );
 
         assert_eq!(envelope["ok"], false);

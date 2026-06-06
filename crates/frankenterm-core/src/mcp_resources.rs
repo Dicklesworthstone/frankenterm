@@ -23,6 +23,9 @@ use crate::attention_router::{
 };
 use crate::context_horizon::predict_context_horizon_from_sqlite;
 use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_STORAGE};
+use crate::operating_envelope::{
+    OPERATING_ENVELOPE_MCP_CURRENT_URI, OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
+};
 use crate::proof_lane::{
     ProofHistoryArtifactInput, ProofHistoryIndex, ProofHistoryQuery, ProofReleaseScoreboard,
     ProofState,
@@ -43,8 +46,8 @@ use crate::swarm_scheduler::{
 };
 
 use super::mcp_tools::{
-    WaAccountsTool, WaEventsTool, WaMissionObjectivePlanTool, WaRehearsalScoreTool,
-    WaReservationsTool, WaRulesListTool, WaStateTool,
+    WaAccountsTool, WaEventsTool, WaMissionObjectivePlanTool, WaOperatingEnvelopeTool,
+    WaRehearsalScoreTool, WaReservationsTool, WaRulesListTool, WaStateTool,
 };
 use super::{McpEnvelope, McpWorkflowItem, McpWorkflowsData, builtin_workflows, elapsed_ms};
 use crate::config::{Config, PaneFilterConfig};
@@ -1095,6 +1098,102 @@ impl ResourceHandler for WaAttentionItemTemplateResource {
     }
 }
 
+pub(super) struct WaOperatingEnvelopeCurrentResource;
+
+impl ResourceHandler for WaOperatingEnvelopeCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: OPERATING_ENVELOPE_MCP_CURRENT_URI.to_string(),
+            name: "ft operating envelope current".to_string(),
+            description: Some("Read-only fail-closed swarm operating-envelope status".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "operating-envelope".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaOperatingEnvelopeTool;
+        let contents = tool.call(
+            ctx,
+            serde_json::json!({
+                "scenario": "current",
+                "surface": "status",
+            }),
+        )?;
+        tool_output_as_resource(OPERATING_ENVELOPE_MCP_CURRENT_URI, contents)
+    }
+}
+
+pub(super) struct WaOperatingEnvelopeRunTemplateResource;
+
+impl ResourceHandler for WaOperatingEnvelopeRunTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://operating-envelope/runs/template".to_string(),
+            name: "ft operating envelope run artifact template".to_string(),
+            description: Some(
+                "Template for read-only per-run operating-envelope artifacts".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "operating-envelope".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE.to_string(),
+            name: "ft operating envelope run artifact".to_string(),
+            description: Some("Read-only operating-envelope run artifact shape".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "operating-envelope".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.read_with_uri(ctx, "wa://operating-envelope/runs/current", &HashMap::new())
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let run_id = params
+            .get("run_id")
+            .map(String::as_str)
+            .unwrap_or("current");
+        let tool = WaOperatingEnvelopeTool;
+        let contents = tool.call(
+            ctx,
+            serde_json::json!({
+                "scenario": "current",
+                "surface": "status",
+                "envelope_id": format!("wa-operating-envelope-{run_id}"),
+            }),
+        )?;
+        tool_output_as_resource(uri, contents)
+    }
+}
+
 fn swarm_capacity_resource_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1745,7 +1844,8 @@ mod tests {
         WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
         WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
         WaEventsUnhandledTemplateResource, WaHerdWaveResource,
-        WaMissionObjectivePlanTemplateResource, WaPanesResource,
+        WaMissionObjectivePlanTemplateResource, WaOperatingEnvelopeCurrentResource,
+        WaOperatingEnvelopeRunTemplateResource, WaPanesResource,
         WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
         WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
         WaRehearsalScoreSurfaceTemplateResource, WaRendererInputToPhotonResource,
@@ -1996,6 +2096,26 @@ mod tests {
     }
 
     #[test]
+    fn operating_envelope_resources_define_current_and_run_template() {
+        let current = WaOperatingEnvelopeCurrentResource.definition();
+        assert_eq!(
+            current.uri,
+            crate::operating_envelope::OPERATING_ENVELOPE_MCP_CURRENT_URI
+        );
+        assert!(current.tags.contains(&"operating-envelope".to_string()));
+        assert!(current.tags.contains(&"swarm".to_string()));
+
+        let template = WaOperatingEnvelopeRunTemplateResource
+            .template()
+            .expect("operating-envelope run template");
+        assert_eq!(
+            template.uri_template,
+            crate::operating_envelope::OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE
+        );
+        assert!(template.tags.contains(&"operating-envelope".to_string()));
+    }
+
+    #[test]
     fn renderer_input_to_photon_resource_definition_uri() {
         let def = WaRendererInputToPhotonResource.definition();
         assert_eq!(
@@ -2101,6 +2221,51 @@ mod tests {
             assert!(
                 !rendered.contains(forbidden),
                 "swarm-capacity MCP payload leaked {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn operating_envelope_current_resource_reads_without_pane_mutation_or_raw_content() {
+        let resource = WaOperatingEnvelopeCurrentResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let contents = resource
+            .read(&ctx)
+            .expect("read operating-envelope current resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::operating_envelope::OPERATING_ENVELOPE_CONTRACT_ID)
+        );
+        assert_eq!(payload["data"]["dry_run"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["side_effects_executed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resources"][0]["uri"].as_str(),
+            Some(crate::operating_envelope::OPERATING_ENVELOPE_MCP_CURRENT_URI)
+        );
+        let rendered = serde_json::to_string(&payload).expect("render payload");
+        for forbidden in [
+            concat!("PROMPT_", "BODY:"),
+            concat!("sk-", "proj-"),
+            concat!("Cookie: ft_session", "="),
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "operating-envelope MCP payload leaked {forbidden}: {rendered}"
             );
         }
     }
@@ -2354,6 +2519,8 @@ mod tests {
                 .uri,
             WaSwarmCapacityCurrentResource.definition().uri,
             WaSwarmCapacityRunTemplateResource.definition().uri,
+            WaOperatingEnvelopeCurrentResource.definition().uri,
+            WaOperatingEnvelopeRunTemplateResource.definition().uri,
             WaRendererInputToPhotonResource.definition().uri,
             WaRendererSsimParityResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
@@ -2409,6 +2576,8 @@ mod tests {
                 .uri,
             WaSwarmCapacityCurrentResource.definition().uri,
             WaSwarmCapacityRunTemplateResource.definition().uri,
+            WaOperatingEnvelopeCurrentResource.definition().uri,
+            WaOperatingEnvelopeRunTemplateResource.definition().uri,
             WaRendererInputToPhotonResource.definition().uri,
             WaRendererSsimParityResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
@@ -2456,6 +2625,8 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
             WaSwarmCapacityCurrentResource.definition(),
             WaSwarmCapacityRunTemplateResource.definition(),
+            WaOperatingEnvelopeCurrentResource.definition(),
+            WaOperatingEnvelopeRunTemplateResource.definition(),
             WaRendererInputToPhotonResource.definition(),
             WaRendererSsimParityResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
@@ -2493,6 +2664,8 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
             WaSwarmCapacityCurrentResource.definition(),
             WaSwarmCapacityRunTemplateResource.definition(),
+            WaOperatingEnvelopeCurrentResource.definition(),
+            WaOperatingEnvelopeRunTemplateResource.definition(),
             WaRendererInputToPhotonResource.definition(),
             WaRendererSsimParityResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),

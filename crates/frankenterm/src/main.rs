@@ -31,6 +31,13 @@ use frankenterm_core::context_horizon::{
 };
 use frankenterm_core::demo_scenarios::{DemoScenarioManifest, DemoScenarioSpec};
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
+#[cfg(test)]
+use frankenterm_core::operating_envelope::OPERATING_ENVELOPE_CONTRACT_ID;
+use frankenterm_core::operating_envelope::{
+    OPERATING_ENVELOPE_MCP_CURRENT_URI, OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
+    OperatingEnvelopeScenario, OperatingEnvelopeSurface, build_operating_envelope_surface_data,
+    operating_envelope_input_for_scenario, plan_operating_envelope,
+};
 use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
 use frankenterm_core::plan::mission_tx_synthetic_commit_report as build_robot_tx_synthetic_commit_report;
@@ -248,6 +255,12 @@ SEE ALSO:
 
         #[command(subcommand)]
         command: Option<RobotCommands>,
+    },
+
+    /// Swarm operator status and planning surfaces
+    Swarm {
+        #[command(subcommand)]
+        command: SwarmCommands,
     },
 
     /// Search captured output (FTS query)
@@ -3340,6 +3353,12 @@ enum RobotCommands {
         level: u8,
     },
 
+    /// Swarm operator status and planning surfaces
+    Swarm {
+        #[command(subcommand)]
+        command: RobotSwarmCommands,
+    },
+
     /// Operator capacity status, planning, and decision explanation surfaces
     #[command(name = "swarm-capacity", visible_alias = "swarm_capacity")]
     SwarmCapacity {
@@ -3626,6 +3645,118 @@ impl From<RobotHerdWaveEventKind> for HerdWaveEventKind {
             RobotHerdWaveEventKind::Other => Self::Other,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum SwarmCommands {
+    /// Explain the current read-only swarm operating envelope
+    Envelope(OperatingEnvelopeCliArgs),
+}
+
+#[derive(Subcommand)]
+enum RobotSwarmCommands {
+    /// Emit read-only swarm operating-envelope status or reason-code explanation
+    Envelope(RobotOperatingEnvelopeArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OperatingEnvelopeScenarioArg {
+    Current,
+    Healthy,
+    Degraded,
+    Blocked,
+    Emergency,
+}
+
+impl From<OperatingEnvelopeScenarioArg> for OperatingEnvelopeScenario {
+    fn from(value: OperatingEnvelopeScenarioArg) -> Self {
+        match value {
+            OperatingEnvelopeScenarioArg::Current => Self::Current,
+            OperatingEnvelopeScenarioArg::Healthy => Self::Healthy,
+            OperatingEnvelopeScenarioArg::Degraded => Self::Degraded,
+            OperatingEnvelopeScenarioArg::Blocked => Self::Blocked,
+            OperatingEnvelopeScenarioArg::Emergency => Self::Emergency,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OperatingEnvelopeSurfaceArg {
+    Status,
+    Explain,
+}
+
+impl From<OperatingEnvelopeSurfaceArg> for OperatingEnvelopeSurface {
+    fn from(value: OperatingEnvelopeSurfaceArg) -> Self {
+        match value {
+            OperatingEnvelopeSurfaceArg::Status => Self::Status,
+            OperatingEnvelopeSurfaceArg::Explain => Self::Explain,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OperatingEnvelopeHumanFormatArg {
+    Plain,
+    Json,
+}
+
+#[derive(Args)]
+struct OperatingEnvelopeCliArgs {
+    /// Deterministic redacted source scenario; current fails closed when live collectors are unavailable
+    #[arg(long, value_enum, default_value_t = OperatingEnvelopeScenarioArg::Current)]
+    scenario: OperatingEnvelopeScenarioArg,
+
+    /// Surface to render
+    #[arg(long, value_enum, default_value_t = OperatingEnvelopeSurfaceArg::Status)]
+    surface: OperatingEnvelopeSurfaceArg,
+
+    /// Reason code to drill into when surface=explain
+    #[arg(long = "explain-reason")]
+    explain_reason: Option<String>,
+
+    /// Stable envelope id for deterministic fixtures
+    #[arg(long, default_value = "operator-current-envelope")]
+    envelope_id: String,
+
+    /// Stable objective id for deterministic fixtures
+    #[arg(long, default_value = "operator.current_safety")]
+    objective_id: String,
+
+    /// Stable generation timestamp for deterministic replay and fixtures
+    #[arg(long)]
+    generated_at_ms: Option<u64>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OperatingEnvelopeHumanFormatArg::Plain)]
+    format: OperatingEnvelopeHumanFormatArg,
+}
+
+#[derive(Args)]
+struct RobotOperatingEnvelopeArgs {
+    /// Deterministic redacted source scenario; current fails closed when live collectors are unavailable
+    #[arg(long, value_enum, default_value_t = OperatingEnvelopeScenarioArg::Current)]
+    scenario: OperatingEnvelopeScenarioArg,
+
+    /// Surface to render
+    #[arg(long, value_enum, default_value_t = OperatingEnvelopeSurfaceArg::Status)]
+    surface: OperatingEnvelopeSurfaceArg,
+
+    /// Reason code to drill into when surface=explain
+    #[arg(long = "explain-reason")]
+    explain_reason: Option<String>,
+
+    /// Stable envelope id for deterministic fixtures
+    #[arg(long, default_value = "robot-current-envelope")]
+    envelope_id: String,
+
+    /// Stable objective id for deterministic fixtures
+    #[arg(long, default_value = "operator.current_safety")]
+    objective_id: String,
+
+    /// Stable generation timestamp for deterministic replay and fixtures
+    #[arg(long)]
+    generated_at_ms: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -19781,6 +19912,133 @@ fn unavailable_swarm_capacity_summary_at(
     SwarmCapacityOperatorSummary::unavailable(generated_at_ms, level, source)
 }
 
+fn build_operating_envelope_payload(
+    generated_at_ms: u64,
+    envelope_id: &str,
+    objective_id: &str,
+    scenario: OperatingEnvelopeScenarioArg,
+    surface: OperatingEnvelopeSurfaceArg,
+    source: &str,
+    explain_reason: Option<&str>,
+) -> serde_json::Value {
+    let input = operating_envelope_input_for_scenario(
+        generated_at_ms,
+        envelope_id,
+        objective_id,
+        OperatingEnvelopeScenario::from(scenario),
+    );
+    let plan = plan_operating_envelope(input);
+    build_operating_envelope_surface_data(
+        &plan,
+        OperatingEnvelopeSurface::from(surface),
+        source,
+        explain_reason,
+    )
+}
+
+fn operating_envelope_payload_text<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn operating_envelope_pointer_text<'a>(payload: &'a serde_json::Value, pointer: &str) -> &'a str {
+    payload
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn operating_envelope_string_list(payload: &serde_json::Value, pointer: &str) -> Vec<String> {
+    payload
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn print_operating_envelope_plain(payload: &serde_json::Value) {
+    println!("Operating Envelope:");
+    println!(
+        "  Tier: {} outcome={} confidence={}",
+        operating_envelope_pointer_text(payload, "/summary/envelope_tier"),
+        operating_envelope_pointer_text(payload, "/summary/outcome"),
+        operating_envelope_pointer_text(payload, "/summary/confidence")
+    );
+    println!(
+        "  Admission: agents={} proofs={} windows={}",
+        payload
+            .pointer("/summary/admission_count/max_parallel_agents")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        payload
+            .pointer("/summary/admission_count/max_parallel_proofs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        payload
+            .pointer("/summary/admission_count/window_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    if let Some(window) = payload.pointer("/summary/next_safe_window") {
+        if !window.is_null() {
+            println!(
+                "  Next safe window: {} ({}) agents={} proofs={}",
+                operating_envelope_pointer_text(window, "/window_id"),
+                operating_envelope_pointer_text(window, "/window_class"),
+                window
+                    .get("max_parallel_agents")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                window
+                    .get("max_parallel_proofs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            );
+        }
+    }
+    let blocked = operating_envelope_string_list(payload, "/summary/blocked_reason_codes");
+    if !blocked.is_empty() {
+        println!("  Reasons: {}", blocked.join(", "));
+    }
+    let proof_requirements = operating_envelope_string_list(payload, "/proof_requirements");
+    if !proof_requirements.is_empty() {
+        println!("  Proof: {}", proof_requirements.join(", "));
+    }
+    let forbidden = operating_envelope_string_list(payload, "/forbidden_action_classes");
+    if !forbidden.is_empty() {
+        println!("  Forbidden: {}", forbidden.join(", "));
+    }
+    println!(
+        "  MCP: {} ({})",
+        OPERATING_ENVELOPE_MCP_CURRENT_URI, OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE
+    );
+    println!(
+        "  Safety: {}",
+        operating_envelope_payload_text(payload, "safety_notice")
+    );
+    if let Some(explain) = payload.get("explain").filter(|value| !value.is_null()) {
+        println!(
+            "  Explain: matched={} query={}",
+            explain
+                .get("matched")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            explain
+                .get("query_reason_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("all")
+        );
+    }
+}
+
 fn robot_swarm_capacity_run_id(generated_at_ms: u64) -> String {
     format!("swarm-capacity-{generated_at_ms}")
 }
@@ -26455,6 +26713,31 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             return Ok(());
         }
 
+        Some(Commands::Swarm { command }) => {
+            match command {
+                SwarmCommands::Envelope(args) => {
+                    let payload = build_operating_envelope_payload(
+                        args.generated_at_ms.unwrap_or_else(now_ms),
+                        &args.envelope_id,
+                        &args.objective_id,
+                        args.scenario,
+                        args.surface,
+                        "cli.swarm.envelope",
+                        args.explain_reason.as_deref(),
+                    );
+                    match args.format {
+                        OperatingEnvelopeHumanFormatArg::Plain => {
+                            print_operating_envelope_plain(&payload);
+                        }
+                        OperatingEnvelopeHumanFormatArg::Json => {
+                            println!("{}", serde_json::to_string_pretty(&payload)?);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         Some(Commands::Handoff { command }) => {
             // br-ft-difnz (ft-yk9lp slice 2): pure-function
             // dispatcher. Loads the capsule from the supplied path,
@@ -33001,6 +33284,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let response = RobotResponse::success(summary, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
+                        RobotCommands::Swarm { command } => match command {
+                            RobotSwarmCommands::Envelope(args) => {
+                                let payload = build_operating_envelope_payload(
+                                    args.generated_at_ms.unwrap_or_else(now_ms),
+                                    &args.envelope_id,
+                                    &args.objective_id,
+                                    args.scenario,
+                                    args.surface,
+                                    "robot.swarm.envelope",
+                                    args.explain_reason.as_deref(),
+                                );
+                                let response = RobotResponse::success(payload, elapsed_ms(start));
+                                print_robot_response(&response, format, stats)?;
+                            }
+                        },
                         RobotCommands::SwarmCapacity { command } => {
                             let generated_at_ms = match &command {
                                 RobotSwarmCapacityCommands::Status {
@@ -71682,6 +71980,187 @@ log_level = "debug"
                 _ => panic!("expected RobotCommands::SwarmCapacity::Explain"),
             },
             _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_swarm_envelope_and_robot_swarm_envelope_parse() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "swarm",
+            "envelope",
+            "--scenario",
+            "blocked",
+            "--surface",
+            "explain",
+            "--explain-reason",
+            "rch.topology_preflight_failed",
+            "--format",
+            "json",
+        ])
+        .expect("human swarm envelope should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Swarm {
+                command: SwarmCommands::Envelope(args),
+            }) => {
+                assert_eq!(args.scenario, OperatingEnvelopeScenarioArg::Blocked);
+                assert_eq!(args.surface, OperatingEnvelopeSurfaceArg::Explain);
+                assert_eq!(
+                    args.explain_reason.as_deref(),
+                    Some("rch.topology_preflight_failed")
+                );
+                assert_eq!(args.format, OperatingEnvelopeHumanFormatArg::Json);
+            }
+            _ => panic!("expected Commands::Swarm::Envelope"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "swarm",
+            "envelope",
+            "--scenario",
+            "healthy",
+            "--generated-at-ms",
+            "1770000000000",
+        ])
+        .expect("robot swarm envelope should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Swarm {
+                    command: RobotSwarmCommands::Envelope(args),
+                }) => {
+                    assert_eq!(args.scenario, OperatingEnvelopeScenarioArg::Healthy);
+                    assert_eq!(args.generated_at_ms, Some(1_770_000_000_000));
+                }
+                _ => panic!("expected RobotCommands::Swarm::Envelope"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn robot_swarm_envelope_surfaces_are_dry_run_redacted_and_toon_safe() {
+        let status = build_operating_envelope_payload(
+            1_770_000_000_001,
+            "test-envelope",
+            "test-objective",
+            OperatingEnvelopeScenarioArg::Healthy,
+            OperatingEnvelopeSurfaceArg::Status,
+            "test.robot.swarm.envelope",
+            None,
+        );
+        assert_eq!(
+            status["contract_id"].as_str(),
+            Some(OPERATING_ENVELOPE_CONTRACT_ID)
+        );
+        assert_eq!(status["surface"].as_str(), Some("status"));
+        assert_eq!(status["dry_run"].as_bool(), Some(true));
+        assert_eq!(status["raw_pane_content_stored"].as_bool(), Some(false));
+        assert_eq!(status["live_mutation_allowed"].as_bool(), Some(false));
+        assert_eq!(status["side_effects_executed"].as_bool(), Some(false));
+        assert_eq!(
+            status["mcp_resources"][0]["uri"].as_str(),
+            Some(OPERATING_ENVELOPE_MCP_CURRENT_URI)
+        );
+        assert_eq!(
+            status["mcp_resources"][1]["uri_template"].as_str(),
+            Some(OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE)
+        );
+
+        let explain = build_operating_envelope_payload(
+            1_770_000_000_002,
+            "test-envelope",
+            "test-objective",
+            OperatingEnvelopeScenarioArg::Blocked,
+            OperatingEnvelopeSurfaceArg::Explain,
+            "test.robot.swarm.envelope",
+            Some("rch.topology_preflight_failed"),
+        );
+        assert_eq!(explain["surface"].as_str(), Some("explain"));
+        assert_eq!(explain["explain"]["matched"].as_bool(), Some(true));
+
+        let response = RobotResponse::success(
+            serde_json::json!({
+                "status": status,
+                "explain": explain,
+            }),
+            17,
+        );
+        let json_value = serde_json::to_value(&response).expect("robot response serializes");
+        let rendered_json = serde_json::to_string(&json_value).expect("render json");
+        for forbidden in [
+            concat!("PROMPT_", "BODY:"),
+            concat!("sk-", "proj-ft-b94bx-", "private-token"),
+            concat!("Cookie: ft_session", "=pri", "vate"),
+        ] {
+            assert!(
+                !rendered_json.contains(forbidden),
+                "operating-envelope JSON leaked {forbidden}: {rendered_json}"
+            );
+        }
+
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["status"]["mcp_resources"][0]["uri"].as_str(),
+            Some(OPERATING_ENVELOPE_MCP_CURRENT_URI)
+        );
+        assert_eq!(
+            roundtripped["data"]["explain"]["explain"]["matched"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn robot_swarm_envelope_golden_scenarios_cover_json_and_toon_outputs() {
+        for (scenario, expected_tier, expected_outcome) in [
+            (OperatingEnvelopeScenarioArg::Healthy, "green", "admit"),
+            (OperatingEnvelopeScenarioArg::Degraded, "yellow", "degrade"),
+            (OperatingEnvelopeScenarioArg::Blocked, "black", "block"),
+            (OperatingEnvelopeScenarioArg::Emergency, "black", "block"),
+        ] {
+            let payload = build_operating_envelope_payload(
+                1_770_000_010_000,
+                "golden-envelope",
+                "golden-objective",
+                scenario,
+                OperatingEnvelopeSurfaceArg::Status,
+                "test.robot.swarm.envelope.golden",
+                None,
+            );
+            assert_eq!(
+                payload["contract_id"].as_str(),
+                Some(OPERATING_ENVELOPE_CONTRACT_ID)
+            );
+            assert_eq!(payload["surface"].as_str(), Some("status"));
+            assert_eq!(
+                payload["summary"]["envelope_tier"].as_str(),
+                Some(expected_tier)
+            );
+            assert_eq!(
+                payload["summary"]["outcome"].as_str(),
+                Some(expected_outcome)
+            );
+            assert_eq!(payload["dry_run"].as_bool(), Some(true));
+            assert_eq!(payload["raw_pane_content_stored"].as_bool(), Some(false));
+            assert_eq!(payload["live_mutation_allowed"].as_bool(), Some(false));
+            assert_eq!(payload["side_effects_executed"].as_bool(), Some(false));
+
+            let response = RobotResponse::success(payload, 17);
+            let json_value = serde_json::to_value(&response).expect("robot response serializes");
+            let roundtripped = toon_roundtrip_json(&json_value);
+            assert_eq!(
+                roundtripped["data"]["summary"]["envelope_tier"].as_str(),
+                Some(expected_tier)
+            );
+            assert_eq!(
+                roundtripped["data"]["summary"]["outcome"].as_str(),
+                Some(expected_outcome)
+            );
+            assert_eq!(
+                roundtripped["data"]["summary"]["raw_pane_content_stored"].as_bool(),
+                Some(false)
+            );
         }
     }
 
