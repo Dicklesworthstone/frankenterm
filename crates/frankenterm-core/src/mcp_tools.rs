@@ -6196,12 +6196,14 @@ fn parse_operating_envelope_surface(
     value: Option<&str>,
     explain_reason: Option<&str>,
 ) -> std::result::Result<OperatingEnvelopeSurface, McpToolError> {
-    value.map_or(
-        Ok(if explain_reason.is_some() {
-            OperatingEnvelopeSurface::Explain
-        } else {
-            OperatingEnvelopeSurface::Status
-        }),
+    value.map_or_else(
+        || {
+            Ok(if explain_reason.is_some() {
+                OperatingEnvelopeSurface::Explain
+            } else {
+                OperatingEnvelopeSurface::Status
+            })
+        },
         |raw| {
             OperatingEnvelopeSurface::from_token(raw).ok_or_else(|| {
                 McpToolError::new(
