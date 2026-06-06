@@ -1214,8 +1214,25 @@ fn closeout_text_mentions_local_fallback(normalized: &str) -> bool {
             "scripts/cargo-local.sh",
         ],
     ) || (normalized.contains("cargo test")
-        && !normalized.contains("rch exec")
+        && !closeout_text_mentions_rch_exec(normalized)
         && !normalized.contains("local smoke"))
+}
+
+fn closeout_text_mentions_rch_exec(normalized: &str) -> bool {
+    let mut saw_rch = false;
+    for token in normalized.split_whitespace().map(closeout_command_token) {
+        match token {
+            "rch" => saw_rch = true,
+            "exec" if saw_rch => return true,
+            "cargo" if saw_rch => saw_rch = false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn closeout_command_token(token: &str) -> &str {
+    token.trim_matches(|character: char| character.is_ascii_punctuation() && character != '-')
 }
 
 fn closeout_text_mentions_stale_proof_phrase(normalized: &str) -> bool {
@@ -3911,6 +3928,24 @@ mod tests {
             "Local fallback cargo test passed, so RCH proof passed and closeout safe.",
             vec![ProofCloseoutLintArtifact {
                 artifact_path: "tests/e2e/artifacts/local-smoke.json".into(),
+                records: Vec::new(),
+                read_error: None,
+            }],
+        );
+
+        let report = lint_proof_closeout(&input);
+        let codes = lint_finding_codes(&report);
+
+        assert!(!report.closeout_eligible);
+        assert!(codes.contains(&"proof.closeout.local_fallback_claimed_as_proof"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_rejects_bare_cargo_test_green_claim() {
+        let input = proof_closeout_lint_input(
+            "Proof-doctor: passed; selected_worker vmi-proof; command: cargo test -p frankenterm-core; remote Cargo reached; rustc reached; test binary passed; proof lane passed; closeout safe.",
+            vec![ProofCloseoutLintArtifact {
+                artifact_path: "tests/e2e/artifacts/bare-cargo-test.json".into(),
                 records: Vec::new(),
                 read_error: None,
             }],
