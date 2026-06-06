@@ -295,9 +295,9 @@ if ! command -v zstd >/dev/null 2>&1; then
 fi
 zstd -dc "$FONT_PAYLOAD" | /usr/bin/tar -xf - -C "$FONT_DIR"
 
-# The mandatory source payload carries the regular face. If this machine already
-# has the matching Pragmasevka style faces installed, include them in the local
-# app bundle too so bold/italic text doesn't fall back through CoreText.
+# The mandatory source payload carries the bundled Pragmasevka faces. If this
+# machine has additional matching Pragmasevka style faces installed, include
+# them in the local app bundle too so text doesn't fall back through CoreText.
 if [ -d "$HOME/Library/Fonts" ]; then
     for font_face in "$HOME"/Library/Fonts/pragmasevka-nf-*.ttf; do
         if [ -f "$font_face" ]; then

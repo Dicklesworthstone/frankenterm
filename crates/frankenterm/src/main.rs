@@ -52954,13 +52954,18 @@ const RECOMMENDED_SCROLLBACK_LINES: u64 = 50_000;
 const PRAGMASEVKA_BUNDLED_VERSION: &str = "1.7.0";
 const PRAGMASEVKA_BUNDLED_SOURCE_URL: &str =
     "https://github.com/shytikov/pragmasevka/releases/download/v1.7.0/Pragmasevka_NF.zip";
-// We repackage only the regular style as store-zip before outer zstd to minimize binary size.
-const PRAGMASEVKA_BUNDLED_ZIP_SHA256: &str =
-    "ef1102723554cffe39b0703de9adebb17ef37e2eccbb7868009f4e0f2c3b5da6";
+// The repository payload is a zstd-compressed tar archive.
+const PRAGMASEVKA_BUNDLED_ARCHIVE_SHA256: &str =
+    "178f2ac68974ba52951d8d87e77659e812ecc57e7b6bd67f669d234139a5bbbf";
 const PRAGMASEVKA_BUNDLED_ZST_SHA256: &str =
-    "f82f680376dccc7063f750636e5d38dc7dc5cec6f6bf47cd3de5ad2632456a7f";
+    "bfd3275fa9f79c48bde7534e7bc9a7078b866bef0aa32c9f3724d310ee59d854";
 const PRAGMASEVKA_BUNDLED_PAYLOAD_ZST: &[u8] = include_bytes!("../assets/Pragmasevka_NF.zip.zst");
-const PRAGMASEVKA_FONT_FILES: &[&str] = &["pragmasevka-nf-regular.ttf"];
+const PRAGMASEVKA_FONT_FILES: &[&str] = &[
+    "pragmasevka-nf-regular.ttf",
+    "pragmasevka-nf-bold.ttf",
+    "pragmasevka-nf-italic.ttf",
+    "pragmasevka-nf-bolditalic.ttf",
+];
 const PRAGMASEVKA_MARKER_FILE: &str = ".ft-pragmasevka-nf-v1.7.0.sha256";
 const FT_SKIP_BUNDLED_FONT_INSTALL_ENV: &str = "FT_SKIP_BUNDLED_FONT_INSTALL";
 
@@ -52971,7 +52976,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{digest:x}")
 }
 
-fn decode_bundled_pragmasevka_zip() -> anyhow::Result<Vec<u8>> {
+fn decode_bundled_pragmasevka_archive() -> anyhow::Result<Vec<u8>> {
     let compressed_hash = sha256_hex(PRAGMASEVKA_BUNDLED_PAYLOAD_ZST);
     if compressed_hash != PRAGMASEVKA_BUNDLED_ZST_SHA256 {
         anyhow::bail!(
@@ -52981,19 +52986,19 @@ fn decode_bundled_pragmasevka_zip() -> anyhow::Result<Vec<u8>> {
         );
     }
 
-    let zip_bytes = zstd::stream::decode_all(Cursor::new(PRAGMASEVKA_BUNDLED_PAYLOAD_ZST))
+    let archive_bytes = zstd::stream::decode_all(Cursor::new(PRAGMASEVKA_BUNDLED_PAYLOAD_ZST))
         .map_err(|e| anyhow::anyhow!("Failed to decompress bundled Pragmasevka payload: {e}"))?;
 
-    let zip_hash = sha256_hex(&zip_bytes);
-    if zip_hash != PRAGMASEVKA_BUNDLED_ZIP_SHA256 {
+    let archive_hash = sha256_hex(&archive_bytes);
+    if archive_hash != PRAGMASEVKA_BUNDLED_ARCHIVE_SHA256 {
         anyhow::bail!(
-            "Bundled font payload hash mismatch (zip): expected {}, got {}",
-            PRAGMASEVKA_BUNDLED_ZIP_SHA256,
-            zip_hash
+            "Bundled font payload hash mismatch (archive): expected {}, got {}",
+            PRAGMASEVKA_BUNDLED_ARCHIVE_SHA256,
+            archive_hash
         );
     }
 
-    Ok(zip_bytes)
+    Ok(archive_bytes)
 }
 
 fn default_font_install_dir() -> anyhow::Result<PathBuf> {
@@ -53036,39 +53041,40 @@ fn install_bundled_pragmasevka(font_dir: &Path) -> anyhow::Result<Vec<PathBuf>> 
         )
     })?;
 
-    let zip_bytes = decode_bundled_pragmasevka_zip()?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
-        .map_err(|e| anyhow::anyhow!("Failed to open bundled font archive: {e}"))?;
+    let archive_bytes = decode_bundled_pragmasevka_archive()?;
+    let mut archive = tar::Archive::new(Cursor::new(archive_bytes));
 
     let mut written_files = Vec::new();
     let mut seen_files = HashSet::new();
 
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|e| anyhow::anyhow!("Failed to read zip entry #{index}: {e}"))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| anyhow::anyhow!("Failed to open bundled font archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| anyhow::anyhow!("Failed to read tar entry: {e}"))?;
 
-        if entry.is_dir() {
+        if !entry.header().entry_type().is_file() {
             continue;
         }
 
-        let enclosed = entry.enclosed_name().ok_or_else(|| {
-            anyhow::anyhow!("Refusing to extract unsafe zip path: {}", entry.name())
-        })?;
+        let path = entry
+            .path()
+            .map_err(|e| anyhow::anyhow!("Failed to read tar entry path: {e}"))?;
 
-        let file_name = enclosed
+        let file_name = path
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
-            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 filename in bundled zip"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 filename in bundled tar"))?
+            .to_string();
 
-        if !Path::new(file_name)
+        if !Path::new(&file_name)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("ttf"))
         {
             continue;
         }
 
-        let output_path = font_dir.join(file_name);
+        let output_path = font_dir.join(&file_name);
         let mut output_file = fs::File::create(&output_path).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create font file {}: {}",
@@ -53080,7 +53086,7 @@ fn install_bundled_pragmasevka(font_dir: &Path) -> anyhow::Result<Vec<PathBuf>> 
             anyhow::anyhow!("Failed to write font file {}: {}", output_path.display(), e)
         })?;
         written_files.push(output_path);
-        seen_files.insert(file_name.to_string());
+        seen_files.insert(file_name);
     }
 
     for expected in PRAGMASEVKA_FONT_FILES {
@@ -53091,10 +53097,10 @@ fn install_bundled_pragmasevka(font_dir: &Path) -> anyhow::Result<Vec<PathBuf>> 
 
     let marker_path = font_dir.join(PRAGMASEVKA_MARKER_FILE);
     let marker = format!(
-        "font=Pragmasevka Nerd Font\nversion={}\nsource={}\nzip_sha256={}\nzst_sha256={}\ninstalled_at_utc={}\n",
+        "font=Pragmasevka Nerd Font\nversion={}\nsource={}\narchive_sha256={}\nzst_sha256={}\ninstalled_at_utc={}\n",
         PRAGMASEVKA_BUNDLED_VERSION,
         PRAGMASEVKA_BUNDLED_SOURCE_URL,
-        PRAGMASEVKA_BUNDLED_ZIP_SHA256,
+        PRAGMASEVKA_BUNDLED_ARCHIVE_SHA256,
         PRAGMASEVKA_BUNDLED_ZST_SHA256,
         chrono::Utc::now().to_rfc3339(),
     );
@@ -77046,23 +77052,30 @@ A  docs/new-proof.md\n";
             PRAGMASEVKA_BUNDLED_ZST_SHA256
         );
 
-        let zip_bytes = decode_bundled_pragmasevka_zip()
+        let archive_bytes = decode_bundled_pragmasevka_archive()
             .expect("bundled Pragmasevka payload should decode correctly");
-        assert_eq!(sha256_hex(&zip_bytes), PRAGMASEVKA_BUNDLED_ZIP_SHA256);
+        assert_eq!(
+            sha256_hex(&archive_bytes),
+            PRAGMASEVKA_BUNDLED_ARCHIVE_SHA256
+        );
     }
 
     #[test]
     fn bundled_pragmasevka_archive_contains_expected_font_files() {
-        let zip_bytes = decode_bundled_pragmasevka_zip()
+        let archive_bytes = decode_bundled_pragmasevka_archive()
             .expect("bundled Pragmasevka payload should decode correctly");
-        let mut archive =
-            zip::ZipArchive::new(Cursor::new(zip_bytes)).expect("zip payload should be readable");
+        let mut archive = tar::Archive::new(Cursor::new(archive_bytes));
 
         let mut names = std::collections::HashSet::new();
-        for index in 0..archive.len() {
-            let entry = archive.by_index(index).expect("zip entry should read");
-            if !entry.is_dir() {
-                names.insert(entry.name().to_string());
+        for entry in archive.entries().expect("tar entries should open") {
+            let entry = entry.expect("tar entry should read");
+            if entry.header().entry_type().is_file() {
+                let path = entry.path().expect("tar path should read");
+                let file_name = path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .expect("tar entry filename should be UTF-8");
+                names.insert(file_name.to_string());
             }
         }
 
@@ -77125,7 +77138,10 @@ A  docs/new-proof.md\n";
         assert!(marker.contains("font=Pragmasevka Nerd Font"));
         assert!(marker.contains(&format!("version={}", PRAGMASEVKA_BUNDLED_VERSION)));
         assert!(marker.contains(&format!("source={}", PRAGMASEVKA_BUNDLED_SOURCE_URL)));
-        assert!(marker.contains(&format!("zip_sha256={}", PRAGMASEVKA_BUNDLED_ZIP_SHA256)));
+        assert!(marker.contains(&format!(
+            "archive_sha256={}",
+            PRAGMASEVKA_BUNDLED_ARCHIVE_SHA256
+        )));
         assert!(marker.contains(&format!("zst_sha256={}", PRAGMASEVKA_BUNDLED_ZST_SHA256)));
         assert!(marker.contains("installed_at_utc="));
 
