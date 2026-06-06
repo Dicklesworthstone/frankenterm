@@ -3,8 +3,34 @@
 //! Holds pure data snapshots/config fragments shared by `frankenterm-core`
 //! connector modules and in-core policy/runtime telemetry aggregation.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+
+const NON_FINITE_RATIO_MESSAGE: &str = "connector snapshot ratios must be finite";
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_finite_f64<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.is_finite() {
+        serializer.serialize_f64(*value)
+    } else {
+        Err(serde::ser::Error::custom(NON_FINITE_RATIO_MESSAGE))
+    }
+}
+
+fn deserialize_finite_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(NON_FINITE_RATIO_MESSAGE))
+    }
+}
 
 // =============================================================================
 // Credential broker telemetry
@@ -88,6 +114,10 @@ pub struct QuotaSnapshot {
     pub used: u64,
     pub max: u64,
     pub remaining: u64,
+    #[serde(
+        serialize_with = "serialize_finite_f64",
+        deserialize_with = "deserialize_finite_f64"
+    )]
     pub usage_fraction: f64,
     pub total_lifetime: u64,
     pub window_ms: u64,
@@ -99,6 +129,10 @@ pub struct CostBudgetSnapshot {
     pub window_cost_cents: u64,
     pub max_cost_cents: u64,
     pub remaining_cents: u64,
+    #[serde(
+        serialize_with = "serialize_finite_f64",
+        deserialize_with = "deserialize_finite_f64"
+    )]
     pub usage_fraction: f64,
     pub total_lifetime_cents: u64,
     pub window_ms: u64,
@@ -110,6 +144,10 @@ pub struct QueueBackpressureSnapshot {
     pub current_depth: usize,
     pub max_depth: usize,
     pub peak_depth: usize,
+    #[serde(
+        serialize_with = "serialize_finite_f64",
+        deserialize_with = "deserialize_finite_f64"
+    )]
     pub depth_fraction: f64,
     pub total_enqueued: u64,
     pub total_rejected: u64,
@@ -119,6 +157,10 @@ pub struct QueueBackpressureSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorGovernorSnapshot {
     pub connector_id: String,
+    #[serde(
+        serialize_with = "serialize_finite_f64",
+        deserialize_with = "deserialize_finite_f64"
+    )]
     pub rate_limit_fill_ratio: f64,
     pub quota: QuotaSnapshot,
     pub cost: CostBudgetSnapshot,
@@ -139,6 +181,10 @@ pub struct GovernorTelemetrySnapshot {
 /// Full governor snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernorSnapshot {
+    #[serde(
+        serialize_with = "serialize_finite_f64",
+        deserialize_with = "deserialize_finite_f64"
+    )]
     pub global_rate_fill_ratio: f64,
     pub global_quota: QuotaSnapshot,
     pub queue: QueueBackpressureSnapshot,

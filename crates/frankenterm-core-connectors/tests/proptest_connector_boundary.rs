@@ -1,7 +1,9 @@
 use frankenterm_core_connectors::{
     BundleRegistrySnapshot, BundleRegistryTelemetry, CONNECTOR_RUNTIME_IMPORTERS_REMAINING,
-    ConnectorExtractionStatus, CredentialAuditType, CredentialBrokerTelemetry,
+    ConnectorExtractionStatus, ConnectorGovernorSnapshot, CostBudgetSnapshot, CredentialAuditType,
+    CredentialBrokerTelemetry, GovernorSnapshot, GovernorTelemetrySnapshot,
     IngestionPipelineConfig, IngestionTelemetry, IngestionTelemetrySnapshot,
+    QueueBackpressureSnapshot, QuotaSnapshot,
 };
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -27,6 +29,10 @@ fn small_label() -> impl Strategy<Value = String> {
 
 fn small_map() -> impl Strategy<Value = BTreeMap<String, usize>> {
     prop::collection::btree_map(small_label(), 0_usize..=10_000, 0..=16)
+}
+
+fn finite_ratio() -> impl Strategy<Value = f64> {
+    prop::sample::select(vec![0.0, 0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
 }
 
 fn broker_telemetry_strategy() -> impl Strategy<Value = CredentialBrokerTelemetry> {
@@ -91,6 +97,178 @@ fn bundle_telemetry_strategy() -> impl Strategy<Value = BundleRegistryTelemetry>
         validations_run: values[3],
         validation_failures: values[4],
     })
+}
+
+fn governor_snapshot_strategy() -> impl Strategy<Value = GovernorSnapshot> {
+    (
+        finite_ratio(),
+        finite_ratio(),
+        finite_ratio(),
+        finite_ratio(),
+        finite_ratio(),
+    )
+        .prop_map(
+            |(
+                global_rate_fill_ratio,
+                global_quota_usage,
+                queue_depth_fraction,
+                connector_rate_fill,
+                connector_quota_usage,
+            )| GovernorSnapshot {
+                global_rate_fill_ratio,
+                global_quota: QuotaSnapshot {
+                    used: 4,
+                    max: 8,
+                    remaining: 4,
+                    usage_fraction: global_quota_usage,
+                    total_lifetime: 16,
+                    window_ms: 60_000,
+                },
+                queue: QueueBackpressureSnapshot {
+                    current_depth: 2,
+                    max_depth: 8,
+                    peak_depth: 4,
+                    depth_fraction: queue_depth_fraction,
+                    total_enqueued: 32,
+                    total_rejected: 1,
+                },
+                connectors: vec![ConnectorGovernorSnapshot {
+                    connector_id: "connector.alpha".to_owned(),
+                    rate_limit_fill_ratio: connector_rate_fill,
+                    quota: QuotaSnapshot {
+                        used: 3,
+                        max: 6,
+                        remaining: 3,
+                        usage_fraction: connector_quota_usage,
+                        total_lifetime: 12,
+                        window_ms: 30_000,
+                    },
+                    cost: CostBudgetSnapshot {
+                        window_cost_cents: 125,
+                        max_cost_cents: 500,
+                        remaining_cents: 375,
+                        usage_fraction: 0.25,
+                        total_lifetime_cents: 1_000,
+                        window_ms: 30_000,
+                    },
+                    backoff_active: false,
+                    backoff_remaining_ms: 0,
+                    consecutive_failures: 0,
+                }],
+                telemetry: GovernorTelemetrySnapshot {
+                    evaluations: 8,
+                    allows: 7,
+                    throttles: 1,
+                    rejections: 0,
+                },
+            },
+        )
+}
+
+#[test]
+fn connector_snapshot_ratio_serialization_rejects_non_finite_values() {
+    let quota = QuotaSnapshot {
+        used: 0,
+        max: 1,
+        remaining: 1,
+        usage_fraction: f64::NAN,
+        total_lifetime: 0,
+        window_ms: 1,
+    };
+    assert!(serde_json::to_string(&quota).is_err());
+
+    let cost = CostBudgetSnapshot {
+        window_cost_cents: 0,
+        max_cost_cents: 1,
+        remaining_cents: 1,
+        usage_fraction: f64::INFINITY,
+        total_lifetime_cents: 0,
+        window_ms: 1,
+    };
+    assert!(serde_json::to_string(&cost).is_err());
+
+    let queue = QueueBackpressureSnapshot {
+        current_depth: 0,
+        max_depth: 1,
+        peak_depth: 0,
+        depth_fraction: f64::NEG_INFINITY,
+        total_enqueued: 0,
+        total_rejected: 0,
+    };
+    assert!(serde_json::to_string(&queue).is_err());
+
+    let connector = ConnectorGovernorSnapshot {
+        connector_id: "connector.alpha".to_owned(),
+        rate_limit_fill_ratio: f64::NAN,
+        quota: QuotaSnapshot {
+            used: 0,
+            max: 1,
+            remaining: 1,
+            usage_fraction: 0.0,
+            total_lifetime: 0,
+            window_ms: 1,
+        },
+        cost: CostBudgetSnapshot {
+            window_cost_cents: 0,
+            max_cost_cents: 1,
+            remaining_cents: 1,
+            usage_fraction: 0.0,
+            total_lifetime_cents: 0,
+            window_ms: 1,
+        },
+        backoff_active: false,
+        backoff_remaining_ms: 0,
+        consecutive_failures: 0,
+    };
+    assert!(serde_json::to_string(&connector).is_err());
+
+    let governor = GovernorSnapshot {
+        global_rate_fill_ratio: f64::INFINITY,
+        global_quota: quota_with_ratio(0.0),
+        queue: QueueBackpressureSnapshot {
+            current_depth: 0,
+            max_depth: 1,
+            peak_depth: 0,
+            depth_fraction: 0.0,
+            total_enqueued: 0,
+            total_rejected: 0,
+        },
+        connectors: Vec::new(),
+        telemetry: GovernorTelemetrySnapshot {
+            evaluations: 0,
+            allows: 0,
+            throttles: 0,
+            rejections: 0,
+        },
+    };
+    assert!(serde_json::to_string(&governor).is_err());
+}
+
+fn quota_with_ratio(usage_fraction: f64) -> QuotaSnapshot {
+    QuotaSnapshot {
+        used: 0,
+        max: 1,
+        remaining: 1,
+        usage_fraction,
+        total_lifetime: 0,
+        window_ms: 1,
+    }
+}
+
+#[test]
+fn connector_snapshot_ratio_deserialization_rejects_json_null() {
+    let input = r#"{
+        "used": 0,
+        "max": 1,
+        "remaining": 1,
+        "usage_fraction": null,
+        "total_lifetime": 0,
+        "window_ms": 1
+    }"#;
+
+    let result = serde_json::from_str::<QuotaSnapshot>(input);
+
+    assert!(result.is_err());
 }
 
 proptest! {
@@ -199,6 +377,38 @@ proptest! {
         prop_assert_eq!(
             decoded.bundles_by_category.keys().collect::<Vec<_>>(),
             snapshot.bundles_by_category.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn proptest_connector_boundary_governor_snapshot_roundtrips(snapshot in governor_snapshot_strategy()) {
+        let encoded = serde_json::to_string(&snapshot).expect("governor snapshot should serialize");
+        let decoded: GovernorSnapshot =
+            serde_json::from_str(&encoded).expect("governor snapshot should deserialize");
+
+        prop_assert_eq!(
+            decoded.global_rate_fill_ratio.to_bits(),
+            snapshot.global_rate_fill_ratio.to_bits()
+        );
+        prop_assert_eq!(
+            decoded.global_quota.usage_fraction.to_bits(),
+            snapshot.global_quota.usage_fraction.to_bits()
+        );
+        prop_assert_eq!(
+            decoded.queue.depth_fraction.to_bits(),
+            snapshot.queue.depth_fraction.to_bits()
+        );
+        prop_assert_eq!(
+            decoded.connectors[0].rate_limit_fill_ratio.to_bits(),
+            snapshot.connectors[0].rate_limit_fill_ratio.to_bits()
+        );
+        prop_assert_eq!(
+            decoded.connectors[0].quota.usage_fraction.to_bits(),
+            snapshot.connectors[0].quota.usage_fraction.to_bits()
+        );
+        prop_assert_eq!(
+            decoded.connectors[0].cost.usage_fraction.to_bits(),
+            snapshot.connectors[0].cost.usage_fraction.to_bits()
         );
     }
 }
