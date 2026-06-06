@@ -200,7 +200,7 @@
         "mode": "agent_mail_transient_database_recovery",
         "agent_mail": {
           "status": "transient_database_recovery",
-          "marker": "Agent Mail reported transient database recovery; retry once, then use Beads-only fallback without repair.",
+          "marker": "Agent Mail reported transient database recovery; retry once, do not repair/restart service; then use Beads-only fallback.",
           "retry_count": 1,
           "last_error": "database is in recovery mode; retry later",
           "forbidden_actions": [

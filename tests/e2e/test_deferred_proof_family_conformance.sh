@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cross-contract conformance harness for the deferred-proof contract family
-# (ft-zbnz4.{1,2,3,5,8}). Locks the vocabulary the family must share so editing one
+# (ft-zbnz4.{1,2,3,5,6,8}). Locks the vocabulary the family must share so editing one
 # contract's enum and forgetting the others fails loudly. Static; no RCH needed.
 set -euo pipefail
 
@@ -21,12 +21,13 @@ RECEIPT="docs/json-schema/ft-deferred-proof-receipt.json"
 EXTRACT="docs/json-schema/ft-deferred-proof-comment-extraction.json"
 SURFACE="docs/json-schema/ft-deferred-proof-queue-surface.json"
 OWNGATE="docs/json-schema/ft-deferred-proof-ownership-gate.json"
+ATTEMPT="docs/json-schema/ft-deferred-proof-replay-attempt.json"
 
-for f in "${RECEIPT}" "${EXTRACT}" "${SURFACE}" "${OWNGATE}" "${PROVENANCE}"; do
+for f in "${RECEIPT}" "${EXTRACT}" "${SURFACE}" "${OWNGATE}" "${ATTEMPT}" "${PROVENANCE}"; do
   [[ -f "$f" ]] || fail "missing file: $f"
 done
 
-jq empty "${RECEIPT}" "${EXTRACT}" "${SURFACE}" "${OWNGATE}"
+jq empty "${RECEIPT}" "${EXTRACT}" "${SURFACE}" "${OWNGATE}" "${ATTEMPT}"
 
 ruby <<'RUBY'
 require "json"
@@ -45,7 +46,9 @@ CONTRACTS = {
   "docs/json-schema/ft-deferred-proof-ownership-gate.json" =>
     ["ft.deferred_proof_ownership_gate.v1", "tests/e2e/test_deferred_proof_ownership_gate.sh"],
   "docs/json-schema/ft-deferred-proof-replay-harness.json" =>
-    ["ft.deferred_proof_replay_harness.decision.v1", "tests/e2e/test_deferred_proof_replay_harness_contract.sh"]
+    ["ft.deferred_proof_replay_harness.decision.v1", "tests/e2e/test_deferred_proof_replay_harness_contract.sh"],
+  "docs/json-schema/ft-deferred-proof-replay-attempt.json" =>
+    ["ft.deferred_proof_replay_attempt.v1", "tests/e2e/test_deferred_proof_replay_harness_contract.sh"]
 }.freeze
 
 CANONICAL_COMMAND_SHAPE = %w[rch-no-self-healing-v1 static-verifier-v1].freeze

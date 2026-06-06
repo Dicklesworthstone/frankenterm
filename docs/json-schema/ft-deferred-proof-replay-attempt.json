@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-deferred-proof-replay-attempt.json",
+  "title": "FrankenTerm Deferred Proof Replay Attempt",
+  "description": "Retained live-attempt record emitted by the deferred proof replay runner after executing exactly one remote-required RCH command. Unlike the dry-run replay-harness decision contract, this record may carry a remote exit status, selected worker, RCH job id, and retained stdout/stderr paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "receipt_id",
+    "source_receipt_digest",
+    "source_text_sha256",
+    "command_argv",
+    "command_env",
+    "target_dir",
+    "selected_worker",
+    "rch_job_id",
+    "remote_exit_status",
+    "outcome",
+    "blockers",
+    "remote_cargo_reached",
+    "local_fallback_detected",
+    "stdout_path",
+    "stderr_path",
+    "attempt_record_path",
+    "note"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.deferred_proof_replay_attempt.v1"
+    },
+    "bead_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "receipt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_receipt_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "source_text_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "command_argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "command_env": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "target_dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^/tmp/ft-[A-Za-z0-9._-]+$"
+    },
+    "selected_worker": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^vmi[0-9]+$"
+    },
+    "rch_job_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^j-[0-9]+$"
+    },
+    "remote_exit_status": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "remote_proof_passed",
+        "remote_proof_failed",
+        "blocked_local_fallback",
+        "blocked_worker_null",
+        "blocked_no_admissible_workers",
+        "blocked_exit_143",
+        "blocked_remote_timeout",
+        "blocked_topology_preflight",
+        "blocked_remote_not_confirmed"
+      ]
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "rch.local_fallback",
+          "rch.worker_null",
+          "rch.no_admissible_workers",
+          "rch.exit_143",
+          "rch.remote_timeout",
+          "rch.topology_preflight_failed",
+          "rch.remote_not_confirmed"
+        ]
+      }
+    },
+    "remote_cargo_reached": {
+      "type": "boolean"
+    },
+    "local_fallback_detected": {
+      "type": "boolean"
+    },
+    "stdout_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stderr_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "attempt_record_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "note": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

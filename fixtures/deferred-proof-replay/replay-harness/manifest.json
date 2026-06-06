@@ -2,16 +2,20 @@
   "schema_version": "ft.deferred_proof_replay_harness.fixtures.v1",
   "contract_id": "ft.deferred_proof_replay_harness.decision.v1",
   "schema_path": "docs/json-schema/ft-deferred-proof-replay-harness.json",
+  "attempt_schema_path": "docs/json-schema/ft-deferred-proof-replay-attempt.json",
   "contract_doc": "docs/robot-contracts/deferred-proof-replay-harness.md",
   "static_verifier": "tests/e2e/test_deferred_proof_replay_harness_contract.sh",
   "input_receipts": "fixtures/deferred-proof-replay/replay-harness/input-receipts.v1.json",
   "tamper_cases": "fixtures/deferred-proof-replay/replay-harness/tamper-cases.v1.json",
   "expected_jsonl": "fixtures/deferred-proof-replay/replay-harness/expected/decisions.v1.jsonl",
+  "live_attempts_jsonl": "fixtures/deferred-proof-replay/replay-harness/live-attempts.v1.jsonl",
   "golden_summary": {
     "input_contract_id": "ft.deferred_proof_replay_harness.input.v1",
     "tamper_contract_id": "ft.deferred_proof_replay_harness.tamper.v1",
+    "attempt_contract_id": "ft.deferred_proof_replay_attempt.v1",
     "receipt_count": 9,
     "tamper_case_count": 9,
+    "live_attempt_count": 1,
     "next_candidate": "ft-stat1",
     "decision_counts": {
       "run_static_now": 1,
@@ -23,6 +27,17 @@
       "reject_stale_command": 1,
       "reject_non_remote_command": 0,
       "request_triage": 1
+    },
+    "live_attempt_outcome_counts": {
+      "remote_proof_passed": 1,
+      "remote_proof_failed": 0,
+      "blocked_local_fallback": 0,
+      "blocked_worker_null": 0,
+      "blocked_no_admissible_workers": 0,
+      "blocked_exit_143": 0,
+      "blocked_remote_timeout": 0,
+      "blocked_topology_preflight": 0,
+      "blocked_remote_not_confirmed": 0
     }
   }
 }

@@ -1,0 +1,7 @@
+RCH remote proof retained for ft-zbnz4.4 comment 6344.
+Worker: vmi1293453.
+Job: j-29871232832766819.
+Command: cargo test -p frankenterm-core --lib deferred_proof_replay -- --nocapture.
+Test result: 5 passed; 0 failed; 0 ignored; 29025 filtered out.
+Timing: total 2017.2s; sync 174.0s; build 1841.2s; artifacts 2.0s.
+Final: [RCH] remote vmi1293453 (2081.1s).

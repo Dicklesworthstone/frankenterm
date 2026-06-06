@@ -1,0 +1,1 @@
+No stderr was retained for this successful proof fixture; RCH progress and the test summary are represented in the paired stdout fixture.

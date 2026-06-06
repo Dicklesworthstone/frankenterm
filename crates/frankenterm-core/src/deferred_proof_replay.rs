@@ -166,6 +166,7 @@ pub enum DeferredProofReplayBlocker {
     RchWorkerNull,
     RchNoAdmissibleWorkers,
     RchExit143,
+    RchRemoteTimeout,
     RchRemoteNotConfirmed,
     OverlapDirtyPaths,
     PrereqBeadOpen,
@@ -185,6 +186,7 @@ impl DeferredProofReplayBlocker {
             Self::RchWorkerNull => "rch.worker_null",
             Self::RchNoAdmissibleWorkers => "rch.no_admissible_workers",
             Self::RchExit143 => "rch.exit_143",
+            Self::RchRemoteTimeout => "rch.remote_timeout",
             Self::RchRemoteNotConfirmed => "rch.remote_not_confirmed",
             Self::OverlapDirtyPaths => "overlap.dirty_paths",
             Self::PrereqBeadOpen => "prereq.bead_open",
@@ -308,6 +310,7 @@ pub enum DeferredProofReplayAttemptOutcome {
     BlockedWorkerNull,
     BlockedNoAdmissibleWorkers,
     BlockedExit143,
+    BlockedRemoteTimeout,
     BlockedTopologyPreflight,
     BlockedRemoteNotConfirmed,
 }
@@ -767,6 +770,12 @@ fn classify_live_output(
             vec![DeferredProofReplayBlocker::RchExit143],
         );
     }
+    if contains_remote_timeout(lower_output) {
+        return (
+            DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout,
+            vec![DeferredProofReplayBlocker::RchRemoteTimeout],
+        );
+    }
     if !remote_cargo_reached {
         return (
             DeferredProofReplayAttemptOutcome::BlockedRemoteNotConfirmed,
@@ -801,6 +810,12 @@ fn contains_topology_preflight_failure(lower_output: &str) -> bool {
     lower_output.contains("topology preflight")
         || lower_output.contains("topology_preflight")
         || lower_output.contains("ln: already exists")
+}
+
+fn contains_remote_timeout(lower_output: &str) -> bool {
+    lower_output.contains("[rch-e104]")
+        || lower_output.contains("ssh command timed out")
+        || lower_output.contains("command timed out after")
 }
 
 fn selected_worker_from_text(text: &str) -> Option<String> {
@@ -872,6 +887,9 @@ fn note_for_attempt(outcome: DeferredProofReplayAttemptOutcome) -> &'static str 
         }
         DeferredProofReplayAttemptOutcome::BlockedExit143 => {
             "RCH proof lane exited 143 before confirmed remote Cargo execution."
+        }
+        DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout => {
+            "RCH selected a remote worker and reached Cargo/test, but the remote command timed out before a terminal proof result."
         }
         DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight => {
             "RCH selected a worker but failed remote topology preflight before Cargo/test."
@@ -1127,5 +1145,27 @@ mod tests {
         assert!(record.remote_cargo_reached);
         assert!(record.blockers.is_empty());
         assert!(record.source_receipt_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn live_attempt_blocks_remote_timeout_without_code_failure() {
+        let receipt = remote_receipt("ft-timeout1");
+        let output = DeferredProofProcessOutput {
+            exit_status: Some(124),
+            stdout: b"[RCH] remote vmi1293453 failed [RCH-E104] SSH command timed out after 1800s\njob j-29871232832766070 reached remote Cargo\n".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        let record = build_live_attempt_record(&receipt, &output);
+
+        assert_eq!(
+            record.outcome,
+            DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout
+        );
+        assert_eq!(record.selected_worker.as_deref(), Some("vmi1293453"));
+        assert_eq!(record.rch_job_id.as_deref(), Some("j-29871232832766070"));
+        assert!(record.remote_cargo_reached);
+        assert!(!record.local_fallback_detected);
+        assert_eq!(record.blockers, vec!["rch.remote_timeout"]);
     }
 }

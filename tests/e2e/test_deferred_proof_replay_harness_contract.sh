@@ -19,11 +19,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 SCHEMA="docs/json-schema/ft-deferred-proof-replay-harness.json"
+ATTEMPT_SCHEMA="docs/json-schema/ft-deferred-proof-replay-attempt.json"
 DOC="docs/robot-contracts/deferred-proof-replay-harness.md"
 MANIFEST="fixtures/deferred-proof-replay/replay-harness/manifest.json"
 INPUT="fixtures/deferred-proof-replay/replay-harness/input-receipts.v1.json"
 TAMPER="fixtures/deferred-proof-replay/replay-harness/tamper-cases.v1.json"
 EXPECTED="fixtures/deferred-proof-replay/replay-harness/expected/decisions.v1.jsonl"
+LIVE_ATTEMPTS="fixtures/deferred-proof-replay/replay-harness/live-attempts.v1.jsonl"
 PROVENANCE="docs/json-schema/PROVENANCE.md"
 
 fail() {
@@ -42,31 +44,37 @@ require_file() {
 require_command jq
 require_command ruby
 require_file "${SCHEMA}"
+require_file "${ATTEMPT_SCHEMA}"
 require_file "${DOC}"
 require_file "${MANIFEST}"
 require_file "${INPUT}"
 require_file "${TAMPER}"
 require_file "${EXPECTED}"
+require_file "${LIVE_ATTEMPTS}"
 require_file "${PROVENANCE}"
 
-jq empty "${SCHEMA}" "${MANIFEST}" "${INPUT}" "${TAMPER}"
+jq empty "${SCHEMA}" "${ATTEMPT_SCHEMA}" "${MANIFEST}" "${INPUT}" "${TAMPER}"
 jq -c empty "${EXPECTED}" >/dev/null
+jq -c empty "${LIVE_ATTEMPTS}" >/dev/null
 
 ruby <<'RUBY'
 require "json"
 require "set"
 
 SCHEMA = "docs/json-schema/ft-deferred-proof-replay-harness.json"
+ATTEMPT_SCHEMA = "docs/json-schema/ft-deferred-proof-replay-attempt.json"
 DOC = "docs/robot-contracts/deferred-proof-replay-harness.md"
 MANIFEST = "fixtures/deferred-proof-replay/replay-harness/manifest.json"
 INPUT = "fixtures/deferred-proof-replay/replay-harness/input-receipts.v1.json"
 TAMPER = "fixtures/deferred-proof-replay/replay-harness/tamper-cases.v1.json"
 EXPECTED = "fixtures/deferred-proof-replay/replay-harness/expected/decisions.v1.jsonl"
+LIVE_ATTEMPTS = "fixtures/deferred-proof-replay/replay-harness/live-attempts.v1.jsonl"
 PROVENANCE = "docs/json-schema/PROVENANCE.md"
 
 DECISION_CONTRACT_ID = "ft.deferred_proof_replay_harness.decision.v1"
 INPUT_CONTRACT_ID = "ft.deferred_proof_replay_harness.input.v1"
 TAMPER_CONTRACT_ID = "ft.deferred_proof_replay_harness.tamper.v1"
+ATTEMPT_CONTRACT_ID = "ft.deferred_proof_replay_attempt.v1"
 
 # Canonical, currently-runnable command shapes. Anything else is stale and must
 # never run, no matter what eligibility the receipt forges.
@@ -84,6 +92,17 @@ DECISIONS = %w[
   reject_stale_command
   reject_non_remote_command
   request_triage
+].freeze
+ATTEMPT_OUTCOMES = %w[
+  remote_proof_passed
+  remote_proof_failed
+  blocked_local_fallback
+  blocked_worker_null
+  blocked_no_admissible_workers
+  blocked_exit_143
+  blocked_remote_timeout
+  blocked_topology_preflight
+  blocked_remote_not_confirmed
 ].freeze
 TARGET_DIR_NEGATIVES = [
   "",
@@ -307,6 +326,50 @@ def assert_fail_closed!(record, schema, where)
   end
 end
 
+def assert_attempt_schema_conformant!(record, schema, where)
+  required = schema.fetch("required")
+  fail!("#{where}: attempt keys #{record.keys.sort.inspect} != schema required #{required.sort.inspect}") unless record.keys.sort == required.sort
+  fail!("#{where}: attempt contract drift") unless record["contract_id"] == schema.dig("properties", "contract_id", "const")
+  fail!("#{where}: attempt schema_version drift") unless record["schema_version"] == schema.dig("properties", "schema_version", "const")
+  outcome_enum = schema.dig("properties", "outcome", "enum")
+  fail!("#{where}: outcome #{record["outcome"]} not in schema enum") unless outcome_enum.include?(record["outcome"])
+  blocker_enum = schema.dig("properties", "blockers", "items", "enum")
+  record.fetch("blockers").each do |blocker|
+    fail!("#{where}: blocker #{blocker} not in attempt schema enum") unless blocker_enum.include?(blocker)
+  end
+end
+
+def assert_live_attempt!(record, schema, where)
+  assert_attempt_schema_conformant!(record, schema, where)
+  fail!("#{where}: unknown attempt outcome #{record["outcome"]}") unless ATTEMPT_OUTCOMES.include?(record["outcome"])
+  fail!("#{where}: source receipt digest is not sha256") unless record["source_receipt_digest"].is_a?(String) && record["source_receipt_digest"].match?(/\Asha256:[0-9a-f]{64}\z/)
+  fail!("#{where}: unsafe target_dir #{record["target_dir"].inspect}") if record["target_dir"] && !safe_target_dir?(record["target_dir"])
+  %w[stdout_path stderr_path attempt_record_path].each do |key|
+    path = record[key]
+    fail!("#{where}: #{key} missing") unless path.is_a?(String) && !path.empty?
+    fail!("#{where}: #{key} path does not exist: #{path}") unless File.file?(path)
+    fail!("#{where}: #{key} path must stay under replay-harness fixtures") unless path.start_with?("fixtures/deferred-proof-replay/replay-harness/")
+  end
+
+  case record["outcome"]
+  when "remote_proof_passed"
+    fail!("#{where}: passed proof must have remote_exit_status 0") unless record["remote_exit_status"] == 0
+    fail!("#{where}: passed proof must be blocker-free") unless record["blockers"].empty?
+    fail!("#{where}: passed proof must prove remote Cargo reached") unless record["remote_cargo_reached"] == true
+    fail!("#{where}: passed proof must not have local fallback") unless record["local_fallback_detected"] == false
+    fail!("#{where}: passed proof lost selected worker") unless record["selected_worker"].is_a?(String)
+    fail!("#{where}: passed proof lost RCH job id") unless record["rch_job_id"].is_a?(String)
+  when "blocked_remote_timeout"
+    fail!("#{where}: timeout must carry rch.remote_timeout") unless record["blockers"].include?("rch.remote_timeout")
+    fail!("#{where}: timeout must not be local fallback") if record["local_fallback_detected"]
+    fail!("#{where}: timeout must retain selected worker") unless record["selected_worker"].is_a?(String)
+    fail!("#{where}: timeout must retain RCH job id") unless record["rch_job_id"].is_a?(String)
+  when "blocked_local_fallback"
+    fail!("#{where}: local fallback must be detected") unless record["local_fallback_detected"] == true
+    fail!("#{where}: local fallback must carry blocker") unless record["blockers"].include?("rch.local_fallback")
+  end
+end
+
 # Mapping from a receipt's self-declared eligibility.state to the decision the
 # authoritative classifier must independently derive. This proves the honest
 # input corpus is internally consistent without trusting its eligibility fields.
@@ -321,10 +384,12 @@ EXPECTED_BY_ELIGIBILITY = {
 }.freeze
 
 schema = read_json(SCHEMA)
+attempt_schema = read_json(ATTEMPT_SCHEMA)
 manifest = read_json(MANIFEST)
 input = read_json(INPUT)
 tamper = read_json(TAMPER)
 expected = read_jsonl(EXPECTED)
+live_attempts = read_jsonl(LIVE_ATTEMPTS)
 doc = File.read(DOC)
 provenance = File.read(PROVENANCE)
 
@@ -334,15 +399,21 @@ fail!("schema contract const drifted") unless schema.dig("properties", "contract
 fail!("schema decision enum drifted") unless schema.dig("properties", "decision", "enum").sort == DECISIONS.sort
 fail!("schema forbids non-null remote exit") unless schema.dig("properties", "remote_exit_status", "type") == "null"
 fail!("schema forces dry_run const") unless schema.dig("properties", "dry_run", "const") == true
+fail!("attempt schema id drifted") unless attempt_schema["$id"]&.end_with?("/ft-deferred-proof-replay-attempt.json")
+fail!("attempt schema contract const drifted") unless attempt_schema.dig("properties", "contract_id", "const") == ATTEMPT_CONTRACT_ID
+fail!("attempt schema outcome enum drifted") unless attempt_schema.dig("properties", "outcome", "enum").sort == ATTEMPT_OUTCOMES.sort
 
 # --- Manifest sanity -----------------------------------------------------
 fail!("manifest contract drifted") unless manifest["contract_id"] == DECISION_CONTRACT_ID
 fail!("manifest schema path drifted") unless manifest["schema_path"] == SCHEMA
+fail!("manifest attempt schema path drifted") unless manifest["attempt_schema_path"] == ATTEMPT_SCHEMA
 fail!("manifest input path drifted") unless manifest["input_receipts"] == INPUT
 fail!("manifest tamper path drifted") unless manifest["tamper_cases"] == TAMPER
 fail!("manifest expected jsonl path drifted") unless manifest["expected_jsonl"] == EXPECTED
+fail!("manifest live attempts path drifted") unless manifest["live_attempts_jsonl"] == LIVE_ATTEMPTS
 fail!("manifest input contract drifted") unless manifest.dig("golden_summary", "input_contract_id") == INPUT_CONTRACT_ID
 fail!("manifest tamper contract drifted") unless manifest.dig("golden_summary", "tamper_contract_id") == TAMPER_CONTRACT_ID
+fail!("manifest attempt contract drifted") unless manifest.dig("golden_summary", "attempt_contract_id") == ATTEMPT_CONTRACT_ID
 
 # --- Honest corpus: classify and compare against the golden JSONL --------
 fail!("input contract drifted") unless input["contract_id"] == INPUT_CONTRACT_ID
@@ -449,6 +520,59 @@ DECISIONS.each do |decision|
 end
 fail!("manifest receipt_count drift") unless manifest.dig("golden_summary", "receipt_count") == receipts.length
 
+# --- Live attempts: retained material proof logs ------------------------
+fail!("live attempts corpus is empty") if live_attempts.empty?
+live_ids = live_attempts.map { |rec| rec.fetch("receipt_id") }
+fail!("live attempt receipt ids are not unique") unless live_ids.uniq.length == live_ids.length
+
+live_attempts.each do |record|
+  assert_live_attempt!(record, attempt_schema, "live attempt #{record["receipt_id"]}")
+end
+
+attempt_counts = Hash.new(0)
+live_attempts.each { |rec| attempt_counts[rec.fetch("outcome")] += 1 }
+ATTEMPT_OUTCOMES.each do |outcome|
+  declared = manifest.dig("golden_summary", "live_attempt_outcome_counts", outcome) || 0
+  fail!("manifest live_attempt_outcome_counts[#{outcome}] drift: got #{attempt_counts[outcome]}, manifest #{declared}") unless declared == attempt_counts[outcome]
+end
+fail!("manifest live_attempt_count drift") unless manifest.dig("golden_summary", "live_attempt_count") == live_attempts.length
+
+passed = live_attempts.find { |rec| rec["bead_id"] == "ft-zbnz4.4" && rec["outcome"] == "remote_proof_passed" }
+fail!("missing retained ft-zbnz4.4 remote proof attempt") unless passed
+fail!("ft-zbnz4.4 proof worker drifted") unless passed["selected_worker"] == "vmi1293453"
+fail!("ft-zbnz4.4 proof job drifted") unless passed["rch_job_id"] == "j-29871232832766819"
+fail!("ft-zbnz4.4 proof command lost RCH wrapper") unless passed["command_argv"].first == "rch"
+fail!("ft-zbnz4.4 proof command lost --no-self-healing") unless passed["command_argv"].include?("--no-self-healing")
+fail!("ft-zbnz4.4 proof env lost RCH_REQUIRE_REMOTE=1") unless env_value({ "env" => passed["command_env"] }, "RCH_REQUIRE_REMOTE") == "1"
+fail!("ft-zbnz4.4 proof env lost RCH_NO_SELF_HEALING=1") unless env_value({ "env" => passed["command_env"] }, "RCH_NO_SELF_HEALING") == "1"
+stdout = File.read(passed.fetch("stdout_path"))
+fail!("ft-zbnz4.4 retained stdout missing test summary") unless stdout.include?("5 passed; 0 failed")
+fail!("ft-zbnz4.4 retained stdout missing remote footer") unless stdout.include?("[RCH] remote vmi1293453")
+
+timeout_fixture = {
+  "schema_version" => 1,
+  "contract_id" => ATTEMPT_CONTRACT_ID,
+  "bead_id" => "ft-timeout1",
+  "receipt_id" => "ft-timeout1:comment-6285",
+  "source_receipt_digest" => "sha256:#{"0" * 64}",
+  "source_text_sha256" => nil,
+  "command_argv" => ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-timeout1", "cargo", "test"],
+  "command_env" => [{ "name" => "RCH_REQUIRE_REMOTE", "value" => "1" }, { "name" => "RCH_NO_SELF_HEALING", "value" => "1" }],
+  "target_dir" => "/tmp/ft-timeout1",
+  "selected_worker" => "vmi1293453",
+  "rch_job_id" => "j-29871232832766070",
+  "remote_exit_status" => 124,
+  "outcome" => "blocked_remote_timeout",
+  "blockers" => ["rch.remote_timeout"],
+  "remote_cargo_reached" => true,
+  "local_fallback_detected" => false,
+  "stdout_path" => passed.fetch("stdout_path"),
+  "stderr_path" => passed.fetch("stderr_path"),
+  "attempt_record_path" => passed.fetch("attempt_record_path"),
+  "note" => "RCH selected a remote worker and reached Cargo/test, but the remote command timed out before a terminal proof result."
+}
+assert_live_attempt!(timeout_fixture, attempt_schema, "synthetic timeout invariant")
+
 # --- Tamper corpus: fail-closed invariants ------------------------------
 fail!("tamper contract drifted") unless tamper["contract_id"] == TAMPER_CONTRACT_ID
 cases = tamper.fetch("cases")
@@ -512,26 +636,33 @@ end
   "ft.deferred_proof_replay_harness.decision.v1",
   "ft.deferred_proof_replay_harness.input.v1",
   "ft.deferred_proof_replay_harness.tamper.v1",
+  "ft.deferred_proof_replay_attempt.v1",
   "run_static_now",
   "would_run_remote",
   "defer_remote_blocked",
+  "remote_proof_passed",
+  "blocked_remote_timeout",
   "reject_non_remote_command",
   "reject_stale_command",
   "rch.topology_preflight_failed",
+  "rch.remote_timeout",
   "RCH_REQUIRE_REMOTE=1",
   "RCH_NO_SELF_HEALING=1",
   "remote_exit_status",
   "ft-zbnz4.4",
+  "live-attempts.v1.jsonl",
   "fixtures/deferred-proof-replay/replay-harness/"
 ].each do |term|
   fail!("doc missing contract term #{term}") unless doc.include?(term)
 end
 
 fail!("provenance missing replay-harness row") unless provenance.include?("`ft-deferred-proof-replay-harness.json`")
+fail!("provenance missing replay-attempt row") unless provenance.include?("`ft-deferred-proof-replay-attempt.json`")
 fail!("provenance row missing verifier") unless provenance.include?("bash tests/e2e/test_deferred_proof_replay_harness_contract.sh")
 
 emitted_remote = actual.count { |rec| rec["decision"] == "would_run_remote" }
 puts "deferred proof replay harness contract: static verifier passed " \
      "(#{actual.length} receipts, next=#{next_candidate["bead_id"]}/#{next_candidate["decision"]}, " \
-     "#{emitted_remote} remote-deferred, #{cases.length} rejected tamper cases)"
+     "#{emitted_remote} remote-deferred, #{cases.length} rejected tamper cases, " \
+     "#{live_attempts.length} retained live attempts)"
 RUBY

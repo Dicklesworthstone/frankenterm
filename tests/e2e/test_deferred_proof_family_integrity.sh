@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Family-integrity guard for the deferred RCH proof replay contract family
-# (ft-zbnz4). The five contracts (receipt, comment-extractor, ownership-gate,
-# queue-surface, replay-harness) each carry a manifest, a JSON schema, a robot
-# contract doc, fixtures, and a static verifier. This guard fences the drift
+# (ft-zbnz4). The contracts (receipt, comment-extractor, ownership-gate,
+# queue-surface, replay-harness, and live-attempt schema) carry manifests,
+# JSON schemas, robot contract docs, fixtures, and static verifiers where
+# applicable. This guard fences the drift
 # class that left the verifiers silently unrun for a while: it asserts that
 #   * every manifest's referenced files actually exist on disk,
 #   * every family verifier is executable AND wired into CI (ci.yml), and

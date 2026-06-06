@@ -4,9 +4,11 @@ Contract IDs:
 - `ft.deferred_proof_replay_harness.input.v1` — retained no-mock input corpus of receipts.
 - `ft.deferred_proof_replay_harness.tamper.v1` — adversarial single-receipt corpus.
 - `ft.deferred_proof_replay_harness.decision.v1` — per-receipt dry-run decision record.
+- `ft.deferred_proof_replay_attempt.v1` — retained live-attempt record from a real remote RCH replay.
 
 Source: `ft-zbnz4.6` (verification harness for the deferred RCH proof replay queue).
 Schema: `docs/json-schema/ft-deferred-proof-replay-harness.json`.
+Attempt schema: `docs/json-schema/ft-deferred-proof-replay-attempt.json`.
 Fixtures: `fixtures/deferred-proof-replay/replay-harness/`.
 Static verifier: `bash tests/e2e/test_deferred_proof_replay_harness_contract.sh`.
 
@@ -17,8 +19,10 @@ The harness projects retained receipts (extracted upstream by
 fail-closed into a single decision, records a dry-run replay decision per
 receipt, and selects at most one next candidate. It is purely static: it
 **never** mints material remote proof. A live material replay still requires a
-real remote RCH worker, which is owned by `ft-zbnz4.4` -> `ft-5xwsu.3` and stays
-blocked until RCH admission recovers.
+real remote RCH worker and is recorded separately as
+`ft.deferred_proof_replay_attempt.v1`. The retained live-attempt corpus includes
+the ft-zbnz4.4 material proof that ran on RCH worker `vmi1293453`, job
+`j-29871232832766819`, and finished `remote_proof_passed`.
 
 The receipt's self-declared `eligibility.state`, `eligibility.replay_allowed`,
 and `proof.evidence_classification` are **untrusted input**. The classifier
@@ -82,6 +86,30 @@ classified as a code/test failure, and never green.
 - A topology-preflight failure always defers, never runs, never green.
 - A material receipt is never `replay_allowed_now`; `remote_exit_status` is
   always null. Only a real remote RCH replay may record a remote exit status.
+- A post-admission RCH timeout such as `[RCH-E104] SSH command timed out` is
+  `blocked_remote_timeout` with `rch.remote_timeout`, not
+  `remote_proof_failed` and not green proof.
+
+## Live Attempt Records
+
+The dry-run decision contract and the live-attempt contract are intentionally
+separate.
+
+`ft.deferred_proof_replay_attempt.v1` records the single live replay result:
+command argv/env, target dir, selected worker, RCH job id, remote exit status,
+outcome, blockers, whether remote Cargo/test was reached, whether local fallback
+was detected, and retained stdout/stderr/attempt-record paths. The success
+fixture is `fixtures/deferred-proof-replay/replay-harness/live-attempts.v1.jsonl`.
+
+Current outcome vocabulary:
+`remote_proof_passed`, `remote_proof_failed`, `blocked_local_fallback`,
+`blocked_worker_null`, `blocked_no_admissible_workers`, `blocked_exit_143`,
+`blocked_remote_timeout`, `blocked_topology_preflight`, and
+`blocked_remote_not_confirmed`.
+
+Live blockers are RCH-specific: `rch.local_fallback`, `rch.worker_null`,
+`rch.no_admissible_workers`, `rch.exit_143`, `rch.remote_timeout`,
+`rch.topology_preflight_failed`, and `rch.remote_not_confirmed`.
 
 ## Next candidate selection
 
@@ -92,7 +120,7 @@ most one. With RCH down, the next candidate must be `run_static_now`.
 ## Provenance / replay
 
 Manual golden update from the static harness corpus. Regenerate and verify with:
-`jq empty docs/json-schema/ft-deferred-proof-replay-harness.json fixtures/deferred-proof-replay/replay-harness/manifest.json fixtures/deferred-proof-replay/replay-harness/input-receipts.v1.json fixtures/deferred-proof-replay/replay-harness/tamper-cases.v1.json`,
-`jq -c empty fixtures/deferred-proof-replay/replay-harness/expected/decisions.v1.jsonl`,
+`jq empty docs/json-schema/ft-deferred-proof-replay-harness.json docs/json-schema/ft-deferred-proof-replay-attempt.json fixtures/deferred-proof-replay/replay-harness/manifest.json fixtures/deferred-proof-replay/replay-harness/input-receipts.v1.json fixtures/deferred-proof-replay/replay-harness/tamper-cases.v1.json`,
+`jq -c empty fixtures/deferred-proof-replay/replay-harness/expected/decisions.v1.jsonl fixtures/deferred-proof-replay/replay-harness/live-attempts.v1.jsonl`,
 and `bash tests/e2e/test_deferred_proof_replay_harness_contract.sh`.
 Future Rust / JSON Schema validation must run through RCH.
