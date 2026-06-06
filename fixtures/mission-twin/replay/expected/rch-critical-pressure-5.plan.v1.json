@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.expected_plan.v1",
+  "source_bead": "ft-u7r37.6",
+  "case_id": "rch-critical-pressure-5",
+  "snapshot_path": "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json",
+  "plan": {
+    "contract_id": "ft.mission_objective_plan.v1",
+    "plan_status": "rch_substrate_blocked",
+    "risk_level": "blocked",
+    "top_step": {
+      "candidate_id": "mission-twin.rch-critical-pressure-5.ready-work",
+      "action_kind": "file_followup_bead",
+      "status": "rch_substrate_blocked",
+      "proof_lane": "blocked"
+    },
+    "reason_codes_include": [
+      "planner.status.rch_substrate_blocked",
+      "rch.critical_pressure",
+      "rch.proof_substrate_blocked",
+      "rch.proof_substrate_unavailable",
+      "operating_envelope.shed"
+    ]
+  },
+  "safety": {
+    "dry_run": true,
+    "side_effects_executed": false,
+    "raw_pane_content_stored": false
+  }
+}

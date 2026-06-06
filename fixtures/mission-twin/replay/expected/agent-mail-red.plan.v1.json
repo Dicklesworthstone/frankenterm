@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.expected_plan.v1",
+  "source_bead": "ft-u7r37.6",
+  "case_id": "agent-mail-red",
+  "snapshot_path": "fixtures/mission-twin/snapshot/valid/agent-mail-red.json",
+  "plan": {
+    "contract_id": "ft.mission_objective_plan.v1",
+    "plan_status": "degraded",
+    "risk_level": "medium",
+    "top_step": {
+      "candidate_id": "mission-twin.agent-mail-red.ready-work",
+      "action_kind": "choose_ready_bead",
+      "status": "actionable",
+      "proof_lane": "not_required"
+    },
+    "reason_codes_include": [
+      "planner.status.degraded",
+      "agent_mail.red",
+      "swarm_tick_fallback",
+      "agent_mail.beads_fallback_available",
+      "mission_twin.mail_fallback_mode"
+    ]
+  },
+  "safety": {
+    "dry_run": true,
+    "side_effects_executed": false,
+    "raw_pane_content_stored": false
+  }
+}

@@ -2,13 +2,22 @@
   "schema_version": 1,
   "contract_id": "ft.mission_twin_replay.golden_corpus.v1",
   "source_bead": "ft-u7r37.2",
+  "corpus_source_bead": "ft-u7r37.6",
   "planner_contract_id": "ft.mission_objective_plan.v1",
+  "expected_plan_contract_id": "ft.mission_twin_replay.expected_plan.v1",
   "counterfactual_contract_id": "ft.mission_twin_counterfactual_replay.v1",
   "counterfactual_source_bead": "ft-u7r37.3",
   "ownership_contract_id": "ft.mission_twin_ownership_handoff.v1",
   "ownership_source_bead": "ft-u7r37.4",
   "surface_contract_id": "ft.mission_twin.robot_mcp_cli_surface.v1",
   "surface_source_bead": "ft-u7r37.5",
+  "step_log_contract_id": "ft.mission_twin_replay.step_log.v1",
+  "step_log_path": "fixtures/mission-twin/replay/trace/step-log.v1.jsonl",
+  "invalid_fragments_contract_id": "ft.mission_twin_replay.invalid_fragments.v1",
+  "invalid_fragments_path": "fixtures/mission-twin/replay/invalid/fragments.v1.json",
+  "static_verification_command": "bash tests/e2e/test_mission_twin_replay_contract.sh",
+  "rust_verification_filter": "cargo test -p frankenterm-core --test mission_twin_replay_golden_corpus -- --nocapture",
+  "remote_rust_verification_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-u7r37-6-mission-twin-replay cargo test -p frankenterm-core --test mission_twin_replay_golden_corpus -- --nocapture",
   "surface_actions": [
     {
       "action": "current_plan",
@@ -83,6 +92,7 @@
       "case_id": "healthy",
       "snapshot_path": "fixtures/mission-twin/snapshot/valid/healthy.json",
       "snapshot_sha256": "766d94e22dbc0ec7c32cb4c4ab23e00ade535ac5f272a7f47b34017fa4865883",
+      "expected_plan_path": "fixtures/mission-twin/replay/expected/healthy.plan.v1.json",
       "expected": {
         "plan_status": "actionable",
         "risk_level": "low",
@@ -101,6 +111,7 @@
       "case_id": "agent-mail-red",
       "snapshot_path": "fixtures/mission-twin/snapshot/valid/agent-mail-red.json",
       "snapshot_sha256": "c3cc23129d240dc71468cd21b96fecf8c605ea2a61a70d73a7638769b108174d",
+      "expected_plan_path": "fixtures/mission-twin/replay/expected/agent-mail-red.plan.v1.json",
       "expected": {
         "plan_status": "degraded",
         "risk_level": "medium",
@@ -121,6 +132,7 @@
       "case_id": "rch-critical-pressure-5",
       "snapshot_path": "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json",
       "snapshot_sha256": "988c82f53bb9da0e2972e1c954d46269db17405389e36872057bfb03231b8b03",
+      "expected_plan_path": "fixtures/mission-twin/replay/expected/rch-critical-pressure-5.plan.v1.json",
       "expected": {
         "plan_status": "rch_substrate_blocked",
         "risk_level": "blocked",
@@ -141,6 +153,7 @@
       "case_id": "active-owner",
       "snapshot_path": "fixtures/mission-twin/snapshot/valid/active-owner.json",
       "snapshot_sha256": "230b29851420309f4a654aeed2983fc57e0792c0e7238beffd254ba8629eeaf3",
+      "expected_plan_path": "fixtures/mission-twin/replay/expected/active-owner.plan.v1.json",
       "expected": {
         "plan_status": "waiting_owner",
         "risk_level": "high",
@@ -161,6 +174,7 @@
       "case_id": "dirty-overlap",
       "snapshot_path": "fixtures/mission-twin/snapshot/valid/dirty-overlap.json",
       "snapshot_sha256": "ec63135172c692f70cbd1ca9289db725b5a8528a9e101d4676e660f5609929f9",
+      "expected_plan_path": "fixtures/mission-twin/replay/expected/dirty-overlap.plan.v1.json",
       "expected": {
         "plan_status": "dirty_overlap",
         "risk_level": "blocked",
@@ -181,6 +195,7 @@
       "case_id": "no-ready-work",
       "snapshot_path": "fixtures/mission-twin/snapshot/valid/no-ready-work.json",
       "snapshot_sha256": "9cda4b2ffd2f921633fb91ed405e077513d40e35e6b7fe77e3ef0a33d9290c78",
+      "expected_plan_path": "fixtures/mission-twin/replay/expected/no-ready-work.plan.v1.json",
       "expected": {
         "plan_status": "no_ready_work",
         "risk_level": "medium",

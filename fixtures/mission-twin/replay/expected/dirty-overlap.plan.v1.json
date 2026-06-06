@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.expected_plan.v1",
+  "source_bead": "ft-u7r37.6",
+  "case_id": "dirty-overlap",
+  "snapshot_path": "fixtures/mission-twin/snapshot/valid/dirty-overlap.json",
+  "plan": {
+    "contract_id": "ft.mission_objective_plan.v1",
+    "plan_status": "dirty_overlap",
+    "risk_level": "blocked",
+    "top_step": {
+      "candidate_id": "mission-twin.dirty-overlap.ready-work",
+      "action_kind": "wait_for_owner",
+      "status": "dirty_overlap",
+      "proof_lane": "not_required"
+    },
+    "reason_codes_include": [
+      "planner.status.dirty_overlap",
+      "mission_twin.dirty_overlap",
+      "dirty_overlap.owned_surface_blocked",
+      "git.dirty_paths_present",
+      "reservations.exclusive_active"
+    ]
+  },
+  "safety": {
+    "dry_run": true,
+    "side_effects_executed": false,
+    "raw_pane_content_stored": false
+  }
+}

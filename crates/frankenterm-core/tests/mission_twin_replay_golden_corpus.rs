@@ -21,6 +21,7 @@ use frankenterm_core::mission_twin_snapshot::MissionTwinSnapshotEnvelope;
 use frankenterm_core::robot_family_contract::mission_twin_family_contract;
 use jsonschema::Validator;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -29,13 +30,22 @@ struct ReplayManifest {
     schema_version: u16,
     contract_id: String,
     source_bead: String,
+    corpus_source_bead: String,
     planner_contract_id: String,
+    expected_plan_contract_id: String,
     counterfactual_contract_id: String,
     counterfactual_source_bead: String,
     ownership_contract_id: String,
     ownership_source_bead: String,
     surface_contract_id: String,
     surface_source_bead: String,
+    step_log_contract_id: String,
+    step_log_path: String,
+    invalid_fragments_contract_id: String,
+    invalid_fragments_path: String,
+    static_verification_command: String,
+    rust_verification_filter: String,
+    remote_rust_verification_command: String,
     surface_actions: Vec<ManifestSurfaceAction>,
     scrub_rules: Vec<ScrubRule>,
     cases: Vec<ReplayCase>,
@@ -56,6 +66,7 @@ struct ReplayCase {
     case_id: String,
     snapshot_path: String,
     snapshot_sha256: String,
+    expected_plan_path: String,
     expected: ExpectedReplayFields,
 }
 
@@ -135,6 +146,62 @@ struct ExpectedSurfaceFields {
     reason_codes_include: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExpectedPlanArtifact {
+    schema_version: u16,
+    contract_id: String,
+    source_bead: String,
+    case_id: String,
+    snapshot_path: String,
+    plan: ExpectedPlanOutput,
+    safety: ExpectedPlanSafety,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedPlanOutput {
+    contract_id: String,
+    plan_status: String,
+    risk_level: String,
+    top_step: ExpectedPlanTopStep,
+    reason_codes_include: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedPlanTopStep {
+    candidate_id: String,
+    action_kind: String,
+    status: String,
+    proof_lane: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedPlanSafety {
+    dry_run: bool,
+    side_effects_executed: bool,
+    raw_pane_content_stored: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplayStepLogEntry {
+    schema_version: u16,
+    contract_id: String,
+    source_bead: String,
+    case_id: String,
+    snapshot_path: String,
+    step_index: u16,
+    step_kind: String,
+    candidate_id: String,
+    action_kind: String,
+    status: String,
+    proof_lane: String,
+    plan_status: String,
+    risk_level: String,
+    dry_run: bool,
+    side_effects_executed: bool,
+    raw_pane_content_stored: bool,
+    reason_codes: Vec<String>,
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -171,6 +238,53 @@ fn load_snapshot(case: &ReplayCase) -> MissionTwinSnapshotEnvelope {
         .unwrap_or_else(|err| panic!("failed to read snapshot {}: {err}", path.display()));
     serde_json::from_str(&text)
         .unwrap_or_else(|err| panic!("failed to deserialize snapshot {}: {err}", path.display()))
+}
+
+fn load_expected_plan(case: &ReplayCase) -> ExpectedPlanArtifact {
+    let path = workspace_root().join(&case.expected_plan_path);
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read expected plan {}: {err}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|err| {
+        panic!(
+            "failed to deserialize expected plan {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Vec<T> {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read JSONL {}: {err}", path.display()));
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(serde_json::from_str(trimmed).unwrap_or_else(|err| {
+                panic!(
+                    "failed to deserialize JSONL {} line {}: {err}",
+                    path.display(),
+                    index + 1
+                )
+            }))
+        })
+        .collect()
+}
+
+fn load_replay_step_logs(manifest: &ReplayManifest) -> Vec<ReplayStepLogEntry> {
+    read_json_lines(&workspace_root().join(&manifest.step_log_path))
+}
+
+fn retained_step_log<'a>(
+    case_id: &str,
+    step_logs: &'a [ReplayStepLogEntry],
+) -> &'a ReplayStepLogEntry {
+    step_logs
+        .iter()
+        .find(|entry| entry.case_id == case_id)
+        .unwrap_or_else(|| panic!("{case_id}: missing retained replay step log"))
 }
 
 fn schema_validator() -> Validator {
@@ -223,6 +337,15 @@ fn encode_toon(value: &Value) -> String {
     toon_rust::encode(value.clone(), None)
 }
 
+fn invalid_case<'a>(invalid: &'a Value, case_id: &str) -> &'a Value {
+    invalid["cases"]
+        .as_array()
+        .expect("invalid fixture cases is an array")
+        .iter()
+        .find(|case| case["case_id"].as_str() == Some(case_id))
+        .unwrap_or_else(|| panic!("missing invalid fixture case {case_id}"))
+}
+
 #[test]
 fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
     let manifest = load_manifest();
@@ -232,7 +355,12 @@ fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
         "ft.mission_twin_replay.golden_corpus.v1"
     );
     assert_eq!(manifest.source_bead, "ft-u7r37.2");
+    assert_eq!(manifest.corpus_source_bead, "ft-u7r37.6");
     assert_eq!(manifest.planner_contract_id, "ft.mission_objective_plan.v1");
+    assert_eq!(
+        manifest.expected_plan_contract_id,
+        "ft.mission_twin_replay.expected_plan.v1"
+    );
     assert_eq!(
         manifest.counterfactual_contract_id,
         "ft.mission_twin_counterfactual_replay.v1"
@@ -248,6 +376,28 @@ fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
         "ft.mission_twin.robot_mcp_cli_surface.v1"
     );
     assert_eq!(manifest.surface_source_bead, "ft-u7r37.5");
+    assert_eq!(
+        manifest.step_log_contract_id,
+        "ft.mission_twin_replay.step_log.v1"
+    );
+    assert_eq!(
+        manifest.invalid_fragments_contract_id,
+        "ft.mission_twin_replay.invalid_fragments.v1"
+    );
+    assert_eq!(
+        manifest.static_verification_command,
+        "bash tests/e2e/test_mission_twin_replay_contract.sh"
+    );
+    assert_eq!(
+        manifest.rust_verification_filter,
+        "cargo test -p frankenterm-core --test mission_twin_replay_golden_corpus -- --nocapture"
+    );
+    assert!(
+        manifest
+            .remote_rust_verification_command
+            .contains("RCH_REQUIRE_REMOTE=1"),
+        "remote verification command must require RCH"
+    );
     assert_eq!(manifest.cases.len(), 6);
     assert_eq!(manifest.counterfactual_cases.len(), 4);
     assert_eq!(manifest.ownership_cases.len(), 2);
@@ -273,8 +423,47 @@ fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
     }
 
     let validator = schema_validator();
+    let step_logs = load_replay_step_logs(&manifest);
+    assert_eq!(
+        step_logs.len(),
+        manifest.cases.len(),
+        "retained replay step log must cover every corpus case"
+    );
 
     for case in &manifest.cases {
+        let expected_plan = load_expected_plan(case);
+        assert_eq!(expected_plan.schema_version, 1);
+        assert_eq!(
+            expected_plan.contract_id,
+            manifest.expected_plan_contract_id
+        );
+        assert_eq!(expected_plan.source_bead, manifest.corpus_source_bead);
+        assert_eq!(expected_plan.case_id, case.case_id);
+        assert_eq!(expected_plan.snapshot_path, case.snapshot_path);
+        assert_eq!(expected_plan.plan.contract_id, manifest.planner_contract_id);
+        assert_eq!(expected_plan.plan.plan_status, case.expected.plan_status);
+        assert_eq!(expected_plan.plan.risk_level, case.expected.risk_level);
+        assert_eq!(
+            expected_plan.plan.top_step.candidate_id,
+            case.expected.top_step_candidate_id
+        );
+        assert_eq!(
+            expected_plan.plan.top_step.action_kind,
+            case.expected.top_step_action_kind
+        );
+        assert_eq!(
+            expected_plan.plan.top_step.status,
+            case.expected.top_step_status
+        );
+        assert_eq!(
+            expected_plan.plan.top_step.proof_lane,
+            case.expected.top_step_proof_lane
+        );
+        assert_eq!(
+            expected_plan.plan.reason_codes_include,
+            case.expected.reason_codes_include
+        );
+
         let snapshot_path = workspace_root().join(&case.snapshot_path);
         assert_eq!(
             sha256_file(&snapshot_path),
@@ -293,43 +482,43 @@ fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
 
         assert_eq!(
             serialize_enum(surface.plan_status),
-            case.expected.plan_status,
+            expected_plan.plan.plan_status,
             "{}: plan_status golden field changed",
             case.case_id
         );
         assert_eq!(
             serialize_enum(surface.risk_level),
-            case.expected.risk_level,
+            expected_plan.plan.risk_level,
             "{}: risk_level golden field changed",
             case.case_id
         );
 
         let step = top_step(&surface);
         assert_eq!(
-            step.candidate_id, case.expected.top_step_candidate_id,
+            step.candidate_id, expected_plan.plan.top_step.candidate_id,
             "{}: top step candidate changed",
             case.case_id
         );
         assert_eq!(
             serialize_enum(step.action_kind),
-            case.expected.top_step_action_kind,
+            expected_plan.plan.top_step.action_kind,
             "{}: top step action kind changed",
             case.case_id
         );
         assert_eq!(
             serialize_enum(step.status),
-            case.expected.top_step_status,
+            expected_plan.plan.top_step.status,
             "{}: top step status changed",
             case.case_id
         );
         assert_eq!(
             serialize_enum(step.proof_lane),
-            case.expected.top_step_proof_lane,
+            expected_plan.plan.top_step.proof_lane,
             "{}: top step proof lane changed",
             case.case_id
         );
 
-        for reason_code in &case.expected.reason_codes_include {
+        for reason_code in &expected_plan.plan.reason_codes_include {
             assert!(
                 surface.reason_codes.iter().any(|code| code == reason_code),
                 "{}: missing expected reason code {reason_code}",
@@ -337,20 +526,50 @@ fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
             );
         }
 
-        assert!(
-            surface.dry_run,
+        assert_eq!(
+            surface.dry_run, expected_plan.safety.dry_run,
             "{}: replay must stay dry-run",
             case.case_id
         );
-        assert!(
-            !surface.side_effects_executed,
+        assert_eq!(
+            surface.side_effects_executed, expected_plan.safety.side_effects_executed,
             "{}: replay must not execute side effects",
             case.case_id
         );
-        assert!(
-            !surface.raw_pane_content_stored,
+        assert_eq!(
+            surface.raw_pane_content_stored, expected_plan.safety.raw_pane_content_stored,
             "{}: replay must not store raw pane content",
             case.case_id
+        );
+
+        let retained_log = retained_step_log(&case.case_id, &step_logs);
+        assert_eq!(retained_log.schema_version, 1);
+        assert_eq!(retained_log.contract_id, manifest.step_log_contract_id);
+        assert_eq!(retained_log.source_bead, manifest.corpus_source_bead);
+        assert_eq!(retained_log.snapshot_path, case.snapshot_path);
+        assert_eq!(retained_log.step_index, 0);
+        assert_eq!(retained_log.step_kind, "top_plan_step");
+        assert_eq!(retained_log.candidate_id, step.candidate_id);
+        assert_eq!(retained_log.action_kind, serialize_enum(step.action_kind));
+        assert_eq!(retained_log.status, serialize_enum(step.status));
+        assert_eq!(retained_log.proof_lane, serialize_enum(step.proof_lane));
+        assert_eq!(
+            retained_log.plan_status,
+            serialize_enum(surface.plan_status)
+        );
+        assert_eq!(retained_log.risk_level, serialize_enum(surface.risk_level));
+        assert_eq!(retained_log.dry_run, surface.dry_run);
+        assert_eq!(
+            retained_log.side_effects_executed,
+            surface.side_effects_executed
+        );
+        assert_eq!(
+            retained_log.raw_pane_content_stored,
+            surface.raw_pane_content_stored
+        );
+        assert_eq!(
+            retained_log.reason_codes,
+            expected_plan.plan.reason_codes_include
         );
 
         let surface_value = serde_json::to_value(&surface)
@@ -373,6 +592,114 @@ fn mission_twin_replay_corpus_matches_reviewed_golden_fields() {
             case.case_id
         );
     }
+}
+
+#[test]
+fn mission_twin_replay_negative_fixture_inventory_covers_safety_edges() {
+    let manifest = load_manifest();
+    let invalid = read_json(&workspace_root().join(&manifest.invalid_fragments_path));
+
+    assert_eq!(invalid["schema_version"].as_u64(), Some(1));
+    assert_eq!(
+        invalid["contract_id"].as_str(),
+        Some(manifest.invalid_fragments_contract_id.as_str())
+    );
+    assert_eq!(
+        invalid["source_bead"].as_str(),
+        Some(manifest.corpus_source_bead.as_str())
+    );
+    assert_eq!(
+        invalid["manifest_path"].as_str(),
+        Some("fixtures/mission-twin/replay/manifest.json")
+    );
+
+    let case_ids = invalid["cases"]
+        .as_array()
+        .expect("invalid fixture cases is an array")
+        .iter()
+        .map(|case| {
+            case["case_id"]
+                .as_str()
+                .expect("invalid fixture case id is string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let expected_case_ids = [
+        "raw-pane-text",
+        "destructive-suggestion",
+        "ambiguous-artifact-path",
+        "stale-timestamp",
+        "live-mutation-attempt",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    assert_eq!(case_ids, expected_case_ids);
+
+    let raw = invalid_case(&invalid, "raw-pane-text");
+    assert_eq!(
+        raw["invalid_fragment"]["raw_pane_content_stored"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        raw["reason_codes"]
+            .as_array()
+            .expect("raw reason codes")
+            .iter()
+            .any(|reason| reason.as_str() == Some("mission_twin_replay.invalid.raw_pane_text"))
+    );
+
+    let destructive = invalid_case(&invalid, "destructive-suggestion");
+    assert!(
+        destructive["invalid_fragment"]["suggested_action"]
+            .as_str()
+            .expect("destructive suggested action")
+            .contains("delete tracked source files")
+    );
+
+    let ambiguous = invalid_case(&invalid, "ambiguous-artifact-path");
+    let artifact_paths = ambiguous["invalid_fragment"]["artifact_paths"]
+        .as_array()
+        .expect("ambiguous artifact paths");
+    assert!(
+        artifact_paths
+            .iter()
+            .any(|path| path.as_str() == Some("fixtures/mission-twin/replay/*"))
+    );
+    assert!(
+        artifact_paths
+            .iter()
+            .any(|path| path.as_str().is_some_and(|path| path.starts_with('/')))
+    );
+    assert!(
+        artifact_paths
+            .iter()
+            .any(|path| path.as_str().is_some_and(|path| path.starts_with("../")))
+    );
+
+    let stale = invalid_case(&invalid, "stale-timestamp");
+    assert_eq!(
+        stale["invalid_fragment"]["generated_at_ms"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        stale["invalid_fragment"]["freshness_state"].as_str(),
+        Some("fresh")
+    );
+
+    let mutation = invalid_case(&invalid, "live-mutation-attempt");
+    assert_eq!(
+        mutation["invalid_fragment"]["live_attempt"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        mutation["invalid_fragment"]["dry_run"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        mutation["invalid_fragment"]["side_effects_executed"].as_bool(),
+        Some(true)
+    );
 }
 
 #[test]

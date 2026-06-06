@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.invalid_fragments.v1",
+  "source_bead": "ft-u7r37.6",
+  "manifest_path": "fixtures/mission-twin/replay/manifest.json",
+  "cases": [
+    {
+      "case_id": "raw-pane-text",
+      "description": "Replay inputs must not retain raw pane text or raw pane content flags.",
+      "reason_codes": [
+        "mission_twin_replay.invalid.raw_pane_text",
+        "mission_twin_replay.invalid.raw_pane_content_stored"
+      ],
+      "invalid_fragment": {
+        "raw_pane_content_stored": true,
+        "sources": {
+          "beads": {
+            "raw_pane_text": "unredacted pane transcript"
+          }
+        }
+      }
+    },
+    {
+      "case_id": "destructive-suggestion",
+      "description": "Replay output may recommend coordination or static verification only, not destructive cleanup.",
+      "reason_codes": [
+        "mission_twin_replay.invalid.destructive_suggestion"
+      ],
+      "invalid_fragment": {
+        "suggested_action": "delete tracked source files without written approval",
+        "next_actions": [
+          "mutate_workspace"
+        ]
+      }
+    },
+    {
+      "case_id": "ambiguous-artifact-path",
+      "description": "Replay artifacts must be concrete repo-relative files, not ambiguous globs or absolute paths.",
+      "reason_codes": [
+        "mission_twin_replay.invalid.ambiguous_artifact_path"
+      ],
+      "invalid_fragment": {
+        "artifact_paths": [
+          "fixtures/mission-twin/replay/*",
+          "/tmp/mission-twin-output.json",
+          "../mission-twin-output.json"
+        ]
+      }
+    },
+    {
+      "case_id": "stale-timestamp",
+      "description": "Replay fixtures must use explicit retained epoch milliseconds and reject stale freshness claims.",
+      "reason_codes": [
+        "mission_twin_replay.invalid.stale_timestamp"
+      ],
+      "invalid_fragment": {
+        "generated_at_ms": 1,
+        "freshness_state": "fresh"
+      }
+    },
+    {
+      "case_id": "live-mutation-attempt",
+      "description": "Replay harnesses must never perform live Beads, Agent Mail, git, RCH, or pane mutations.",
+      "reason_codes": [
+        "mission_twin_replay.invalid.live_mutation_attempt"
+      ],
+      "invalid_fragment": {
+        "live_attempt": true,
+        "mutation_surface": "rch_build_cancellation",
+        "dry_run": false,
+        "side_effects_executed": true
+      }
+    }
+  ]
+}

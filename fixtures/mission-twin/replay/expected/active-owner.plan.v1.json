@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_twin_replay.expected_plan.v1",
+  "source_bead": "ft-u7r37.6",
+  "case_id": "active-owner",
+  "snapshot_path": "fixtures/mission-twin/snapshot/valid/active-owner.json",
+  "plan": {
+    "contract_id": "ft.mission_objective_plan.v1",
+    "plan_status": "waiting_owner",
+    "risk_level": "high",
+    "top_step": {
+      "candidate_id": "mission-twin.active-owner.owner.ft-u7r37.7",
+      "action_kind": "wait_for_owner",
+      "status": "waiting_owner",
+      "proof_lane": "not_required"
+    },
+    "reason_codes_include": [
+      "planner.status.waiting_owner",
+      "mission_twin.owner_handoff_required",
+      "beads.owner_active",
+      "recent_closeout",
+      "reservations.exclusive_active"
+    ]
+  },
+  "safety": {
+    "dry_run": true,
+    "side_effects_executed": false,
+    "raw_pane_content_stored": false
+  }
+}

@@ -9,6 +9,8 @@ REPLAY_MODULE="crates/frankenterm-core/src/mission_twin_replay.rs"
 REPLAY_TEST="crates/frankenterm-core/tests/mission_twin_replay_golden_corpus.rs"
 ROBOT_CONTRACT_MODULE="crates/frankenterm-core/src/robot_family_contract.rs"
 MANIFEST="fixtures/mission-twin/replay/manifest.json"
+REPLAY_LOG="fixtures/mission-twin/replay/trace/step-log.v1.jsonl"
+REPLAY_INVALID="fixtures/mission-twin/replay/invalid/fragments.v1.json"
 PLAN_SCHEMA="docs/json-schema/ft-mission-objective-plan.json"
 SNAPSHOT_DIR="fixtures/mission-twin/snapshot/valid"
 REQUIRED_CASES=(
@@ -65,6 +67,13 @@ REQUIRED_SURFACE_CASES=(
   "explain-step-active-owner"
   "simulate-dirty-overlap-with-ownership"
 )
+REQUIRED_REPLAY_INVALID_CASES=(
+  "ambiguous-artifact-path"
+  "destructive-suggestion"
+  "live-mutation-attempt"
+  "raw-pane-text"
+  "stale-timestamp"
+)
 
 fail() {
   printf '{"event":"mission_twin_replay.error","status":"fail","message":%s}\n' "$(ruby -rjson -e 'print JSON.generate(ARGV.fetch(0))' "$*")" >&2
@@ -114,17 +123,23 @@ require_file "${REPLAY_MODULE}"
 require_file "${REPLAY_TEST}"
 require_file "${ROBOT_CONTRACT_MODULE}"
 require_file "${MANIFEST}"
+require_file "${REPLAY_LOG}"
+require_file "${REPLAY_INVALID}"
 require_file "${PLAN_SCHEMA}"
 
 mapfile -t manifest_snapshot_paths < <(jq -r '.cases[].snapshot_path' "${MANIFEST}" | sort)
+mapfile -t manifest_expected_plan_paths < <(jq -r '.cases[].expected_plan_path' "${MANIFEST}" | sort)
 mapfile -t actual_snapshot_paths < <(find "${SNAPSHOT_DIR}" -type f -name '*.json' | sort)
 
-for path in "${MANIFEST}" "${PLAN_SCHEMA}" "${manifest_snapshot_paths[@]}"; do
+for path in "${MANIFEST}" "${REPLAY_LOG}" "${REPLAY_INVALID}" "${PLAN_SCHEMA}" \
+  "${manifest_snapshot_paths[@]}" "${manifest_expected_plan_paths[@]}"; do
   require_repo_relative_path "${path}"
   require_file "${path}"
 done
 
-jq empty "${MANIFEST}" "${PLAN_SCHEMA}" "${manifest_snapshot_paths[@]}"
+jq empty "${MANIFEST}" "${REPLAY_INVALID}" "${PLAN_SCHEMA}" \
+  "${manifest_snapshot_paths[@]}" "${manifest_expected_plan_paths[@]}"
+jq -s 'length > 0' "${REPLAY_LOG}" >/dev/null || fail "replay step log has no entries"
 
 diff -u <(printf '%s\n' "${manifest_snapshot_paths[@]}") <(printf '%s\n' "${actual_snapshot_paths[@]}") \
   >/dev/null || fail "manifest snapshot paths do not match ${SNAPSHOT_DIR}/*.json"
@@ -153,13 +168,23 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
   .schema_version == 1
   and .contract_id == "ft.mission_twin_replay.golden_corpus.v1"
   and .source_bead == "ft-u7r37.2"
+  and .corpus_source_bead == "ft-u7r37.6"
   and .planner_contract_id == "ft.mission_objective_plan.v1"
+  and .expected_plan_contract_id == "ft.mission_twin_replay.expected_plan.v1"
   and .counterfactual_contract_id == "ft.mission_twin_counterfactual_replay.v1"
   and .counterfactual_source_bead == "ft-u7r37.3"
   and .ownership_contract_id == "ft.mission_twin_ownership_handoff.v1"
   and .ownership_source_bead == "ft-u7r37.4"
   and .surface_contract_id == "ft.mission_twin.robot_mcp_cli_surface.v1"
   and .surface_source_bead == "ft-u7r37.5"
+  and .step_log_contract_id == "ft.mission_twin_replay.step_log.v1"
+  and .step_log_path == "fixtures/mission-twin/replay/trace/step-log.v1.jsonl"
+  and .invalid_fragments_contract_id == "ft.mission_twin_replay.invalid_fragments.v1"
+  and .invalid_fragments_path == "fixtures/mission-twin/replay/invalid/fragments.v1.json"
+  and .static_verification_command == "bash tests/e2e/test_mission_twin_replay_contract.sh"
+  and .rust_verification_filter == "cargo test -p frankenterm-core --test mission_twin_replay_golden_corpus -- --nocapture"
+  and (.remote_rust_verification_command | contains("RCH_REQUIRE_REMOTE=1"))
+  and (.remote_rust_verification_command | contains("rch --no-self-healing exec --"))
   and ([.cases[].case_id] | sort) == ($required | sort)
   and (.scrub_rules | type == "array" and length >= 5)
   and all(.scrub_rules[];
@@ -171,6 +196,9 @@ jq -e --argjson required "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq 
     (.case_id | type == "string" and length > 0)
     and (.snapshot_path | snapshot_path_ok)
     and (.snapshot_sha256 | test("^[0-9a-f]{64}$"))
+    and (.expected_plan_path | repo_relative_path_ok)
+    and (.expected_plan_path | startswith("fixtures/mission-twin/replay/expected/"))
+    and (.expected_plan_path | endswith(".plan.v1.json"))
     and (.expected.plan_status | IN(
       "actionable",
       "degraded",
@@ -401,10 +429,151 @@ while IFS=$'\t' read -r case_id snapshot_path fixture_sha256; do
     || fail "snapshot hash drift for ${case_id}: expected ${fixture_sha256}, got ${actual_sha256}"
 done < <(jq -r '.cases[] | [.case_id, .snapshot_path, .snapshot_sha256] | @tsv' "${MANIFEST}")
 
+while IFS=$'\t' read -r case_id snapshot_path expected_plan_path plan_status risk_level \
+  candidate_id action_kind step_status proof_lane; do
+  reasons_json="$(jq -c --arg case_id "${case_id}" \
+    '.cases[] | select(.case_id == $case_id) | .expected.reason_codes_include' "${MANIFEST}")"
+
+  jq -e \
+    --arg case_id "${case_id}" \
+    --arg snapshot_path "${snapshot_path}" \
+    --arg plan_status "${plan_status}" \
+    --arg risk_level "${risk_level}" \
+    --arg candidate_id "${candidate_id}" \
+    --arg action_kind "${action_kind}" \
+    --arg step_status "${step_status}" \
+    --arg proof_lane "${proof_lane}" \
+    --argjson reasons "${reasons_json}" '
+      .schema_version == 1
+      and .contract_id == "ft.mission_twin_replay.expected_plan.v1"
+      and .source_bead == "ft-u7r37.6"
+      and .case_id == $case_id
+      and .snapshot_path == $snapshot_path
+      and .plan.contract_id == "ft.mission_objective_plan.v1"
+      and .plan.plan_status == $plan_status
+      and .plan.risk_level == $risk_level
+      and .plan.top_step.candidate_id == $candidate_id
+      and .plan.top_step.action_kind == $action_kind
+      and .plan.top_step.status == $step_status
+      and .plan.top_step.proof_lane == $proof_lane
+      and (.plan.reason_codes_include | sort) == ($reasons | sort)
+      and .safety.dry_run == true
+      and .safety.side_effects_executed == false
+      and .safety.raw_pane_content_stored == false
+    ' "${expected_plan_path}" >/dev/null \
+    || fail "expected plan artifact mismatch for ${case_id}"
+done < <(jq -r '.cases[] | [
+  .case_id,
+  .snapshot_path,
+  .expected_plan_path,
+  .expected.plan_status,
+  .expected.risk_level,
+  .expected.top_step_candidate_id,
+  .expected.top_step_action_kind,
+  .expected.top_step_status,
+  .expected.top_step_proof_lane
+] | @tsv' "${MANIFEST}")
+
 while IFS=$'\t' read -r case_id snapshot_path; do
   require_repo_relative_path "${snapshot_path}"
   require_file "${snapshot_path}"
 done < <(jq -r '.surface_cases[] | .case_id as $case_id | .request.snapshot_paths[] | [$case_id, .] | @tsv' "${MANIFEST}")
+
+jq -s -e \
+  --argjson required_cases "$(printf '%s\n' "${REQUIRED_CASES[@]}" | jq -R . | jq -s .)" '
+    length == ($required_cases | length)
+    and ([.[].case_id] | sort) == ($required_cases | sort)
+    and all(.[];
+      .schema_version == 1
+      and .contract_id == "ft.mission_twin_replay.step_log.v1"
+      and .source_bead == "ft-u7r37.6"
+      and (.snapshot_path | type == "string" and startswith("fixtures/mission-twin/snapshot/valid/"))
+      and .step_index == 0
+      and .step_kind == "top_plan_step"
+      and (.candidate_id | type == "string" and length > 0)
+      and (.action_kind | IN("choose_ready_bead", "file_followup_bead", "run_bv_robot_triage", "wait_for_owner"))
+      and (.status | IN("actionable", "dirty_overlap", "no_ready_work", "rch_substrate_blocked", "waiting_owner"))
+      and (.proof_lane | IN("blocked", "not_required"))
+      and (.plan_status | IN("actionable", "degraded", "dirty_overlap", "no_ready_work", "rch_substrate_blocked", "waiting_owner"))
+      and (.risk_level | IN("low", "medium", "high", "blocked"))
+      and .dry_run == true
+      and .side_effects_executed == false
+      and .raw_pane_content_stored == false
+      and (.reason_codes | type == "array" and length >= 3)
+    )
+  ' "${REPLAY_LOG}" >/dev/null || fail "replay step log contract mismatch"
+
+while IFS=$'\t' read -r case_id snapshot_path plan_status risk_level candidate_id action_kind step_status proof_lane; do
+  reasons_json="$(jq -c --arg case_id "${case_id}" \
+    '.cases[] | select(.case_id == $case_id) | .expected.reason_codes_include' "${MANIFEST}")"
+
+  jq -s -e \
+    --arg case_id "${case_id}" \
+    --arg snapshot_path "${snapshot_path}" \
+    --arg plan_status "${plan_status}" \
+    --arg risk_level "${risk_level}" \
+    --arg candidate_id "${candidate_id}" \
+    --arg action_kind "${action_kind}" \
+    --arg step_status "${step_status}" \
+    --arg proof_lane "${proof_lane}" \
+    --argjson reasons "${reasons_json}" '
+      any(.[];
+        .case_id == $case_id
+        and .snapshot_path == $snapshot_path
+        and .plan_status == $plan_status
+        and .risk_level == $risk_level
+        and .candidate_id == $candidate_id
+        and .action_kind == $action_kind
+        and .status == $step_status
+        and .proof_lane == $proof_lane
+        and (.reason_codes | sort) == ($reasons | sort)
+      )
+    ' "${REPLAY_LOG}" >/dev/null || fail "replay log row mismatch for ${case_id}"
+done < <(jq -r '.cases[] | [
+  .case_id,
+  .snapshot_path,
+  .expected.plan_status,
+  .expected.risk_level,
+  .expected.top_step_candidate_id,
+  .expected.top_step_action_kind,
+  .expected.top_step_status,
+  .expected.top_step_proof_lane
+] | @tsv' "${MANIFEST}")
+
+jq -e \
+  --arg manifest "${MANIFEST}" \
+  --argjson required_cases "$(printf '%s\n' "${REQUIRED_REPLAY_INVALID_CASES[@]}" | jq -R . | jq -s .)" '
+    . as $root
+    | $root.schema_version == 1
+    and $root.contract_id == "ft.mission_twin_replay.invalid_fragments.v1"
+    and $root.source_bead == "ft-u7r37.6"
+    and $root.manifest_path == $manifest
+    and ([$root.cases[].case_id] | sort) == ($required_cases | sort)
+    and ([$root.cases[].case_id] | length) == ([$root.cases[].case_id] | unique | length)
+    and all($root.cases[];
+      (.description | type == "string" and length > 0)
+      and (.reason_codes | type == "array" and length > 0)
+      and all(.reason_codes[]; startswith("mission_twin_replay.invalid."))
+      and (.invalid_fragment | type == "object")
+    )
+    and any($root.cases[]; .case_id == "raw-pane-text"
+      and .invalid_fragment.raw_pane_content_stored == true
+      and (.invalid_fragment.sources.beads.raw_pane_text | type == "string" and length > 0))
+    and any($root.cases[]; .case_id == "destructive-suggestion"
+      and (.invalid_fragment.suggested_action | contains("delete tracked source files"))
+      and (.invalid_fragment.next_actions | index("mutate_workspace") != null))
+    and any($root.cases[]; .case_id == "ambiguous-artifact-path"
+      and any(.invalid_fragment.artifact_paths[]; . == "fixtures/mission-twin/replay/*")
+      and any(.invalid_fragment.artifact_paths[]; startswith("/"))
+      and any(.invalid_fragment.artifact_paths[]; startswith("../")))
+    and any($root.cases[]; .case_id == "stale-timestamp"
+      and .invalid_fragment.generated_at_ms == 1
+      and .invalid_fragment.freshness_state == "fresh")
+    and any($root.cases[]; .case_id == "live-mutation-attempt"
+      and .invalid_fragment.live_attempt == true
+      and .invalid_fragment.dry_run == false
+      and .invalid_fragment.side_effects_executed == true)
+  ' "${REPLAY_INVALID}" >/dev/null || fail "replay invalid fixture coverage mismatch"
 
 for needle in \
   "MissionTwinSnapshotEnvelope" \
@@ -422,13 +591,18 @@ for needle in \
   "MissionTwinOwnershipHandoffState" \
   "mission_twin_family_contract" \
   "MissionTwinReplayError::EmptySnapshotSet" \
+  "ExpectedPlanArtifact" \
+  "ReplayStepLogEntry" \
+  "load_replay_step_logs" \
+  "invalid_fragments_path" \
   "side-effect-free"; do
   rg -q "${needle}" "${REPLAY_MODULE}" "${REPLAY_TEST}" "${ROBOT_CONTRACT_MODULE}" \
     || fail "replay source/test missing required text: ${needle}"
 done
 
-if rg -n 'std::process|Command::new|remove_file|remove_dir|am service|doctor fix|doctor repair|git reset|git clean|kill ' "${REPLAY_MODULE}"; then
+if rg -n 'std::process|Command::new|remove_file|remove_dir|am service|doctor fix|doctor repair|git reset|git clean|kill ' "${REPLAY_MODULE}" "${REPLAY_TEST}"; then
   fail "replay module contains forbidden mutating command surface"
 fi
 
+jq -c '.' "${REPLAY_LOG}"
 emit "mission_twin_replay.manifest" "status=ok" "cases=${#REQUIRED_CASES[@]}" "ownership_cases=${#REQUIRED_OWNERSHIP_CASES[@]}" "surface_cases=${#REQUIRED_SURFACE_CASES[@]}" "path=${MANIFEST}"
