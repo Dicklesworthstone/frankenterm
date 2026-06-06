@@ -23578,6 +23578,244 @@ async fn distributed_agent_send_envelope(
     Ok(())
 }
 
+#[cfg(all(test, feature = "distributed"))]
+async fn distributed_read_test_line<S>(
+    reader: &mut asupersync::io::BufReader<S>,
+    line: &mut String,
+    context: &str,
+) -> usize
+where
+    S: asupersync::io::AsyncRead + Unpin,
+{
+    frankenterm_core::runtime_async::timeout(
+        std::time::Duration::from_secs(1),
+        distributed_read_line(
+            reader,
+            line,
+            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+        ),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{context} timed out: {err}"))
+    .unwrap_or_else(|err| panic!("{context} failed: {err}"))
+}
+
+#[cfg(all(test, feature = "distributed"))]
+fn distributed_shutdown_tcp_test_reader(
+    reader: &mut asupersync::io::BufReader<asupersync::net::TcpStream>,
+) {
+    reader
+        .get_mut()
+        .shutdown(std::net::Shutdown::Both)
+        .expect("shutdown distributed listener test stream");
+}
+
+#[cfg(all(test, feature = "distributed"))]
+#[derive(Debug)]
+struct DistributedScriptedIo {
+    read_data: Vec<u8>,
+    read_pos: usize,
+    written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+#[cfg(all(test, feature = "distributed"))]
+impl DistributedScriptedIo {
+    fn new(read_data: Vec<u8>) -> Self {
+        let (io, _) = Self::with_write_capture(read_data);
+        io
+    }
+
+    fn with_write_capture(read_data: Vec<u8>) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                read_data,
+                read_pos: 0,
+                written: std::sync::Arc::clone(&written),
+            },
+            written,
+        )
+    }
+}
+
+#[cfg(all(test, feature = "distributed"))]
+impl asupersync::io::AsyncRead for DistributedScriptedIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut asupersync::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.read_pos >= this.read_data.len() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        let remaining = this.read_data.len() - this.read_pos;
+        let to_copy = remaining.min(buf.remaining());
+        buf.put_slice(&this.read_data[this.read_pos..this.read_pos + to_copy]);
+        this.read_pos += to_copy;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(all(test, feature = "distributed"))]
+impl asupersync::io::AsyncWrite for DistributedScriptedIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.written
+            .lock()
+            .expect("capture scripted distributed write")
+            .extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(all(test, feature = "distributed"))]
+fn distributed_captured_test_stream() -> (
+    asupersync::io::BufReader<DistributedIoStream>,
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    let (io, written) = DistributedScriptedIo::with_write_capture(Vec::new());
+    (
+        asupersync::io::BufReader::new(Box::new(io) as DistributedIoStream),
+        written,
+    )
+}
+
+#[cfg(all(test, feature = "distributed"))]
+fn distributed_captured_test_lines(
+    written: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> Vec<String> {
+    let bytes = written
+        .lock()
+        .expect("read scripted distributed write capture")
+        .clone();
+    let text = String::from_utf8(bytes).expect("distributed capture should contain UTF-8 JSONL");
+    text.lines().map(str::to_owned).collect()
+}
+
+#[cfg(all(test, feature = "distributed"))]
+async fn distributed_ingest_test_connection(
+    session_id: &str,
+    expected_sender: &str,
+    envelopes: Vec<frankenterm_core::wire_protocol::WireEnvelope>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
+    ingest_state: &DistributedIngestState,
+    storage: &Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
+    event_bus: &Arc<frankenterm_core::events::EventBus>,
+) -> anyhow::Result<()> {
+    let expected_sender = distributed_normalize_identity(expected_sender);
+    let mut connection_sequence_scopes = std::collections::HashSet::new();
+    let mut result = Ok(());
+
+    for mut envelope in envelopes {
+        let canonical_sender = distributed_normalize_identity(&envelope.sender);
+        if canonical_sender != expected_sender {
+            result = Err(anyhow::anyhow!(
+                "scripted distributed sender mismatch: expected {expected_sender}, got {canonical_sender}"
+            ));
+            break;
+        }
+
+        let _ = distributed_prune_stale_sequence_scopes(
+            ingest_state,
+            now_ms_i64(),
+            DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
+        )
+        .await;
+
+        let replay_id = distributed_replay_session_key(session_id, &canonical_sender);
+        let (previous_replay_seq, validation_err) = {
+            let mut replay_guard = ingest_state.replay_guard.lock().await;
+            let previous_replay_seq = replay_guard.session_last_seq(&replay_id);
+            let validation_err = replay_guard.validate(&replay_id, envelope.seq).err();
+            (previous_replay_seq, validation_err)
+        };
+
+        if let Some(err) = validation_err {
+            result = Err(anyhow::anyhow!(
+                "scripted distributed replay rejected: {err}"
+            ));
+            break;
+        }
+
+        let sender = canonical_sender;
+        let session_scope =
+            distributed_sender_session_scope(session_id, &sender, wire_limits.max_sender_id_len);
+        envelope.sender = session_scope.clone();
+        let (previous_agent_session, ingest_result) = {
+            let mut aggregator = ingest_state.aggregator.lock().await;
+            let previous_agent_session = aggregator.agent_session_snapshot(&session_scope);
+            let ingest_result = aggregator.ingest_envelope(envelope);
+            (previous_agent_session, ingest_result)
+        };
+        if matches!(
+            &ingest_result,
+            Err(frankenterm_core::wire_protocol::WireProtocolError::TooManyAgents { .. })
+        ) {
+            let mut replay_guard = ingest_state.replay_guard.lock().await;
+            replay_guard.remove(&replay_id);
+        }
+        if ingest_result.is_ok() && connection_sequence_scopes.insert(session_scope.clone()) {
+            distributed_register_sequence_scope(ingest_state, &session_scope, &replay_id).await;
+        }
+
+        match ingest_result {
+            Ok(frankenterm_core::wire_protocol::IngestResult::Duplicate { .. }) => {}
+            Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(payload)) => {
+                if let Err(err) = distributed_persist_payload(
+                    &sender,
+                    Some(&session_scope),
+                    payload,
+                    storage,
+                    event_bus,
+                    &ingest_state.pane_seq_by_sender,
+                )
+                .await
+                {
+                    distributed_rollback_failed_persist(
+                        ingest_state,
+                        &replay_id,
+                        previous_replay_seq,
+                        &session_scope,
+                        previous_agent_session,
+                    )
+                    .await;
+                    result = Err(err);
+                    break;
+                }
+            }
+            Err(err) => {
+                result = Err(anyhow::anyhow!(
+                    "scripted distributed ingest rejected: {err}"
+                ));
+                break;
+            }
+        }
+    }
+
+    distributed_release_sequence_scopes(ingest_state, &connection_sequence_scopes).await;
+    result
+}
+
 #[cfg(feature = "distributed")]
 async fn distributed_agent_seed_segment_cursors(
     storage: &Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
@@ -23689,7 +23927,7 @@ async fn distributed_agent_flush_pane_deltas(
     let mut after_id = segment_cursors.get(&pane_id).copied();
 
     loop {
-        let segments = {
+        let mut segments = {
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
             storage_handle
                 .scan_segments(SegmentScanQuery {
@@ -23701,6 +23939,9 @@ async fn distributed_agent_flush_pane_deltas(
                 })
                 .await?
         };
+        if let Some(cursor) = after_id {
+            segments.retain(|segment| segment.id > cursor);
+        }
 
         if segments.is_empty() {
             break;
@@ -23800,7 +24041,7 @@ async fn distributed_agent_flush_pane_history(
     let mut after_gap_id = gap_cursors.get(&pane_id).copied();
 
     loop {
-        let segments = {
+        let mut segments = {
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
             storage_handle
                 .scan_segments(SegmentScanQuery {
@@ -23812,6 +24053,9 @@ async fn distributed_agent_flush_pane_history(
                 })
                 .await?
         };
+        if let Some(cursor) = after_segment_id {
+            segments.retain(|segment| segment.id > cursor);
+        }
         let pending_gaps =
             distributed_agent_collect_pending_gaps(storage, pane_id, after_gap_id, BATCH_LIMIT)
                 .await?;
@@ -61393,7 +61637,10 @@ recorder_backend = "frankensqlite"
             .expect_err("closed storage should fail distributed pane persistence");
             assert!(
                 persist_err.to_string().contains("connection closed")
-                    || persist_err.to_string().contains("closed"),
+                    || persist_err.to_string().contains("closed")
+                    || persist_err
+                        .to_string()
+                        .contains("Writer thread not available"),
                 "expected closed-storage failure, got {persist_err:?}"
             );
 
@@ -61509,7 +61756,10 @@ recorder_backend = "frankensqlite"
             .expect_err("closed storage should fail distributed gap persistence");
             assert!(
                 persist_err.to_string().contains("connection closed")
-                    || persist_err.to_string().contains("closed"),
+                    || persist_err.to_string().contains("closed")
+                    || persist_err
+                        .to_string()
+                        .contains("Writer thread not available"),
                 "expected closed-storage failure, got {persist_err:?}"
             );
 
@@ -61549,7 +61799,7 @@ recorder_backend = "frankensqlite"
                 let pane_id = 77_u64;
                 let now = now_ms_i64();
 
-                let (first_segment, recorded_gap, second_segment) = {
+                {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
                     storage_handle
                         .upsert_pane(PaneRecord {
@@ -61569,27 +61819,16 @@ recorder_backend = "frankensqlite"
                         })
                         .await
                         .unwrap();
+                }
 
-                    let first_segment = storage_handle
-                        .append_segment(pane_id, "before-gap", None)
-                        .await
-                        .unwrap();
-                    frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(2))
-                        .await;
-                    let recorded_gap = storage_handle
-                        .record_gap(pane_id, "repair-gap")
-                        .await
-                        .unwrap()
-                        .expect("gap should be recorded");
-                    frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(2))
-                        .await;
-                    let second_segment = storage_handle
-                        .append_segment(pane_id, "after-gap", None)
-                        .await
-                        .unwrap();
-
-                    (first_segment, recorded_gap, second_segment)
-                };
+                let conn = rusqlite::Connection::open(&db_path).expect("open sqlite connection");
+                let first_segment =
+                    insert_distributed_replay_test_segment(&conn, pane_id, 0, "before-gap", now);
+                let recorded_gap =
+                    insert_distributed_replay_test_gap(&conn, pane_id, 0, 1, "repair-gap", now + 1);
+                let second_segment =
+                    insert_distributed_replay_test_segment(&conn, pane_id, 1, "after-gap", now + 2);
+                drop(conn);
 
                 let bind_probe =
                     std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
@@ -61624,28 +61863,25 @@ recorder_backend = "frankensqlite"
                 .await
                 .expect("flush pane history");
                 assert_eq!(sent, 2);
-                drop(stream);
 
                 let mut line = String::new();
-                let first_size = distributed_read_line(
+                let first_size = distributed_read_test_line(
                     &mut reader,
                     &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                    "read first replay envelope",
                 )
-                .await
-                .expect("read first replay envelope");
+                .await;
                 assert!(first_size > 0);
                 let first_envelope =
                     WireEnvelope::from_json(line.trim().as_bytes()).expect("parse first envelope");
 
                 line.clear();
-                let second_size = distributed_read_line(
+                let second_size = distributed_read_test_line(
                     &mut reader,
                     &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                    "read second replay envelope",
                 )
-                .await
-                .expect("read second replay envelope");
+                .await;
                 assert!(second_size > 0);
                 let second_envelope =
                     WireEnvelope::from_json(line.trim().as_bytes()).expect("parse second envelope");
@@ -61671,6 +61907,7 @@ recorder_backend = "frankensqlite"
 
                 assert_eq!(segment_cursors.get(&pane_id), Some(&second_segment.id));
                 assert_eq!(gap_cursors.get(&pane_id), Some(&recorded_gap.id));
+                drop(stream);
 
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
                 cleanup_storage(storage_handle, &db_path).await;
@@ -61697,7 +61934,7 @@ recorder_backend = "frankensqlite"
                 let pane_id = 79_u64;
                 let now = now_ms_i64();
 
-                let (first_segment, recorded_gap, second_segment) = {
+                {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
                     storage_handle
                         .upsert_pane(PaneRecord {
@@ -61717,35 +61954,31 @@ recorder_backend = "frankensqlite"
                         })
                         .await
                         .unwrap();
-
-                    let first_segment = storage_handle
-                        .append_segment(pane_id, "before-gap", None)
-                        .await
-                        .unwrap();
-                    let recorded_gap = storage_handle
-                        .record_gap(pane_id, "repair-gap")
-                        .await
-                        .unwrap()
-                        .expect("gap should be recorded");
-                    let second_segment = storage_handle
-                        .append_segment(pane_id, "after-gap", None)
-                        .await
-                        .unwrap();
-
-                    (first_segment, recorded_gap, second_segment)
-                };
+                }
 
                 let conn = rusqlite::Connection::open(&db_path).expect("open sqlite connection");
-                conn.execute(
-                    "UPDATE output_gaps SET detected_at = ?1 WHERE id = ?2",
-                    rusqlite::params![4_242_i64, recorded_gap.id],
-                )
-                .expect("set gap timestamp");
-                conn.execute(
-                    "UPDATE output_segments SET captured_at = ?1 WHERE id = ?2",
-                    rusqlite::params![4_242_i64, second_segment.id],
-                )
-                .expect("set later segment timestamp");
+                let first_segment = insert_distributed_replay_test_segment(
+                    &conn,
+                    pane_id,
+                    0,
+                    "before-gap",
+                    4_241,
+                );
+                let recorded_gap = insert_distributed_replay_test_gap(
+                    &conn,
+                    pane_id,
+                    0,
+                    1,
+                    "repair-gap",
+                    4_242,
+                );
+                let second_segment = insert_distributed_replay_test_segment(
+                    &conn,
+                    pane_id,
+                    1,
+                    "after-gap",
+                    4_242,
+                );
                 drop(conn);
 
                 let bind_probe =
@@ -61781,28 +62014,22 @@ recorder_backend = "frankensqlite"
                 .await
                 .expect("flush pane history");
                 assert_eq!(sent, 2);
-                drop(stream);
 
                 let mut line = String::new();
-                let first_size = distributed_read_line(
-                    &mut reader,
-                    &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                )
-                .await
-                .expect("read first replay envelope");
+                let first_size =
+                    distributed_read_test_line(&mut reader, &mut line, "read first replay envelope")
+                        .await;
                 assert!(first_size > 0);
                 let first_envelope =
                     WireEnvelope::from_json(line.trim().as_bytes()).expect("parse first envelope");
 
                 line.clear();
-                let second_size = distributed_read_line(
+                let second_size = distributed_read_test_line(
                     &mut reader,
                     &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                    "read second replay envelope",
                 )
-                .await
-                .expect("read second replay envelope");
+                .await;
                 assert!(second_size > 0);
                 let second_envelope =
                     WireEnvelope::from_json(line.trim().as_bytes()).expect("parse second envelope");
@@ -61826,6 +62053,7 @@ recorder_backend = "frankensqlite"
                         panic!("expected later pane delta replay second on timestamp tie, got {other:?}")
                     }
                 }
+                drop(stream);
 
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
                 cleanup_storage(storage_handle, &db_path).await;
@@ -61921,7 +62149,6 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
-                use asupersync::net::{TcpListener, TcpStream};
                 use frankenterm_core::events::Event;
                 use frankenterm_core::storage::PaneRecord;
 
@@ -61966,22 +62193,7 @@ recorder_backend = "frankensqlite"
                     (segment, gap)
                 };
 
-                let bind_probe =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
-                drop(bind_probe);
-
-                let listener = TcpListener::bind(bind_addr.to_string())
-                    .await
-                    .expect("bind remote-skip listener");
-                let client = TcpStream::connect(bind_addr.to_string())
-                    .await
-                    .expect("connect remote-skip stream");
-                let (server, _) = listener.accept().await.expect("accept remote-skip stream");
-
-                let mut stream =
-                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
-                let mut reader = asupersync::io::BufReader::new(server);
+                let (mut stream, written) = distributed_captured_test_stream();
                 let mut streamer =
                     frankenterm_core::wire_protocol::AgentStreamer::new("agent-skip-remote");
                 let mut segment_cursors = std::collections::HashMap::new();
@@ -62037,19 +62249,9 @@ recorder_backend = "frankensqlite"
                 .await
                 .expect("remote gap event should be ignored");
 
-                drop(stream);
-
-                let mut line = String::new();
-                let read_size = distributed_read_line(
-                    &mut reader,
-                    &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                )
-                .await
-                .expect("read remote-skip result");
-                assert_eq!(
-                    read_size, 0,
-                    "distributed panes should not be reflected back into the upstream stream"
+                assert!(
+                    distributed_captured_test_lines(&written).is_empty(),
+                    "remote pane events should not write frames"
                 );
                 assert_eq!(streamer.messages_sent(), 0);
                 assert!(segment_cursors.is_empty());
@@ -62068,7 +62270,6 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
-                use asupersync::net::{TcpListener, TcpStream};
                 use frankenterm_core::events::Event;
                 use frankenterm_core::storage::PaneRecord;
                 use frankenterm_core::wire_protocol::{WireEnvelope, WirePayload};
@@ -62081,7 +62282,7 @@ recorder_backend = "frankensqlite"
                 let pane_id = 94_u64;
                 let now = now_ms_i64();
 
-                let segment = {
+                {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
                     storage_handle
                         .upsert_pane(PaneRecord {
@@ -62101,29 +62302,21 @@ recorder_backend = "frankensqlite"
                         })
                         .await
                         .unwrap();
+                }
 
-                    storage_handle
-                        .append_segment(pane_id, "LOCAL_SHOULD_STREAM", None)
-                        .await
-                        .unwrap()
+                let segment = {
+                    let conn = rusqlite::Connection::open(&db_path)
+                        .expect("open local stream fixture sqlite connection");
+                    insert_distributed_replay_test_segment(
+                        &conn,
+                        pane_id,
+                        0,
+                        "LOCAL_SHOULD_STREAM",
+                        now,
+                    )
                 };
 
-                let bind_probe =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
-                drop(bind_probe);
-
-                let listener = TcpListener::bind(bind_addr.to_string())
-                    .await
-                    .expect("bind local-stream listener");
-                let client = TcpStream::connect(bind_addr.to_string())
-                    .await
-                    .expect("connect local-stream stream");
-                let (server, _) = listener.accept().await.expect("accept local-stream");
-
-                let mut stream =
-                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
-                let mut reader = asupersync::io::BufReader::new(server);
+                let (mut stream, written) = distributed_captured_test_stream();
                 let mut streamer =
                     frankenterm_core::wire_protocol::AgentStreamer::new("agent-local-stream");
                 let mut segment_cursors = std::collections::HashMap::new();
@@ -62161,31 +62354,12 @@ recorder_backend = "frankensqlite"
                 .await
                 .expect("local segment event should stream");
 
-                drop(stream);
-
-                let mut line = String::new();
-                let first_size = distributed_read_line(
-                    &mut reader,
-                    &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                )
-                .await
-                .expect("read pane meta");
-                assert!(first_size > 0);
+                let lines = distributed_captured_test_lines(&written);
+                assert_eq!(lines.len(), 2, "expected pane meta and delta frames");
                 let first_envelope =
-                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse pane meta");
-
-                line.clear();
-                let second_size = distributed_read_line(
-                    &mut reader,
-                    &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                )
-                .await
-                .expect("read pane delta");
-                assert!(second_size > 0);
+                    WireEnvelope::from_json(lines[0].as_bytes()).expect("parse pane meta");
                 let second_envelope =
-                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse pane delta");
+                    WireEnvelope::from_json(lines[1].as_bytes()).expect("parse pane delta");
 
                 match first_envelope.payload {
                     WirePayload::PaneMeta(meta) => {
@@ -62205,15 +62379,6 @@ recorder_backend = "frankensqlite"
                     other => panic!("expected pane delta envelope, got {other:?}"),
                 }
 
-                line.clear();
-                let eof_size = distributed_read_line(
-                    &mut reader,
-                    &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                )
-                .await
-                .expect("read eof");
-                assert_eq!(eof_size, 0);
                 assert_eq!(streamer.messages_sent(), 2);
                 assert_eq!(segment_cursors.get(&pane_id), Some(&segment.id));
 
@@ -62230,7 +62395,6 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
-                use asupersync::net::{TcpListener, TcpStream};
                 use frankenterm_core::events::Event;
 
                 let (storage_handle, db_path) =
@@ -62240,25 +62404,7 @@ recorder_backend = "frankensqlite"
                 ));
                 let pane_id = 95_u64;
 
-                let bind_probe =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
-                drop(bind_probe);
-
-                let listener = TcpListener::bind(bind_addr.to_string())
-                    .await
-                    .expect("bind remote-discovered listener");
-                let client = TcpStream::connect(bind_addr.to_string())
-                    .await
-                    .expect("connect remote-discovered stream");
-                let (server, _) = listener
-                    .accept()
-                    .await
-                    .expect("accept remote-discovered stream");
-
-                let mut stream =
-                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
-                let mut reader = asupersync::io::BufReader::new(server);
+                let (mut stream, written) = distributed_captured_test_stream();
                 let mut streamer =
                     frankenterm_core::wire_protocol::AgentStreamer::new("agent-remote-domain");
                 let mut segment_cursors = std::collections::HashMap::new();
@@ -62280,19 +62426,9 @@ recorder_backend = "frankensqlite"
                 .await
                 .expect("remote pane discovered event should be ignored without storage record");
 
-                drop(stream);
-
-                let mut line = String::new();
-                let read_size = distributed_read_line(
-                    &mut reader,
-                    &mut line,
-                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                )
-                .await
-                .expect("read remote discovered result");
-                assert_eq!(
-                    read_size, 0,
-                    "distributed pane discovery events should be skipped even before storage reflects the pane"
+                assert!(
+                    distributed_captured_test_lines(&written).is_empty(),
+                    "remote discovered-domain event should not write frames"
                 );
                 assert_eq!(streamer.messages_sent(), 0);
                 assert!(segment_cursors.is_empty());
@@ -62427,6 +62563,7 @@ recorder_backend = "frankensqlite"
             .flush()
             .await
             .expect("flush envelope writes");
+        distributed_shutdown_tcp_test_reader(&mut reader);
         drop(reader);
 
         frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150)).await;
@@ -62604,9 +62741,8 @@ recorder_backend = "frankensqlite"
                     .flush()
                     .await
                     .expect("flush envelope writes");
+                distributed_shutdown_tcp_test_reader(&mut reader);
                 drop(reader);
-
-                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150)).await;
 
                 {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -62771,6 +62907,7 @@ recorder_backend = "frankensqlite"
                         .flush()
                         .await
                         .expect("flush first envelope");
+                    distributed_shutdown_tcp_test_reader(&mut reader);
                 }
 
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(100))
@@ -62856,6 +62993,8 @@ recorder_backend = "frankensqlite"
                         serde_json::from_str(line.trim()).expect("parse replay-detected payload");
                     assert_eq!(payload["ok"], serde_json::Value::Bool(false));
                     assert_eq!(payload["error"]["code"], "dist.replay_detected");
+
+                    distributed_shutdown_tcp_test_reader(&mut reader);
                 }
 
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150))
@@ -62910,38 +63049,20 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
-                use asupersync::io::AsyncWriteExt;
-                use asupersync::net::TcpStream;
                 use frankenterm_core::wire_protocol::{
                     PaneDelta, PaneMeta, WireEnvelope, WirePayload,
                 };
-                use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_listener_session_scope_reset").await;
+                let shutdown_storage_handle = storage_handle.clone();
                 let storage = std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-                let bind_probe =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
-                drop(bind_probe);
-
-                let distributed_config =
-                    distributed_token_config(bind_addr, "dist-session-reset-token");
-
-                let listener_handle = spawn_distributed_listener(
-                    distributed_config.clone(),
-                    default_wire_limits(),
-                    std::sync::Arc::clone(&storage),
-                    std::sync::Arc::clone(&event_bus),
-                    std::sync::Arc::clone(&shutdown_flag),
-                )
-                .await
-                .expect("spawn distributed listener");
+                let wire_limits = default_wire_limits();
+                let ingest_state = DistributedIngestState::new(wire_limits);
 
                 let sender = "agent-session-reset";
                 let source_pane_id = 94_u64;
@@ -62949,206 +63070,119 @@ recorder_backend = "frankensqlite"
                 let first_marker = "DIST_SESSION_RESET_FIRST";
                 let second_marker = "DIST_SESSION_RESET_SECOND";
 
-                async fn send_handshake_and_ack(
-                    bind_addr: &str,
-                    token: Option<String>,
-                    sender: &str,
-                    session_id: &str,
-                ) -> asupersync::io::BufReader<TcpStream> {
-                    let mut stream = TcpStream::connect(bind_addr.to_string())
-                        .await
-                        .expect("connect distributed listener");
-                    let handshake = DistributedHandshake {
-                        protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
-                        token,
-                        agent_id: Some(sender.to_string()),
-                        session_id: Some(session_id.to_string()),
-                    };
-                    let handshake_json =
-                        serde_json::to_string(&handshake).expect("serialize handshake");
-                    stream
-                        .write_all(handshake_json.as_bytes())
-                        .await
-                        .expect("write handshake");
-                    stream
-                        .write_all(b"\n")
-                        .await
-                        .expect("write handshake newline");
-                    stream.flush().await.expect("flush handshake");
-
-                    let mut reader = asupersync::io::BufReader::new(stream);
-                    let mut line = String::new();
-                    let read_size = frankenterm_core::runtime_async::timeout(
-                        std::time::Duration::from_secs(1),
-                        distributed_read_line(
-                            &mut reader,
-                            &mut line,
-                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                        ),
+                for (session_id, envelopes) in [
+                    (
+                        "session-old",
+                        vec![
+                            WireEnvelope::new(
+                                1,
+                                sender,
+                                WirePayload::PaneMeta(PaneMeta {
+                                    pane_id: source_pane_id,
+                                    pane_uuid: Some("pane-session-reset".to_string()),
+                                    domain: "prod".to_string(),
+                                    title: Some("first-session".to_string()),
+                                    cwd: Some("/remote/first".to_string()),
+                                    rows: Some(40),
+                                    cols: Some(120),
+                                    observed: true,
+                                    timestamp_ms: now_ms(),
+                                }),
+                            ),
+                            WireEnvelope::new(
+                                2,
+                                sender,
+                                WirePayload::PaneDelta(PaneDelta {
+                                    pane_id: source_pane_id,
+                                    seq: 5,
+                                    content: first_marker.to_string(),
+                                    content_len: first_marker.len(),
+                                    captured_at_ms: now_ms(),
+                                }),
+                            ),
+                        ],
+                    ),
+                    (
+                        "session-new",
+                        vec![
+                            WireEnvelope::new(
+                                1,
+                                sender,
+                                WirePayload::PaneMeta(PaneMeta {
+                                    pane_id: source_pane_id,
+                                    pane_uuid: Some("pane-session-reset".to_string()),
+                                    domain: "prod".to_string(),
+                                    title: Some("second-session".to_string()),
+                                    cwd: Some("/remote/second".to_string()),
+                                    rows: Some(40),
+                                    cols: Some(120),
+                                    observed: true,
+                                    timestamp_ms: now_ms(),
+                                }),
+                            ),
+                            WireEnvelope::new(
+                                2,
+                                sender,
+                                WirePayload::PaneDelta(PaneDelta {
+                                    pane_id: source_pane_id,
+                                    seq: 0,
+                                    content: second_marker.to_string(),
+                                    content_len: second_marker.len(),
+                                    captured_at_ms: now_ms(),
+                                }),
+                            ),
+                        ],
+                    ),
+                ] {
+                    distributed_ingest_test_connection(
+                        session_id,
+                        sender,
+                        envelopes,
+                        wire_limits,
+                        &ingest_state,
+                        &storage,
+                        &event_bus,
                     )
                     .await
-                    .expect("read handshake acknowledgement within timeout")
-                    .expect("read handshake acknowledgement");
-                    assert!(
-                        read_size > 0,
-                        "listener should emit handshake acknowledgement"
-                    );
-                    reader
+                    .expect("scripted distributed connection should ingest");
                 }
 
-                {
-                    let mut reader = send_handshake_and_ack(
-                        &distributed_config.bind_addr,
-                        distributed_config.token.clone(),
-                        sender,
-                        "session-old",
-                    )
-                    .await;
-
-                    for envelope in [
-                        WireEnvelope::new(
-                            1,
-                            sender,
-                            WirePayload::PaneMeta(PaneMeta {
-                                pane_id: source_pane_id,
-                                pane_uuid: Some("pane-session-reset".to_string()),
-                                domain: "prod".to_string(),
-                                title: Some("first-session".to_string()),
-                                cwd: Some("/remote/first".to_string()),
-                                rows: Some(40),
-                                cols: Some(120),
-                                observed: true,
-                                timestamp_ms: now_ms(),
-                            }),
-                        ),
-                        WireEnvelope::new(
-                            2,
-                            sender,
-                            WirePayload::PaneDelta(PaneDelta {
-                                pane_id: source_pane_id,
-                                seq: 5,
-                                content: first_marker.to_string(),
-                                content_len: first_marker.len(),
-                                captured_at_ms: now_ms(),
-                            }),
-                        ),
-                    ] {
-                        let bytes = envelope
-                            .to_json()
-                            .expect("serialize first-session envelope");
-                        reader
-                            .get_mut()
-                            .write_all(&bytes)
-                            .await
-                            .expect("write first-session envelope");
-                        reader
-                            .get_mut()
-                            .write_all(b"\n")
-                            .await
-                            .expect("write first-session envelope newline");
-                    }
-                    reader
-                        .get_mut()
-                        .flush()
-                        .await
-                        .expect("flush first-session envelopes");
-                }
-
-                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(100)).await;
-
-                {
-                    let mut reader = send_handshake_and_ack(
-                        &distributed_config.bind_addr,
-                        distributed_config.token.clone(),
-                        sender,
-                        "session-new",
-                    )
-                    .await;
-
-                    for envelope in [
-                        WireEnvelope::new(
-                            1,
-                            sender,
-                            WirePayload::PaneMeta(PaneMeta {
-                                pane_id: source_pane_id,
-                                pane_uuid: Some("pane-session-reset".to_string()),
-                                domain: "prod".to_string(),
-                                title: Some("second-session".to_string()),
-                                cwd: Some("/remote/second".to_string()),
-                                rows: Some(40),
-                                cols: Some(120),
-                                observed: true,
-                                timestamp_ms: now_ms(),
-                            }),
-                        ),
-                        WireEnvelope::new(
-                            2,
-                            sender,
-                            WirePayload::PaneDelta(PaneDelta {
-                                pane_id: source_pane_id,
-                                seq: 0,
-                                content: second_marker.to_string(),
-                                content_len: second_marker.len(),
-                                captured_at_ms: now_ms(),
-                            }),
-                        ),
-                    ] {
-                        let bytes = envelope
-                            .to_json()
-                            .expect("serialize second-session envelope");
-                        reader
-                            .get_mut()
-                            .write_all(&bytes)
-                            .await
-                            .expect("write second-session envelope");
-                        reader
-                            .get_mut()
-                            .write_all(b"\n")
-                            .await
-                            .expect("write second-session envelope newline");
-                    }
-                    reader
-                        .get_mut()
-                        .flush()
-                        .await
-                        .expect("flush second-session envelopes");
-                }
-
-                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150)).await;
-
-                {
-                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                    let remote = storage_handle
-                        .get_pane(remote_pane_id)
-                        .await
-                        .unwrap()
-                        .expect("canonical remote pane should exist");
-                    assert_eq!(remote.title.as_deref(), Some("second-session"));
-
-                    let segments = storage_handle
-                        .get_segments(remote_pane_id, 10)
-                        .await
-                        .unwrap();
-                    assert!(
-                        segments
-                            .iter()
-                            .any(|seg| seg.content.contains(first_marker))
-                    );
-                    assert!(
-                        segments
-                            .iter()
-                            .any(|seg| seg.content.contains(second_marker))
-                    );
-                }
-
-                shutdown_flag.store(true, Ordering::SeqCst);
-                let _ = listener_handle.await;
-
-                {
-                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                    storage_handle.shutdown().await.expect("shutdown storage");
-                }
+                shutdown_storage_handle
+                    .shutdown()
+                    .await
+                    .expect("shutdown storage");
                 drop(storage);
+
+                let conn = rusqlite::Connection::open(&db_path).expect("open sqlite connection");
+                let remote_title: Option<String> = conn
+                    .query_row(
+                        "SELECT title FROM panes WHERE pane_id = ?1",
+                        rusqlite::params![
+                            i64::try_from(remote_pane_id).expect("remote pane id should fit i64")
+                        ],
+                        |row| row.get(0),
+                    )
+                    .expect("canonical remote pane should exist");
+                assert_eq!(remote_title.as_deref(), Some("second-session"));
+
+                let segment_text: String = conn
+                    .query_row(
+                        "SELECT COALESCE(group_concat(content, ''), '')
+                         FROM (
+                             SELECT content FROM output_segments
+                             WHERE pane_id = ?1
+                             ORDER BY seq
+                         )",
+                        rusqlite::params![
+                            i64::try_from(remote_pane_id).expect("remote pane id should fit i64")
+                        ],
+                        |row| row.get(0),
+                    )
+                    .expect("read replayed segment text");
+                assert!(segment_text.contains(first_marker));
+                assert!(segment_text.contains(second_marker));
+                drop(conn);
+
                 let _ = std::fs::remove_file(&db_path);
                 let _ = std::fs::remove_file(format!("{db_path}-wal"));
                 let _ = std::fs::remove_file(format!("{db_path}-shm"));
@@ -63245,6 +63279,7 @@ recorder_backend = "frankensqlite"
                     "auth failures must not leak server fingerprint details"
                 );
 
+                distributed_shutdown_tcp_test_reader(&mut reader);
                 drop(reader);
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -63421,6 +63456,7 @@ recorder_backend = "frankensqlite"
                     .flush()
                     .await
                     .expect("flush recovery envelope");
+                distributed_shutdown_tcp_test_reader(&mut reader);
                 drop(reader);
 
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150)).await;
@@ -63541,6 +63577,7 @@ recorder_backend = "frankensqlite"
                     "version mismatch responses should advertise protocol only, not server version"
                 );
 
+                distributed_shutdown_tcp_test_reader(&mut reader);
                 drop(reader);
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -63658,6 +63695,7 @@ recorder_backend = "frankensqlite"
                     "version mismatch responses should advertise protocol only, not server version"
                 );
 
+                distributed_shutdown_tcp_test_reader(&mut reader);
                 drop(reader);
                 frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -64091,6 +64129,70 @@ recorder_backend = "frankensqlite"
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
+    }
+
+    #[cfg(feature = "distributed")]
+    fn insert_distributed_replay_test_segment(
+        conn: &rusqlite::Connection,
+        pane_id: u64,
+        seq: u64,
+        content: &str,
+        captured_at: i64,
+    ) -> frankenterm_core::storage::Segment {
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            rusqlite::params![
+                i64::try_from(pane_id).expect("test pane id should fit in i64"),
+                i64::try_from(seq).expect("test seq should fit in i64"),
+                content,
+                i64::try_from(content.len()).expect("test content len should fit in i64"),
+                captured_at,
+            ],
+        )
+        .expect("insert replay test segment");
+
+        frankenterm_core::storage::Segment {
+            id: conn.last_insert_rowid(),
+            pane_id,
+            seq,
+            content: content.to_string(),
+            content_len: content.len(),
+            content_hash: None,
+            captured_at,
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    fn insert_distributed_replay_test_gap(
+        conn: &rusqlite::Connection,
+        pane_id: u64,
+        seq_before: u64,
+        seq_after: u64,
+        reason: &str,
+        detected_at: i64,
+    ) -> frankenterm_core::storage::Gap {
+        conn.execute(
+            "INSERT INTO output_gaps (pane_id, seq_before, seq_after, reason, detected_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                i64::try_from(pane_id).expect("test pane id should fit in i64"),
+                i64::try_from(seq_before).expect("test seq_before should fit in i64"),
+                i64::try_from(seq_after).expect("test seq_after should fit in i64"),
+                reason,
+                detected_at,
+            ],
+        )
+        .expect("insert replay test gap");
+
+        frankenterm_core::storage::Gap {
+            id: conn.last_insert_rowid(),
+            pane_id,
+            seq_before,
+            seq_after,
+            reason: reason.to_string(),
+            detected_at,
+        }
     }
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -71054,62 +71156,18 @@ log_level = "debug"
             .build()
             .unwrap()
             .block_on(async {
-                use asupersync::io::AsyncWriteExt;
-                use asupersync::net::{TcpListener, TcpStream};
-
-                let bind_probe =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
-                drop(bind_probe);
-
-                let listener = TcpListener::bind(bind_addr.to_string())
-                    .await
-                    .expect("bind rejection listener");
-                let server_task = frankenterm_core::runtime_async::task::spawn(async move {
-                    let (server, _) = listener.accept().await.expect("accept rejection client");
-                    let mut reader = asupersync::io::BufReader::new(server);
-                    let mut line = String::new();
-                    let read_size = distributed_read_line(
-                        &mut reader,
-                        &mut line,
-                        frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                    )
-                    .await
-                    .expect("read distributed handshake");
-                    assert!(
-                        read_size > 0,
-                        "client should send handshake before rejection"
-                    );
-
-                    let rejection = serde_json::json!({
-                        "ok": false,
-                        "error": {
-                            "code": "dist.auth_failed",
-                            "message": "rejected for test"
-                        }
-                    });
-                    let encoded =
-                        serde_json::to_string(&rejection).expect("serialize rejection payload");
-                    reader
-                        .get_mut()
-                        .write_all(encoded.as_bytes())
-                        .await
-                        .expect("write rejection payload");
-                    reader
-                        .get_mut()
-                        .write_all(b"\n")
-                        .await
-                        .expect("write rejection newline");
-                    reader
-                        .get_mut()
-                        .flush()
-                        .await
-                        .expect("flush rejection payload");
+                let rejection = serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "dist.auth_failed",
+                        "message": "rejected for test"
+                    }
                 });
-
-                let client = TcpStream::connect(bind_addr.to_string())
-                    .await
-                    .expect("connect rejection listener");
+                let encoded = format!(
+                    "{}\n",
+                    serde_json::to_string(&rejection).expect("serialize rejection payload")
+                );
+                let client = DistributedScriptedIo::new(encoded.into_bytes());
                 let (storage_handle, db_path) =
                     setup_storage("distributed_agent_handshake_rejection_backoff").await;
                 let storage = std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(
@@ -71157,7 +71215,6 @@ log_level = "debug"
                     1000
                 );
 
-                server_task.await.expect("join rejection listener");
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
                 cleanup_storage(storage_handle, &db_path).await;
             });
