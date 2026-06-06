@@ -1,0 +1,467 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "flight-recorder-incident-replay-convergence-attestation",
+  "category": "proofs/robot-contracts",
+  "produced_by_bead": "ft-ogr3n.8",
+  "generated_at": "2026-06-06T05:32:36Z",
+  "epic_id": "ft-ogr3n",
+  "contract_id": "ft.swarm.incident_surfaces.v1",
+  "source_adapter_contract_id": "ft.swarm.source_adapters.v1",
+  "corpus_contract_id": "ft.flight_recorder.incident_corpus.v1",
+  "overall_status": "pass",
+  "proof_categories": [4],
+  "scope": "Release-bundle convergence evidence for the swarm flight-recorder incident replay contract, retained incident corpus, robot/MCP incident surfaces, privacy guarantees, docs-static runbook, and RCH-only proof posture.",
+  "raw_pane_content_stored": false,
+  "live_mutation_allowed": false,
+  "side_effects_executed": false,
+  "local_heavy_cargo_counted": false,
+  "forbidden_actions": {
+    "agent_mail_service_repaired": false,
+    "agent_mail_service_restarted": false,
+    "agent_mail_process_killed": false,
+    "rch_worker_mutated": false,
+    "remote_source_deleted_or_mutated": false,
+    "destructive_git_cleanup": false,
+    "file_deleted": false,
+    "local_heavy_cargo_fallback_counted": false,
+    "live_panes_mutated": false
+  },
+  "retained_corpus": {
+    "manifest_path": "fixtures/flight-recorder/incident-corpus/manifest.v1.json",
+    "schema_version": "ft.flight_recorder.incident_corpus.v1",
+    "scenario_count": 5,
+    "proof_ledger_entries": 5,
+    "invalid_case_count": 7,
+    "scenario_ids": [
+      "rch_mirror_before_cargo",
+      "remote_cargo_pass",
+      "dirty_tree_contaminated",
+      "agent_mail_outage_beads_fallback",
+      "bead_closeout_mirror"
+    ],
+    "required_negative_cases": [
+      "missing-source-set-artifact",
+      "duplicate-scenario-id",
+      "absolute-artifact-path",
+      "parent-relative-artifact-path",
+      "local-cargo-counted",
+      "agent-mail-service-repair",
+      "remote-pass-missing-worker"
+    ],
+    "outcome_counts": {
+      "source_pass": 2,
+      "infrastructure_block": 1,
+      "contaminated_proof_attempt": 1,
+      "source_unavailable": 1
+    },
+    "side_effects_forbidden_by_manifest": {
+      "live_panes_mutated": true,
+      "external_services_called": true,
+      "agent_mail_repair_attempted": true,
+      "agent_mail_service_restarted": true,
+      "rch_worker_mutated": true,
+      "file_deleted": true,
+      "local_cargo_counted": true
+    }
+  },
+  "child_acceptance_matrix": [
+    {
+      "bead_id": "ft-ogr3n.1",
+      "title": "Causal event schema and storage contract",
+      "status": "closed",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        "crates/frankenterm-core-replay-types/src/swarm_causal_event.rs",
+        "crates/frankenterm-core-replay-types/src/lib.rs"
+      ],
+      "proof": {
+        "job": "j-29862592113541159",
+        "worker": "vmi1227854",
+        "remote": true,
+        "exit_code": 0,
+        "result": "54 lib tests passed, 8 proptest tests passed, doctests 0 passed/0 failed"
+      }
+    },
+    {
+      "bead_id": "ft-ogr3n.2",
+      "title": "Source adapters for panes, Beads, RCH, git, and mail",
+      "status": "closed",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        "crates/frankenterm-core-replay-types/src/source_adapters.rs",
+        "fixtures/flight-recorder/source-adapters/valid-source-set.json"
+      ],
+      "proof": {
+        "test_job": "j-29871232832766289",
+        "clippy_job": "j-29871232832766296",
+        "worker": "vmi1149989",
+        "remote": true,
+        "exit_code": 0,
+        "result": "source_adapters lib filter passed 8 tests; all-targets clippy passed"
+      }
+    },
+    {
+      "bead_id": "ft-ogr3n.3",
+      "title": "Deterministic causality engine and incident DAG",
+      "status": "closed",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        "crates/frankenterm-core-replay-types/src/incident_dag.rs",
+        "crates/frankenterm/src/main.rs"
+      ],
+      "proof": {
+        "focused_jobs": [
+          {
+            "job": "j-29871232832766307",
+            "worker": "vmi1149989",
+            "command": "cargo test --locked -p frankenterm-core-replay-types incident_dag --lib",
+            "exit_code": 0,
+            "result": "8 passed"
+          },
+          {
+            "job": "j-29871232832766309",
+            "worker": "vmi1264463",
+            "command": "cargo clippy --locked -p frankenterm-core-replay-types --all-targets -- -D warnings",
+            "exit_code": 0
+          },
+          {
+            "job": "j-29871232832766308",
+            "worker": "vmi1293453",
+            "command": "cargo test --locked -p frankenterm --bin ft cli_demo",
+            "exit_code": 0,
+            "result": "4 passed"
+          }
+        ],
+        "workspace_jobs": [
+          {
+            "job": "j-29871232832766314",
+            "worker": "vmi1293453",
+            "command": "cargo check --locked --workspace --all-targets",
+            "exit_code": 0
+          },
+          {
+            "job": "j-29871232832766316",
+            "worker": "vmi1149989",
+            "command": "cargo clippy --locked --workspace --all-targets -- -D warnings",
+            "exit_code": 0
+          }
+        ]
+      }
+    },
+    {
+      "bead_id": "ft-ogr3n.4",
+      "title": "Robot and MCP incident replay surfaces",
+      "status": "closed",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core-replay/src/replay_incidents.rs"
+      ],
+      "proof": {
+        "replay_tests_job": "j-29871232832766509",
+        "cli_incidents_job": "j-29871232832766514",
+        "golden_corpus_job": "j-29871232832766538",
+        "workspace_check_job": "j-29871232832766549",
+        "workspace_clippy_job": "j-29871232832766541",
+        "workers": ["vmi1227854", "vmi1293453"],
+        "remote": true,
+        "exit_code": 0,
+        "result": "read-only robot/MCP incident surfaces, replay error envelopes, golden corpus, workspace check, and workspace clippy passed"
+      }
+    },
+    {
+      "bead_id": "ft-ogr3n.5",
+      "title": "Privacy, redaction, retention, and size budgets",
+      "status": "closed",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        "crates/frankenterm-core-replay-types/src/swarm_causal_event.rs"
+      ],
+      "proof": {
+        "test_job": "j-29871232832766239",
+        "clippy_job": "j-29871232832766242",
+        "workspace_check_job": "j-29871232832766243",
+        "workspace_clippy_job": "j-29871232832766250",
+        "worker": "vmi1293453",
+        "remote": true,
+        "exit_code": 0,
+        "result": "swarm_causal_event privacy tests passed 19 tests; changed crate clippy, workspace check, and workspace clippy passed"
+      }
+    },
+    {
+      "bead_id": "ft-ogr3n.6",
+      "title": "Golden incident corpus and no-mock replay harness",
+      "status": "closed",
+      "readiness_state": "measured",
+      "implementation_surfaces": [
+        "fixtures/flight-recorder/incident-corpus/manifest.v1.json",
+        "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl",
+        "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json",
+        "fixtures/flight-recorder/incident-corpus/source-sets/*.json",
+        "fixtures/flight-recorder/incident-corpus/golden/*.json",
+        "fixtures/flight-recorder/incident-corpus/golden/*.toon",
+        "tests/e2e/test_flight_recorder_incident_corpus.sh",
+        "crates/frankenterm-core-replay/src/replay_incidents.rs"
+      ],
+      "proof": {
+        "static_verifier": "bash tests/e2e/test_flight_recorder_incident_corpus.sh",
+        "static_result": "flight-recorder incident corpus: static verifier passed (5 scenarios, 5 proof-ledger entries, 7 invalid cases)",
+        "test_job": "j-29871232832766564",
+        "clippy_job": "j-29871232832766575",
+        "worker": "vmi1227854",
+        "remote": true,
+        "exit_code": 0,
+        "result": "cargo test -p frankenterm-core-replay replay_incidents --lib passed 6 tests; all-targets clippy passed",
+        "non_counted_context": "Broad workspace check j-29871232832766568 reached the changed crate but ended with RCH-E104 SSH timeout; it is not counted as passing proof."
+      }
+    },
+    {
+      "bead_id": "ft-ogr3n.7",
+      "title": "Operator docs, trust boundaries, and incident runbook",
+      "status": "closed",
+      "readiness_state": "docs_static",
+      "implementation_surfaces": [
+        "README.md",
+        "docs/flight-recorder/README.md",
+        "docs/operator-playbook.md",
+        "docs/operator-runbook.md",
+        "tests/e2e/test_flight_recorder_incident_corpus.sh"
+      ],
+      "proof": {
+        "cargo_rch_required": false,
+        "static_checks": [
+          "git diff --check on touched docs/static paths",
+          "bash -n tests/e2e/test_flight_recorder_incident_corpus.sh",
+          "jq empty on retained incident corpus JSON",
+          "bash tests/e2e/test_flight_recorder_incident_corpus.sh",
+          "br dep cycles --json count 0"
+        ],
+        "result": "docs-static runbook and pointers passed; no Cargo/RCH proof lane claimed"
+      }
+    }
+  ],
+  "fresh_convergence_proof": {
+    "status": "pass",
+    "all_jobs_remote": true,
+    "all_exit_codes_zero": true,
+    "local_cargo_counted": false,
+    "jobs": [
+      {
+        "claim_id": "schema_adapter_causality_privacy_replay_types",
+        "job": "j-29871232832766646",
+        "worker": "vmi1227854",
+        "remote": true,
+        "exit_code": 0,
+        "command": "RCH_WORKER=vmi1152480 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false RCH_TEST_TIMEOUT_SEC=9000 RCH_BUILD_TIMEOUT_SEC=9000 RCH_REMOTE_PREFLIGHT_WAIT_SECS=900 RCH_WORKER_SELECTION_WAIT_SECS=900 rch --no-self-healing exec -- env TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/ft-ogr3n8-replay-types-captured CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true GIT_TERMINAL_PROMPT=0 cargo test -p frankenterm-core-replay-types --lib -- --nocapture",
+        "requested_target_dir": "/tmp/ft-ogr3n8-replay-types-captured",
+        "remote_target_dir": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1227854-job-29871232832766646-1780721305987477000-0",
+        "cargo_reached": true,
+        "cargo_test_reached": true,
+        "test_reached": true,
+        "local_cargo_counted": false,
+        "result": "77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        "total_seconds": 217.8,
+        "rch_wall_seconds": 401.5,
+        "timing": {
+          "sync_up_ms": 172597,
+          "exec_ms": 43247,
+          "sync_down_ms": 1935
+        },
+        "artifact_retrieval": {
+          "files": 565,
+          "bytes": 2385
+        }
+      },
+      {
+        "claim_id": "golden_replay_harness",
+        "job": "j-29871232832766639",
+        "worker": "vmi1156319",
+        "remote": true,
+        "exit_code": 0,
+        "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false RCH_TEST_TIMEOUT_SEC=9000 RCH_BUILD_TIMEOUT_SEC=9000 RCH_REMOTE_PREFLIGHT_WAIT_SECS=900 RCH_WORKER_SELECTION_WAIT_SECS=900 rch --no-self-healing exec -- env TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/ft-ogr3n8-replay-surfaces CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true GIT_TERMINAL_PROMPT=0 cargo test -p frankenterm-core-replay replay_incidents --lib -- --nocapture",
+        "requested_target_dir": "/tmp/ft-ogr3n8-replay-surfaces",
+        "remote_target_dir": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1156319-job-29871232832766639-1780719849461338000-0",
+        "cargo_reached": true,
+        "cargo_test_reached": true,
+        "test_reached": true,
+        "local_cargo_counted": false,
+        "result": "6 passed; 0 failed; 0 ignored; 0 measured; 976 filtered out; includes list_show_explain_and_replay_expose_read_only_contract and incident_golden_corpus_matches_replay_surfaces",
+        "total_seconds": 1111.2,
+        "rch_wall_seconds": 1434.5,
+        "timing": {
+          "sync_up_ms": 187192,
+          "exec_ms": 920511,
+          "sync_down_ms": 3497
+        },
+        "artifact_retrieval": {
+          "files": 1725,
+          "bytes": 2385
+        }
+      },
+      {
+        "claim_id": "robot_cli_incident_contract",
+        "job": "j-29871232832766640",
+        "worker": "vmi1227854",
+        "remote": true,
+        "exit_code": 0,
+        "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false RCH_TEST_TIMEOUT_SEC=9000 RCH_BUILD_TIMEOUT_SEC=9000 RCH_REMOTE_PREFLIGHT_WAIT_SECS=900 RCH_WORKER_SELECTION_WAIT_SECS=900 rch --no-self-healing exec -- env TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/ft-ogr3n8-robot-incidents CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true GIT_TERMINAL_PROMPT=0 cargo test -p frankenterm --bin ft robot_incidents -- --nocapture",
+        "requested_target_dir": "/tmp/ft-ogr3n8-robot-incidents",
+        "remote_target_dir": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1227854-job-29871232832766640-1780719737999311000-0",
+        "cargo_reached": true,
+        "cargo_test_reached": true,
+        "test_reached": true,
+        "local_cargo_counted": false,
+        "result": "2 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; covers cli_robot_incidents_parses_list_show_explain_replay and robot_incidents_payloads_are_read_only_redacted_and_toon_safe",
+        "total_seconds": 1365.5,
+        "rch_wall_seconds": 1571.5,
+        "timing": {
+          "sync_up_ms": 173408,
+          "exec_ms": 1190154,
+          "sync_down_ms": 1974
+        },
+        "artifact_retrieval": {
+          "files": 565,
+          "bytes": 2385
+        }
+      }
+    ],
+    "evidence_limitations": [
+      "All fresh convergence lanes were foreground RCH runs with stdout, worker identity, requested target dir, rewritten remote target dir, exit code, and artifact retrieval metadata retained.",
+      "The first replay-types attempt before j-29871232832766646 was refused as local fallback with no worker assigned and is not counted as proof."
+    ]
+  },
+  "manifest_completeness_proof": {
+    "status": "pass",
+    "worker": "vmi1227854",
+    "job": "j-29871232832766657",
+    "remote": true,
+    "exit_code": 0,
+    "command": "RCH_QUEUE_WHEN_BUSY=1 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false RCH_TEST_TIMEOUT_SEC=9000 RCH_BUILD_TIMEOUT_SEC=9000 RCH_REMOTE_PREFLIGHT_WAIT_SECS=900 RCH_WORKER_SELECTION_WAIT_SECS=900 rch --no-self-healing exec -- env TMPDIR=/tmp CARGO_TARGET_DIR=/tmp/ft-ogr3n8-attestation-manifest-fallback CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true GIT_TERMINAL_PROMPT=0 cargo test -p frankenterm-core --test attestation_manifest_completeness --no-default-features -- --nocapture",
+    "requested_target_dir": "/tmp/ft-ogr3n8-attestation-manifest-fallback",
+    "remote_target_dir": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1227854-job-29871232832766657-1780723085324805000-0",
+    "test_binary": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1227854-job-29871232832766657-1780723085324805000-0/debug/deps/attestation_manifest_completeness-fd6880ebebba0634",
+    "result": "16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+    "test_time_seconds": 0.01,
+    "remote_command_elapsed_ms": 641973,
+    "total_seconds": 817.0,
+    "rch_wall_seconds": 878.5,
+    "sync_seconds": 173.0,
+    "build_seconds": 642.0,
+    "artifact_retrieval_seconds": 2.0,
+    "artifact_retrieval": {
+      "files": 565,
+      "bytes": 2385
+    },
+    "cache": "miss",
+    "local_cargo_counted": false,
+    "rerun_reason": "Initial remote manifest-completeness proof j-29871232832766653 failed because the RCH mirror omitted .beads/issues.jsonl and the embedded producer fallback did not yet include ft-ogr3n.8; the fallback was updated and this rerun passed."
+  },
+  "source_artifacts": [
+    {
+      "path": "fixtures/flight-recorder/incident-corpus/manifest.v1.json",
+      "media_type": "application/json",
+      "sha256": "2cbdaf0cdc6d410a88f401aa6a11f8340bbd6405e41f7e62a7ff47e588980ddd",
+      "size_bytes": 6203
+    },
+    {
+      "path": "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json",
+      "media_type": "application/json",
+      "sha256": "caaeeb3bc138e825ce9f043dc425f3291e3988c2d84410af41b58aae678c2c51",
+      "size_bytes": 2547
+    },
+    {
+      "path": "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl",
+      "media_type": "application/jsonl",
+      "sha256": "ce217016e7bc1926de5721b19046d995a4c10c77b3e41109bb98c2c4c33c9f8f",
+      "size_bytes": 11080
+    },
+    {
+      "path": "fixtures/flight-recorder/incident-corpus/invalid/fragments.v1.json",
+      "media_type": "application/json",
+      "sha256": "c68669e6f394f8c92c6d100c990fb27739413b14ad6b1752910b32f25e38c103",
+      "size_bytes": 2880
+    },
+    {
+      "path": "tests/e2e/test_flight_recorder_incident_corpus.sh",
+      "media_type": "text/x-shellscript",
+      "sha256": "0b7b52b90f5504192ca1010abde1018ec5324bfd2af3d5fdd06b1e864ffb5d76",
+      "size_bytes": 18118
+    },
+    {
+      "path": "crates/frankenterm-core-replay/src/replay_incidents.rs",
+      "media_type": "text/plain",
+      "sha256": "c37fb08c22606cfea8b59c794a15e0b768ff2d1c3c75bff02045cf42e67911e9",
+      "size_bytes": 59639
+    },
+    {
+      "path": "crates/frankenterm-core-replay-types/src/source_adapters.rs",
+      "media_type": "text/plain",
+      "sha256": "07a0bcdbf183e5ff1e5ef1f5ddf1e11b1c98b6361391261ea0b06b30ecc229be",
+      "size_bytes": 42327
+    },
+    {
+      "path": "crates/frankenterm-core-replay-types/src/swarm_causal_event.rs",
+      "media_type": "text/plain",
+      "sha256": "7cfcea7b249a8f65d2145b36e689064e556f59627fa575a49c590e8d7c654339",
+      "size_bytes": 57200
+    },
+    {
+      "path": "crates/frankenterm-core-replay-types/src/incident_dag.rs",
+      "media_type": "text/plain",
+      "sha256": "3a73dea3a9115d8509082b74b7037c20867d626aeea86fd44c5266a72fbb6cc6",
+      "size_bytes": 42549
+    },
+    {
+      "path": "crates/frankenterm/src/main.rs",
+      "media_type": "text/plain",
+      "sha256": "20cefdeddf81da69fb789ca277954daed336a4170ebb1b89d3e5a7ded089e878",
+      "size_bytes": 3113084
+    },
+    {
+      "path": "crates/frankenterm-core/tests/attestation_manifest_completeness.rs",
+      "media_type": "text/plain",
+      "sha256": "a1ee544d7c0496ea3f52faec8bfac0a7d336568c2bd1c57ba7c4f448d2675f1d",
+      "size_bytes": 36985
+    },
+    {
+      "path": "docs/operator-runbook.md",
+      "media_type": "text/markdown",
+      "sha256": "b651860180e3b9651d75423becc9b9a7710a87352e713d44b21ec1f22f2284b1",
+      "size_bytes": 72125
+    },
+    {
+      "path": "docs/operator-playbook.md",
+      "media_type": "text/markdown",
+      "sha256": "d78971b9dd4564a6ca5fa7e9c7238b442baabccc04fd07bfe02bd811ea85b83c",
+      "size_bytes": 15766
+    },
+    {
+      "path": "docs/flight-recorder/README.md",
+      "media_type": "text/markdown",
+      "sha256": "330c99c1550cae3f4646701107f4e4599e8ac51167982dfd688e4c41547200d6",
+      "size_bytes": 1427
+    },
+    {
+      "path": "README.md",
+      "media_type": "text/markdown",
+      "sha256": "239b8a0875380d6af49a846036e5ca108998a044911a2b49be13f4bf45cd0bfe",
+      "size_bytes": 250937
+    }
+  ],
+  "validation": {
+    "focused_rch_harness": "pass",
+    "attestation_manifest_completeness_rch": "pass",
+    "static_manifest_verifier": "bash tests/e2e/test_flight_recorder_incident_corpus.sh",
+    "static_manifest_verifier_result": "flight-recorder incident corpus: static verifier passed (5 scenarios, 5 proof-ledger entries, 7 invalid cases)",
+    "beads_dependency_cycles": "br dep cycles --json count 0 required before closeout",
+    "release_bundle_checks": "recorded in ft-ogr3n.8 closeout"
+  },
+  "release_bundle": {
+    "manifest_path": "docs/attestations/manifest.json",
+    "manifest_category": "proofs/robot-contracts",
+    "manifest_slot_path": "docs/attestations/proofs/flight-recorder-incident-replay.json",
+    "manifest_category_required": true,
+    "this_slot_optional": true,
+    "bundle_hashing": "scripts/attestation-build.sh hashes this artifact into dev and release bundles."
+  }
+}

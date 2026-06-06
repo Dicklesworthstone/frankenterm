@@ -66,6 +66,13 @@ fixture-only states. A release claim may cite a concrete receipt only for the
 criteria whose evidence is proven; blocked, skipped, degraded, simulated, or
 fixture-only rows stay visible as non-production proof states.
 
+`proofs/robot-contracts` also hashes
+`docs/attestations/proofs/flight-recorder-incident-replay.json`, the
+`ft-ogr3n.8` convergence artifact for `ft.swarm.incident_surfaces.v1`. It
+maps the flight-recorder child beads to retained incident-corpus artifacts,
+read-only robot/MCP incident surfaces, no-side-effect guarantees, and RCH-only
+proof lanes.
+
 `proofs/tx-killswitch` hashes
 `docs/attestations/proofs/tx-killswitch.json`, which points at the
 TLA+ spec, TLC summary contract, Rust state-space harness, and
