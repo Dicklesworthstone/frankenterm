@@ -6,8 +6,9 @@ Source design: `ft-wjjkp.2`
 
 Target implementation: `ft-wjjkp.3`
 
-Status: static conformance matrix plus `ft-wjjkp.3` source implementation
-target. Retained RCH proof remains the `ft-wjjkp.4` closeout requirement.
+Status: static conformance matrix plus `ft-wjjkp.3` source implementation.
+`ft-wjjkp.4` retained current-tree RCH proof in
+`docs/security/redaction-evidence-byte-semantics-proof.json`.
 
 ## Scope
 
@@ -32,18 +33,17 @@ is `fixtures/redaction-evidence-byte-semantics/verify-requirements.sh`.
 
 | Area | MUST requirements | Fixture-covered | Runtime implementation status |
 |---|---:|---:|---|
-| Evidence fields | 7 | 7 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
-| Derived-only values | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
-| Streaming accounting | 2 | 2 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
-| Merge behavior | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
-| Cold-tier propagation | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
-| Mmap append/header accounting | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
-| Privacy and legacy-name guardrails | 2 | 2 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
+| Evidence fields | 7 | 7 | implemented in `ft-wjjkp.3`; current-tree RCH proof retained under `ft-wjjkp.4` |
+| Derived-only values | 1 | 1 | implemented in `ft-wjjkp.3`; current-tree RCH proof retained under `ft-wjjkp.4` |
+| Streaming accounting | 2 | 2 | implemented in `ft-wjjkp.3`; current-tree RCH proof retained under `ft-wjjkp.4` |
+| Merge behavior | 1 | 1 | implemented in `ft-wjjkp.3`; current-tree RCH proof retained under `ft-wjjkp.4` |
+| Cold-tier propagation | 1 | 1 | implemented in `ft-wjjkp.3`; current-tree RCH proof retained under `ft-wjjkp.4` |
+| Mmap append/header accounting | 1 | 1 | implemented in `ft-wjjkp.3`; current-tree RCH proof retained under `ft-wjjkp.4` |
+| Privacy and legacy-name guardrails | 2 | 2 | implemented in `ft-wjjkp.3`; current-tree RCH proof retained under `ft-wjjkp.4` |
 
 Static coverage is complete for the requirements listed here. Source
-conformance is implemented in `ft-wjjkp.3`; material closeout remains pending
-until `ft-wjjkp.4` records RCH proof for the implementation lanes named in the
-source design.
+conformance is implemented in `ft-wjjkp.3`; material closeout proof for the
+current redactor/storage tree is retained under `ft-wjjkp.4`.
 
 ## Requirement Matrix
 
@@ -94,6 +94,6 @@ br dep cycles --json
 ```
 
 These checks verify the retained requirements, fixture coverage, and privacy
-guardrails. They are intentionally static. The implementation proof remains
-the RCH-backed test/check lane described in
-`docs/security/redaction-evidence-byte-semantics.md`.
+guardrails. They are intentionally static. The implementation proof is the
+passing RCH-backed lane retained in
+`docs/security/redaction-evidence-byte-semantics-proof.json`.

@@ -69,6 +69,12 @@ material. `PipelineHealth::record_write` still receives a boolean
 `redactor_applied` privacy invariant rather than inferring application from
 replacement counts.
 
+`ft-wjjkp.4` retains the RCH proof ledger for this contract in
+`docs/security/redaction-evidence-byte-semantics-proof.json`. That artifact is
+not a release-bundle manifest slot; the current release manifest keeps
+`security/redactor-coverage` as the coverage artifact while this file and the
+byte-semantics proof ledger document the cold-tier privacy contract.
+
 Compile-time invariants (verified by absence — these
 patterns *cannot* compile):
 

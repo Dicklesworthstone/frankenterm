@@ -114,6 +114,8 @@ const STREAMING_SECRET_ANCHORS: &[&str] = &[
     "authorization",
     "Bearer ",
     "bearer ",
+    "https://",
+    "http://",
     "api_key",
     "api-key",
     "apikey",
@@ -1155,8 +1157,15 @@ impl StreamingRedactor {
             let anchor_lower = anchor.to_ascii_lowercase();
             if let Some(offset) = suffix_lower.rfind(anchor_lower.as_str()) {
                 let candidate = scan_start + offset;
+                let candidate_value_start = candidate + anchor.len();
                 let covered_by_complete_detection = detections.iter().any(|(_, start, end)| {
-                    *start == candidate && candidate < *end && *end < current_boundary
+                    *end < current_boundary
+                        && ((*start <= candidate && candidate < *end)
+                            || keyed_anchor_reaches_detection_value(
+                                self.pending.as_str(),
+                                candidate_value_start,
+                                *start,
+                            ))
                 });
                 if !covered_by_complete_detection {
                     earliest = earliest.min(candidate);
@@ -1169,6 +1178,12 @@ impl StreamingRedactor {
                     earliest = earliest.min(current_boundary - prefix.len());
                 }
             }
+        }
+
+        if let Some(boundary_start) =
+            trailing_generic_token_or_secret_boundary_start(self.pending.as_str(), current_boundary)
+        {
+            earliest = earliest.min(boundary_start);
         }
 
         floor_char_boundary(self.pending.as_str(), earliest)
@@ -1189,6 +1204,35 @@ impl StreamingRedactor {
         let prefix = self.pending.take_prefix(boundary);
         redact_decoded_text_with_evidence(&self.redactor, &prefix)
     }
+}
+
+fn keyed_anchor_reaches_detection_value(
+    pending: &str,
+    candidate_value_start: usize,
+    detection_start: usize,
+) -> bool {
+    if candidate_value_start > detection_start {
+        return false;
+    }
+
+    let bridge = &pending[candidate_value_start..detection_start];
+    !bridge.is_empty()
+        && bridge
+            .chars()
+            .all(|ch| matches!(ch, '=' | ':' | '"' | '\'') || ch.is_ascii_whitespace())
+}
+
+fn trailing_generic_token_or_secret_boundary_start(
+    pending: &str,
+    current_boundary: usize,
+) -> Option<usize> {
+    if current_boundary == 0 {
+        return None;
+    }
+
+    let boundary_start = current_boundary - 1;
+    let byte = pending.as_bytes()[boundary_start];
+    matches!(byte, b'_' | b'-').then_some(boundary_start)
 }
 
 impl Default for StreamingRedactor {
@@ -1572,6 +1616,80 @@ mod tests {
             assert_eq!(out, expected, "split={split}");
             let rendered = String::from_utf8(out).unwrap();
             assert!(!rendered.contains("sk-ant-api03-"), "split={split}");
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_emits_delimited_complete_secret_without_finish_tail() {
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let input = format!("export OPENAI_API_KEY={secret}\n");
+        let mut streaming = StreamingRedactor::new();
+
+        let result = streaming.redact_chunk(input.as_bytes());
+
+        assert_eq!(
+            String::from_utf8(result.bytes).expect("streaming redactor emits UTF-8"),
+            Redactor::new().redact(&input)
+        );
+        assert_eq!(streaming.pending_bytes(), 0);
+        assert!(streaming.finish().bytes.is_empty());
+    }
+
+    #[test]
+    fn streaming_redactor_retains_open_key_anchor_before_unrelated_detection() {
+        let complete_secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let input = format!("prefix api_key=short-value {complete_secret}\n");
+        let mut streaming = StreamingRedactor::new();
+
+        let result = streaming.redact_chunk(input.as_bytes());
+        let emitted = String::from_utf8(result.bytes).expect("streaming redactor emits UTF-8");
+
+        assert_eq!(emitted, "prefix ");
+        assert_eq!(
+            streaming.pending_text(),
+            format!("api_key=short-value {complete_secret}\n")
+        );
+    }
+
+    #[test]
+    fn streaming_redactor_retains_oauth_url_prefix_before_query_token() {
+        let input = "redirect=https://example.com/cb?access_token=abc123def456&state=xyz";
+        let split = "redirect=https:/".len();
+        let mut streaming = StreamingRedactor::new();
+
+        let mut streamed = Vec::new();
+        streamed.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
+        streamed.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+        streamed.extend(streaming.finish().bytes);
+
+        assert_eq!(
+            String::from_utf8(streamed).expect("streaming redactor emits UTF-8"),
+            Redactor::new().redact(input)
+        );
+    }
+
+    #[test]
+    fn streaming_redactor_retains_key_separator_before_generic_token_or_secret() {
+        for (key_prefix, key_suffix, value) in [
+            ("auth_", "token", "AAAABBBBCCCCDDDDEEEEFFFF"),
+            ("client-", "secret", "AAAABBBBCCCCDDDDEEEEFFFF"),
+        ] {
+            let input = format!("{key_prefix}{key_suffix}: \"{value}\"");
+            let expected = Redactor::new().redact(&input);
+            assert_ne!(expected, input, "fixture must actually redact");
+
+            let split = key_prefix.len();
+            let mut streaming = StreamingRedactor::new();
+            let mut streamed = Vec::new();
+            streamed.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
+            streamed.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+            streamed.extend(streaming.finish().bytes);
+
+            assert_eq!(
+                String::from_utf8(streamed).expect("streaming redactor emits UTF-8"),
+                expected,
+                "key_prefix={key_prefix:?} key_suffix={key_suffix:?}"
+            );
         }
     }
 

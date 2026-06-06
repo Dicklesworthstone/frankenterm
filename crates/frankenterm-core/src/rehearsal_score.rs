@@ -2282,12 +2282,11 @@ mod tests {
             Some("sha256:7f33c947552bbecf774a3172200b44fd9e014c0a1b7365e37bbea04a9b1c845b")
         );
 
-        let usage_limit_log =
-            find_criterion(&extraction, "demo.usage_limit.artifact.structured_log");
+        let usage_limit_log = find_criterion(&extraction, "demo.usage_limit.artifact.proof_ledger");
         assert_eq!(usage_limit_log.verdict, RehearsalVerdict::MissingEvidence);
         assert_eq!(
             usage_limit_log.evidence[0].reference,
-            "tests/e2e/logs/demo-lab/usage_limit.proof-ledger.jsonl"
+            "fixtures/demo-lab/proof/proof-ledger.v1.jsonl"
         );
 
         let fallback_policy = find_criterion(

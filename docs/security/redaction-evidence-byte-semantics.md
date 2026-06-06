@@ -1,10 +1,11 @@
 # Redaction Evidence Byte Semantics
 
-Beads: `ft-wjjkp.2`, `ft-wjjkp.3`
+Beads: `ft-wjjkp.2`, `ft-wjjkp.3`, `ft-wjjkp.4`
 
 Status: design accepted under `ft-wjjkp.2`; source implementation landed under
-`ft-wjjkp.3`; retained RCH proof and any release-attestation update remain the
-`ft-wjjkp.4` closeout scope.
+`ft-wjjkp.3`; `ft-wjjkp.4` retained current-tree RCH proof for the streaming
+redactor storage boundary fixes. The retained proof ledger is
+`docs/security/redaction-evidence-byte-semantics-proof.json`.
 
 ## Previous State
 
@@ -176,6 +177,12 @@ No database migration is required unless `ft-wjjkp.3` chooses to persist the
 new evidence fields. If it does, the migration must store counts only and must
 not store raw spans, raw bytes, hashes of secrets, or surrounding context.
 
+`ft-wjjkp.4` also targets the production storage and mmap mirror path for
+streaming redaction across segment boundaries. The storage layer uses
+`StreamingRedactor::redact_chunk` output for persisted segment bytes and flushes
+retained redacted tails before gap, shutdown, panic-recovery, or writer-drain
+paths.
+
 ### Telemetry
 
 The following counters remain aggregate health signals rather than byte
@@ -254,23 +261,50 @@ Required edge tests:
 - cold-tier conversion preserving every evidence field
 - mmap append report and header accounting using replacement counts
 
-## RCH Proof Requirements For `ft-wjjkp.4`
+## RCH Proof Ledger For `ft-wjjkp.4`
 
-Compiled proof must run through RCH, not local Cargo. The implementation bead
-should retain logs for these lanes:
+Compiled proof must run through RCH, not local Cargo. The retained proof ledger
+is `docs/security/redaction-evidence-byte-semantics-proof.json`.
+
+Accepted current-tree RCH lanes:
 
 ```bash
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --lib redactor::
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --lib scrollback_cold_tier_pipeline::
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --lib scrollback_mmap_writer::
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p frankenterm-core --test cold_tier_privacy_integration
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check -p frankenterm-core --lib
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false RCH_TEST_TIMEOUT_SEC=9000 RCH_BUILD_TIMEOUT_SEC=9000 RCH_REMOTE_PREFLIGHT_WAIT_SECS=900 RCH_WORKER_SELECTION_WAIT_SECS=900 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true GIT_TERMINAL_PROMPT=0 cargo test -p frankenterm-core --lib streaming_redactor -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false RCH_TEST_TIMEOUT_SEC=9000 RCH_BUILD_TIMEOUT_SEC=9000 RCH_REMOTE_PREFLIGHT_WAIT_SECS=900 RCH_WORKER_SELECTION_WAIT_SECS=900 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-wjjkp4-cold-tier-current-proof-20260606-lavender CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true GIT_TERMINAL_PROMPT=0 cargo test -p frankenterm-core --test cold_tier_privacy_integration -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false RCH_TEST_TIMEOUT_SEC=9000 RCH_BUILD_TIMEOUT_SEC=9000 RCH_REMOTE_PREFLIGHT_WAIT_SECS=900 RCH_WORKER_SELECTION_WAIT_SECS=900 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS=-Cdebuginfo=0 CARGO_NET_GIT_FETCH_WITH_CLI=true GIT_TERMINAL_PROMPT=0 cargo test -p frankenterm-core --lib storage_segment_redactor_flushes_retained_tail_before_gap -- --nocapture
 ```
 
-Static proof before the RCH lanes:
+Retained streaming-redactor results:
+
+- `j-29871232832766780` on `vmi1227854`: exit status `0`; result `20`
+  tests passed, `0` failed, `29010` filtered out; RCH footer
+  `[RCH] remote vmi1227854 (1733.9s)`.
+- `j-29871232832766781` on `vmi1149989`: exit status `0`; result `20`
+  tests passed, `0` failed, `29010` filtered out; RCH footer
+  `[RCH] remote vmi1149989 (1841.9s)`.
+
+Retained cold-tier integration result:
+
+- `j-29871232832766792` on `vmi1227854`: exit status `0`; result `3`
+  tests passed, `0` failed; test binary artifact
+  `/Users/jemanuel/projects/frankenterm/.rch-target-vmi1227854-job-29871232832766792-1780747285064755000-0/debug/deps/cold_tier_privacy_integration-2e01c9240fd1ff4e`;
+  RCH footer `[RCH] remote vmi1227854 (1377.9s)`.
+
+Retained storage-tail result:
+
+- `j-29871232832766794` on `vmi1149989`: exit status `0`; result `1`
+  test passed, `0` failed, `29029` filtered out; test binary artifact
+  `/Users/jemanuel/projects/frankenterm/.rch-target-vmi1149989-job-29871232832766794-1780747456420112000-0/debug/deps/frankenterm_core-c06eef094b85981c`;
+  RCH footer `[RCH] remote vmi1149989 (1944.4s)`.
+
+Earlier failed and superseded RCH lanes are retained in
+`docs/security/redaction-evidence-byte-semantics-proof.json` as fail-closed
+diagnostic history, not acceptance proof.
+
+Static proof retained for the closeout:
 
 ```bash
-rg -n "\bbytes_replaced\b" crates/frankenterm-core/src crates/frankenterm-core/tests docs
+rg -n "\bbytes_replaced\b" crates/frankenterm-core/src crates/frankenterm-core/tests
 git diff --check -- crates/frankenterm-core/src/redactor.rs \
   crates/frankenterm-core/src/scrollback_cold_tier_pipeline.rs \
   crates/frankenterm-core/src/scrollback_mmap_writer.rs \
@@ -284,3 +318,6 @@ document describing the retired field or an intentional external compatibility
 note approved by the operator. First-party evidence structs should not expose
 it. The implemented `secret_input_bytes_replaced` field is intentionally
 separate from the retired standalone field name.
+
+`br dep cycles --json` returned `{"cycles":[],"count":0}` for the retained
+closeout.

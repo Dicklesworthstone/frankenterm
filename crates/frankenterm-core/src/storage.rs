@@ -7961,7 +7961,7 @@ fn dispatch_write_command_raw_recovering(
                 error = %message,
                 "storage writer dispatch panic recovered; failing undispatched batch commands"
             );
-            flush_segment_redactors(segment_redactors);
+            flush_segment_redactors(backend, mmap_mirror, segment_redactors);
             if command_was_shutdown {
                 *should_break = true;
             }
@@ -8203,7 +8203,7 @@ fn writer_loop(
         }
     }
 
-    flush_segment_redactors(&mut segment_redactors);
+    flush_segment_redactors(backend, mmap_mirror, &mut segment_redactors);
 }
 
 #[cfg(test)]
@@ -8759,8 +8759,9 @@ fn dispatch_write_command_raw(
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
-            let result = flush_segment_redactor_for_pane(segment_redactors, pane_id)
-                .and_then(|()| record_gap_backend(backend, pane_id, &reason));
+            let result =
+                flush_segment_redactor_for_pane(backend, mmap_mirror, segment_redactors, pane_id)
+                    .and_then(|()| record_gap_backend(backend, pane_id, &reason));
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordEvent { event, respond } => {
@@ -9310,7 +9311,7 @@ fn dispatch_write_command_raw(
         }
         WriteCommand::Shutdown { respond } => {
             let respond = WriterShutdownResponder::new(respond);
-            flush_segment_redactors(segment_redactors);
+            flush_segment_redactors(backend, mmap_mirror, segment_redactors);
             respond_oneshot_best_effort(respond, ());
             *should_break = true;
         }
@@ -9325,11 +9326,16 @@ fn redact_segment_for_persistence(
 ) -> Result<(String, bool)> {
     let streaming_redactor = segment_redactors.entry(pane_id).or_default();
     let pending_before = streaming_redactor.pending_text().to_string();
-    let _ = streaming_redactor.redact_chunk(content.as_bytes());
+    let redacted = streaming_redactor.redact_chunk(content.as_bytes());
+    let redacted_content = String::from_utf8(redacted.bytes).map_err(|error| {
+        StorageError::Database(format!(
+            "streaming redactor emitted invalid UTF-8 for pane {pane_id}: {error}"
+        ))
+    })?;
 
     let redactor = Redactor::new();
     if pending_before.is_empty() {
-        return Ok((redactor.redact(content), false));
+        return Ok((redacted_content, false));
     }
 
     let combined = format!("{pending_before}{content}");
@@ -9342,13 +9348,15 @@ fn redact_segment_for_persistence(
     if crosses_boundary {
         let updated_prior =
             remove_suffix_from_last_segment_backend(backend, pane_id, &pending_before)?;
-        return Ok((redactor.redact(&combined), updated_prior));
+        return Ok((redacted_content, updated_prior));
     }
 
-    Ok((redactor.redact(content), false))
+    Ok((redacted_content, false))
 }
 
 fn flush_segment_redactor_for_pane(
+    backend: &dyn StorageBackend,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, StreamingRedactor>,
     pane_id: u64,
 ) -> Result<()> {
@@ -9356,7 +9364,18 @@ fn flush_segment_redactor_for_pane(
         return Ok(());
     };
 
-    let _ = redactor.finish();
+    let redacted = redactor.finish();
+    if redacted.bytes.is_empty() {
+        return Ok(());
+    }
+
+    let redacted_tail = String::from_utf8(redacted.bytes).map_err(|error| {
+        StorageError::Database(format!(
+            "streaming redactor emitted invalid UTF-8 while flushing pane {pane_id}: {error}"
+        ))
+    })?;
+    let segment = append_segment_backend(backend, pane_id, &redacted_tail, None)?;
+    mirror_segment_into_mmap(mmap_mirror, &segment);
     Ok(())
 }
 
@@ -9425,10 +9444,16 @@ fn disable_mmap_mirror_after_retained_tail_move(
     }
 }
 
-fn flush_segment_redactors(segment_redactors: &mut HashMap<u64, StreamingRedactor>) {
+fn flush_segment_redactors(
+    backend: &dyn StorageBackend,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+) {
     let pane_ids = segment_redactors.keys().copied().collect::<Vec<_>>();
     for pane_id in pane_ids {
-        if let Err(error) = flush_segment_redactor_for_pane(segment_redactors, pane_id) {
+        if let Err(error) =
+            flush_segment_redactor_for_pane(backend, mmap_mirror, segment_redactors, pane_id)
+        {
             tracing::warn!(
                 pane_id,
                 error = %error,
@@ -21618,6 +21643,49 @@ fn storage_handle_writer_queue_processes_all() {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+#[test]
+fn storage_segment_redactor_flushes_retained_tail_before_gap() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("redaction_tail_flush.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db_path_str).await.unwrap();
+
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("redaction-tail-flush".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        let content = "plain before OPENAI_API_";
+        storage.append_segment(1, content, None).await.unwrap();
+        storage.record_gap(1, "capture gap").await.unwrap();
+
+        let mut segments = storage.get_segments(1, 100).await.unwrap();
+        segments.sort_by_key(|segment| segment.seq);
+        let persisted = segments
+            .iter()
+            .map(|segment| segment.content.as_str())
+            .collect::<String>();
+        assert_eq!(persisted, content);
+
+        storage.shutdown().await.unwrap();
     });
 }
 
