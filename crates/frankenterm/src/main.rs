@@ -20799,6 +20799,7 @@ async fn batch_get_pane_text(
     escapes: bool,
     tail_lines: usize,
 ) -> BTreeMap<u64, RobotPaneTextResult> {
+    let parent_cx = frankenterm_core::cx::for_request();
     let semaphore = Arc::new(frankenterm_core::runtime_async::Semaphore::new(
         ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT,
     ));
@@ -20807,20 +20808,21 @@ async fn batch_get_pane_text(
     for pane_id in pane_ids.iter().copied() {
         let wezterm = wezterm.clone();
         let semaphore = semaphore.clone();
-        let task = frankenterm_core::runtime_async::task::spawn(async move {
-            let _permit = semaphore.acquire_owned().await.map_err(|err| {
-                frankenterm_core::Error::RuntimeOperation {
-                    operation: "batch_get_text.acquire_permit",
-                    source: frankenterm_core::error::RuntimeOperationSource::Cancelled(
-                        err.to_string(),
-                    ),
-                }
-            })?;
-            // ft-xbnl0.2.3 tick 230: cx-first wezterm get_text (inside spawn).
-            let cx = frankenterm_core::cx::Cx::current()
-                .unwrap_or_else(frankenterm_core::cx::for_request);
-            wezterm.get_text_with_cx(&cx, pane_id, escapes).await
-        });
+        let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+            &parent_cx,
+            move |child_cx| async move {
+                let _permit = semaphore
+                    .acquire_owned_with_cx(&child_cx)
+                    .await
+                    .map_err(|err| frankenterm_core::Error::RuntimeOperation {
+                        operation: "batch_get_text.acquire_permit",
+                        source: frankenterm_core::error::RuntimeOperationSource::Cancelled(
+                            err.to_string(),
+                        ),
+                    })?;
+                wezterm.get_text_with_cx(&child_cx, pane_id, escapes).await
+            },
+        );
         tasks.push((pane_id, task));
     }
 
@@ -74344,7 +74346,7 @@ A  docs/new-proof.md\n";
                     truncated,
                     truncation_info,
                 } => {
-                    assert_eq!(text, "gamma\n");
+                    assert_eq!(text, "gamma");
                     assert!(*truncated, "tail=1 should truncate pane 7");
                     let info = truncation_info
                         .as_ref()
@@ -74363,7 +74365,7 @@ A  docs/new-proof.md\n";
                     truncated,
                     truncation_info,
                 } => {
-                    assert_eq!(text, "two\n");
+                    assert_eq!(text, "two");
                     assert!(*truncated, "tail=1 should truncate pane 11");
                     let info = truncation_info
                         .as_ref()
