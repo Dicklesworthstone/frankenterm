@@ -112,11 +112,17 @@ impl TokenBucket {
     ///
     /// # Panics
     ///
-    /// Panics if `capacity` or `refill_rate` is not positive.
+    /// Panics if `capacity` or `refill_rate` is not positive and finite.
     #[must_use]
     pub fn new(capacity: f64, refill_rate: f64) -> Self {
-        assert!(capacity > 0.0, "capacity must be positive");
-        assert!(refill_rate > 0.0, "refill_rate must be positive");
+        assert!(
+            capacity.is_finite() && capacity > 0.0,
+            "capacity must be positive and finite"
+        );
+        assert!(
+            refill_rate.is_finite() && refill_rate > 0.0,
+            "refill_rate must be positive and finite"
+        );
         Self {
             capacity,
             refill_rate,
@@ -684,6 +690,18 @@ mod tests {
     #[should_panic(expected = "refill_rate must be positive")]
     fn negative_rate_panics() {
         let _ = TokenBucket::new(10.0, -5.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be positive")]
+    fn infinite_capacity_panics() {
+        let _ = TokenBucket::new(f64::INFINITY, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "refill_rate must be positive")]
+    fn infinite_rate_panics() {
+        let _ = TokenBucket::new(10.0, f64::INFINITY);
     }
 
     #[test]

@@ -271,19 +271,35 @@ pub fn finish_streaming_redaction(
     ))
 }
 
-/// Evidence the redactor returns to prove it ran. The
-/// integration's redactor produces this; the substrate's
-/// typed-state pipeline plumbs it through.
+/// Count-only evidence the redactor returns to prove it ran. The
+/// integration's redactor produces this; the substrate's typed-state
+/// pipeline plumbs it through without storing snippets, offsets, hashes,
+/// or raw bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct RedactionEvidence {
-    /// Number of redactor-rule matches. Zero means the
-    /// redactor inspected the bytes but found nothing — the
-    /// integration still treats this as `redactor_applied=true`
-    /// (the redactor scanned). The distinction from a no-op
-    /// identity closure is the integration's responsibility.
-    pub matches: u32,
-    /// Bytes the redactor replaced (sum across all matches).
-    pub bytes_replaced: u32,
+    /// Number of non-overlapping redactor spans replaced. Zero means the
+    /// redactor inspected the bytes but found nothing — the integration
+    /// still treats this as `redactor_applied=true` (the redactor
+    /// scanned). The distinction from a no-op identity closure is the
+    /// integration's responsibility.
+    pub replacement_count: u32,
+    /// Exact source bytes represented by this returned result. Streaming
+    /// bytes retained in `pending` are counted only when emitted or
+    /// flushed.
+    pub original_input_bytes: u64,
+    /// UTF-8 byte length of the lossy-decoded text scanned before
+    /// redaction.
+    pub decoded_input_text_bytes: u64,
+    /// UTF-8 byte length of the emitted redacted bytes.
+    pub redacted_output_bytes: u64,
+    /// Exact original source bytes covered by replaced secret spans.
+    pub secret_input_bytes_replaced: u64,
+    /// Original source bytes represented by lossy replacement characters
+    /// in the scanned text.
+    pub lossy_input_bytes: u64,
+    /// Number of `U+FFFD` replacement characters inserted before
+    /// redaction.
+    pub lossy_replacement_count: u32,
 }
 
 impl RedactionEvidence {
@@ -301,15 +317,20 @@ impl RedactionEvidence {
     /// Whether the redactor found and replaced anything.
     #[must_use]
     pub const fn made_changes(&self) -> bool {
-        self.matches > 0
+        self.replacement_count > 0
     }
 }
 
 impl From<BytesRedactionEvidence> for RedactionEvidence {
     fn from(evidence: BytesRedactionEvidence) -> Self {
         Self {
-            matches: evidence.matches,
-            bytes_replaced: evidence.bytes_replaced,
+            replacement_count: evidence.replacement_count,
+            original_input_bytes: evidence.original_input_bytes,
+            decoded_input_text_bytes: evidence.decoded_input_text_bytes,
+            redacted_output_bytes: evidence.redacted_output_bytes,
+            secret_input_bytes_replaced: evidence.secret_input_bytes_replaced,
+            lossy_input_bytes: evidence.lossy_input_bytes,
+            lossy_replacement_count: evidence.lossy_replacement_count,
         }
     }
 }
@@ -941,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn redact_with_evidence_returns_match_count() {
+    fn redact_with_evidence_returns_replacement_count() {
         // Self-review fix (br-ft-0gjrq): redact_with_evidence
         // lets the integration trust substrate output for the
         // record_write redactor_applied flag.
@@ -950,16 +971,23 @@ mod tests {
             let s = String::from_utf8(b).unwrap();
             let replaced = s.replace("hunter2", "[REDACTED]");
             let evid = RedactionEvidence {
-                matches: 1,
-                bytes_replaced: 7,
+                replacement_count: 1,
+                original_input_bytes: s.len() as u64,
+                decoded_input_text_bytes: s.len() as u64,
+                redacted_output_bytes: replaced.len() as u64,
+                secret_input_bytes_replaced: "hunter2".len() as u64,
+                lossy_input_bytes: 0,
+                lossy_replacement_count: 0,
             };
             (replaced.into_bytes(), evid)
         });
         assert_eq!(redacted.as_bytes(), b"api_key=[REDACTED]");
         assert!(evidence.redactor_applied());
         assert!(evidence.made_changes());
-        assert_eq!(evidence.matches, 1);
-        assert_eq!(evidence.bytes_replaced, 7);
+        assert_eq!(evidence.replacement_count, 1);
+        assert_eq!(evidence.original_input_bytes, 15);
+        assert_eq!(evidence.redacted_output_bytes, 18);
+        assert_eq!(evidence.secret_input_bytes_replaced, 7);
     }
 
     #[test]
@@ -969,11 +997,22 @@ mod tests {
         let raw = ChunkBytes::<Raw>::from_raw(b"benign text".to_vec());
         let (redacted, evidence) = raw.redact_with_evidence(|b| {
             // Scanned with rules; matched zero.
-            (b, RedactionEvidence::default())
+            let len = b.len() as u64;
+            (
+                b,
+                RedactionEvidence {
+                    original_input_bytes: len,
+                    decoded_input_text_bytes: len,
+                    redacted_output_bytes: len,
+                    ..RedactionEvidence::default()
+                },
+            )
         });
         assert_eq!(redacted.as_bytes(), b"benign text");
         assert!(evidence.redactor_applied());
         assert!(!evidence.made_changes());
+        assert_eq!(evidence.original_input_bytes, 11);
+        assert_eq!(evidence.redacted_output_bytes, 11);
     }
 
     #[test]
@@ -998,7 +1037,9 @@ mod tests {
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("sk-ant-api03-"));
         assert_eq!(
-            evidence1.matches + evidence2.matches + finish_evidence.matches,
+            evidence1.replacement_count
+                + evidence2.replacement_count
+                + finish_evidence.replacement_count,
             1
         );
     }

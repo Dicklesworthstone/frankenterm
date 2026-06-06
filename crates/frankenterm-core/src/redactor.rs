@@ -698,14 +698,14 @@ impl Redactor {
         detections
     }
 
-    /// Cold-tier integration adapter (br-ft-95vfk slice 1).
+    /// Cold-tier integration adapter (br-ft-95vfk slice 1 / ft-wjjkp.3).
     ///
     /// Takes raw chunk bytes (typically UTF-8 terminal output but
     /// may contain arbitrary bytes from misbehaving processes),
     /// runs the redactor, and returns the post-redact bytes plus
     /// evidence the integration plumbs into
-    /// `ColdTierPipelineHealth::record_write`'s `redactor_applied`
-    /// flag and `bytes_replaced` telemetry.
+    /// `ColdTierPipelineHealth::record_write`'s
+    /// `redactor_applied` flag and byte-accounting telemetry.
     ///
     /// Non-UTF-8 input is handled via lossy decode
     /// (`String::from_utf8_lossy`): invalid bytes become `U+FFFD`
@@ -715,37 +715,255 @@ impl Redactor {
     /// The returned bytes are the lossy-decoded then redacted
     /// then re-encoded UTF-8.
     ///
-    /// `bytes_replaced` is the difference in length between the
-    /// pre-redact lossy-decoded text and the post-redact text.
-    /// Negative direction (substrate signals length grew because
-    /// the marker is longer than the secret) is captured as `0`
-    /// since we use `saturating_sub`. Operator interprets as
-    /// "bytes that the redactor sanitised away."
+    /// Evidence counts original input bytes, lossy-decode expansion,
+    /// emitted redacted bytes, and the exact original source bytes
+    /// covered by replacement spans. Evidence stores counts only:
+    /// no snippets, offsets, hashes, or raw bytes leave this helper.
     #[must_use]
     pub fn redact_bytes_with_evidence(&self, bytes: &[u8]) -> RedactionResult {
-        let lossy = String::from_utf8_lossy(bytes);
-        let detections = self.detect(&lossy);
-        let matches = detections.len() as u32;
-        // br-ft-r24qu: pre_len is the LOSSY-DECODED UTF-8 byte
-        // length, NOT bytes.len(). For invalid UTF-8 input,
-        // lossy expands every invalid sequence into U+FFFD
-        // (3 bytes). The resulting `bytes_replaced` is in
-        // lossy-decoded units — see BytesRedactionEvidence::bytes_replaced
-        // for the operator-interpretation contract.
-        let pre_len = lossy.len();
-        let redacted = self.redact(&lossy);
-        let post_len = redacted.len();
-        // Positive when redactor shortened (typical: secret →
-        // [REDACTED]). Negative direction saturates at 0.
-        let bytes_replaced = pre_len.saturating_sub(post_len) as u32;
-        RedactionResult {
-            bytes: redacted.into_bytes(),
-            evidence: BytesRedactionEvidence {
-                matches,
-                bytes_replaced,
-            },
+        let decoded = PendingDecodedText::from_lossy_decoded(bytes);
+        redact_decoded_text_with_evidence(self, &decoded)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PendingDecodedText {
+    text: String,
+    spans: Vec<DecodedSpan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedSpan {
+    text_start: usize,
+    text_end: usize,
+    original_bytes: u64,
+    lossy: bool,
+    lossy_replacement_count: u32,
+}
+
+impl PendingDecodedText {
+    fn from_lossy_decoded(bytes: &[u8]) -> Self {
+        let mut decoded = Self::default();
+        decoded.push_lossy_decoded(bytes);
+        decoded
+    }
+
+    fn push_lossy_decoded(&mut self, bytes: &[u8]) {
+        let decoded = decode_lossy_with_spans(bytes);
+        self.append(decoded);
+    }
+
+    fn append(&mut self, decoded: Self) {
+        let offset = self.text.len();
+        self.text.push_str(&decoded.text);
+        self.spans
+            .extend(decoded.spans.into_iter().map(|span| DecodedSpan {
+                text_start: span.text_start + offset,
+                text_end: span.text_end + offset,
+                ..span
+            }));
+    }
+
+    fn push_span_text(
+        &mut self,
+        text: &str,
+        original_bytes: u64,
+        lossy: bool,
+        lossy_replacement_count: u32,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        let text_start = self.text.len();
+        self.text.push_str(text);
+        self.spans.push(DecodedSpan {
+            text_start,
+            text_end: self.text.len(),
+            original_bytes,
+            lossy,
+            lossy_replacement_count,
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn take_prefix(&mut self, boundary: usize) -> Self {
+        let boundary = floor_char_boundary(&self.text, boundary);
+        let suffix_text = self.text.split_off(boundary);
+        let prefix_text = std::mem::replace(&mut self.text, suffix_text);
+
+        let mut prefix_spans = Vec::new();
+        let mut suffix_spans = Vec::new();
+        for span in self.spans.drain(..) {
+            if span.text_end <= boundary {
+                prefix_spans.push(span);
+            } else if span.text_start >= boundary {
+                suffix_spans.push(span.rebased_after(boundary));
+            } else {
+                let (prefix, suffix) = span.split_at(boundary);
+                if let Some(prefix) = prefix {
+                    prefix_spans.push(prefix);
+                }
+                if let Some(suffix) = suffix {
+                    suffix_spans.push(suffix.rebased_after(boundary));
+                }
+            }
+        }
+
+        self.spans = suffix_spans;
+        Self {
+            text: prefix_text,
+            spans: prefix_spans,
         }
     }
+
+    fn original_input_bytes(&self) -> u64 {
+        self.spans
+            .iter()
+            .map(|span| span.original_bytes)
+            .fold(0, u64::saturating_add)
+    }
+
+    fn lossy_input_bytes(&self) -> u64 {
+        self.spans
+            .iter()
+            .filter(|span| span.lossy)
+            .map(|span| span.original_bytes)
+            .fold(0, u64::saturating_add)
+    }
+
+    fn lossy_replacement_count(&self) -> u32 {
+        self.spans
+            .iter()
+            .map(|span| span.lossy_replacement_count)
+            .fold(0, u32::saturating_add)
+    }
+
+    fn original_bytes_for_text_range(&self, start: usize, end: usize) -> u64 {
+        self.spans
+            .iter()
+            .map(|span| span.original_bytes_for_text_range(start, end))
+            .fold(0, u64::saturating_add)
+    }
+}
+
+impl DecodedSpan {
+    fn rebased_after(self, boundary: usize) -> Self {
+        Self {
+            text_start: self.text_start - boundary,
+            text_end: self.text_end - boundary,
+            ..self
+        }
+    }
+
+    fn split_at(self, boundary: usize) -> (Option<Self>, Option<Self>) {
+        debug_assert!(self.text_start < boundary && boundary < self.text_end);
+        if self.lossy {
+            return (Some(self), None);
+        }
+
+        let prefix_text_bytes = boundary - self.text_start;
+        let suffix_text_bytes = self.text_end - boundary;
+        let prefix = (prefix_text_bytes > 0).then_some(Self {
+            text_start: self.text_start,
+            text_end: boundary,
+            original_bytes: prefix_text_bytes as u64,
+            lossy: false,
+            lossy_replacement_count: 0,
+        });
+        let suffix = (suffix_text_bytes > 0).then_some(Self {
+            text_start: boundary,
+            text_end: self.text_end,
+            original_bytes: suffix_text_bytes as u64,
+            lossy: false,
+            lossy_replacement_count: 0,
+        });
+        (prefix, suffix)
+    }
+
+    fn original_bytes_for_text_range(self, start: usize, end: usize) -> u64 {
+        let overlap_start = self.text_start.max(start);
+        let overlap_end = self.text_end.min(end);
+        if overlap_start >= overlap_end {
+            return 0;
+        }
+        if self.lossy {
+            self.original_bytes
+        } else {
+            (overlap_end - overlap_start) as u64
+        }
+    }
+}
+
+fn decode_lossy_with_spans(mut remaining: &[u8]) -> PendingDecodedText {
+    let mut decoded = PendingDecodedText::default();
+
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                decoded.push_span_text(valid, remaining.len() as u64, false, 0);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid = std::str::from_utf8(&remaining[..valid_up_to])
+                        .expect("valid_up_to prefix is valid UTF-8");
+                    decoded.push_span_text(valid, valid_up_to as u64, false, 0);
+                    remaining = &remaining[valid_up_to..];
+                    continue;
+                }
+
+                let invalid_len = error.error_len().unwrap_or(remaining.len()).max(1);
+                decoded.push_span_text("\u{fffd}", invalid_len as u64, true, 1);
+                remaining = &remaining[invalid_len..];
+            }
+        }
+    }
+
+    decoded
+}
+
+fn redact_decoded_text_with_evidence(
+    redactor: &Redactor,
+    decoded: &PendingDecodedText,
+) -> RedactionResult {
+    let detections = redactor.detect(decoded.as_str());
+    let replacement_count = usize_to_u32_saturating(detections.len());
+    let secret_input_bytes_replaced = detections
+        .iter()
+        .map(|(_, start, end)| decoded.original_bytes_for_text_range(*start, *end))
+        .fold(0, u64::saturating_add);
+    let redacted = redactor.redact(decoded.as_str());
+    let redacted_output_bytes = redacted.len() as u64;
+
+    RedactionResult {
+        bytes: redacted.into_bytes(),
+        evidence: BytesRedactionEvidence {
+            replacement_count,
+            original_input_bytes: decoded.original_input_bytes(),
+            decoded_input_text_bytes: decoded.len() as u64,
+            redacted_output_bytes,
+            secret_input_bytes_replaced,
+            lossy_input_bytes: decoded.lossy_input_bytes(),
+            lossy_replacement_count: decoded.lossy_replacement_count(),
+        },
+    }
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Stateful chunk-boundary redactor for streaming persistence paths.
@@ -758,7 +976,7 @@ impl Redactor {
 #[derive(Debug, Clone)]
 pub struct StreamingRedactor {
     redactor: Redactor,
-    pending: String,
+    pending: PendingDecodedText,
     tail_bytes: usize,
     /// br-ft-4socw: absolute cap on the pending buffer. Above this,
     /// [`StreamingRedactor::redact_chunk`] forces emission of the
@@ -780,7 +998,7 @@ impl StreamingRedactor {
     pub fn with_redactor(redactor: Redactor) -> Self {
         Self {
             redactor,
-            pending: String::new(),
+            pending: PendingDecodedText::default(),
             tail_bytes: DEFAULT_STREAMING_REDACTOR_TAIL_BYTES,
             max_pending_bytes: DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES,
         }
@@ -841,8 +1059,7 @@ impl StreamingRedactor {
     /// mangled at a chunk seam never masks a credential.
     #[must_use]
     pub fn redact_chunk(&mut self, bytes: &[u8]) -> RedactionResult {
-        let lossy = String::from_utf8_lossy(bytes);
-        self.pending.push_str(&lossy);
+        self.pending.push_lossy_decoded(bytes);
 
         // br-ft-4socw: forced emission on overflow. Drains the oldest
         // half of pending so subsequent boundary-safe scanning works
@@ -853,7 +1070,7 @@ impl StreamingRedactor {
         while self.pending.len() > self.max_pending_bytes {
             record_streaming_redactor_pending_overflow();
             let half = self.max_pending_bytes / 2;
-            let force_boundary = overflow_emit_boundary(&self.pending, half);
+            let force_boundary = overflow_emit_boundary(self.pending.as_str(), half);
             let forced = self.emit_prefix(force_boundary);
             overflow_result = Some(match overflow_result {
                 Some(prev) => merge_redaction_results(prev, forced),
@@ -873,7 +1090,7 @@ impl StreamingRedactor {
     #[must_use]
     pub fn finish(&mut self) -> RedactionResult {
         let pending = std::mem::take(&mut self.pending);
-        self.redact_text_with_evidence(&pending)
+        redact_decoded_text_with_evidence(&self.redactor, &pending)
     }
 
     /// Bytes currently retained to protect the next chunk boundary.
@@ -885,12 +1102,12 @@ impl StreamingRedactor {
     /// Text currently retained to protect the next chunk boundary.
     #[must_use]
     pub(crate) fn pending_text(&self) -> &str {
-        &self.pending
+        self.pending.as_str()
     }
 
     fn stable_emit_boundary(&self) -> usize {
         let mut boundary = self.pending.len();
-        let detections = self.redactor.detect(&self.pending);
+        let detections = self.redactor.detect(self.pending.as_str());
 
         loop {
             let mut next_boundary = self.earliest_secret_like_suffix_start(boundary, &detections);
@@ -920,10 +1137,10 @@ impl StreamingRedactor {
         }
 
         let scan_start = floor_char_boundary(
-            &self.pending,
+            self.pending.as_str(),
             current_boundary.saturating_sub(self.effective_tail_bytes()),
         );
-        let suffix = &self.pending[scan_start..current_boundary];
+        let suffix = &self.pending.as_str()[scan_start..current_boundary];
         // br-ft-zbnz4: anchors are matched case-insensitively. The keyed secret
         // patterns are `(?i)` (e.g. `API_KEY=`, `TOKEN=`, `MISTRAL_API_KEY=`,
         // `AWS_SECRET_ACCESS_KEY=`), so an UPPERCASE env-var-style key name split
@@ -954,7 +1171,7 @@ impl StreamingRedactor {
             }
         }
 
-        floor_char_boundary(&self.pending, earliest)
+        floor_char_boundary(self.pending.as_str(), earliest)
     }
 
     fn effective_tail_bytes(&self) -> usize {
@@ -969,32 +1186,8 @@ impl StreamingRedactor {
             };
         }
 
-        let suffix = self.pending.split_off(boundary);
-        let prefix = std::mem::replace(&mut self.pending, suffix);
-        self.redact_text_with_evidence(&prefix)
-    }
-
-    fn redact_text_with_evidence(&self, text: &str) -> RedactionResult {
-        let detections = self.redactor.detect(text);
-        let matches = detections.len() as u32;
-        // br-ft-r24qu: text here is the LOSSY-DECODED pending
-        // buffer (from redact_chunk's `from_utf8_lossy(bytes) →
-        // self.pending.push_str(...)` pipeline). pre_len is in
-        // lossy-decoded UTF-8 byte units, NOT original-input
-        // bytes. The FFFD-substitution inflation propagates from
-        // the chunk boundary through to bytes_replaced. See
-        // BytesRedactionEvidence::bytes_replaced for the
-        // operator-interpretation contract.
-        let pre_len = text.len();
-        let redacted = self.redactor.redact(text);
-        let post_len = redacted.len();
-        RedactionResult {
-            bytes: redacted.into_bytes(),
-            evidence: BytesRedactionEvidence {
-                matches,
-                bytes_replaced: pre_len.saturating_sub(post_len) as u32,
-            },
-        }
+        let prefix = self.pending.take_prefix(boundary);
+        redact_decoded_text_with_evidence(&self.redactor, &prefix)
     }
 }
 
@@ -1033,67 +1226,63 @@ fn merge_redaction_results(first: RedactionResult, mut second: RedactionResult) 
     RedactionResult {
         bytes,
         evidence: BytesRedactionEvidence {
-            matches: first
+            replacement_count: first
                 .evidence
-                .matches
-                .saturating_add(second.evidence.matches),
-            bytes_replaced: first
+                .replacement_count
+                .saturating_add(second.evidence.replacement_count),
+            original_input_bytes: first
                 .evidence
-                .bytes_replaced
-                .saturating_add(second.evidence.bytes_replaced),
+                .original_input_bytes
+                .saturating_add(second.evidence.original_input_bytes),
+            decoded_input_text_bytes: first
+                .evidence
+                .decoded_input_text_bytes
+                .saturating_add(second.evidence.decoded_input_text_bytes),
+            redacted_output_bytes: first
+                .evidence
+                .redacted_output_bytes
+                .saturating_add(second.evidence.redacted_output_bytes),
+            secret_input_bytes_replaced: first
+                .evidence
+                .secret_input_bytes_replaced
+                .saturating_add(second.evidence.secret_input_bytes_replaced),
+            lossy_input_bytes: first
+                .evidence
+                .lossy_input_bytes
+                .saturating_add(second.evidence.lossy_input_bytes),
+            lossy_replacement_count: first
+                .evidence
+                .lossy_replacement_count
+                .saturating_add(second.evidence.lossy_replacement_count),
         },
     }
 }
 
-/// Evidence the redactor returns to the cold-tier integration
-/// per the bead's privacy invariant. Mirrors the
-/// `RedactionEvidence` shape in
-/// `scrollback_cold_tier_pipeline.rs` so the integration can
-/// pass either through `ChunkBytes::redact_with_evidence`.
+/// Count-only evidence the redactor returns to cold-tier integrations.
+/// Mirrors the `RedactionEvidence` shape in
+/// `scrollback_cold_tier_pipeline.rs` so the integration can pass
+/// either through `ChunkBytes::redact_with_evidence`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct BytesRedactionEvidence {
-    /// Number of redactor-rule matches the substrate found
-    /// in the input.
-    pub matches: u32,
-    /// Bytes the redactor replaced (pre-redact length minus
-    /// post-redact length, saturating at 0). Operator-readable
-    /// signal of "how much the redactor sanitised away."
-    ///
-    /// br-ft-r24qu: this metric is computed in **lossy-decoded
-    /// UTF-8 byte units**, NOT original-input byte units. The
-    /// substrate runs `String::from_utf8_lossy(bytes)` first, so
-    /// invalid UTF-8 sequences (e.g. `[0xff, 0xfe]`) get
-    /// substituted with the Unicode replacement character
-    /// `U+FFFD` (3 bytes in UTF-8). For mixed-encoding or binary
-    /// input, `pre_len = lossy.len()` is INFLATED proportional
-    /// to the number of FFFD substitutions; the resulting
-    /// `bytes_replaced` overstates redaction work by the same
-    /// margin.
-    ///
-    /// **Pure-UTF-8 input** (the common terminal-output case):
-    /// `lossy.len() == bytes.len()`, so `bytes_replaced` equals
-    /// the exact original-byte savings. Operators ingesting
-    /// well-formed UTF-8 streams can read this number at face
-    /// value.
-    ///
-    /// **Mixed/binary input** (rare; occurs when the pane emits
-    /// raw bytes mixed with UTF-8 text): operators must scale by
-    /// the FFFD-substitution rate to recover original-byte
-    /// semantics. The substrate doesn't track that rate today;
-    /// the bead's option-B follow-up adds an `original_bytes:
-    /// u32` field for direct exposure.
-    ///
-    /// **Why this is unfixed in the runtime**: Option B (track
-    /// `original_bytes` separately) requires a `BytesRedactionEvidence`
-    /// schema bump + cold-tier integration update;
-    /// option C (compare against `bytes.len()` instead of
-    /// `lossy.len()`) changes the semantics for binary inputs in
-    /// a direction-correct but value-different way. Both are
-    /// larger than this docstring fix; deferred per the bead's
-    /// recommendation. See `Redactor::redact_bytes_with_evidence`
-    /// at redactor.rs:660 + `StreamingRedactor::redact_text_with_evidence`
-    /// at ~868 for the call sites.
-    pub bytes_replaced: u32,
+    /// Number of non-overlapping redactor spans replaced.
+    pub replacement_count: u32,
+    /// Exact source bytes represented by this returned result.
+    /// Streaming bytes retained in `pending` are counted only when
+    /// emitted or flushed.
+    pub original_input_bytes: u64,
+    /// UTF-8 byte length of the lossy-decoded text scanned before
+    /// redaction.
+    pub decoded_input_text_bytes: u64,
+    /// UTF-8 byte length of the emitted redacted bytes.
+    pub redacted_output_bytes: u64,
+    /// Exact original source bytes covered by replaced secret spans.
+    pub secret_input_bytes_replaced: u64,
+    /// Original source bytes represented by lossy replacement
+    /// characters in the scanned text.
+    pub lossy_input_bytes: u64,
+    /// Number of `U+FFFD` replacement characters inserted before
+    /// redaction.
+    pub lossy_replacement_count: u32,
 }
 
 impl BytesRedactionEvidence {
@@ -1112,7 +1301,7 @@ impl BytesRedactionEvidence {
     /// found no secrets ⇒ applied=true, made_changes=false).
     #[must_use]
     pub const fn made_changes(&self) -> bool {
-        self.matches > 0
+        self.replacement_count > 0
     }
 }
 
@@ -1160,19 +1349,54 @@ mod tests {
         },
     ];
 
+    fn test_evidence_with_replacements(replacement_count: u32) -> BytesRedactionEvidence {
+        BytesRedactionEvidence {
+            replacement_count,
+            original_input_bytes: 100,
+            decoded_input_text_bytes: 100,
+            redacted_output_bytes: 40,
+            secret_input_bytes_replaced: 60,
+            lossy_input_bytes: 0,
+            lossy_replacement_count: 0,
+        }
+    }
+
     // ----------------------------------------------------------------
     // Cold-tier integration adapter (br-ft-95vfk slice 1)
     // ----------------------------------------------------------------
 
     #[test]
+    fn mapped_lossy_decoder_matches_std_lossy_text() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"plain ascii",
+            b"emoji \xf0\x9f\xa6\x80",
+            &[0xff, 0xfe, b'a', 0xf0, 0x9f],
+            &[b'a', 0xe2, 0x82, 0xac, b'z'],
+        ];
+
+        for bytes in cases {
+            let decoded = PendingDecodedText::from_lossy_decoded(bytes);
+            assert_eq!(decoded.as_str(), String::from_utf8_lossy(bytes));
+            assert_eq!(decoded.original_input_bytes(), bytes.len() as u64);
+        }
+    }
+
+    #[test]
     fn redact_bytes_with_evidence_clean_input_no_match() {
         let r = Redactor::new();
-        let result = r.redact_bytes_with_evidence(b"benign log line, nothing secret");
+        let input = b"benign log line, nothing secret";
+        let result = r.redact_bytes_with_evidence(input);
         assert!(result.evidence.redactor_applied());
         assert!(!result.evidence.made_changes());
-        assert_eq!(result.evidence.matches, 0);
-        assert_eq!(result.evidence.bytes_replaced, 0);
-        assert_eq!(result.bytes, b"benign log line, nothing secret");
+        assert_eq!(result.evidence.replacement_count, 0);
+        assert_eq!(result.evidence.original_input_bytes, input.len() as u64);
+        assert_eq!(result.evidence.decoded_input_text_bytes, input.len() as u64);
+        assert_eq!(result.evidence.redacted_output_bytes, input.len() as u64);
+        assert_eq!(result.evidence.secret_input_bytes_replaced, 0);
+        assert_eq!(result.evidence.lossy_input_bytes, 0);
+        assert_eq!(result.evidence.lossy_replacement_count, 0);
+        assert_eq!(result.bytes, input);
     }
 
     #[test]
@@ -1182,14 +1406,41 @@ mod tests {
         let result = r.redact_bytes_with_evidence(input);
         assert!(result.evidence.redactor_applied());
         assert!(result.evidence.made_changes());
-        assert!(result.evidence.matches >= 1);
+        assert!(result.evidence.replacement_count >= 1);
         assert!(
             !std::str::from_utf8(&result.bytes)
                 .unwrap()
                 .contains("glpat-")
         );
-        // Marker is shorter than the secret → bytes_replaced > 0.
-        assert!(result.evidence.bytes_replaced > 0);
+        assert_eq!(result.evidence.original_input_bytes, input.len() as u64);
+        assert_eq!(result.evidence.decoded_input_text_bytes, input.len() as u64);
+        assert_eq!(
+            result.evidence.redacted_output_bytes,
+            result.bytes.len() as u64
+        );
+        assert!(result.evidence.secret_input_bytes_replaced > 0);
+        assert_eq!(result.evidence.lossy_input_bytes, 0);
+        assert_eq!(result.evidence.lossy_replacement_count, 0);
+    }
+
+    #[test]
+    fn redact_bytes_with_evidence_preserves_output_growth() {
+        let r = Redactor::with_debug_markers();
+        let input = b"password=abcd";
+        let result = r.redact_bytes_with_evidence(input);
+
+        assert!(result.evidence.made_changes());
+        assert!(result.bytes.len() > input.len());
+        assert_eq!(result.evidence.original_input_bytes, input.len() as u64);
+        assert_eq!(result.evidence.decoded_input_text_bytes, input.len() as u64);
+        assert_eq!(
+            result.evidence.redacted_output_bytes,
+            result.bytes.len() as u64
+        );
+        assert_eq!(
+            result.evidence.secret_input_bytes_replaced,
+            input.len() as u64
+        );
     }
 
     #[test]
@@ -1221,18 +1472,24 @@ mod tests {
                 .unwrap()
                 .contains("glpat-")
         );
+        assert_eq!(result.evidence.original_input_bytes, input.len() as u64);
+        assert_eq!(
+            result.evidence.decoded_input_text_bytes,
+            String::from_utf8_lossy(&input).len() as u64
+        );
+        assert_eq!(
+            result.evidence.redacted_output_bytes,
+            result.bytes.len() as u64
+        );
+        assert!(result.evidence.secret_input_bytes_replaced > 0);
+        assert_eq!(result.evidence.lossy_input_bytes, 3);
+        assert_eq!(result.evidence.lossy_replacement_count, 3);
     }
 
     #[test]
     fn redact_bytes_with_evidence_evidence_made_changes_predicate() {
-        let zero = BytesRedactionEvidence {
-            matches: 0,
-            bytes_replaced: 0,
-        };
-        let some = BytesRedactionEvidence {
-            matches: 3,
-            bytes_replaced: 100,
-        };
+        let zero = BytesRedactionEvidence::default();
+        let some = test_evidence_with_replacements(3);
         assert!(zero.redactor_applied());
         assert!(!zero.made_changes());
         assert!(some.redactor_applied());
@@ -1246,6 +1503,45 @@ mod tests {
         assert!(result.evidence.redactor_applied());
         assert!(!result.evidence.made_changes());
         assert!(result.bytes.is_empty());
+        assert_eq!(result.evidence, BytesRedactionEvidence::default());
+    }
+
+    #[test]
+    fn streaming_redactor_no_emission_reports_zero_byte_evidence() {
+        let secret = b"sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
+        let split = b"sk-ant-api03-".len();
+        let mut streaming = StreamingRedactor::new();
+
+        let first = streaming.redact_chunk(&secret[..split]);
+        assert!(first.bytes.is_empty());
+        assert_eq!(first.evidence.original_input_bytes, 0);
+        assert_eq!(first.evidence.redacted_output_bytes, 0);
+        assert_eq!(first.evidence.replacement_count, 0);
+
+        let second = streaming.redact_chunk(&secret[split..]);
+        let finish = streaming.finish();
+        let merged = merge_redaction_results(second, finish);
+
+        assert!(merged.evidence.made_changes());
+        assert_eq!(merged.evidence.original_input_bytes, secret.len() as u64);
+        assert_eq!(
+            merged.evidence.secret_input_bytes_replaced,
+            secret.len() as u64
+        );
+    }
+
+    #[test]
+    fn streaming_redactor_split_invalid_utf8_counts_original_bytes_once() {
+        let mut streaming = StreamingRedactor::new();
+        let first = streaming.redact_chunk(&[0xf0]);
+        let second = streaming.redact_chunk(&[0x9f]);
+        let finish = streaming.finish();
+        let merged = merge_redaction_results(merge_redaction_results(first, second), finish);
+
+        assert_eq!(merged.evidence.original_input_bytes, 2);
+        assert_eq!(merged.evidence.lossy_input_bytes, 2);
+        assert_eq!(merged.evidence.lossy_replacement_count, 2);
+        assert_eq!(String::from_utf8_lossy(&merged.bytes), "\u{fffd}\u{fffd}");
     }
 
     #[test]
@@ -1590,15 +1886,15 @@ mod tests {
 
     #[test]
     fn detect_redact_evidence_match_count_consistency() {
-        // The bead's tamper-evidence concern: evidence.matches
+        // The bead's tamper-evidence concern: replacement_count
         // should equal the number of distinct secrets in the
         // input, not the cumulative cross-pattern hit count.
         let token = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let result = Redactor::new().redact_bytes_with_evidence(token.as_bytes());
         assert_eq!(
-            result.evidence.matches, 1,
-            "evidence.matches must equal distinct secret count, got {}",
-            result.evidence.matches
+            result.evidence.replacement_count, 1,
+            "replacement_count must equal distinct secret count, got {}",
+            result.evidence.replacement_count
         );
     }
 

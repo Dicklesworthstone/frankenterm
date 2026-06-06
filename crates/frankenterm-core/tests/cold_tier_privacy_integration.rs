@@ -77,15 +77,15 @@ fn streaming_redactor_drives_cold_tier_split_secret_privacy() {
     let (redacted1, evidence1) = raw1.redact_with_streaming(&mut redactor);
     let (redacted2, evidence2) = raw2.redact_with_streaming(&mut redactor);
 
-    let mut matches = evidence1.matches + evidence2.matches;
+    let mut replacements = evidence1.replacement_count + evidence2.replacement_count;
     let mut redacted_bytes = [redacted1.as_bytes(), redacted2.as_bytes()].concat();
     if let Some((tail, tail_evidence)) = finish_streaming_redaction(&mut redactor) {
-        matches += tail_evidence.matches;
+        replacements += tail_evidence.replacement_count;
         redacted_bytes.extend_from_slice(tail.as_bytes());
     }
 
     let redacted_text = String::from_utf8(redacted_bytes).expect("redactor emits utf-8");
-    assert!(matches > 0);
+    assert!(replacements > 0);
     assert!(!redacted_text.contains(secret));
     assert!(redacted_text.contains(REDACTED_MARKER));
 }

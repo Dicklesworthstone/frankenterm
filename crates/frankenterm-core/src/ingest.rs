@@ -3516,7 +3516,7 @@ mod tests {
             TEST_MAX_PERSIST_SEGMENT_BYTES,
         )
         .expect("append captured segment to mmap writer");
-        assert!(report.redaction.matches > 0);
+        assert!(report.redaction.replacement_count > 0);
         let path = writer.path().to_path_buf();
         drop(writer);
 

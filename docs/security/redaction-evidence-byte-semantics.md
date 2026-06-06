@@ -1,12 +1,14 @@
 # Redaction Evidence Byte Semantics
 
-Bead: `ft-wjjkp.2`
+Beads: `ft-wjjkp.2`, `ft-wjjkp.3`
 
-Status: design for the `ft-wjjkp.3` implementation slice.
+Status: design accepted under `ft-wjjkp.2`; source implementation landed under
+`ft-wjjkp.3`; retained RCH proof and any release-attestation update remain the
+`ft-wjjkp.4` closeout scope.
 
-## Current State
+## Previous State
 
-`BytesRedactionEvidence` currently lives in
+Before `ft-wjjkp.3`, `BytesRedactionEvidence` lived in
 `crates/frankenterm-core/src/redactor.rs` and has two fields:
 
 ```rust
@@ -50,7 +52,7 @@ The current field also saturates at zero when the replacement marker is longer
 than the matched secret. That hides output growth. It is useful as a coarse
 "some text got shorter" signal, but it is not a durable evidence schema.
 
-## Proposed Schema
+## Implemented Schema
 
 Replace the old two-field evidence with an explicit byte-accounting schema. Do
 not keep a compatibility shim for `bytes_replaced`; the old name is the source
@@ -105,6 +107,7 @@ struct DecodedSpan {
     text_end: usize,
     original_bytes: u64,
     lossy: bool,
+    lossy_replacement_count: u32,
 }
 ```
 
@@ -267,7 +270,7 @@ RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo c
 Static proof before the RCH lanes:
 
 ```bash
-rg -n "bytes_replaced" crates/frankenterm-core/src crates/frankenterm-core/tests docs
+rg -n "\bbytes_replaced\b" crates/frankenterm-core/src crates/frankenterm-core/tests docs
 git diff --check -- crates/frankenterm-core/src/redactor.rs \
   crates/frankenterm-core/src/scrollback_cold_tier_pipeline.rs \
   crates/frankenterm-core/src/scrollback_mmap_writer.rs \
@@ -276,6 +279,8 @@ git diff --check -- crates/frankenterm-core/src/redactor.rs \
   docs/security/scrollback-cold-tier-pipeline.md
 ```
 
-Any remaining `bytes_replaced` hit must either be this design document
-describing the retired field or an intentional external compatibility note
-approved by the operator. First-party evidence structs should not expose it.
+Any remaining standalone `bytes_replaced` hit must either be this design
+document describing the retired field or an intentional external compatibility
+note approved by the operator. First-party evidence structs should not expose
+it. The implemented `secret_input_bytes_replaced` field is intentionally
+separate from the retired standalone field name.

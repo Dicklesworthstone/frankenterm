@@ -6,9 +6,8 @@ Source design: `ft-wjjkp.2`
 
 Target implementation: `ft-wjjkp.3`
 
-Status: static pre-code conformance matrix. This document does not claim that
-the Rust implementation conforms yet; it freezes the requirements and fixture
-coverage that the implementation bead must satisfy.
+Status: static conformance matrix plus `ft-wjjkp.3` source implementation
+target. Retained RCH proof remains the `ft-wjjkp.4` closeout requirement.
 
 ## Scope
 
@@ -33,17 +32,18 @@ is `fixtures/redaction-evidence-byte-semantics/verify-requirements.sh`.
 
 | Area | MUST requirements | Fixture-covered | Runtime implementation status |
 |---|---:|---:|---|
-| Evidence fields | 7 | 7 | pending `ft-wjjkp.3` |
-| Derived-only values | 1 | 1 | pending `ft-wjjkp.3` |
-| Streaming accounting | 2 | 2 | pending `ft-wjjkp.3` |
-| Merge behavior | 1 | 1 | pending `ft-wjjkp.3` |
-| Cold-tier propagation | 1 | 1 | pending `ft-wjjkp.3` |
-| Mmap append/header accounting | 1 | 1 | pending `ft-wjjkp.3` |
-| Privacy and legacy-name guardrails | 2 | 2 | pending `ft-wjjkp.3` |
+| Evidence fields | 7 | 7 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
+| Derived-only values | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
+| Streaming accounting | 2 | 2 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
+| Merge behavior | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
+| Cold-tier propagation | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
+| Mmap append/header accounting | 1 | 1 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
+| Privacy and legacy-name guardrails | 2 | 2 | implemented in `ft-wjjkp.3`; RCH proof pending `ft-wjjkp.4` |
 
-Static coverage is complete for the requirements listed here. Runtime
-conformance remains pending until `ft-wjjkp.3` lands and `ft-wjjkp.4` records
-RCH proof for the implementation lanes named in the source design.
+Static coverage is complete for the requirements listed here. Source
+conformance is implemented in `ft-wjjkp.3`; material closeout remains pending
+until `ft-wjjkp.4` records RCH proof for the implementation lanes named in the
+source design.
 
 ## Requirement Matrix
 

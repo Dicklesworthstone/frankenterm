@@ -43,6 +43,32 @@ ChunkBytes<Compressed>   -> encrypt_with(key, cipher)    -> ChunkBytes<Encrypted
 ChunkBytes<Encrypted>    -> mark_written()               -> ChunkBytes<Written>
 ```
 
+### Redaction evidence contract (`ft-wjjkp.3`)
+
+`redact_with_evidence` and `redact_with_streaming` return a count-only
+`RedactionEvidence` schema:
+
+- `replacement_count`
+- `original_input_bytes`
+- `decoded_input_text_bytes`
+- `redacted_output_bytes`
+- `secret_input_bytes_replaced`
+- `lossy_input_bytes`
+- `lossy_replacement_count`
+
+The schema distinguishes original source bytes from lossy-decoded text bytes
+and redacted output bytes. Streaming calls count bytes only when that call
+emits them; a chunk retained in the redactor tail reports zero original and
+output bytes until a later emission or `finish_streaming_redaction`. The legacy
+standalone `bytes_replaced` evidence field is retired; output growth and lossy
+decode are represented by the explicit fields above and derived deltas.
+
+Evidence remains privacy-safe: it stores counts only, never raw pane bytes,
+matched snippets, surrounding context, byte offsets, or hashes of secret
+material. `PipelineHealth::record_write` still receives a boolean
+`redactor_applied` privacy invariant rather than inferring application from
+replacement counts.
+
 Compile-time invariants (verified by absence — these
 patterns *cannot* compile):
 

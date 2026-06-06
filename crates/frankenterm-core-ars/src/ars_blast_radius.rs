@@ -30,6 +30,18 @@ use tracing::{debug, warn};
 use crate::ars_fst::ReflexId;
 use frankenterm_core_audit_types::token_bucket::TokenBucket;
 
+const FAIL_CLOSED_BUCKET_CAPACITY: f64 = f64::EPSILON;
+const FAIL_CLOSED_BUCKET_REFILL_RATE: f64 = f64::EPSILON;
+
+fn token_bucket_from_per_minute(burst: f64, rate_per_min: f64) -> TokenBucket {
+    let refill_rate = rate_per_min / 60.0;
+    if burst.is_finite() && burst > 0.0 && refill_rate.is_finite() && refill_rate > 0.0 {
+        TokenBucket::new(burst, refill_rate)
+    } else {
+        TokenBucket::new(FAIL_CLOSED_BUCKET_CAPACITY, FAIL_CLOSED_BUCKET_REFILL_RATE)
+    }
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -247,7 +259,8 @@ pub struct BlastRadiusController {
 impl BlastRadiusController {
     /// Create a controller with the given configuration.
     pub fn new(config: BlastRadiusConfig) -> Self {
-        let swarm_bucket = TokenBucket::new(config.swarm_burst, config.swarm_rate_per_min / 60.0);
+        let swarm_bucket =
+            token_bucket_from_per_minute(config.swarm_burst, config.swarm_rate_per_min);
         Self {
             config,
             swarm_bucket,
@@ -299,9 +312,9 @@ impl BlastRadiusController {
             .cluster_buckets
             .entry(cluster_id.clone())
             .or_insert_with(|| {
-                TokenBucket::new(
+                token_bucket_from_per_minute(
                     self.config.cluster_burst,
-                    self.config.cluster_rate_per_min / 60.0,
+                    self.config.cluster_rate_per_min,
                 )
             });
         if !cluster_bucket.try_acquire(1, now_ms) {
@@ -319,7 +332,7 @@ impl BlastRadiusController {
         let reflex_bucket = self
             .reflex_buckets
             .entry(reflex_id)
-            .or_insert_with(|| TokenBucket::new(burst, rate / 60.0));
+            .or_insert_with(|| token_bucket_from_per_minute(burst, rate));
         if !reflex_bucket.try_acquire(1, now_ms) {
             self.total_denied = self.total_denied.saturating_add(1);
             return BlastDecision::Deny {
@@ -342,7 +355,7 @@ impl BlastRadiusController {
                 let new_tier = state.tier;
                 let (rate, burst) = self.tier_rate(new_tier);
                 self.reflex_buckets
-                    .insert(reflex_id, TokenBucket::new(burst, rate / 60.0));
+                    .insert(reflex_id, token_bucket_from_per_minute(burst, rate));
             }
         }
     }
@@ -357,7 +370,7 @@ impl BlastRadiusController {
                 let new_tier = state.tier;
                 let (rate, burst) = self.tier_rate(new_tier);
                 self.reflex_buckets
-                    .insert(reflex_id, TokenBucket::new(burst, rate / 60.0));
+                    .insert(reflex_id, token_bucket_from_per_minute(burst, rate));
             }
         }
     }
@@ -769,6 +782,70 @@ mod tests {
         denied.register_reflex(1, "c1");
         assert!(!denied.check(1, 1000).is_allowed());
         assert_eq!(denied.stats().total_denied, u64::MAX);
+    }
+
+    #[test]
+    fn invalid_swarm_bucket_config_fails_closed_without_panic() {
+        let mut ctrl = BlastRadiusController::new(BlastRadiusConfig {
+            swarm_burst: 0.0,
+            ..Default::default()
+        });
+        ctrl.register_reflex(1, "c1");
+
+        let decision = ctrl.check(1, 1000);
+
+        assert!(matches!(
+            decision,
+            BlastDecision::Deny {
+                reason: DenyReason::SwarmLimit,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_cluster_bucket_config_fails_closed_without_panic() {
+        let mut ctrl = BlastRadiusController::new(BlastRadiusConfig {
+            swarm_rate_per_min: 6000.0,
+            swarm_burst: 100.0,
+            cluster_burst: f64::INFINITY,
+            ..Default::default()
+        });
+        ctrl.register_reflex(1, "c1");
+
+        let decision = ctrl.check(1, 1000);
+
+        assert!(matches!(
+            decision,
+            BlastDecision::Deny {
+                reason: DenyReason::ClusterLimit { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_reflex_bucket_config_fails_closed_without_panic() {
+        let mut ctrl = BlastRadiusController::new(BlastRadiusConfig {
+            swarm_rate_per_min: 6000.0,
+            swarm_burst: 100.0,
+            cluster_rate_per_min: 6000.0,
+            cluster_burst: 100.0,
+            incubating_rate_per_min: f64::NAN,
+            incubating_burst: 100.0,
+            ..Default::default()
+        });
+        ctrl.register_reflex(1, "c1");
+
+        let decision = ctrl.check(1, 1000);
+
+        assert!(matches!(
+            decision,
+            BlastDecision::Deny {
+                reason: DenyReason::ReflexLimit { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

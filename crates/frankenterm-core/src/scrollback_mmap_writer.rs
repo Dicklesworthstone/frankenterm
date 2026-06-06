@@ -295,7 +295,7 @@ impl MmapScrollback {
         self.header.redactions_applied = self
             .header
             .redactions_applied
-            .saturating_add(u64::from(redacted.evidence.matches));
+            .saturating_add(u64::from(redacted.evidence.replacement_count));
         self.write_header()?;
 
         self.appends_since_sync = self.appends_since_sync.saturating_add(1);
@@ -761,7 +761,13 @@ mod tests {
         let report = writer
             .append(RecordKind::Text, secret)
             .expect("append secret");
-        assert!(report.redaction.matches > 0);
+        assert!(report.redaction.replacement_count > 0);
+        assert_eq!(
+            report.redaction.redacted_output_bytes,
+            report.payload_bytes as u64
+        );
+        assert_eq!(report.redaction.original_input_bytes, secret.len() as u64);
+        assert!(report.redaction.secret_input_bytes_replaced > 0);
         assert!(report.synced);
 
         let path = writer.path().to_path_buf();
@@ -800,7 +806,16 @@ mod tests {
         let second = writer
             .append(RecordKind::Osc, &second_payload)
             .expect("append second half");
-        assert!(second.redaction.matches > 0);
+        assert!(second.redaction.replacement_count > 0);
+        assert_eq!(
+            first
+                .redaction
+                .original_input_bytes
+                .saturating_add(second.redaction.original_input_bytes),
+            (secret.len() + 1) as u64
+        );
+        assert_eq!(first.redaction.replacement_count, 0);
+        assert!(second.redaction.secret_input_bytes_replaced >= secret.len() as u64);
         assert!(second.synced);
 
         let path = writer.path().to_path_buf();

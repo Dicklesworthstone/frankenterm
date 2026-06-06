@@ -75,7 +75,7 @@ fn mmap_writer_streaming_redacts_secret_split_across_record_kinds() {
     let second = writer
         .append(RecordKind::Osc, &second_payload)
         .expect("append second chunk");
-    assert!(second.redaction.matches > 0);
+    assert!(second.redaction.replacement_count > 0);
     writer.sync().expect("sync writer");
     drop(writer);
 
@@ -137,7 +137,7 @@ proptest! {
         for (kind, payload) in &records {
             let report = writer.append(*kind, payload).expect("append record");
             prop_assert!(report.payload_bytes <= payload.len() + expected_bytes.len());
-            prop_assert_eq!(report.redaction.matches, 0);
+            prop_assert_eq!(report.redaction.replacement_count, 0);
             prop_assert!(!report.synced);
             expected_bytes.extend_from_slice(payload);
         }
