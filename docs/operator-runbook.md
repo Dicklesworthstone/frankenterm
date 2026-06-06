@@ -914,6 +914,173 @@ attention; it does not elevate a 64-core/256 GiB claim by itself.
 
 ---
 
+## 2D. Flight-Recorder Incident Replay Runbook
+
+The swarm flight-recorder incident surface answers "what happened, what proof
+state did it imply, and what can an operator safely cite?" from persisted
+source-set artifacts. Its robot contract is
+`ft.swarm.incident_surfaces.v1`; the retained corpus lives under
+`fixtures/flight-recorder/incident-corpus/`, and the source-set adapter fixture
+for the live command shape is
+`fixtures/flight-recorder/source-adapters/valid-source-set.json`.
+
+The surface is read-only. It loads retained Beads, RCH, Agent Mail, git, pane,
+policy, robot, MCP, operator, and source-unavailable events from artifacts and
+projects them into list/show/explain/replay views. It must not mutate panes,
+repair Agent Mail, restart services, cancel RCH jobs, delete files, reopen
+Beads, or turn local Cargo into closeout proof.
+
+### 2D.1 Incident commands
+
+Use `list` to discover incident ids, then `show`, `explain`, or `replay` one
+incident. Prefer TOON for agent-to-agent handoff.
+
+```bash
+ft robot incidents list \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json \
+  --limit 10
+
+ft robot incidents show ft-ogr3n6-remote-cargo-pass \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json
+
+ft robot incidents explain ft-ogr3n6-rch-mirror-before-cargo \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/rch-mirror-before-cargo.json
+
+ft robot --format toon incidents replay ft-ogr3n6-agent-mail-outage-beads-fallback \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/agent-mail-outage-beads-fallback.json
+```
+
+Useful `list` filters:
+
+```bash
+ft robot incidents list --source-set <source-set.json> --bead ft-ogr3n.6
+ft robot incidents list --source-set <source-set.json> --worker vmi1293453
+ft robot incidents list --source-set <source-set.json> --build-id j-29871232832766549
+ft robot incidents list --source-set <source-set.json> --source-kind rch
+ft robot incidents list --source-set <source-set.json> --causal-class infrastructure-failure
+```
+
+If a read command fails with `incident_not_found`, run `list` and use an id
+from `data.incidents`. If it fails with malformed, redacted, retention-expired,
+or source-unavailable state, cite that source failure directly; do not fill the
+gap with live pane text or a fresh service mutation.
+
+MCP mirrors expose the same read-only views for agents that consume resources
+instead of CLI output:
+
+| Resource | Meaning |
+| --- | --- |
+| `wa://incidents` | List retained incident summaries from the loaded source-set artifact. |
+| `wa://incidents/{incident_id}` | Show the incident DAG, proof coverage, and evidence refs. |
+| `wa://incidents/{incident_id}/explain` | Return the concise verdict, reason code, and remediation-safe explanation. |
+| `wa://incidents/{incident_id}/replay` | Return the deterministic replay frames in causal order. |
+
+These resources are bounded, redaction-guaranteed, and
+`live_mutation_allowed=false`. They are alternate read paths, not approval to
+run proof, repair services, or mutate panes.
+
+### 2D.2 Trust boundaries
+
+| Evidence | Trust boundary |
+| --- | --- |
+| Source-set artifact | Required input. It is durable only for the sources it contains; missing sources stay missing. |
+| Recorder/pane payload | May be redacted, hash-only, truncated, unavailable, or retention-expired. Raw pane text is not required for incident closeout. |
+| Beads and git events | Attribution and ownership evidence. They do not prove source behavior unless paired with the relevant proof artifact. |
+| RCH events | Proof-state evidence. Remote worker id, build id, target dir, exit code, and remote Cargo/rustc/test reachability must be retained before a source-health claim is admissible. |
+| Agent Mail events | Coordination evidence. Mail outage after one retry is a communication outage with Beads fallback, not permission to repair or restart the shared service. |
+| Replay frames | Deterministic projection of retained events. They can explain causality and gaps; they do not perform remediation. |
+| Golden incident corpus | Proves deterministic classification and replay semantics for retained fixtures. It does not prove new live remote Cargo execution unless the scenario carries retained remote RCH metadata. |
+
+### 2D.3 Incident patterns and safe interpretation
+
+First classify the event class before interpreting the final `outcome`:
+
+| Event class | Distinction |
+| --- | --- |
+| `source_failure` | The source command or verifier reached its own verdict and failed. Fix source code, tests, fixtures, or docs; do not describe it as RCH infrastructure. |
+| `infrastructure_failure` | RCH, artifact materialization, worker health, or another substrate blocked proof before a source verdict. Preserve worker, build, command, and reason-code evidence. |
+| `dirty_tree_contamination` | Shared worktree or ownership overlap made attribution unsafe. Remote execution may still have happened, but closeout is blocked. |
+| `policy_denial` | Policy refused a requested action. Preserve the denial and approval boundary; do not bypass policy inside replay review. |
+| `communication_outage` | Agent Mail or another coordination source was unavailable after the allowed retry. Use Beads/git fallback evidence; do not repair or restart the service. |
+| `operator_cancellation` | A human or operator workflow deliberately stopped the lane. Treat it as a cancellation receipt, not a source failure or infrastructure outage. |
+
+| Scenario | Canonical artifact | Safe interpretation |
+| --- | --- | --- |
+| RCH mirror/preflight blocks before Cargo | `fixtures/flight-recorder/incident-corpus/source-sets/rch-mirror-before-cargo.json` | Outcome is `infrastructure_block`; proof is inadmissible because Cargo did not reach the remote lane. Preserve the artifact and rerun the proof lane when RCH recovers. |
+| Remote Cargo/test pass metadata is retained | `fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json` | Outcome is `source_pass` only for the cited command, worker, target dir, exit code, and retained artifact set. Do not generalize it to unrelated crates or later edits. |
+| Dirty tracked paths contaminate attribution | `fixtures/flight-recorder/incident-corpus/source-sets/dirty-tree-contaminated.json` | Outcome is `contaminated_proof_attempt`; remote execution may have happened, but closeout remains blocked until ownership and dirty-path attribution are clean. |
+| Agent Mail is unavailable after retry | `fixtures/flight-recorder/incident-corpus/source-sets/agent-mail-outage-beads-fallback.json` | Outcome is `source_unavailable`; use Beads fallback comments and avoid Agent Mail service repair/restart. |
+| Bead closeout mirror is retained | `fixtures/flight-recorder/incident-corpus/source-sets/bead-closeout-mirror.json` | Use it to audit dep-cycle, branch-mirror, proof-ledger, and closeout wording. It is still evidence for that retained case, not a global pass. |
+
+Operator cancellations are distinct from infrastructure failures. If a human
+or agent intentionally cancelled a build, classify the event as cancellation
+evidence and include who cancelled it, why, and whether RCH reported cleanup.
+Do not rewrite cancellation into a source failure.
+
+### 2D.4 Citing incident replay evidence
+
+Use this Beads or Agent Mail shape after reviewing `show`/`explain` output:
+
+```text
+Flight-recorder incident: contract ft.swarm.incident_surfaces.v1; incident <incident_id>; outcome <outcome>; proof_admissible <true|false>; causal_classes <classes>; sources <sources>; artifact <source-set-path>; replay <json|toon command or golden path>; worker <worker-or-none>; build <build-or-none>; remote_cargo_reached <true|false>; local_cargo_counted false; side_effects_executed false; closeout <safe|blocked>.
+```
+
+Pair docs/static runbook work with the standard non-proof footer:
+
+```text
+Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
+Target-dir lifecycle: not applicable; no Cargo/RCH target dir created.
+```
+
+For proof-heavy Beads, the flight-recorder incident is supporting evidence.
+The closeout still needs the Bead's required proof lane or an explicit blocked
+proof-doctor verdict. In particular:
+
+- A pre-Cargo RCH block cannot prove source health.
+- A dirty-tree incident cannot close green even if the remote command exited 0.
+- An Agent Mail outage cannot authorize shared service repair.
+- Replay frames cannot replace retained worker, command, target-dir, and exit
+  metadata for proof claims.
+- A retained fixture cannot prove behavior introduced after that fixture was
+  recorded.
+
+### 2D.5 Required static validation
+
+For docs-only updates to this section, run:
+
+```bash
+git diff --check -- \
+  README.md \
+  docs/flight-recorder/README.md \
+  docs/operator-playbook.md \
+  docs/operator-runbook.md \
+  tests/e2e/test_flight_recorder_incident_corpus.sh \
+  .beads/issues.jsonl
+jq empty \
+  fixtures/flight-recorder/incident-corpus/manifest.v1.json \
+  fixtures/flight-recorder/incident-corpus/proof/summary.v1.json \
+  fixtures/flight-recorder/incident-corpus/source-sets/*.json \
+  fixtures/flight-recorder/incident-corpus/golden/*.json
+bash tests/e2e/test_flight_recorder_incident_corpus.sh
+br dep cycles --json
+```
+
+If this section changes command examples or retained fixture paths, also run the
+focused RCH lane for the incident surface before closing implementation or
+convergence Beads:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env \
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  CARGO_TARGET_DIR=/tmp/<bead>-replay-incidents-target \
+  cargo test -p frankenterm-core-replay replay_incidents --lib -- --nocapture
+```
+
+Do not count that RCH lane unless RCH reports remote execution and the retained
+log reaches Cargo/rustc/test for the intended command.
+
+---
+
 ## 3. Tick #1 — establish baseline
 
 The first tick sets the contract for the session. Skip steps and you

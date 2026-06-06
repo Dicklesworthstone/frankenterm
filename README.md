@@ -1607,6 +1607,14 @@ When something goes wrong (a crash, a stuck pane, a fleet-wide degradation), `ft
 
 **Consumer side:** `ft reproduce --kind crash` exports the latest crash bundle in a format `ft proof-doctor` and external forensic tools can read.
 
+**Replay side:** `ft robot incidents list/show/explain/replay` reads persisted
+flight-recorder source sets and classifies proof evidence without mutating
+panes, Beads, RCH, Agent Mail, or git. Use
+[`docs/operator-runbook.md#2d-flight-recorder-incident-replay-runbook`](docs/operator-runbook.md#2d-flight-recorder-incident-replay-runbook)
+for source failures, RCH infrastructure blocks, dirty-tree contamination,
+policy denials, communication outages, operator cancellations, and
+proof-incomplete closeouts.
+
 ---
 
 ## Substrate Audit Discipline

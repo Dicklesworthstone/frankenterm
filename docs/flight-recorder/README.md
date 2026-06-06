@@ -25,6 +25,7 @@ This directory contains design contracts, validation artifacts, and rollout oper
 - `validation-gates-wa-oegrb-7-5.md`
 - `security-privacy-validation-wa-oegrb-7-6.md`
 - `recovery-drills-wa-oegrb-7-4.md`
+- `../operator-runbook.md#2d-flight-recorder-incident-replay-runbook`
 
 ## Rollout Track (`wa-oegrb.8.*`)
 

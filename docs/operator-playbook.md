@@ -21,6 +21,7 @@ If something needs attention, follow the relevant flow below.
 
 Related guides:
 - For blessed 10, 50, and 200+ pane profiles plus exact validation commands, use `docs/ft-xbnl0-5-3-blessed-tuning-playbook.md`.
+- For artifact-backed proof verdicts from `ft robot incidents list/show/explain/replay`, use `docs/operator-runbook.md#2d-flight-recorder-incident-replay-runbook`.
 - For release posture and per-tier fallback defaults, use `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
 - For exact knob meanings and safe starting ranges, use `docs/tuning-reference.md`.
 - For GUI-specific fleet operation, use `docs/frankenterm-gui-user-guide.md`.
@@ -158,6 +159,31 @@ ft diag bundle --output /tmp/ft-diag
 - incident bundle path (from `ft reproduce export --kind crash`)
 - triage output (plain or JSON)
 - any recent ft logs
+
+---
+
+## Flow 3a: incident replay -> proof verdict
+
+Use this when the question is whether a retained proof lane is admissible,
+blocked by infrastructure, contaminated by dirty shared-tree state, or degraded
+because a coordination source was unavailable. The replay commands read
+persisted source-set artifacts and do not collect live state.
+
+```bash
+ft robot incidents list \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json
+ft robot incidents show ft-ogr3n6-remote-cargo-pass \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json
+ft robot --format toon incidents explain ft-ogr3n6-remote-cargo-pass \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json
+ft robot incidents replay ft-ogr3n6-remote-cargo-pass \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json
+```
+
+Read `outcome`, `proof_admissible`, event classes, reason codes, evidence refs,
+and RCH worker/build metadata before deciding a proof is valid. The detailed
+classification table and Beads citation template are in
+`docs/operator-runbook.md#2d-flight-recorder-incident-replay-runbook`.
 
 ---
 
