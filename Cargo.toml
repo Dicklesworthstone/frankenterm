@@ -558,7 +558,7 @@ getrandom = "0.3"
 trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
-fastmcp = { path = "/dp/fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
+fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "09de04d147927b048aa054116c90f7647427416a", package = "fastmcp-rust" }
 fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "39ff887fca40763a62233d2e7b83b5b62725b286", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
@@ -594,30 +594,29 @@ strip = "none"
 [profile.release.package.frankenterm-fuzz]
 debug = 1
 
-# Provide git-based versions of crates that upstream repos (fastmcp_rust, fastapi_rust)
-# reference as path deps pointing outside their own repo (../asupersync, ../rich_rust).
-# Without these patches, cargo cannot resolve those transitive path deps when fetching
-# the upstream repos as git dependencies.
+# Override the crates.io versions of rich_rust / asupersync that the upstream repos
+# (fastmcp_rust, fastapi_rust) depend on, pinning them to the upstream GitHub repos so
+# the graph is single-sourced and reproducible on any machine.
 [patch.crates-io]
 # Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
-rich_rust = { path = "/dp/rich_rust" }
-# asupersync is sourced from the local sibling checkout (/dp -> ~/projects) so the
-# build always tracks the latest local asupersync. A previously pinned github rev
-# (3b9d1199) had diverged from local main and shipped an older io_driver waker path
-# that broke remote mux-domain readiness wakeups (handshake "Timed out while parsing
-# the response from the server"). Keep this as a path patch, not a stale pin.
-asupersync = { path = "/dp/asupersync" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
+# asupersync is pinned to the upstream repo HEAD (0.3.3), which is ahead of the
+# crates.io release (0.3.2) and carries the io_driver waker fix for remote mux-domain
+# readiness wakeups (previously a handshake "Timed out while parsing the response from
+# the server"). A stale github rev (3b9d1199) had shipped the older waker path; this
+# rev keeps the fixed one without relying on a local checkout.
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "7f38a9fd0c15bc01ae024a6ea05d9f2891e864ef" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
 k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b48b5e05cf1f8fffc7c" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { path = "/dp/asupersync" }
-rich_rust = { path = "/dp/rich_rust" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "7f38a9fd0c15bc01ae024a6ea05d9f2891e864ef" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "7f38a9fd0c15bc01ae024a6ea05d9f2891e864ef" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "7f38a9fd0c15bc01ae024a6ea05d9f2891e864ef" }
