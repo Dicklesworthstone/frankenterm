@@ -32,6 +32,7 @@ const WARMUP_FRAMES: u32 = 12;
 const P99_FRAME_BUDGET_US: u64 = 16_600;
 const FIRST_PAINT_REFLOW_BUDGET_US: u64 = 16_600;
 const EVIDENCE_PATH: &str = "target/criterion/slo-resize_fps.jsonl";
+const EVIDENCE_FILE_NAME: &str = "slo-resize_fps.jsonl";
 
 #[derive(Debug)]
 struct ResizeStormTermConfig;
@@ -92,7 +93,7 @@ fn percentile_us(samples: &mut [u64], percentile: u8) -> u64 {
 }
 
 fn append_evidence_row(p50_us: u64, p95_us: u64, p99_us: u64, sample_count: usize) {
-    let path = PathBuf::from(EVIDENCE_PATH);
+    let path = evidence_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create resize FPS evidence directory");
     }
@@ -123,8 +124,8 @@ fn append_evidence_row(p50_us: u64, p95_us: u64, p99_us: u64, sample_count: usiz
         "runner": {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
-            "hostname": std::env::var("HOSTNAME").ok(),
-            "rch_worker_id": std::env::var("RCH_WORKER_ID").ok(),
+            "hostname": runner_hostname(),
+            "rch_worker_id": rch_worker_id(),
             "cargo_target_dir": std::env::var("CARGO_TARGET_DIR").ok()
         },
         "tags": {
@@ -236,6 +237,35 @@ fn now_ms() -> u64 {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or_default()
+}
+
+fn evidence_path() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(|target_dir| {
+            PathBuf::from(target_dir)
+                .join("criterion")
+                .join(EVIDENCE_FILE_NAME)
+        })
+        .unwrap_or_else(|| PathBuf::from(EVIDENCE_PATH))
+}
+
+fn rch_worker_id() -> Option<String> {
+    std::env::var("RCH_WORKER_ID")
+        .ok()
+        .or_else(|| std::env::var("RCH_WORKER").ok())
+}
+
+fn runner_hostname() -> Option<String> {
+    std::env::var("HOSTNAME").ok().or_else(|| {
+        fs::read_to_string("/etc/hostname").ok().and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_owned())
+            }
+        })
+    })
 }
 
 criterion_group!(benches, bench_resize_storm);
