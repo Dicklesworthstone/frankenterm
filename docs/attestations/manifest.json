@@ -155,6 +155,14 @@
     },
     {
       "category": "proofs/robot-contracts",
+      "path": "docs/attestations/proofs/mission-twin.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-u7r37.8",
+      "proof_categories": [4],
+      "description": "Mission-twin convergence proof mapping the snapshot, replay, counterfactual, ownership, Robot/MCP/CLI surface, retained corpus, and safety-policy child claims to code, tests, retained artifacts, and proof state. Uses the existing robot-contracts release category because ft.mission_twin.* is a schema-backed read-only planning contract; it does not claim live coordination authority or target-class capacity proof."
+    },
+    {
+      "category": "proofs/robot-contracts",
       "path": "docs/attestations/proofs/swarm-capacity-readiness.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-b94bx.10",
