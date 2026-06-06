@@ -11,6 +11,8 @@ Schema: `docs/json-schema/ft-deferred-proof-replay-harness.json`.
 Attempt schema: `docs/json-schema/ft-deferred-proof-replay-attempt.json`.
 Fixtures: `fixtures/deferred-proof-replay/replay-harness/`.
 Static verifier: `bash tests/e2e/test_deferred_proof_replay_harness_contract.sh`.
+Attestation artifact: `docs/attestations/proofs/deferred-proof-replay.json`
+(`proofs/robot-contracts`, produced by `ft-zbnz4.7`).
 
 ## What the harness does
 
@@ -29,6 +31,17 @@ and `proof.evidence_classification` are **untrusted input**. The classifier
 derives its decision only from structural and coordination facts, so a forged
 `replay_allowed: true` or a forged green `evidence_classification` can never
 upgrade a blocked or rejected receipt.
+
+## Release / attestation posture
+
+The release bundle hashes the proof-replay closeout through the existing
+`proofs/robot-contracts` category because this family is a schema-backed
+operator/Robot/MCP contract. The attestation proves the queue contracts,
+fail-closed classifiers, retained live-attempt record, and focused remote-only
+replay proof. It does **not** prove that every queued receipt is green:
+`wait_rch`, `dirty_overlap`, `prerequisite_blocked`, `stale_command`,
+`ambiguous`, and `completed` remain separate states, and only a real remote RCH
+attempt may turn an individual receipt into completed proof.
 
 ## Decision vocabulary
 

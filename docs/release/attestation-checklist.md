@@ -41,6 +41,12 @@ that bead, verify:
   `fixture_only` states, and do not turn `score_percent` into a release claim.
   The optional manifest slot is `proofs/rehearsal-score`, currently backed by
   `crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json`.
+- [ ] Deferred-proof replay wording changes cite the retained queue/harness
+  artifact or live-attempt record, preserve `queued`, `wait_rch`,
+  `dirty_overlap`, `prerequisite_blocked`, `stale_command`, `ambiguous`, and
+  `completed` states, and do not turn a queued receipt into green proof. The
+  optional robot-contract manifest slot is
+  `docs/attestations/proofs/deferred-proof-replay.json`.
 - [ ] The closing comment cites the manifest slot category, artifact path,
   build/verify exit codes, and retained RCH artifact bundle path.
 
@@ -93,6 +99,10 @@ appear in `required_categories` until the owning epic graduates them. For
 rehearsal-score closeout, confirm the `proofs/rehearsal-score` slot remains
 present and points at the golden matrix unless a later bead replaces it with a
 stronger retained no-mock receipt bundle.
+For deferred-proof replay closeout, confirm the optional
+`proofs/robot-contracts` slot points at
+`docs/attestations/proofs/deferred-proof-replay.json` and that the artifact
+keeps queued/deferred receipts visibly distinct from completed remote proof.
 
 If any bead is **not closed**, the release MUST NOT proceed —
 the attestation bundle would either be partial (rejected by

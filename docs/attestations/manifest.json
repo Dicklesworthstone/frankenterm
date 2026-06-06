@@ -170,6 +170,14 @@
       "description": "Flight-recorder incident replay convergence proof mapping each ft-ogr3n child acceptance criterion to retained corpus artifacts, robot/MCP incident surfaces, no-side-effect guarantees, and RCH-only proof lanes. Uses the existing robot-contracts release category because ft.swarm.incident_surfaces.v1 is a schema-backed machine incident replay contract."
     },
     {
+      "category": "proofs/robot-contracts",
+      "path": "docs/attestations/proofs/deferred-proof-replay.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-zbnz4.7",
+      "proof_categories": [4],
+      "description": "Deferred RCH proof replay convergence proof for the proof-debt queue contracts, ownership/admission fail-closed guards, retained live-attempt record, and focused remote-only replay proof. Uses the existing robot-contracts release category because the queue is a schema-backed operator/Robot/MCP contract; it does not claim that every queued proof debt has passed."
+    },
+    {
       "category": "proofs/rehearsal-score",
       "path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
       "media_type": "application/json",

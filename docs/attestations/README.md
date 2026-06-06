@@ -73,6 +73,13 @@ maps the flight-recorder child beads to retained incident-corpus artifacts,
 read-only robot/MCP incident surfaces, no-side-effect guarantees, and RCH-only
 proof lanes.
 
+`proofs/robot-contracts` also hashes
+`docs/attestations/proofs/deferred-proof-replay.json`, the `ft-zbnz4.7`
+convergence artifact for the deferred RCH proof replay queue. That artifact
+attests the schema-backed queue/explain contracts, ownership/admission
+fail-closed guards, retained live-attempt record, and focused remote-only replay
+proof; it deliberately does not claim that every queued proof debt has passed.
+
 `proofs/tx-killswitch` hashes
 `docs/attestations/proofs/tx-killswitch.json`, which points at the
 TLA+ spec, TLC summary contract, Rust state-space harness, and
