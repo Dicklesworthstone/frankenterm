@@ -328,6 +328,7 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.3.3"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -387,6 +388,7 @@ dependencies = [
 [[package]]
 name = "asupersync-macros"
 version = "0.3.3"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2917,6 +2919,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-client"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "asupersync",
  "dirs",
@@ -2932,6 +2935,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-console"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -2949,6 +2953,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-core"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "asupersync",
  "log",
@@ -2959,6 +2964,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-derive"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2968,6 +2974,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-protocol"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "base64 0.22.1",
  "fastmcp-core",
@@ -2979,6 +2986,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-rust"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -2994,6 +3002,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-server"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -3014,6 +3023,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-transport"
 version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust?rev=09de04d147927b048aa054116c90f7647427416a#09de04d147927b048aa054116c90f7647427416a"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -3328,6 +3338,7 @@ dependencies = [
 [[package]]
 name = "franken-decision"
 version = "0.3.3"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -3337,6 +3348,7 @@ dependencies = [
 [[package]]
 name = "franken-evidence"
 version = "0.3.3"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
 dependencies = [
  "serde",
  "serde_json",
@@ -3345,6 +3357,7 @@ dependencies = [
 [[package]]
 name = "franken-kernel"
 version = "0.3.3"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
 dependencies = [
  "serde",
 ]
@@ -9285,6 +9298,7 @@ dependencies = [
 [[package]]
 name = "rich_rust"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/rich_rust?rev=1386fec4bafb385cea801dd1f7974ceabcfa09dc#1386fec4bafb385cea801dd1f7974ceabcfa09dc"
 dependencies = [
  "bitflags 2.11.1",
  "crossterm",

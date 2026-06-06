@@ -559,7 +559,7 @@ getrandom = "0.3"
 trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
-fastmcp = { path = "/dp/fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
+fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "09de04d147927b048aa054116c90f7647427416a", package = "fastmcp-rust" }
 fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "39ff887fca40763a62233d2e7b83b5b62725b286", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
@@ -595,30 +595,37 @@ strip = "none"
 [profile.release.package.frankenterm-fuzz]
 debug = 1
 
-# Provide git-based versions of crates that upstream repos (fastmcp_rust, fastapi_rust)
-# reference as path deps pointing outside their own repo (../asupersync, ../rich_rust).
-# Without these patches, cargo cannot resolve those transitive path deps when fetching
-# the upstream repos as git dependencies.
+# Override the crates.io versions of rich_rust / asupersync that the upstream repos
+# (fastmcp_rust, fastapi_rust) depend on, pinning them to upstream GitHub revs so the
+# graph is single-sourced and resolvable on any machine (CI runners, cargo install,
+# external contributors). Absolute /dp/... path patches broke every build outside the
+# fleet (and CI's --locked jobs), since /dp only exists on development machines.
+#
+# PIN MAINTENANCE: these revs are refreshed to the deps' origin/main HEADs as of the
+# pin date, i.e. exactly the content local checkouts built against at that time. If
+# you need frankenterm to pick up unpushed local work in one of these deps, add a
+# TEMPORARY local patch override (e.g. `asupersync = { path = "/dp/asupersync" }`)
+# while iterating, then land the dep, bump the rev here, and REVERT the temporary
+# patch before committing — committing a /dp path breaks CI and external builds.
 [patch.crates-io]
-# Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
-rich_rust = { path = "/dp/rich_rust" }
-# asupersync is sourced from the local sibling checkout (/dp -> ~/projects) so the
-# build always tracks the latest local asupersync. A previously pinned github rev
-# (3b9d1199) had diverged from local main and shipped an older io_driver waker path
-# that broke remote mux-domain readiness wakeups (handshake "Timed out while parsing
-# the response from the server"). Keep this as a path patch, not a stale pin.
-asupersync = { path = "/dp/asupersync" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
+# asupersync is pinned to upstream main (0.3.3, 2026-06-06), which is ahead of the
+# crates.io release and carries the io_driver waker fix for remote mux-domain
+# readiness wakeups (a previously stale pin, 3b9d1199, shipped the older waker path
+# and broke handshakes with "Timed out while parsing the response from the server").
+# Keep this pin FRESH when asupersync moves — see PIN MAINTENANCE above.
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
 k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b48b5e05cf1f8fffc7c" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { path = "/dp/asupersync" }
-rich_rust = { path = "/dp/rich_rust" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
