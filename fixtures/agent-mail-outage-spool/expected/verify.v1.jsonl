@@ -4,5 +4,6 @@
 {"event":"fixture_checked","fixture":"reservation-intent","state":"queued","source_operation":"file_reservation","failure_class":"agent_mail_unavailable"}
 {"event":"fixture_checked","fixture":"beads-fallback-closeout","state":"superseded","source_operation":"beads_closeout_comment","failure_class":"agent_mail_unavailable"}
 {"event":"fixture_checked","fixture":"stale-owner-handoff","state":"replay_failed","source_operation":"stale_owner_handoff_notice","failure_class":"database_recovery_notice"}
+{"event":"fixture_checked","fixture":"replayed-send","state":"replayed","source_operation":"send_message","failure_class":"api_error"}
 {"event":"fixture_checked","fixture":"writer-adapter-queued-send","state":"queued","source_operation":"send_message","failure_class":"api_error"}
-{"event":"contract_summary","fixtures":7,"states":["queued","replay_dry_run_ok","replay_failed","superseded"],"source_operations":["beads_closeout_comment","file_reservation","send_message","stale_owner_handoff_notice"],"failure_classes":["agent_mail_unavailable","api_error","api_unreachable","contact_permission_blocked","database_recovery_notice"]}
+{"event":"contract_summary","fixtures":8,"states":["queued","replay_dry_run_ok","replay_failed","replayed","superseded"],"source_operations":["beads_closeout_comment","file_reservation","send_message","stale_owner_handoff_notice"],"failure_classes":["agent_mail_unavailable","api_error","api_unreachable","contact_permission_blocked","database_recovery_notice"]}

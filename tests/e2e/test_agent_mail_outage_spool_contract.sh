@@ -52,6 +52,7 @@ EXPECTED_FIXTURE_IDS = %w[
   reservation-intent
   beads-fallback-closeout
   stale-owner-handoff
+  replayed-send
   writer-adapter-queued-send
 ].freeze
 EXPECTED_STATES = %w[

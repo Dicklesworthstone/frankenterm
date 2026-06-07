@@ -11,6 +11,7 @@
     "fixtures/agent-mail-outage-spool/valid/reservation-intent.json",
     "fixtures/agent-mail-outage-spool/valid/beads-fallback-closeout.json",
     "fixtures/agent-mail-outage-spool/valid/stale-owner-handoff.json",
+    "fixtures/agent-mail-outage-spool/valid/replayed-send.json",
     "fixtures/agent-mail-outage-spool/valid/writer-adapter-queued-send.json"
   ],
   "expected_verifier_log": "fixtures/agent-mail-outage-spool/expected/verify.v1.jsonl",

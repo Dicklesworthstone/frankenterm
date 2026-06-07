@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_outbox_entry.v1",
+  "source_bead": "ft-dezx8.1",
+  "replay_id": "amq1-333333333333333333333333",
+  "created_at": "2026-05-29T14:05:33Z",
+  "agent": {
+    "name": "IvoryCreek",
+    "program": "codex-cli",
+    "model": "gpt-5-codex",
+    "project_key": "/Users/jemanuel/projects/frankenterm"
+  },
+  "thread_id": "ft-dezx8.2",
+  "recipients": {
+    "to": [
+      "SapphireCardinal"
+    ],
+    "cc": [
+      "YellowHorse"
+    ],
+    "bcc": []
+  },
+  "subject": "ft-dezx8.2 replayed fallback coordination",
+  "body_policy": {
+    "body_sha256": "63209eeb88540ab96b9153d466beda5b50d87557ba015033fbf06d16b1611780",
+    "body_storage": "digest_only",
+    "body_preview_redacted": "Agent Mail fallback send was dry-run checked and replayed exactly once.",
+    "body_byte_count": 61,
+    "max_retained_bytes": 16384,
+    "raw_body_retained": false
+  },
+  "importance": "normal",
+  "ack_required": false,
+  "attachments": [],
+  "source_operation": "send_message",
+  "failure_reason": {
+    "class": "api_error",
+    "summary": "API error: Agent Mail send returned HTTP 503",
+    "retry_count": 1,
+    "retry_limit": 1,
+    "last_attempt_at": "2026-05-29T14:05:38Z"
+  },
+  "state": "replayed",
+  "state_reason": null,
+  "operator_decision": null,
+  "replay_receipt": {
+    "dry_run_at": "2026-05-29T14:10:00Z",
+    "replayed_at": "2026-05-29T14:10:12Z",
+    "delivered_message_id": "agent-mail-msg-ft-dezx8-2-6370",
+    "failure_summary": null
+  },
+  "retention": {
+    "retain_until": "2026-06-28T14:05:33Z",
+    "automatic_discard": false,
+    "redaction": [
+      "body_digest_only",
+      "body_preview_redacted",
+      "attachment_refs_only"
+    ]
+  },
+  "reservation_intent": null,
+  "beads_fallback": {
+    "bead_id": "ft-dezx8.2",
+    "action": "comment_only",
+    "comment_sha256": "9ffb1d0d8800e830790afa65cace6c30cc84d6dbb159d91768816ca23000ca93",
+    "comment_preview_redacted": "Recorded queued fallback send in Beads; Agent Mail delivery remains unclaimed until replay receipt."
+  }
+}

@@ -7,6 +7,7 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: u8 = 1;
@@ -591,6 +592,15 @@ impl AgentMailOutboxFailure {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMailOutboxReplayDryRun {
+    pub checked_at: String,
+    pub available_recipients: Vec<String>,
+    pub ack_available: bool,
+    pub available_attachment_paths: Vec<String>,
+    pub delivered_message_id: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentMailRetryPolicy {
     retry_limit: u32,
@@ -635,6 +645,19 @@ pub enum AgentMailOutboxWriterError {
     InvalidTimestamp { field: &'static str, value: String },
     #[error("reservation_intent is required for {operation:?}")]
     MissingReservationIntent { operation: SourceOperation },
+    #[error(transparent)]
+    Validation(#[from] AgentMailOutboxValidationError),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AgentMailOutboxReplayError {
+    #[error("entry state {state:?} is not eligible for {transition}")]
+    IneligibleState {
+        state: OutboxState,
+        transition: &'static str,
+    },
+    #[error("delivered message id mismatch: existing {existing}, requested {requested}")]
+    DeliveredMessageIdMismatch { existing: String, requested: String },
     #[error(transparent)]
     Validation(#[from] AgentMailOutboxValidationError),
 }
@@ -728,6 +751,102 @@ pub fn build_queued_outbox_entry_with_policy(
     };
     entry.validate()?;
     Ok(entry)
+}
+
+pub fn dry_run_replay_outbox_entry(
+    entry: AgentMailOutboxEntry,
+    dry_run: &AgentMailOutboxReplayDryRun,
+) -> Result<AgentMailOutboxEntry, AgentMailOutboxReplayError> {
+    entry.validate()?;
+    validate_replay_dry_run(dry_run)?;
+
+    match entry.state {
+        OutboxState::Queued => dry_run_queued_outbox_entry(entry, dry_run),
+        OutboxState::ReplayDryRunOk => {
+            if let Some(delivered_message_id) = &dry_run.delivered_message_id {
+                mark_outbox_entry_replayed(
+                    entry,
+                    dry_run.checked_at.clone(),
+                    delivered_message_id.clone(),
+                )
+            } else {
+                Ok(entry)
+            }
+        }
+        OutboxState::Replayed => {
+            if let Some(delivered_message_id) = &dry_run.delivered_message_id {
+                ensure_delivered_message_id_matches(&entry, delivered_message_id)?;
+            }
+            Ok(entry)
+        }
+        OutboxState::ReplayFailed => Ok(entry),
+        OutboxState::Superseded | OutboxState::DiscardedByOperator => {
+            Err(AgentMailOutboxReplayError::IneligibleState {
+                state: entry.state,
+                transition: "replay dry-run",
+            })
+        }
+    }
+}
+
+pub fn mark_outbox_entry_replayed(
+    mut entry: AgentMailOutboxEntry,
+    replayed_at: impl Into<String>,
+    delivered_message_id: impl Into<String>,
+) -> Result<AgentMailOutboxEntry, AgentMailOutboxReplayError> {
+    entry.validate()?;
+    let replayed_at = replayed_at.into();
+    let delivered_message_id = delivered_message_id.into();
+    validate_rfc3339_utc("replay_receipt.replayed_at", &replayed_at)?;
+    validate_non_empty("replay_receipt.delivered_message_id", &delivered_message_id)?;
+
+    match entry.state {
+        OutboxState::ReplayDryRunOk => {
+            let dry_run_at = entry
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.dry_run_at.clone());
+            transition_to_replayed(&mut entry, dry_run_at, replayed_at, delivered_message_id)?;
+            Ok(entry)
+        }
+        OutboxState::Replayed => {
+            ensure_delivered_message_id_matches(&entry, &delivered_message_id)?;
+            Ok(entry)
+        }
+        OutboxState::Queued
+        | OutboxState::ReplayFailed
+        | OutboxState::Superseded
+        | OutboxState::DiscardedByOperator => Err(AgentMailOutboxReplayError::IneligibleState {
+            state: entry.state,
+            transition: "mark replayed",
+        }),
+    }
+}
+
+pub fn mark_outbox_entry_replay_failed(
+    mut entry: AgentMailOutboxEntry,
+    failed_at: impl Into<String>,
+    failure_summary: impl Into<String>,
+) -> Result<AgentMailOutboxEntry, AgentMailOutboxReplayError> {
+    entry.validate()?;
+    let failed_at = failed_at.into();
+    let failure_summary = failure_summary.into();
+    validate_rfc3339_utc("replay_receipt.replayed_at", &failed_at)?;
+    validate_preview(&failure_summary)?;
+
+    match entry.state {
+        OutboxState::Queued | OutboxState::ReplayDryRunOk => {
+            transition_to_replay_failed(&mut entry, failed_at, failure_summary)?;
+            Ok(entry)
+        }
+        OutboxState::ReplayFailed => Ok(entry),
+        OutboxState::Replayed | OutboxState::Superseded | OutboxState::DiscardedByOperator => {
+            Err(AgentMailOutboxReplayError::IneligibleState {
+                state: entry.state,
+                transition: "mark replay failed",
+            })
+        }
+    }
 }
 
 #[must_use]
@@ -843,6 +962,167 @@ fn retention_redactions(request: &AgentMailOutboxWriteRequest) -> Vec<RetentionR
         redactions.push(RetentionRedaction::BccAllowedForReplay);
     }
     redactions
+}
+
+fn dry_run_queued_outbox_entry(
+    mut entry: AgentMailOutboxEntry,
+    dry_run: &AgentMailOutboxReplayDryRun,
+) -> Result<AgentMailOutboxEntry, AgentMailOutboxReplayError> {
+    if let Some(delivered_message_id) = &dry_run.delivered_message_id {
+        transition_to_replayed(
+            &mut entry,
+            Some(dry_run.checked_at.clone()),
+            dry_run.checked_at.clone(),
+            delivered_message_id.clone(),
+        )?;
+        return Ok(entry);
+    }
+
+    let blockers = replay_dry_run_blockers(&entry, dry_run);
+    if !blockers.is_empty() {
+        transition_to_replay_failed(&mut entry, dry_run.checked_at.clone(), blockers.join("; "))?;
+        return Ok(entry);
+    }
+
+    entry.state = OutboxState::ReplayDryRunOk;
+    entry.state_reason = None;
+    entry.operator_decision = None;
+    entry.replay_receipt = Some(ReplayReceipt {
+        dry_run_at: Some(dry_run.checked_at.clone()),
+        replayed_at: None,
+        delivered_message_id: None,
+        failure_summary: None,
+    });
+    entry.validate()?;
+    Ok(entry)
+}
+
+fn replay_dry_run_blockers(
+    entry: &AgentMailOutboxEntry,
+    dry_run: &AgentMailOutboxReplayDryRun,
+) -> Vec<String> {
+    let available_recipients: BTreeSet<&str> = dry_run
+        .available_recipients
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let unavailable_recipients = entry
+        .recipients
+        .to
+        .iter()
+        .chain(&entry.recipients.cc)
+        .chain(&entry.recipients.bcc)
+        .filter(|recipient| !available_recipients.contains(recipient.as_str()))
+        .count();
+
+    let available_attachment_paths: BTreeSet<&str> = dry_run
+        .available_attachment_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let unavailable_attachments = entry
+        .attachments
+        .iter()
+        .filter(|attachment| !available_attachment_paths.contains(attachment.path.as_str()))
+        .count();
+
+    let mut blockers = Vec::new();
+    if unavailable_recipients > 0 {
+        blockers.push(format!(
+            "recipient/contact unavailable for replay ({unavailable_recipients} missing)"
+        ));
+    }
+    if entry.ack_required && !dry_run.ack_available {
+        blockers.push("ack_required replay blocked because ack delivery is unavailable".to_owned());
+    }
+    if entry.source_operation == SourceOperation::ReplyMessage && entry.thread_id.is_none() {
+        blockers.push("reply replay blocked because thread_id is required".to_owned());
+    }
+    if unavailable_attachments > 0 {
+        blockers.push(format!(
+            "attachment unavailable for replay ({unavailable_attachments} missing)"
+        ));
+    }
+    blockers
+}
+
+fn transition_to_replayed(
+    entry: &mut AgentMailOutboxEntry,
+    dry_run_at: Option<String>,
+    replayed_at: String,
+    delivered_message_id: String,
+) -> Result<(), AgentMailOutboxReplayError> {
+    entry.state = OutboxState::Replayed;
+    entry.state_reason = None;
+    entry.operator_decision = None;
+    entry.replay_receipt = Some(ReplayReceipt {
+        dry_run_at,
+        replayed_at: Some(replayed_at),
+        delivered_message_id: Some(delivered_message_id),
+        failure_summary: None,
+    });
+    entry.validate()?;
+    Ok(())
+}
+
+fn transition_to_replay_failed(
+    entry: &mut AgentMailOutboxEntry,
+    replayed_at: String,
+    failure_summary: String,
+) -> Result<(), AgentMailOutboxReplayError> {
+    let dry_run_at = entry
+        .replay_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.dry_run_at.clone());
+    entry.state = OutboxState::ReplayFailed;
+    entry.state_reason = None;
+    entry.operator_decision = None;
+    entry.replay_receipt = Some(ReplayReceipt {
+        dry_run_at,
+        replayed_at: Some(replayed_at),
+        delivered_message_id: None,
+        failure_summary: Some(failure_summary),
+    });
+    entry.validate()?;
+    Ok(())
+}
+
+fn ensure_delivered_message_id_matches(
+    entry: &AgentMailOutboxEntry,
+    delivered_message_id: &str,
+) -> Result<(), AgentMailOutboxReplayError> {
+    let existing = entry
+        .replay_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.delivered_message_id.as_deref())
+        .ok_or(AgentMailOutboxValidationError::InvalidState {
+            state: entry.state,
+            reason: "replayed requires delivered_message_id",
+        })?;
+    if existing == delivered_message_id {
+        Ok(())
+    } else {
+        Err(AgentMailOutboxReplayError::DeliveredMessageIdMismatch {
+            existing: existing.to_owned(),
+            requested: delivered_message_id.to_owned(),
+        })
+    }
+}
+
+fn validate_replay_dry_run(
+    dry_run: &AgentMailOutboxReplayDryRun,
+) -> Result<(), AgentMailOutboxReplayError> {
+    validate_rfc3339_utc("replay_dry_run.checked_at", &dry_run.checked_at)?;
+    for recipient in &dry_run.available_recipients {
+        validate_recipient(recipient)?;
+    }
+    for path in &dry_run.available_attachment_paths {
+        validate_repo_relative_path("replay_dry_run.available_attachment_paths", path)?;
+    }
+    if let Some(delivered_message_id) = &dry_run.delivered_message_id {
+        validate_non_empty("replay_dry_run.delivered_message_id", delivered_message_id)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -1159,6 +1439,16 @@ mod tests {
         }
     }
 
+    fn valid_replay_dry_run() -> AgentMailOutboxReplayDryRun {
+        AgentMailOutboxReplayDryRun {
+            checked_at: "2026-05-29T14:10:00Z".to_owned(),
+            available_recipients: vec!["SapphireCardinal".to_owned()],
+            ack_available: true,
+            available_attachment_paths: Vec::new(),
+            delivered_message_id: None,
+        }
+    }
+
     #[test]
     fn valid_fixture_entries_pass_validation() {
         for fixture in [
@@ -1176,6 +1466,7 @@ mod tests {
             include_str!(
                 "../../../fixtures/agent-mail-outage-spool/valid/stale-owner-handoff.json"
             ),
+            include_str!("../../../fixtures/agent-mail-outage-spool/valid/replayed-send.json"),
             include_str!(
                 "../../../fixtures/agent-mail-outage-spool/valid/writer-adapter-queued-send.json"
             ),
@@ -1256,6 +1547,135 @@ mod tests {
                 .contains(&RetentionRedaction::BodyPreviewRedacted)
         );
         entry.validate().expect("queued entry validates");
+    }
+
+    #[test]
+    fn dry_run_verifier_marks_queued_entry_ready_for_replay() {
+        let entry = dry_run_replay_outbox_entry(valid_entry(), &valid_replay_dry_run())
+            .expect("dry-run ok");
+
+        assert_eq!(entry.state, OutboxState::ReplayDryRunOk);
+        assert_eq!(
+            entry
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.dry_run_at.as_deref()),
+            Some("2026-05-29T14:10:00Z")
+        );
+        assert_eq!(
+            entry
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.delivered_message_id.as_deref()),
+            None
+        );
+        entry.validate().expect("dry-run entry validates");
+    }
+
+    #[test]
+    fn dry_run_verifier_suppresses_duplicate_when_message_already_delivered() {
+        let mut dry_run = valid_replay_dry_run();
+        dry_run.delivered_message_id = Some("agent-mail-msg-ft-dezx8-3-6372".to_owned());
+
+        let entry =
+            dry_run_replay_outbox_entry(valid_entry(), &dry_run).expect("duplicate is replayed");
+
+        assert_eq!(entry.state, OutboxState::Replayed);
+        assert_eq!(
+            entry
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.dry_run_at.as_deref()),
+            Some("2026-05-29T14:10:00Z")
+        );
+        assert_eq!(
+            entry
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.replayed_at.as_deref()),
+            Some("2026-05-29T14:10:00Z")
+        );
+        assert_eq!(
+            entry
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.delivered_message_id.as_deref()),
+            Some("agent-mail-msg-ft-dezx8-3-6372")
+        );
+        entry.validate().expect("replayed entry validates");
+    }
+
+    #[test]
+    fn replay_delivery_transition_is_idempotent_for_same_message() {
+        let ready = dry_run_replay_outbox_entry(valid_entry(), &valid_replay_dry_run())
+            .expect("dry-run ok");
+        let replayed = mark_outbox_entry_replayed(
+            ready,
+            "2026-05-29T14:11:00Z",
+            "agent-mail-msg-ft-dezx8-3-6373",
+        )
+        .expect("delivery receipt records");
+        let repeated = mark_outbox_entry_replayed(
+            replayed.clone(),
+            "2026-05-29T14:12:00Z",
+            "agent-mail-msg-ft-dezx8-3-6373",
+        )
+        .expect("same delivery receipt is idempotent");
+
+        assert_eq!(repeated, replayed);
+    }
+
+    #[test]
+    fn ack_required_dry_run_failure_records_structured_reason() {
+        let mut entry = valid_entry();
+        entry.ack_required = true;
+        let mut dry_run = valid_replay_dry_run();
+        dry_run.ack_available = false;
+
+        let failed = dry_run_replay_outbox_entry(entry, &dry_run).expect("ack blocker records");
+
+        assert_eq!(failed.state, OutboxState::ReplayFailed);
+        assert_eq!(
+            failed
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.failure_summary.as_deref()),
+            Some("ack_required replay blocked because ack delivery is unavailable")
+        );
+        failed.validate().expect("failed entry validates");
+    }
+
+    #[test]
+    fn contact_unavailable_dry_run_failure_records_structured_reason() {
+        let mut dry_run = valid_replay_dry_run();
+        dry_run.available_recipients.clear();
+
+        let failed =
+            dry_run_replay_outbox_entry(valid_entry(), &dry_run).expect("contact blocker records");
+
+        assert_eq!(failed.state, OutboxState::ReplayFailed);
+        assert_eq!(
+            failed
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.failure_summary.as_deref()),
+            Some("recipient/contact unavailable for replay (1 missing)")
+        );
+    }
+
+    #[test]
+    fn replay_delivery_requires_prior_dry_run_state() {
+        assert!(matches!(
+            mark_outbox_entry_replayed(
+                valid_entry(),
+                "2026-05-29T14:11:00Z",
+                "agent-mail-msg-ft-dezx8-3-6374"
+            ),
+            Err(AgentMailOutboxReplayError::IneligibleState {
+                state: OutboxState::Queued,
+                transition: "mark replayed"
+            })
+        ));
     }
 
     #[test]
