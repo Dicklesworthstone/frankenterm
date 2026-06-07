@@ -41,15 +41,31 @@
       "measurement": "Criterion sample of presented frame intervals",
       "source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
       "structured_log": "target/criterion/slo-resize_fps.jsonl",
-      "status": "substrate_wired",
+      "status": "retained_run_validated",
       "retained_evidence": {
-        "status": "substrate_wired_pending_rch_target_run",
+        "status": "retained_run_validated",
         "follow_up_bead": "ft-tf6g3.3.7",
-        "source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
+        "source_artifact_path": "crates/frankenterm-core/benches/resize_storm.rs",
+        "source_artifact_sha256": "ae786cddb6bb4ace280e00cee32a24d29f5b43435247f5e09bd941518c8c21e7",
         "structured_log": "target/criterion/slo-resize_fps.jsonl",
-        "reason": "Source bench now exists and emits a structured evidence row; retained target-run artifact hash remains pending RCH proof."
+        "retained_artifact_path": "docs/attestations/tui/resize-fps-rq-s1-20260606T2351Z.jsonl",
+        "retained_artifact_sha256": "3b815a2c0d4dda5a8e6d19fb8dcd055081026b7c816cdedc73cffc86dee2275d",
+        "row_count": 20,
+        "remote_cargo_reached": true,
+        "remote_rustc_reached": true,
+        "bench_binary_reached": true,
+        "selected_worker_id": "vmi1153651",
+        "rch_job": "j-29871232832767027",
+        "remote_target_dir": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1153651-job-29871232832767027-1780789590451569000-0",
+        "local_target_sync_path": "/tmp/rch-ft-tf6g3-3-7-resize-target-20260606T2351Z/criterion/slo-resize_fps.jsonl",
+        "criterion_samples": 10,
+        "criterion_measurement_time_secs": 3,
+        "criterion_time_interval_ms": "[3.1410, 3.3148, 3.4337]",
+        "max_p99_frame_time_us": 106,
+        "max_p95_frame_time_us": 16,
+        "reason": "Remote RCH retained target run passed on vmi1153651 with all 20 evidence rows within the 16.6ms p99 frame-time target; retained JSONL max p99 frame time was 106us."
       },
-      "blocked_by": ["ft-tf6g3.3.7"],
+      "blocked_by": [],
       "owner_bead": "ft-tf6g3.3.7"
     },
     {
@@ -344,6 +360,12 @@
       "date": "2026-05-16",
       "bead": "ft-tf6g3.3.10",
       "note": "RQ-S10 atlas stability retained release evidence passed through remote RCH on vmi1293453; retained JSONL shows zero atlas rebuild delta, zero atlas version drift, and zero glyph reuploads for the pure-resize workload."
+    },
+    {
+      "version": "0.1.8",
+      "date": "2026-06-07",
+      "bead": "ft-tf6g3.3.7",
+      "note": "RQ-S1 resize FPS retained release evidence passed through remote RCH on vmi1153651; retained JSONL has 20 rows, all within target, with max p99 frame time 106us for the 200-pane continuous-resize workload."
     }
   ]
 }

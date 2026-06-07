@@ -60,7 +60,7 @@ machine-readable JSON, the README, and the attestation bundle.
 
 | ID | Title | Target | Source bench / test | Owner bead | Status |
 |---|---|---|---|---|---|
-| RQ-S1 | Resize FPS | ≥60 sustained on 200-pane fleet, 5s gesture (p99 frame ≤16.6ms) | `crates/frankenterm-core/benches/resize_storm.rs` | ft-tf6g3.3.7 | substrate_wired |
+| RQ-S1 | Resize FPS | ≥60 sustained on 200-pane fleet, 5s gesture (p99 frame ≤16.6ms) | `crates/frankenterm-core/benches/resize_storm.rs` | ft-tf6g3.3.7 | retained_run_validated |
 | RQ-S2 | Input-to-photon (macOS) | p95 < 16ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
 | RQ-S3 | Input-to-photon (Wayland) | p95 < 20ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
 | RQ-S4 | Visual artifacts (24h fuzz) | 0 critical from random resize+scroll+content | `tests/renderer_golden/fuzz` | ft-mpc9b.1.6 | bench_pending |
@@ -83,10 +83,10 @@ disagree, the JSON wins.
 
 `docs/attestations/tui/render-parity.json` now carries the
 `renderer_slo_retained_evidence` ledger used by the G18 umbrella. As of
-2026-05-16, the umbrella is still blocked: RQ-S10 and RQ-S13 have retained
-remote RCH proof, while RQ-S1/RQ-S2/RQ-S3/RQ-S5 are substrate-only pending
-target runs. The remaining missing target-run work is split across
-`ft-tf6g3.3.7` through `ft-tf6g3.3.9`.
+2026-06-07, the umbrella is still blocked: RQ-S1/RQ-S10/RQ-S13 have
+retained remote RCH proof, while RQ-S2/RQ-S3/RQ-S5 are substrate-only
+pending target runs. The remaining missing target-run work is split across
+`ft-tf6g3.3.8` and `ft-tf6g3.3.9`.
 
 ## Structured-log contract
 
