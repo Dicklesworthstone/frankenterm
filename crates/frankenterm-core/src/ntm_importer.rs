@@ -755,7 +755,7 @@ impl NtmImporter {
                     resource_hints: TranslatedResourceHints::default(),
                     layout_template: Some(format!("{}-{}", session.name, window.name)),
                     bootstrap_commands: Vec::new(),
-                    tags: vec![format!("imported:ntm"), format!("session:{}", session.name)],
+                    tags: vec!["imported:ntm".to_string(), format!("session:{}", session.name)],
                 });
             }
         }

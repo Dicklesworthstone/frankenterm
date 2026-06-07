@@ -4250,11 +4250,16 @@ impl RuntimeHandle {
     }
 
     /// Current write queue depth (pending commands for the storage writer thread).
+    // Intentionally `async`: part of the Cx-first async surface and the sibling
+    // pair below; the signature is the public contract even though the current
+    // body delegates to a sync read.
+    #[allow(clippy::unused_async)]
     pub async fn write_queue_depth(&self) -> usize {
         self.storage.write_queue_depth()
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::write_queue_depth`].
+    #[allow(clippy::unused_async)]
     pub async fn write_queue_depth_with_cx(&self, _cx: &crate::cx::Cx) -> usize {
         self.storage.write_queue_depth()
     }

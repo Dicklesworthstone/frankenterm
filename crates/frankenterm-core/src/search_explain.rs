@@ -361,7 +361,7 @@ fn check_pane_excluded(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExpla
                     ],
                     suggestions: vec![
                         "Remove the exclusion rule from ft.toml pane filters.".to_string(),
-                        format!("Check config: ft config show --effective | grep pane"),
+                        "Check config: ft config show --effective | grep pane".to_string(),
                     ],
                     confidence: 0.95,
                 });
