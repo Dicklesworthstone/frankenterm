@@ -20,9 +20,10 @@ pub const OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE: &str = "wa://operating-envelo
 pub const OPERATING_ENVELOPE_SURFACE_SAFETY_NOTICE: &str = "read-only plan; not permission to mutate panes, claim Beads, repair or restart services, \
      cancel RCH work, count local Cargo as proof, capture raw pane content, or drain workers";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OperatingEnvelopeScenario {
+    #[default]
     Current,
     Healthy,
     Degraded,
@@ -56,15 +57,10 @@ impl OperatingEnvelopeScenario {
     }
 }
 
-impl Default for OperatingEnvelopeScenario {
-    fn default() -> Self {
-        Self::Current
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperatingEnvelopeSurface {
+    #[default]
     Status,
     Explain,
 }
@@ -85,12 +81,6 @@ impl OperatingEnvelopeSurface {
             "explain" | "reason" | "reason_code" => Some(Self::Explain),
             _ => None,
         }
-    }
-}
-
-impl Default for OperatingEnvelopeSurface {
-    fn default() -> Self {
-        Self::Status
     }
 }
 
