@@ -1,4 +1,3 @@
-#![macro_use]
 // Vendored from WezTerm — suppress cosmetic clippy lints
 #![allow(clippy::mutable_key_type)]
 #![allow(clippy::needless_borrow)]
