@@ -319,7 +319,12 @@ fn gauss_kl(m1: f64, v1: f64, m2: f64, v2: f64) -> f64 {
     // windows; the gauss_summary helper already clamps to 1e-9 but the
     // ratio can still explode under extreme inputs.
     let v2 = v2.max(1e-12);
-    0.5 * ((v1 / v2) + ((m2 - m1).powi(2) / v2) - 1.0 + (v2 / v1.max(1e-12)).ln())
+    // The leading 0.5 is the KL-divergence coefficient from Cover & Thomas,
+    // not a midpoint of the two parenthesized terms; `.midpoint()` would be
+    // semantically wrong here.
+    #[allow(clippy::manual_midpoint)]
+    let kl = 0.5 * ((v1 / v2) + ((m2 - m1).powi(2) / v2) - 1.0 + (v2 / v1.max(1e-12)).ln());
+    kl
 }
 
 #[cfg(test)]

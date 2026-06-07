@@ -195,7 +195,13 @@ impl GaussianPosterior {
     pub fn kl_divergence(&self, other: &GaussianPosterior) -> f64 {
         let var_ratio = self.variance / other.variance.max(1e-12);
         let mean_diff = self.mean - other.mean;
-        0.5 * (var_ratio - 1.0 + mean_diff * mean_diff / other.variance.max(1e-12) - var_ratio.ln())
+        // The leading 0.5 is the KL-divergence coefficient, not a midpoint of
+        // the parenthesized terms; `.midpoint()` would be semantically wrong.
+        #[allow(clippy::manual_midpoint)]
+        let kl = 0.5
+            * (var_ratio - 1.0 + mean_diff * mean_diff / other.variance.max(1e-12)
+                - var_ratio.ln());
+        kl
     }
 
     /// Standard deviation.

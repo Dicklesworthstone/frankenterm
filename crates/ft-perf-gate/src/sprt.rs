@@ -393,7 +393,7 @@ pub fn evaluate_wald_sprt(samples: &[EvidenceSample], cfg: &WaldSprtConfig) -> W
 
     #[allow(clippy::suspicious_operation_groupings)]
     let coefficient = (cfg.mu_alt - cfg.mu_null) / (cfg.sigma * cfg.sigma);
-    let midpoint = 0.5 * (cfg.mu_null + cfg.mu_alt);
+    let midpoint = cfg.mu_null.midpoint(cfg.mu_alt);
     let max_n = cfg.max_samples.max(cfg.min_samples).max(1);
 
     let mut llr = 0.0_f64;
