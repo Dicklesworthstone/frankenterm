@@ -62794,38 +62794,32 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
-                use asupersync::io::AsyncWriteExt;
-                use asupersync::net::TcpStream;
                 use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
-                use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_listener_session_fallback_normalized").await;
+                let shutdown_storage_handle = storage_handle.clone();
                 let storage = std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(
                     storage_handle,
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-                let bind_probe =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
-                drop(bind_probe);
-
-                let distributed_config =
-                    distributed_token_config(bind_addr, "dist-case-session-token");
-
-                let listener_handle = spawn_distributed_listener(
-                    distributed_config.clone(),
-                    default_wire_limits(),
-                    std::sync::Arc::clone(&storage),
-                    std::sync::Arc::clone(&event_bus),
-                    std::sync::Arc::clone(&shutdown_flag),
-                )
-                .await
-                .expect("spawn distributed listener");
+                let wire_limits = default_wire_limits();
+                let ingest_state = DistributedIngestState::new(wire_limits);
 
                 let canonical_sender = "agent-case";
+                let first_session_id = distributed_resolve_session_id(
+                    None,
+                    Some("Agent-Case"),
+                    "127.0.0.1:49152".parse().expect("valid test peer addr"),
+                );
+                let second_session_id = distributed_resolve_session_id(
+                    None,
+                    Some("agent-case"),
+                    "127.0.0.1:49153".parse().expect("valid test peer addr"),
+                );
+                assert_eq!(first_session_id, canonical_sender);
+                assert_eq!(second_session_id, canonical_sender);
+
                 let source_pane_id = 93_u64;
                 let remote_pane_id = distributed_remote_pane_id(canonical_sender, source_pane_id);
                 let newer_meta = PaneMeta {
@@ -62851,156 +62845,44 @@ recorder_backend = "frankensqlite"
                     timestamp_ms: now_ms(),
                 };
 
-                {
-                    let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
-                        .await
-                        .expect("connect first distributed listener");
-                    let handshake = DistributedHandshake {
-                        protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
-                        token: distributed_config.token.clone(),
-                        agent_id: Some("Agent-Case".to_string()),
-                        session_id: None,
-                    };
-                    let handshake_json =
-                        serde_json::to_string(&handshake).expect("serialize first handshake");
-                    stream
-                        .write_all(handshake_json.as_bytes())
-                        .await
-                        .expect("write first handshake");
-                    stream
-                        .write_all(b"\n")
-                        .await
-                        .expect("write first handshake newline");
-                    stream.flush().await.expect("flush first handshake");
+                distributed_ingest_test_connection(
+                    &first_session_id,
+                    canonical_sender,
+                    vec![WireEnvelope::new(
+                        2,
+                        "AGENT-CASE",
+                        WirePayload::PaneMeta(newer_meta),
+                    )],
+                    wire_limits,
+                    &ingest_state,
+                    &storage,
+                    &event_bus,
+                )
+                .await
+                .expect("first fallback-session connection should ingest");
 
-                    let mut reader = asupersync::io::BufReader::new(stream);
-                    let mut line = String::new();
-                    let read_size = frankenterm_core::runtime_async::timeout(
-                        std::time::Duration::from_secs(1),
-                        distributed_read_line(
-                            &mut reader,
-                            &mut line,
-                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                        ),
-                    )
-                    .await
-                    .expect("read first handshake acknowledgement within timeout")
-                    .expect("read first handshake acknowledgement");
-                    assert!(
-                        read_size > 0,
-                        "listener should emit first handshake acknowledgement"
-                    );
-
-                    let envelope =
-                        WireEnvelope::new(2, "AGENT-CASE", WirePayload::PaneMeta(newer_meta));
-                    let bytes = envelope.to_json().expect("serialize first envelope");
-                    reader
-                        .get_mut()
-                        .write_all(&bytes)
-                        .await
-                        .expect("write first envelope");
-                    reader
-                        .get_mut()
-                        .write_all(b"\n")
-                        .await
-                        .expect("write first envelope newline");
-                    reader
-                        .get_mut()
-                        .flush()
-                        .await
-                        .expect("flush first envelope");
-                    distributed_shutdown_tcp_test_reader(&mut reader);
-                }
-
-                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(100))
-                    .await;
-
-                {
-                    let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
-                        .await
-                        .expect("connect second distributed listener");
-                    let handshake = DistributedHandshake {
-                        protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
-                        token: distributed_config.token.clone(),
-                        agent_id: Some("agent-case".to_string()),
-                        session_id: None,
-                    };
-                    let handshake_json =
-                        serde_json::to_string(&handshake).expect("serialize second handshake");
-                    stream
-                        .write_all(handshake_json.as_bytes())
-                        .await
-                        .expect("write second handshake");
-                    stream
-                        .write_all(b"\n")
-                        .await
-                        .expect("write second handshake newline");
-                    stream.flush().await.expect("flush second handshake");
-
-                    let mut reader = asupersync::io::BufReader::new(stream);
-                    let mut line = String::new();
-                    let read_size = frankenterm_core::runtime_async::timeout(
-                        std::time::Duration::from_secs(1),
-                        distributed_read_line(
-                            &mut reader,
-                            &mut line,
-                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                        ),
-                    )
-                    .await
-                    .expect("read second handshake acknowledgement within timeout")
-                    .expect("read second handshake acknowledgement");
-                    assert!(
-                        read_size > 0,
-                        "listener should emit second handshake acknowledgement"
-                    );
-
-                    let envelope =
-                        WireEnvelope::new(1, "agent-case", WirePayload::PaneMeta(stale_meta));
-                    let bytes = envelope.to_json().expect("serialize second envelope");
-                    reader
-                        .get_mut()
-                        .write_all(&bytes)
-                        .await
-                        .expect("write second envelope");
-                    reader
-                        .get_mut()
-                        .write_all(b"\n")
-                        .await
-                        .expect("write second envelope newline");
-                    reader
-                        .get_mut()
-                        .flush()
-                        .await
-                        .expect("flush second envelope");
-
-                    line.clear();
-                    let read_size = frankenterm_core::runtime_async::timeout(
-                        std::time::Duration::from_secs(1),
-                        distributed_read_line(
-                            &mut reader,
-                            &mut line,
-                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-                        ),
-                    )
-                    .await
-                    .expect("read replay-detected response within timeout")
-                    .expect("read replay-detected response");
-                    assert!(
-                        read_size > 0,
-                        "listener should emit replay-detected response"
-                    );
-
-                    let payload: serde_json::Value =
-                        serde_json::from_str(line.trim()).expect("parse replay-detected payload");
-                    assert_eq!(payload["ok"], serde_json::Value::Bool(false));
-                    assert_eq!(payload["error"]["code"], "dist.replay_detected");
-
-                    distributed_shutdown_tcp_test_reader(&mut reader);
-                }
-
-                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(150))
-                    .await;
+                let stale_result = distributed_ingest_test_connection(
+                    &second_session_id,
+                    canonical_sender,
+                    vec![WireEnvelope::new(
+                        1,
+                        "agent-case",
+                        WirePayload::PaneMeta(stale_meta),
+                    )],
+                    wire_limits,
+                    &ingest_state,
+                    &storage,
+                    &event_bus,
+                )
+                .await;
+                let stale_error =
+                    stale_result.expect_err("case-only fallback reconnect must be rejected");
+                assert!(
+                    stale_error
+                        .to_string()
+                        .contains("distributed replay detected"),
+                    "unexpected stale reconnect error: {stale_error}"
+                );
 
                 {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -63029,13 +62911,10 @@ recorder_backend = "frankensqlite"
                     );
                 }
 
-                shutdown_flag.store(true, Ordering::SeqCst);
-                let _ = listener_handle.await;
-
-                {
-                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                    storage_handle.shutdown().await.expect("shutdown storage");
-                }
+                shutdown_storage_handle
+                    .shutdown()
+                    .await
+                    .expect("shutdown storage");
                 drop(storage);
                 let _ = std::fs::remove_file(&db_path);
                 let _ = std::fs::remove_file(format!("{db_path}-wal"));
