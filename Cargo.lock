@@ -327,8 +327,8 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.3.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
+version = "0.3.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=1e87cc68fac906b5a5e98a555f6fa7659831eaa6#46f32a16277a3c6b424cbbedb9cc6bec2e834953"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -387,8 +387,8 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.3.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
+version = "0.3.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=1e87cc68fac906b5a5e98a555f6fa7659831eaa6#46f32a16277a3c6b424cbbedb9cc6bec2e834953"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3337,8 +3337,8 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.3.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
+version = "0.3.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=1e87cc68fac906b5a5e98a555f6fa7659831eaa6#46f32a16277a3c6b424cbbedb9cc6bec2e834953"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -3347,8 +3347,8 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.3.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
+version = "0.3.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=1e87cc68fac906b5a5e98a555f6fa7659831eaa6#46f32a16277a3c6b424cbbedb9cc6bec2e834953"
 dependencies = [
  "serde",
  "serde_json",
@@ -3356,8 +3356,8 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.3.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=888385dbe33232a71ded9ee14535c05b8b5b086f#888385dbe33232a71ded9ee14535c05b8b5b086f"
+version = "0.3.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=1e87cc68fac906b5a5e98a555f6fa7659831eaa6#46f32a16277a3c6b424cbbedb9cc6bec2e834953"
 dependencies = [
  "serde",
 ]
@@ -3642,6 +3642,7 @@ dependencies = [
  "franken-agent-detection",
  "frankensearch",
  "frankenterm-alloc",
+ "frankenterm-cell",
  "frankenterm-core-ars",
  "frankenterm-core-atlas-pack-types",
  "frankenterm-core-audit-types",

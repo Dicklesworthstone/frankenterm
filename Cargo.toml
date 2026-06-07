@@ -548,8 +548,8 @@ wasmtime-wasi = { version = "44.0.2", default-features = false, features = ["p1"
 criterion = "0.5"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.3.2" }
-asupersync-macros = { version = "0.3.1" }
+asupersync = { version = "0.3.4" }
+asupersync-macros = { version = "0.3.4" }
 rich_rust = { version = "0.2.0" }
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -609,23 +609,25 @@ debug = 1
 # patch before committing — committing a /dp path breaks CI and external builds.
 [patch.crates-io]
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
-# asupersync is pinned to upstream main (0.3.3, 2026-06-06), which is ahead of the
-# crates.io release and carries the io_driver waker fix for remote mux-domain
-# readiness wakeups (a previously stale pin, 3b9d1199, shipped the older waker path
-# and broke handshakes with "Timed out while parsing the response from the server").
+# asupersync is pinned to the v0.3.4 release tag (rev 1e87cc68, 2026-06-07). 0.3.4
+# supersedes the yanked 0.3.3, which shipped a tls compile regression in
+# src/atp/policy/scope.rs (E0277 only under tls features) plus packaging breakage.
+# It retains the io_driver waker fix for remote mux-domain readiness wakeups (a
+# previously stale pin, 3b9d1199, shipped the older waker path and broke handshakes
+# with "Timed out while parsing the response from the server").
 # Keep this pin FRESH when asupersync moves — see PIN MAINTENANCE above.
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
 k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b48b5e05cf1f8fffc7c" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "888385dbe33232a71ded9ee14535c05b8b5b086f" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
