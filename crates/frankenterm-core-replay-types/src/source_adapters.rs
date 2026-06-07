@@ -617,6 +617,12 @@ fn append_event_or_failure(
     }
 }
 
+// Internal event-construction helper: each parameter is a distinct,
+// already-validated field of the causal event being assembled, and the
+// five call sites each supply a different combination. Bundling them into
+// a params struct would only move the same field list to every caller, so
+// the wide signature is the clearer shape here.
+#[allow(clippy::too_many_arguments)]
 fn build_validated_event(
     adapter: SourceAdapterKind,
     event_class: CausalEventClass,
