@@ -1664,6 +1664,49 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_verifier_checks_secondary_recipient_roles() {
+        let mut entry = valid_entry();
+        entry.recipients.cc = vec!["YellowHorse".to_owned()];
+        entry.recipients.bcc = vec!["GreenLake".to_owned()];
+
+        let failed = dry_run_replay_outbox_entry(entry, &valid_replay_dry_run())
+            .expect("secondary-recipient blocker records");
+
+        assert_eq!(failed.state, OutboxState::ReplayFailed);
+        assert_eq!(
+            failed
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.failure_summary.as_deref()),
+            Some("recipient/contact unavailable for replay (2 missing)")
+        );
+    }
+
+    #[test]
+    fn dry_run_verifier_records_missing_attachment_blocker() {
+        let mut entry = valid_entry();
+        entry.attachments = vec![AttachmentRef {
+            path: "docs/outbox-proof.txt".to_owned(),
+            sha256: Some(digest()),
+            byte_count: 128,
+            content_type: Some("text/plain".to_owned()),
+            retention: AttachmentRetention::DigestOnly,
+        }];
+
+        let failed = dry_run_replay_outbox_entry(entry, &valid_replay_dry_run())
+            .expect("attachment blocker records");
+
+        assert_eq!(failed.state, OutboxState::ReplayFailed);
+        assert_eq!(
+            failed
+                .replay_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.failure_summary.as_deref()),
+            Some("attachment unavailable for replay (1 missing)")
+        );
+    }
+
+    #[test]
     fn replay_delivery_requires_prior_dry_run_state() {
         assert!(matches!(
             mark_outbox_entry_replayed(
