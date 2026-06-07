@@ -5784,7 +5784,7 @@ impl StorageHandle {
     /// This is a lightweight health check that sends a ping to the writer thread.
     // Intentionally `async`: part of the storage async surface; the signature is
     // the public contract even though the current body is a sync channel check.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async_trait_impl)]
     pub async fn is_writable(&self) -> bool {
         // A simple check: if the channel is not closed, writer should be alive
         // We can't easily send a ping without adding a new WriteCommand variant,
