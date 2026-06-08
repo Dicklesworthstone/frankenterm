@@ -33,7 +33,9 @@ pub const PROOF_INTENT_SCHEMA_VERSION: u32 = 1;
 /// Build/proof scope. Package-scoped proofs are cheaper and preferred under
 /// pressure; workspace-wide proofs are stronger but heavier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+// Tag is `type` (not `kind`) to avoid visual confusion with the sibling `kind`
+// field on `ProofIntent` once a scope is nested inside it.
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProofScope {
     /// A single package (`cargo ... -p <package>`).
     Package {
@@ -42,6 +44,17 @@ pub enum ProofScope {
     },
     /// The whole workspace (`cargo ... --workspace`).
     Workspace,
+}
+
+impl ProofScope {
+    /// Stable, separator-free token for the content hash.
+    #[must_use]
+    fn canonical_token(&self) -> String {
+        match self {
+            Self::Package { package } => format!("package:{package}"),
+            Self::Workspace => "workspace".to_string(),
+        }
+    }
 }
 
 /// The class of proof a command produces. Carried on the intent so replay and
@@ -67,20 +80,44 @@ pub enum ProofKind {
     Attestation,
 }
 
+impl ProofKind {
+    /// Stable string token (matches the serde representation). Used for the
+    /// content hash so the id never depends on `Debug` formatting.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Check => "check",
+            Self::Clippy => "clippy",
+            Self::Fmt => "fmt",
+            Self::Schema => "schema",
+            Self::Fuzz => "fuzz",
+            Self::Replay => "replay",
+            Self::Attestation => "attestation",
+        }
+    }
+}
+
 /// Redaction policy applied to any captured proof output before it is persisted
 /// or surfaced. Mirrors the project's T1/T2/T3 sensitivity tiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProofRedactionPolicy {
     /// Standard read-path redaction (default).
+    #[default]
     Standard,
     /// Most aggressive tier — for proofs over secret-bearing surfaces.
     Strict,
 }
 
-impl Default for ProofRedactionPolicy {
-    fn default() -> Self {
-        Self::Standard
+impl ProofRedactionPolicy {
+    /// Stable string token (matches the serde representation) for the hash.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+        }
     }
 }
 
@@ -170,22 +207,18 @@ impl ProofIntent {
     /// Excludes `intent_id` and `created_at_ms`.
     #[must_use]
     pub fn canonical_string(&self) -> String {
-        let scope = match &self.scope {
-            ProofScope::Package { package } => format!("package:{package}"),
-            ProofScope::Workspace => "workspace".to_string(),
-        };
         format!(
-            "v={};cmd={};scope={};kind={:?};src={};artifact={};remote={};bead={};slot={};redact={:?}",
+            "v={};cmd={};scope={};kind={};src={};artifact={};remote={};bead={};slot={};redact={}",
             self.schema_version,
             self.command,
-            scope,
-            self.kind,
+            self.scope.canonical_token(),
+            self.kind.as_str(),
             self.source_hash,
             self.expected_artifact_path.as_deref().unwrap_or("none"),
             self.required_remote,
             self.bead_id.as_deref().unwrap_or("none"),
             self.attestation_slot.as_deref().unwrap_or("none"),
-            self.redaction_policy,
+            self.redaction_policy.as_str(),
         )
     }
 
@@ -201,7 +234,7 @@ impl ProofIntent {
     /// against a different tree than intended).
     #[must_use]
     pub fn is_stale(&self, live_source_hash: &str) -> bool {
-        self.source_hash != live_source_hash
+        self.source_hash.as_str() != live_source_hash
     }
 
     /// Forward-compatibility + invariant guard. Call before queueing or
@@ -311,9 +344,12 @@ mod tests {
         );
         let json = serde_json::to_string(&ws).expect("serialize");
         assert!(
-            json.contains("\"kind\":\"workspace\""),
+            json.contains("\"type\":\"workspace\""),
             "scope tag present: {json}"
         );
+        // The top-level proof kind still serializes under `kind` (no collision
+        // with the scope discriminator, which is now `type`).
+        assert!(json.contains("\"kind\":\"test\""), "proof kind present: {json}");
         let back: ProofIntent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(ws, back);
         assert_ne!(
