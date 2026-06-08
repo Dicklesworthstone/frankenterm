@@ -20,8 +20,6 @@
 //!   bound hashes, verdict, rehearsal score, sorted approvals) and deliberately
 //!   EXCLUDES timestamps, so an identical plan always yields an identical id.
 
-#![allow(clippy::module_name_repetitions)]
-
 use crate::plan::Mission;
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +79,6 @@ pub struct SteeringReceipt {
 impl SteeringReceipt {
     /// Build a receipt binding an optional mission (by its canonical
     /// [`Mission::compute_hash`]) and an optional caller-computed tx hash.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         objective: impl Into<String>,
@@ -141,7 +138,7 @@ impl SteeringReceipt {
     /// Compute the content-addressed receipt id from [`Self::canonical_string`].
     #[must_use]
     pub fn compute_id(&self) -> String {
-        let hash = crate::replay_capture::sha256_hex(&self.canonical_string());
+        let hash = sha256_hex(&self.canonical_string());
         format!("steer:{}", &hash[..32])
     }
 
@@ -189,6 +186,16 @@ impl SteeringReceipt {
         }
         Ok(())
     }
+}
+
+/// Local SHA-256 hex helper. Kept module-local (matching the per-module pattern
+/// used across the crate, e.g. `plan.rs`/`approval.rs`) so this foundational
+/// type does not couple to a higher-level module for its content hash.
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

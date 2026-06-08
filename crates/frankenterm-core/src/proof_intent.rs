@@ -20,8 +20,6 @@
 //!   hash differs (re-running a stale command against a moved tree is the replay
 //!   hazard W8.2 guards against).
 
-#![allow(clippy::module_name_repetitions)]
-
 use serde::{Deserialize, Serialize};
 
 /// Stable contract id for the proof-intent schema.
@@ -171,7 +169,6 @@ pub struct ProofIntent {
 
 impl ProofIntent {
     /// Build a proof intent, computing the content-addressed `intent_id`.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         command: impl Into<String>,
@@ -225,7 +222,7 @@ impl ProofIntent {
     /// Compute the content-addressed intent id from [`Self::canonical_string`].
     #[must_use]
     pub fn compute_id(&self) -> String {
-        let hash = crate::replay_capture::sha256_hex(&self.canonical_string());
+        let hash = sha256_hex(&self.canonical_string());
         format!("proof:{}", &hash[..32])
     }
 
@@ -258,6 +255,16 @@ impl ProofIntent {
         }
         Ok(())
     }
+}
+
+/// Local SHA-256 hex helper. Kept module-local (matching the per-module pattern
+/// used across the crate, e.g. `plan.rs`/`approval.rs`) so this foundational
+/// type does not couple to a higher-level module for its content hash.
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
