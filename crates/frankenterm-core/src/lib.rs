@@ -615,6 +615,7 @@ pub mod spectral;
 pub mod splay_tree;
 pub mod spsc_ring_buffer;
 pub mod status_bar;
+pub mod steering;
 pub mod storage;
 pub mod storage_backend_cells;
 // br-ft-kcdqp: stub StorageBackend implementation under the
