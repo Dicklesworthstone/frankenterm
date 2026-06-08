@@ -442,6 +442,7 @@ pub mod pool;
 pub mod priority;
 pub mod process_tree;
 pub mod process_triage;
+pub mod proof_intent;
 pub mod protocol_recovery;
 pub mod quantile_sketch;
 pub mod query_contract;
