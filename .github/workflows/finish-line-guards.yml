@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6
 
       - name: Install jq + python3
         run: |
@@ -64,7 +64,7 @@ jobs:
 
       - name: Upload guard summary
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: finish-line-guards-summary-shell
           path: |
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -142,7 +142,7 @@ jobs:
 
       - name: Upload ft-e87u6.4 hedge alignment artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-e87u6-4-hedge-alignment
           path: tests/e2e/artifacts/goal-line/ft-e87u6/hedge-alignment/
@@ -151,7 +151,7 @@ jobs:
 
       - name: Upload ft-e87u6.5 manifest completeness artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-e87u6-5-manifest-completeness
           path: tests/e2e/artifacts/goal-line/ft-e87u6/manifest_completeness/
@@ -160,7 +160,7 @@ jobs:
 
       - name: Upload ft-e87u6.6 attestation closing-template artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-e87u6-6-template-smoke
           path: tests/e2e/artifacts/goal-line/ft-e87u6/template_smoke/
@@ -169,7 +169,7 @@ jobs:
 
       - name: Upload ft-e87u6.7 README attestation cross-link artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-e87u6-7-readme-cross-links
           path: tests/e2e/artifacts/goal-line/ft-e87u6/readme-cross-links/
@@ -181,7 +181,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6
 
       - name: Install jq + python3
         run: |
@@ -237,7 +237,7 @@ jobs:
 
       - name: Upload E2E artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: finish-line-guards-e2e-bundle
           path: tests/e2e/logs/ft_xbnl0_5_2_finish_line_guards_*/
@@ -246,7 +246,7 @@ jobs:
 
       - name: Upload ft-5eqd4.4 policy count artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-5eqd4-4-policy-count-doc-pin
           path: tests/e2e/artifacts/goal-line/ft-5eqd4/policy_count_doc_pin/
@@ -255,7 +255,7 @@ jobs:
 
       - name: Upload ft-5eqd4.5 policy convergence artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-5eqd4-5-policy-convergence
           path: tests/e2e/artifacts/goal-line/ft-5eqd4/convergence/
@@ -264,7 +264,7 @@ jobs:
 
       - name: Upload ft-e87u6.2 attestation build matrix
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-e87u6-2-attestation-build-matrix
           path: target/test-artifacts/ft-e87u6-2-attestation-build-matrix-ci/
@@ -280,7 +280,7 @@ jobs:
       - cargo-guards
       - e2e-composition
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -296,7 +296,7 @@ jobs:
 
       - name: Upload ft-e87u6.8 convergence artifact bundle
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ft-e87u6-8-epic-convergence
           path: tests/e2e/artifacts/goal-line/ft-e87u6/convergence/
