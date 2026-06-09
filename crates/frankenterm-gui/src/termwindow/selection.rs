@@ -27,6 +27,19 @@ impl super::TermWindow {
         RefMut::map(self.pane_state(pane_id), |state| &mut state.selection)
     }
 
+    pub fn update_selection(&mut self, pane: &Arc<dyn Pane>, update: impl FnOnce(&mut Selection)) {
+        let pane_id = pane.pane_id();
+        let current_seqno = pane.get_current_seqno();
+        {
+            let mut selection = self.selection(pane_id);
+            update(&mut selection);
+            selection.seqno = current_seqno;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
     /// Returns the selection region as a series of Line
     pub fn selection_lines(&self, pane: &Arc<dyn Pane>) -> Vec<Line> {
         let mut result = vec![];
@@ -43,12 +56,20 @@ impl super::TermWindow {
             let last_row = sel.rows().end;
 
             for line in pane.get_logical_lines(sel.rows()) {
+                let Some(first_physical_line) = line.physical_lines.first() else {
+                    continue;
+                };
                 if result.is_empty() || !last_was_wrapped {
-                    result.push(Line::with_width(0, line.physical_lines[0].current_seqno()));
+                    result.push(Line::with_width(0, first_physical_line.current_seqno()));
                 }
                 let last_idx = line.physical_lines.len().saturating_sub(1);
                 for (idx, phys) in line.physical_lines.iter().enumerate() {
-                    let this_row = line.first_row + idx as StableRowIndex;
+                    let Ok(row_offset) = StableRowIndex::try_from(idx) else {
+                        break;
+                    };
+                    let Some(this_row) = line.first_row.checked_add(row_offset) else {
+                        break;
+                    };
                     if this_row >= first_row && this_row < last_row {
                         let last_phys_idx = phys.len().saturating_sub(1);
                         let cols = sel.cols_for_row(this_row, rectangular);
@@ -92,12 +113,8 @@ impl super::TermWindow {
     }
 
     pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
-        let mut selection = self.selection(pane.pane_id());
-        selection.clear();
-        selection.seqno = pane.get_current_seqno();
-        if let Some(window) = self.window.as_ref() {
-            window.invalidate();
-        }
+        self.active_selection_drag_pane = None;
+        self.update_selection(pane, Selection::clear);
     }
 
     pub fn extend_selection_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
@@ -295,12 +312,20 @@ fn selected_text_from_logical_lines(
     let last_row = sel.rows().end;
 
     for line in logical_lines {
+        if line.physical_lines.is_empty() {
+            continue;
+        }
         if !s.is_empty() && !last_was_wrapped {
             s.push('\n');
         }
         let last_idx = line.physical_lines.len().saturating_sub(1);
         for (idx, phys) in line.physical_lines.iter().enumerate() {
-            let this_row = line.first_row + idx as StableRowIndex;
+            let Ok(row_offset) = StableRowIndex::try_from(idx) else {
+                break;
+            };
+            let Some(this_row) = line.first_row.checked_add(row_offset) else {
+                break;
+            };
             if this_row >= first_row && this_row < last_row {
                 let last_phys_idx = phys.len().saturating_sub(1);
                 let cols = sel.cols_for_row(this_row, rectangular);
@@ -497,6 +522,33 @@ mod tests {
         );
 
         assert_eq!(text, format!("A界{tail_payload}"));
+    }
+
+    #[test]
+    fn selection_clipboard_text_ignores_logical_lines_with_no_physical_rows() {
+        let attrs = CellAttributes::default();
+        let first = Line::from_text("first", &attrs, SEQ_ZERO, None);
+        let second = Line::from_text("second", &attrs, SEQ_ZERO, None);
+        let empty = LogicalLine {
+            physical_lines: vec![],
+            logical: Line::new(SEQ_ZERO),
+            first_row: 1,
+        };
+        let second_len = second.len();
+        let mut first_logical = logical_line_from_physical(vec![first]);
+        first_logical.first_row = 0;
+        let mut second_logical = logical_line_from_physical(vec![second]);
+        second_logical.first_row = 2;
+        let selected = SelectionRange::start(SelectionCoordinate::x_y(0, 0))
+            .extend(SelectionCoordinate::x_y(second_len.saturating_sub(1), 2));
+
+        let text = selected_text_from_logical_lines(
+            &[first_logical, empty, second_logical],
+            selected,
+            false,
+        );
+
+        assert_eq!(text, "first\nsecond");
     }
 
     proptest! {

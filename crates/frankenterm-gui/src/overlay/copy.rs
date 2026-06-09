@@ -435,12 +435,10 @@ impl CopyRenderable {
     }
 
     fn clear_selection(&mut self) {
-        let pane_id = self.delegate.pane_id();
+        let pane = Arc::clone(&self.delegate);
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let mut selection = term_window.selection(pane_id);
-                selection.origin.take();
-                selection.range.take();
+                term_window.clear_selection(&pane);
             })));
     }
 
@@ -526,16 +524,15 @@ impl CopyRenderable {
     }
 
     fn adjust_selection(&self, start: SelectionCoordinate, range: SelectionRange) {
-        let pane_id = self.delegate.pane_id();
-        let window = self.window.clone();
+        let pane = Arc::clone(&self.delegate);
         let mode = self.selection_mode;
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let mut selection = term_window.selection(pane_id);
-                selection.origin = Some(start);
-                selection.range = Some(range);
-                selection.rectangular = mode == SelectionMode::Block;
-                window.invalidate();
+                term_window.update_selection(&pane, |selection| {
+                    selection.origin = Some(start);
+                    selection.range = Some(range);
+                    selection.rectangular = mode == SelectionMode::Block;
+                });
             })));
         self.adjust_viewport_for_cursor_position();
     }

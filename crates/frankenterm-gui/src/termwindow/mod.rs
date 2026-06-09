@@ -54,6 +54,7 @@ use frankenterm_gui::floating_panes::{
 use frankenterm_gui::triple_buffer_gui::{
     GuiTripleBufferPollReport, TerminalStateTripleBufferRegistry,
 };
+use frankenterm_toast_notification::persistent_toast_notification;
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
@@ -881,6 +882,7 @@ pub struct TermWindow {
     current_modifier_and_leds: (Modifiers, KeyboardLedStatus),
     current_mouse_buttons: Vec<MousePress>,
     current_mouse_capture: Option<MouseCapture>,
+    active_selection_drag_pane: Option<PaneId>,
 
     opengl_info: Option<String>,
 
@@ -1069,15 +1071,6 @@ pub struct TermWindow {
     dashboard: crate::dashboard::DashboardPanel,
 }
 
-/// Free-function helper for `TermWindow::clear_dirty_lines_after_frame`
-/// so the predicate wiring is unit-testable without needing to
-/// stand up a full TermWindow. Per ft-jvj78.
-///
-/// Consults the substrate's `should_clear_at_frame_end` predicate
-/// against the supplied `last_was_whole_screen` flag and the default
-/// `DirtyTelemetryConfig`. When the predicate fires, every bitmap is
-/// cleared. Either way, the flag is reset to false so the next
-/// whole-screen event has to set it explicitly.
 /// Per ft-8pcwy: pure predicate the GUI render loop calls per
 /// (pane_id, line_idx) to decide whether a row is clean enough to
 /// reuse cached quads. Free function so the truth table is
@@ -1106,6 +1099,27 @@ pub(crate) fn should_skip_clean_line(
         return false;
     }
     !bm.contains(line_idx)
+}
+
+/// True only while an active terminal-pane left-drag is extending a selection.
+/// Dirty PTY output may redraw under that in-flight selection, but it must not
+/// clear the selection before the matching mouse-up can copy it.
+pub(crate) fn should_preserve_selection_during_dirty_line_update(
+    current_mouse_capture: &Option<MouseCapture>,
+    current_mouse_buttons: &[MousePress],
+    active_selection_drag_pane: Option<PaneId>,
+    pane_id: PaneId,
+) -> bool {
+    let captured_pane_id = match current_mouse_capture {
+        Some(MouseCapture::TerminalPane(captured_pane_id)) => Some(*captured_pane_id),
+        Some(MouseCapture::UI) | None => None,
+    };
+    frankenterm_gui::should_preserve_dirty_selection_during_mouse_drag(
+        active_selection_drag_pane,
+        captured_pane_id,
+        current_mouse_buttons.contains(&MousePress::Left),
+        pane_id,
+    )
 }
 
 /// Per ft-camu6: mark every stable-row index in `stable_rows`
@@ -1350,6 +1364,15 @@ pub(crate) fn evaluate_frame_budget_reduce_motion_gate(
     frame_budget_a11y::evaluate_reduce_motion_gate(a11y_op, motion, base)
 }
 
+/// Free-function helper for `TermWindow::clear_dirty_lines_after_frame`
+/// so the predicate wiring is unit-testable without needing to
+/// stand up a full `TermWindow`. Per ft-jvj78.
+///
+/// Consults the substrate's `should_clear_at_frame_end` predicate
+/// against the supplied `last_was_whole_screen` flag and the default
+/// `DirtyTelemetryConfig`. When the predicate fires, every bitmap is
+/// cleared. Either way, the flag is reset to false so the next
+/// whole-screen event has to set it explicitly.
 fn run_clear_dirty_lines_after_frame(
     bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
     last_was_whole_screen: &mut bool,
@@ -2271,6 +2294,7 @@ impl TermWindow {
             pane_state: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
+            active_selection_drag_pane: None,
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,
@@ -3463,7 +3487,15 @@ impl TermWindow {
                     (false, None)
                 };
 
-            if clear_selection {
+            if clear_selection
+                && !should_preserve_selection_during_dirty_line_update(
+                    &self.current_mouse_capture,
+                    &self.current_mouse_buttons,
+                    self.active_selection_drag_pane,
+                    pane_id,
+                )
+            {
+                self.active_selection_drag_pane = None;
                 self.selection(pane.pane_id()).range.take();
                 self.selection(pane.pane_id()).origin.take();
                 self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
@@ -4876,11 +4908,16 @@ impl TermWindow {
                     }
                 }
             }
-            SelectTextAtMouseCursor(mode) => self.select_text_at_mouse_cursor(*mode, pane),
+            SelectTextAtMouseCursor(mode) => {
+                self.active_selection_drag_pane = Some(pane.pane_id());
+                self.select_text_at_mouse_cursor(*mode, pane);
+            }
             ExtendSelectionToMouseCursor(mode) => {
-                self.extend_selection_at_mouse_cursor(*mode, pane)
+                self.active_selection_drag_pane = Some(pane.pane_id());
+                self.extend_selection_at_mouse_cursor(*mode, pane);
             }
             ClearSelection => {
+                self.active_selection_drag_pane = None;
                 self.clear_selection(pane);
             }
             StartWindowDrag => {
@@ -4893,6 +4930,7 @@ impl TermWindow {
                 self.emit_window_event(name, None);
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
+                self.active_selection_drag_pane = None;
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);
@@ -4904,6 +4942,7 @@ impl TermWindow {
                 }
             }
             CompleteSelection(dest) => {
+                self.active_selection_drag_pane = None;
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);
@@ -5172,38 +5211,32 @@ impl TermWindow {
             }
             AttachDomain(domain) => {
                 let window = self.mux_window_id;
-                let domain = domain.to_string();
+                let domain_name = domain.to_string();
                 let dpi = self.dimensions.dpi as u32;
 
                 promise::spawn::spawn(async move {
-                    let mux = Mux::try_get()
-                        .ok_or_else(|| anyhow!("cannot attach domain without an active mux"))?;
-                    let domain = mux
-                        .get_domain_by_name(&domain)
-                        .ok_or_else(|| anyhow!("{} is not a valid domain name", domain))?;
-                    domain.attach(Some(window)).await?;
+                    let result = async {
+                        let mux = Mux::try_get()
+                            .ok_or_else(|| anyhow!("cannot attach domain without an active mux"))?;
+                        let domain = mux
+                            .get_domain_by_name(&domain_name)
+                            .ok_or_else(|| anyhow!("{} is not a valid domain name", domain_name))?;
+                        crate::spawn::attach_domain_to_window_or_spawn_recovery(
+                            domain, window, None, None, dpi,
+                        )
+                        .await?;
 
-                    let have_panes_in_domain = mux
-                        .iter_panes()
-                        .iter()
-                        .any(|p| p.domain_id() == domain.domain_id());
-
-                    if !have_panes_in_domain {
-                        let config = config::configuration();
-                        let _tab = domain
-                            .spawn(
-                                config.initial_size(
-                                    dpi,
-                                    Some(crate::cell_pixel_dims(&config, dpi as f64)?),
-                                ),
-                                None,
-                                None,
-                                window,
-                            )
-                            .await?;
+                        Result::<(), anyhow::Error>::Ok(())
                     }
+                    .await;
 
-                    Result::<(), anyhow::Error>::Ok(())
+                    if let Err(err) = result {
+                        let message = format!(
+                            "failed to attach domain `{domain_name}` to window {window}: {err:#}"
+                        );
+                        log::error!("{message}");
+                        persistent_toast_notification("Domain attach failed", &message);
+                    }
                 })
                 .detach();
             }

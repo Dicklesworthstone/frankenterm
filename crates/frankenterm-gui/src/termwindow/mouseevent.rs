@@ -135,6 +135,9 @@ impl super::TermWindow {
             WMEK::Release(ref press) => {
                 self.current_mouse_capture = None;
                 self.current_mouse_buttons.retain(|p| p != press);
+                if press == &MousePress::Left {
+                    self.active_selection_drag_pane = None;
+                }
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
                     // Completed a window drag
                     return;
@@ -147,6 +150,9 @@ impl super::TermWindow {
 
             WMEK::Press(ref press) => {
                 capture_mouse = true;
+                if press == &MousePress::Left {
+                    self.active_selection_drag_pane = None;
+                }
 
                 // Perform click counting
                 let button = mouse_press_to_tmb(press);

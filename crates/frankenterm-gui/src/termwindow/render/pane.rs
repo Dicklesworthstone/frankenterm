@@ -20,6 +20,7 @@ use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
 use ordered_float::NotNan;
+use std::convert::TryFrom;
 use std::time::Instant;
 use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
@@ -543,10 +544,10 @@ impl crate::TermWindow {
             palette.cursor_fg == global_cursor_fg && palette.cursor_bg == global_cursor_bg;
 
         {
-            let stable_range = match current_viewport {
-                Some(top) => top..top + dims.viewport_rows as StableRowIndex,
-                None => dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
-            };
+            let stable_top = current_viewport.unwrap_or(dims.physical_top);
+            let stable_range =
+                frankenterm_gui::checked_stable_row_range_from_top(stable_top, dims.viewport_rows)
+                    .context("stable row range overflow")?;
 
             pos.pane
                 .apply_hyperlinks(stable_range.clone(), &self.config.hyperlink_rules);
@@ -614,7 +615,11 @@ impl crate::TermWindow {
                     line_idx: usize,
                     line: &&mut Line,
                 ) -> anyhow::Result<()> {
-                    let stable_row = stable_top + line_idx as StableRowIndex;
+                    let row_offset = StableRowIndex::try_from(line_idx)
+                        .context("visible line index exceeds stable row range")?;
+                    let stable_row = stable_top
+                        .checked_add(row_offset)
+                        .context("stable row index overflow while rendering line")?;
                     let selrange = self
                         .selrange
                         .map_or(0..0, |sel| sel.cols_for_row(stable_row, self.rectangular));

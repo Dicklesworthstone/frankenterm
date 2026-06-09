@@ -1177,12 +1177,10 @@ impl QuickSelectRenderable {
     }
 
     fn clear_selection(&mut self) {
-        let pane_id = self.delegate.pane_id();
+        let pane = Arc::clone(&self.delegate);
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let mut selection = term_window.selection(pane_id);
-                selection.origin.take();
-                selection.range.take();
+                term_window.clear_selection(&pane);
             })));
     }
 
@@ -1201,9 +1199,8 @@ impl QuickSelectRenderable {
                     return;
                 };
                 if let Some(pane) = mux.get_pane(pane_id) {
-                    {
-                        let mut selection = term_window.selection(pane_id);
-                        let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
+                    let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
+                    term_window.update_selection(&pane, |selection| {
                         selection.origin = Some(start);
                         selection.range = Some(SelectionRange {
                             start,
@@ -1214,10 +1211,8 @@ impl QuickSelectRenderable {
                                 result.end_y,
                             ),
                         });
-                        // Ensure that selection doesn't get invalidated when
-                        // the overlay is closed
-                        selection.seqno = pane.get_current_seqno();
-                    }
+                        selection.rectangular = false;
+                    });
 
                     let text = term_window.selection_text(&pane);
                     if !text.is_empty() {

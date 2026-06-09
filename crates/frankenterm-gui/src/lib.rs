@@ -13,6 +13,95 @@ pub mod osc8_gui;
 pub mod plugins;
 pub mod renderer_slo;
 pub mod rollout_env;
+
+/// Keep drag-selection geometry alive while live output dirties rows under it.
+///
+/// This lives in the library crate so the binary-owned `termwindow` selection
+/// lifecycle can keep a small pure predicate under normal `cargo test --lib`
+/// coverage.
+pub fn should_preserve_dirty_selection_during_mouse_drag(
+    active_selection_drag_pane_id: Option<usize>,
+    captured_pane_id: Option<usize>,
+    left_mouse_button_down: bool,
+    pane_id: usize,
+) -> bool {
+    left_mouse_button_down
+        && active_selection_drag_pane_id == Some(pane_id)
+        && captured_pane_id == Some(pane_id)
+}
+
+/// Build an exclusive stable-row range from a top row and visible row count.
+///
+/// Binary-owned render code uses this to avoid wrapping stable-row arithmetic
+/// when a viewport is near the representable row boundary.
+pub fn checked_stable_row_range_from_top(
+    top: wezterm_term::StableRowIndex,
+    row_count: usize,
+) -> Option<std::ops::Range<wezterm_term::StableRowIndex>> {
+    let row_count =
+        <wezterm_term::StableRowIndex as std::convert::TryFrom<usize>>::try_from(row_count).ok()?;
+    let end = top.checked_add(row_count)?;
+    Some(top..end)
+}
+
+#[cfg(test)]
+mod selection_lifecycle_tests {
+    use super::{
+        checked_stable_row_range_from_top, should_preserve_dirty_selection_during_mouse_drag,
+    };
+    use wezterm_term::StableRowIndex;
+
+    #[test]
+    fn dirty_selection_is_preserved_only_for_active_left_drag_on_same_pane() {
+        assert!(should_preserve_dirty_selection_during_mouse_drag(
+            Some(7),
+            Some(7),
+            true,
+            7,
+        ));
+        assert!(!should_preserve_dirty_selection_during_mouse_drag(
+            None,
+            Some(7),
+            true,
+            7,
+        ));
+        assert!(!should_preserve_dirty_selection_during_mouse_drag(
+            Some(7),
+            None,
+            true,
+            7,
+        ));
+        assert!(!should_preserve_dirty_selection_during_mouse_drag(
+            Some(7),
+            Some(8),
+            true,
+            7,
+        ));
+        assert!(!should_preserve_dirty_selection_during_mouse_drag(
+            Some(8),
+            Some(7),
+            true,
+            7,
+        ));
+        assert!(!should_preserve_dirty_selection_during_mouse_drag(
+            Some(7),
+            Some(7),
+            false,
+            7,
+        ));
+    }
+
+    #[test]
+    fn checked_stable_row_range_from_top_rejects_unrepresentable_ranges() {
+        assert_eq!(checked_stable_row_range_from_top(10, 3), Some(10..13));
+        assert_eq!(
+            checked_stable_row_range_from_top(StableRowIndex::MAX, 1),
+            None
+        );
+        assert_eq!(checked_stable_row_range_from_top(0, usize::MAX), None);
+    }
+}
+
 pub mod command_rules {
     use config::keyassignment::KeyAssignment::*;
     use config::keyassignment::*;
