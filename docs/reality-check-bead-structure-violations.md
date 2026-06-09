@@ -1,11 +1,11 @@
 # Reality-check bead structure violations
 
 - Epic: `ft-tf6g3`
-- Checked issues: 68
-- Strict-structure checked: 22
-- Closed checked: 27
+- Checked issues: 81
+- Strict-structure checked: 35
+- Closed checked: 73
 - Errors: 0
-- Warnings: 168
+- Warnings: 187
 
 | Severity | Bead | Kind | Detail |
 |---|---|---|---|
@@ -34,6 +34,13 @@
 | warning | `ft-tf6g3.9` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
 | warning | `ft-tf6g3.9` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
 | warning | `ft-tf6g3.9` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
+| warning | `ft-tf6g3.10` | missing_section | missing required reality-check section: test_companion (test_companion) |
+| warning | `ft-tf6g3.10` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
+| warning | `ft-tf6g3.10` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
+| warning | `ft-tf6g3.11` | missing_section | missing required reality-check section: test_companion (test_companion) |
+| warning | `ft-tf6g3.11` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
+| warning | `ft-tf6g3.11` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
+| warning | `ft-tf6g3.11` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
 | warning | `ft-tf6g3.12` | missing_section | missing required reality-check section: test_companion (test_companion) |
 | warning | `ft-tf6g3.12` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
 | warning | `ft-tf6g3.12` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
@@ -115,6 +122,10 @@
 | warning | `ft-tf6g3.22` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
 | warning | `ft-tf6g3.22` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
 | warning | `ft-tf6g3.22` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
+| warning | `ft-tf6g3.23` | missing_section | missing required reality-check section: test_companion (test_companion) |
+| warning | `ft-tf6g3.23` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
+| warning | `ft-tf6g3.23` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
+| warning | `ft-tf6g3.23` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
 | warning | `ft-tf6g3.24` | missing_section | missing required reality-check section: test_companion (test_companion) |
 | warning | `ft-tf6g3.24` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
 | warning | `ft-tf6g3.24` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
@@ -127,6 +138,10 @@
 | warning | `ft-tf6g3.26` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
 | warning | `ft-tf6g3.26` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
 | warning | `ft-tf6g3.26` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
+| warning | `ft-tf6g3.27` | missing_section | missing required reality-check section: test_companion (test_companion) |
+| warning | `ft-tf6g3.27` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
+| warning | `ft-tf6g3.27` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
+| warning | `ft-tf6g3.27` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
 | warning | `ft-tf6g3.30` | missing_section | missing required reality-check section: background (background) |
 | warning | `ft-tf6g3.30` | missing_section | missing required reality-check section: why_this_matters (why_this_matters) |
 | warning | `ft-tf6g3.30` | missing_section | missing required reality-check section: test_companion (test_companion) |
@@ -141,6 +156,10 @@
 | warning | `ft-tf6g3.31` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
 | warning | `ft-tf6g3.32` | missing_section | missing required reality-check section: background (background) |
 | warning | `ft-tf6g3.32` | missing_section | missing required reality-check section: why_this_matters (why_this_matters) |
+| warning | `ft-tf6g3.32` | missing_section | missing required reality-check section: test_companion (test_companion) |
+| warning | `ft-tf6g3.32` | missing_section | missing required reality-check section: operator_surface (operator_surface) |
+| warning | `ft-tf6g3.32` | missing_section | missing required reality-check section: degradation_behavior (degradation_behavior) |
+| warning | `ft-tf6g3.32` | missing_section | missing required reality-check section: proof_category_section (proof_category_section) |
 | warning | `ft-tf6g3.33` | missing_section | missing required reality-check section: background (background) |
 | warning | `ft-tf6g3.33` | missing_section | missing required reality-check section: why_this_matters (why_this_matters) |
 | warning | `ft-tf6g3.33` | missing_section | missing required reality-check section: test_companion (test_companion) |

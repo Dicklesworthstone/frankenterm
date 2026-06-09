@@ -136,11 +136,6 @@ missing_docs_in_private_items = "allow"
 doc_markdown = "allow"
 # Nursery lints that are too noisy for stub code
 unused_async = "allow"
-# Same family as unused_async: fires on async-trait impls whose bodies don't
-# `.await` — but the async signatures are dictated by the trait contract
-# (Cx-first async surfaces + the many async-trait test mocks/stubs), so the
-# `async` is intentional and required, not removable.
-unused_async_trait_impl = "allow"
 collection_is_never_read = "allow"
 missing_const_for_fn = "allow"
 # Cargo lints - we don't have full metadata yet

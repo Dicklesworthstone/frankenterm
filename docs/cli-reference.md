@@ -244,6 +244,7 @@ ft robot help
 ft robot quick-start
 ft robot state [--include-text] [--tail <n>] [--escapes]
 ft robot get-text <pane_id>|--panes <id,id,...>|--all [--tail <n>] [--escapes]
+ft robot dom zones|last-command|output-of|exit-code <pane_id> [--command-index <n>]
 ft robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
 ft robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
 ft robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--until <epoch_ms>] [--limit <n>] [--snippets[=<true|false>]] [--mode <lexical|semantic|hybrid>]
@@ -281,6 +282,7 @@ ft robot tx plan|run|rollback|show
 ft robot health
 ft robot approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
 ft robot why <code>
+ft robot agent-mail-outbox [--manifest <path>] [--entry <path> ...]
 
 ft robot checkpoint save|list|show|delete|rollback
 ft robot context status|rotate|history
@@ -289,10 +291,20 @@ ft robot fleet status|scale|rebalance|agents
 ft robot profile list|show|apply|validate
 ```
 
+`ft robot send` success data includes `submit` when a non-dry-run send reaches
+the policy gate. The receipt records the submission state, verification polls,
+elapsed time, evidence rule IDs, and idempotency key persisted as the audit
+`correlation_id`; replay it with `ft audit --correlation-id <idempotency_key>`.
+
 `ft robot health` includes an `active_agents` snapshot for operator
 convergence polling. The snapshot is bounded and evidence-linked; unavailable
 joins such as Beads assignments, recent commits, or proof lanes are reported
 explicitly under `active_agent_sources` instead of being inferred.
+
+`ft robot agent-mail-outbox` reads retained Agent Mail outage-spool fixtures and
+queued-entry files. It is a read-only contract/replay surface: queued or
+`replay_dry_run_ok` rows are not Agent Mail delivery proof, and the command does
+not repair, restart, or mutate the shared Agent Mail service.
 
 Examples:
 - `ft robot search "compilation failed" --mode lexical`
@@ -302,10 +314,11 @@ Examples:
 Notes:
 - `ft robot help` emits the machine-readable command inventory by default; use `ft robot --format toon help` for the compact TOON form.
 - Distributed panes appear in `state`, `search`, and related persisted-data surfaces, but live `get-text` is intentionally unavailable for them.
+- `ft robot dom` returns live OSC 133 semantic zones. Panes without OSC 133 prompt/input markers return `semantic_data_unavailable=true` instead of guessed command boundaries.
 - Some NTM-aligned robot families are specialized machine surfaces; they are listed here because they ship, even when most humans stay on the higher-level human CLI.
 
 Policy/redaction:
-- `ft get-text`, `ft search`, `ft robot get-text`, and `ft robot search` are policy-gated read/search surfaces.
+- `ft get-text`, `ft search`, `ft robot get-text`, `ft robot dom`, and `ft robot search` are policy-gated read/search surfaces.
 - Returned text/snippets are passed through the standard secret redactor before output.
 - Redaction applies to echoed query/content fields as well (`query`, `snippet`, `content`) for search responses.
 - Policy denials return `robot.policy_denied`; approval-required paths return `robot.require_approval` with approval guidance.

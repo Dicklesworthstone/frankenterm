@@ -19,7 +19,7 @@ or contract artifact, and the proof lane that keeps the row honest.
 | events | 2 | 2 | 0 | 2 | 0 |
 | meta | 3 | 3 | 0 | 3 | 0 |
 | mission | 2 | 2 | 0 | 2 | 0 |
-| pane | 4 | 4 | 0 | 4 | 0 |
+| pane | 5 | 5 | 0 | 5 | 0 |
 | replay | 3 | 3 | 0 | 3 | 0 |
 | reservations | 2 | 2 | 0 | 2 | 0 |
 | rules | 3 | 3 | 0 | 3 | 0 |
@@ -32,6 +32,7 @@ or contract artifact, and the proof lane that keeps the row honest.
 | Surface | Category | Robot CLI | MCP surface | Schema artifact | Docs artifact | Golden or matrix artifact | Proof lane | Status |
 |---|---|---|---|---|---|---|---|---|
 | `get-text` | `pane` | `ft robot get-text <pane_id>` | `wa.get_text` | `docs/json-schema/wa-robot-get-text.json` | `docs/cli-reference.md`; `README.md`; `docs/integration-guide.md` | `crates/frankenterm-core/tests/golden_robot_envelope/wa_get_text.json` | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-luisq-api-surface cargo test -p frankenterm-core --test conformance_robot_api_surface_coverage -- --nocapture` | COVERED |
+| `dom` | `pane` | `ft robot dom zones <pane_id>` | none | `docs/json-schema/wa-robot-dom.json` | `docs/cli-reference.md`; `docs/json-schema/PROVENANCE.md` | `crates/frankenterm-core/tests/typed_client_integration.rs::schema_dom` | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da-dom cargo test -p frankenterm-core --test typed_client_integration schema_dom -- --nocapture` | COVERED |
 | `batch-get-text` | `pane` | `ft robot get-text --panes <id,id>` | none | `docs/json-schema/wa-robot-api-surface-data-schemas.json::$defs/batch_get_text` | `docs/cli-reference.md`; `README.md`; `docs/robot-contracts/api-surface-coverage.md` | `crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json::robot-batch-get-text-json-focused` | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-luisq-control-plane cargo test -p frankenterm-core --test control_plane_golden_matrix --features vc-export -- --nocapture` | COVERED |
 | `send-text` | `pane` | `ft robot send <pane_id> <text>` | `wa.send` | `docs/json-schema/wa-robot-send.json` | `docs/cli-reference.md`; `README.md`; `docs/mcp-api-spec.md` | `crates/frankenterm-core/tests/golden_robot_envelope/wa_send.json` | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-luisq-api-surface cargo test -p frankenterm-core --test conformance_robot_api_surface_coverage -- --nocapture` | COVERED |
 | `state` | `pane` | `ft robot state` | `wa.state` | `docs/json-schema/wa-robot-state.json` | `docs/cli-reference.md`; `README.md`; `docs/mcp-api-spec.md` | `crates/frankenterm-core/tests/golden_robot_envelope/wa_state.json` | `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-luisq-api-surface cargo test -p frankenterm-core --test conformance_robot_api_surface_coverage -- --nocapture` | COVERED |

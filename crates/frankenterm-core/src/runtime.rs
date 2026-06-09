@@ -4253,12 +4253,14 @@ impl RuntimeHandle {
     // Intentionally `async`: part of the Cx-first async surface and the sibling
     // pair below; the signature is the public contract even though the current
     // body delegates to a sync read.
+    #[allow(unknown_lints)]
     #[allow(clippy::unused_async_trait_impl)]
     pub async fn write_queue_depth(&self) -> usize {
         self.storage.write_queue_depth()
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::write_queue_depth`].
+    #[allow(unknown_lints)]
     #[allow(clippy::unused_async_trait_impl)]
     pub async fn write_queue_depth_with_cx(&self, _cx: &crate::cx::Cx) -> usize {
         self.storage.write_queue_depth()
