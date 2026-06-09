@@ -159,7 +159,7 @@ The watcher's pattern engine has already noticed pane 1 hit a rate limit; the ev
 
 ### 4 · React safely (2 minutes — send + wait-for + policy gate)
 
-Send a `/compact` to the stuck codex pane, but block until the recovery confirms. The response `data` is a `SendData` with an `injection` blob (the wire-level bytes-sent record, an unstructured `serde_json::Value`) and a `wait_for` field carrying `WaitForData { pane_id, pattern, matched, elapsed_ms, polls, is_regex }`:
+Send a `/compact` to the stuck codex pane, but block until the recovery confirms. The response `data` is a `SendData` with an `injection` blob (the wire-level bytes-sent record, an unstructured `serde_json::Value`), a `wait_for` field carrying `WaitForData { pane_id, pattern, matched, elapsed_ms, polls, is_regex }`, and a `submit` receipt persisted with the audit row under its `idempotency_key`:
 
 ```bash
 $ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
@@ -175,6 +175,14 @@ $ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
       "elapsed_ms": 4823,
       "polls": 96,
       "is_regex": false
+    },
+    "submit": {
+      "state": "verified",
+      "attempts": 1,
+      "evidence_rule_ids": ["policy.allow"],
+      "elapsed_ms": 4829,
+      "polls": 96,
+      "idempotency_key": "rk:0123456789abcdef"
     }
   },
   "elapsed_ms": 4829,
@@ -1054,6 +1062,7 @@ The `ft robot` subcommand provides machine-optimized output for AI agents. Alway
 | `ft robot search` | lexical / semantic / hybrid | shipped |
 | `ft robot events` | recent detection events | shipped |
 | `ft robot approve` | approve gated action | shipped |
+| `ft robot agent-mail-outbox` | retained fallback outbox entries + replay state | shipped (read-only fixture/queued-entry surface; not live delivery proof) |
 | `ft robot checkpoint` | save / list / show / delete / rollback | shipped (rollback requires `--dry-run` until robot policy approval lands) |
 | `ft robot context` | status / rotate / history | shipped (native SQLite registry; rotation receipts are durable; raw context content is not stored) |
 | `ft robot work` | claim / release / complete / list / ready / assign | shipped (native SQLite `work_claims` queue) |
@@ -1136,6 +1145,20 @@ ft robot events --rule-id "usage_limit"
 ft robot events --unhandled
 ft robot events --event-type gap            # capture-gap events only
 ```
+
+### Agent Mail outage outbox
+
+```bash
+ft robot agent-mail-outbox
+ft robot --format toon agent-mail-outbox --entry fixtures/agent-mail-outage-spool/valid/agent-mail-unavailable.json
+```
+
+`ft robot agent-mail-outbox` reads retained fallback outbox fixtures and
+additional queued-entry JSON files. It is for outage review and replay
+planning, not live service repair: queued entries, dry-run-ok rows, and fixture
+replay logs are not Agent Mail delivery proof until a replay receipt records a
+delivered message id. The command is read-only and never restarts, repairs, or
+reconstructs the shared Agent Mail service.
 
 ### Profile management (ft-hac7w)
 
