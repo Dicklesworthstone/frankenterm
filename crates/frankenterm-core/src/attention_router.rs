@@ -42,6 +42,14 @@ pub enum AttentionRouterSourceKind {
     Rch,
     PaneState,
     OperatingEnvelope,
+    PolicyDeniedAudit,
+    ApprovalStore,
+    PaneReservations,
+    MissionTxStatus,
+    Events,
+    StuckPaneClassification,
+    ConnectorBreaker,
+    IncidentBundles,
     Manual,
     Fixture,
 }
@@ -55,6 +63,14 @@ impl AttentionRouterSourceKind {
             Self::Rch => "rch",
             Self::PaneState => "pane_state",
             Self::OperatingEnvelope => "operating_envelope",
+            Self::PolicyDeniedAudit => "policy_denied_audit",
+            Self::ApprovalStore => "approval_store",
+            Self::PaneReservations => "pane_reservations",
+            Self::MissionTxStatus => "mission_tx_status",
+            Self::Events => "events",
+            Self::StuckPaneClassification => "stuck_pane_classification",
+            Self::ConnectorBreaker => "connector_breaker",
+            Self::IncidentBundles => "incident_bundles",
             Self::Manual => "manual",
             Self::Fixture => "fixture",
         }
@@ -128,6 +144,22 @@ pub enum AttentionRouterSourceFactKind {
     OperatingEnvelopeCapacity,
     OperatingEnvelopeSideEffectPolicy,
     OperatingEnvelopeProofPosture,
+    PolicyDeniedAudit,
+    PolicyRequireApproval,
+    ApprovalPending,
+    ApprovalDenied,
+    PaneReservationConflict,
+    PaneReservationActive,
+    MissionBlocked,
+    MissionTxState,
+    MissionTxApprovalRequired,
+    EventUnhandled,
+    EventCritical,
+    StuckPaneClassification,
+    ConnectorBreakerOpen,
+    ConnectorBreakerDegraded,
+    IncidentBundleOpen,
+    IncidentBundleMissingEvidence,
     SourceUnavailable,
     SourceNotConfigured,
     Manual,
@@ -393,6 +425,16 @@ pub enum AttentionRouterItemKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AttentionRouterSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AttentionRouterSafeAction {
     ClaimReadyStaticSliceReservePathsAndRunStaticChecks,
     DoNotClaimBvPickRecordBlockerOrFindDisjointStaticSlice,
@@ -411,6 +453,13 @@ pub enum AttentionRouterSafeAction {
     PauseWriteWorkRequestExactCleanupApprovalOrPickReadOnlyWork,
     WorkDomainDependencyFirst,
     RefreshUnavailableSourceOrUseRemainingReadOnlyContext,
+    InspectPolicyDenialAndChooseAllowedReadOnlyPath,
+    WaitForApprovalDecisionOrPickUngatedWork,
+    RespectPaneReservationOrRequestExplicitHandoff,
+    StabilizeMissionOrTxBeforeNewWork,
+    TriageUnhandledEventBeforeClaimingMoreWork,
+    WaitForConnectorRecoveryOrUseReadOnlyFallback,
+    InvestigateIncidentBundleBeforeContinuing,
 }
 
 impl AttentionRouterSafeAction {
@@ -466,6 +515,27 @@ impl AttentionRouterSafeAction {
             }
             Self::RefreshUnavailableSourceOrUseRemainingReadOnlyContext => {
                 "Refresh the unavailable source or proceed only from remaining read-only context."
+            }
+            Self::InspectPolicyDenialAndChooseAllowedReadOnlyPath => {
+                "Inspect the policy denial and choose an allowed read-only or policy-approved path."
+            }
+            Self::WaitForApprovalDecisionOrPickUngatedWork => {
+                "Wait for the approval decision, or pick ungated read-only work."
+            }
+            Self::RespectPaneReservationOrRequestExplicitHandoff => {
+                "Respect the pane reservation or request an explicit handoff before acting."
+            }
+            Self::StabilizeMissionOrTxBeforeNewWork => {
+                "Stabilize the mission or transaction state before claiming additional work."
+            }
+            Self::TriageUnhandledEventBeforeClaimingMoreWork => {
+                "Triage the unhandled event before claiming additional work."
+            }
+            Self::WaitForConnectorRecoveryOrUseReadOnlyFallback => {
+                "Wait for connector recovery or use a read-only fallback surface."
+            }
+            Self::InvestigateIncidentBundleBeforeContinuing => {
+                "Investigate the incident bundle evidence before continuing mutable work."
             }
         }
     }
@@ -650,7 +720,12 @@ pub struct AttentionRouterItem {
     pub schema: String,
     pub item_id: String,
     pub kind: AttentionRouterItemKind,
+    pub severity: AttentionRouterSeverity,
+    pub domain: String,
+    pub owner: Option<String>,
     pub subject: AttentionRouterSubject,
+    pub redacted_summary: String,
+    pub freshness_ms: Option<u64>,
     pub classification: AttentionRouterClassification,
     pub priority: u8,
     pub confidence: f32,
@@ -947,7 +1022,12 @@ fn item_from_fact(
         schema: ATTENTION_ROUTER_ITEM_SCHEMA.to_string(),
         item_id,
         kind: rule.kind,
+        severity: severity_for_classification(rule.classification),
+        domain: source.source_kind.slug().to_string(),
+        owner: subject.agent_name.clone(),
         subject,
+        redacted_summary: redacted_summary_for_item(source, fact),
+        freshness_ms: source.freshness_ms,
         classification: rule.classification,
         priority: rule.priority,
         confidence: rule.confidence.score(),
@@ -993,6 +1073,74 @@ fn rule_from_fact(
                 "rm_rf",
                 "git_clean",
                 "treat_cleanup_inventory_as_permission",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::PolicyDeniedAudit
+        || contains_reason(
+            reason_codes,
+            &[
+                "policy.denied",
+                "policy_denied_audit",
+                "policy.deny",
+                "policy.gate_denied",
+            ],
+        )
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedDomain,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::InspectPolicyDenialAndChooseAllowedReadOnlyPath,
+            AttentionRouterConfidence::High,
+            &[
+                "ignore_policy_denial",
+                "replay_denied_action",
+                "bypass_policy_gate",
+                "forge_approval_token",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::PolicyRequireApproval
+        || fact.fact == AttentionRouterSourceFactKind::ApprovalPending
+        || fact.fact == AttentionRouterSourceFactKind::MissionTxApprovalRequired
+        || contains_reason(
+            reason_codes,
+            &[
+                "approval.pending",
+                "approval.required",
+                "require_approval",
+                "policy.require_approval",
+            ],
+        )
+    {
+        return Some(rule(
+            AttentionRouterClassification::WaitingComm,
+            AttentionRouterItemKind::Communication,
+            AttentionRouterSafeAction::WaitForApprovalDecisionOrPickUngatedWork,
+            AttentionRouterConfidence::High,
+            &[
+                "self_approve_request",
+                "reuse_approval_token",
+                "bypass_approval_store",
+                "send_without_approval",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::ApprovalDenied
+        || contains_reason(reason_codes, &["approval.denied", "approval.rejected"])
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedDomain,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::InspectPolicyDenialAndChooseAllowedReadOnlyPath,
+            AttentionRouterConfidence::High,
+            &[
+                "ignore_approval_denial",
+                "reuse_denied_approval_code",
+                "send_without_approval",
             ],
         ));
     }
@@ -1045,7 +1193,8 @@ fn rule_from_fact(
             "reservation.not_released",
             "reservation.release_pending",
         ],
-    ) {
+    ) || fact.fact == AttentionRouterSourceFactKind::PaneReservationActive
+    {
         return Some(rule(
             AttentionRouterClassification::DoNotTouch,
             AttentionRouterItemKind::Ownership,
@@ -1189,16 +1338,19 @@ fn rule_from_fact(
             "agent_mail.file_reservation_overlap",
             "reservation.overlap",
         ],
-    ) {
+    ) || fact.fact == AttentionRouterSourceFactKind::PaneReservationConflict
+    {
         return Some(rule(
             AttentionRouterClassification::DirtyOverlap,
             AttentionRouterItemKind::Ownership,
-            AttentionRouterSafeAction::ChooseDisjointWorkOrRequestHandoffBeforeEditing,
+            AttentionRouterSafeAction::RespectPaneReservationOrRequestExplicitHandoff,
             AttentionRouterConfidence::High,
             &[
                 "edit_reserved_path",
                 "stage_reserved_path",
                 "claim_overlapping_work",
+                "send_input_to_reserved_pane",
+                "release_reservation_without_owner",
             ],
         ));
     }
@@ -1256,7 +1408,8 @@ fn rule_from_fact(
         ));
     }
 
-    if fact.fact == AttentionRouterSourceFactKind::PaneStuckSignal
+    if (fact.fact == AttentionRouterSourceFactKind::PaneStuckSignal
+        || fact.fact == AttentionRouterSourceFactKind::StuckPaneClassification)
         && !contains_reason(reason_codes, &["pane_state.codex_placeholder_caveat"])
     {
         return Some(rule(
@@ -1267,6 +1420,152 @@ fn rule_from_fact(
             &[
                 "treat_pane_text_as_ownership_proof",
                 "force_release_without_status_check",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::OperatingEnvelopeCapacity
+        || fact.fact == AttentionRouterSourceFactKind::OperatingEnvelopeProofPosture
+        || fact.fact == AttentionRouterSourceFactKind::OperatingEnvelopeSideEffectPolicy
+    {
+        if contains_reason(
+            reason_codes,
+            &[
+                "capacity.red",
+                "capacity.black",
+                "capacity.stale",
+                "capacity.target_class_unproven",
+                "envelope.shed",
+                "telemetry.stale",
+                "target_class_skipped",
+                "target_class_unproven",
+            ],
+        ) || contains_text(
+            &text,
+            &[
+                "deny",
+                "denied",
+                "shed",
+                "stale telemetry",
+                "target class",
+                "skipped",
+                "unproven",
+            ],
+        ) {
+            return Some(rule(
+                AttentionRouterClassification::BlockedInfra,
+                AttentionRouterItemKind::Blocker,
+                AttentionRouterSafeAction::FailClosedRequestTargetedHandoffOrPickDisjointWork,
+                AttentionRouterConfidence::High,
+                &[
+                    "ignore_operating_envelope",
+                    "admit_without_envelope",
+                    "claim_target_class_capacity",
+                    "treat_skipped_artifact_as_proof",
+                ],
+            ));
+        }
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::MissionBlocked
+        || fact.fact == AttentionRouterSourceFactKind::MissionTxState
+        || contains_reason(
+            reason_codes,
+            &[
+                "mission.blocked",
+                "mission.awaiting_approval",
+                "mission.failed",
+                "tx.failed",
+                "tx.compensating",
+                "tx.rollback_required",
+            ],
+        )
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedDomain,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::StabilizeMissionOrTxBeforeNewWork,
+            AttentionRouterConfidence::High,
+            &[
+                "mutate_running_mission_state",
+                "skip_tx_compensation",
+                "force_complete_mission",
+                "claim_dependent_work_before_tx_stabilizes",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::EventUnhandled
+        || fact.fact == AttentionRouterSourceFactKind::EventCritical
+        || contains_reason(
+            reason_codes,
+            &[
+                "event.unhandled",
+                "event.critical",
+                "events.unhandled",
+                "events.critical",
+            ],
+        )
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedDomain,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::TriageUnhandledEventBeforeClaimingMoreWork,
+            AttentionRouterConfidence::Medium,
+            &[
+                "mark_event_handled_without_triage",
+                "suppress_event",
+                "send_recovery_without_policy_gate",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::ConnectorBreakerOpen
+        || fact.fact == AttentionRouterSourceFactKind::ConnectorBreakerDegraded
+        || contains_reason(
+            reason_codes,
+            &[
+                "connector.breaker_open",
+                "connector.circuit_open",
+                "connector.degraded",
+            ],
+        )
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedInfra,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::WaitForConnectorRecoveryOrUseReadOnlyFallback,
+            AttentionRouterConfidence::Medium,
+            &[
+                "restart_connector_process",
+                "bypass_circuit_breaker",
+                "edit_connector_credentials",
+                "force_connector_half_open",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::IncidentBundleOpen
+        || fact.fact == AttentionRouterSourceFactKind::IncidentBundleMissingEvidence
+        || contains_reason(
+            reason_codes,
+            &[
+                "incident.bundle_open",
+                "incident.missing_evidence",
+                "incident.unreviewed",
+            ],
+        )
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedInfra,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::InvestigateIncidentBundleBeforeContinuing,
+            AttentionRouterConfidence::High,
+            &[
+                "delete_incident_bundle",
+                "close_without_incident_review",
+                "redact_by_deleting_bundle",
+                "resume_mutation_without_incident_triage",
             ],
         ));
     }
@@ -1482,7 +1781,8 @@ fn nudge_kind_for_action(
         AttentionRouterSafeAction::AvoidOverlappingPathsAndClaimOnlyDisjointReadyWork
         | AttentionRouterSafeAction::ChooseDisjointWorkOrRequestHandoffBeforeEditing
         | AttentionRouterSafeAction::FailClosedRequestTargetedHandoffOrPickDisjointWork
-        | AttentionRouterSafeAction::NotifyOwnerWaitForPublishOrPickDisjointWork => {
+        | AttentionRouterSafeAction::NotifyOwnerWaitForPublishOrPickDisjointWork
+        | AttentionRouterSafeAction::RespectPaneReservationOrRequestExplicitHandoff => {
             AttentionRouterNudgeKind::HandoffRequest
         }
         AttentionRouterSafeAction::KeepProofRequiredBeadOpenOrBlockedAndRecordRchReasonCode
@@ -1754,6 +2054,31 @@ fn item_subject_slug(
     } else {
         slug
     }
+}
+
+fn severity_for_classification(
+    classification: AttentionRouterClassification,
+) -> AttentionRouterSeverity {
+    match classification {
+        AttentionRouterClassification::DoNotTouch => AttentionRouterSeverity::Critical,
+        AttentionRouterClassification::DirtyOverlap
+        | AttentionRouterClassification::ProofStarved
+        | AttentionRouterClassification::WaitingComm
+        | AttentionRouterClassification::BlockedInfra
+        | AttentionRouterClassification::BlockedDomain => AttentionRouterSeverity::High,
+        AttentionRouterClassification::StaleClaim => AttentionRouterSeverity::Medium,
+        AttentionRouterClassification::ReadyNow => AttentionRouterSeverity::Info,
+    }
+}
+
+fn redacted_summary_for_item(
+    source: &AttentionRouterSourceSnapshot,
+    fact: &AttentionRouterSourceFact,
+) -> String {
+    bounded_string(
+        format!("{}: {}", source.source_kind.slug(), fact.summary),
+        "redacted attention summary unavailable",
+    )
 }
 
 fn contains_reason(reason_codes: &[String], needles: &[&str]) -> bool {
@@ -2114,7 +2439,7 @@ mod tests {
             .sources
             .iter()
             .find(|source| source.source_kind == kind)
-            .unwrap_or_else(|| panic!("missing source {kind:?}"))
+            .expect("expected attention-router source kind in test bundle")
     }
 
     fn healthy_observation(kind: AttentionRouterSourceKind) -> AttentionRouterSourceObservation {
@@ -2165,7 +2490,175 @@ mod tests {
             .items
             .iter()
             .find(|item| item.nudge_plan_receipt.nudge.kind == kind)
-            .unwrap_or_else(|| panic!("missing nudge kind {kind:?}"))
+            .expect("expected attention-router nudge kind in test snapshot")
+    }
+
+    fn w6_optional_source_observations() -> Vec<AttentionRouterSourceObservation> {
+        vec![
+            AttentionRouterSourceObservation::new(
+                "policy_denied_audit.recent",
+                AttentionRouterSourceKind::PolicyDeniedAudit,
+                AttentionRouterSourceHealth::Available,
+                "storage.policy_denied_audit.read",
+                "recent policy denial metadata was collected",
+            )
+            .live(1_770_000_100_000, 1_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::PolicyDeniedAudit,
+                    "policy denied a proposed pane send",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("policy.denied"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "approval_store.pending",
+                AttentionRouterSourceKind::ApprovalStore,
+                AttentionRouterSourceHealth::Available,
+                "approval_store.read_pending",
+                "approval store metadata has a pending request",
+            )
+            .live(1_770_000_100_000, 2_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::ApprovalPending,
+                    "approval pending for policy-gated pane input",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("approval.pending"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "pane_reservations.active",
+                AttentionRouterSourceKind::PaneReservations,
+                AttentionRouterSourceHealth::Available,
+                "storage.pane_reservations.read",
+                "pane reservation metadata has an active overlap",
+            )
+            .live(1_770_000_100_000, 3_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::PaneReservationConflict,
+                    "pane 7 is reserved by another owner",
+                )
+                .with_agent_name("ScarletForge")
+                .with_affected_path("pane:7")
+                .with_reason_code("reservation.active_exclusive"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "operating_envelope.capacity",
+                AttentionRouterSourceKind::OperatingEnvelope,
+                AttentionRouterSourceHealth::Degraded,
+                "ft.operating_envelope.v1.snapshot",
+                "operating envelope denied admission under capacity red",
+            )
+            .live(1_770_000_100_000, 4_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::OperatingEnvelopeCapacity,
+                    "capacity red blocks additional pane admission",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("capacity.red"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "mission_tx_status.active",
+                AttentionRouterSourceKind::MissionTxStatus,
+                AttentionRouterSourceHealth::Degraded,
+                "mission_tx_status.read_only",
+                "mission transaction state requires stabilization",
+            )
+            .live(1_770_000_100_000, 5_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::MissionTxState,
+                    "transaction failed and compensation is required",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("tx.failed")
+                .with_reason_code("tx.rollback_required"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "events.unhandled",
+                AttentionRouterSourceKind::Events,
+                AttentionRouterSourceHealth::Available,
+                "storage.events.read_unhandled",
+                "unhandled event metadata was collected",
+            )
+            .live(1_770_000_100_000, 6_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::EventUnhandled,
+                    "critical detection event remains unhandled",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("event.unhandled"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "stuck_pane_classification.current",
+                AttentionRouterSourceKind::StuckPaneClassification,
+                AttentionRouterSourceHealth::Available,
+                "agent_state_classifier.read_only",
+                "stuck-pane classifier reported a stale agent",
+            )
+            .live(1_770_000_100_000, 7_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::StuckPaneClassification,
+                    "pane 12 is classified stuck after input",
+                )
+                .with_agent_name("IvoryCreek")
+                .with_affected_path("pane:12")
+                .with_reason_code("pane_state.stuck"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "rch.state",
+                AttentionRouterSourceKind::Rch,
+                AttentionRouterSourceHealth::Degraded,
+                "rch status --json",
+                "RCH worker pressure is degraded",
+            )
+            .live(1_770_000_100_000, 8_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::RchQueueState,
+                    "remote queue pressure blocks proof readiness",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("rch.worker_pressure"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "connector_breaker.open",
+                AttentionRouterSourceKind::ConnectorBreaker,
+                AttentionRouterSourceHealth::Degraded,
+                "connector_breaker.read_only",
+                "connector breaker is open",
+            )
+            .live(1_770_000_100_000, 9_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::ConnectorBreakerOpen,
+                    "connector circuit is open after repeated failures",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("connector.breaker_open"),
+            ),
+            AttentionRouterSourceObservation::new(
+                "incident_bundles.latest",
+                AttentionRouterSourceKind::IncidentBundles,
+                AttentionRouterSourceHealth::Degraded,
+                "incident_bundle.index.read_only",
+                "latest incident bundle still needs review",
+            )
+            .live(1_770_000_100_000, 10_000)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::IncidentBundleMissingEvidence,
+                    "incident bundle is missing required evidence",
+                )
+                .with_agent_name("LavenderDove")
+                .with_reason_code("incident.missing_evidence"),
+            ),
+        ]
     }
 
     #[test]
@@ -2395,6 +2888,199 @@ mod tests {
                     && source["health"].as_str() == Some("available")
             })
         }));
+    }
+
+    #[test]
+    fn w6_sources_aggregate_into_typed_read_only_attention_items() {
+        let snapshot = score(w6_optional_source_observations());
+        let expected = [
+            (
+                AttentionRouterSourceKind::PolicyDeniedAudit,
+                AttentionRouterSourceFactKind::PolicyDeniedAudit,
+                AttentionRouterClassification::BlockedDomain,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::InspectPolicyDenialAndChooseAllowedReadOnlyPath,
+                "LavenderDove",
+                "bypass_policy_gate",
+            ),
+            (
+                AttentionRouterSourceKind::ApprovalStore,
+                AttentionRouterSourceFactKind::ApprovalPending,
+                AttentionRouterClassification::WaitingComm,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::WaitForApprovalDecisionOrPickUngatedWork,
+                "LavenderDove",
+                "bypass_approval_store",
+            ),
+            (
+                AttentionRouterSourceKind::PaneReservations,
+                AttentionRouterSourceFactKind::PaneReservationConflict,
+                AttentionRouterClassification::DirtyOverlap,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::RespectPaneReservationOrRequestExplicitHandoff,
+                "ScarletForge",
+                "send_input_to_reserved_pane",
+            ),
+            (
+                AttentionRouterSourceKind::OperatingEnvelope,
+                AttentionRouterSourceFactKind::OperatingEnvelopeCapacity,
+                AttentionRouterClassification::BlockedInfra,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::FailClosedRequestTargetedHandoffOrPickDisjointWork,
+                "LavenderDove",
+                "ignore_operating_envelope",
+            ),
+            (
+                AttentionRouterSourceKind::MissionTxStatus,
+                AttentionRouterSourceFactKind::MissionTxState,
+                AttentionRouterClassification::BlockedDomain,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::StabilizeMissionOrTxBeforeNewWork,
+                "LavenderDove",
+                "skip_tx_compensation",
+            ),
+            (
+                AttentionRouterSourceKind::Events,
+                AttentionRouterSourceFactKind::EventUnhandled,
+                AttentionRouterClassification::BlockedDomain,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::TriageUnhandledEventBeforeClaimingMoreWork,
+                "LavenderDove",
+                "mark_event_handled_without_triage",
+            ),
+            (
+                AttentionRouterSourceKind::StuckPaneClassification,
+                AttentionRouterSourceFactKind::StuckPaneClassification,
+                AttentionRouterClassification::StaleClaim,
+                AttentionRouterSeverity::Medium,
+                AttentionRouterSafeAction::SendOrDraftStatusCheckBeforeForceRelease,
+                "IvoryCreek",
+                "force_release_without_status_check",
+            ),
+            (
+                AttentionRouterSourceKind::Rch,
+                AttentionRouterSourceFactKind::RchQueueState,
+                AttentionRouterClassification::BlockedInfra,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::DoNotClaimBvPickRecordBlockerOrFindDisjointStaticSlice,
+                "LavenderDove",
+                "restart_rch",
+            ),
+            (
+                AttentionRouterSourceKind::ConnectorBreaker,
+                AttentionRouterSourceFactKind::ConnectorBreakerOpen,
+                AttentionRouterClassification::BlockedInfra,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::WaitForConnectorRecoveryOrUseReadOnlyFallback,
+                "LavenderDove",
+                "bypass_circuit_breaker",
+            ),
+            (
+                AttentionRouterSourceKind::IncidentBundles,
+                AttentionRouterSourceFactKind::IncidentBundleMissingEvidence,
+                AttentionRouterClassification::BlockedInfra,
+                AttentionRouterSeverity::High,
+                AttentionRouterSafeAction::InvestigateIncidentBundleBeforeContinuing,
+                "LavenderDove",
+                "delete_incident_bundle",
+            ),
+        ];
+
+        for (source_kind, fact_kind, classification, severity, action, owner, forbidden_action) in
+            expected
+        {
+            let item = snapshot
+                .items
+                .iter()
+                .find(|item| {
+                    item.evidence.iter().any(|evidence| {
+                        evidence.source_kind == source_kind && evidence.fact == fact_kind
+                    })
+                })
+                .expect("expected W6 attention item for source/fact pair");
+
+            assert_eq!(item.schema, ATTENTION_ROUTER_ITEM_SCHEMA);
+            assert_eq!(item.domain, source_kind.slug());
+            assert_eq!(item.owner.as_deref(), Some(owner));
+            assert_eq!(item.classification, classification);
+            assert_eq!(item.severity, severity);
+            assert_eq!(item.recommended_action.action, action);
+            assert!(!item.redacted_summary.trim().is_empty());
+            assert!(item.redacted_summary.chars().count() <= ATTENTION_ROUTER_SUMMARY_MAX_CHARS);
+            assert!(item.freshness_ms.is_some());
+            assert!(
+                item.forbidden_actions
+                    .iter()
+                    .any(|action| action == forbidden_action),
+                "item {} missing forbidden action {forbidden_action}",
+                item.item_id
+            );
+            assert!(
+                item.nudge_plan_receipt
+                    .forbidden_actions
+                    .iter()
+                    .any(|action| action == "local_cargo_proof"),
+                "nudge receipt {} missing global proof guard",
+                item.nudge_plan_receipt.receipt_id
+            );
+            assert!(!item.recommended_action.mutates);
+            assert!(!item.nudge_plan_receipt.nudge.mutates);
+            assert!(!item.nudge_plan_receipt.live_mutation_allowed);
+            assert!(!item.nudge_plan_receipt.side_effects_executed);
+        }
+
+        for source_kind in [
+            AttentionRouterSourceKind::PolicyDeniedAudit,
+            AttentionRouterSourceKind::ApprovalStore,
+            AttentionRouterSourceKind::PaneReservations,
+            AttentionRouterSourceKind::OperatingEnvelope,
+            AttentionRouterSourceKind::MissionTxStatus,
+            AttentionRouterSourceKind::Events,
+            AttentionRouterSourceKind::StuckPaneClassification,
+            AttentionRouterSourceKind::Rch,
+            AttentionRouterSourceKind::ConnectorBreaker,
+            AttentionRouterSourceKind::IncidentBundles,
+        ] {
+            assert!(
+                snapshot
+                    .sources
+                    .iter()
+                    .any(|source| source.source_kind == source_kind),
+                "missing W6 source {source_kind:?}"
+            );
+        }
+        assert!(!snapshot.side_effects_executed);
+    }
+
+    #[test]
+    fn w6_source_item_order_is_deterministic_when_observation_order_changes() {
+        let forward = score(w6_optional_source_observations());
+        let mut reversed = w6_optional_source_observations();
+        reversed.reverse();
+        let reverse = score(reversed);
+
+        assert_eq!(
+            forward
+                .items
+                .iter()
+                .map(|item| (&item.item_id, item.severity, item.domain.as_str()))
+                .collect::<Vec<_>>(),
+            reverse
+                .items
+                .iter()
+                .map(|item| (&item.item_id, item.severity, item.domain.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let item_ids = forward
+            .items
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            item_ids.len(),
+            forward.items.len(),
+            "W6 attention item ids must be stable and unique"
+        );
     }
 
     #[test]
