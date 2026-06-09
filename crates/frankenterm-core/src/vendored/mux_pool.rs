@@ -39,8 +39,8 @@ use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
 };
 use codec::{
-    GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse, SpawnResponse, SpawnV2,
-    SplitPane, UnitResponse,
+    GetLinesResponse, GetPaneRenderChangesResponse, GetSemanticZonesResponse, ListPanesResponse,
+    SpawnResponse, SpawnV2, SplitPane, UnitResponse,
 };
 
 /// Error type for mux pool operations.
@@ -527,6 +527,31 @@ impl MuxPool {
                     .get_pane_render_changes_with_cx(&op_cx, pane_id)
                     .await
             })
+        })
+        .await
+    }
+
+    /// Fetch OSC 133 semantic zones from a pane via a pooled connection.
+    pub async fn get_semantic_zones(
+        &self,
+        pane_id: u64,
+    ) -> Result<GetSemanticZonesResponse, MuxPoolError> {
+        self.execute_with_recovery("get_semantic_zones", |client| {
+            Box::pin(client.get_semantic_zones(pane_id))
+        })
+        .await
+    }
+
+    /// Fetch OSC 133 semantic zones via a pooled connection using explicit `Cx`.
+    pub async fn get_semantic_zones_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+    ) -> Result<GetSemanticZonesResponse, MuxPoolError> {
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "get_semantic_zones", move |client| {
+            let op_cx = op_cx.clone();
+            Box::pin(async move { client.get_semantic_zones_with_cx(&op_cx, pane_id).await })
         })
         .await
     }

@@ -329,6 +329,7 @@ pub struct TerminalState {
     wrap_next: bool,
 
     clear_semantic_attribute_on_newline: bool,
+    last_semantic_command_status: Option<i32>,
 
     /// If true, writing a character inserts a new cell
     insert: bool,
@@ -619,6 +620,7 @@ impl TerminalState {
             left_and_right_margin_mode: false,
             wrap_next: false,
             clear_semantic_attribute_on_newline: false,
+            last_semantic_command_status: None,
             // We default auto wrap to true even though the default for
             // a dec terminal is false, because it is more useful this way.
             dec_auto_wrap: true,
@@ -2956,6 +2958,11 @@ impl TerminalState {
         }
 
         Ok(zones)
+    }
+
+    /// Return the latest OSC 133 command status retained by the terminal.
+    pub fn last_semantic_command_status(&self) -> Option<i32> {
+        self.last_semantic_command_status
     }
 
     #[inline]

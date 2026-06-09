@@ -23,7 +23,7 @@ use procinfo::LocalProcessInfo;
 use rangeset::RangeSet;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -938,6 +938,11 @@ impl Pane for LocalPane {
         term.get_semantic_zones()
     }
 
+    fn get_semantic_exit_code(&self) -> anyhow::Result<Option<i32>> {
+        let term = self.terminal.lock();
+        Ok(term.last_semantic_command_status())
+    }
+
     async fn search(
         &self,
         pattern: Pattern,
@@ -1093,11 +1098,17 @@ impl Pane for LocalPane {
             let mut coords = vec![];
 
             for (row_idx, line) in lines.iter().enumerate() {
+                let Ok(row_offset) = StableRowIndex::try_from(row_idx) else {
+                    break;
+                };
+                let Some(stable_row) = stable_row.checked_add(row_offset) else {
+                    break;
+                };
                 for cell in line.visible_cells() {
                     coords.push(Coord {
                         byte_idx,
                         grapheme_idx: cell.cell_index(),
-                        stable_row: stable_row + row_idx as StableRowIndex,
+                        stable_row,
                     });
                     byte_idx += cell.str().len();
                 }

@@ -241,6 +241,100 @@ impl LogicalLine {
     }
 }
 
+fn semantic_zone_row_range(zone: &SemanticZone) -> Option<Range<StableRowIndex>> {
+    if zone.end_y < zone.start_y {
+        return None;
+    }
+
+    let end = zone.end_y.checked_add(1).unwrap_or(StableRowIndex::MAX);
+    if end <= zone.start_y {
+        return None;
+    }
+
+    Some(zone.start_y..end)
+}
+
+fn cols_for_semantic_zone_row(zone: &SemanticZone, row: StableRowIndex) -> Range<usize> {
+    if row < zone.start_y || row > zone.end_y {
+        0..0
+    } else if zone.start_y == zone.end_y {
+        if zone.start_x <= zone.end_x {
+            zone.start_x..zone.end_x.saturating_add(1)
+        } else {
+            zone.end_x..zone.start_x.saturating_add(1)
+        }
+    } else if row == zone.end_y {
+        0..zone.end_x.saturating_add(1)
+    } else if row == zone.start_y {
+        zone.start_x..usize::MAX
+    } else {
+        0..usize::MAX
+    }
+}
+
+pub fn text_from_semantic_zone<P: Pane + ?Sized>(pane: &P, zone: SemanticZone) -> String {
+    let Some(row_range) = semantic_zone_row_range(&zone) else {
+        return String::new();
+    };
+
+    let logical_lines = pane.get_logical_lines(row_range);
+    text_from_semantic_zone_lines(&logical_lines, &zone)
+}
+
+fn text_from_semantic_zone_lines(logical_lines: &[LogicalLine], zone: &SemanticZone) -> String {
+    let mut text = String::new();
+    let mut last_was_wrapped = false;
+    let mut wrote_logical_line = false;
+
+    for line in logical_lines {
+        if line.physical_lines.is_empty() {
+            continue;
+        }
+
+        let mut line_text = String::new();
+        let mut line_selected = false;
+        let mut line_last_was_wrapped = false;
+        let last_idx = line.physical_lines.len().saturating_sub(1);
+        for (idx, phys) in line.physical_lines.iter().enumerate() {
+            let Some(this_row) = stable_row_offset(line.first_row, idx) else {
+                break;
+            };
+            if this_row < zone.start_y || this_row > zone.end_y {
+                continue;
+            }
+
+            line_selected = true;
+            let last_phys_idx = phys.len().saturating_sub(1);
+            let cols = cols_for_semantic_zone_row(zone, this_row);
+            let last_col_idx = cols.end.saturating_sub(1).min(last_phys_idx);
+            let col_span = phys.columns_as_str(cols);
+
+            if idx == last_idx {
+                line_text.push_str(col_span.trim_end());
+            } else {
+                line_text.push_str(&col_span);
+            }
+
+            line_last_was_wrapped = last_col_idx == last_phys_idx
+                && phys
+                    .get_cell(last_col_idx)
+                    .map(|cell| cell.attrs().wrapped())
+                    .unwrap_or(false);
+        }
+
+        if line_selected {
+            if wrote_logical_line && !last_was_wrapped {
+                text.push('\n');
+            }
+            text.push_str(&line_text);
+            wrote_logical_line = true;
+            last_was_wrapped = line_last_was_wrapped;
+        }
+    }
+
+    text
+}
+
 /// A Pane represents a view on a terminal
 #[async_trait(?Send)]
 pub trait Pane: Downcast + Send + Sync {
@@ -394,6 +488,16 @@ pub trait Pane: Downcast + Send + Sync {
     /// Retrieve the set of semantic zones
     fn get_semantic_zones(&self) -> anyhow::Result<Vec<SemanticZone>> {
         Ok(vec![])
+    }
+
+    /// Retrieve text for a semantic zone using the pane's logical line model.
+    fn get_text_from_semantic_zone(&self, zone: SemanticZone) -> anyhow::Result<String> {
+        Ok(text_from_semantic_zone(self, zone))
+    }
+
+    /// Retrieve the latest OSC 133 command status for this pane, when retained.
+    fn get_semantic_exit_code(&self) -> anyhow::Result<Option<i32>> {
+        Ok(None)
     }
 
     /// Returns true if the terminal has grabbed the mouse and wants to
@@ -1328,6 +1432,106 @@ mod test {
             summarize_logical_lines(&lines),
             vec![(start, Cow::Borrowed("boundary"))]
         );
+    }
+
+    #[test]
+    fn semantic_zone_row_range_handles_reversed_and_max_boundaries() {
+        let zone = SemanticZone {
+            start_y: 4,
+            start_x: 0,
+            end_y: 6,
+            end_x: 0,
+            semantic_type: Default::default(),
+        };
+        assert_eq!(semantic_zone_row_range(&zone), Some(4..7));
+
+        let reversed = SemanticZone {
+            start_y: 6,
+            start_x: 0,
+            end_y: 4,
+            end_x: 0,
+            semantic_type: Default::default(),
+        };
+        assert_eq!(semantic_zone_row_range(&reversed), None);
+
+        let max_end = SemanticZone {
+            start_y: StableRowIndex::MAX - 1,
+            start_x: 0,
+            end_y: StableRowIndex::MAX,
+            end_x: 0,
+            semantic_type: Default::default(),
+        };
+        assert_eq!(
+            semantic_zone_row_range(&max_end),
+            Some(StableRowIndex::MAX - 1..StableRowIndex::MAX)
+        );
+
+        let max_only = SemanticZone {
+            start_y: StableRowIndex::MAX,
+            start_x: 0,
+            end_y: StableRowIndex::MAX,
+            end_x: 0,
+            semantic_type: Default::default(),
+        };
+        assert_eq!(semantic_zone_row_range(&max_only), None);
+    }
+
+    #[test]
+    fn semantic_zone_text_skips_empty_logical_lines_without_extra_newlines() {
+        let first = line("first", false);
+        let second = line("second", false);
+        let first_logical = LogicalLine {
+            physical_lines: vec![first.clone()],
+            logical: first,
+            first_row: 0,
+        };
+        let empty_logical = LogicalLine {
+            physical_lines: vec![],
+            logical: Line::new(SEQ_ZERO),
+            first_row: 1,
+        };
+        let second_logical = LogicalLine {
+            physical_lines: vec![second.clone()],
+            logical: second,
+            first_row: 2,
+        };
+        let zone = SemanticZone {
+            start_y: 0,
+            start_x: 0,
+            end_y: 2,
+            end_x: usize::MAX,
+            semantic_type: Default::default(),
+        };
+
+        let text =
+            text_from_semantic_zone_lines(&[first_logical, empty_logical, second_logical], &zone);
+
+        assert_eq!(text, "first\nsecond");
+    }
+
+    #[test]
+    fn semantic_zone_text_handles_max_end_y_without_overflow() {
+        let start = StableRowIndex::MAX - 1;
+        let pane = FakePane::new_with_base_row(vec![line("boundary", false)], start);
+        let max_end_zone = SemanticZone {
+            start_y: start,
+            start_x: 0,
+            end_y: StableRowIndex::MAX,
+            end_x: usize::MAX,
+            semantic_type: Default::default(),
+        };
+
+        assert_eq!(text_from_semantic_zone(&pane, max_end_zone), "boundary");
+
+        let max_only_zone = SemanticZone {
+            start_y: StableRowIndex::MAX,
+            start_x: 0,
+            end_y: StableRowIndex::MAX,
+            end_x: usize::MAX,
+            semantic_type: Default::default(),
+        };
+
+        assert_eq!(text_from_semantic_zone(&pane, max_only_zone), "");
     }
 
     fn is_double_click_word(s: &str) -> bool {

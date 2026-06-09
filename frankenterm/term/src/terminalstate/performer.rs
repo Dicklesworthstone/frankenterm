@@ -805,6 +805,7 @@ impl<'a> Performer<'a> {
                 self.cursor = Default::default();
                 self.wrap_next = false;
                 self.clear_semantic_attribute_on_newline = false;
+                self.last_semantic_command_status = None;
                 self.insert = false;
                 self.dec_auto_wrap = true;
                 self.saved_dec_private_modes.clear();
@@ -1113,8 +1114,10 @@ impl<'a> Performer<'a> {
             }
 
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::CommandStatus { .. },
-            ) => {}
+                FinalTermSemanticPrompt::CommandStatus { status, .. },
+            ) => {
+                self.last_semantic_command_status = Some(status);
+            }
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {

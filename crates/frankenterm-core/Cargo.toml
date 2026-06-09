@@ -107,6 +107,7 @@ shell-words.workspace = true
 codec = { workspace = true, optional = true, features = ["async-asupersync"] }
 config = { workspace = true, optional = true }
 mux = { workspace = true, optional = true }
+frankenterm-cell = { workspace = true, optional = true }
 frankenterm-term = { workspace = true, optional = true }
 
 # TUI (optional, behind feature)
@@ -916,7 +917,7 @@ cass-export = []
 vc-export = ["subprocess-bridge"]
 
 # Optional heavy integrations - feature-gated (internal)
-frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]
+frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-cell", "dep:frankenterm-term"]
 vendored-wezterm = ["frankenterm-deps"]  # backward compat alias
 browser-automation = []
 mcp-server = ["dep:fastmcp", "dep:toon_rust"]

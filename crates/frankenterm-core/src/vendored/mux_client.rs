@@ -18,10 +18,10 @@ use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CompressionMode, CreateFloatingPane, CycleStack, DecodedPdu,
     GetCodecVersion, GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
-    GetPaneRenderChangesResponse, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
-    RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ,
-    SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, ToggleFloatingPane,
-    UnitResponse, UpdatePaneConstraints, WriteToPane,
+    GetPaneRenderChangesResponse, GetSemanticZones, GetSemanticZonesResponse, ListPanes,
+    ListPanesResponse, MoveFloatingPane, Pdu, RemoveFloatingPane, Resize, SelectStackPane,
+    SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
+    SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -522,6 +522,38 @@ impl DirectMuxClient {
             Pdu::GetLinesResponse(payload) => Ok(payload),
             other => Err(DirectMuxError::UnexpectedResponse {
                 expected: "GetLinesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// Fetch OSC 133 semantic zones from a pane through the native mux protocol.
+    pub async fn get_semantic_zones(
+        &mut self,
+        pane_id: u64,
+    ) -> Result<GetSemanticZonesResponse, DirectMuxError> {
+        let cx = ambient_mux_cx();
+        self.get_semantic_zones_with_cx(&cx, pane_id).await
+    }
+
+    /// Fetch OSC 133 semantic zones using an explicit capability context.
+    pub async fn get_semantic_zones_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+    ) -> Result<GetSemanticZonesResponse, DirectMuxError> {
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::GetSemanticZones(GetSemanticZones {
+                    pane_id: pane_id as usize,
+                }),
+            )
+            .await?;
+        match response {
+            Pdu::GetSemanticZonesResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "GetSemanticZonesResponse".to_string(),
                 got: other.pdu_name().to_string(),
             }),
         }

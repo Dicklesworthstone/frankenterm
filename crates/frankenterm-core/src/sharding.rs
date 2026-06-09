@@ -20,8 +20,8 @@ use crate::patterns::AgentType;
 use crate::runtime_async::RwLock;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
-    MoveDirection, PaneInfo, PaneTieredScrollbackSummary, SpawnTarget, SplitDirection,
-    WeztermFuture, WeztermHandle, WeztermInterface,
+    MoveDirection, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackSummary, SpawnTarget,
+    SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
 };
 
 // =============================================================================
@@ -1021,6 +1021,20 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
+    fn get_semantic_zones(&self, pane_id: u64) -> WeztermFuture<'_, MuxSemanticSnapshot> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .get_semantic_zones(route.local_pane_id)
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "get_semantic_zones", Some(pane_id), err)
+                })
+        })
+    }
+
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
         let text = text.to_string();
         Box::pin(async move {
@@ -1350,6 +1364,24 @@ impl WeztermInterface for ShardedWeztermClient {
                 .get_text_with_cx(cx, route.local_pane_id, escapes)
                 .await
                 .map_err(|err| self.backend_error(route.shard_id, "get_text", Some(pane_id), err))
+        })
+    }
+
+    fn get_semantic_zones_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, MuxSemanticSnapshot> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .get_semantic_zones_with_cx(cx, route.local_pane_id)
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "get_semantic_zones", Some(pane_id), err)
+                })
         })
     }
 

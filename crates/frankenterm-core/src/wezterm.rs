@@ -89,6 +89,52 @@ pub type MuxHandle = Arc<dyn MuxInterface>;
 /// [`MuxHandle`].
 pub type WeztermHandle = MuxHandle;
 
+/// Semantic type for a contiguous OSC 133 terminal zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxSemanticZoneKind {
+    Prompt,
+    Input,
+    Output,
+}
+
+/// A contiguous terminal region carrying one OSC 133 semantic type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxSemanticZone {
+    pub start_y: isize,
+    pub start_x: usize,
+    pub end_y: isize,
+    pub end_x: usize,
+    pub semantic_type: MuxSemanticZoneKind,
+    pub text: String,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl From<(frankenterm_term::SemanticZone, String)> for MuxSemanticZone {
+    fn from((zone, text): (frankenterm_term::SemanticZone, String)) -> Self {
+        let semantic_type = match zone.semantic_type {
+            frankenterm_cell::SemanticType::Prompt => MuxSemanticZoneKind::Prompt,
+            frankenterm_cell::SemanticType::Input => MuxSemanticZoneKind::Input,
+            frankenterm_cell::SemanticType::Output => MuxSemanticZoneKind::Output,
+        };
+        Self {
+            start_y: zone.start_y,
+            start_x: zone.start_x,
+            end_y: zone.end_y,
+            end_x: zone.end_x,
+            semantic_type,
+            text,
+        }
+    }
+}
+
+/// Live semantic-zone snapshot for a mux pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxSemanticSnapshot {
+    pub zones: Vec<MuxSemanticZone>,
+    pub last_exit_code: Option<i32>,
+}
+
 /// Abstraction layer over an in-process mux session — the API the
 /// recorder, workflows, and policy layers use to drive panes/tabs/windows
 /// regardless of which concrete client (`WeztermClient`, mocks, sharded
@@ -163,6 +209,26 @@ pub trait MuxInterface: Send + Sync {
     ) -> WeztermFuture<'a, String> {
         self.get_text(pane_id, escapes)
     }
+
+    /// Get OSC 133 semantic zones retained by the live terminal state.
+    fn get_semantic_zones(&self, pane_id: u64) -> WeztermFuture<'_, MuxSemanticSnapshot> {
+        Box::pin(async move {
+            Err(WeztermError::CommandFailed(format!(
+                "semantic data unavailable for pane {pane_id}: active mux backend does not expose SemanticZone data"
+            ))
+            .into())
+        })
+    }
+
+    /// Get semantic zones bound to the caller's asupersync capability context.
+    fn get_semantic_zones_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, MuxSemanticSnapshot> {
+        self.get_semantic_zones(pane_id)
+    }
+
     /// Send text using paste mode.
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()>;
 
@@ -1557,6 +1623,80 @@ impl WeztermClient {
         self.run_cli_with_pane_check_retry(&args, pane_id).await
     }
 
+    /// Get OSC 133 semantic zones from the live mux pane state.
+    pub async fn get_semantic_zones(&self, pane_id: u64) -> Result<MuxSemanticSnapshot> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_semantic_zones_with_cx(&cx, pane_id).await
+    }
+
+    /// Get OSC 133 semantic zones from the live mux pane state.
+    #[cfg(all(feature = "vendored", unix))]
+    pub async fn get_semantic_zones_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<MuxSemanticSnapshot> {
+        if let Some(ref pool) = self.mux_pool {
+            if !self.mux_circuit_guard() {
+                return Err(WeztermError::CircuitOpen { retry_after_ms: 0 }.into());
+            }
+
+            match pool.get_semantic_zones_with_cx(cx, pane_id).await {
+                Ok(response) => {
+                    self.mux_circuit_record_success();
+                    if response.zones.len() != response.zone_texts.len() {
+                        return Err(WeztermError::CommandFailed(format!(
+                            "semantic data unavailable for pane {pane_id}: mux returned {} zones but {} texts",
+                            response.zones.len(),
+                            response.zone_texts.len()
+                        ))
+                        .into());
+                    }
+                    let zones = response
+                        .zones
+                        .into_iter()
+                        .zip(response.zone_texts)
+                        .map(Into::into)
+                        .collect();
+                    return Ok(MuxSemanticSnapshot {
+                        zones,
+                        last_exit_code: response.last_exit_code,
+                    });
+                }
+                Err(err) => {
+                    self.mux_circuit_record_failure(&err);
+                    if !self.mux_error_should_fallback_to_cli_for_client(&err) {
+                        return Err(Self::mux_cancelled_error("get_semantic_zones_with_cx", err));
+                    }
+                    tracing::debug!(
+                        error = %err,
+                        "mux pool get_semantic_zones_with_cx failed; no CLI fallback can expose SemanticZone data"
+                    );
+                }
+            }
+        }
+
+        Err(WeztermError::CommandFailed(format!(
+            "semantic data unavailable for pane {pane_id}: direct mux SemanticZone query is not available"
+        ))
+        .into())
+    }
+
+    /// Stub semantic-zone query for builds without the vendored mux client.
+    #[cfg(not(all(feature = "vendored", unix)))]
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async_trait_impl)]
+    pub async fn get_semantic_zones_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<MuxSemanticSnapshot> {
+        Err(WeztermError::CommandFailed(format!(
+            "semantic data unavailable for pane {pane_id}: vendored mux support is not enabled"
+        ))
+        .into())
+    }
+
     /// Read the mux-side tiered scrollback summary for a pane when available.
     ///
     /// This is a best-effort telemetry path used by runtime maintenance. It
@@ -1630,6 +1770,8 @@ impl WeztermClient {
     /// without vendored+unix+asupersync — delegates to the legacy
     /// method which returns the CLI-unavailable error path.
     #[cfg(not(all(feature = "vendored", unix)))]
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async_trait_impl)]
     pub async fn pane_tiered_scrollback_summary_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2908,6 +3050,18 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { self.get_text_with_cx(cx, pane_id, escapes).await })
     }
 
+    fn get_semantic_zones(&self, pane_id: u64) -> WeztermFuture<'_, MuxSemanticSnapshot> {
+        Box::pin(async move { WeztermClient::get_semantic_zones(self, pane_id).await })
+    }
+
+    fn get_semantic_zones_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, MuxSemanticSnapshot> {
+        Box::pin(async move { self.get_semantic_zones_with_cx(cx, pane_id).await })
+    }
+
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
         let text = text.to_string();
         Box::pin(async move { WeztermClient::send_text(self, pane_id, &text).await })
@@ -3206,6 +3360,10 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().get_text(pane_id, escapes)
     }
 
+    fn get_semantic_zones(&self, pane_id: u64) -> WeztermFuture<'_, MuxSemanticSnapshot> {
+        self.as_ref().get_semantic_zones(pane_id)
+    }
+
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
         self.as_ref().send_text(pane_id, text)
     }
@@ -3324,6 +3482,14 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
         self.as_ref().get_text_with_cx(cx, pane_id, escapes)
+    }
+
+    fn get_semantic_zones_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, MuxSemanticSnapshot> {
+        self.as_ref().get_semantic_zones_with_cx(cx, pane_id)
     }
 
     fn send_text_with_cx<'a>(
@@ -6929,6 +7095,10 @@ impl WeztermInterface for UnifiedClient {
         self.inner.get_text(pane_id, escapes)
     }
 
+    fn get_semantic_zones(&self, pane_id: u64) -> WeztermFuture<'_, MuxSemanticSnapshot> {
+        self.inner.get_semantic_zones(pane_id)
+    }
+
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
         self.inner.send_text(pane_id, text)
     }
@@ -7048,6 +7218,14 @@ impl WeztermInterface for UnifiedClient {
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
         self.inner.get_text_with_cx(cx, pane_id, escapes)
+    }
+
+    fn get_semantic_zones_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, MuxSemanticSnapshot> {
+        self.inner.get_semantic_zones_with_cx(cx, pane_id)
     }
 
     fn send_text_with_cx<'a>(

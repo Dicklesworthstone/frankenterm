@@ -6,15 +6,16 @@ use codec::{
     DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList, GetClientListResponse,
     GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse,
     GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
-    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCredsResponse,
-    InputSerial, KillPane, ListPanes, ListPanesResponse, ListPanesTabStackEntry,
-    ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse, MoveFloatingPane,
-    MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert, Pdu, Ping, Pong, RemoveFloatingPane,
-    RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
-    SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId,
-    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
-    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
-    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
+    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetSemanticZones,
+    GetSemanticZonesResponse, GetTlsCredsResponse, InputSerial, KillPane, ListPanes,
+    ListPanesResponse, ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse,
+    LivenessResponse, MoveFloatingPane, MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert,
+    Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
+    SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
+    SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
+    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
+    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WriteToPane,
 };
 use config::TermConfig;
 use mux::client::ClientId;
@@ -1105,6 +1106,34 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::GetSemanticZones(GetSemanticZones { pane_id }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = session_mux()?;
+                            let pane = mux
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            let zones = pane.get_semantic_zones()?;
+                            let zone_texts = zones
+                                .iter()
+                                .copied()
+                                .map(|zone| pane.get_text_from_semantic_zone(zone))
+                                .collect::<anyhow::Result<Vec<_>>>()?;
+                            let last_exit_code = pane.get_semantic_exit_code()?;
+                            Ok(Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse {
+                                pane_id,
+                                zones,
+                                zone_texts,
+                                last_exit_code,
+                            }))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+
             Pdu::GetImageCell(GetImageCell {
                 pane_id,
                 line_idx,
@@ -1570,6 +1599,7 @@ impl SessionHandler {
             | Pdu::GetPaneDirectionResponse { .. }
             | Pdu::SearchScrollbackResponse { .. }
             | Pdu::GetLinesResponse { .. }
+            | Pdu::GetSemanticZonesResponse { .. }
             | Pdu::GetCodecVersionResponse { .. }
             | Pdu::WindowWorkspaceChanged { .. }
             | Pdu::GetTlsCredsResponse { .. }

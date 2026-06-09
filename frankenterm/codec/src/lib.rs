@@ -19,7 +19,7 @@
 use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
+use frankenterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
@@ -703,7 +703,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 46;
+pub const CODEC_VERSION: usize = 47;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -882,6 +882,8 @@ pdu! {
     SetActiveWorkspace: 74,
     ListPanesTabStacks: 75,
     ListPanesTabStacksResponse: 76,
+    GetSemanticZones: 77,
+    GetSemanticZonesResponse: 78,
 }
 
 impl Pdu {
@@ -967,6 +969,7 @@ impl Pdu {
     pub fn pane_id(&self) -> Option<PaneId> {
         match self {
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
+            | Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse { pane_id, .. })
             | Pdu::SetPalette(SetPalette { pane_id, .. })
             | Pdu::NotifyAlert(NotifyAlert { pane_id, .. })
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
@@ -1392,6 +1395,19 @@ pub struct ActivatePaneDirection {
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneRenderChanges {
     pub pane_id: PaneId,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct GetSemanticZones {
+    pub pane_id: PaneId,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct GetSemanticZonesResponse {
+    pub pane_id: PaneId,
+    pub zones: Vec<SemanticZone>,
+    pub zone_texts: Vec<String>,
+    pub last_exit_code: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -2433,18 +2449,15 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 46);
+        assert_eq!(CODEC_VERSION, 47);
     }
 
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_bootstrap_min_equals_version() {
-        // Bootstrap invariant: until an additive bump opens a window,
-        // CODEC_VERSION_MIN_SUPPORTED equals CODEC_VERSION, which makes
-        // the helper's behavior strict-equality-equivalent for the
-        // (remote, remote_min = remote) caller convention.
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, CODEC_VERSION);
+    fn check_compat_additive_window_keeps_min_supported() {
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
+        assert_eq!(CODEC_VERSION, 47);
     }
 
     #[test]

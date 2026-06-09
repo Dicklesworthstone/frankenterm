@@ -4,6 +4,8 @@ use luahelper::{dynamic_to_lua_value, from_lua, to_lua};
 use mlua::Value;
 use mux::pane::CachePolicy;
 use std::cmp::Ordering;
+use std::convert::TryFrom;
+use std::ops::Range;
 use std::sync::Arc;
 use termwiz::cell::SemanticType;
 use termwiz_funcs::lines_to_escapes;
@@ -22,66 +24,37 @@ impl MuxPane {
     fn get_text_from_semantic_zone(&self, zone: SemanticZone) -> mlua::Result<String> {
         let mux = get_mux()?;
         let pane = self.resolve(&mux)?;
-
-        let mut last_was_wrapped = false;
-        let first_row = zone.start_y;
-        let last_row = zone.end_y;
-
-        fn cols_for_row(zone: &SemanticZone, row: StableRowIndex) -> std::ops::Range<usize> {
-            if row < zone.start_y || row > zone.end_y {
-                0..0
-            } else if zone.start_y == zone.end_y {
-                // A single line zone
-                if zone.start_x <= zone.end_x {
-                    zone.start_x..zone.end_x.saturating_add(1)
-                } else {
-                    zone.end_x..zone.start_x.saturating_add(1)
-                }
-            } else if row == zone.end_y {
-                // last line of multi-line
-                0..zone.end_x.saturating_add(1)
-            } else if row == zone.start_y {
-                // first line of multi-line
-                zone.start_x..usize::MAX
-            } else {
-                // some "middle" line of multi-line
-                0..usize::MAX
-            }
-        }
-
-        let mut s = String::new();
-        for line in pane.get_logical_lines(zone.start_y..zone.end_y + 1) {
-            if !s.is_empty() && !last_was_wrapped {
-                s.push('\n');
-            }
-            let last_idx = line.physical_lines.len().saturating_sub(1);
-            for (idx, phys) in line.physical_lines.iter().enumerate() {
-                let this_row = line.first_row + idx as StableRowIndex;
-                if this_row >= first_row && this_row <= last_row {
-                    let last_phys_idx = phys.len().saturating_sub(1);
-
-                    let cols = cols_for_row(&zone, this_row);
-                    let last_col_idx = cols.end.saturating_sub(1).min(last_phys_idx);
-                    let col_span = phys.columns_as_str(cols);
-                    // Only trim trailing whitespace if we are the last line
-                    // in a wrapped sequence
-                    if idx == last_idx {
-                        s.push_str(col_span.trim_end());
-                    } else {
-                        s.push_str(&col_span);
-                    }
-
-                    last_was_wrapped = last_col_idx == last_phys_idx
-                        && phys
-                            .get_cell(last_col_idx)
-                            .map(|c| c.attrs().wrapped())
-                            .unwrap_or(false);
-                }
-            }
-        }
-
-        Ok(s)
+        pane.get_text_from_semantic_zone(zone)
+            .map_err(mlua::Error::external)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_row_range_for_tail_checks_bottom_row_arithmetic() {
+        assert_eq!(visible_row_range_for_tail(10, 5, 3).unwrap(), 12..15);
+        assert!(visible_row_range_for_tail(StableRowIndex::MAX, 1, 1).is_err());
+        assert!(visible_row_range_for_tail(0, usize::MAX, 1).is_err());
+    }
+}
+
+fn visible_row_range_for_tail(
+    physical_top: StableRowIndex,
+    viewport_rows: usize,
+    nlines: usize,
+) -> mlua::Result<Range<StableRowIndex>> {
+    let viewport_rows = StableRowIndex::try_from(viewport_rows)
+        .map_err(|_| mlua::Error::external("viewport row count exceeds stable row range"))?;
+    let bottom_row = physical_top
+        .checked_add(viewport_rows)
+        .ok_or_else(|| mlua::Error::external("stable row range overflow"))?;
+    let nlines = StableRowIndex::try_from(nlines).unwrap_or(StableRowIndex::MAX);
+    let top_row = bottom_row.saturating_sub(nlines);
+
+    Ok(top_row..bottom_row)
 }
 
 impl UserData for MuxPane {
@@ -220,9 +193,8 @@ impl UserData for MuxPane {
             let pane = this.resolve(&mux)?;
             let dims = pane.get_dimensions();
             let nlines = nlines.unwrap_or(dims.viewport_rows);
-            let bottom_row = dims.physical_top + dims.viewport_rows as isize;
-            let top_row = bottom_row.saturating_sub(nlines as isize);
-            let (_first_row, lines) = pane.get_lines(top_row..bottom_row);
+            let range = visible_row_range_for_tail(dims.physical_top, dims.viewport_rows, nlines)?;
+            let (_first_row, lines) = pane.get_lines(range);
             let mut text = String::new();
             for line in lines {
                 for cell in line.visible_cells() {
@@ -242,9 +214,8 @@ impl UserData for MuxPane {
             let pane = this.resolve(&mux)?;
             let dims = pane.get_dimensions();
             let nlines = nlines.unwrap_or(dims.viewport_rows);
-            let bottom_row = dims.physical_top + dims.viewport_rows as isize;
-            let top_row = bottom_row.saturating_sub(nlines as isize);
-            let (_first_row, lines) = pane.get_lines(top_row..bottom_row);
+            let range = visible_row_range_for_tail(dims.physical_top, dims.viewport_rows, nlines)?;
+            let (_first_row, lines) = pane.get_lines(range);
             let text = lines_to_escapes(lines).map_err(mlua::Error::external)?;
             Ok(text)
         });
@@ -256,9 +227,9 @@ impl UserData for MuxPane {
                 let pane = this.resolve(&mux)?;
                 let dims = pane.get_dimensions();
                 let nlines = nlines.unwrap_or(dims.viewport_rows);
-                let bottom_row = dims.physical_top + dims.viewport_rows as isize;
-                let top_row = bottom_row.saturating_sub(nlines as isize);
-                let lines = pane.get_logical_lines(top_row..bottom_row);
+                let range =
+                    visible_row_range_for_tail(dims.physical_top, dims.viewport_rows, nlines)?;
+                let lines = pane.get_logical_lines(range);
                 let mut text = String::new();
                 for line in lines {
                     for cell in line.logical.visible_cells() {
