@@ -43,6 +43,17 @@ pub enum SteeringReceiptError {
     /// A negative TTL is nonsensical (time cannot run backwards).
     #[error("steering receipt has a negative ttl_ms ({0})")]
     NegativeTtl(i64),
+    /// The rehearsal score must stay within the documented 0..=1000 range.
+    #[error("steering receipt rehearsal_score {0} exceeds 1000")]
+    RehearsalScoreOutOfRange(u32),
+    /// The stored id does not match the current content binding.
+    #[error("steering receipt id mismatch: found {found}, expected {expected}")]
+    ReceiptIdMismatch {
+        /// Stored id found on the receipt.
+        found: String,
+        /// Id recomputed from the current binding fields.
+        expected: String,
+    },
 }
 
 /// A content-hash-bound record of an admitted steering plan.
@@ -121,18 +132,20 @@ impl SteeringReceipt {
     pub fn canonical_string(&self) -> String {
         let mut approvals = self.required_approvals.clone();
         approvals.sort();
-        format!(
-            "v={};ws={};obj={};mission={};tx={};verdict={};rehearsal={};approvals=[{}]",
-            self.schema_version,
-            self.workspace_id,
-            self.objective,
-            self.mission_contract_hash.as_deref().unwrap_or("none"),
-            self.tx_contract_hash.as_deref().unwrap_or("none"),
-            self.envelope_verdict,
-            self.rehearsal_score
-                .map_or_else(|| "none".to_string(), |s| s.to_string()),
-            approvals.join(","),
-        )
+        [
+            canonical_field("schema_version", &self.schema_version.to_string()),
+            canonical_field("workspace_id", &self.workspace_id),
+            canonical_field("objective", &self.objective),
+            canonical_option_field(
+                "mission_contract_hash",
+                self.mission_contract_hash.as_deref(),
+            ),
+            canonical_option_field("tx_contract_hash", self.tx_contract_hash.as_deref()),
+            canonical_field("envelope_verdict", &self.envelope_verdict),
+            canonical_option_u32_field("rehearsal_score", self.rehearsal_score),
+            canonical_list_field("required_approvals", &approvals),
+        ]
+        .join("|")
     }
 
     /// Compute the content-addressed receipt id from [`Self::canonical_string`].
@@ -171,7 +184,9 @@ impl SteeringReceipt {
     /// loaded from disk or the wire.
     ///
     /// # Errors
-    /// Returns [`SteeringReceiptError`] if the schema is too new or ttl < 0.
+    /// Returns [`SteeringReceiptError`] if the schema is too new, ttl < 0,
+    /// rehearsal score exceeds 1000, or the stored id does not match the current
+    /// content binding.
     pub fn validate(&self) -> Result<(), SteeringReceiptError> {
         if self.schema_version > STEERING_RECEIPT_SCHEMA_VERSION {
             return Err(SteeringReceiptError::UnsupportedSchemaVersion {
@@ -184,8 +199,51 @@ impl SteeringReceipt {
                 return Err(SteeringReceiptError::NegativeTtl(ttl));
             }
         }
+        if let Some(score) = self.rehearsal_score {
+            if score > 1000 {
+                return Err(SteeringReceiptError::RehearsalScoreOutOfRange(score));
+            }
+        }
+        let expected = self.compute_id();
+        if self.receipt_id != expected {
+            return Err(SteeringReceiptError::ReceiptIdMismatch {
+                found: self.receipt_id.clone(),
+                expected,
+            });
+        }
         Ok(())
     }
+}
+
+fn canonical_value(value: &str) -> String {
+    format!("{}:{value}", value.len())
+}
+
+fn canonical_field(label: &str, value: &str) -> String {
+    format!("{label}={}", canonical_value(value))
+}
+
+fn canonical_option_field(label: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("{label}=some:{}", canonical_value(value)),
+        None => format!("{label}=none"),
+    }
+}
+
+fn canonical_option_u32_field(label: &str, value: Option<u32>) -> String {
+    match value {
+        Some(value) => canonical_field(label, &value.to_string()),
+        None => format!("{label}=none"),
+    }
+}
+
+fn canonical_list_field(label: &str, values: &[String]) -> String {
+    let mut output = format!("{label}=list:{}", values.len());
+    for value in values {
+        output.push('|');
+        output.push_str(&canonical_value(value));
+    }
+    output
 }
 
 /// Local SHA-256 hex helper. Kept module-local (matching the per-module pattern
@@ -275,6 +333,35 @@ mod tests {
     }
 
     #[test]
+    fn receipt_id_disambiguates_delimiter_bearing_approvals() {
+        let a = SteeringReceipt::new(
+            "spawn agents",
+            "ws-main",
+            None,
+            None,
+            "envelope.admit",
+            Some(820),
+            vec!["a,b".to_string(), "c".to_string()],
+            1_704_000_000_000,
+            None,
+        );
+        let b = SteeringReceipt::new(
+            "spawn agents",
+            "ws-main",
+            None,
+            None,
+            "envelope.admit",
+            Some(820),
+            vec!["a".to_string(), "b,c".to_string()],
+            1_704_000_000_000,
+            None,
+        );
+
+        assert_ne!(a.canonical_string(), b.canonical_string());
+        assert_ne!(a.receipt_id, b.receipt_id);
+    }
+
+    #[test]
     fn json_round_trip_is_lossless() {
         let m = sample_mission("Refactor pricing");
         let r = sample_receipt(Some(&m), 1_704_000_000_000, Some(60_000));
@@ -316,6 +403,24 @@ mod tests {
         assert!(matches!(
             r.validate(),
             Err(SteeringReceiptError::NegativeTtl(-1))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_score_over_1000_and_id_mismatch() {
+        let m = sample_mission("Refactor pricing");
+        let mut r = sample_receipt(Some(&m), 1_704_000_000_000, Some(60_000));
+        r.rehearsal_score = Some(1001);
+        assert!(matches!(
+            r.validate(),
+            Err(SteeringReceiptError::RehearsalScoreOutOfRange(1001))
+        ));
+
+        r.rehearsal_score = Some(1000);
+        r.receipt_id = "steer:00000000000000000000000000000000".to_string();
+        assert!(matches!(
+            r.validate(),
+            Err(SteeringReceiptError::ReceiptIdMismatch { .. })
         ));
     }
 

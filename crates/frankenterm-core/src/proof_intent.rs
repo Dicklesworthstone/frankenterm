@@ -45,11 +45,11 @@ pub enum ProofScope {
 }
 
 impl ProofScope {
-    /// Stable, separator-free token for the content hash.
+    /// Stable, length-delimited token for the content hash.
     #[must_use]
     fn canonical_token(&self) -> String {
         match self {
-            Self::Package { package } => format!("package:{package}"),
+            Self::Package { package } => format!("package({})", canonical_value(package)),
             Self::Workspace => "workspace".to_string(),
         }
     }
@@ -136,6 +136,14 @@ pub enum ProofIntentError {
     /// The source hash is empty — staleness can never be checked.
     #[error("proof intent has an empty source_hash (staleness uncheckable)")]
     EmptySourceHash,
+    /// The stored id does not match the current content binding.
+    #[error("proof intent id mismatch: found {found}, expected {expected}")]
+    IntentIdMismatch {
+        /// Stored id found on the intent.
+        found: String,
+        /// Id recomputed from the current binding fields.
+        expected: String,
+    },
 }
 
 /// A durable record of an intended-but-deferred proof.
@@ -204,19 +212,22 @@ impl ProofIntent {
     /// Excludes `intent_id` and `created_at_ms`.
     #[must_use]
     pub fn canonical_string(&self) -> String {
-        format!(
-            "v={};cmd={};scope={};kind={};src={};artifact={};remote={};bead={};slot={};redact={}",
-            self.schema_version,
-            self.command,
-            self.scope.canonical_token(),
-            self.kind.as_str(),
-            self.source_hash,
-            self.expected_artifact_path.as_deref().unwrap_or("none"),
-            self.required_remote,
-            self.bead_id.as_deref().unwrap_or("none"),
-            self.attestation_slot.as_deref().unwrap_or("none"),
-            self.redaction_policy.as_str(),
-        )
+        [
+            canonical_field("schema_version", &self.schema_version.to_string()),
+            canonical_field("command", &self.command),
+            canonical_field("scope", &self.scope.canonical_token()),
+            canonical_field("kind", self.kind.as_str()),
+            canonical_field("source_hash", &self.source_hash),
+            canonical_option_field(
+                "expected_artifact_path",
+                self.expected_artifact_path.as_deref(),
+            ),
+            canonical_field("required_remote", &self.required_remote.to_string()),
+            canonical_option_field("bead_id", self.bead_id.as_deref()),
+            canonical_option_field("attestation_slot", self.attestation_slot.as_deref()),
+            canonical_field("redaction_policy", self.redaction_policy.as_str()),
+        ]
+        .join("|")
     }
 
     /// Compute the content-addressed intent id from [`Self::canonical_string`].
@@ -239,7 +250,8 @@ impl ProofIntent {
     ///
     /// # Errors
     /// Returns [`ProofIntentError`] if the schema is too new, the command is
-    /// empty, or the source hash is empty.
+    /// empty, the source hash is empty, or the stored id does not match the
+    /// current content binding.
     pub fn validate(&self) -> Result<(), ProofIntentError> {
         if self.schema_version > PROOF_INTENT_SCHEMA_VERSION {
             return Err(ProofIntentError::UnsupportedSchemaVersion {
@@ -253,7 +265,29 @@ impl ProofIntent {
         if self.source_hash.trim().is_empty() {
             return Err(ProofIntentError::EmptySourceHash);
         }
+        let expected = self.compute_id();
+        if self.intent_id != expected {
+            return Err(ProofIntentError::IntentIdMismatch {
+                found: self.intent_id.clone(),
+                expected,
+            });
+        }
         Ok(())
+    }
+}
+
+fn canonical_value(value: &str) -> String {
+    format!("{}:{value}", value.len())
+}
+
+fn canonical_field(label: &str, value: &str) -> String {
+    format!("{label}={}", canonical_value(value))
+}
+
+fn canonical_option_field(label: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("{label}=some:{}", canonical_value(value)),
+        None => format!("{label}=none"),
     }
 }
 
@@ -318,6 +352,41 @@ mod tests {
     }
 
     #[test]
+    fn intent_id_disambiguates_delimiter_bearing_fields() {
+        let a = ProofIntent::new(
+            "cargo test;scope=package:beta",
+            ProofScope::Package {
+                package: "gamma".to_string(),
+            },
+            ProofKind::Test,
+            "sha256:tree-aaaa",
+            None,
+            true,
+            None,
+            None,
+            ProofRedactionPolicy::Standard,
+            1_704_000_000_000,
+        );
+        let b = ProofIntent::new(
+            "cargo test",
+            ProofScope::Package {
+                package: "beta;scope=package:gamma".to_string(),
+            },
+            ProofKind::Test,
+            "sha256:tree-aaaa",
+            None,
+            true,
+            None,
+            None,
+            ProofRedactionPolicy::Standard,
+            1_704_000_000_000,
+        );
+
+        assert_ne!(a.canonical_string(), b.canonical_string());
+        assert_ne!(a.intent_id, b.intent_id);
+    }
+
+    #[test]
     fn staleness_detection() {
         let p = sample("sha256:tree-aaaa", 1_704_000_000_000);
         assert!(!p.is_stale("sha256:tree-aaaa"), "same tree is not stale");
@@ -356,7 +425,10 @@ mod tests {
         );
         // The top-level proof kind still serializes under `kind` (no collision
         // with the scope discriminator, which is now `type`).
-        assert!(json.contains("\"kind\":\"test\""), "proof kind present: {json}");
+        assert!(
+            json.contains("\"kind\":\"test\""),
+            "proof kind present: {json}"
+        );
         let back: ProofIntent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(ws, back);
         assert_ne!(
@@ -386,6 +458,17 @@ mod tests {
         assert!(matches!(
             p.validate(),
             Err(ProofIntentError::EmptySourceHash)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_id_mismatch() {
+        let mut p = sample("sha256:tree-aaaa", 1_704_000_000_000);
+        p.intent_id = "proof:00000000000000000000000000000000".to_string();
+
+        assert!(matches!(
+            p.validate(),
+            Err(ProofIntentError::IntentIdMismatch { .. })
         ));
     }
 
