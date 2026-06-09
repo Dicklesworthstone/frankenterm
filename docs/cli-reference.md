@@ -314,7 +314,7 @@ Examples:
 Notes:
 - `ft robot help` emits the machine-readable command inventory by default; use `ft robot --format toon help` for the compact TOON form.
 - Distributed panes appear in `state`, `search`, and related persisted-data surfaces, but live `get-text` is intentionally unavailable for them.
-- `ft robot dom` returns live OSC 133 semantic zones. Panes without OSC 133 prompt/input markers return `semantic_data_unavailable=true` instead of guessed command boundaries.
+- `ft robot dom` is the **semantic pane API** — despite the verb name it returns a **flat list** of live OSC 133 semantic zones, **not** a DOM tree (no nesting, parent/child, or root; the envelope has no `children`). Panes without OSC 133 prompt/input markers return `semantic_data_unavailable=true` instead of guessed command boundaries. Full contract: [`docs/robot-contracts/semantic-pane-api.md`](robot-contracts/semantic-pane-api.md).
 - Some NTM-aligned robot families are specialized machine surfaces; they are listed here because they ship, even when most humans stay on the higher-level human CLI.
 
 Policy/redaction:
