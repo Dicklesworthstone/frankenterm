@@ -1,0 +1,96 @@
+{
+  "schema_version": "ft.security.redaction_hygiene.v1",
+  "category": "security/redaction-hygiene",
+  "produced_by_bead": "ft-7h5da.1.5",
+  "generated_at": "2026-06-09T00:00:00Z",
+  "summary": "Redaction-hygiene attestation: the at-rest output corpus is catalog-versioned and sweepable. Each captured segment records the secret-pattern catalog fingerprint in effect at capture (output_segments.redaction_catalog_version, schema v29), and a catalog-aware backfill rewrites stale-catalog secrets with a per-family receipt. Together these make 'is this corpus clean as of catalog vN?' a queryable fact rather than a guess.",
+  "attestation_manifest_slot": {
+    "category": "security/redaction-hygiene",
+    "path": "docs/security/redaction-hygiene.json",
+    "media_type": "application/json",
+    "produced_by_bead": "ft-7h5da.1.5"
+  },
+  "catalog": {
+    "fingerprint": "live-secret-patterns-sha256:d3a987729a34e2903e1b130de9aa698301d5339efdabfd2d2e98c8e5ec5583b1",
+    "fingerprint_algorithm": "sha256 over the ordered secret-pattern family names joined by \"\\n\" (no trailing newline)",
+    "computed_at_runtime_by": "frankenterm_core::redact_backfill::catalog_version()",
+    "reproducible": "sha256 of the `families` list below, joined by newline, must equal `fingerprint`'s hex suffix.",
+    "family_count": 32,
+    "families": [
+      "anthropic_key",
+      "openai_key",
+      "github_token",
+      "github_fine_grained_pat",
+      "gitlab_token",
+      "xai_key",
+      "groq_key",
+      "google_api_key",
+      "google_oauth_token",
+      "huggingface_token",
+      "replicate_token",
+      "anyscale_key",
+      "perplexity_key",
+      "ai_provider_keyed_value",
+      "aws_access_key_id",
+      "aws_secret_key",
+      "bearer_token",
+      "slack_token",
+      "stripe_key",
+      "twilio_account_sid",
+      "sendgrid_key",
+      "datadog_api_key",
+      "database_url",
+      "ssh_private_key",
+      "pgp_block",
+      "jwt_token",
+      "device_code",
+      "oauth_url",
+      "generic_api_key",
+      "generic_token",
+      "generic_password",
+      "generic_secret"
+    ]
+  },
+  "temporal_redaction": {
+    "ingest_stamping": {
+      "since_schema_version": 29,
+      "column": "output_segments.redaction_catalog_version",
+      "stamped_by": "frankenterm_core::redact_backfill::current_catalog_version()",
+      "pre_v29_rows": "NULL = catalog unknown at capture (honest; eligible for backfill)",
+      "produced_by_bead": "ft-7h5da.1.5"
+    },
+    "backfill": {
+      "tool": "ft redact backfill",
+      "engine": "frankenterm_core::redact_backfill::run_redact_backfill",
+      "receipt_location": "maintenance_log table, event_type='redaction_backfill'",
+      "receipt_schema_version": "ft.redact-backfill.v1",
+      "receipt_fields": [
+        "catalog_version",
+        "patterns_checked",
+        "segments_scanned",
+        "segments_rewritten",
+        "family_counts",
+        "last_segment_id",
+        "embeddings_invalidated",
+        "fts_rebuilt"
+      ],
+      "properties": [
+        "idempotent (re-run rewrites zero rows)",
+        "resumable (segment-id cursor)",
+        "derived-store rebuild: output_segments_fts FTS5 + segment_embeddings invalidation"
+      ],
+      "produced_by_bead": "ft-7h5da.1.3"
+    },
+    "purge": {
+      "tool": "ft redact purge --secret-hash",
+      "status": "pending",
+      "tracking_bead": "ft-7h5da.1.4",
+      "note": "Targeted secret-hash purge + tombstones not yet implemented; backfill is the catalog-wide sweep half."
+    }
+  },
+  "coverage_map_reference": "docs/security/redaction-coverage-map.md",
+  "verification": {
+    "claim": "Corpus cleanliness is catalog-versioned and queryable: each new segment carries the catalog version in effect at capture, and each backfill sweep emits a durable receipt recording the catalog fingerprint and per-family rewrite counts.",
+    "not_claimed": "This slot does NOT assert the corpus is currently free of all secrets. It attests that the catalog-version stamping and catalog-aware backfill machinery exist, are wired, and produce catalog-versioned receipts; the as-of-vN cleanliness of a given deployment is answered by querying that deployment's segments and maintenance_log."
+  }
+}

@@ -98,6 +98,14 @@
       "description": "Redactor recall/precision matrix vs gitleaks/trufflehog corpora (G10)."
     },
     {
+      "category": "security/redaction-hygiene",
+      "path": "docs/security/redaction-hygiene.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-7h5da.1.5",
+      "proof_categories": [7, 9],
+      "description": "Temporal redaction hygiene (G10.5): catalog-versioned segment stamping (output_segments.redaction_catalog_version, schema v29) + catalog-aware backfill receipts (maintenance_log event_type='redaction_backfill')."
+    },
+    {
       "category": "security/distributed-threat-model",
       "path": "docs/security/distributed-threat-model.md",
       "media_type": "text/markdown",
