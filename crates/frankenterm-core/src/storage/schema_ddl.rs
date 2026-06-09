@@ -44,7 +44,10 @@
 ///
 /// Per ft-7h5da.8.1: bumped 27 → 28 to gate the durable
 /// `limit_windows` ledger for pane/account rate-limit forecasting.
-pub const SCHEMA_VERSION: i32 = 28;
+///
+/// Per ft-7h5da.1.5: bumped 28 → 29 to stamp `output_segments` with the
+/// redaction catalog version in effect at capture (corpus-hygiene queries).
+pub const SCHEMA_VERSION: i32 = 29;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -131,6 +134,7 @@ CREATE TABLE IF NOT EXISTS output_segments (
     content_len INTEGER NOT NULL,     -- cached length for stats
     content_hash TEXT,                -- for overlap detection (optional)
     captured_at INTEGER NOT NULL,     -- epoch ms
+    redaction_catalog_version TEXT,   -- redaction catalog fingerprint at capture (ft-7h5da.1.5); NULL = unknown
     UNIQUE(pane_id, seq)
 );
 

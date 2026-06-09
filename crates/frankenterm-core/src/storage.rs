@@ -9860,8 +9860,10 @@ fn append_segment_backend(
 
     let row = backend
         .query_row_typed(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        // ft-7h5da.1.5: stamp the redaction catalog version in effect at capture
+        // so corpus cleanliness ("clean as of catalog vN?") is a queryable fact.
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at, redaction_catalog_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          RETURNING id",
         &[
             ToSqlValue::Integer(pane_id_i64),
@@ -9870,6 +9872,7 @@ fn append_segment_backend(
             ToSqlValue::Integer(content_len_i64),
             ToSqlValue::optional_text(content_hash),
             ToSqlValue::Integer(now),
+            ToSqlValue::Text(crate::redact_backfill::current_catalog_version()),
         ],
     )
     .map_err(|e| storage_backend_error("Failed to insert segment", e))?

@@ -32,6 +32,7 @@
 //! case). Cross-segment-split backfill is tracked separately.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,15 @@ pub fn catalog_version() -> String {
     let mut hasher = Sha256::new();
     hasher.update(names.join("\n").as_bytes());
     format!("live-secret-patterns-sha256:{:x}", hasher.finalize())
+}
+
+/// The active catalog fingerprint, computed once and cached. Hot paths — most
+/// importantly segment-append stamping (ft-7h5da.1.5) — call this instead of
+/// recomputing the sha256 over the pattern names on every row.
+#[must_use]
+pub fn current_catalog_version() -> &'static str {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(catalog_version)
 }
 
 fn db_err(context: &str, err: &rusqlite::Error) -> Error {

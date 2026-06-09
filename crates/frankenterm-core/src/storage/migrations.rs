@@ -1578,6 +1578,17 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
              DROP TABLE IF EXISTS limit_windows;",
         ),
     },
+    Migration {
+        version: 29,
+        description: "Stamp output_segments with the redaction catalog version in \
+                      effect at capture, so corpus cleanliness is queryable per \
+                      segment (ft-7h5da.1.5). Existing rows keep NULL = catalog \
+                      unknown at capture.",
+        up_sql: r"
+        ALTER TABLE output_segments ADD COLUMN redaction_catalog_version TEXT;
+        ",
+        down_sql: Some("ALTER TABLE output_segments DROP COLUMN redaction_catalog_version;"),
+    },
 ];
 
 // =============================================================================
@@ -3059,6 +3070,77 @@ mod tests {
         let down = m28.down_sql.expect("down_sql must be supported");
         assert!(down.contains("DROP INDEX IF EXISTS idx_limit_windows_pane_account"));
         assert!(down.contains("DROP TABLE IF EXISTS limit_windows"));
+    }
+
+    #[test]
+    fn redaction_catalog_version_migration_entry_present_at_version_29() {
+        let m29 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 29)
+            .expect("version 29 migration must be registered");
+        assert!(
+            m29.description.contains("redaction catalog version"),
+            "description must reference the redaction catalog version, got: {:?}",
+            m29.description,
+        );
+        assert!(
+            m29.up_sql
+                .contains("ALTER TABLE output_segments ADD COLUMN redaction_catalog_version"),
+            "up_sql must add the redaction_catalog_version column",
+        );
+        let down = m29.down_sql.expect("down_sql must be supported");
+        assert!(down.contains("DROP COLUMN redaction_catalog_version"));
+    }
+
+    /// ft-7h5da.1.5: applying v29 to an output_segments table adds the
+    /// redaction_catalog_version column; the down-rollback removes it.
+    #[test]
+    fn redaction_catalog_version_migration_adds_and_drops_column() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        // Minimal pre-v29 output_segments shape (sufficient to ALTER).
+        conn.execute_batch(
+            "CREATE TABLE output_segments (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                content_len INTEGER NOT NULL,
+                content_hash TEXT,
+                captured_at INTEGER NOT NULL,
+                UNIQUE(pane_id, seq)
+            );",
+        )
+        .expect("base output_segments");
+
+        let m29 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 29)
+            .expect("v29");
+        conn.execute_batch(m29.up_sql).expect("apply v29");
+        assert!(
+            output_segments_has_column(&conn, "redaction_catalog_version"),
+            "column must exist after v29",
+        );
+
+        conn.execute_batch(m29.down_sql.unwrap()).expect("rollback v29");
+        assert!(
+            !output_segments_has_column(&conn, "redaction_catalog_version"),
+            "column must be gone after down-rollback",
+        );
+    }
+
+    fn output_segments_has_column(conn: &rusqlite::Connection, col: &str) -> bool {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('output_segments')")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        names.iter().any(|n| n == col)
     }
 
     /// br-ft-4yr9i: applying the version-25 migration to a fresh
