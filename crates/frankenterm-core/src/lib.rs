@@ -526,6 +526,7 @@ pub mod retry;
 pub mod ring_buffer;
 pub mod robot_api_contracts;
 pub mod robot_checkpoint_state_machine;
+pub mod robot_dom;
 pub mod robot_context_state_machine;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;

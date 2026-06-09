@@ -21334,30 +21334,6 @@ async fn robot_get_semantic_snapshot_on_runtime_task(
         })?
 }
 
-fn robot_dom_zone_from_mux(
-    zone: &frankenterm_core::wezterm::MuxSemanticZone,
-) -> frankenterm_core::robot_types::DomSemanticZone {
-    let semantic_type = match zone.semantic_type {
-        frankenterm_core::wezterm::MuxSemanticZoneKind::Prompt => {
-            frankenterm_core::robot_types::DomSemanticZoneKind::Prompt
-        }
-        frankenterm_core::wezterm::MuxSemanticZoneKind::Input => {
-            frankenterm_core::robot_types::DomSemanticZoneKind::Input
-        }
-        frankenterm_core::wezterm::MuxSemanticZoneKind::Output => {
-            frankenterm_core::robot_types::DomSemanticZoneKind::Output
-        }
-    };
-    frankenterm_core::robot_types::DomSemanticZone {
-        start_y: zone.start_y,
-        start_x: zone.start_x,
-        end_y: zone.end_y,
-        end_x: zone.end_x,
-        semantic_type,
-        text: redact_for_output(&zone.text),
-    }
-}
-
 fn robot_dom_unavailable(
     pane_id: u64,
     query: frankenterm_core::robot_types::DomQueryKind,
@@ -21365,31 +21341,16 @@ fn robot_dom_unavailable(
     zones: Vec<frankenterm_core::robot_types::DomSemanticZone>,
     reason: impl Into<String>,
 ) -> frankenterm_core::robot_types::DomData {
-    frankenterm_core::robot_types::DomData {
+    // ft-7h5da.2.6: single source of truth lives in frankenterm_core::robot_dom
+    // so the robot CLI and the wa.dom MCP tool emit byte-equal envelopes.
+    frankenterm_core::robot_dom::dom_unavailable(
         pane_id,
         query,
-        source: "unavailable".to_string(),
-        confidence: 0.0,
-        semantic_data_unavailable: true,
-        unavailable_reason: Some(redact_for_output(&reason.into())),
         requested_command_index,
         zones,
-        command: None,
-        output: None,
-        exit_code: None,
-    }
-}
-
-fn resolve_robot_dom_command_index(input_count: usize, requested: i64) -> Option<usize> {
-    if input_count == 0 {
-        return None;
-    }
-    if requested == -1 {
-        return input_count.checked_sub(1);
-    }
-    usize::try_from(requested)
-        .ok()
-        .filter(|index| *index < input_count)
+        reason,
+        &frankenterm_core::redactor::Redactor::new(),
+    )
 }
 
 fn build_robot_dom_data(
@@ -21398,159 +21359,15 @@ fn build_robot_dom_data(
     requested_command_index: Option<i64>,
     snapshot: frankenterm_core::wezterm::MuxSemanticSnapshot,
 ) -> frankenterm_core::robot_types::DomData {
-    use frankenterm_core::robot_types::{
-        DomCommandData, DomCommandOutputData, DomData, DomExitCodeData, DomQueryKind,
-        DomSemanticZoneKind,
-    };
-
-    let zones: Vec<_> = snapshot.zones.iter().map(robot_dom_zone_from_mux).collect();
-    let has_osc133_markers = zones.iter().any(|zone| {
-        matches!(
-            zone.semantic_type,
-            DomSemanticZoneKind::Prompt | DomSemanticZoneKind::Input
-        )
-    });
-
-    if !has_osc133_markers {
-        return robot_dom_unavailable(
-            pane_id,
-            query,
-            requested_command_index,
-            Vec::new(),
-            "semantic data unavailable: pane has no OSC 133 prompt/input markers",
-        );
-    }
-
-    let input_positions: Vec<(usize, i64)> = zones
-        .iter()
-        .enumerate()
-        .filter(|(_, zone)| zone.semantic_type == DomSemanticZoneKind::Input)
-        .enumerate()
-        .map(|(command_index, (zone_index, _))| (zone_index, command_index as i64))
-        .collect();
-
-    let mut data = DomData {
+    // ft-7h5da.2.6: delegate to the shared core builder so the robot CLI and the
+    // wa.dom MCP tool produce byte-equal DomData envelopes from one implementation.
+    frankenterm_core::robot_dom::build_dom_data(
         pane_id,
         query,
-        source: "osc133".to_string(),
-        confidence: 1.0,
-        semantic_data_unavailable: false,
-        unavailable_reason: None,
         requested_command_index,
-        zones: zones.clone(),
-        command: None,
-        output: None,
-        exit_code: None,
-    };
-
-    match query {
-        DomQueryKind::Zones => data,
-        DomQueryKind::LastCommand => {
-            let Some((zone_index, command_index)) = input_positions.last().copied() else {
-                return robot_dom_unavailable(
-                    pane_id,
-                    query,
-                    requested_command_index,
-                    zones,
-                    "semantic data unavailable: OSC 133 markers contain no command input zone",
-                );
-            };
-            let zone = zones[zone_index].clone();
-            data.command = Some(DomCommandData {
-                command_index,
-                text: zone.text.clone(),
-                zone,
-            });
-            data
-        }
-        DomQueryKind::OutputOf => {
-            let requested = requested_command_index.unwrap_or(-1);
-            let Some(selected_input_index) =
-                resolve_robot_dom_command_index(input_positions.len(), requested)
-            else {
-                return robot_dom_unavailable(
-                    pane_id,
-                    query,
-                    requested_command_index,
-                    zones,
-                    format!("semantic data unavailable: command index {requested} is out of range"),
-                );
-            };
-            let (input_zone_index, command_index) = input_positions[selected_input_index];
-            let input_zone = zones[input_zone_index].clone();
-            data.command = Some(DomCommandData {
-                command_index,
-                text: input_zone.text.clone(),
-                zone: input_zone,
-            });
-            let output_zone = zones
-                .iter()
-                .skip(input_zone_index + 1)
-                .take_while(|zone| zone.semantic_type != DomSemanticZoneKind::Input)
-                .find(|zone| zone.semantic_type == DomSemanticZoneKind::Output)
-                .cloned();
-            let Some(zone) = output_zone else {
-                return robot_dom_unavailable(
-                    pane_id,
-                    query,
-                    requested_command_index,
-                    zones,
-                    format!(
-                        "semantic data unavailable: command index {command_index} has no output zone"
-                    ),
-                );
-            };
-            data.output = Some(DomCommandOutputData {
-                command_index,
-                text: zone.text.clone(),
-                zone,
-            });
-            data
-        }
-        DomQueryKind::ExitCode => {
-            let requested = requested_command_index.unwrap_or(-1);
-            let selected_input_index =
-                resolve_robot_dom_command_index(input_positions.len(), requested);
-            let command_index = match selected_input_index {
-                Some(index) => input_positions[index].1,
-                None if requested == -1 => -1,
-                None => {
-                    return robot_dom_unavailable(
-                        pane_id,
-                        query,
-                        requested_command_index,
-                        zones,
-                        format!(
-                            "semantic data unavailable: command index {requested} is out of range"
-                        ),
-                    );
-                }
-            };
-            if requested != -1 && selected_input_index != input_positions.len().checked_sub(1) {
-                return robot_dom_unavailable(
-                    pane_id,
-                    query,
-                    requested_command_index,
-                    zones,
-                    "semantic data unavailable: only the latest OSC 133 exit status is retained",
-                );
-            }
-            let Some(code) = snapshot.last_exit_code else {
-                return robot_dom_unavailable(
-                    pane_id,
-                    query,
-                    requested_command_index,
-                    zones,
-                    "semantic data unavailable: pane has no retained OSC 133 exit status",
-                );
-            };
-            data.exit_code = Some(DomExitCodeData {
-                command_index,
-                code,
-            });
-            data
-        }
-    }
+        &snapshot,
+        &frankenterm_core::redactor::Redactor::new(),
+    )
 }
 
 async fn batch_get_pane_text(
