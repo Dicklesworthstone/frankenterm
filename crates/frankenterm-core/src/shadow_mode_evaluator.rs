@@ -26,8 +26,12 @@
 
 use crate::mission_events::{MissionEvent, MissionEventKind};
 use crate::planner_features::{Assignment, AssignmentSet};
+use crate::shadow_experiment_harness::{DivergenceCounts, ExperimentLedger};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Stable schema version for the `ft doctor --json .shadow_mode` block.
+pub const SHADOW_MODE_DOCTOR_SCHEMA_VERSION: &str = "ft.shadow-mode.doctor.v1";
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
@@ -259,6 +263,387 @@ impl ShadowModeMetrics {
             self.current_streak = 0;
         }
     }
+}
+
+// ── Doctor report ───────────────────────────────────────────────────────────
+
+/// Whether a shadow engine is actually receiving live samples in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowModeFeedState {
+    /// The engine is observing live traffic and appending only shadow telemetry.
+    ObservingLiveTraffic,
+    /// The engine is wired and safe, but this doctor pass saw no samples.
+    NoLiveSamples,
+    /// The engine substrate exists, but the live feed is owned by a follow-up phase.
+    DormantNotWired,
+}
+
+impl ShadowModeFeedState {
+    /// Stable string used by plain doctor output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservingLiveTraffic => "observing_live_traffic",
+            Self::NoLiveSamples => "no_live_samples",
+            Self::DormantNotWired => "dormant_not_wired",
+        }
+    }
+}
+
+/// Aggregate doctor status for all shadow-mode engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowModeDoctorStatus {
+    /// At least one engine is receiving live samples.
+    Observing,
+    /// No engines received samples in this doctor process, but at least one substrate is ready.
+    ReadyNoSamples,
+    /// Every listed engine still needs a live-feed wiring pass.
+    DormantNotWired,
+}
+
+impl ShadowModeDoctorStatus {
+    /// Stable string used by plain doctor output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observing => "observing",
+            Self::ReadyNoSamples => "ready_no_samples",
+            Self::DormantNotWired => "dormant_not_wired",
+        }
+    }
+}
+
+/// Per-engine decision/divergence counters emitted by `ft doctor --json`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowModeDecisionCounts {
+    /// Baseline decisions or real dispatches the shadow run compared against.
+    pub baseline_decisions: u64,
+    /// Candidate decisions the shadow engine would have made.
+    pub shadow_decisions: u64,
+    /// Exact baseline-vs-shadow matches.
+    pub matches: u64,
+    /// Safe semantic differences recorded by generic experiment ledgers.
+    pub minor_divergences: u64,
+    /// Outcome-changing differences recorded by generic experiment ledgers.
+    pub major_divergences: u64,
+    /// Mission recommendations that did not appear in execution events.
+    pub missing_executions: u64,
+    /// Mission execution events absent from recommendations.
+    pub unexpected_executions: u64,
+    /// Mission recommendations executed by a different agent.
+    pub agent_divergences: u64,
+    /// Low-confidence recommendations observed by the mission evaluator.
+    pub low_confidence_recommendations: u64,
+}
+
+impl ShadowModeDecisionCounts {
+    /// Total divergences represented by all divergence buckets.
+    #[must_use]
+    pub const fn total_divergences(self) -> u64 {
+        self.minor_divergences
+            .saturating_add(self.major_divergences)
+            .saturating_add(self.missing_executions)
+            .saturating_add(self.unexpected_executions)
+            .saturating_add(self.agent_divergences)
+    }
+
+    fn from_divergence_counts(decisions: u64, counts: DivergenceCounts) -> Self {
+        Self {
+            baseline_decisions: decisions,
+            shadow_decisions: decisions,
+            matches: counts.match_count,
+            minor_divergences: counts.minor_count,
+            major_divergences: counts.major_count,
+            ..Self::default()
+        }
+    }
+}
+
+/// One engine row in the shadow-mode doctor report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowModeEngineDoctorRow {
+    pub engine_id: String,
+    pub display_name: String,
+    pub source_module: String,
+    pub decision_surface: String,
+    pub feed_state: ShadowModeFeedState,
+    pub observe_only: bool,
+    pub production_behavior_changed: bool,
+    pub live_mutation_allowed: bool,
+    pub counts: ShadowModeDecisionCounts,
+    pub sampling_gaps: u64,
+    pub last_cycle_id: Option<u64>,
+    pub pending_reason: Option<String>,
+    pub evidence: Vec<String>,
+}
+
+impl ShadowModeEngineDoctorRow {
+    /// Row for a live or test-owned mission shadow evaluator.
+    #[must_use]
+    pub fn from_mission_evaluator(
+        engine_id: impl Into<String>,
+        display_name: impl Into<String>,
+        evaluator: &ShadowModeEvaluator,
+        pending_reason: Option<String>,
+    ) -> Self {
+        let mut counts = ShadowModeDecisionCounts {
+            baseline_decisions: evaluator.metrics().total_dispatches,
+            shadow_decisions: evaluator.metrics().total_recommendations,
+            ..ShadowModeDecisionCounts::default()
+        };
+        for diff in evaluator.history() {
+            let missing = usize_to_u64(diff.missing_executions.len());
+            let unexpected = usize_to_u64(diff.unexpected_executions.len());
+            let agent = usize_to_u64(diff.agent_divergences.len());
+            counts.missing_executions = counts.missing_executions.saturating_add(missing);
+            counts.unexpected_executions = counts.unexpected_executions.saturating_add(unexpected);
+            counts.agent_divergences = counts.agent_divergences.saturating_add(agent);
+            counts.low_confidence_recommendations = counts
+                .low_confidence_recommendations
+                .saturating_add(usize_to_u64(diff.low_confidence_recommendations));
+
+            let matched = diff
+                .emissions_count
+                .saturating_sub(diff.unexpected_executions.len())
+                .saturating_sub(diff.agent_divergences.len());
+            counts.matches = counts.matches.saturating_add(usize_to_u64(matched));
+        }
+
+        Self {
+            engine_id: engine_id.into(),
+            display_name: display_name.into(),
+            source_module: "shadow_mode_evaluator".to_string(),
+            decision_surface: "MissionLoop AssignmentSet vs MissionEventLog".to_string(),
+            feed_state: if evaluator.total_cycles() == 0 {
+                ShadowModeFeedState::NoLiveSamples
+            } else {
+                ShadowModeFeedState::ObservingLiveTraffic
+            },
+            observe_only: true,
+            production_behavior_changed: false,
+            live_mutation_allowed: false,
+            counts,
+            sampling_gaps: 0,
+            last_cycle_id: evaluator.last_diff().map(|diff| diff.cycle_id),
+            pending_reason,
+            evidence: vec!["crates/frankenterm-core/src/shadow_mode_evaluator.rs".to_string()],
+        }
+    }
+
+    /// Row for a generic shadow-experiment ledger.
+    #[must_use]
+    pub fn from_experiment_ledger(
+        engine_id: impl Into<String>,
+        display_name: impl Into<String>,
+        source_module: impl Into<String>,
+        decision_surface: impl Into<String>,
+        ledger: &ExperimentLedger,
+        feed_state: ShadowModeFeedState,
+        pending_reason: Option<String>,
+    ) -> Self {
+        let decisions = usize_to_u64(ledger.decisions.len());
+        Self {
+            engine_id: engine_id.into(),
+            display_name: display_name.into(),
+            source_module: source_module.into(),
+            decision_surface: decision_surface.into(),
+            feed_state,
+            observe_only: true,
+            production_behavior_changed: false,
+            live_mutation_allowed: false,
+            counts: ShadowModeDecisionCounts::from_divergence_counts(
+                decisions,
+                ledger.divergence_counts(),
+            ),
+            sampling_gaps: ledger.sampling_gaps,
+            last_cycle_id: None,
+            pending_reason,
+            evidence: vec!["crates/frankenterm-core/src/shadow_experiment_harness.rs".to_string()],
+        }
+    }
+
+    /// Row for a known engine whose observe-only live feed has not landed yet.
+    #[must_use]
+    pub fn dormant(
+        engine_id: impl Into<String>,
+        display_name: impl Into<String>,
+        source_module: impl Into<String>,
+        decision_surface: impl Into<String>,
+        pending_reason: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            engine_id: engine_id.into(),
+            display_name: display_name.into(),
+            source_module: source_module.into(),
+            decision_surface: decision_surface.into(),
+            feed_state: ShadowModeFeedState::DormantNotWired,
+            observe_only: true,
+            production_behavior_changed: false,
+            live_mutation_allowed: false,
+            counts: ShadowModeDecisionCounts::default(),
+            sampling_gaps: 0,
+            last_cycle_id: None,
+            pending_reason: Some(pending_reason.into()),
+            evidence: vec![evidence.into()],
+        }
+    }
+}
+
+/// Aggregate counts across all shadow-mode doctor rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowModeDoctorTotals {
+    pub engines_total: u64,
+    pub engines_observing_live_traffic: u64,
+    pub engines_ready_without_samples: u64,
+    pub engines_dormant_not_wired: u64,
+    pub baseline_decisions: u64,
+    pub shadow_decisions: u64,
+    pub matches: u64,
+    pub total_divergences: u64,
+    pub sampling_gaps: u64,
+}
+
+impl ShadowModeDoctorTotals {
+    fn from_rows(rows: &[ShadowModeEngineDoctorRow]) -> Self {
+        let mut totals = Self {
+            engines_total: usize_to_u64(rows.len()),
+            ..Self::default()
+        };
+        for row in rows {
+            match row.feed_state {
+                ShadowModeFeedState::ObservingLiveTraffic => {
+                    totals.engines_observing_live_traffic =
+                        totals.engines_observing_live_traffic.saturating_add(1);
+                }
+                ShadowModeFeedState::NoLiveSamples => {
+                    totals.engines_ready_without_samples =
+                        totals.engines_ready_without_samples.saturating_add(1);
+                }
+                ShadowModeFeedState::DormantNotWired => {
+                    totals.engines_dormant_not_wired =
+                        totals.engines_dormant_not_wired.saturating_add(1);
+                }
+            }
+            totals.baseline_decisions = totals
+                .baseline_decisions
+                .saturating_add(row.counts.baseline_decisions);
+            totals.shadow_decisions = totals
+                .shadow_decisions
+                .saturating_add(row.counts.shadow_decisions);
+            totals.matches = totals.matches.saturating_add(row.counts.matches);
+            totals.total_divergences = totals
+                .total_divergences
+                .saturating_add(row.counts.total_divergences());
+            totals.sampling_gaps = totals.sampling_gaps.saturating_add(row.sampling_gaps);
+        }
+        totals
+    }
+}
+
+/// Stable `ft doctor --json .shadow_mode` report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowModeDoctorReport {
+    pub schema_version: String,
+    pub status: ShadowModeDoctorStatus,
+    pub observe_only: bool,
+    pub production_behavior_changed: bool,
+    pub live_mutation_allowed: bool,
+    pub totals: ShadowModeDoctorTotals,
+    pub engines: Vec<ShadowModeEngineDoctorRow>,
+}
+
+impl ShadowModeDoctorReport {
+    /// Build a report from explicit per-engine rows.
+    #[must_use]
+    pub fn from_engines(engines: Vec<ShadowModeEngineDoctorRow>) -> Self {
+        let totals = ShadowModeDoctorTotals::from_rows(&engines);
+        let status = if totals.engines_observing_live_traffic > 0 {
+            ShadowModeDoctorStatus::Observing
+        } else if totals.engines_ready_without_samples > 0 {
+            ShadowModeDoctorStatus::ReadyNoSamples
+        } else {
+            ShadowModeDoctorStatus::DormantNotWired
+        };
+        Self {
+            schema_version: SHADOW_MODE_DOCTOR_SCHEMA_VERSION.to_string(),
+            status,
+            observe_only: true,
+            production_behavior_changed: false,
+            live_mutation_allowed: false,
+            totals,
+            engines,
+        }
+    }
+}
+
+/// Build the standalone CLI doctor report.
+///
+/// The CLI process is read-only and does not own live MissionLoop or watcher
+/// state. The report therefore exposes honest zero-count rows for ready
+/// substrates and explicit `dormant_not_wired` rows for W4 follow-up engines.
+#[must_use]
+pub fn shadow_mode_doctor_report() -> ShadowModeDoctorReport {
+    let mission_evaluator = ShadowModeEvaluator::with_defaults();
+    let mut rows = vec![ShadowModeEngineDoctorRow::from_mission_evaluator(
+        "mission_loop_assignments",
+        "Mission assignment shadow evaluator",
+        &mission_evaluator,
+        Some("standalone ft doctor has no live MissionLoop sample stream yet".to_string()),
+    )];
+
+    rows.push(ShadowModeEngineDoctorRow {
+        engine_id: "generic_shadow_experiments".to_string(),
+        display_name: "Generic shadow experiment harness".to_string(),
+        source_module: "shadow_experiment_harness".to_string(),
+        decision_surface: "baseline vs candidate decision ledgers".to_string(),
+        feed_state: ShadowModeFeedState::NoLiveSamples,
+        observe_only: true,
+        production_behavior_changed: false,
+        live_mutation_allowed: false,
+        counts: ShadowModeDecisionCounts::default(),
+        sampling_gaps: 0,
+        last_cycle_id: None,
+        pending_reason: Some(
+            "no live experiment ledger was supplied to this doctor process".to_string(),
+        ),
+        evidence: vec!["crates/frankenterm-core/src/shadow_experiment_harness.rs".to_string()],
+    });
+
+    rows.extend([
+        ShadowModeEngineDoctorRow::dormant(
+            "bocpd_change_points",
+            "BOCPD change-point detector",
+            "bocpd",
+            "watcher detect-stage pane-output regime changes",
+            "W4.2 must wire BOCPD into the live watcher detect stage before counts become non-zero",
+            "crates/frankenterm-core/src/bocpd.rs",
+        ),
+        ShadowModeEngineDoctorRow::dormant(
+            "connector_reliability_governor",
+            "Connector reliability and quota governor",
+            "connector_governor",
+            "outbound connector dispatch decisions",
+            "W4.3 must run connector governor decisions beside dispatch before divergence can be measured",
+            "crates/frankenterm-core/src/connector_governor.rs",
+        ),
+        ShadowModeEngineDoctorRow::dormant(
+            "capacity_governor_admission",
+            "Capacity governor admission",
+            "swarm_scheduler",
+            "resource-pressure admission and quality decisions",
+            "W4.4 must route capacity-governor dry-run decisions into the operating envelope actuator",
+            "crates/frankenterm-core/src/swarm_scheduler.rs",
+        ),
+    ]);
+
+    ShadowModeDoctorReport::from_engines(rows)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 // ── Evaluator ───────────────────────────────────────────────────────────────
@@ -603,6 +988,10 @@ fn compute_diff(
 mod tests {
     use super::*;
     use crate::planner_features::{RejectedCandidate, SolverConfig};
+    use crate::shadow_experiment_harness::{
+        DivergenceKind, ExperimentBudget, ExperimentManifest, ShadowDecisionPair,
+        ShadowExperimentHarness,
+    };
     use proptest::prelude::*;
 
     fn make_assignment(bead_id: &str, agent_id: &str, score: f64, rank: usize) -> Assignment {
@@ -702,6 +1091,110 @@ mod tests {
             .correlation("corr-1")
             .labels("workspace", "track"),
         );
+    }
+
+    fn experiment_manifest() -> ExperimentManifest {
+        ExperimentManifest {
+            experiment_id: "exp-shadow-doctor".to_string(),
+            baseline_label: "baseline".to_string(),
+            candidate_label: "candidate".to_string(),
+            budget: ExperimentBudget::conservative(),
+            redaction_policy_version: "redaction-v1".to_string(),
+        }
+    }
+
+    fn shadow_pair(
+        event_id: &str,
+        divergence: DivergenceKind,
+        overhead_us: u64,
+    ) -> ShadowDecisionPair {
+        ShadowDecisionPair {
+            event_id: event_id.to_string(),
+            baseline_decision: "baseline:allow".to_string(),
+            candidate_decision: "candidate:allow".to_string(),
+            divergence,
+            overhead_us,
+            evidence_citations: vec![format!("event:{event_id}")],
+        }
+    }
+
+    #[test]
+    fn shadow_mode_doctor_report_lists_engines_without_mutation() {
+        let report = shadow_mode_doctor_report();
+
+        assert_eq!(report.schema_version, SHADOW_MODE_DOCTOR_SCHEMA_VERSION);
+        assert_eq!(report.status, ShadowModeDoctorStatus::ReadyNoSamples);
+        assert!(report.observe_only);
+        assert!(!report.live_mutation_allowed);
+        assert!(!report.production_behavior_changed);
+        assert_eq!(report.totals.engines_total, 5);
+        assert_eq!(report.totals.shadow_decisions, 0);
+        assert_eq!(report.totals.total_divergences, 0);
+        assert!(
+            report
+                .engines
+                .iter()
+                .any(|engine| engine.engine_id == "bocpd_change_points"
+                    && engine.feed_state == ShadowModeFeedState::DormantNotWired)
+        );
+        assert!(report.engines.iter().all(|engine| engine.observe_only
+            && !engine.live_mutation_allowed
+            && !engine.production_behavior_changed));
+    }
+
+    #[test]
+    fn shadow_mode_doctor_row_summarizes_mission_evaluator_counts() {
+        let mut eval = ShadowModeEvaluator::with_defaults();
+        let recs = make_assignment_set(vec![
+            make_assignment("b1", "a1", 0.9, 1),
+            make_assignment("b2", "a2", 0.2, 2),
+        ]);
+        let mut log = make_log();
+        emit_dispatch(&mut log, 1, "b1", "a-other");
+        emit_dispatch(&mut log, 1, "b-extra", "a3");
+
+        eval.evaluate_cycle(1, 1000, &recs, log.events());
+        let row =
+            ShadowModeEngineDoctorRow::from_mission_evaluator("mission", "Mission", &eval, None);
+
+        assert_eq!(row.feed_state, ShadowModeFeedState::ObservingLiveTraffic);
+        assert_eq!(row.counts.shadow_decisions, 2);
+        assert_eq!(row.counts.baseline_decisions, 2);
+        assert_eq!(row.counts.matches, 0);
+        assert_eq!(row.counts.missing_executions, 1);
+        assert_eq!(row.counts.unexpected_executions, 1);
+        assert_eq!(row.counts.agent_divergences, 1);
+        assert_eq!(row.counts.low_confidence_recommendations, 1);
+        assert_eq!(row.counts.total_divergences(), 3);
+        assert_eq!(row.last_cycle_id, Some(1));
+    }
+
+    #[test]
+    fn shadow_mode_doctor_report_summarizes_experiment_ledger_counts() {
+        let mut harness = ShadowExperimentHarness::new(experiment_manifest());
+        assert!(harness.record_pair(shadow_pair("e1", DivergenceKind::Match, 10)));
+        assert!(harness.record_pair(shadow_pair("e2", DivergenceKind::Minor, 10)));
+        assert!(harness.record_pair(shadow_pair("e3", DivergenceKind::Major, 10)));
+
+        let row = ShadowModeEngineDoctorRow::from_experiment_ledger(
+            "experiment",
+            "Experiment",
+            "shadow_experiment_harness",
+            "baseline vs candidate",
+            harness.ledger(),
+            ShadowModeFeedState::ObservingLiveTraffic,
+            None,
+        );
+        let report = ShadowModeDoctorReport::from_engines(vec![row]);
+
+        assert_eq!(report.status, ShadowModeDoctorStatus::Observing);
+        assert_eq!(report.totals.engines_observing_live_traffic, 1);
+        assert_eq!(report.totals.shadow_decisions, 3);
+        assert_eq!(report.totals.baseline_decisions, 3);
+        assert_eq!(report.totals.matches, 1);
+        assert_eq!(report.totals.total_divergences, 2);
+        assert_eq!(report.engines[0].counts.minor_divergences, 1);
+        assert_eq!(report.engines[0].counts.major_divergences, 1);
     }
 
     // ── Perfect match tests ─────────────────────────────────────────────
