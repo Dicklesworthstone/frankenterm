@@ -43,6 +43,8 @@ pub enum ApiSurface {
     SendText,
     /// state — pane state listing.
     PaneState,
+    /// dom — live OSC 133 semantic-zone queries.
+    Dom,
 
     // Search
     /// search — full-text and semantic search.
@@ -140,6 +142,7 @@ impl ApiSurface {
         Self::BatchGetText,
         Self::SendText,
         Self::PaneState,
+        Self::Dom,
         Self::Search,
         Self::SearchExplain,
         Self::SearchPipelineStatus,
@@ -182,6 +185,7 @@ impl ApiSurface {
             Self::BatchGetText => "batch-get-text",
             Self::SendText => "send-text",
             Self::PaneState => "state",
+            Self::Dom => "dom",
             Self::Search => "search",
             Self::SearchExplain => "search-explain",
             Self::SearchPipelineStatus => "search-pipeline-status",
@@ -256,7 +260,9 @@ impl ApiSurface {
     #[must_use]
     pub fn category(&self) -> &'static str {
         match self {
-            Self::GetText | Self::BatchGetText | Self::SendText | Self::PaneState => "pane",
+            Self::GetText | Self::BatchGetText | Self::SendText | Self::PaneState | Self::Dom => {
+                "pane"
+            }
             Self::Search | Self::SearchExplain | Self::SearchPipelineStatus => "search",
             Self::Events | Self::EventsMutate => "events",
             Self::WorkflowRun | Self::WorkflowList | Self::WorkflowStatus | Self::WorkflowAbort => {
@@ -994,6 +1000,21 @@ pub fn standard_contract_matrix() -> ContractMatrix {
             "state response has pane list with required fields",
         )
         .with_required_fields(&["panes", "tail_lines"]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "schema-dom",
+            ApiSurface::Dom,
+            CheckCategory::SchemaStability,
+            "dom response has explicit semantic availability fields",
+        )
+        .with_required_fields(&[
+            "pane_id",
+            "source",
+            "confidence",
+            "semantic_data_unavailable",
+            "zones",
+        ]),
     );
     matrix.register(
         ContractCheck::new(

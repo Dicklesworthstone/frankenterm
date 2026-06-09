@@ -619,6 +619,7 @@ pub mod status_bar;
 pub mod steering;
 pub mod storage;
 pub mod storage_backend_cells;
+pub mod verified_submit;
 // br-ft-kcdqp: stub StorageBackend implementation under the
 // `frankensqlite-backend` feature. Compile-time scaffold awaiting
 // frankensqlite Phase 5+ release; readiness tracked by

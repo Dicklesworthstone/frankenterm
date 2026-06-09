@@ -1,0 +1,38 @@
+{
+  "profile_id": "claude_code.default",
+  "agent_type": "claude_code",
+  "covered_states": [
+    "composer_nonempty",
+    "composer_cleared",
+    "working_state",
+    "queued_behind_operation",
+    "crash_to_shell"
+  ],
+  "samples": {
+    "composer_nonempty": [
+      ">",
+      "shift+enter",
+      "Press Enter to send"
+    ],
+    "composer_cleared": [
+      "Thinking",
+      "Using tool",
+      "Tool call:"
+    ],
+    "working_state": [
+      "Thinking",
+      "Using tool",
+      "Executing:"
+    ],
+    "queued_behind_operation": [
+      "Approve?",
+      "Allow?",
+      "Permission"
+    ],
+    "crash_to_shell": [
+      "Traceback (most recent call last)",
+      "thread 'main' panicked",
+      "Session ended"
+    ]
+  }
+}

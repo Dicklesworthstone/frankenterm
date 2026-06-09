@@ -1090,24 +1090,27 @@ fn send_schema_has_expected_fields() {
         let names: Vec<&str> = doc.properties.iter().map(|p| p.name.as_str()).collect();
 
         assert!(names.contains(&"pane_id"), "send missing pane_id");
-        assert!(names.contains(&"sent"), "send missing sent");
-        assert!(
-            names.contains(&"policy_decision"),
-            "send missing policy_decision"
-        );
+        assert!(names.contains(&"injection"), "send missing injection");
+        assert!(names.contains(&"submit"), "send missing submit receipt");
 
         // Required fields should be marked required
         let pane_id = doc.properties.iter().find(|p| p.name == "pane_id").unwrap();
         assert!(pane_id.required, "pane_id should be required");
 
-        let policy = doc
+        let injection = doc
             .properties
             .iter()
-            .find(|p| p.name == "policy_decision")
+            .find(|p| p.name == "injection")
             .unwrap();
         assert!(
-            !policy.enum_values.is_empty(),
-            "policy_decision should have enum values"
+            injection.required,
+            "injection should be required for live send responses"
+        );
+        assert!(
+            doc.definitions
+                .iter()
+                .any(|(name, _)| name == "submit_receipt"),
+            "send missing submit_receipt definition"
         );
     }
 }

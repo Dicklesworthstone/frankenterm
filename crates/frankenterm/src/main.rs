@@ -3125,6 +3125,12 @@ enum RobotCommands {
         escapes: bool,
     },
 
+    /// Query live OSC 133 semantic zones for a pane
+    Dom {
+        #[command(subcommand)]
+        command: RobotDomCommands,
+    },
+
     /// Evaluate semantic anomaly z-score for a pane's recent output
     EvaluateAnomaly {
         /// Target pane ID
@@ -3396,6 +3402,21 @@ enum RobotCommands {
         /// Swarm session name passed to the fallback producer
         #[arg(default_value = "frankenterm")]
         session: String,
+    },
+
+    /// List retained Agent Mail fallback outbox entries and replay state
+    #[command(
+        name = "agent-mail-outbox",
+        visible_aliases = ["agent_mail_outbox", "mail-outbox", "outbox"]
+    )]
+    AgentMailOutbox {
+        /// Manifest containing retained outbox entry paths
+        #[arg(long, value_name = "PATH")]
+        manifest: Option<PathBuf>,
+
+        /// Additional retained outbox entry JSON file; repeatable
+        #[arg(long = "entry", value_name = "PATH")]
+        entries: Vec<PathBuf>,
     },
 
     /// Emit read-only blocker radar across mail, Beads, git, RCH, and CI evidence
@@ -4096,6 +4117,77 @@ enum RobotAgentsCommands {
         #[arg(long, value_enum, default_value_t = RobotAgentConfigScope::Project)]
         scope: RobotAgentConfigScope,
     },
+}
+
+#[derive(Subcommand)]
+#[command(disable_help_subcommand = true)]
+enum RobotDomCommands {
+    /// Return all retained semantic zones for a pane
+    Zones {
+        /// Pane ID
+        pane_id: u64,
+    },
+    /// Return the latest command input zone
+    LastCommand {
+        /// Pane ID
+        pane_id: u64,
+    },
+    /// Return output for a command input zone
+    OutputOf {
+        /// Pane ID
+        pane_id: u64,
+
+        /// Command index; -1 selects the latest command
+        #[arg(long, default_value_t = -1)]
+        command_index: i64,
+    },
+    /// Return the retained OSC 133 exit status
+    ExitCode {
+        /// Pane ID
+        pane_id: u64,
+
+        /// Command index; -1 selects the latest command
+        #[arg(long, default_value_t = -1)]
+        command_index: i64,
+    },
+}
+
+impl RobotDomCommands {
+    fn pane_id(&self) -> u64 {
+        match self {
+            Self::Zones { pane_id }
+            | Self::LastCommand { pane_id }
+            | Self::OutputOf { pane_id, .. }
+            | Self::ExitCode { pane_id, .. } => *pane_id,
+        }
+    }
+
+    fn query_kind(&self) -> frankenterm_core::robot_types::DomQueryKind {
+        match self {
+            Self::Zones { .. } => frankenterm_core::robot_types::DomQueryKind::Zones,
+            Self::LastCommand { .. } => frankenterm_core::robot_types::DomQueryKind::LastCommand,
+            Self::OutputOf { .. } => frankenterm_core::robot_types::DomQueryKind::OutputOf,
+            Self::ExitCode { .. } => frankenterm_core::robot_types::DomQueryKind::ExitCode,
+        }
+    }
+
+    fn command_index(&self) -> Option<i64> {
+        match self {
+            Self::OutputOf { command_index, .. } | Self::ExitCode { command_index, .. } => {
+                Some(*command_index)
+            }
+            Self::Zones { .. } | Self::LastCommand { .. } => None,
+        }
+    }
+
+    fn command_name(&self) -> &'static str {
+        match self {
+            Self::Zones { .. } => "zones",
+            Self::LastCommand { .. } => "last-command",
+            Self::OutputOf { .. } => "output-of",
+            Self::ExitCode { .. } => "exit-code",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -5876,6 +5968,7 @@ const ROBOT_ERR_WORK_ITEM_CONFLICT: &str = "robot.work_item_conflict";
 const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
 const ROBOT_ERR_RESOURCE_WHAT_IF: &str = "robot.resource.what_if_error";
 const ROBOT_ERR_COORDINATION_RISK: &str = "robot.coordination_risk_unavailable";
+const ROBOT_ERR_AGENT_MAIL_OUTBOX: &str = "robot.agent_mail_outbox_unavailable";
 const ROBOT_ERR_INCIDENT_NOT_FOUND: &str = "robot.incident.not_found";
 const ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE: &str = "robot.incident.source_unavailable";
 const ROBOT_ERR_INCIDENT_DAG: &str = "robot.incident.dag_error";
@@ -9517,6 +9610,8 @@ struct RobotSendData {
     wait_for: Option<RobotWaitForData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submit: Option<frankenterm_core::robot_types::SubmitReceipt>,
 }
 
 /// Human send response data (stable JSON when non-TTY)
@@ -9528,8 +9623,249 @@ struct HumanSendData {
     wait_for: Option<RobotWaitForData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submit: Option<frankenterm_core::robot_types::SubmitReceipt>,
     no_paste: bool,
     no_newline: bool,
+}
+
+fn send_submit_rule_ids(injection: &frankenterm_core::policy::InjectionResult) -> Vec<String> {
+    use frankenterm_core::policy::InjectionResult;
+
+    let rule_id = match injection {
+        InjectionResult::Allowed { decision, .. }
+        | InjectionResult::Denied { decision, .. }
+        | InjectionResult::RequiresApproval { decision, .. }
+        | InjectionResult::Error { decision, .. } => decision.rule_id(),
+    };
+    rule_id.map(str::to_string).into_iter().collect()
+}
+
+fn send_submit_state(
+    injection: &frankenterm_core::policy::InjectionResult,
+    verification_report: Option<&frankenterm_core::verified_submit::VerifiedSubmitReport>,
+) -> frankenterm_core::robot_types::SubmitReceiptState {
+    use frankenterm_core::policy::InjectionResult;
+    use frankenterm_core::robot_types::SubmitReceiptState;
+
+    match injection {
+        InjectionResult::Allowed { .. } => {
+            verification_report.map_or(SubmitReceiptState::Submitted, |report| report.state)
+        }
+        InjectionResult::Denied { .. } => SubmitReceiptState::PolicyDenied,
+        InjectionResult::RequiresApproval { .. } => SubmitReceiptState::RequiresApproval,
+        InjectionResult::Error { .. } => SubmitReceiptState::SendFailed,
+    }
+}
+
+fn merge_send_submit_evidence_rule_ids(
+    injection: &frankenterm_core::policy::InjectionResult,
+    verification_report: Option<&frankenterm_core::verified_submit::VerifiedSubmitReport>,
+) -> Vec<String> {
+    let mut evidence_rule_ids = send_submit_rule_ids(injection);
+    if let Some(report) = verification_report {
+        evidence_rule_ids.extend(report.evidence_rule_ids.iter().cloned());
+    }
+    evidence_rule_ids.sort();
+    evidence_rule_ids.dedup();
+    evidence_rule_ids
+}
+
+fn build_send_submit_receipt(
+    pane_id: u64,
+    text: &str,
+    injection: &frankenterm_core::policy::InjectionResult,
+    wait_for: Option<&RobotWaitForData>,
+    verification_report: Option<&frankenterm_core::verified_submit::VerifiedSubmitReport>,
+    elapsed_ms: u64,
+) -> frankenterm_core::robot_types::SubmitReceipt {
+    frankenterm_core::robot_types::SubmitReceipt {
+        state: send_submit_state(injection, verification_report),
+        agent_type: verification_report.and_then(|report| report.agent_type.clone()),
+        profile_id: verification_report.and_then(|report| report.profile_id.clone()),
+        profile_version: verification_report.and_then(|report| report.profile_version.clone()),
+        attempts: verification_report.map_or(1, |report| report.attempts),
+        evidence_rule_ids: merge_send_submit_evidence_rule_ids(injection, verification_report),
+        elapsed_ms,
+        polls: verification_report.map_or_else(
+            || wait_for.map_or(0, |data| data.polls),
+            |report| report.polls,
+        ),
+        cursor_before: verification_report.and_then(|report| report.cursor_before.clone()),
+        cursor_after: verification_report.and_then(|report| report.cursor_after.clone()),
+        idempotency_key: frankenterm_core::robot_idempotency::send_text_key(pane_id, text)
+            .to_string(),
+    }
+}
+
+fn infer_send_submit_agent_type(
+    pane_info: &frankenterm_core::wezterm::PaneInfo,
+) -> frankenterm_core::patterns::AgentType {
+    let mut correlator = frankenterm_core::agent_correlator::AgentCorrelator::new();
+    correlator.update_from_pane_info(pane_info);
+    if let Some(entry) = correlator.inventory().running.get(&pane_info.pane_id) {
+        let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
+        let agent_type = provider.to_agent_type();
+        if agent_type != frankenterm_core::patterns::AgentType::Unknown {
+            return agent_type;
+        }
+    }
+    frankenterm_core::sharding::infer_agent_type(pane_info)
+}
+
+fn load_send_submit_profile(
+    config: &frankenterm_core::config::Config,
+    resolved_config_path: Option<&Path>,
+    agent_type: frankenterm_core::patterns::AgentType,
+) -> Option<frankenterm_core::patterns::SubmitProfile> {
+    if matches!(
+        agent_type,
+        frankenterm_core::patterns::AgentType::Unknown
+            | frankenterm_core::patterns::AgentType::Wezterm
+    ) {
+        return None;
+    }
+
+    let patterns_root = resolved_config_path.and_then(Path::parent);
+    match frankenterm_core::patterns::PatternEngine::from_config_with_root(
+        &config.patterns,
+        patterns_root,
+    ) {
+        Ok(engine) => engine.submit_profile_for_agent(agent_type).cloned(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %agent_type,
+                "Failed to load submit profile pattern engine; verified-submit will fail open"
+            );
+            None
+        }
+    }
+}
+
+async fn capture_send_submit_text(
+    wezterm: &frankenterm_core::wezterm::WeztermHandle,
+    cx: &frankenterm_core::cx::Cx,
+    pane_id: u64,
+) -> Option<String> {
+    match wezterm.get_text_with_cx(cx, pane_id, false).await {
+        Ok(text) => Some(text),
+        Err(error) => {
+            tracing::debug!(
+                pane_id,
+                %error,
+                "Verified-submit text capture unavailable"
+            );
+            None
+        }
+    }
+}
+
+async fn capture_send_submit_semantic_snapshot(
+    wezterm: &frankenterm_core::wezterm::WeztermHandle,
+    cx: &frankenterm_core::cx::Cx,
+    pane_id: u64,
+) -> Option<frankenterm_core::wezterm::MuxSemanticSnapshot> {
+    match wezterm.get_semantic_zones_with_cx(cx, pane_id).await {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            tracing::debug!(
+                pane_id,
+                %error,
+                "Verified-submit semantic capture unavailable"
+            );
+            None
+        }
+    }
+}
+
+async fn classify_send_submit_after_send(
+    wezterm: &frankenterm_core::wezterm::WeztermHandle,
+    cx: &frankenterm_core::cx::Cx,
+    pane_id: u64,
+    text: &str,
+    agent_type: frankenterm_core::patterns::AgentType,
+    submit_profile: Option<&frankenterm_core::patterns::SubmitProfile>,
+    before_text: Option<&str>,
+    attempts: u32,
+    polls: usize,
+) -> frankenterm_core::verified_submit::VerifiedSubmitReport {
+    let (after_text, after_semantic_snapshot) = if submit_profile.is_some() {
+        let _ = frankenterm_core::runtime_async::sleep_with_cx(
+            cx,
+            std::time::Duration::from_millis(120),
+        )
+        .await;
+        let after_text = capture_send_submit_text(wezterm, cx, pane_id).await;
+        let after_semantic_snapshot =
+            capture_send_submit_semantic_snapshot(wezterm, cx, pane_id).await;
+        (after_text, after_semantic_snapshot)
+    } else {
+        (None, None)
+    };
+
+    frankenterm_core::verified_submit::classify_verified_submit(
+        frankenterm_core::verified_submit::VerifiedSubmitInput {
+            pane_id,
+            command_text: text,
+            agent_type,
+            profile: submit_profile,
+            before_text,
+            after_text: after_text.as_deref(),
+            after_semantic_snapshot: after_semantic_snapshot.as_ref(),
+            attempts,
+            polls,
+        },
+    )
+}
+
+fn attach_send_submit_receipt_to_audit_record(
+    audit_record: &mut frankenterm_core::storage::AuditActionRecord,
+    receipt: &frankenterm_core::robot_types::SubmitReceipt,
+) {
+    audit_record.correlation_id = Some(receipt.idempotency_key.clone());
+    match serde_json::to_string(receipt) {
+        Ok(json) => audit_record.verification_summary = Some(json),
+        Err(error) => {
+            tracing::warn!(%error, "Failed to serialize send submit receipt for audit");
+        }
+    }
+}
+
+#[cfg(test)]
+async fn get_send_submit_receipt_by_idempotency_key(
+    storage: &frankenterm_core::storage::StorageHandle,
+    idempotency_key: &str,
+) -> anyhow::Result<Option<frankenterm_core::robot_types::SubmitReceipt>> {
+    use anyhow::Context as _;
+
+    let query = frankenterm_core::storage::AuditQuery {
+        correlation_id: Some(idempotency_key.to_string()),
+        action_kind: Some("send_text".to_string()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let rows = storage
+        .get_audit_actions_with_cx(&storage_cx, query)
+        .await
+        .with_context(|| format!("querying send submit receipt `{idempotency_key}`"))?;
+
+    for row in rows {
+        let Some(raw_receipt) = row.verification_summary.as_deref() else {
+            continue;
+        };
+        let receipt: frankenterm_core::robot_types::SubmitReceipt =
+            serde_json::from_str(raw_receipt).with_context(|| {
+                format!("decoding send submit receipt `{idempotency_key}` from audit row")
+            })?;
+        if receipt.idempotency_key == idempotency_key {
+            return Ok(Some(receipt));
+        }
+    }
+
+    Ok(None)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -9970,11 +10306,16 @@ struct RobotRuleDetailData {
 struct RobotRulesLintData {
     total_rules: usize,
     rules_checked: usize,
+    total_submit_profiles: usize,
+    submit_profiles_checked: usize,
     errors: Vec<RobotLintIssue>,
     warnings: Vec<RobotLintIssue>,
     /// Fixture coverage statistics (present when --fixtures flag used)
     #[serde(skip_serializing_if = "Option::is_none")]
     fixture_coverage: Option<RobotFixtureCoverage>,
+    /// Submit-profile fixture coverage statistics (present when --fixtures flag used)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submit_profile_fixture_coverage: Option<RobotSubmitProfileFixtureCoverage>,
     passed: bool,
 }
 
@@ -9997,7 +10338,23 @@ struct RobotFixtureCoverage {
     total_fixtures: usize,
 }
 
+/// Submit-profile fixture coverage statistics
+#[derive(Debug, serde::Serialize)]
+#[allow(clippy::struct_field_names)]
+struct RobotSubmitProfileFixtureCoverage {
+    profiles_with_fixtures: usize,
+    profiles_without_fixtures: Vec<String>,
+    total_fixtures: usize,
+}
+
 const RULE_ID_PREFIXES: &[&str] = &["codex.", "claude_code.", "gemini.", "wezterm."];
+const SUBMIT_PROFILE_FIXTURE_STATES: &[&str] = &[
+    "composer_nonempty",
+    "composer_cleared",
+    "working_state",
+    "queued_behind_operation",
+    "crash_to_shell",
+];
 
 fn collect_fixture_rule_ids(
     dir: &Path,
@@ -10026,6 +10383,49 @@ fn collect_fixture_rule_ids(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+fn collect_submit_profile_fixture_ids(
+    dir: &Path,
+    profile_fixture_states: &mut HashMap<String, BTreeSet<String>>,
+    total_fixtures: &mut usize,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_submit_profile_fixture_ids(&path, profile_fixture_states, total_fixtures);
+        } else if path.extension().is_some_and(|ext| ext == "json")
+            && path.to_string_lossy().contains(".submit-profile.")
+        {
+            *total_fixtures += 1;
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let Some(profile_id) = val
+                        .get("profile_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    let covered = val
+                        .get("covered_states")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<BTreeSet<_>>();
+                    profile_fixture_states
+                        .entry(profile_id)
+                        .or_default()
+                        .extend(covered);
                 }
             }
         }
@@ -18580,6 +18980,12 @@ fn format_send_result_human(
     if let Some(err) = data.verification_error.as_deref() {
         let _ = writeln!(output, "  Verification: {err}");
     }
+    if let Some(submit) = &data.submit {
+        let _ = writeln!(output, "  Submit: {}", submit.state.as_str());
+        if let Some(profile_id) = submit.profile_id.as_deref() {
+            let _ = writeln!(output, "  Submit profile: {profile_id}");
+        }
+    }
 
     output
 }
@@ -19183,6 +19589,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Fetch recent pane output (aliases: read, tail)",
             },
             RobotCommandInfo {
+                name: "dom",
+                description: "Query live OSC 133 semantic zones and command/output metadata",
+            },
+            RobotCommandInfo {
                 name: "send",
                 description: "Send text to a pane (aliases: inject, write)",
             },
@@ -19297,6 +19707,10 @@ fn build_robot_help() -> RobotHelp {
             RobotCommandInfo {
                 name: "coordination-risk",
                 description: "Emit Agent Mail fallback Beads/git coordination-risk snapshot",
+            },
+            RobotCommandInfo {
+                name: "agent-mail-outbox",
+                description: "List retained Agent Mail fallback outbox entries and replay state",
             },
             RobotCommandInfo {
                 name: "blocker-radar",
@@ -19496,6 +19910,17 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                     "ft robot get-text 0",
                     "ft robot get-text --panes 0,1,2 --tail 20",
                     "ft robot get-text --all --tail 10",
+                ],
+            },
+            QuickStartCommand {
+                name: "dom",
+                args: "zones|last-command|output-of|exit-code <pane_id> [--command-index N]",
+                summary: "Read live OSC 133 semantic zones, command text, command output, and exit status",
+                examples: vec![
+                    "ft robot dom zones 0",
+                    "ft robot dom last-command 0",
+                    "ft robot dom output-of 0 --command-index -1",
+                    "ft robot dom exit-code 0",
                 ],
             },
             QuickStartCommand {
@@ -19737,6 +20162,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot coordination-risk",
                     "ft robot --format toon coordination-risk frankenterm",
+                ],
+            },
+            QuickStartCommand {
+                name: "agent-mail-outbox",
+                args: "[--manifest <path>] [--entry <path> ...]",
+                summary: "Read retained Agent Mail fallback outbox entries and replay state",
+                examples: vec![
+                    "ft robot agent-mail-outbox",
+                    "ft robot --format toon agent-mail-outbox --entry fixtures/agent-mail-outage-spool/valid/agent-mail-unavailable.json",
                 ],
             },
             QuickStartCommand {
@@ -20429,6 +20863,39 @@ fn print_herd_wave_doctor_section(report: &serde_json::Value) {
     println!("  MCP: deferred to ft-5bwjf.8");
 }
 
+fn print_shadow_mode_doctor_section(
+    report: &frankenterm_core::shadow_mode_evaluator::ShadowModeDoctorReport,
+) {
+    println!();
+    println!("Shadow Mode:");
+    println!(
+        "  Status: {} engines={} observing={} shadow_decisions={} divergences={}",
+        report.status.as_str(),
+        report.totals.engines_total,
+        report.totals.engines_observing_live_traffic,
+        report.totals.shadow_decisions,
+        report.totals.total_divergences,
+    );
+    println!(
+        "  Safety: observe_only={} live_mutation_allowed={} production_behavior_changed={}",
+        report.observe_only, report.live_mutation_allowed, report.production_behavior_changed
+    );
+    for engine in &report.engines {
+        println!(
+            "  {}: state={} shadow_decisions={} baseline_decisions={} divergences={} gaps={}",
+            engine.engine_id,
+            engine.feed_state.as_str(),
+            engine.counts.shadow_decisions,
+            engine.counts.baseline_decisions,
+            engine.counts.total_divergences(),
+            engine.sampling_gaps,
+        );
+        if let Some(reason) = &engine.pending_reason {
+            println!("       -> {reason}");
+        }
+    }
+}
+
 fn print_swarm_capacity_doctor_section(
     summary: &frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary,
 ) {
@@ -20791,6 +21258,241 @@ async fn robot_get_text_on_runtime_task(
             operation: "robot.get_text.await_task",
             source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
         })?
+}
+
+async fn robot_get_semantic_snapshot_on_runtime_task(
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+    pane_id: u64,
+) -> frankenterm_core::Result<frankenterm_core::wezterm::MuxSemanticSnapshot> {
+    let task = frankenterm_core::runtime_async::task::spawn(async move {
+        let cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        wezterm.get_semantic_zones_with_cx(&cx, pane_id).await
+    });
+    task.await
+        .map_err(|err| frankenterm_core::Error::RuntimeOperation {
+            operation: "robot.dom.await_task",
+            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?
+}
+
+fn robot_dom_zone_from_mux(
+    zone: &frankenterm_core::wezterm::MuxSemanticZone,
+) -> frankenterm_core::robot_types::DomSemanticZone {
+    let semantic_type = match zone.semantic_type {
+        frankenterm_core::wezterm::MuxSemanticZoneKind::Prompt => {
+            frankenterm_core::robot_types::DomSemanticZoneKind::Prompt
+        }
+        frankenterm_core::wezterm::MuxSemanticZoneKind::Input => {
+            frankenterm_core::robot_types::DomSemanticZoneKind::Input
+        }
+        frankenterm_core::wezterm::MuxSemanticZoneKind::Output => {
+            frankenterm_core::robot_types::DomSemanticZoneKind::Output
+        }
+    };
+    frankenterm_core::robot_types::DomSemanticZone {
+        start_y: zone.start_y,
+        start_x: zone.start_x,
+        end_y: zone.end_y,
+        end_x: zone.end_x,
+        semantic_type,
+        text: redact_for_output(&zone.text),
+    }
+}
+
+fn robot_dom_unavailable(
+    pane_id: u64,
+    query: frankenterm_core::robot_types::DomQueryKind,
+    requested_command_index: Option<i64>,
+    zones: Vec<frankenterm_core::robot_types::DomSemanticZone>,
+    reason: impl Into<String>,
+) -> frankenterm_core::robot_types::DomData {
+    frankenterm_core::robot_types::DomData {
+        pane_id,
+        query,
+        source: "unavailable".to_string(),
+        confidence: 0.0,
+        semantic_data_unavailable: true,
+        unavailable_reason: Some(redact_for_output(&reason.into())),
+        requested_command_index,
+        zones,
+        command: None,
+        output: None,
+        exit_code: None,
+    }
+}
+
+fn resolve_robot_dom_command_index(input_count: usize, requested: i64) -> Option<usize> {
+    if input_count == 0 {
+        return None;
+    }
+    if requested == -1 {
+        return input_count.checked_sub(1);
+    }
+    usize::try_from(requested)
+        .ok()
+        .filter(|index| *index < input_count)
+}
+
+fn build_robot_dom_data(
+    pane_id: u64,
+    query: frankenterm_core::robot_types::DomQueryKind,
+    requested_command_index: Option<i64>,
+    snapshot: frankenterm_core::wezterm::MuxSemanticSnapshot,
+) -> frankenterm_core::robot_types::DomData {
+    use frankenterm_core::robot_types::{
+        DomCommandData, DomCommandOutputData, DomData, DomExitCodeData, DomQueryKind,
+        DomSemanticZoneKind,
+    };
+
+    let zones: Vec<_> = snapshot.zones.iter().map(robot_dom_zone_from_mux).collect();
+    let has_osc133_markers = zones.iter().any(|zone| {
+        matches!(
+            zone.semantic_type,
+            DomSemanticZoneKind::Prompt | DomSemanticZoneKind::Input
+        )
+    });
+
+    if !has_osc133_markers {
+        return robot_dom_unavailable(
+            pane_id,
+            query,
+            requested_command_index,
+            Vec::new(),
+            "semantic data unavailable: pane has no OSC 133 prompt/input markers",
+        );
+    }
+
+    let input_positions: Vec<(usize, i64)> = zones
+        .iter()
+        .enumerate()
+        .filter(|(_, zone)| zone.semantic_type == DomSemanticZoneKind::Input)
+        .enumerate()
+        .map(|(command_index, (zone_index, _))| (zone_index, command_index as i64))
+        .collect();
+
+    let mut data = DomData {
+        pane_id,
+        query,
+        source: "osc133".to_string(),
+        confidence: 1.0,
+        semantic_data_unavailable: false,
+        unavailable_reason: None,
+        requested_command_index,
+        zones: zones.clone(),
+        command: None,
+        output: None,
+        exit_code: None,
+    };
+
+    match query {
+        DomQueryKind::Zones => data,
+        DomQueryKind::LastCommand => {
+            let Some((zone_index, command_index)) = input_positions.last().copied() else {
+                return robot_dom_unavailable(
+                    pane_id,
+                    query,
+                    requested_command_index,
+                    zones,
+                    "semantic data unavailable: OSC 133 markers contain no command input zone",
+                );
+            };
+            let zone = zones[zone_index].clone();
+            data.command = Some(DomCommandData {
+                command_index,
+                text: zone.text.clone(),
+                zone,
+            });
+            data
+        }
+        DomQueryKind::OutputOf => {
+            let requested = requested_command_index.unwrap_or(-1);
+            let Some(selected_input_index) =
+                resolve_robot_dom_command_index(input_positions.len(), requested)
+            else {
+                return robot_dom_unavailable(
+                    pane_id,
+                    query,
+                    requested_command_index,
+                    zones,
+                    format!("semantic data unavailable: command index {requested} is out of range"),
+                );
+            };
+            let (input_zone_index, command_index) = input_positions[selected_input_index];
+            let input_zone = zones[input_zone_index].clone();
+            data.command = Some(DomCommandData {
+                command_index,
+                text: input_zone.text.clone(),
+                zone: input_zone,
+            });
+            let output_zone = zones
+                .iter()
+                .skip(input_zone_index + 1)
+                .take_while(|zone| zone.semantic_type != DomSemanticZoneKind::Input)
+                .find(|zone| zone.semantic_type == DomSemanticZoneKind::Output)
+                .cloned();
+            let Some(zone) = output_zone else {
+                return robot_dom_unavailable(
+                    pane_id,
+                    query,
+                    requested_command_index,
+                    zones,
+                    format!(
+                        "semantic data unavailable: command index {command_index} has no output zone"
+                    ),
+                );
+            };
+            data.output = Some(DomCommandOutputData {
+                command_index,
+                text: zone.text.clone(),
+                zone,
+            });
+            data
+        }
+        DomQueryKind::ExitCode => {
+            let requested = requested_command_index.unwrap_or(-1);
+            let selected_input_index =
+                resolve_robot_dom_command_index(input_positions.len(), requested);
+            let command_index = match selected_input_index {
+                Some(index) => input_positions[index].1,
+                None if requested == -1 => -1,
+                None => {
+                    return robot_dom_unavailable(
+                        pane_id,
+                        query,
+                        requested_command_index,
+                        zones,
+                        format!(
+                            "semantic data unavailable: command index {requested} is out of range"
+                        ),
+                    );
+                }
+            };
+            if requested != -1 && selected_input_index != input_positions.len().checked_sub(1) {
+                return robot_dom_unavailable(
+                    pane_id,
+                    query,
+                    requested_command_index,
+                    zones,
+                    "semantic data unavailable: only the latest OSC 133 exit status is retained",
+                );
+            }
+            let Some(code) = snapshot.last_exit_code else {
+                return robot_dom_unavailable(
+                    pane_id,
+                    query,
+                    requested_command_index,
+                    zones,
+                    "semantic data unavailable: pane has no retained OSC 133 exit status",
+                );
+            };
+            data.exit_code = Some(DomExitCodeData {
+                command_index,
+                code,
+            });
+            data
+        }
+    }
 }
 
 async fn batch_get_pane_text(
@@ -23555,11 +24257,18 @@ fn distributed_agent_pane_meta(
 }
 
 #[cfg(feature = "distributed")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistributedEnvelopeSendOutcome {
+    Sent,
+    Oversized { size: usize, max: usize },
+}
+
+#[cfg(feature = "distributed")]
 async fn distributed_agent_send_envelope(
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
     envelope: &frankenterm_core::wire_protocol::WireEnvelope,
     wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DistributedEnvelopeSendOutcome> {
     use asupersync::io::AsyncWriteExt;
 
     let bytes = envelope.to_json()?;
@@ -23571,13 +24280,56 @@ async fn distributed_agent_send_envelope(
             max = wire_limits.max_message_size,
             "Skipping oversized distributed envelope"
         );
-        return Ok(());
+        return Ok(DistributedEnvelopeSendOutcome::Oversized {
+            size: bytes.len(),
+            max: wire_limits.max_message_size,
+        });
     }
 
     stream.get_mut().write_all(&bytes).await?;
     stream.get_mut().write_all(b"\n").await?;
     stream.get_mut().flush().await?;
-    Ok(())
+    Ok(DistributedEnvelopeSendOutcome::Sent)
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_send_oversized_delta_gap(
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+    stream: &mut asupersync::io::BufReader<DistributedIoStream>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
+    pane_id: u64,
+    seq: u64,
+    content_len: usize,
+    oversized_frame_size: usize,
+    oversized_frame_max: usize,
+) -> anyhow::Result<()> {
+    use frankenterm_core::events::Event;
+
+    let skipped_seq_after = seq.saturating_add(1);
+    let (seq_before, seq_after) = distributed_inferred_gap_bounds(seq, skipped_seq_after);
+    let reason = format!(
+        "distributed_oversized_delta:pane_id={pane_id}:seq={seq}:content_len={content_len}:frame_size={oversized_frame_size}:max={oversized_frame_max}"
+    );
+    let Some(gap_envelope) = streamer.event_to_envelope(&Event::GapDetected {
+        pane_id,
+        seq_before,
+        seq_after,
+        reason,
+        detected_at_ms: now_ms_i64(),
+    }) else {
+        anyhow::bail!(
+            "distributed stream sequence exhausted while reporting oversized pane delta gap"
+        );
+    };
+
+    match distributed_agent_send_envelope(stream, &gap_envelope, wire_limits).await? {
+        DistributedEnvelopeSendOutcome::Sent => Ok(()),
+        DistributedEnvelopeSendOutcome::Oversized { size, max } => {
+            anyhow::bail!(
+                "oversized distributed pane-delta gap marker exceeded wire limit: {size} bytes (max {max})"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "distributed"))]
@@ -23904,7 +24656,7 @@ async fn distributed_agent_send_pane_snapshot(
             if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
                 *meta = distributed_agent_pane_meta(&pane);
             }
-            distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+            let _ = distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
         }
     }
 
@@ -23965,7 +24717,21 @@ async fn distributed_agent_flush_pane_deltas(
                 delta.content_len = segment.content_len;
                 delta.captured_at_ms = segment.captured_at;
             }
-            distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+            let send_outcome =
+                distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+            if let DistributedEnvelopeSendOutcome::Oversized { size, max } = send_outcome {
+                distributed_agent_send_oversized_delta_gap(
+                    streamer,
+                    stream,
+                    wire_limits,
+                    segment.pane_id,
+                    segment.seq,
+                    segment.content_len,
+                    size,
+                    max,
+                )
+                .await?;
+            }
 
             total_sent += 1;
             after_id = Some(segment.id);
@@ -24091,7 +24857,21 @@ async fn distributed_agent_flush_pane_history(
                         delta.content_len = segment.content_len;
                         delta.captured_at_ms = segment.captured_at;
                     }
-                    distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+                    let send_outcome =
+                        distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+                    if let DistributedEnvelopeSendOutcome::Oversized { size, max } = send_outcome {
+                        distributed_agent_send_oversized_delta_gap(
+                            streamer,
+                            stream,
+                            wire_limits,
+                            segment.pane_id,
+                            segment.seq,
+                            segment.content_len,
+                            size,
+                            max,
+                        )
+                        .await?;
+                    }
 
                     total_sent += 1;
                     after_segment_id = Some(segment.id);
@@ -24114,7 +24894,14 @@ async fn distributed_agent_flush_pane_history(
                         gap_notice.reason = gap.reason;
                         gap_notice.detected_at_ms = gap.detected_at;
                     }
-                    distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+                    match distributed_agent_send_envelope(stream, &envelope, wire_limits).await? {
+                        DistributedEnvelopeSendOutcome::Sent => {}
+                        DistributedEnvelopeSendOutcome::Oversized { size, max } => {
+                            anyhow::bail!(
+                                "oversized distributed gap replay envelope exceeded wire limit: {size} bytes (max {max})"
+                            );
+                        }
+                    }
 
                     total_sent += 1;
                     after_gap_id = Some(gap.id);
@@ -24261,7 +25048,7 @@ async fn distributed_agent_stream_event(
                         *meta = distributed_agent_pane_meta(&record);
                     }
                 }
-                distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+                let _ = distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
             }
             Ok(())
         }
@@ -24288,7 +25075,7 @@ async fn distributed_agent_stream_event(
                         *meta = distributed_agent_pane_meta(&record);
                     }
                 }
-                distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
+                let _ = distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
             }
             Ok(())
         }
@@ -27367,6 +28154,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::AgentMailOutbox { manifest, entries } => {
+                    let response =
+                        match frankenterm_core::agent_mail_outbox::load_agent_mail_outbox_surface(
+                            &workspace_root,
+                            manifest.as_deref(),
+                            &entries,
+                        ) {
+                            Ok(surface) => RobotResponse::success(surface, elapsed_ms(start)),
+                            Err(err) => RobotResponse::<
+                                frankenterm_core::agent_mail_outbox::AgentMailOutboxSurface,
+                            >::error_with_code(
+                                ROBOT_ERR_AGENT_MAIL_OUTBOX,
+                                err.to_string(),
+                                Some(
+                                    "Pass --manifest fixtures/agent-mail-outage-spool/manifest.json or repeat --entry for retained outbox JSON files."
+                                        .to_string(),
+                                ),
+                                elapsed_ms(start),
+                            ),
+                        };
+                    print_robot_response(&response, format, stats)?;
+                }
                 RobotCommands::BlockerRadar { session } => {
                     let report = build_blocker_radar_report_from_fallback(
                         &workspace_root,
@@ -27462,6 +28271,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::Rehearsal { .. } => unreachable!("handled above"),
                         RobotCommands::Incidents { .. } => unreachable!("handled above"),
                         RobotCommands::Perf { .. } => unreachable!("handled above"),
+                        RobotCommands::AgentMailOutbox { .. } => unreachable!("handled above"),
                         RobotCommands::State {
                             include_text,
                             tail,
@@ -27753,6 +28563,140 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 );
                                 print_robot_response(&response, format, stats)?;
                             }
+                        }
+                        RobotCommands::Dom { command } => {
+                            let pane_id = command.pane_id();
+                            let query = command.query_kind();
+                            let requested_command_index = command.command_index();
+                            let wezterm =
+                                frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                            let storage = frankenterm_core::storage::StorageHandle::new(
+                                &ctx.effective.paths.db_path,
+                            )
+                            .await
+                            .ok();
+                            let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
+                            let summary =
+                                format!("robot.dom {} pane_id={pane_id}", command.command_name());
+                            let (decision, domain) = match authorize_read_or_search_policy(
+                                &config,
+                                storage.as_ref(),
+                                Some(ipc_socket),
+                                Some(Path::new(&ctx.effective.paths.workspace_root)),
+                                frankenterm_core::policy::ActionKind::ReadOutput,
+                                frankenterm_core::policy::ActorKind::Robot,
+                                Some(pane_id),
+                                &summary,
+                            )
+                            .await
+                            {
+                                Ok(authorized) => authorized,
+                                Err(e) => {
+                                    let response = RobotResponse::<
+                                        frankenterm_core::robot_types::DomData,
+                                    >::error_with_code(
+                                        ROBOT_ERR_APPROVAL,
+                                        e,
+                                        Some(ROBOT_APPROVAL_RECOVERY_HINT.to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            if !decision.is_allowed() {
+                                let policy_status = if decision.requires_approval() {
+                                    "require_approval"
+                                } else {
+                                    "denied"
+                                };
+                                record_read_search_policy_audit(
+                                    storage.as_ref(),
+                                    frankenterm_core::policy::ActorKind::Robot,
+                                    frankenterm_core::policy::ActionKind::ReadOutput,
+                                    Some(pane_id),
+                                    domain.as_deref(),
+                                    &summary,
+                                    &decision,
+                                    policy_status,
+                                )
+                                .await;
+                                let (code, message, hint) =
+                                    robot_policy_error_from_decision(&decision, "Read denied");
+                                let response = RobotResponse::<
+                                    frankenterm_core::robot_types::DomData,
+                                >::error_with_code(
+                                    &code, message, hint, elapsed_ms(start)
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+
+                            let data = match load_distributed_remote_pane_record(
+                                storage.as_ref(),
+                                pane_id,
+                            )
+                            .await
+                            {
+                                Ok(Some(_)) => robot_dom_unavailable(
+                                    pane_id,
+                                    query,
+                                    requested_command_index,
+                                    Vec::new(),
+                                    DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE,
+                                ),
+                                Ok(None) => {
+                                    match robot_get_semantic_snapshot_on_runtime_task(
+                                        wezterm.clone(),
+                                        pane_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(snapshot) => build_robot_dom_data(
+                                            pane_id,
+                                            query,
+                                            requested_command_index,
+                                            snapshot,
+                                        ),
+                                        Err(err) => robot_dom_unavailable(
+                                            pane_id,
+                                            query,
+                                            requested_command_index,
+                                            Vec::new(),
+                                            format!("semantic data unavailable: {err}"),
+                                        ),
+                                    }
+                                }
+                                Err(err) => robot_dom_unavailable(
+                                    pane_id,
+                                    query,
+                                    requested_command_index,
+                                    Vec::new(),
+                                    format!(
+                                        "semantic data unavailable: failed to inspect pane metadata: {err}"
+                                    ),
+                                ),
+                            };
+
+                            let audit_status = if data.semantic_data_unavailable {
+                                "semantic_data_unavailable"
+                            } else {
+                                "success"
+                            };
+                            record_read_search_policy_audit(
+                                storage.as_ref(),
+                                frankenterm_core::policy::ActorKind::Robot,
+                                frankenterm_core::policy::ActionKind::ReadOutput,
+                                Some(pane_id),
+                                domain.as_deref(),
+                                &summary,
+                                &decision,
+                                audit_status,
+                            )
+                            .await;
+                            let response = RobotResponse::success(data, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::GetText {
                             pane_id,
@@ -28294,6 +29238,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
                                 let domain = pane_info.inferred_domain();
+                                let submit_agent_type = infer_send_submit_agent_type(&pane_info);
+                                let submit_profile = load_send_submit_profile(
+                                    &config,
+                                    resolved_config_path.as_deref(),
+                                    submit_agent_type,
+                                );
+                                let use_verified_submit_path = submit_profile.is_some();
 
                                 let mut engine = PolicyEngine::new(
                                     config.safety.rate_limit_per_pane,
@@ -28354,12 +29305,35 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
 
+                                let mut submit_before_text = None;
                                 let mut injection = match decision {
                                     PolicyDecision::Allow { .. } => {
+                                        if use_verified_submit_path {
+                                            submit_before_text =
+                                                capture_send_submit_text(&wezterm, &cx, pane_id)
+                                                    .await;
+                                        }
                                         // ft-xbnl0.2.3 tick 231: cx-first send_text. Reuses
                                         // the `cx` from the get_pane migration above (same scope).
-                                        let send_result =
-                                            wezterm.send_text_with_cx(&cx, pane_id, &text).await;
+                                        let send_result = if use_verified_submit_path {
+                                            match wezterm
+                                                .send_text_with_options_with_cx(
+                                                    &cx, pane_id, &text, false, true,
+                                                )
+                                                .await
+                                            {
+                                                Ok(()) => wezterm
+                                                    .send_control_with_cx(
+                                                        &cx,
+                                                        pane_id,
+                                                        frankenterm_core::wezterm::control::ENTER,
+                                                    )
+                                                    .await,
+                                                Err(error) => Err(error),
+                                            }
+                                        } else {
+                                            wezterm.send_text_with_cx(&cx, pane_id, &text).await
+                                        };
                                         match send_result {
                                             Ok(()) => InjectionResult::Allowed {
                                                 decision,
@@ -28394,30 +29368,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                     }
                                 };
-
-                                let mut audit_record = injection.to_audit_record(
-                                    ActorKind::Robot,
-                                    None,
-                                    Some(domain.clone()),
-                                );
-                                audit_record.input_summary =
-                                    Some(frankenterm_core::policy::build_send_text_audit_summary(
-                                        &text, None, None,
-                                    ));
-                                // ft-xbnl0.2.3 tick 237: cx-first storage write.
-                                let storage_cx = frankenterm_core::cx::Cx::current()
-                                    .unwrap_or_else(frankenterm_core::cx::for_request);
-                                match storage
-                                    .record_audit_action_redacted_with_cx(&storage_cx, audit_record)
-                                    .await
-                                {
-                                    Ok(audit_id) => {
-                                        injection.set_audit_action_id(audit_id);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(pane_id, "Failed to record audit: {e}");
-                                    }
-                                }
 
                                 let mut wait_for_data = None;
                                 let mut verification_error = None;
@@ -28511,11 +29461,73 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
 
+                                let submit_verification = if injection.is_allowed() {
+                                    let polls = wait_for_data
+                                        .as_ref()
+                                        .map_or(0, |data| data.polls)
+                                        .saturating_add(usize::from(use_verified_submit_path));
+                                    Some(
+                                        classify_send_submit_after_send(
+                                            &wezterm,
+                                            &cx,
+                                            pane_id,
+                                            &text,
+                                            submit_agent_type,
+                                            submit_profile.as_ref(),
+                                            submit_before_text.as_deref(),
+                                            1,
+                                            polls,
+                                        )
+                                        .await,
+                                    )
+                                } else {
+                                    None
+                                };
+
+                                let submit = Some(build_send_submit_receipt(
+                                    pane_id,
+                                    &text,
+                                    &injection,
+                                    wait_for_data.as_ref(),
+                                    submit_verification.as_ref(),
+                                    elapsed_ms(start),
+                                ));
+                                let mut audit_record = injection.to_audit_record(
+                                    ActorKind::Robot,
+                                    None,
+                                    Some(domain.clone()),
+                                );
+                                audit_record.input_summary =
+                                    Some(frankenterm_core::policy::build_send_text_audit_summary(
+                                        &text, None, None,
+                                    ));
+                                if let Some(receipt) = &submit {
+                                    attach_send_submit_receipt_to_audit_record(
+                                        &mut audit_record,
+                                        receipt,
+                                    );
+                                }
+                                // ft-xbnl0.2.3 tick 237: cx-first storage write.
+                                let storage_cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                match storage
+                                    .record_audit_action_redacted_with_cx(&storage_cx, audit_record)
+                                    .await
+                                {
+                                    Ok(audit_id) => {
+                                        injection.set_audit_action_id(audit_id);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(pane_id, "Failed to record audit: {e}");
+                                    }
+                                }
+
                                 let data = RobotSendData {
                                     pane_id,
                                     injection,
                                     wait_for: wait_for_data,
                                     verification_error,
+                                    submit,
                                 };
                                 let response = RobotResponse::success(data, elapsed_ms(start));
                                 print_robot_response(&response, format, stats)?;
@@ -31451,6 +32463,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                             })
                                             .collect();
+                                    let submit_profiles: Vec<
+                                        &frankenterm_core::patterns::SubmitProfile,
+                                    > = if let Some(ref pack_filter) = pack {
+                                        engine
+                                            .packs()
+                                            .iter()
+                                            .filter(|pattern_pack| {
+                                                pattern_pack.name == *pack_filter
+                                            })
+                                            .flat_map(|pattern_pack| {
+                                                pattern_pack.submit_profiles.iter()
+                                            })
+                                            .collect()
+                                    } else {
+                                        engine.submit_profiles().iter().collect()
+                                    };
                                     let mut errors: Vec<RobotLintIssue> = Vec::new();
                                     let mut warnings: Vec<RobotLintIssue> = Vec::new();
 
@@ -31532,53 +32560,102 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
 
                                     // 3. Check fixture coverage if requested
-                                    let fixture_coverage = if fixtures {
-                                        let corpus_base =
-                                            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                                                .parent()
-                                                .unwrap_or_else(|| std::path::Path::new("."))
-                                                .join("frankenterm-core")
-                                                .join("tests")
-                                                .join("corpus");
+                                    let (fixture_coverage, submit_profile_fixture_coverage) =
+                                        if fixtures {
+                                            let corpus_base = std::path::PathBuf::from(env!(
+                                                "CARGO_MANIFEST_DIR"
+                                            ))
+                                            .parent()
+                                            .unwrap_or_else(|| std::path::Path::new("."))
+                                            .join("frankenterm-core")
+                                            .join("tests")
+                                            .join("corpus");
 
-                                        let mut rules_with_fixtures: HashSet<String> =
-                                            HashSet::new();
-                                        let mut total_fixtures = 0;
+                                            let mut rules_with_fixtures: HashSet<String> =
+                                                HashSet::new();
+                                            let mut total_fixtures = 0;
 
-                                        collect_fixture_rule_ids(
-                                            &corpus_base,
-                                            &mut rules_with_fixtures,
-                                            &mut total_fixtures,
-                                        );
+                                            collect_fixture_rule_ids(
+                                                &corpus_base,
+                                                &mut rules_with_fixtures,
+                                                &mut total_fixtures,
+                                            );
 
-                                        // Find rules without any fixture coverage
-                                        let rules_without: Vec<String> = rules
-                                            .iter()
-                                            .filter(|r| !rules_with_fixtures.contains(&r.id))
-                                            .map(|r| r.id.clone())
-                                            .collect();
+                                            // Find rules without any fixture coverage
+                                            let rules_without: Vec<String> = rules
+                                                .iter()
+                                                .filter(|r| !rules_with_fixtures.contains(&r.id))
+                                                .map(|r| r.id.clone())
+                                                .collect();
 
-                                        // Add warnings for rules without fixtures
-                                        for rule_id in &rules_without {
-                                            warnings.push(RobotLintIssue {
-                                                rule_id: rule_id.clone(),
-                                                category: "fixture".to_string(),
-                                                message: "No corpus fixture found for this rule".to_string(),
-                                                suggestion: Some(format!(
-                                                    "Add tests/corpus/<agent>/{}.txt and .expect.json",
-                                                    rule_id.split('.').next_back().unwrap_or("unknown")
-                                                )),
-                                            });
-                                        }
+                                            // Add warnings for rules without fixtures
+                                            for rule_id in &rules_without {
+                                                warnings.push(RobotLintIssue {
+                                                    rule_id: rule_id.clone(),
+                                                    category: "fixture".to_string(),
+                                                    message: "No corpus fixture found for this rule".to_string(),
+                                                    suggestion: Some(format!(
+                                                        "Add tests/corpus/<agent>/{}.txt and .expect.json",
+                                                        rule_id
+                                                            .split('.')
+                                                            .next_back()
+                                                            .unwrap_or("unknown")
+                                                    )),
+                                                });
+                                            }
 
-                                        Some(RobotFixtureCoverage {
-                                            rules_with_fixtures: rules_with_fixtures.len(),
-                                            rules_without_fixtures: rules_without,
-                                            total_fixtures,
-                                        })
-                                    } else {
-                                        None
-                                    };
+                                            let mut profile_fixture_states: HashMap<
+                                                String,
+                                                BTreeSet<String>,
+                                            > = HashMap::new();
+                                            let mut total_profile_fixtures = 0;
+                                            collect_submit_profile_fixture_ids(
+                                                &corpus_base,
+                                                &mut profile_fixture_states,
+                                                &mut total_profile_fixtures,
+                                            );
+
+                                            let mut profiles_without: Vec<String> = Vec::new();
+                                            for profile in &submit_profiles {
+                                                let complete = profile_fixture_states
+                                                    .get(&profile.id)
+                                                    .is_some_and(|covered| {
+                                                        SUBMIT_PROFILE_FIXTURE_STATES
+                                                            .iter()
+                                                            .all(|state| covered.contains(*state))
+                                                    });
+                                                if !complete {
+                                                    profiles_without.push(profile.id.clone());
+                                                    warnings.push(RobotLintIssue {
+                                                        rule_id: profile.id.clone(),
+                                                        category: "submit_profile_fixture".to_string(),
+                                                        message: "No complete submit-profile corpus fixture found for this profile".to_string(),
+                                                        suggestion: Some(format!(
+                                                            "Add tests/corpus/{}/submit_profile.submit-profile.json covering {}",
+                                                            profile.agent_type,
+                                                            SUBMIT_PROFILE_FIXTURE_STATES.join(", ")
+                                                        )),
+                                                    });
+                                                }
+                                            }
+
+                                            (
+                                                Some(RobotFixtureCoverage {
+                                                    rules_with_fixtures: rules_with_fixtures.len(),
+                                                    rules_without_fixtures: rules_without,
+                                                    total_fixtures,
+                                                }),
+                                                Some(RobotSubmitProfileFixtureCoverage {
+                                                    profiles_with_fixtures: submit_profiles
+                                                        .len()
+                                                        .saturating_sub(profiles_without.len()),
+                                                    profiles_without_fixtures: profiles_without,
+                                                    total_fixtures: total_profile_fixtures,
+                                                }),
+                                            )
+                                        } else {
+                                            (None, None)
+                                        };
 
                                     let passed =
                                         errors.is_empty() && (!strict || warnings.is_empty());
@@ -31586,9 +32663,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let data = RobotRulesLintData {
                                         total_rules: rules.len(),
                                         rules_checked: rules.len(),
+                                        total_submit_profiles: submit_profiles.len(),
+                                        submit_profiles_checked: submit_profiles.len(),
                                         errors,
                                         warnings,
                                         fixture_coverage,
+                                        submit_profile_fixture_coverage,
                                         passed,
                                     };
 
@@ -35845,6 +36925,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
                 let domain = pane_info.inferred_domain();
+                let submit_agent_type = infer_send_submit_agent_type(&pane_info);
+                let submit_profile = load_send_submit_profile(
+                    &config,
+                    resolved_config_path.as_deref(),
+                    submit_agent_type,
+                );
+                let use_verified_submit_path = submit_profile.is_some() && !no_newline;
 
                 let mut engine = frankenterm_core::policy::PolicyEngine::new(
                     config.safety.rate_limit_per_pane,
@@ -35900,11 +36987,36 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
 
+                let mut submit_before_text = None;
                 let mut injection = match decision {
                     frankenterm_core::policy::PolicyDecision::Allow { .. } => {
-                        let send_result = wezterm
-                            .send_text_with_options(pane_id, &text, no_paste, no_newline)
-                            .await;
+                        if use_verified_submit_path {
+                            submit_before_text =
+                                capture_send_submit_text(&wezterm, &cx, pane_id).await;
+                        }
+                        let send_result = if use_verified_submit_path {
+                            match wezterm
+                                .send_text_with_options_with_cx(&cx, pane_id, &text, no_paste, true)
+                                .await
+                            {
+                                Ok(()) => {
+                                    wezterm
+                                        .send_control_with_cx(
+                                            &cx,
+                                            pane_id,
+                                            frankenterm_core::wezterm::control::ENTER,
+                                        )
+                                        .await
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            wezterm
+                                .send_text_with_options_with_cx(
+                                    &cx, pane_id, &text, no_paste, no_newline,
+                                )
+                                .await
+                        };
                         match send_result {
                             Ok(()) => frankenterm_core::policy::InjectionResult::Allowed {
                                 decision,
@@ -35941,29 +37053,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                 };
-
-                let mut audit_record = injection.to_audit_record(
-                    frankenterm_core::policy::ActorKind::Human,
-                    None,
-                    Some(domain.clone()),
-                );
-                audit_record.input_summary = Some(
-                    frankenterm_core::policy::build_send_text_audit_summary(&text, None, None),
-                );
-                // ft-xbnl0.2.3 tick 240: cx-first storage write.
-                let storage_cx = frankenterm_core::cx::Cx::current()
-                    .unwrap_or_else(frankenterm_core::cx::for_request);
-                match storage
-                    .record_audit_action_redacted_with_cx(&storage_cx, audit_record)
-                    .await
-                {
-                    Ok(audit_id) => {
-                        injection.set_audit_action_id(audit_id);
-                    }
-                    Err(e) => {
-                        tracing::warn!(pane_id, "Failed to record audit: {e}");
-                    }
-                }
 
                 let mut wait_for_data = None;
                 let mut verification_error = None;
@@ -36041,11 +37130,72 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 }
 
+                let effective_submit_profile = use_verified_submit_path
+                    .then_some(())
+                    .and(submit_profile.as_ref());
+                let submit_verification = if injection.is_allowed() {
+                    let polls = wait_for_data
+                        .as_ref()
+                        .map_or(0, |data| data.polls)
+                        .saturating_add(usize::from(use_verified_submit_path));
+                    Some(
+                        classify_send_submit_after_send(
+                            &wezterm,
+                            &cx,
+                            pane_id,
+                            &text,
+                            submit_agent_type,
+                            effective_submit_profile,
+                            submit_before_text.as_deref(),
+                            1,
+                            polls,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+
+                let submit = Some(build_send_submit_receipt(
+                    pane_id,
+                    &text,
+                    &injection,
+                    wait_for_data.as_ref(),
+                    submit_verification.as_ref(),
+                    elapsed_ms(start),
+                ));
+                let mut audit_record = injection.to_audit_record(
+                    frankenterm_core::policy::ActorKind::Human,
+                    None,
+                    Some(domain.clone()),
+                );
+                audit_record.input_summary = Some(
+                    frankenterm_core::policy::build_send_text_audit_summary(&text, None, None),
+                );
+                if let Some(receipt) = &submit {
+                    attach_send_submit_receipt_to_audit_record(&mut audit_record, receipt);
+                }
+                // ft-xbnl0.2.3 tick 240: cx-first storage write.
+                let storage_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match storage
+                    .record_audit_action_redacted_with_cx(&storage_cx, audit_record)
+                    .await
+                {
+                    Ok(audit_id) => {
+                        injection.set_audit_action_id(audit_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(pane_id, "Failed to record audit: {e}");
+                    }
+                }
+
                 let data = HumanSendData {
                     pane_id,
                     injection,
                     wait_for: wait_for_data,
                     verification_error,
+                    submit,
                     no_paste,
                     no_newline,
                 };
@@ -40517,6 +41667,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let attestation_report = build_attestation_doctor_report(&workspace_root);
             let renderer_slos_report =
                 frankenterm_core::render_quality::renderer_slos_doctor_report();
+            let shadow_mode_report =
+                frankenterm_core::shadow_mode_evaluator::shadow_mode_doctor_report();
             all_checks.push(attestation_doctor_check(&attestation_report));
 
             // Determine overall status
@@ -40603,6 +41755,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 result["attestation"] = attestation_report;
                 result["renderer_slos"] =
                     serde_json::to_value(&renderer_slos_report).unwrap_or(serde_json::Value::Null);
+                result["shadow_mode"] =
+                    serde_json::to_value(&shadow_mode_report).unwrap_or(serde_json::Value::Null);
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
                         serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
@@ -40661,6 +41815,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 print_blocker_radar_doctor_section(&blocker_radar_report);
                 print_herd_wave_doctor_section(&herd_wave_report);
                 print_attestation_doctor_section(&attestation_report);
+                print_shadow_mode_doctor_section(&shadow_mode_report);
 
                 println!();
                 println!("Renderer SLOs:");
@@ -62391,6 +63546,122 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_agent_flush_pane_deltas_reports_oversized_segment_as_gap() {
+        frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use frankenterm_core::storage::PaneRecord;
+                use frankenterm_core::wire_protocol::{
+                    AgentStreamer, WireEnvelope, WirePayload, WireProtocolLimits,
+                };
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_agent_oversized_delta_gap").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(
+                    storage_handle,
+                ));
+                let pane_id = 96_u64;
+                let now = now_ms_i64();
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle
+                        .upsert_pane(PaneRecord {
+                            pane_id,
+                            pane_uuid: Some("local-oversized-pane".to_string()),
+                            domain: "local".to_string(),
+                            window_id: None,
+                            tab_id: None,
+                            title: Some("local-oversized-pane".to_string()),
+                            cwd: Some("/local".to_string()),
+                            tty_name: None,
+                            first_seen_at: now,
+                            last_seen_at: now,
+                            observed: true,
+                            ignore_reason: None,
+                            last_decision_at: Some(now),
+                        })
+                        .await
+                        .unwrap();
+                }
+
+                let oversized_content = "OVERSIZED_DISTRIBUTED_SEGMENT_MARKER".repeat(160);
+                let segment = {
+                    let conn = rusqlite::Connection::open(&db_path)
+                        .expect("open oversized segment fixture sqlite connection");
+                    insert_distributed_replay_test_segment(
+                        &conn,
+                        pane_id,
+                        0,
+                        &oversized_content,
+                        now,
+                    )
+                };
+                let wire_limits = WireProtocolLimits {
+                    max_message_size: 1_024,
+                    ..default_wire_limits()
+                };
+                let (mut stream, written) = distributed_captured_test_stream();
+                let mut streamer = AgentStreamer::new("agent-oversized-delta");
+                let mut segment_cursors = std::collections::HashMap::new();
+
+                let sent = distributed_agent_flush_pane_deltas(
+                    pane_id,
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut stream,
+                    wire_limits,
+                )
+                .await
+                .expect("oversized pane delta should be reported as a gap");
+                assert_eq!(sent, 1);
+                assert_eq!(segment_cursors.get(&pane_id), Some(&segment.id));
+
+                let lines = distributed_captured_test_lines(&written);
+                assert_eq!(lines.len(), 1, "expected only an inferred gap frame");
+                let envelope =
+                    WireEnvelope::from_json_with_limits(lines[0].as_bytes(), wire_limits)
+                        .expect("parse inferred oversized-delta gap envelope");
+
+                match envelope.payload {
+                    WirePayload::Gap(gap_notice) => {
+                        assert_eq!(gap_notice.pane_id, pane_id);
+                        assert_eq!(gap_notice.seq_before, 0);
+                        assert_eq!(gap_notice.seq_after, 1);
+                        assert!(
+                            gap_notice.reason.contains("distributed_oversized_delta"),
+                            "gap reason should identify oversized delta loss: {}",
+                            gap_notice.reason
+                        );
+                        assert!(
+                            gap_notice.reason.contains("frame_size="),
+                            "gap reason should include the rejected frame size: {}",
+                            gap_notice.reason
+                        );
+                        assert!(
+                            gap_notice.reason.contains("max=1024"),
+                            "gap reason should include the active wire limit: {}",
+                            gap_notice.reason
+                        );
+                    }
+                    other => panic!("expected inferred gap envelope, got {other:?}"),
+                }
+                assert_eq!(
+                    streamer.messages_sent(),
+                    2,
+                    "streamer sequence should account for the skipped delta and the gap marker"
+                );
+
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_agent_stream_event_skips_discovered_remote_domain_without_storage_record() {
         frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
@@ -62804,18 +64075,26 @@ recorder_backend = "frankensqlite"
                 ));
                 let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
                 let wire_limits = default_wire_limits();
-                let ingest_state = DistributedIngestState::new(wire_limits);
+                let ingest_state = std::sync::Arc::new(DistributedIngestState::new(wire_limits));
+                let bind_addr = "127.0.0.1:0".parse().expect("valid test bind addr");
+                let distributed_config =
+                    distributed_token_config(bind_addr, "dist-case-session-token");
+                let expected_token = distributed_config.token.clone();
+                let allow_agent_ids = std::sync::Arc::new(std::collections::HashSet::new());
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                 let canonical_sender = "agent-case";
+                let first_peer_addr = "127.0.0.1:49152".parse().expect("valid test peer addr");
+                let second_peer_addr = "127.0.0.1:49153".parse().expect("valid test peer addr");
                 let first_session_id = distributed_resolve_session_id(
                     None,
                     Some("Agent-Case"),
-                    "127.0.0.1:49152".parse().expect("valid test peer addr"),
+                    first_peer_addr,
                 );
                 let second_session_id = distributed_resolve_session_id(
                     None,
                     Some("agent-case"),
-                    "127.0.0.1:49153".parse().expect("valid test peer addr"),
+                    second_peer_addr,
                 );
                 assert_eq!(first_session_id, canonical_sender);
                 assert_eq!(second_session_id, canonical_sender);
@@ -62845,44 +64124,95 @@ recorder_backend = "frankensqlite"
                     timestamp_ms: now_ms(),
                 };
 
-                distributed_ingest_test_connection(
-                    &first_session_id,
-                    canonical_sender,
-                    vec![WireEnvelope::new(
-                        2,
-                        "AGENT-CASE",
-                        WirePayload::PaneMeta(newer_meta),
-                    )],
+                let first_handshake = DistributedHandshake {
+                    protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+                    token: distributed_config.token.clone(),
+                    agent_id: Some("Agent-Case".to_string()),
+                    session_id: None,
+                };
+                let mut first_input =
+                    serde_json::to_vec(&first_handshake).expect("serialize first handshake");
+                first_input.push(b'\n');
+                let first_envelope =
+                    WireEnvelope::new(2, "AGENT-CASE", WirePayload::PaneMeta(newer_meta));
+                first_input.extend_from_slice(
+                    &first_envelope
+                        .to_json()
+                        .expect("serialize first fallback envelope"),
+                );
+                first_input.push(b'\n');
+                let (first_io, first_written) =
+                    DistributedScriptedIo::with_write_capture(first_input);
+                distributed_handle_connection(
+                    first_io,
+                    first_peer_addr,
+                    distributed_config.clone(),
                     wire_limits,
-                    &ingest_state,
-                    &storage,
-                    &event_bus,
-                )
-                .await
-                .expect("first fallback-session connection should ingest");
-
-                let stale_result = distributed_ingest_test_connection(
-                    &second_session_id,
-                    canonical_sender,
-                    vec![WireEnvelope::new(
-                        1,
-                        "agent-case",
-                        WirePayload::PaneMeta(stale_meta),
-                    )],
-                    wire_limits,
-                    &ingest_state,
-                    &storage,
-                    &event_bus,
+                    expected_token.clone(),
+                    std::sync::Arc::clone(&allow_agent_ids),
+                    std::sync::Arc::clone(&ingest_state),
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    std::sync::Arc::clone(&shutdown_flag),
                 )
                 .await;
-                let stale_error =
-                    stale_result.expect_err("case-only fallback reconnect must be rejected");
-                assert!(
-                    stale_error
-                        .to_string()
-                        .contains("distributed replay detected"),
-                    "unexpected stale reconnect error: {stale_error}"
+                let first_lines = distributed_captured_test_lines(&first_written);
+                let first_payload: serde_json::Value = serde_json::from_str(
+                    first_lines
+                        .first()
+                        .expect("first connection should emit handshake acknowledgement"),
+                )
+                .expect("parse first handshake acknowledgement");
+                assert_eq!(first_payload["ok"], serde_json::Value::Bool(true));
+
+                let second_handshake = DistributedHandshake {
+                    protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+                    token: distributed_config.token.clone(),
+                    agent_id: Some("agent-case".to_string()),
+                    session_id: None,
+                };
+                let mut second_input =
+                    serde_json::to_vec(&second_handshake).expect("serialize second handshake");
+                second_input.push(b'\n');
+                let second_envelope =
+                    WireEnvelope::new(1, "agent-case", WirePayload::PaneMeta(stale_meta));
+                second_input.extend_from_slice(
+                    &second_envelope
+                        .to_json()
+                        .expect("serialize stale fallback envelope"),
                 );
+                second_input.push(b'\n');
+                let (second_io, second_written) =
+                    DistributedScriptedIo::with_write_capture(second_input);
+                distributed_handle_connection(
+                    second_io,
+                    second_peer_addr,
+                    distributed_config,
+                    wire_limits,
+                    expected_token,
+                    allow_agent_ids,
+                    ingest_state,
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    shutdown_flag,
+                )
+                .await;
+                let second_lines = distributed_captured_test_lines(&second_written);
+                assert!(
+                    second_lines.len() >= 2,
+                    "second connection should emit handshake acknowledgement and replay error, got {second_lines:?}"
+                );
+                let second_handshake_payload: serde_json::Value =
+                    serde_json::from_str(&second_lines[0])
+                        .expect("parse second handshake acknowledgement");
+                assert_eq!(
+                    second_handshake_payload["ok"],
+                    serde_json::Value::Bool(true)
+                );
+                let stale_payload: serde_json::Value =
+                    serde_json::from_str(&second_lines[1]).expect("parse replay-detected payload");
+                assert_eq!(stale_payload["ok"], serde_json::Value::Bool(false));
+                assert_eq!(stale_payload["error"]["code"], "dist.replay_detected");
 
                 {
                     let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -64724,6 +66054,7 @@ log_level = "debug"
             injection,
             wait_for: None,
             verification_error: None,
+            submit: None,
             no_paste: false,
             no_newline: false,
         };
@@ -64762,6 +66093,7 @@ log_level = "debug"
             injection,
             wait_for: Some(wait_for),
             verification_error: None,
+            submit: None,
             no_paste: false,
             no_newline: false,
         };
@@ -64771,6 +66103,203 @@ log_level = "debug"
         assert!(output.contains("matched"));
         assert!(output.contains("Wait-for"));
         assert!(output.contains("Audit ID: 7"));
+    }
+
+    fn make_send_submit_report(
+        state: frankenterm_core::robot_types::SubmitReceiptState,
+    ) -> frankenterm_core::verified_submit::VerifiedSubmitReport {
+        frankenterm_core::verified_submit::VerifiedSubmitReport {
+            state,
+            agent_type: Some("codex".to_string()),
+            profile_id: Some("codex.default".to_string()),
+            profile_version: Some("2026-06-08".to_string()),
+            attempts: 1,
+            evidence_rule_ids: vec!["submit_profile:codex.default:composer_cleared:0".to_string()],
+            polls: 3,
+            cursor_before: Some("pane:1:capture:sha256:before".to_string()),
+            cursor_after: Some("pane:1:capture:sha256:after".to_string()),
+        }
+    }
+
+    #[test]
+    fn send_submit_receipt_is_replayable_from_audit_correlation() {
+        let decision = frankenterm_core::policy::PolicyDecision::Allow {
+            rule_id: Some("policy.allow".to_string()),
+            context: None,
+        };
+        let injection = frankenterm_core::policy::InjectionResult::Allowed {
+            decision,
+            summary: "[redacted]".to_string(),
+            pane_id: 1,
+            action: frankenterm_core::policy::ActionKind::SendText,
+            audit_action_id: None,
+        };
+        let wait_for = RobotWaitForData {
+            pane_id: 1,
+            pattern: "READY".to_string(),
+            matched: true,
+            elapsed_ms: 10,
+            polls: 2,
+            is_regex: false,
+        };
+        let verification_report =
+            make_send_submit_report(frankenterm_core::robot_types::SubmitReceiptState::Submitted);
+        let receipt = build_send_submit_receipt(
+            1,
+            "echo READY",
+            &injection,
+            Some(&wait_for),
+            Some(&verification_report),
+            15,
+        );
+
+        assert_eq!(
+            receipt.state,
+            frankenterm_core::robot_types::SubmitReceiptState::Submitted
+        );
+        assert_eq!(
+            receipt.evidence_rule_ids,
+            vec![
+                "policy.allow",
+                "submit_profile:codex.default:composer_cleared:0"
+            ]
+        );
+        assert_eq!(receipt.profile_id.as_deref(), Some("codex.default"));
+        assert_eq!(receipt.polls, 3);
+        assert_eq!(
+            receipt.idempotency_key,
+            frankenterm_core::robot_idempotency::send_text_key(1, "echo READY").to_string()
+        );
+
+        let mut audit_record = injection.to_audit_record(
+            frankenterm_core::policy::ActorKind::Robot,
+            None,
+            Some("local".to_string()),
+        );
+        attach_send_submit_receipt_to_audit_record(&mut audit_record, &receipt);
+
+        assert_eq!(
+            audit_record.correlation_id.as_deref(),
+            Some(receipt.idempotency_key.as_str())
+        );
+        let stored: frankenterm_core::robot_types::SubmitReceipt = serde_json::from_str(
+            audit_record
+                .verification_summary
+                .as_deref()
+                .expect("receipt json"),
+        )
+        .expect("stored receipt parses");
+        assert_eq!(stored, receipt);
+    }
+
+    #[test]
+    fn send_submit_receipt_replays_from_storage_by_idempotency_key() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("create send receipt tempdir");
+            let db_path = dir.path().join("ft-send-receipt.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = frankenterm_core::storage::StorageHandle::new(&db_path)
+                .await
+                .expect("open storage");
+            storage
+                .upsert_pane(make_pane_record(1, "local", None))
+                .await
+                .expect("seed pane for audit FK");
+
+            let decision = frankenterm_core::policy::PolicyDecision::Allow {
+                rule_id: Some("policy.allow".to_string()),
+                context: None,
+            };
+            let injection = frankenterm_core::policy::InjectionResult::Allowed {
+                decision,
+                summary: "[redacted]".to_string(),
+                pane_id: 1,
+                action: frankenterm_core::policy::ActionKind::SendText,
+                audit_action_id: None,
+            };
+            let wait_for = RobotWaitForData {
+                pane_id: 1,
+                pattern: "READY".to_string(),
+                matched: true,
+                elapsed_ms: 10,
+                polls: 2,
+                is_regex: false,
+            };
+            let verification_report = make_send_submit_report(
+                frankenterm_core::robot_types::SubmitReceiptState::Submitted,
+            );
+            let receipt = build_send_submit_receipt(
+                1,
+                "echo READY",
+                &injection,
+                Some(&wait_for),
+                Some(&verification_report),
+                15,
+            );
+            let mut audit_record = injection.to_audit_record(
+                frankenterm_core::policy::ActorKind::Robot,
+                None,
+                Some("local".to_string()),
+            );
+            attach_send_submit_receipt_to_audit_record(&mut audit_record, &receipt);
+
+            storage
+                .record_audit_action_redacted(audit_record)
+                .await
+                .expect("persist receipt audit row");
+
+            let replayed =
+                get_send_submit_receipt_by_idempotency_key(&storage, &receipt.idempotency_key)
+                    .await
+                    .expect("lookup receipt by idempotency key")
+                    .expect("receipt should replay");
+            assert_eq!(replayed, receipt);
+
+            let missing = get_send_submit_receipt_by_idempotency_key(&storage, "rk:missing")
+                .await
+                .expect("lookup missing receipt");
+            assert!(missing.is_none());
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn send_submit_state_distinguishes_denial_and_typed_verification() {
+        let denied = frankenterm_core::policy::InjectionResult::Denied {
+            decision: frankenterm_core::policy::PolicyDecision::Deny {
+                reason: "Alt-screen active".to_string(),
+                rule_id: Some("policy.alt_screen".to_string()),
+                context: None,
+            },
+            summary: "[redacted]".to_string(),
+            pane_id: 9,
+            action: frankenterm_core::policy::ActionKind::SendText,
+            audit_action_id: None,
+        };
+        assert_eq!(
+            send_submit_state(&denied, None),
+            frankenterm_core::robot_types::SubmitReceiptState::PolicyDenied
+        );
+
+        let allowed = frankenterm_core::policy::InjectionResult::Allowed {
+            decision: frankenterm_core::policy::PolicyDecision::Allow {
+                rule_id: None,
+                context: None,
+            },
+            summary: "[redacted]".to_string(),
+            pane_id: 1,
+            action: frankenterm_core::policy::ActionKind::SendText,
+            audit_action_id: None,
+        };
+        let verification_report = make_send_submit_report(
+            frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer,
+        );
+
+        assert_eq!(
+            send_submit_state(&allowed, Some(&verification_report)),
+            frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer
+        );
     }
 
     #[test]
@@ -64792,6 +66321,7 @@ log_level = "debug"
             injection,
             wait_for: None,
             verification_error: Some("Timeout waiting for pattern 'READY'".to_string()),
+            submit: None,
             no_paste: false,
             no_newline: false,
         };
@@ -72597,6 +74127,46 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_agent_mail_outbox_parses_alias_manifest_and_entries() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "mail-outbox",
+            "--manifest",
+            "fixtures/agent-mail-outage-spool/manifest.json",
+            "--entry",
+            "fixtures/agent-mail-outage-spool/valid/agent-mail-unavailable.json",
+            "--entry",
+            "fixtures/agent-mail-outage-spool/valid/contact-blocked.json",
+        ])
+        .expect("robot agent-mail-outbox alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::AgentMailOutbox { manifest, entries }) => {
+                    assert_eq!(
+                        manifest.as_deref(),
+                        Some(Path::new("fixtures/agent-mail-outage-spool/manifest.json"))
+                    );
+                    assert_eq!(
+                        entries,
+                        vec![
+                            PathBuf::from(
+                                "fixtures/agent-mail-outage-spool/valid/agent-mail-unavailable.json",
+                            ),
+                            PathBuf::from(
+                                "fixtures/agent-mail-outage-spool/valid/contact-blocked.json",
+                            ),
+                        ]
+                    );
+                }
+                _ => panic!("expected RobotCommands::AgentMailOutbox"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn cli_attention_and_robot_attention_parse() {
         let cli = Cli::try_parse_from([
             "ft",
@@ -73060,6 +74630,10 @@ log_level = "debug"
                 && command.description.contains("read-only blocker radar")
         }));
         assert!(help.commands.iter().any(|command| {
+            command.name == "agent-mail-outbox"
+                && command.description.contains("fallback outbox entries")
+        }));
+        assert!(help.commands.iter().any(|command| {
             command.name == "swarm-capacity"
                 && command.description.contains("decision explanations")
         }));
@@ -73080,6 +74654,19 @@ log_level = "debug"
                 .iter()
                 .any(|example| example == &"ft robot --format toon blocker-radar frankenterm")
         );
+        let agent_mail_outbox = quick_start
+            .commands
+            .iter()
+            .find(|command| command.name == "agent-mail-outbox")
+            .expect("quick start should list agent-mail-outbox");
+        assert_eq!(
+            agent_mail_outbox.args,
+            "[--manifest <path>] [--entry <path> ...]"
+        );
+        assert!(agent_mail_outbox.examples.iter().any(|example| {
+            example
+                == &"ft robot --format toon agent-mail-outbox --entry fixtures/agent-mail-outage-spool/valid/agent-mail-unavailable.json"
+        }));
         let swarm_capacity = quick_start
             .commands
             .iter()
@@ -74193,6 +75780,119 @@ A  docs/new-proof.md\n";
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_robot_dom_output_of_parses_command_index() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "dom",
+            "output-of",
+            "9",
+            "--command-index",
+            "-1",
+        ])
+        .expect("robot dom output-of should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Dom { command }) => match command {
+                    RobotDomCommands::OutputOf {
+                        pane_id,
+                        command_index,
+                    } => {
+                        assert_eq!(pane_id, 9);
+                        assert_eq!(command_index, -1);
+                    }
+                    _ => panic!("expected RobotDomCommands::OutputOf"),
+                },
+                _ => panic!("expected RobotCommands::Dom"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn robot_dom_payload_serializes_json_and_toon_matrix() {
+        use frankenterm_core::robot_types::DomQueryKind;
+        use frankenterm_core::wezterm::{
+            MuxSemanticSnapshot, MuxSemanticZone, MuxSemanticZoneKind,
+        };
+
+        let snapshot = MuxSemanticSnapshot {
+            zones: vec![
+                MuxSemanticZone {
+                    start_y: 10,
+                    start_x: 0,
+                    end_y: 10,
+                    end_x: 1,
+                    semantic_type: MuxSemanticZoneKind::Prompt,
+                    text: "$ ".to_string(),
+                },
+                MuxSemanticZone {
+                    start_y: 10,
+                    start_x: 2,
+                    end_y: 10,
+                    end_x: 12,
+                    semantic_type: MuxSemanticZoneKind::Input,
+                    text: "cargo check".to_string(),
+                },
+                MuxSemanticZone {
+                    start_y: 11,
+                    start_x: 0,
+                    end_y: 11,
+                    end_x: 4,
+                    semantic_type: MuxSemanticZoneKind::Output,
+                    text: "done".to_string(),
+                },
+            ],
+            last_exit_code: Some(0),
+        };
+
+        let output = build_robot_dom_data(7, DomQueryKind::OutputOf, Some(-1), snapshot.clone());
+        assert!(!output.semantic_data_unavailable);
+        assert_eq!(output.source, "osc133");
+        assert_eq!(output.command.as_ref().unwrap().text, "cargo check");
+        assert_eq!(output.output.as_ref().unwrap().text, "done");
+
+        let exit_code = build_robot_dom_data(7, DomQueryKind::ExitCode, Some(-1), snapshot);
+        assert_eq!(exit_code.exit_code.as_ref().unwrap().code, 0);
+
+        let response = RobotResponse::success(output, 3);
+        let json_value = serde_json::to_value(&response).unwrap();
+        assert_eq!(json_value["data"]["source"], "osc133");
+        assert_eq!(json_value["data"]["semantic_data_unavailable"], false);
+        assert_eq!(json_value["data"]["output"]["text"], "done");
+
+        let toon = toon_rust::encode(json_value.clone(), None);
+        let decoded_toon = toon_rust::try_decode(&toon, None).expect("decode robot dom toon");
+        let decoded_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_toon, 0).join("\n");
+        let decoded_value: serde_json::Value =
+            serde_json::from_str(&decoded_json).expect("toon roundtrip json");
+        assert_eq!(decoded_value["data"]["query"], "output_of");
+        assert_eq!(decoded_value["data"]["zones"][1]["text"], "cargo check");
+
+        let unavailable = build_robot_dom_data(
+            8,
+            DomQueryKind::Zones,
+            None,
+            MuxSemanticSnapshot {
+                zones: vec![MuxSemanticZone {
+                    start_y: 0,
+                    start_x: 0,
+                    end_y: 0,
+                    end_x: 5,
+                    semantic_type: MuxSemanticZoneKind::Output,
+                    text: "plain".to_string(),
+                }],
+                last_exit_code: None,
+            },
+        );
+        assert!(unavailable.semantic_data_unavailable);
+        assert_eq!(unavailable.source, "unavailable");
+        assert!(unavailable.zones.is_empty());
     }
 
     #[test]
@@ -76167,6 +77867,72 @@ A  docs/new-proof.md\n";
 
         assert_eq!(overall, "ok");
         assert!(!has_errors);
+    }
+
+    #[test]
+    fn doctor_json_exposes_shadow_mode_contract() {
+        let shadow_mode_report =
+            frankenterm_core::shadow_mode_evaluator::shadow_mode_doctor_report();
+        let mut result = doctor_build_envelope(&[]);
+        result["shadow_mode"] =
+            serde_json::to_value(&shadow_mode_report).expect("shadow mode report serializes");
+
+        let shadow_mode = &result["shadow_mode"];
+        assert_eq!(
+            shadow_mode["schema_version"],
+            frankenterm_core::shadow_mode_evaluator::SHADOW_MODE_DOCTOR_SCHEMA_VERSION
+        );
+        assert_eq!(shadow_mode["status"], "ready_no_samples");
+        assert_eq!(shadow_mode["observe_only"], true);
+        assert_eq!(shadow_mode["production_behavior_changed"], false);
+        assert_eq!(shadow_mode["live_mutation_allowed"], false);
+        assert_eq!(shadow_mode["totals"]["engines_total"], 5);
+        assert_eq!(shadow_mode["totals"]["engines_ready_without_samples"], 2);
+        assert_eq!(shadow_mode["totals"]["engines_dormant_not_wired"], 3);
+
+        let engines = shadow_mode["engines"]
+            .as_array()
+            .expect("shadow mode engines should be an array");
+        for engine in engines {
+            let engine_id = engine["engine_id"]
+                .as_str()
+                .expect("shadow mode engine_id should be a string");
+            let counts = engine["counts"]
+                .as_object()
+                .expect("shadow mode engine counts should be an object");
+            for field in [
+                "baseline_decisions",
+                "shadow_decisions",
+                "matches",
+                "minor_divergences",
+                "major_divergences",
+                "missing_executions",
+                "unexpected_executions",
+                "agent_divergences",
+                "low_confidence_recommendations",
+            ] {
+                assert!(
+                    counts.contains_key(field),
+                    "shadow mode engine {engine_id} missing count field {field}"
+                );
+            }
+            assert_eq!(engine["observe_only"], true);
+            assert_eq!(engine["production_behavior_changed"], false);
+            assert_eq!(engine["live_mutation_allowed"], false);
+        }
+
+        assert!(engines.iter().any(|engine| {
+            engine["engine_id"] == "mission_loop_assignments"
+                && engine["feed_state"] == "no_live_samples"
+        }));
+        assert!(engines.iter().any(|engine| {
+            engine["engine_id"] == "generic_shadow_experiments"
+                && engine["feed_state"] == "no_live_samples"
+        }));
+        assert!(engines.iter().any(|engine| {
+            engine["engine_id"] == "bocpd_change_points"
+                && engine["feed_state"] == "dormant_not_wired"
+        }));
     }
 
     #[test]

@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-dom.json",
+  "title": "WA Robot DOM Response",
+  "description": "Schema for the data field when calling 'ft robot dom ...'. Returns live OSC 133 semantic zones and selected command metadata.",
+  "type": "object",
+  "required": [
+    "pane_id",
+    "query",
+    "source",
+    "confidence",
+    "semantic_data_unavailable",
+    "unavailable_reason",
+    "requested_command_index",
+    "zones",
+    "command",
+    "output",
+    "exit_code"
+  ],
+  "properties": {
+    "pane_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "query": {
+      "type": "string",
+      "enum": ["zones", "last_command", "output_of", "exit_code"]
+    },
+    "source": {
+      "type": "string",
+      "enum": ["osc133", "unavailable"]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "semantic_data_unavailable": {
+      "type": "boolean"
+    },
+    "unavailable_reason": {
+      "type": ["string", "null"]
+    },
+    "requested_command_index": {
+      "type": ["integer", "null"]
+    },
+    "zones": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/semantic_zone"
+      }
+    },
+    "command": {
+      "anyOf": [{ "$ref": "#/$defs/command" }, { "type": "null" }]
+    },
+    "output": {
+      "anyOf": [{ "$ref": "#/$defs/output" }, { "type": "null" }]
+    },
+    "exit_code": {
+      "anyOf": [{ "$ref": "#/$defs/exit_code" }, { "type": "null" }]
+    }
+  },
+  "$defs": {
+    "semantic_zone": {
+      "type": "object",
+      "required": ["start_y", "start_x", "end_y", "end_x", "semantic_type", "text"],
+      "properties": {
+        "start_y": {
+          "type": "integer"
+        },
+        "start_x": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_y": {
+          "type": "integer"
+        },
+        "end_x": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "semantic_type": {
+          "type": "string",
+          "enum": ["prompt", "input", "output"]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "command": {
+      "type": "object",
+      "required": ["command_index", "text", "zone"],
+      "properties": {
+        "command_index": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "zone": {
+          "$ref": "#/$defs/semantic_zone"
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "type": "object",
+      "required": ["command_index", "text", "zone"],
+      "properties": {
+        "command_index": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "zone": {
+          "$ref": "#/$defs/semantic_zone"
+        }
+      },
+      "additionalProperties": false
+    },
+    "exit_code": {
+      "type": "object",
+      "required": ["command_index", "code"],
+      "properties": {
+        "command_index": {
+          "type": "integer"
+        },
+        "code": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

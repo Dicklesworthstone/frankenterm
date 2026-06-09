@@ -583,6 +583,34 @@ schema_match_test!(
 );
 
 schema_match_test!(
+    schema_dom,
+    DomData,
+    "wa-robot-dom.json",
+    json!({
+        "pane_id": 1,
+        "query": "zones",
+        "source": "osc133",
+        "confidence": 1.0,
+        "semantic_data_unavailable": false,
+        "unavailable_reason": null,
+        "requested_command_index": null,
+        "zones": [
+            {
+                "start_y": 4,
+                "start_x": 0,
+                "end_y": 4,
+                "end_x": 11,
+                "semantic_type": "input",
+                "text": "cargo check"
+            }
+        ],
+        "command": null,
+        "output": null,
+        "exit_code": null
+    })
+);
+
+schema_match_test!(
     schema_events,
     EventsData,
     "wa-robot-events.json",

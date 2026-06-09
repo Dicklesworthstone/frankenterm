@@ -1,0 +1,38 @@
+{
+  "profile_id": "codex.default",
+  "agent_type": "codex",
+  "covered_states": [
+    "composer_nonempty",
+    "composer_cleared",
+    "working_state",
+    "queued_behind_operation",
+    "crash_to_shell"
+  ],
+  "samples": {
+    "composer_nonempty": [
+      "Type your message",
+      "Press Enter to send",
+      "ctrl+j for newline"
+    ],
+    "composer_cleared": [
+      "Thinking",
+      "working",
+      "Token usage:"
+    ],
+    "working_state": [
+      "Running command",
+      "Reading file",
+      "Editing file"
+    ],
+    "queued_behind_operation": [
+      "waiting for approval",
+      "operation in progress",
+      "queued"
+    ],
+    "crash_to_shell": [
+      "thread 'main' panicked",
+      "Traceback (most recent call last)",
+      "codex resume"
+    ]
+  }
+}

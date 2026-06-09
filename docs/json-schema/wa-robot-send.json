@@ -2,66 +2,129 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-send.json",
   "title": "WA Robot Send Response",
-  "description": "Schema for the data field when calling 'wa robot send <pane_id> <text>'. Confirms text was sent.",
+  "description": "Schema for the data field when calling 'ft robot send <pane_id> <text>'. Returns the policy-gated injection result, optional wait-for verification, and an optional durable submit receipt.",
   "type": "object",
-  "required": ["pane_id", "sent", "policy_decision"],
+  "required": ["pane_id", "injection"],
   "properties": {
     "pane_id": {
       "type": "integer",
       "minimum": 0,
-      "description": "The pane ID text was sent to"
+      "description": "The pane ID targeted by the send action."
     },
-    "sent": {
-      "type": "boolean",
-      "description": "Whether the text was actually sent (false if dry_run or policy denied)"
+    "injection": {
+      "type": "object",
+      "description": "Policy-gated injection result serialized from the live InjectionResult enum.",
+      "additionalProperties": true
     },
-    "text_length": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Length of text that was sent (redacted content not counted)"
+    "wait_for": {
+      "$ref": "#/$defs/wait_for",
+      "description": "If --wait-for was specified and the send executed, the result of waiting for confirmation."
     },
-    "policy_decision": {
+    "verification_error": {
       "type": "string",
-      "enum": ["allow", "deny", "require_approval"],
-      "description": "The policy decision for this send action"
+      "description": "Post-send verification error, such as a wait-for timeout."
     },
-    "policy_reason": {
-      "type": "string",
-      "description": "Explanation of the policy decision"
+    "submit": {
+      "$ref": "#/$defs/submit_receipt",
+      "description": "Durable idempotent send receipt persisted with the audit action."
     },
     "dry_run": {
       "type": "boolean",
-      "description": "True if this was a dry-run (no actual send occurred)"
-    },
-    "wait_for_result": {
-      "$ref": "#/$defs/wait_result",
-      "description": "If --wait-for was specified, the result of waiting for confirmation"
+      "description": "True on MCP dry-run send responses."
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "wait_result": {
+    "wait_for": {
       "type": "object",
-      "description": "Result of waiting for a condition after send",
-      "required": ["condition", "matched"],
+      "description": "Result of waiting for a pattern after send.",
+      "required": ["pane_id", "pattern", "matched", "elapsed_ms", "polls"],
       "properties": {
-        "condition": {
-          "type": "string",
-          "description": "What was being waited for (e.g., 'prompt_boundary', pattern rule_id)"
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pattern": {
+          "type": "string"
         },
         "matched": {
-          "type": "boolean",
-          "description": "Whether the condition was satisfied"
+          "type": "boolean"
         },
-        "timeout_ms": {
+        "elapsed_ms": {
           "type": "integer",
-          "minimum": 0,
-          "description": "Timeout that was used"
+          "minimum": 0
         },
-        "waited_ms": {
+        "polls": {
           "type": "integer",
-          "minimum": 0,
-          "description": "How long the wait actually took"
+          "minimum": 0
+        },
+        "is_regex": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "submit_receipt": {
+      "type": "object",
+      "description": "Replayable receipt for a send submission.",
+      "required": [
+        "state",
+        "attempts",
+        "evidence_rule_ids",
+        "elapsed_ms",
+        "polls",
+        "idempotency_key"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+            "enum": [
+              "submitted",
+              "queued_behind_operation",
+              "stuck_in_composer",
+              "pane_crashed_to_shell",
+              "verification_unavailable",
+              "policy_denied",
+              "requires_approval",
+              "send_failed"
+          ]
+        },
+        "agent_type": {
+          "type": "string"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_version": {
+          "type": "string"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_rule_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "polls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cursor_before": {
+          "type": "string"
+        },
+        "cursor_after": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": false

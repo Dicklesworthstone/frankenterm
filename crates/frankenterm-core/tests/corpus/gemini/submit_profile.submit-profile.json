@@ -1,0 +1,38 @@
+{
+  "profile_id": "gemini.default",
+  "agent_type": "gemini",
+  "covered_states": [
+    "composer_nonempty",
+    "composer_cleared",
+    "working_state",
+    "queued_behind_operation",
+    "crash_to_shell"
+  ],
+  "samples": {
+    "composer_nonempty": [
+      "Gemini",
+      "Press Enter to send",
+      "Ctrl+J"
+    ],
+    "composer_cleared": [
+      "Responding with gemini-",
+      "Using model",
+      "Interaction Summary"
+    ],
+    "working_state": [
+      "Responding with gemini-",
+      "Using model",
+      "Tool Calls:"
+    ],
+    "queued_behind_operation": [
+      "authorize this app",
+      "complete authentication",
+      "sign in with Google"
+    ],
+    "crash_to_shell": [
+      "UnhandledPromiseRejection",
+      "Traceback (most recent call last)",
+      "gemini resume"
+    ]
+  }
+}

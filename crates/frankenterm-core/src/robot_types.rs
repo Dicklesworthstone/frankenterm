@@ -567,6 +567,75 @@ pub struct GetTextData {
     pub truncation_info: Option<TruncationInfo>,
 }
 
+/// Response data for `ft robot dom ...`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomData {
+    pub pane_id: u64,
+    pub query: DomQueryKind,
+    pub source: String,
+    pub confidence: f64,
+    pub semantic_data_unavailable: bool,
+    pub unavailable_reason: Option<String>,
+    pub requested_command_index: Option<i64>,
+    pub zones: Vec<DomSemanticZone>,
+    pub command: Option<DomCommandData>,
+    pub output: Option<DomCommandOutputData>,
+    pub exit_code: Option<DomExitCodeData>,
+}
+
+/// `ft robot dom` query kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomQueryKind {
+    Zones,
+    LastCommand,
+    OutputOf,
+    ExitCode,
+}
+
+/// Semantic zone entry returned by `ft robot dom`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomSemanticZone {
+    pub start_y: isize,
+    pub start_x: usize,
+    pub end_y: isize,
+    pub end_x: usize,
+    pub semantic_type: DomSemanticZoneKind,
+    pub text: String,
+}
+
+/// Semantic type for a `ft robot dom` zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomSemanticZoneKind {
+    Prompt,
+    Input,
+    Output,
+}
+
+/// Command input selected by a `ft robot dom` query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomCommandData {
+    pub command_index: i64,
+    pub text: String,
+    pub zone: DomSemanticZone,
+}
+
+/// Command output selected by a `ft robot dom output-of` query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomCommandOutputData {
+    pub command_index: i64,
+    pub text: String,
+    pub zone: DomSemanticZone,
+}
+
+/// Exit status selected by a `ft robot dom exit-code` query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomExitCodeData {
+    pub command_index: i64,
+    pub code: i32,
+}
+
 /// Response data for batched `ft robot get-text --panes ...` and `--all`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchGetTextData {
@@ -641,6 +710,60 @@ pub struct SendData {
     pub wait_for: Option<WaitForData>,
     #[serde(default)]
     pub verification_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit: Option<SubmitReceipt>,
+}
+
+/// Durable submission state for a mutating send operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitReceiptState {
+    Submitted,
+    QueuedBehindOperation,
+    StuckInComposer,
+    PaneCrashedToShell,
+    VerificationUnavailable,
+    PolicyDenied,
+    RequiresApproval,
+    SendFailed,
+}
+
+impl SubmitReceiptState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::QueuedBehindOperation => "queued_behind_operation",
+            Self::StuckInComposer => "stuck_in_composer",
+            Self::PaneCrashedToShell => "pane_crashed_to_shell",
+            Self::VerificationUnavailable => "verification_unavailable",
+            Self::PolicyDenied => "policy_denied",
+            Self::RequiresApproval => "requires_approval",
+            Self::SendFailed => "send_failed",
+        }
+    }
+}
+
+/// Idempotent send receipt persisted with the corresponding audit action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitReceipt {
+    pub state: SubmitReceiptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_version: Option<String>,
+    pub attempts: u32,
+    #[serde(default)]
+    pub evidence_rule_ids: Vec<String>,
+    pub elapsed_ms: u64,
+    pub polls: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_after: Option<String>,
+    pub idempotency_key: String,
 }
 
 /// Wait-for result data (used by send and wait-for commands).
@@ -4094,6 +4217,107 @@ mod tests {
         let data = resp.into_result().unwrap();
         assert_eq!(data.pane_id, 1);
         assert!(data.injection.is_object());
+        assert!(data.submit.is_none());
+    }
+
+    #[test]
+    fn send_data_parses_submit_receipt() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "pane_id": 1,
+                "injection": {"status": "allowed", "summary": "echo hello", "pane_id": 1, "action": "send_text", "decision": {"decision": "allow"}},
+                "submit": {
+                    "state": "queued_behind_operation",
+                    "agent_type": "codex",
+                    "profile_id": "default",
+                    "profile_version": "2026-06-07",
+                    "attempts": 1,
+                    "evidence_rule_ids": ["policy.allow"],
+                    "elapsed_ms": 50,
+                    "polls": 3,
+                    "cursor_before": "pane:1:seq:10",
+                    "cursor_after": "pane:1:seq:12",
+                    "idempotency_key": "rk:0123456789abcdef"
+                }
+            },
+            "elapsed_ms": 50,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<SendData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        let submit = data.submit.expect("submit receipt");
+
+        assert_eq!(submit.state, SubmitReceiptState::QueuedBehindOperation);
+        assert_eq!(submit.agent_type.as_deref(), Some("codex"));
+        assert_eq!(submit.profile_id.as_deref(), Some("default"));
+        assert_eq!(submit.profile_version.as_deref(), Some("2026-06-07"));
+        assert_eq!(submit.attempts, 1);
+        assert_eq!(submit.evidence_rule_ids, vec!["policy.allow"]);
+        assert_eq!(submit.elapsed_ms, 50);
+        assert_eq!(submit.polls, 3);
+        assert_eq!(submit.cursor_before.as_deref(), Some("pane:1:seq:10"));
+        assert_eq!(submit.cursor_after.as_deref(), Some("pane:1:seq:12"));
+        assert_eq!(submit.idempotency_key, "rk:0123456789abcdef");
+    }
+
+    #[test]
+    fn submit_receipt_round_trips_through_json_and_toon() {
+        fn normalize_integral_toon_numbers(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        normalize_integral_toon_numbers(item);
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for value in map.values_mut() {
+                        normalize_integral_toon_numbers(value);
+                    }
+                }
+                serde_json::Value::Number(number) => {
+                    if let Some(float) = number.as_f64() {
+                        #[allow(clippy::cast_precision_loss)]
+                        let max_u64 = u64::MAX as f64;
+                        if float.fract() == 0.0 && float >= 0.0 && float <= max_u64 {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let integer = float as u64;
+                            *value = serde_json::Value::Number(serde_json::Number::from(integer));
+                        }
+                    }
+                }
+                serde_json::Value::Bool(_)
+                | serde_json::Value::Null
+                | serde_json::Value::String(_) => {}
+            }
+        }
+
+        let receipt = SubmitReceipt {
+            state: SubmitReceiptState::Submitted,
+            agent_type: None,
+            profile_id: None,
+            profile_version: None,
+            attempts: 1,
+            evidence_rule_ids: vec!["policy.allow".to_string()],
+            elapsed_ms: 9,
+            polls: 0,
+            cursor_before: None,
+            cursor_after: None,
+            idempotency_key: "rk:feedfacecafebeef".to_string(),
+        };
+        let json = serde_json::to_value(&receipt).unwrap();
+        let back: SubmitReceipt = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, receipt);
+
+        let toon = toon_rust::encode(json, None);
+        let decoded = toon_rust::try_decode(&toon, None).expect("decode submit receipt toon");
+        let decoded_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+        let mut decoded_value: serde_json::Value = serde_json::from_str(&decoded_json).unwrap();
+        normalize_integral_toon_numbers(&mut decoded_value);
+        let roundtripped: SubmitReceipt = serde_json::from_value(decoded_value).unwrap();
+        assert_eq!(roundtripped, receipt);
     }
 
     #[test]

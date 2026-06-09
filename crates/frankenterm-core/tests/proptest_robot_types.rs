@@ -230,6 +230,62 @@ fn arb_wait_for_data() -> impl Strategy<Value = WaitForData> {
         )
 }
 
+fn arb_submit_receipt_state() -> impl Strategy<Value = SubmitReceiptState> {
+    prop_oneof![
+        Just(SubmitReceiptState::Submitted),
+        Just(SubmitReceiptState::QueuedBehindOperation),
+        Just(SubmitReceiptState::StuckInComposer),
+        Just(SubmitReceiptState::PaneCrashedToShell),
+        Just(SubmitReceiptState::VerificationUnavailable),
+        Just(SubmitReceiptState::PolicyDenied),
+        Just(SubmitReceiptState::RequiresApproval),
+        Just(SubmitReceiptState::SendFailed),
+    ]
+}
+
+fn arb_submit_receipt() -> impl Strategy<Value = SubmitReceipt> {
+    (
+        arb_submit_receipt_state(),
+        proptest::option::of("[a-z_]{3,16}"),
+        proptest::option::of("[a-z0-9_-]{3,24}"),
+        proptest::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}"),
+        1_u32..5,
+        proptest::collection::vec("[a-z.]{3,30}", 0..4),
+        0_u64..60_000,
+        0_usize..100,
+        proptest::option::of("[a-z0-9:._-]{3,32}"),
+        proptest::option::of("[a-z0-9:._-]{3,32}"),
+        "[a-z0-9:]{4,32}",
+    )
+        .prop_map(
+            |(
+                state,
+                agent_type,
+                profile_id,
+                profile_version,
+                attempts,
+                evidence_rule_ids,
+                elapsed_ms,
+                polls,
+                cursor_before,
+                cursor_after,
+                idempotency_key,
+            )| SubmitReceipt {
+                state,
+                agent_type,
+                profile_id,
+                profile_version,
+                attempts,
+                evidence_rule_ids,
+                elapsed_ms,
+                polls,
+                cursor_before,
+                cursor_after,
+                idempotency_key,
+            },
+        )
+}
+
 fn arb_search_hit() -> impl Strategy<Value = SearchHit> {
     (
         0i64..100_000,
@@ -784,14 +840,18 @@ fn arb_event_item() -> impl Strategy<Value = EventItem> {
 }
 
 fn arb_send_data() -> impl Strategy<Value = SendData> {
-    (any::<u64>(), proptest::option::of("[a-z ]{5,30}")).prop_map(
-        |(pane_id, verification_error)| SendData {
+    (
+        any::<u64>(),
+        proptest::option::of("[a-z ]{5,30}"),
+        proptest::option::of(arb_submit_receipt()),
+    )
+        .prop_map(|(pane_id, verification_error, submit)| SendData {
             pane_id,
             injection: serde_json::json!({"text": "hello"}),
             wait_for: None,
             verification_error,
-        },
-    )
+            submit,
+        })
 }
 
 fn arb_pane_state_data() -> impl Strategy<Value = PaneStateData> {
@@ -935,12 +995,20 @@ proptest! {
         let back: SendData = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.pane_id, data.pane_id);
         prop_assert_eq!(back.verification_error, data.verification_error);
+        prop_assert_eq!(back.submit, data.submit);
     }
 
     #[test]
     fn prop_send_data_json_has_pane_id(data in arb_send_data()) {
         let json = serde_json::to_string(&data).unwrap();
         prop_assert!(json.contains("\"pane_id\""));
+    }
+
+    #[test]
+    fn prop_submit_receipt_serde_roundtrip(receipt in arb_submit_receipt()) {
+        let json = serde_json::to_string(&receipt).unwrap();
+        let back: SubmitReceipt = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, receipt);
     }
 }
 
