@@ -460,6 +460,7 @@ pub mod recorder_replay;
 pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
+pub mod redact_backfill;
 pub mod redactor;
 pub mod redactor_coverage_matrix;
 pub mod redraw_predicate_telemetry;

@@ -984,6 +984,23 @@ SEE ALSO:
         command: SecretsCommands,
     },
 
+    /// Retroactive redaction maintenance over the at-rest corpus
+    #[command(after_help = r#"EXAMPLES:
+    ft redact backfill                 Re-redact stored segments + rebuild search index
+    ft redact backfill --dry-run       Count what would change, mutate nothing
+    ft redact backfill --format json   Machine-readable receipt
+    ft redact backfill --resume-after 45678   Resume an interrupted pass
+
+NOTE:
+    Offline maintenance like `ft db repair`: stop `ft watch` first.
+
+SEE ALSO:
+    ft secrets scan   Detect (don't rewrite) secrets in stored output"#)]
+    Redact {
+        #[command(subcommand)]
+        command: RedactCommands,
+    },
+
     /// Run diagnostics
     #[command(after_help = r#"EXAMPLES:
     ft doctor                         Run all environment checks
@@ -2974,6 +2991,47 @@ enum SecretsCommands {
         /// Filter by end time (epoch ms)
         #[arg(long)]
         until: Option<i64>,
+
+        /// Pretty-print JSON output
+        #[arg(long)]
+        pretty: bool,
+    },
+}
+
+/// `ft redact` — retroactive redaction maintenance (ft-7h5da.1.x / W0).
+#[derive(Subcommand)]
+enum RedactCommands {
+    /// Re-apply the current pattern catalog to at-rest output_segments and
+    /// rebuild derived stores (FTS5 / embeddings). Idempotent and resumable.
+    #[command(after_help = r#"EXAMPLES:
+    ft redact backfill
+    ft redact backfill --dry-run
+    ft redact backfill --batch-size 5000 --format json
+    ft redact backfill --resume-after 45678"#)]
+    Backfill {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Scan and count, but mutate nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Segments scanned per batch
+        #[arg(long, default_value = "1000")]
+        batch_size: u32,
+
+        /// Resume strictly after this segment id (0 = from the start)
+        #[arg(long, default_value = "0")]
+        resume_after: i64,
+
+        /// Skip rebuilding the FTS5 index after rewriting
+        #[arg(long)]
+        no_rebuild_fts: bool,
+
+        /// Keep (do not invalidate) embeddings for rewritten segments
+        #[arg(long)]
+        keep_embeddings: bool,
 
         /// Pretty-print JSON output
         #[arg(long)]
@@ -41475,6 +41533,97 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     render_report(&report, &format, pretty)?;
+                }
+            }
+        }
+
+        Some(Commands::Redact { command }) => {
+            use frankenterm_core::output::{OutputFormat, detect_format};
+            use frankenterm_core::redact_backfill::{
+                RedactBackfillConfig, run_redact_backfill_on_path,
+            };
+
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error: Failed to get workspace layout: {e}");
+                    eprintln!("Check --workspace or FT_WORKSPACE");
+                    std::process::exit(1);
+                }
+            };
+            if !layout.db_path.exists() {
+                eprintln!("Error: database not found at {}", layout.db_path.display());
+                eprintln!("Is the database initialized? Run 'ft watch' first.");
+                std::process::exit(1);
+            }
+            let db_path = layout.db_path.to_string_lossy().to_string();
+
+            match command {
+                RedactCommands::Backfill {
+                    format,
+                    dry_run,
+                    batch_size,
+                    resume_after,
+                    no_rebuild_fts,
+                    keep_embeddings,
+                    pretty,
+                } => {
+                    let cfg = RedactBackfillConfig {
+                        batch_size,
+                        dry_run,
+                        resume_after_id: resume_after,
+                        rebuild_fts: !no_rebuild_fts,
+                        invalidate_embeddings: !keep_embeddings,
+                    };
+
+                    // Offline maintenance over the db file (stop `ft watch` first).
+                    // The engine is synchronous SQLite work; running it inline in
+                    // this one-shot CLI task is fine — nothing else needs the executor.
+                    let receipt = match run_redact_backfill_on_path(&db_path, &cfg) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Error: redact backfill failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let output_format = match format.to_lowercase().as_str() {
+                        "json" => OutputFormat::Json,
+                        "plain" => OutputFormat::Plain,
+                        _ => detect_format(),
+                    };
+                    match output_format {
+                        OutputFormat::Json => {
+                            let rendered = if pretty {
+                                serde_json::to_string_pretty(&receipt)
+                            } else {
+                                serde_json::to_string(&receipt)
+                            }
+                            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+                            println!("{rendered}");
+                        }
+                        _ => {
+                            println!("{}", receipt.summary_line());
+                            println!("  catalog:  {}", receipt.catalog_version);
+                            println!("  patterns: {}", receipt.patterns_checked);
+                            if receipt.family_counts.is_empty() {
+                                println!("  families: (none matched)");
+                            } else {
+                                println!("  per-family redactions:");
+                                for (family, count) in &receipt.family_counts {
+                                    println!("    {family:<28} {count}");
+                                }
+                            }
+                            if receipt.tantivy_rebuild_requested {
+                                println!(
+                                    "  note: Tantivy reindex signaled (handled by the search daemon)"
+                                );
+                            }
+                            if receipt.dry_run {
+                                println!("  (dry-run: no changes were written)");
+                            }
+                        }
+                    }
                 }
             }
         }
