@@ -105,6 +105,7 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
 
 - `wa.send`
   - Params: `{ pane_id: u64, text: string, dry_run?: bool=false, wait_for?: string, timeout_secs?: u64=30, wait_for_regex?: bool=false }`
+  - Response notes: non-dry-run send responses may include `data.submit`, a durable submit receipt keyed by `idempotency_key` and aligned with the audit `correlation_id`.
 
 - `wa.wait_for`
   - Params: `{ pane_id: u64, pattern: string, timeout_secs?: u64=30, tail?: u64=200, regex?: bool=false }`

@@ -16,6 +16,7 @@ use crate::mcp_framework::{
     FrameworkResourceTemplate as ResourceTemplate, FrameworkToolHandler as ToolHandler,
 };
 
+use crate::agent_mail_outbox::{DEFAULT_OUTBOX_MANIFEST_PATH, load_agent_mail_outbox_surface};
 use crate::attention_router::{
     ATTENTION_ROUTER_MCP_CURRENT_URI, ATTENTION_ROUTER_MCP_ITEM_URI_TEMPLATE,
     AttentionRouterSourceAdapterInput, AttentionRouterSurface,
@@ -54,6 +55,7 @@ use crate::config::{Config, PaneFilterConfig};
 
 const PROOF_HISTORY_RESOURCE_URI: &str = "wa://proof-history";
 const PROOF_HISTORY_RELEASE_BLOCKING_URI: &str = "wa://proof-history/release-blocking";
+pub(super) const AGENT_MAIL_OUTBOX_RESOURCE_URI: &str = "wa://agent-mail/outbox";
 
 fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
     let Some(text) = contents.into_iter().find_map(|content| match content {
@@ -941,6 +943,76 @@ impl ResourceHandler for WaWorkflowsResource {
         };
         let envelope = McpEnvelope::success(data, elapsed_ms(start));
         envelope_as_resource("wa://workflows", envelope)
+    }
+}
+
+pub(super) struct WaAgentMailOutboxResource {
+    config: Arc<Config>,
+}
+
+impl WaAgentMailOutboxResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaAgentMailOutboxResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: AGENT_MAIL_OUTBOX_RESOURCE_URI.to_string(),
+            name: "ft agent mail outbox".to_string(),
+            description: Some(
+                "Read-only Agent Mail fallback outbox entries and replay state".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "agent-mail".to_string(),
+                "outbox".to_string(),
+                "coordination".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let layout = match self.config.workspace_layout(None) {
+            Ok(layout) => layout,
+            Err(error) => {
+                return envelope_as_resource(
+                    AGENT_MAIL_OUTBOX_RESOURCE_URI,
+                    McpEnvelope::<serde_json::Value>::error(
+                        MCP_ERR_CONFIG,
+                        format!("Resolve workspace layout: {error}"),
+                        Some(
+                            "Set FT_WORKSPACE or run the MCP server from the workspace root."
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    ),
+                );
+            }
+        };
+
+        match load_agent_mail_outbox_surface(&layout.root, None, &[]) {
+            Ok(surface) => envelope_as_resource(
+                AGENT_MAIL_OUTBOX_RESOURCE_URI,
+                McpEnvelope::success(surface, elapsed_ms(start)),
+            ),
+            Err(error) => envelope_as_resource(
+                AGENT_MAIL_OUTBOX_RESOURCE_URI,
+                McpEnvelope::<serde_json::Value>::error(
+                    MCP_ERR_INTERNAL,
+                    format!("Load Agent Mail outbox surface: {error}"),
+                    Some(format!(
+                        "Expected retained outbox manifest at {DEFAULT_OUTBOX_MANIFEST_PATH}."
+                    )),
+                    elapsed_ms(start),
+                ),
+            ),
+        }
     }
 }
 
@@ -1841,12 +1913,12 @@ impl ResourceHandler for WaReservationsByPaneTemplateResource {
 mod tests {
     use super::McpEnvelope;
     use super::{
-        WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
-        WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
-        WaEventsUnhandledTemplateResource, WaHerdWaveResource,
-        WaMissionObjectivePlanTemplateResource, WaOperatingEnvelopeCurrentResource,
-        WaOperatingEnvelopeRunTemplateResource, WaPanesResource,
-        WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
+        AGENT_MAIL_OUTBOX_RESOURCE_URI, WaAccountsByServiceTemplateResource, WaAccountsResource,
+        WaAgentMailOutboxResource, WaAttestationRetractionsResource, WaContextHorizonResource,
+        WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
+        WaHerdWaveResource, WaMissionObjectivePlanTemplateResource,
+        WaOperatingEnvelopeCurrentResource, WaOperatingEnvelopeRunTemplateResource,
+        WaPanesResource, WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
         WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
         WaRehearsalScoreSurfaceTemplateResource, WaRendererInputToPhotonResource,
         WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
@@ -2356,6 +2428,18 @@ mod tests {
     }
 
     #[test]
+    fn agent_mail_outbox_resource_definition_uri() {
+        let resource = WaAgentMailOutboxResource::new(Arc::new(Config::default()));
+        let def = resource.definition();
+        assert_eq!(def.uri, AGENT_MAIL_OUTBOX_RESOURCE_URI);
+        assert!(def.tags.contains(&"agent-mail".to_string()));
+        assert!(def.tags.contains(&"outbox".to_string()));
+        assert!(def.description.as_deref().is_some_and(|description| {
+            description.contains("fallback outbox") && description.contains("replay state")
+        }));
+    }
+
+    #[test]
     fn proof_history_resource_loader_uses_canonical_query_contract() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
@@ -2517,6 +2601,9 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaAgentMailOutboxResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
             WaSwarmCapacityCurrentResource.definition().uri,
             WaSwarmCapacityRunTemplateResource.definition().uri,
             WaOperatingEnvelopeCurrentResource.definition().uri,
@@ -2572,6 +2659,9 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
             WaRulesResource.definition().uri,
             WaWorkflowsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaAgentMailOutboxResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
             WaSwarmCapacityCurrentResource.definition().uri,

@@ -6,17 +6,18 @@
 use super::{
     AuditedToolHandler, Config, FormatAwareToolHandler, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
-    WaAttentionCurrentResource, WaAttentionItemTemplateResource, WaAttentionTool,
-    WaAttestationRetractionsResource, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
-    WaContextHorizonResource, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource,
-    WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource,
-    WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool,
-    WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool, WaMissionPauseTool,
-    WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeCurrentResource,
-    WaOperatingEnvelopeRunTemplateResource, WaOperatingEnvelopeTool, WaPanesResource,
-    WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
-    WaRehearsalScoreCurrentResource, WaRehearsalScoreSurfaceTemplateResource, WaRehearsalScoreTool,
-    WaReleaseTool, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
+    WaAgentMailOutboxResource, WaAttentionCurrentResource, WaAttentionItemTemplateResource,
+    WaAttentionTool, WaAttestationRetractionsResource, WaCassSearchTool, WaCassStatusTool,
+    WaCassViewTool, WaContextHorizonResource, WaEventsAnnotateTool, WaEventsLabelTool,
+    WaEventsResource, WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool,
+    WaEventsUnhandledTemplateResource, WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool,
+    WaMissionExplainTool, WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool,
+    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
+    WaOperatingEnvelopeCurrentResource, WaOperatingEnvelopeRunTemplateResource,
+    WaOperatingEnvelopeTool, WaPanesResource, WaProofHistoryReleaseBlockingResource,
+    WaProofHistoryResource, WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
+    WaRehearsalScoreSurfaceTemplateResource, WaRehearsalScoreTool, WaReleaseTool,
+    WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSwarmCapacityCurrentResource,
@@ -286,6 +287,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             db_path.clone(),
         ))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
+        .resource(WaAgentMailOutboxResource::new(Arc::clone(&config)))
         .resource(WaHerdWaveResource)
         .resource(WaMissionObjectivePlanTemplateResource)
         .resource(WaOperatingEnvelopeCurrentResource)
