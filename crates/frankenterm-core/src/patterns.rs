@@ -824,6 +824,136 @@ fn reserved_rule_prefix_agent_type(rule_id: &str) -> Option<AgentType> {
     }
 }
 
+/// Data-driven submit verification profile bundled with a pattern pack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitProfile {
+    /// Stable profile identifier, usually `<agent>.default`.
+    pub id: String,
+    /// Agent type this profile applies to.
+    pub agent_type: AgentType,
+    /// Profile data version. This is independent of the pack version so
+    /// downstream receipts can record exactly which submit heuristics ran.
+    pub version: String,
+    /// Anchor sets used by the verified-submit state machine.
+    pub anchors: SubmitProfileAnchors,
+    /// Optional remediation steps for verification failure states.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation: Vec<SubmitProfileRemediation>,
+}
+
+/// Required anchor groups for submit verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitProfileAnchors {
+    pub composer_nonempty: Vec<String>,
+    pub composer_cleared: Vec<String>,
+    pub working_state: Vec<String>,
+    pub queued_behind_operation: Vec<String>,
+    pub crash_to_shell: Vec<String>,
+}
+
+/// Data-only remediation for a submit profile state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitProfileRemediation {
+    pub when: String,
+    pub action: String,
+}
+
+impl SubmitProfile {
+    fn validate(&self) -> Result<()> {
+        validate_submit_profile_identity(self)?;
+        validate_submit_anchor_group(
+            &self.id,
+            "composer_nonempty",
+            &self.anchors.composer_nonempty,
+        )?;
+        validate_submit_anchor_group(&self.id, "composer_cleared", &self.anchors.composer_cleared)?;
+        validate_submit_anchor_group(&self.id, "working_state", &self.anchors.working_state)?;
+        validate_submit_anchor_group(
+            &self.id,
+            "queued_behind_operation",
+            &self.anchors.queued_behind_operation,
+        )?;
+        validate_submit_anchor_group(&self.id, "crash_to_shell", &self.anchors.crash_to_shell)?;
+
+        for step in &self.remediation {
+            if step.when.trim().is_empty() || step.action.trim().is_empty() {
+                return Err(PatternError::InvalidRule(format!(
+                    "submit profile '{}' has an empty remediation field",
+                    self.id
+                ))
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_submit_profile_identity(profile: &SubmitProfile) -> Result<()> {
+    if profile.id.trim().is_empty() {
+        return Err(
+            PatternError::InvalidRule("submit profile id cannot be empty".to_string()).into(),
+        );
+    }
+    if profile.id.chars().any(char::is_whitespace) {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile id '{}' cannot contain whitespace",
+            profile.id
+        ))
+        .into());
+    }
+    if !profile.id.contains('.')
+        || profile
+            .id
+            .split('.')
+            .any(|segment| segment.trim().is_empty())
+    {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile id '{}' must contain non-empty dot-separated segments",
+            profile.id
+        ))
+        .into());
+    }
+    if profile.version.trim().is_empty() {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile '{}' must include a non-empty version",
+            profile.id
+        ))
+        .into());
+    }
+    if matches!(profile.agent_type, AgentType::Unknown | AgentType::Wezterm) {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile '{}' must target a coding agent, not '{}'",
+            profile.id, profile.agent_type
+        ))
+        .into());
+    }
+    if let Some(expected_agent_type) = reserved_rule_prefix_agent_type(&profile.id) {
+        if profile.agent_type != expected_agent_type {
+            return Err(PatternError::InvalidRule(format!(
+                "submit profile '{}' has reserved prefix for agent_type '{}' but declares '{}'",
+                profile.id, expected_agent_type, profile.agent_type
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_submit_anchor_group(
+    profile_id: &str,
+    group_name: &str,
+    anchors: &[String],
+) -> Result<()> {
+    if anchors.is_empty() || anchors.iter().any(|anchor| anchor.trim().is_empty()) {
+        return Err(PatternError::InvalidRule(format!(
+            "submit profile '{profile_id}' must include at least one non-empty {group_name} anchor"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Pattern pack containing a set of rules
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternPack {
@@ -833,6 +963,9 @@ pub struct PatternPack {
     pub version: String,
     /// Rules in this pack
     pub rules: Vec<RuleDef>,
+    /// Optional submit verification profiles carried as pack data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submit_profiles: Vec<SubmitProfile>,
     /// Optional supply-chain manifest for user or extension pattern packs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supply_chain: Option<PatternPackSupplyChain>,
@@ -948,8 +1081,15 @@ impl PatternPack {
             name: name.into(),
             version: version.into(),
             rules,
+            submit_profiles: Vec::new(),
             supply_chain: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_submit_profiles(mut self, submit_profiles: Vec<SubmitProfile>) -> Self {
+        self.submit_profiles = submit_profiles;
+        self
     }
 
     #[must_use]
@@ -1003,6 +1143,8 @@ impl PatternPack {
             }
         }
 
+        self.validate_submit_profiles()?;
+
         Ok(())
     }
 
@@ -1021,6 +1163,23 @@ impl PatternPack {
             }
         }
 
+        self.validate_submit_profiles()?;
+
+        Ok(())
+    }
+
+    fn validate_submit_profiles(&self) -> Result<()> {
+        let mut seen = HashSet::new();
+        for profile in &self.submit_profiles {
+            profile.validate()?;
+            if !seen.insert(profile.id.as_str()) {
+                return Err(PatternError::InvalidRule(format!(
+                    "pack '{}' contains duplicate submit profile id '{}'",
+                    self.name, profile.id
+                ))
+                .into());
+            }
+        }
         Ok(())
     }
 }
@@ -1330,6 +1489,7 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 pub struct PatternLibrary {
     packs: Vec<PatternPack>,
     merged_rules: Vec<RuleDef>,
+    merged_submit_profiles: Vec<SubmitProfile>,
     rule_to_pack: HashMap<String, String>,
 }
 
@@ -1349,10 +1509,12 @@ impl PatternLibrary {
         }
 
         let merged_rules = merge_rules(&packs);
+        let merged_submit_profiles = merge_submit_profiles(&packs);
 
         Ok(Self {
             packs,
             merged_rules,
+            merged_submit_profiles,
             rule_to_pack,
         })
     }
@@ -1378,10 +1540,12 @@ impl PatternLibrary {
         }
 
         let merged_rules = merge_rules(&packs);
+        let merged_submit_profiles = merge_submit_profiles(&packs);
 
         Ok(Self {
             packs,
             merged_rules,
+            merged_submit_profiles,
             rule_to_pack,
         })
     }
@@ -1392,6 +1556,7 @@ impl PatternLibrary {
         Self {
             packs: Vec::new(),
             merged_rules: Vec::new(),
+            merged_submit_profiles: Vec::new(),
             rule_to_pack: HashMap::new(),
         }
     }
@@ -1406,6 +1571,20 @@ impl PatternLibrary {
     #[must_use]
     pub fn rules(&self) -> &[RuleDef] {
         &self.merged_rules
+    }
+
+    /// List merged submit profiles in deterministic order.
+    #[must_use]
+    pub fn submit_profiles(&self) -> &[SubmitProfile] {
+        &self.merged_submit_profiles
+    }
+
+    /// Return the first submit profile for an agent type, if any.
+    #[must_use]
+    pub fn submit_profile_for_agent(&self, agent_type: AgentType) -> Option<&SubmitProfile> {
+        self.merged_submit_profiles
+            .iter()
+            .find(|profile| profile.agent_type == agent_type)
     }
 
     fn pack_id_for_rule_id(&self, rule_id: &str) -> Option<&str> {
@@ -1627,6 +1806,20 @@ fn merge_rules(packs: &[PatternPack]) -> Vec<RuleDef> {
     let mut rules: Vec<RuleDef> = merged.into_values().collect();
     rules.sort_by(|a, b| a.id.cmp(&b.id));
     rules
+}
+
+fn merge_submit_profiles(packs: &[PatternPack]) -> Vec<SubmitProfile> {
+    let mut merged: HashMap<String, SubmitProfile> = HashMap::new();
+
+    for pack in packs {
+        for profile in &pack.submit_profiles {
+            merged.insert(profile.id.clone(), profile.clone());
+        }
+    }
+
+    let mut profiles: Vec<SubmitProfile> = merged.into_values().collect();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    profiles
 }
 
 fn builtin_packs() -> Vec<PatternPack> {
@@ -2181,11 +2374,69 @@ fn parse_severity_override(value: &str) -> Result<Severity> {
 /// Builtin core pack containing the default shipped ruleset.
 fn builtin_core_pack() -> PatternPack {
     let mut rules = Vec::new();
-    rules.extend(builtin_codex_pack().rules);
-    rules.extend(builtin_claude_code_pack().rules);
-    rules.extend(builtin_gemini_pack().rules);
+    let mut submit_profiles = Vec::new();
+
+    let codex = builtin_codex_pack();
+    rules.extend(codex.rules);
+    submit_profiles.extend(codex.submit_profiles);
+
+    let claude_code = builtin_claude_code_pack();
+    rules.extend(claude_code.rules);
+    submit_profiles.extend(claude_code.submit_profiles);
+
+    let gemini = builtin_gemini_pack();
+    rules.extend(gemini.rules);
+    submit_profiles.extend(gemini.submit_profiles);
+
     rules.extend(builtin_wezterm_pack().rules);
-    PatternPack::new("builtin:core", "0.1.0", rules)
+    PatternPack::new("builtin:core", "0.1.0", rules).with_submit_profiles(submit_profiles)
+}
+
+fn builtin_codex_submit_profile() -> SubmitProfile {
+    SubmitProfile {
+        id: "codex.default".to_string(),
+        agent_type: AgentType::Codex,
+        version: "2026-06-08".to_string(),
+        anchors: SubmitProfileAnchors {
+            composer_nonempty: vec![
+                "Press Enter to send".to_string(),
+                "ctrl+j for newline".to_string(),
+                "Type your message".to_string(),
+            ],
+            composer_cleared: vec![
+                "Thinking".to_string(),
+                "working".to_string(),
+                "Token usage:".to_string(),
+            ],
+            working_state: vec![
+                "Thinking".to_string(),
+                "Running".to_string(),
+                "Reading".to_string(),
+                "Editing".to_string(),
+            ],
+            queued_behind_operation: vec![
+                "waiting for approval".to_string(),
+                "operation in progress".to_string(),
+                "queued".to_string(),
+            ],
+            crash_to_shell: vec![
+                "thread 'main' panicked".to_string(),
+                "Traceback (most recent call last)".to_string(),
+                "Segmentation fault".to_string(),
+                "codex resume".to_string(),
+            ],
+        },
+        remediation: vec![
+            SubmitProfileRemediation {
+                when: "queued_behind_operation".to_string(),
+                action: "Wait for the current tool call or approval gate before retrying submit verification.".to_string(),
+            },
+            SubmitProfileRemediation {
+                when: "crash_to_shell".to_string(),
+                action: "Capture the pane tail and surface verification_unavailable without resending input.".to_string(),
+            },
+        ],
+    }
 }
 
 /// Builtin Codex pack with rules for OpenAI Codex CLI detection
@@ -2350,6 +2601,54 @@ fn builtin_codex_pack() -> PatternPack {
             },
         ],
     )
+    .with_submit_profiles(vec![builtin_codex_submit_profile()])
+}
+
+fn builtin_claude_code_submit_profile() -> SubmitProfile {
+    SubmitProfile {
+        id: "claude_code.default".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        version: "2026-06-08".to_string(),
+        anchors: SubmitProfileAnchors {
+            composer_nonempty: vec![
+                ">".to_string(),
+                "shift+enter".to_string(),
+                "Press Enter to send".to_string(),
+            ],
+            composer_cleared: vec![
+                "Thinking".to_string(),
+                "Using tool".to_string(),
+                "Tool call:".to_string(),
+            ],
+            working_state: vec![
+                "Thinking".to_string(),
+                "Using tool".to_string(),
+                "Executing:".to_string(),
+                "Auto-compact".to_string(),
+            ],
+            queued_behind_operation: vec![
+                "Approve?".to_string(),
+                "Allow?".to_string(),
+                "Permission".to_string(),
+            ],
+            crash_to_shell: vec![
+                "Traceback (most recent call last)".to_string(),
+                "thread 'main' panicked".to_string(),
+                "Session ended".to_string(),
+                "Goodbye".to_string(),
+            ],
+        },
+        remediation: vec![
+            SubmitProfileRemediation {
+                when: "queued_behind_operation".to_string(),
+                action: "Treat approval prompts as requires_approval evidence instead of re-sending the prompt.".to_string(),
+            },
+            SubmitProfileRemediation {
+                when: "crash_to_shell".to_string(),
+                action: "Stop polling and return verification_unavailable with the crash evidence rule id.".to_string(),
+            },
+        ],
+    }
 }
 
 /// Builtin Claude Code pack with rules for Anthropic Claude Code detection
@@ -2732,6 +3031,53 @@ fn builtin_claude_code_pack() -> PatternPack {
             },
         ],
     )
+    .with_submit_profiles(vec![builtin_claude_code_submit_profile()])
+}
+
+fn builtin_gemini_submit_profile() -> SubmitProfile {
+    SubmitProfile {
+        id: "gemini.default".to_string(),
+        agent_type: AgentType::Gemini,
+        version: "2026-06-08".to_string(),
+        anchors: SubmitProfileAnchors {
+            composer_nonempty: vec![
+                "Gemini".to_string(),
+                "Press Enter to send".to_string(),
+                "Ctrl+J".to_string(),
+            ],
+            composer_cleared: vec![
+                "Responding with gemini-".to_string(),
+                "Using model".to_string(),
+                "Interaction Summary".to_string(),
+            ],
+            working_state: vec![
+                "Responding with gemini-".to_string(),
+                "Using model".to_string(),
+                "Tool Calls:".to_string(),
+            ],
+            queued_behind_operation: vec![
+                "authorize this app".to_string(),
+                "complete authentication".to_string(),
+                "sign in with Google".to_string(),
+            ],
+            crash_to_shell: vec![
+                "UnhandledPromiseRejection".to_string(),
+                "Traceback (most recent call last)".to_string(),
+                "Segmentation fault".to_string(),
+                "gemini resume".to_string(),
+            ],
+        },
+        remediation: vec![
+            SubmitProfileRemediation {
+                when: "queued_behind_operation".to_string(),
+                action: "Classify OAuth prompts as requires_approval/auth evidence and wait for the browser flow.".to_string(),
+            },
+            SubmitProfileRemediation {
+                when: "crash_to_shell".to_string(),
+                action: "Return verification_unavailable and preserve the resume hint when present.".to_string(),
+            },
+        ],
+    }
 }
 
 /// Builtin Gemini pack with rules for Google Gemini CLI detection
@@ -2891,6 +3237,7 @@ fn builtin_gemini_pack() -> PatternPack {
             },
         ],
     )
+    .with_submit_profiles(vec![builtin_gemini_submit_profile()])
 }
 
 /// Builtin WezTerm pack with rules for WezTerm multiplexer events
@@ -4044,6 +4391,18 @@ impl PatternEngine {
         self.library.rules()
     }
 
+    /// Access merged submit verification profiles.
+    #[must_use]
+    pub fn submit_profiles(&self) -> &[SubmitProfile] {
+        self.library.submit_profiles()
+    }
+
+    /// Return the submit verification profile for an agent type, if one is configured.
+    #[must_use]
+    pub fn submit_profile_for_agent(&self, agent_type: AgentType) -> Option<&SubmitProfile> {
+        self.library.submit_profile_for_agent(agent_type)
+    }
+
     /// Access the loaded pattern packs.
     #[must_use]
     pub fn packs(&self) -> &[PatternPack] {
@@ -4376,6 +4735,81 @@ rules:
                 .iter()
                 .any(|rule| rule.id == "wezterm.mux.connection_lost"),
             "builtin:core should include WezTerm default rules"
+        );
+    }
+
+    #[test]
+    fn builtin_core_loads_submit_profiles_for_supported_coding_agents() {
+        let config = PatternsConfig {
+            packs: vec!["builtin:core".to_string()],
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).expect("builtin:core should load");
+        let profile_ids = engine
+            .submit_profiles()
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(profile_ids.contains("codex.default"));
+        assert!(profile_ids.contains("claude_code.default"));
+        assert!(profile_ids.contains("gemini.default"));
+        assert_eq!(engine.submit_profiles().len(), 3);
+        assert!(engine.submit_profile_for_agent(AgentType::Codex).is_some());
+        assert!(
+            engine
+                .submit_profile_for_agent(AgentType::ClaudeCode)
+                .is_some()
+        );
+        assert!(engine.submit_profile_for_agent(AgentType::Gemini).is_some());
+        assert!(
+            engine
+                .submit_profile_for_agent(AgentType::Unknown)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn submit_profiles_round_trip_as_pattern_pack_data() {
+        let pack = builtin_codex_pack();
+        let json = serde_json::to_string(&pack).expect("serialize pack");
+        assert!(
+            json.contains("\"submit_profiles\""),
+            "submit profile data must serialize as pack data"
+        );
+
+        let decoded: PatternPack = serde_json::from_str(&json).expect("decode pattern pack");
+        let user_pack_names = HashSet::from([decoded.name.clone()]);
+        let library = PatternLibrary::new_with_user_packs(vec![decoded], &user_pack_names)
+            .expect("submit profile pack should validate");
+
+        let profile = library
+            .submit_profile_for_agent(AgentType::Codex)
+            .expect("codex submit profile");
+        assert_eq!(profile.id, "codex.default");
+        assert!(
+            profile
+                .anchors
+                .queued_behind_operation
+                .iter()
+                .any(|anchor| anchor == "queued")
+        );
+    }
+
+    #[test]
+    fn submit_profile_validation_rejects_missing_required_anchor_groups() {
+        let mut profile = builtin_codex_submit_profile();
+        profile.anchors.crash_to_shell.clear();
+        let pack = PatternPack::new("builtin:codex", "0.1.0", Vec::new())
+            .with_submit_profiles(vec![profile]);
+
+        let err = match PatternLibrary::new(vec![pack]) {
+            Ok(_) => panic!("empty crash_to_shell anchors must fail validation"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("crash_to_shell"),
+            "error should name the missing anchor group: {err}"
         );
     }
 

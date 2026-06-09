@@ -28,3 +28,26 @@ rules:
     description: Claude Code signaled context-window exhaustion.
     remediation: Trigger the compaction workflow and resume.
     workflow: compact_context
+submit_profiles:
+  - id: codex.default
+    agent_type: codex
+    version: "2026-06-08"
+    anchors:
+      composer_nonempty:
+        - "Press Enter to send"
+        - "Type your message"
+      composer_cleared:
+        - "Thinking"
+        - "Token usage:"
+      working_state:
+        - "Thinking"
+        - "Running"
+      queued_behind_operation:
+        - "waiting for approval"
+        - "queued"
+      crash_to_shell:
+        - "thread 'main' panicked"
+        - "codex resume"
+    remediation:
+      - when: queued_behind_operation
+        action: Wait for the current tool call or approval gate before retrying.

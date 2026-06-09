@@ -11,7 +11,8 @@
 ## At a glance
 
 A pattern pack is a single document with three required top-level
-fields and one optional supply-chain manifest:
+fields plus optional submit-profile data and an optional supply-chain
+manifest:
 
 ```yaml
 name: builtin:core
@@ -49,6 +50,7 @@ shape is the same across all three.
 | `name` | string | **MUST** | Pack identifier. Built-in packs use a `builtin:` prefix (`builtin:core`); user packs use a plain or namespaced name (`example.com:custom-rules`). MUST be non-empty after trimming. |
 | `version` | string | **MUST** | Pack version. Convention is semver-like (`"1.0.0"`) but the loader treats it as opaque; MUST be non-empty after trimming. |
 | `rules` | array of [Rule](#rule-fields) | **MUST** | The rule list. MAY be empty for an intentionally-stubbed pack, but every rule's `id` MUST be unique within the pack. |
+| `submit_profiles` | array of [SubmitProfile](#submit-profile-fields) | MAY | Verified-submit profiles carried as pack data. Every profile's `id` MUST be unique within the pack. |
 | `supply_chain` | object | MAY | Supply-chain verification manifest for user or extension packs. See [Supply-chain fields](#supply-chain-fields). |
 
 Unknown top-level fields are tolerated by the parser (default serde
@@ -80,6 +82,31 @@ the conformance gate enforces the JSON Schema `additionalProperties`
 contract: pack files MUST NOT carry unknown rule fields. CI treats
 unknown rule fields as a build failure even though the lower-level
 serde parser can still deserialize them.
+
+## Submit profile fields
+
+`submit_profiles` is data for the verified-submit state machine. It
+keeps per-agent composer and progress heuristics in the same maintenance
+lane as detection rules, so third-party UI drift is handled by updating
+pack data and corpus fixtures rather than verifier code.
+
+| Field | Type | Presence | Description |
+|-------|------|:--------:|-------------|
+| `id` | string | **MUST** | Stable profile identifier, usually `<agent>.default`. MUST be non-empty, dot-separated, and whitespace-free. |
+| `agent_type` | enum | **MUST** | One of `codex`, `claude_code`, `gemini`. `unknown` and terminal-runtime agents do not have submit profiles; unknown agents intentionally resolve to no profile and downstream verification reports `verification_unavailable`. |
+| `version` | string | **MUST** | Profile data version recorded by durable submit receipts. MUST be non-empty after trimming. |
+| `anchors` | object | **MUST** | Required anchor sets for the verifier. Each set MUST contain at least one non-empty string. |
+| `remediation` | array | MAY | Optional data-only remediation steps with `when` and `action` strings. |
+
+Required `anchors` fields:
+
+| Field | Description |
+|-------|-------------|
+| `composer_nonempty` | Evidence that the composer/input box still contains pending text. |
+| `composer_cleared` | Evidence that submitted text left the composer and the agent accepted the send. |
+| `working_state` | Evidence that the agent is actively processing after submission. |
+| `queued_behind_operation` | Evidence that submission is blocked behind an approval, tool call, auth flow, or other operation. |
+| `crash_to_shell` | Evidence that the agent exited or crashed back to a shell/resume state. |
 
 ## Supply-chain fields
 
@@ -118,6 +145,10 @@ is optional. When present, it has the following fields.
    namespace prefix (no bare `core.*` or `builtin:*` in user
    packs); regexes MUST NOT contain unbounded backreferences
    (`\1`+) that could enable catastrophic-backtracking DoS.
+3. **Submit profile validation**. Profile IDs are checked for
+   whitespace, dot-segment shape, duplicate IDs, supported coding-agent
+   type, reserved-prefix/agent consistency, non-empty version, non-empty
+   required anchor groups, and non-empty remediation fields.
 
 A pack that passes the JSON Schema check MAY still fail validation —
 the schema is a structural gate, not a semantic one.
@@ -129,6 +160,8 @@ file format has been **additive-only since v1**:
 
 - New OPTIONAL rule fields (e.g. `manual_fix`, `preview_command`,
   `learn_more_url` in recent commits) are backward-compatible.
+- New OPTIONAL top-level data fields such as `submit_profiles` are
+  backward-compatible because absent fields deserialize to empty data.
 - A REQUIRED field rename or removal is a breaking change and MUST
   be guarded by a `format_version` field bump (deferred until the
   first such change is needed).
@@ -187,10 +220,14 @@ each is exercised by at least one valid fixture. New OPTIONAL
 fields landing in `RuleDef` without a fixture update fail the
 matrix check.
 
+The same conformance fixture also exercises every submit-profile field.
+`ft robot rules lint --fixtures --strict` additionally checks that every
+loaded submit profile has a complete `.submit-profile.json` corpus
+fixture covering the five required anchor states.
+
 ## References
 
-- `crates/frankenterm-core/src/patterns.rs:619` — `PatternPack`
-- `crates/frankenterm-core/src/patterns.rs:487` — `RuleDef`
+- `crates/frankenterm-core/src/patterns.rs` — `PatternPack`, `RuleDef`, and `SubmitProfile`
 - `docs/json-schema/ft-pattern-pack.json` — companion JSON Schema
 - `tests/conformance_pattern_pack_format.rs` — CI gate
 - Sandbox commits: `6ab52765`, `0239fbd6`, `37384b01`

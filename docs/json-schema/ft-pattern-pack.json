@@ -24,6 +24,11 @@
       "description": "Rules in this pack. Every rule's `id` MUST be unique within the array.",
       "items": { "$ref": "#/$defs/Rule" }
     },
+    "submit_profiles": {
+      "type": "array",
+      "description": "Optional verified-submit profiles carried as pattern-pack data. Every profile's `id` MUST be unique within the array.",
+      "items": { "$ref": "#/$defs/SubmitProfile" }
+    },
     "supply_chain": {
       "oneOf": [
         { "$ref": "#/$defs/SupplyChain" },
@@ -109,6 +114,58 @@
           "pattern": "\\S",
           "description": "URL for additional documentation about this rule."
         }
+      }
+    },
+    "SubmitProfile": {
+      "type": "object",
+      "required": ["id", "agent_type", "version", "anchors"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Stable submit profile identifier, usually `<agent>.default`."
+        },
+        "agent_type": { "$ref": "#/$defs/SubmitProfileAgentType" },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Profile data version recorded by durable submit receipts."
+        },
+        "anchors": { "$ref": "#/$defs/SubmitProfileAnchors" },
+        "remediation": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SubmitProfileRemediation" }
+        }
+      }
+    },
+    "SubmitProfileAnchors": {
+      "type": "object",
+      "required": [
+        "composer_nonempty",
+        "composer_cleared",
+        "working_state",
+        "queued_behind_operation",
+        "crash_to_shell"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "composer_nonempty": { "$ref": "#/$defs/NonEmptyStringArray" },
+        "composer_cleared": { "$ref": "#/$defs/NonEmptyStringArray" },
+        "working_state": { "$ref": "#/$defs/NonEmptyStringArray" },
+        "queued_behind_operation": { "$ref": "#/$defs/NonEmptyStringArray" },
+        "crash_to_shell": { "$ref": "#/$defs/NonEmptyStringArray" }
+      }
+    },
+    "SubmitProfileRemediation": {
+      "type": "object",
+      "required": ["when", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "when": { "$ref": "#/$defs/NonBlankString" },
+        "action": { "$ref": "#/$defs/NonBlankString" }
       }
     },
     "SupplyChain": {
@@ -261,10 +318,20 @@
       "minLength": 1,
       "pattern": "\\S"
     },
+    "NonEmptyStringArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/NonBlankString" }
+    },
     "AgentType": {
       "type": "string",
       "enum": ["codex", "claude_code", "gemini", "wezterm", "unknown"],
       "description": "Snake-case serialization of frankenterm_core::patterns::AgentType."
+    },
+    "SubmitProfileAgentType": {
+      "type": "string",
+      "enum": ["codex", "claude_code", "gemini"],
+      "description": "Coding-agent subset accepted by SubmitProfile."
     },
     "Severity": {
       "type": "string",

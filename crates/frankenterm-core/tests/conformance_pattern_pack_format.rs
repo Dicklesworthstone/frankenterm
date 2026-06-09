@@ -408,6 +408,131 @@ fn every_documented_rule_field_is_exercised_by_some_valid_fixture() {
     );
 }
 
+#[test]
+fn every_documented_submit_profile_field_is_exercised_by_some_valid_fixture() {
+    let mut seen_profile_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut seen_anchor_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut seen_remediation_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
+    for path in discover_fixtures("valid") {
+        let value = parse_to_json_value(&path);
+        let Some(profiles) = value.get("submit_profiles").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for profile in profiles {
+            if let Some(obj) = profile.as_object() {
+                for key in obj.keys() {
+                    seen_profile_keys.insert(key.clone());
+                }
+            }
+            if let Some(anchor_obj) = profile.get("anchors").and_then(|v| v.as_object()) {
+                for key in anchor_obj.keys() {
+                    seen_anchor_keys.insert(key.clone());
+                }
+            }
+            if let Some(remediations) = profile.get("remediation").and_then(|v| v.as_array()) {
+                for step in remediations {
+                    if let Some(obj) = step.as_object() {
+                        for key in obj.keys() {
+                            seen_remediation_keys.insert(key.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let expected_profile_keys: std::collections::BTreeSet<String> =
+        ["id", "agent_type", "version", "anchors", "remediation"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+    let expected_anchor_keys: std::collections::BTreeSet<String> = [
+        "composer_nonempty",
+        "composer_cleared",
+        "working_state",
+        "queued_behind_operation",
+        "crash_to_shell",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let expected_remediation_keys: std::collections::BTreeSet<String> =
+        ["when", "action"].into_iter().map(String::from).collect();
+
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "phase": "submit_profile_coverage",
+            "suite": "pattern_pack_format",
+            "seen_profile_keys": seen_profile_keys.iter().collect::<Vec<_>>(),
+            "expected_profile_keys": expected_profile_keys.iter().collect::<Vec<_>>(),
+            "seen_anchor_keys": seen_anchor_keys.iter().collect::<Vec<_>>(),
+            "expected_anchor_keys": expected_anchor_keys.iter().collect::<Vec<_>>(),
+            "seen_remediation_keys": seen_remediation_keys.iter().collect::<Vec<_>>(),
+            "expected_remediation_keys": expected_remediation_keys.iter().collect::<Vec<_>>(),
+        })
+    );
+
+    let missing_profile_keys: Vec<String> = expected_profile_keys
+        .difference(&seen_profile_keys)
+        .cloned()
+        .collect();
+    assert!(
+        missing_profile_keys.is_empty(),
+        "SubmitProfile fields not exercised by any valid fixture: {missing_profile_keys:?}"
+    );
+    let unknown_profile_keys: Vec<String> = seen_profile_keys
+        .difference(&expected_profile_keys)
+        .cloned()
+        .collect();
+    assert!(
+        unknown_profile_keys.is_empty(),
+        "fixtures use submit profile keys not documented in docs/patterns-pack-format.md: \
+         {unknown_profile_keys:?}"
+    );
+
+    let missing_anchor_keys: Vec<String> = expected_anchor_keys
+        .difference(&seen_anchor_keys)
+        .cloned()
+        .collect();
+    assert!(
+        missing_anchor_keys.is_empty(),
+        "SubmitProfile anchor fields not exercised by any valid fixture: {missing_anchor_keys:?}"
+    );
+    let unknown_anchor_keys: Vec<String> = seen_anchor_keys
+        .difference(&expected_anchor_keys)
+        .cloned()
+        .collect();
+    assert!(
+        unknown_anchor_keys.is_empty(),
+        "fixtures use submit profile anchor keys not documented in docs/patterns-pack-format.md: \
+         {unknown_anchor_keys:?}"
+    );
+
+    let missing_remediation_keys: Vec<String> = expected_remediation_keys
+        .difference(&seen_remediation_keys)
+        .cloned()
+        .collect();
+    assert!(
+        missing_remediation_keys.is_empty(),
+        "SubmitProfile remediation fields not exercised by any valid fixture: \
+         {missing_remediation_keys:?}"
+    );
+    let unknown_remediation_keys: Vec<String> = seen_remediation_keys
+        .difference(&expected_remediation_keys)
+        .cloned()
+        .collect();
+    assert!(
+        unknown_remediation_keys.is_empty(),
+        "fixtures use submit profile remediation keys not documented in docs/patterns-pack-format.md: \
+         {unknown_remediation_keys:?}"
+    );
+}
+
 // ── Falsification: deliberately-broken pack must fail ───────────────────────
 
 #[test]
