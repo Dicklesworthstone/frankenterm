@@ -4,9 +4,11 @@
 `frankenterm-core` and confirm it runs through `Redactor::redact` (or an
 equivalent policy-engine wrapper).
 
-**Design invariant:** pane content is stored raw at ingest
-(`storage::append_segment_sync`). **Every** outbound read path must redact.
-A single miss is a secret leak; this matrix is the regression benchmark.
+**Design invariant:** current local and distributed capture paths redact pane
+content before `output_segments` persistence (`storage::redact_segment_for_persistence`
+and the distributed aggregator ingest choke point). **Every** outbound read path
+still redacts with the current live catalog as defense in depth. A single miss
+is a secret leak; this matrix is the regression benchmark.
 
 ## Matrix (as of 2026-04-23)
 
