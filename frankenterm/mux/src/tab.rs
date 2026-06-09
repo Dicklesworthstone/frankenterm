@@ -1679,6 +1679,29 @@ impl Tab {
         self.inner.lock().iter_floating_panes()
     }
 
+    pub fn has_panes_in_domain(&self, domain_id: DomainId) -> bool {
+        self.iter_panes_ignoring_zoom()
+            .iter()
+            .any(|pane| pane.pane.domain_id() == domain_id)
+            || self
+                .iter_floating_panes()
+                .iter()
+                .any(|pane| pane.pane.domain_id() == domain_id)
+    }
+
+    pub fn domain_id_for_pane(&self, pane_id: PaneId) -> Option<DomainId> {
+        self.iter_panes_ignoring_zoom()
+            .iter()
+            .find(|pane| pane.pane.pane_id() == pane_id)
+            .map(|pane| pane.pane.domain_id())
+            .or_else(|| {
+                self.iter_floating_panes()
+                    .iter()
+                    .find(|pane| pane.pane.pane_id() == pane_id)
+                    .map(|pane| pane.pane.domain_id())
+            })
+    }
+
     pub fn has_floating_pane(&self, pane_id: PaneId) -> bool {
         self.inner.lock().has_floating_pane(pane_id)
     }
@@ -4625,6 +4648,7 @@ mod test {
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
+        domain_id: DomainId,
         constraints: PaneConstraints,
         priority: CollapsePriority,
         writes: Mutex<Vec<u8>>,
@@ -4635,6 +4659,18 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                domain_id: 1,
+                constraints: PaneConstraints::default(),
+                priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn new_with_domain(id: PaneId, size: TerminalSize, domain_id: DomainId) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                domain_id,
                 constraints: PaneConstraints::default(),
                 priority: CollapsePriority::default(),
                 writes: Mutex::new(Vec::new()),
@@ -4649,6 +4685,7 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                domain_id: 1,
                 constraints,
                 priority: CollapsePriority::default(),
                 writes: Mutex::new(Vec::new()),
@@ -4664,6 +4701,7 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                domain_id: 1,
                 constraints,
                 priority,
                 writes: Mutex::new(Vec::new()),
@@ -4773,7 +4811,7 @@ mod test {
             ColorPalette::default()
         }
         fn domain_id(&self) -> DomainId {
-            1
+            self.domain_id
         }
         fn is_mouse_grabbed(&self) -> bool {
             false
@@ -5067,6 +5105,60 @@ mod test {
         assert_eq!(min_floating_pane_height(), floating.height);
         assert_eq!(Some(2), tab.count_panes());
         assert_eq!(99, tab.get_active_pane().expect("floating focus").pane_id());
+    }
+
+    #[test]
+    fn has_panes_in_domain_counts_floating_panes() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_domain(1, size, 1));
+        tab.add_floating_pane(
+            FakePane::new_with_domain(2, size, 2),
+            FloatingPaneRect {
+                left: 2,
+                top: 2,
+                width: 20,
+                height: 10,
+            },
+        );
+
+        assert!(tab.has_panes_in_domain(1));
+        assert!(tab.has_panes_in_domain(2));
+        assert!(!tab.has_panes_in_domain(3));
+    }
+
+    #[test]
+    fn domain_id_for_pane_counts_floating_panes() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_domain(1, size, 1));
+        tab.add_floating_pane(
+            FakePane::new_with_domain(2, size, 2),
+            FloatingPaneRect {
+                left: 2,
+                top: 2,
+                width: 20,
+                height: 10,
+            },
+        );
+
+        assert_eq!(tab.domain_id_for_pane(1), Some(1));
+        assert_eq!(tab.domain_id_for_pane(2), Some(2));
+        assert_eq!(tab.domain_id_for_pane(3), None);
     }
 
     #[test]

@@ -377,6 +377,7 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     build_initial_mux(&config::configuration(), None, None)?;
 
     let gui = crate::frontend::try_new()?;
+    let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
 
     promise::spawn::spawn(async {
         if let Err(err) = async_run_ssh(opts).await {
@@ -428,6 +429,7 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     build_initial_mux(&config, None, None)?;
 
     let gui = crate::frontend::try_new()?;
+    let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
 
     promise::spawn::spawn(async {
         if let Err(err) = async_run_serial(opts).await {
@@ -440,36 +442,31 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     gui.run_forever()
 }
 
+fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
+    config::subscribe_to_config_reload(move || {
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Err(err) = update_mux_domains(&config::configuration()) {
+                log::error!("Error updating mux domains: {:#}", err);
+            }
+        })
+        .detach();
+        true
+    })
+}
+
 fn have_panes_in_domain_and_ws(
     mux: &Mux,
     domain: &Arc<dyn Domain>,
     workspace: &Option<String>,
 ) -> bool {
-    let have_panes_in_domain = mux
-        .iter_panes()
-        .iter()
-        .any(|p| p.domain_id() == domain.domain_id());
+    let window_ids = workspace.as_ref().map_or_else(
+        || mux.iter_windows(),
+        |ws| mux.iter_windows_in_workspace(ws),
+    );
 
-    if !have_panes_in_domain {
-        return false;
-    }
-
-    if let Some(ws) = &workspace {
-        for window_id in mux.iter_windows_in_workspace(ws) {
-            if let Some(win) = mux.get_window(window_id) {
-                for t in win.iter() {
-                    for p in t.iter_panes_ignoring_zoom() {
-                        if p.pane.domain_id() == domain.domain_id() {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    } else {
-        true
-    }
+    window_ids
+        .into_iter()
+        .any(|window_id| mux.window_has_panes_in_domain(window_id, domain.domain_id()))
 }
 
 async fn spawn_tab_in_domain_if_mux_is_empty(
@@ -500,34 +497,15 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     };
 
     let config = config::configuration();
-    config.update_ulimit()?;
-
-    domain.attach(Some(window_id)).await?;
-
-    if have_panes_in_domain_and_ws(&mux, &domain, &workspace) {
-        trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
-        return Ok(());
-    }
-
-    let _config_subscription = config::subscribe_to_config_reload(move || {
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Err(err) = update_mux_domains(&config::configuration()) {
-                log::error!("Error updating mux domains: {:#}", err);
-            }
-        })
-        .detach();
-        true
-    });
-
     let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
-    let _tab = domain
-        .spawn(
-            config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
-            cmd,
-            None,
-            window_id,
-        )
-        .await?;
+    crate::spawn::attach_domain_to_window_or_spawn_recovery(
+        Arc::clone(&domain),
+        window_id,
+        cmd,
+        None,
+        dpi as u32,
+    )
+    .await?;
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
     Ok(())
 }
@@ -702,7 +680,7 @@ async fn async_run_terminal_gui(
             let window_id = {
                 // Force the builder to notify the frontend early,
                 // so that the attach await below doesn't block it.
-                let workspace = None;
+                let workspace = opts.workspace.clone();
                 let position = None;
                 let builder = mux.new_empty_window(workspace, position);
                 *builder
@@ -719,12 +697,17 @@ async fn async_run_terminal_gui(
                     window_id,
                 )
                 .await?;
+            let tab_id = tab.tab_id();
             let mut window = mux
                 .get_window_mut(window_id)
                 .ok_or_else(|| anyhow!("failed to get mux window id {window_id}"))?;
-            if let Some(tab_idx) = window.idx_by_id(tab.tab_id()) {
-                window.set_active_without_saving(tab_idx);
-            }
+            let tab_idx = window.idx_by_id(tab_id).ok_or_else(|| {
+                anyhow!(
+                    "domain `{}` spawned tab {tab_id}, but window {window_id} does not contain it",
+                    domain.domain_name()
+                )
+            })?;
+            window.set_active_without_saving(tab_idx);
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
@@ -1042,6 +1025,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     }
 
     let gui = crate::frontend::try_new()?;
+    let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {

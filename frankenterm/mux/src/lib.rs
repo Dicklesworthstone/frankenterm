@@ -1570,6 +1570,20 @@ impl Mux {
         window.get_active().map(Arc::clone)
     }
 
+    pub fn window_has_panes_in_domain(&self, window_id: WindowId, domain_id: DomainId) -> bool {
+        let Some(window) = self.get_window(window_id) else {
+            return false;
+        };
+
+        for tab in window.iter() {
+            if tab.has_panes_in_domain(domain_id) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub fn new_empty_window(
         &self,
         workspace: Option<String>,
@@ -1665,11 +1679,9 @@ impl Mux {
     pub fn resolve_pane_id(&self, pane_id: PaneId) -> Option<(DomainId, WindowId, TabId)> {
         let mut ids = None;
         for tab in self.tabs.read().values() {
-            for p in tab.iter_panes_ignoring_zoom() {
-                if p.pane.pane_id() == pane_id {
-                    ids = Some((tab.tab_id(), p.pane.domain_id()));
-                    break;
-                }
+            if let Some(domain_id) = tab.domain_id_for_pane(pane_id) {
+                ids = Some((tab.tab_id(), domain_id));
+                break;
             }
         }
         let (tab_id, domain_id) = ids?;

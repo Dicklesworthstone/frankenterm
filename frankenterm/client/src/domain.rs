@@ -68,10 +68,8 @@ impl ClientInner {
             .retain(
                 |remote_tab_id, local_tab_id| match mux.get_tab(*local_tab_id) {
                     Some(tab) => {
-                        for pos in tab.iter_panes_ignoring_zoom() {
-                            if pos.pane.domain_id() == self.local_domain_id {
-                                return true;
-                            }
+                        if tab.has_panes_in_domain(self.local_domain_id) {
+                            return true;
                         }
                         log::trace!(
                             "expire_stale_mappings: domain: {}. will remove \
@@ -91,21 +89,9 @@ impl ClientInner {
                 log::warn!("recovering poisoned remote_to_local_window lock");
                 poisoned.into_inner()
             })
-            .retain(
-                |_remote_window_id, local_window_id| match mux.get_window(*local_window_id) {
-                    Some(w) => {
-                        for tab in w.iter() {
-                            for pos in tab.iter_panes_ignoring_zoom() {
-                                if pos.pane.domain_id() == self.local_domain_id {
-                                    return true;
-                                }
-                            }
-                        }
-                        false
-                    }
-                    None => false,
-                },
-            );
+            .retain(|_remote_window_id, local_window_id| {
+                mux.window_has_panes_in_domain(*local_window_id, self.local_domain_id)
+            });
     }
 
     fn record_remote_to_local_window_mapping(
@@ -332,6 +318,12 @@ fn current_active_workspace_sync(
     Some(codec::SetActiveWorkspace {
         workspace: mux.active_workspace_for_client(owner_client_id),
     })
+}
+
+fn workspace_for_spawn_window(mux: &Mux, window_id: WindowId) -> String {
+    mux.get_window(window_id)
+        .map(|window| window.get_workspace().to_string())
+        .unwrap_or_else(|| mux.active_workspace())
 }
 
 fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -> bool {
@@ -1049,9 +1041,8 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let workspace = Mux::try_get()
-            .context("mux singleton is not available")?
-            .active_workspace();
+        let mux = Mux::try_get().context("mux singleton is not available")?;
+        let workspace = workspace_for_spawn_window(&mux, window);
 
         let result = inner
             .client
@@ -1114,7 +1105,9 @@ impl Domain for ClientDomain {
 
     async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
         if self.state() == DomainState::Attached {
-            // Already attached
+            if let Some(inner) = self.inner() {
+                Self::sync_remote_topology(inner, window_id).await?;
+            }
             return Ok(());
         }
 
@@ -1283,6 +1276,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spawn_workspace_prefers_target_window_over_active_workspace() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+
+        let owner = test_client_id("owner", 41_004);
+        mux.register_client(Arc::clone(&owner));
+        mux.replace_identity(Some(owner));
+        mux.set_active_workspace("active-workspace");
+
+        let target_window_id = *mux.new_empty_window(Some("target-workspace".to_string()), None);
+
+        assert_eq!(
+            workspace_for_spawn_window(&mux, target_window_id),
+            "target-workspace"
+        );
+        assert_eq!(
+            workspace_for_spawn_window(&mux, usize::MAX),
+            "active-workspace"
+        );
+    }
+
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
         let unix = UnixDomain {
             name: "test-client-domain".to_string(),
@@ -1408,6 +1424,37 @@ mod tests {
 
         assert!(client_pane.is_alt_screen_active());
         assert_eq!(inner.remote_to_local_window(41), Some(local_window_id));
+        assert!(mux.window_has_panes_in_domain(local_window_id, local_domain_id));
+
+        let other_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
+        assert!(!mux.window_has_panes_in_domain(other_window_id, local_domain_id));
+    }
+
+    #[test]
+    fn process_pane_list_keeps_workspace_mismatch_out_of_primary_window() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        ensure_test_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+
+        let local_domain_id = alloc_domain_id();
+        let inner = test_client_inner(local_domain_id);
+        let requested_window_id = *mux.new_empty_window(Some("local-workspace".to_string()), None);
+
+        ClientDomain::process_pane_list(
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            Some(requested_window_id),
+        )
+        .expect("process_pane_list should attach remote topology");
+
+        let mapped_window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+
+        assert_ne!(mapped_window_id, requested_window_id);
+        assert!(!mux.window_has_panes_in_domain(requested_window_id, local_domain_id));
+        assert!(mux.window_has_panes_in_domain(mapped_window_id, local_domain_id));
     }
 
     #[test]

@@ -1,9 +1,9 @@
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use config::TermConfig;
 use config::keyassignment::SpawnCommand;
 use mux::Mux;
 use mux::activity::Activity;
-use mux::domain::SplitSource;
+use mux::domain::{Domain, SplitSource};
 use mux::tab::{FloatingPaneRect, SplitRequest};
 use mux::window::WindowId as MuxWindowId;
 use portable_pty::CommandBuilder;
@@ -16,6 +16,48 @@ pub enum SpawnWhere {
     NewTab,
     SplitPane(SplitRequest),
     FloatingPane(FloatingPaneRect),
+}
+
+pub async fn attach_domain_to_window_or_spawn_recovery(
+    domain: Arc<dyn Domain>,
+    window_id: MuxWindowId,
+    command: Option<CommandBuilder>,
+    command_dir: Option<String>,
+    dpi: u32,
+) -> anyhow::Result<()> {
+    let mux = Mux::try_get().context("mux singleton is not available")?;
+    let domain_id = domain.domain_id();
+    let domain_name = domain.domain_name().to_string();
+
+    domain
+        .attach(Some(window_id))
+        .await
+        .with_context(|| format!("attaching domain `{domain_name}` to window {window_id}"))?;
+
+    if mux.window_has_panes_in_domain(window_id, domain_id) {
+        return Ok(());
+    }
+
+    let config = config::configuration();
+    config.update_ulimit()?;
+    let _tab = domain
+        .spawn(
+            config.initial_size(dpi, Some(crate::cell_pixel_dims(&config, f64::from(dpi))?)),
+            command,
+            command_dir,
+            window_id,
+        )
+        .await
+        .with_context(|| {
+            format!("spawning recovery tab for domain `{domain_name}` in window {window_id}")
+        })?;
+
+    ensure!(
+        mux.window_has_panes_in_domain(window_id, domain_id),
+        "domain `{domain_name}` attach/spawn completed, but window {window_id} still has no panes in that domain"
+    );
+
+    Ok(())
 }
 
 pub fn spawn_command_impl(
