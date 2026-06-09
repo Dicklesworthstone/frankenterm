@@ -444,6 +444,7 @@ struct ProfileFleetMutationExecutor<'a, E: ProfileApplyMutationExecutor> {
     executor: &'a mut E,
     specs: BTreeMap<String, ProfileApplySpawnSpec>,
     spawned_by_step: BTreeMap<String, u64>,
+    spawn_order: Vec<String>,
 }
 
 impl<'a, E: ProfileApplyMutationExecutor> ProfileFleetMutationExecutor<'a, E> {
@@ -455,21 +456,22 @@ impl<'a, E: ProfileApplyMutationExecutor> ProfileFleetMutationExecutor<'a, E> {
                 .map(|spec| (spec.step_id.clone(), spec.clone()))
                 .collect(),
             spawned_by_step: BTreeMap::new(),
+            spawn_order: Vec::new(),
         }
     }
 
     fn compensate_spawned_after_log_failure(&mut self) -> Result<(), ProfileApplyExecutionError> {
-        let spawned: Vec<(String, u64)> = self
-            .spawned_by_step
-            .iter()
-            .map(|(step_id, pane_id)| (step_id.clone(), *pane_id))
-            .collect();
-        for (step_id, pane_id) in spawned.into_iter().rev() {
+        while let Some(step_id) = self.spawn_order.last().cloned() {
+            let Some(pane_id) = self.spawned_by_step.get(&step_id).copied() else {
+                self.spawn_order.pop();
+                continue;
+            };
             self.executor.stop_agent(
                 pane_id,
                 "profile apply receipt logging failed; rolling back spawned pane",
             )?;
             self.spawned_by_step.remove(&step_id);
+            self.spawn_order.pop();
         }
         Ok(())
     }
@@ -494,7 +496,13 @@ impl<E: ProfileApplyMutationExecutor> FleetMutationExecutor
                     .executor
                     .spawn_agent(spec)
                     .map_err(profile_execution_to_fleet_error)?;
-                self.spawned_by_step.insert(step.step_id.clone(), pane_id);
+                if self
+                    .spawned_by_step
+                    .insert(step.step_id.clone(), pane_id)
+                    .is_none()
+                {
+                    self.spawn_order.push(step.step_id.clone());
+                }
                 let mut output = FleetMutationStepOutput {
                     pane_id: Some(pane_id),
                     ..FleetMutationStepOutput::default()
@@ -559,6 +567,8 @@ impl<E: ProfileApplyMutationExecutor> FleetMutationExecutor
             .stop_agent(pane_id, reason)
             .map_err(profile_execution_to_fleet_error)?;
         self.spawned_by_step.remove(&original.step_id);
+        self.spawn_order
+            .retain(|step_id| step_id != &original.step_id);
         let mut output = FleetMutationStepOutput {
             pane_id: Some(pane_id),
             ..FleetMutationStepOutput::default()
@@ -1715,6 +1725,59 @@ mod tests {
         assert_eq!(executor.spawned.len(), 2);
         assert_eq!(executor.stopped.len(), 1);
         assert_eq!(executor.stopped[0].0, 100);
+    }
+
+    #[test]
+    fn log_failure_compensation_uses_reverse_spawn_order_for_double_digit_steps() {
+        let profile = synth("ready", "r", vec![]);
+        let env_overrides = HashMap::new();
+        let specs = profile_apply_spawn_specs(&profile, 12, &env_overrides);
+        let mut executor = FakeApplyExecutor::new();
+        let plan = profile_apply_plan("profile-apply-test", false, &specs, &executor);
+
+        {
+            let mut fleet_executor = ProfileFleetMutationExecutor::new(&mut executor, &specs);
+            for step in &plan.steps {
+                fleet_executor.execute_step(step).expect("spawn step");
+            }
+            fleet_executor
+                .compensate_spawned_after_log_failure()
+                .expect("compensate");
+        }
+
+        let stopped = executor
+            .stopped
+            .iter()
+            .map(|(pane_id, _)| *pane_id)
+            .collect::<Vec<_>>();
+        let expected = (100..112).rev().collect::<Vec<_>>();
+        assert_eq!(stopped, expected);
+    }
+
+    #[test]
+    fn log_failure_compensation_keeps_pending_state_when_stop_fails() {
+        let profile = synth("ready", "r", vec![]);
+        let env_overrides = HashMap::new();
+        let specs = profile_apply_spawn_specs(&profile, 3, &env_overrides);
+        let mut executor = FakeApplyExecutor::new();
+        executor.fail_stop = true;
+        let plan = profile_apply_plan("profile-apply-test", false, &specs, &executor);
+
+        let mut fleet_executor = ProfileFleetMutationExecutor::new(&mut executor, &specs);
+        for step in &plan.steps {
+            fleet_executor.execute_step(step).expect("spawn step");
+        }
+        let err = fleet_executor
+            .compensate_spawned_after_log_failure()
+            .expect_err("stop failure should surface");
+
+        assert_eq!(err.error_code, "robot.profile.mux_compensation_failed");
+        assert_eq!(fleet_executor.spawn_order.len(), 3);
+        assert_eq!(fleet_executor.spawned_by_step.len(), 3);
+        assert_eq!(
+            fleet_executor.spawn_order.last().map(String::as_str),
+            Some("spawn-3")
+        );
     }
 
     #[test]
