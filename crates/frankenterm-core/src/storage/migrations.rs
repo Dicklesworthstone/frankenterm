@@ -1528,6 +1528,56 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
              DROP TABLE IF EXISTS fleet_mutation_receipts;",
         ),
     },
+    // ft-7h5da.8.1: durable limit windows for usage/rate-limit reset
+    // forecasting. The table stores one idempotent row per pane/account
+    // service key; known accounts link to the existing accounts table, while
+    // unknown account detections stay durable under account_id='unknown' so
+    // unparseable or under-specified limit events cannot disappear.
+    Migration {
+        version: 28,
+        description: "Add limit_windows table for pane/account rate-limit reset ledger \
+                      (ft-7h5da.8.1)",
+        up_sql: r"
+        CREATE TABLE IF NOT EXISTS limit_windows (
+            id INTEGER PRIMARY KEY,
+            pane_id INTEGER NOT NULL REFERENCES panes(pane_id) ON DELETE CASCADE,
+            service TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            account_db_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+            account_known INTEGER NOT NULL DEFAULT 0,
+            agent_type TEXT,
+            rule_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            limited_at INTEGER NOT NULL,
+            reset_at INTEGER,
+            reset_source TEXT NOT NULL,
+            reset_text TEXT,
+            conservative_ttl_ms INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            seen_count INTEGER NOT NULL DEFAULT 1,
+            metadata TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            CHECK(account_known IN (0, 1)),
+            CHECK(reset_source IN ('absolute', 'retry_after', 'unknown_ttl')),
+            CHECK(seen_count >= 1),
+            UNIQUE(pane_id, service, account_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_limit_windows_pane_account
+            ON limit_windows(pane_id, service, account_id);
+        CREATE INDEX IF NOT EXISTS idx_limit_windows_service_reset
+            ON limit_windows(service, reset_at);
+        CREATE INDEX IF NOT EXISTS idx_limit_windows_last_seen
+            ON limit_windows(last_seen_at);
+        ",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS idx_limit_windows_last_seen;
+             DROP INDEX IF EXISTS idx_limit_windows_service_reset;
+             DROP INDEX IF EXISTS idx_limit_windows_pane_account;
+             DROP TABLE IF EXISTS limit_windows;",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -2980,6 +3030,35 @@ mod tests {
         let down = m27.down_sql.expect("down_sql must be supported");
         assert!(down.contains("DROP INDEX IF EXISTS fleet_mutation_receipts_action_time_idx"));
         assert!(down.contains("DROP TABLE IF EXISTS fleet_mutation_receipts"));
+    }
+
+    #[test]
+    fn limit_windows_migration_entry_present_at_version_28() {
+        let m28 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 28)
+            .expect("version 28 migration must be registered");
+        assert!(
+            m28.description.contains("limit_windows"),
+            "description must reference limit_windows, got: {:?}",
+            m28.description,
+        );
+        assert!(
+            m28.up_sql
+                .contains("CREATE TABLE IF NOT EXISTS limit_windows"),
+            "up_sql must include the limit_windows CREATE TABLE",
+        );
+        assert!(
+            m28.up_sql.contains("idx_limit_windows_pane_account"),
+            "up_sql must include the pane/account index",
+        );
+        assert!(
+            m28.up_sql.contains("UNIQUE(pane_id, service, account_id)"),
+            "up_sql must preserve idempotency key",
+        );
+        let down = m28.down_sql.expect("down_sql must be supported");
+        assert!(down.contains("DROP INDEX IF EXISTS idx_limit_windows_pane_account"));
+        assert!(down.contains("DROP TABLE IF EXISTS limit_windows"));
     }
 
     /// br-ft-4yr9i: applying the version-25 migration to a fresh

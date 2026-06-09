@@ -241,9 +241,9 @@ pub use self::types::{
 // metrics records (10 types + 3 impls) moved to
 // `storage/types.rs`.
 pub use self::types::{
-    AgentMetricBreakdown, DailyMetricSummary, MaintenanceRecord, MetricQuery, MetricType,
-    PreparedPlanRecord, SecretScanReportRecord, UsageMetricRecord, WorkflowActionPlanRecord,
-    WorkflowRecord,
+    AgentMetricBreakdown, DailyMetricSummary, LimitWindowRecord, MaintenanceRecord, MetricQuery,
+    MetricType, PreparedPlanRecord, SecretScanReportRecord, UsageMetricRecord,
+    WorkflowActionPlanRecord, WorkflowRecord,
 };
 
 // br-ft-8bvg0 slice 6: notification + saved search + bookmark +
@@ -675,6 +675,11 @@ enum WriteCommand {
         account_id: String,
         respond: oneshot::Sender<Result<bool>>,
     },
+    /// Upsert a pane/account rate-limit window.
+    UpsertLimitWindow {
+        record: LimitWindowRecord,
+        respond: oneshot::Sender<Result<LimitWindowRecord>>,
+    },
     /// Create a pane reservation (exclusive lock)
     CreateReservation {
         pane_id: u64,
@@ -879,6 +884,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::UpsertAccount { .. } => "UpsertAccount",
             Self::UpdateAccountLastUsed { .. } => "UpdateAccountLastUsed",
             Self::DeleteAccount { .. } => "DeleteAccount",
+            Self::UpsertLimitWindow { .. } => "UpsertLimitWindow",
             Self::CreateReservation { .. } => "CreateReservation",
             Self::ReleaseReservation { .. } => "ReleaseReservation",
             Self::ExpireStaleReservations { .. } => "ExpireStaleReservations",
@@ -5784,6 +5790,7 @@ impl StorageHandle {
     /// This is a lightweight health check that sends a ping to the writer thread.
     // Intentionally `async`: part of the storage async surface; the signature is
     // the public contract even though the current body is a sync channel check.
+    #[allow(unknown_lints)]
     #[allow(clippy::unused_async_trait_impl)]
     pub async fn is_writable(&self) -> bool {
         // A simple check: if the channel is not closed, writer should be alive
@@ -5971,6 +5978,71 @@ impl StorageHandle {
             // br-ft-l4gdl: trait-typed pool helper.
             pooled_backend(db_path.as_str(), |backend| {
                 get_account_backend(backend, &service, &account_id)
+            })
+        })
+        .await
+    }
+
+    /// Upsert a durable rate-limit window keyed by pane/service/account.
+    pub async fn upsert_limit_window(
+        &self,
+        record: LimitWindowRecord,
+    ) -> Result<LimitWindowRecord> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.upsert_limit_window_with_cx(&cx, record).await
+    }
+
+    /// Cx-first sibling of [`upsert_limit_window`].
+    pub async fn upsert_limit_window_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: LimitWindowRecord,
+    ) -> Result<LimitWindowRecord> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("upsert_limit_window cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpsertLimitWindow {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Get a single durable rate-limit window by pane/service/account key.
+    pub async fn get_limit_window(
+        &self,
+        pane_id: u64,
+        service: &str,
+        account_id: &str,
+    ) -> Result<Option<LimitWindowRecord>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_limit_window_with_cx(&cx, pane_id, service, account_id)
+            .await
+    }
+
+    /// Cx-first sibling of [`get_limit_window`].
+    pub async fn get_limit_window_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        service: &str,
+        account_id: &str,
+    ) -> Result<Option<LimitWindowRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_limit_window cancelled: {err}")))?;
+        let db_path = self.db_path.clone();
+        let service = service.to_string();
+        let account_id = account_id.to_string();
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                get_limit_window_backend(backend, pane_id, &service, &account_id)
             })
         })
         .await
@@ -7887,6 +7959,9 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::InsertSessionCheckpoint { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
+        WriteCommand::UpsertLimitWindow { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
         WriteCommand::PurgeAuditActions { respond, .. }
         | WriteCommand::DeleteSavedSearch { respond, .. }
         | WriteCommand::PruneSegments { respond, .. }
@@ -9085,6 +9160,11 @@ fn dispatch_write_command_raw(
         } => {
             let respond = WriterResultResponder::new(respond);
             let result = delete_account_backend(backend, &service, &account_id);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::UpsertLimitWindow { record, respond } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = upsert_limit_window_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::CreateReservation {
@@ -13487,6 +13567,228 @@ fn get_account_backend(
         .map_err(|err| storage_backend_error("Failed to get account", err))?;
     row.as_deref()
         .map(account_record_from_backend_row)
+        .transpose()
+}
+
+fn limit_window_record_from_backend_row(row: &[String]) -> Result<LimitWindowRecord> {
+    let reader = RowReader::new(row);
+    let pane_id = reader
+        .i64(1)
+        .map_err(|err| storage_backend_error("Limit window pane_id", err))
+        .and_then(|value| {
+            backend_i64_to_u64(value, "limit_windows.pane_id")
+                .map_err(|err| storage_backend_error("Limit window pane_id", err))
+        })?;
+    let account_known_raw = reader
+        .i64(5)
+        .map_err(|err| storage_backend_error("Limit window account_known", err))?;
+    let account_known = backend_i64_to_bool(account_known_raw, "limit_windows.account_known")
+        .map_err(|err| storage_backend_error("Limit window account_known", err))?;
+
+    Ok(LimitWindowRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Limit window id", err))?,
+        pane_id,
+        service: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Limit window service", err))?,
+        account_id: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("Limit window account_id", err))?,
+        account_db_id: reader
+            .optional_i64(4)
+            .map_err(|err| storage_backend_error("Limit window account_db_id", err))?,
+        account_known,
+        agent_type: reader
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("Limit window agent_type", err))?,
+        rule_id: reader
+            .string(7)
+            .map_err(|err| storage_backend_error("Limit window rule_id", err))?,
+        event_type: reader
+            .string(8)
+            .map_err(|err| storage_backend_error("Limit window event_type", err))?,
+        limited_at: reader
+            .i64(9)
+            .map_err(|err| storage_backend_error("Limit window limited_at", err))?,
+        reset_at: reader
+            .optional_i64(10)
+            .map_err(|err| storage_backend_error("Limit window reset_at", err))?,
+        reset_source: reader
+            .string(11)
+            .map_err(|err| storage_backend_error("Limit window reset_source", err))?,
+        reset_text: reader
+            .optional_string(12)
+            .map_err(|err| storage_backend_error("Limit window reset_text", err))?,
+        conservative_ttl_ms: reader
+            .i64(13)
+            .map_err(|err| storage_backend_error("Limit window conservative_ttl_ms", err))?,
+        last_seen_at: reader
+            .i64(14)
+            .map_err(|err| storage_backend_error("Limit window last_seen_at", err))?,
+        seen_count: reader
+            .i64(15)
+            .map_err(|err| storage_backend_error("Limit window seen_count", err))?,
+        metadata: reader
+            .optional_string(16)
+            .map_err(|err| storage_backend_error("Limit window metadata", err))?,
+        created_at: reader
+            .i64(17)
+            .map_err(|err| storage_backend_error("Limit window created_at", err))?,
+        updated_at: reader
+            .i64(18)
+            .map_err(|err| storage_backend_error("Limit window updated_at", err))?,
+    })
+}
+
+fn limit_window_select_sql() -> &'static str {
+    "SELECT id, pane_id, service, account_id, account_db_id, account_known,
+            agent_type, rule_id, event_type, limited_at, reset_at, reset_source,
+            reset_text, conservative_ttl_ms, last_seen_at, seen_count, metadata,
+            created_at, updated_at
+     FROM limit_windows"
+}
+
+fn upsert_limit_window_backend(
+    backend: &dyn StorageBackend,
+    record: &LimitWindowRecord,
+) -> Result<LimitWindowRecord> {
+    let pane_id = u64_to_i64(record.pane_id, "limit_windows.pane_id")?;
+    let now = now_ms();
+    let limited_at = if record.limited_at == 0 {
+        now
+    } else {
+        record.limited_at
+    };
+    let last_seen_at = if record.last_seen_at == 0 {
+        limited_at
+    } else {
+        record.last_seen_at
+    };
+    let created_at = if record.created_at == 0 {
+        limited_at
+    } else {
+        record.created_at
+    };
+    let updated_at = if record.updated_at == 0 {
+        last_seen_at
+    } else {
+        record.updated_at
+    };
+    let seen_count = record.seen_count.max(1);
+
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO limit_windows (
+                pane_id, service, account_id, account_db_id, account_known,
+                agent_type, rule_id, event_type, limited_at, reset_at,
+                reset_source, reset_text, conservative_ttl_ms, last_seen_at,
+                seen_count, metadata, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(pane_id, service, account_id) DO UPDATE SET
+                account_db_id = COALESCE(excluded.account_db_id, limit_windows.account_db_id),
+                account_known = CASE
+                    WHEN excluded.account_known = 1 OR limit_windows.account_known = 1 THEN 1
+                    ELSE 0
+                END,
+                agent_type = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.agent_type
+                    ELSE limit_windows.agent_type
+                END,
+                rule_id = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.rule_id
+                    ELSE limit_windows.rule_id
+                END,
+                event_type = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.event_type
+                    ELSE limit_windows.event_type
+                END,
+                reset_at = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.reset_at
+                    ELSE limit_windows.reset_at
+                END,
+                reset_source = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.reset_source
+                    ELSE limit_windows.reset_source
+                END,
+                reset_text = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.reset_text
+                    ELSE limit_windows.reset_text
+                END,
+                conservative_ttl_ms = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.conservative_ttl_ms
+                    ELSE limit_windows.conservative_ttl_ms
+                END,
+                last_seen_at = MAX(limit_windows.last_seen_at, excluded.last_seen_at),
+                seen_count = limit_windows.seen_count + excluded.seen_count,
+                metadata = CASE
+                    WHEN excluded.last_seen_at >= limit_windows.last_seen_at
+                    THEN excluded.metadata
+                    ELSE limit_windows.metadata
+                END,
+                updated_at = MAX(limit_windows.updated_at, excluded.updated_at)
+             RETURNING id, pane_id, service, account_id, account_db_id, account_known,
+                       agent_type, rule_id, event_type, limited_at, reset_at, reset_source,
+                       reset_text, conservative_ttl_ms, last_seen_at, seen_count, metadata,
+                       created_at, updated_at",
+            &[
+                ToSqlValue::Integer(pane_id),
+                ToSqlValue::Text(&record.service),
+                ToSqlValue::Text(&record.account_id),
+                ToSqlValue::optional_i64(record.account_db_id),
+                ToSqlValue::bool(record.account_known),
+                ToSqlValue::optional_text(record.agent_type.as_deref()),
+                ToSqlValue::Text(&record.rule_id),
+                ToSqlValue::Text(&record.event_type),
+                ToSqlValue::Integer(limited_at),
+                ToSqlValue::optional_i64(record.reset_at),
+                ToSqlValue::Text(&record.reset_source),
+                ToSqlValue::optional_text(record.reset_text.as_deref()),
+                ToSqlValue::Integer(record.conservative_ttl_ms),
+                ToSqlValue::Integer(last_seen_at),
+                ToSqlValue::Integer(seen_count),
+                ToSqlValue::optional_text(record.metadata.as_deref()),
+                ToSqlValue::Integer(created_at),
+                ToSqlValue::Integer(updated_at),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to upsert limit window", err))?
+        .ok_or_else(|| StorageError::Database("limit window upsert returned no row".to_string()))?;
+
+    limit_window_record_from_backend_row(&row)
+}
+
+fn get_limit_window_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    service: &str,
+    account_id: &str,
+) -> Result<Option<LimitWindowRecord>> {
+    let pane_id = u64_to_i64(pane_id, "limit_windows.pane_id")?;
+    let sql = format!(
+        "{} WHERE pane_id = ?1 AND service = ?2 AND account_id = ?3",
+        limit_window_select_sql()
+    );
+    let row = backend
+        .query_row_typed(
+            &sql,
+            &[
+                ToSqlValue::Integer(pane_id),
+                ToSqlValue::Text(service),
+                ToSqlValue::Text(account_id),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to get limit window", err))?;
+    row.as_deref()
+        .map(limit_window_record_from_backend_row)
         .transpose()
 }
 
@@ -19789,6 +20091,179 @@ fn storage_tick144_account_cluster_roundtrip() {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+#[test]
+fn limit_window_upsert_is_idempotent_by_pane_service_account() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("limit-window.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+        let now = 1_800_000_000_000;
+
+        storage
+            .upsert_pane_with_cx(
+                &cx,
+                PaneRecord {
+                    pane_id: 77,
+                    pane_uuid: Some("pane-77".to_string()),
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("codex".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let account_db_id = storage
+            .upsert_account_with_cx(
+                &cx,
+                crate::accounts::AccountRecord {
+                    id: 0,
+                    account_id: "acct-openai".to_string(),
+                    service: "openai".to_string(),
+                    name: Some("OpenAI team".to_string()),
+                    percent_remaining: 0.0,
+                    reset_at: Some("2026-06-09T00:00:00Z".to_string()),
+                    tokens_used: None,
+                    tokens_remaining: None,
+                    tokens_limit: None,
+                    last_refreshed_at: now,
+                    last_used_at: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let first = storage
+            .upsert_limit_window_with_cx(
+                &cx,
+                LimitWindowRecord {
+                    id: 0,
+                    pane_id: 77,
+                    service: "openai".to_string(),
+                    account_id: "acct-openai".to_string(),
+                    account_db_id: Some(account_db_id),
+                    account_known: true,
+                    agent_type: Some("codex".to_string()),
+                    rule_id: "codex.usage.reached".to_string(),
+                    event_type: "usage.reached".to_string(),
+                    limited_at: now,
+                    reset_at: Some(now + 60_000),
+                    reset_source: "retry_after".to_string(),
+                    reset_text: Some("60 seconds".to_string()),
+                    conservative_ttl_ms: 0,
+                    last_seen_at: now,
+                    seen_count: 1,
+                    metadata: Some("{\"source\":\"test\"}".to_string()),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = storage
+            .upsert_limit_window_with_cx(
+                &cx,
+                LimitWindowRecord {
+                    id: 0,
+                    pane_id: 77,
+                    service: "openai".to_string(),
+                    account_id: "acct-openai".to_string(),
+                    account_db_id: Some(account_db_id),
+                    account_known: true,
+                    agent_type: Some("codex".to_string()),
+                    rule_id: "codex.rate_limit.detected".to_string(),
+                    event_type: "rate_limit.detected".to_string(),
+                    limited_at: now + 1_000,
+                    reset_at: Some(now + 300_000),
+                    reset_source: "retry_after".to_string(),
+                    reset_text: Some("5 minutes".to_string()),
+                    conservative_ttl_ms: 0,
+                    last_seen_at: now + 1_000,
+                    seen_count: 1,
+                    metadata: Some("{\"source\":\"test-repeat\"}".to_string()),
+                    created_at: now + 1_000,
+                    updated_at: now + 1_000,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.limited_at, now);
+        assert_eq!(second.last_seen_at, now + 1_000);
+        assert_eq!(second.seen_count, 2);
+        assert_eq!(second.reset_at, Some(now + 300_000));
+        assert_eq!(second.account_db_id, Some(account_db_id));
+        assert!(second.account_known);
+
+        let stale = storage
+            .upsert_limit_window_with_cx(
+                &cx,
+                LimitWindowRecord {
+                    id: 0,
+                    pane_id: 77,
+                    service: "openai".to_string(),
+                    account_id: "acct-openai".to_string(),
+                    account_db_id: None,
+                    account_known: false,
+                    agent_type: Some("codex".to_string()),
+                    rule_id: "codex.usage.reached".to_string(),
+                    event_type: "usage.reached".to_string(),
+                    limited_at: now - 1_000,
+                    reset_at: Some(now + 10_000),
+                    reset_source: "retry_after".to_string(),
+                    reset_text: Some("10 seconds".to_string()),
+                    conservative_ttl_ms: 0,
+                    last_seen_at: now - 1_000,
+                    seen_count: 1,
+                    metadata: Some("{\"source\":\"stale-repeat\"}".to_string()),
+                    created_at: now - 1_000,
+                    updated_at: now - 1_000,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stale.id, first.id);
+        assert_eq!(stale.last_seen_at, now + 1_000);
+        assert_eq!(stale.seen_count, 3);
+        assert_eq!(
+            stale.reset_at,
+            Some(now + 300_000),
+            "older repeat detections must not regress a newer reset deadline"
+        );
+        assert_eq!(
+            stale.account_db_id,
+            Some(account_db_id),
+            "unknown stale repeats must not erase known account linkage"
+        );
+        assert!(stale.account_known);
+
+        let fetched = storage
+            .get_limit_window_with_cx(&cx, 77, "openai", "acct-openai")
+            .await
+            .unwrap()
+            .expect("limit window should be queryable by pane/service/account");
+        assert_eq!(fetched.id, first.id);
+        assert_eq!(fetched.seen_count, 3);
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
     });
 }
 

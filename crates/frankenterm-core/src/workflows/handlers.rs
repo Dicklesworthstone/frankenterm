@@ -51,6 +51,66 @@ fn cooldown_query_since_ms(now_ms: i64, cooldown_ms: i64) -> i64 {
     now_ms.saturating_sub(cooldown_ms.max(0)).max(0)
 }
 
+async fn record_limit_window_if_hard_limit(
+    storage: &crate::storage::StorageHandle,
+    pane_id: u64,
+    trigger: &serde_json::Value,
+    detected_at_ms: i64,
+    workflow_name: &'static str,
+) {
+    if !super::builtin_workflows::trigger_is_limit_window_event(trigger) {
+        return;
+    }
+
+    if let Err(err) = super::builtin_workflows::record_limit_window_for_trigger(
+        storage,
+        pane_id,
+        trigger,
+        detected_at_ms,
+        workflow_name,
+    )
+    .await
+    {
+        tracing::warn!(
+            pane_id,
+            workflow = workflow_name,
+            error = %err,
+            "workflow limit handler: failed to upsert limit window"
+        );
+    }
+}
+
+async fn record_limit_window_if_hard_limit_with_cx(
+    storage: &crate::storage::StorageHandle,
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    trigger: &serde_json::Value,
+    detected_at_ms: i64,
+    workflow_name: &'static str,
+) {
+    if !super::builtin_workflows::trigger_is_limit_window_event(trigger) {
+        return;
+    }
+
+    if let Err(err) = super::builtin_workflows::record_limit_window_for_trigger_with_cx(
+        storage,
+        cx,
+        pane_id,
+        trigger,
+        detected_at_ms,
+        workflow_name,
+    )
+    .await
+    {
+        tracing::warn!(
+            pane_id,
+            workflow = workflow_name,
+            error = %err,
+            "workflow limit handler: failed to upsert limit window"
+        );
+    }
+}
+
 fn new_workflow_handler_audit_context(
     action_kind: &str,
     workflow_name: &str,
@@ -4274,6 +4334,14 @@ impl Workflow for HandleClaudeCodeLimits {
             match step_idx {
                 // Step 0: Guard checks
                 0 => {
+                    record_limit_window_if_hard_limit(
+                        &storage,
+                        pane_id,
+                        &trigger,
+                        now_ms(),
+                        "handle_claude_code_limits",
+                    )
+                    .await;
                     if caps.alt_screen == Some(true) {
                         return StepResult::abort("Pane is in alt-screen mode");
                     }
@@ -4452,6 +4520,15 @@ impl Workflow for HandleClaudeCodeLimits {
             match step_idx {
                 // Step 0: Guard checks (pure CPU)
                 0 => {
+                    record_limit_window_if_hard_limit_with_cx(
+                        &storage,
+                        cx,
+                        pane_id,
+                        &trigger,
+                        now_ms(),
+                        "handle_claude_code_limits",
+                    )
+                    .await;
                     if caps.alt_screen == Some(true) {
                         return StepResult::abort("Pane is in alt-screen mode");
                     }
@@ -4764,6 +4841,14 @@ impl Workflow for HandleGeminiQuota {
         Box::pin(async move {
             match step_idx {
                 0 => {
+                    record_limit_window_if_hard_limit(
+                        &storage,
+                        pane_id,
+                        &trigger,
+                        now_ms(),
+                        "handle_gemini_quota",
+                    )
+                    .await;
                     if caps.alt_screen == Some(true) {
                         return StepResult::abort("Pane is in alt-screen mode");
                     }
@@ -4939,6 +5024,15 @@ impl Workflow for HandleGeminiQuota {
             match step_idx {
                 // Step 0: Guard checks (pure CPU)
                 0 => {
+                    record_limit_window_if_hard_limit_with_cx(
+                        &storage,
+                        cx,
+                        pane_id,
+                        &trigger,
+                        now_ms(),
+                        "handle_gemini_quota",
+                    )
+                    .await;
                     if caps.alt_screen == Some(true) {
                         return StepResult::abort("Pane is in alt-screen mode");
                     }
@@ -8123,6 +8217,80 @@ mod tests {
     }
 
     #[test]
+    fn handle_claude_code_limits_step0_writes_limit_window() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("workflow test runtime");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("claude-limit-window.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        runtime.block_on(async {
+            let storage = std::sync::Arc::new(
+                crate::storage::StorageHandle::new(&db_path_str)
+                    .await
+                    .expect("storage"),
+            );
+            let now = crate::storage::now_ms();
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 91,
+                    pane_uuid: Some("pane-91".to_string()),
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("claude".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("seed pane");
+
+            let trigger = serde_json::json!({
+                "agent_type": "claude_code",
+                "event_type": "usage.reached",
+                "rule_id": "claude_code.usage.reached",
+                "extracted": {"reset_time": "15 minutes"}
+            });
+            let mut ctx = WorkflowContext::new(
+                storage.clone(),
+                91,
+                crate::policy::PaneCapabilities::default(),
+                "exec-claude-limit-window",
+            )
+            .with_trigger(trigger);
+
+            let step = HandleClaudeCodeLimits::new()
+                .execute_step(&mut ctx, 0)
+                .await;
+            assert!(step.is_continue(), "step 0 should continue, got {step:?}");
+
+            let row = storage
+                .get_limit_window(91, "anthropic", "unknown")
+                .await
+                .expect("query limit window")
+                .expect("limit window should be written");
+            assert_eq!(row.service, "anthropic");
+            assert_eq!(row.account_id, "unknown");
+            assert!(!row.account_known);
+            assert_eq!(row.rule_id, "claude_code.usage.reached");
+            assert_eq!(row.event_type, "usage.reached");
+            assert_eq!(row.reset_source, "retry_after");
+            assert_eq!(row.reset_at, row.limited_at.checked_add(15 * 60 * 1000));
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
     fn handle_claude_code_limits_recovery_plan_usage_warning_is_safe_to_send() {
         let plan = HandleClaudeCodeLimits::build_recovery_plan("usage_warning", None, 5);
         assert_eq!(plan["safe_to_send"], true);
@@ -8291,6 +8459,86 @@ mod tests {
         let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
         assert_eq!(quota_type, "quota_reached");
         assert_eq!(remaining.as_deref(), Some("0%"));
+    }
+
+    #[test]
+    fn handle_gemini_quota_step0_cx_writes_limit_window() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("workflow test runtime");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("gemini-limit-window.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        runtime.block_on(async {
+            let cx = crate::cx::for_testing();
+            let storage = std::sync::Arc::new(
+                crate::storage::StorageHandle::new_with_cx(&cx, &db_path_str)
+                    .await
+                    .expect("storage"),
+            );
+            let now = crate::storage::now_ms();
+            storage
+                .upsert_pane_with_cx(
+                    &cx,
+                    crate::storage::PaneRecord {
+                        pane_id: 92,
+                        pane_uuid: Some("pane-92".to_string()),
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("gemini".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                )
+                .await
+                .expect("seed pane");
+
+            let trigger = serde_json::json!({
+                "agent_type": "gemini",
+                "event_type": "rate_limit.detected",
+                "rule_id": "gemini.rate_limit.detected",
+                "extracted": {"retry_after": "45 seconds"}
+            });
+            let mut ctx = WorkflowContext::new(
+                storage.clone(),
+                92,
+                crate::policy::PaneCapabilities::default(),
+                "exec-gemini-limit-window",
+            )
+            .with_trigger(trigger);
+
+            let step = HandleGeminiQuota::new()
+                .execute_step_cx(&cx, &mut ctx, 0)
+                .await;
+            assert!(step.is_continue(), "step 0 should continue, got {step:?}");
+
+            let row = storage
+                .get_limit_window_with_cx(&cx, 92, "google", "unknown")
+                .await
+                .expect("query limit window")
+                .expect("limit window should be written");
+            assert_eq!(row.service, "google");
+            assert_eq!(row.account_id, "unknown");
+            assert_eq!(row.rule_id, "gemini.rate_limit.detected");
+            assert_eq!(row.event_type, "rate_limit.detected");
+            assert_eq!(row.reset_source, "retry_after");
+            assert_eq!(row.reset_at, row.limited_at.checked_add(45_000));
+
+            storage
+                .shutdown_with_cx(&cx)
+                .await
+                .expect("shutdown storage");
+        });
     }
 
     #[test]

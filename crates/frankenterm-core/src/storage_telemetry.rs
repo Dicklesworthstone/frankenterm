@@ -703,6 +703,7 @@ impl<S> InstrumentedStorage<S> {
     /// Time an append_batch call and record telemetry.
     // Intentionally `async`: mirrors the instrumented storage async surface even
     // though the telemetry recording path is currently synchronous.
+    #[allow(unknown_lints)]
     #[allow(clippy::future_not_send)]
     #[allow(clippy::unused_async_trait_impl)]
     pub async fn append_batch_instrumented(

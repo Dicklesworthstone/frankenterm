@@ -856,6 +856,49 @@ pub struct UsageMetricRecord {
     pub created_at: i64,
 }
 
+/// Durable rate/usage-limit window keyed by pane and account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitWindowRecord {
+    /// Record ID (0 for new records).
+    pub id: i64,
+    /// Pane where the limit was detected.
+    pub pane_id: u64,
+    /// Service/provider namespace for the account key.
+    pub service: String,
+    /// Stable account key. Uses `unknown` when the detector lacks account context.
+    pub account_id: String,
+    /// Row ID in `accounts` when the account was resolved from the existing table.
+    pub account_db_id: Option<i64>,
+    /// True when `account_db_id` points at a known account row.
+    pub account_known: bool,
+    /// Agent type that emitted the limit event.
+    pub agent_type: Option<String>,
+    /// Rule that fired.
+    pub rule_id: String,
+    /// Event type that fired.
+    pub event_type: String,
+    /// First detected time for this pane/account window.
+    pub limited_at: i64,
+    /// Parsed reset deadline, if available.
+    pub reset_at: Option<i64>,
+    /// How `reset_at` was derived: `absolute`, `retry_after`, or `unknown_ttl`.
+    pub reset_source: String,
+    /// Original reset/retry-after text from the detector.
+    pub reset_text: Option<String>,
+    /// Conservative TTL applied when reset text is missing or unparseable.
+    pub conservative_ttl_ms: i64,
+    /// Most recent detection time for this pane/account window.
+    pub last_seen_at: i64,
+    /// Number of detections folded into this idempotent row.
+    pub seen_count: i64,
+    /// Optional JSON metadata.
+    pub metadata: Option<String>,
+    /// Row creation time.
+    pub created_at: i64,
+    /// Row update time.
+    pub updated_at: i64,
+}
+
 /// Aggregated daily summary row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyMetricSummary {

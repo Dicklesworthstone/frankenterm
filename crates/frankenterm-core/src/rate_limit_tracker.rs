@@ -474,11 +474,22 @@ impl Default for RateLimitTracker {
 /// `Retry-After: 18446744073709551615` (u64::MAX seconds) would propagate a
 /// [`Duration`] that panics the next `Instant + cooldown` in
 /// [`PaneRateLimitState::record_event`].
-fn parse_retry_after(text: &str) -> Option<Duration> {
+pub fn parse_retry_after_duration(text: &str) -> Option<Duration> {
     let text = text.trim().to_lowercase();
 
     // Try plain number (assumed seconds)
     if let Ok(secs) = text.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(MAX_COOLDOWN_SECS)));
+    }
+
+    if let Some((amount, unit)) = parse_compact_retry_after(&text) {
+        let multiplier = match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            _ => return None,
+        };
+        let secs = amount.checked_mul(multiplier)?;
         return Some(Duration::from_secs(secs.min(MAX_COOLDOWN_SECS)));
     }
 
@@ -501,6 +512,22 @@ fn parse_retry_after(text: &str) -> Option<Duration> {
     None
 }
 
+fn parse_compact_retry_after(text: &str) -> Option<(u64, &'static str)> {
+    for unit in ["s", "m", "h"] {
+        if let Some(amount) = text.strip_suffix(unit) {
+            if amount.is_empty() || !amount.chars().all(|ch| ch.is_ascii_digit()) {
+                return None;
+            }
+            return amount.parse::<u64>().ok().map(|parsed| (parsed, unit));
+        }
+    }
+    None
+}
+
+fn parse_retry_after(text: &str) -> Option<Duration> {
+    parse_retry_after_duration(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +540,7 @@ mod tests {
             Some(Duration::from_secs(30))
         );
         assert_eq!(parse_retry_after("1 second"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_retry_after("30s"), Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -522,6 +550,7 @@ mod tests {
             Some(Duration::from_secs(300))
         );
         assert_eq!(parse_retry_after("1 minute"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after("5m"), Some(Duration::from_secs(300)));
     }
 
     #[test]
@@ -531,6 +560,7 @@ mod tests {
             parse_retry_after("2 hours"),
             Some(Duration::from_secs(7200))
         );
+        assert_eq!(parse_retry_after("1h"), Some(Duration::from_secs(3600)));
     }
 
     #[test]

@@ -41,7 +41,10 @@
 /// Per ft-27rlg: bumped 26 → 27 to gate the
 /// `fleet_mutation_receipts` table used by non-dry-run
 /// `ft robot fleet scale` / `rebalance` durable receipt replay.
-pub const SCHEMA_VERSION: i32 = 27;
+///
+/// Per ft-7h5da.8.1: bumped 27 → 28 to gate the durable
+/// `limit_windows` ledger for pane/account rate-limit forecasting.
+pub const SCHEMA_VERSION: i32 = 28;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -442,6 +445,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_service_account ON accounts(servi
 CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service);
 CREATE INDEX IF NOT EXISTS idx_accounts_percent ON accounts(service, percent_remaining DESC);
 CREATE INDEX IF NOT EXISTS idx_accounts_last_used ON accounts(service, last_used_at);
+
+-- Limit windows: forward-looking usage/rate-limit reset ledger
+-- Supports: capacity forecasting, scheduling decline hooks, economic breaker
+CREATE TABLE IF NOT EXISTS limit_windows (
+    id INTEGER PRIMARY KEY,
+    pane_id INTEGER NOT NULL REFERENCES panes(pane_id) ON DELETE CASCADE,
+    service TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    account_db_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+    account_known INTEGER NOT NULL DEFAULT 0,
+    agent_type TEXT,
+    rule_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    limited_at INTEGER NOT NULL,
+    reset_at INTEGER,
+    reset_source TEXT NOT NULL,
+    reset_text TEXT,
+    conservative_ttl_ms INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    metadata TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK(account_known IN (0, 1)),
+    CHECK(reset_source IN ('absolute', 'retry_after', 'unknown_ttl')),
+    CHECK(seen_count >= 1),
+    UNIQUE(pane_id, service, account_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_limit_windows_pane_account
+    ON limit_windows(pane_id, service, account_id);
+CREATE INDEX IF NOT EXISTS idx_limit_windows_service_reset
+    ON limit_windows(service, reset_at);
+CREATE INDEX IF NOT EXISTS idx_limit_windows_last_seen
+    ON limit_windows(last_seen_at);
 
 -- Pane reservations: exclusive workflow locks on panes
 -- Only one active reservation per pane; auto-expire on TTL

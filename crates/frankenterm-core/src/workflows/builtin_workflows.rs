@@ -7,6 +7,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use chrono::{Datelike as _, TimeZone as _, Timelike as _};
 
 // ============================================================================
 // Built-in Workflows
@@ -606,6 +607,9 @@ static RATE_LIMIT_TRACKER: LazyLock<
     crate::runtime_async::Mutex::new(crate::rate_limit_tracker::RateLimitTracker::new())
 });
 
+const UNKNOWN_LIMIT_ACCOUNT_ID: &str = "unknown";
+const CONSERVATIVE_UNKNOWN_LIMIT_WINDOW_TTL_MS: i64 = 5 * 60 * 1000;
+
 fn trigger_agent_type(trigger: &serde_json::Value) -> crate::patterns::AgentType {
     match trigger
         .get("agent_type")
@@ -631,12 +635,497 @@ fn trigger_is_rate_limit(trigger: &serde_json::Value) -> bool {
             .is_some_and(|rule_id| rule_id.contains("rate_limit"))
 }
 
+pub(super) fn trigger_is_limit_window_event(trigger: &serde_json::Value) -> bool {
+    if let Some(event) = trigger.get("event_type").and_then(|v| v.as_str()) {
+        return matches!(
+            event,
+            "usage.reached" | "rate_limit.detected" | "usage_limit"
+        );
+    }
+
+    trigger
+        .get("rule_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|rule_id| {
+            rule_id.contains("usage.reached")
+                || rule_id.contains("usage_limit")
+                || rule_id.contains("rate_limit")
+        })
+}
+
+fn trigger_service(trigger: &serde_json::Value) -> String {
+    trigger_string_field(trigger, &["service", "provider"])
+        .or_else(|| trigger_extracted_string(trigger, &["service", "provider"]))
+        .unwrap_or_else(|| match trigger_agent_type(trigger) {
+            crate::patterns::AgentType::Codex => "openai".to_string(),
+            crate::patterns::AgentType::ClaudeCode => "anthropic".to_string(),
+            crate::patterns::AgentType::Gemini => "google".to_string(),
+            _ => "unknown".to_string(),
+        })
+}
+
+fn trigger_account_id(trigger: &serde_json::Value) -> Option<String> {
+    trigger_extracted_string(trigger, &["account_id", "account", "account_name"])
+        .or_else(|| trigger_string_field(trigger, &["account_id", "account", "account_name"]))
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn trigger_retry_after(trigger: &serde_json::Value) -> Option<String> {
+    trigger_extracted_string(trigger, &["retry_after"])
+        .or_else(|| trigger_string_field(trigger, &["retry_after"]))
+}
+
+fn trigger_extracted_string(trigger: &serde_json::Value, keys: &[&str]) -> Option<String> {
     trigger
         .get("extracted")
-        .and_then(|v| v.get("retry_after"))
+        .and_then(|extracted| trigger_string_field(extracted, keys))
+}
+
+fn trigger_string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        match value {
+            serde_json::Value::String(raw) => Some(raw.trim().to_string()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }
+        .filter(|text| !text.is_empty())
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LimitWindowReset {
+    reset_at: Option<i64>,
+    reset_source: &'static str,
+    reset_text: Option<String>,
+    conservative_ttl_ms: i64,
+}
+
+fn limit_window_reset_from_trigger(
+    trigger: &serde_json::Value,
+    detected_at_ms: i64,
+) -> LimitWindowReset {
+    let absolute_text =
+        trigger_extracted_string(trigger, &["reset_at", "reset_time", "reset_until"])
+            .or_else(|| trigger_string_field(trigger, &["reset_at", "reset_time", "reset_until"]));
+    if let Some(text) = absolute_text {
+        if let Some((reset_source, reset_at)) = parse_reset_deadline_ms(&text, detected_at_ms) {
+            return LimitWindowReset {
+                reset_at: Some(reset_at),
+                reset_source,
+                reset_text: Some(text),
+                conservative_ttl_ms: 0,
+            };
+        }
+        return LimitWindowReset {
+            reset_at: None,
+            reset_source: "unknown_ttl",
+            reset_text: Some(text),
+            conservative_ttl_ms: CONSERVATIVE_UNKNOWN_LIMIT_WINDOW_TTL_MS,
+        };
+    }
+
+    if let Some(text) = trigger_retry_after(trigger) {
+        if let Some(duration) = crate::rate_limit_tracker::parse_retry_after_duration(&text) {
+            let delta_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+            return LimitWindowReset {
+                reset_at: detected_at_ms.checked_add(delta_ms),
+                reset_source: "retry_after",
+                reset_text: Some(text),
+                conservative_ttl_ms: 0,
+            };
+        }
+        return LimitWindowReset {
+            reset_at: None,
+            reset_source: "unknown_ttl",
+            reset_text: Some(text),
+            conservative_ttl_ms: CONSERVATIVE_UNKNOWN_LIMIT_WINDOW_TTL_MS,
+        };
+    }
+
+    LimitWindowReset {
+        reset_at: None,
+        reset_source: "unknown_ttl",
+        reset_text: None,
+        conservative_ttl_ms: CONSERVATIVE_UNKNOWN_LIMIT_WINDOW_TTL_MS,
+    }
+}
+
+fn parse_absolute_reset_ms(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(epoch) = trimmed.parse::<i64>() {
+        if epoch < 946_684_800 {
+            return None;
+        }
+        return if epoch >= 10_000_000_000 {
+            Some(epoch)
+        } else {
+            epoch.checked_mul(1000)
+        };
+    }
+
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+fn parse_reset_deadline_ms(text: &str, detected_at_ms: i64) -> Option<(&'static str, i64)> {
+    if let Some(reset_at) = parse_absolute_reset_ms(text) {
+        return Some(("absolute", reset_at));
+    }
+
+    if let Some(duration) = crate::rate_limit_tracker::parse_retry_after_duration(text) {
+        let delta_ms = i64::try_from(duration.as_millis()).ok()?;
+        return detected_at_ms
+            .checked_add(delta_ms)
+            .map(|reset_at| ("retry_after", reset_at));
+    }
+
+    parse_time_of_day_reset_ms(text, detected_at_ms).map(|reset_at| ("absolute", reset_at))
+}
+
+fn parse_time_of_day_reset_ms(text: &str, detected_at_ms: i64) -> Option<i64> {
+    let parsed = ParsedResetTimeOfDay::parse(text)?;
+    match parsed.zone.as_deref() {
+        Some("UTC" | "Etc/UTC" | "Z") => {
+            parse_utc_time_of_day_reset_ms(&parsed.time_text, detected_at_ms)
+        }
+        Some("America/New_York" | "US/Eastern" | "EST" | "EDT") => {
+            parse_new_york_time_of_day_reset_ms(&parsed.time_text, detected_at_ms)
+        }
+        Some(_) => None,
+        None => parse_local_time_of_day_reset_ms(&parsed.time_text, detected_at_ms),
+    }
+}
+
+struct ParsedResetTimeOfDay {
+    time_text: String,
+    zone: Option<String>,
+}
+
+impl ParsedResetTimeOfDay {
+    fn parse(text: &str) -> Option<Self> {
+        let mut value = text.trim().trim_end_matches('.').trim().to_string();
+        if value.is_empty() {
+            return None;
+        }
+
+        let mut zone = None;
+        if let Some(open_idx) = value.rfind('(') {
+            if value.ends_with(')') {
+                let zone_text = value[open_idx + 1..value.len() - 1].trim();
+                if !zone_text.is_empty() {
+                    zone = Some(zone_text.to_string());
+                    value.truncate(open_idx);
+                    value = value.trim().to_string();
+                }
+            }
+        }
+
+        let uppercase = value.to_ascii_uppercase();
+        if uppercase.ends_with(" UTC") {
+            zone = Some("UTC".to_string());
+            value.truncate(value.len().saturating_sub(4));
+            value = value.trim().to_string();
+        }
+
+        normalize_time_of_day_text(&value).map(|time_text| Self { time_text, zone })
+    }
+}
+
+fn normalize_time_of_day_text(text: &str) -> Option<String> {
+    let compact = text.trim();
+    if compact.is_empty() {
+        return None;
+    }
+
+    let lowercase = compact.to_ascii_lowercase();
+    for suffix in ["am", "pm"] {
+        if lowercase.ends_with(suffix) {
+            let split_at = compact.len().checked_sub(suffix.len())?;
+            let time = compact[..split_at].trim();
+            if time.is_empty() {
+                return None;
+            }
+            return normalize_meridiem_time_text(time, &suffix.to_ascii_uppercase());
+        }
+    }
+
+    Some(compact.to_string())
+}
+
+fn normalize_meridiem_time_text(time: &str, suffix: &str) -> Option<String> {
+    let (hour_text, minute_text) = time
+        .split_once(':')
+        .map_or((time.trim(), None), |(hour, minute)| {
+            (hour.trim(), Some(minute.trim()))
+        });
+    let hour = hour_text.parse::<u32>().ok()?;
+    if !(1..=12).contains(&hour) {
+        return None;
+    }
+
+    match minute_text {
+        Some(minute_text) => {
+            let minute = minute_text.parse::<u32>().ok()?;
+            if minute > 59 {
+                return None;
+            }
+            Some(format!("{hour:02}:{minute:02} {suffix}"))
+        }
+        None => Some(format!("{hour:02} {suffix}")),
+    }
+}
+
+fn parse_naive_time_of_day(text: &str) -> Option<chrono::NaiveTime> {
+    parse_meridiem_time_of_day(text).or_else(|| {
+        ["%H:%M"]
+            .iter()
+            .find_map(|format| chrono::NaiveTime::parse_from_str(text, format).ok())
+    })
+}
+
+fn parse_meridiem_time_of_day(text: &str) -> Option<chrono::NaiveTime> {
+    let mut parts = text.split_whitespace();
+    let time_text = parts.next()?;
+    let suffix = parts.next()?.to_ascii_uppercase();
+    if parts.next().is_some() {
+        return None;
+    }
+    let (hour_text, minute_text) = time_text
+        .split_once(':')
+        .map_or((time_text, "0"), |(hour, minute)| (hour, minute));
+    let hour = hour_text.parse::<u32>().ok()?;
+    let minute = minute_text.parse::<u32>().ok()?;
+    if !(1..=12).contains(&hour) || minute > 59 {
+        return None;
+    }
+    let hour_24 = match suffix.as_str() {
+        "AM" => {
+            if hour == 12 {
+                0
+            } else {
+                hour
+            }
+        }
+        "PM" => {
+            if hour == 12 {
+                12
+            } else {
+                hour + 12
+            }
+        }
+        _ => return None,
+    };
+    chrono::NaiveTime::from_hms_opt(hour_24, minute, 0)
+}
+
+fn parse_local_time_of_day_reset_ms(text: &str, detected_at_ms: i64) -> Option<i64> {
+    let time = parse_naive_time_of_day(text)?;
+    let detected_utc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(detected_at_ms)?;
+    let detected_local = detected_utc.with_timezone(&chrono::Local);
+    let date = detected_local.date_naive();
+    let candidate_naive = date.and_time(time);
+    let mut candidate = chrono::Local
+        .from_local_datetime(&candidate_naive)
+        .earliest()
+        .or_else(|| chrono::Local.from_local_datetime(&candidate_naive).latest())?;
+    if candidate.timestamp_millis() <= detected_at_ms {
+        let next_naive = candidate_naive.checked_add_days(chrono::Days::new(1))?;
+        candidate = chrono::Local
+            .from_local_datetime(&next_naive)
+            .earliest()
+            .or_else(|| chrono::Local.from_local_datetime(&next_naive).latest())?;
+    }
+    Some(candidate.timestamp_millis())
+}
+
+fn parse_utc_time_of_day_reset_ms(text: &str, detected_at_ms: i64) -> Option<i64> {
+    let time = parse_naive_time_of_day(text)?;
+    let detected = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(detected_at_ms)?;
+    let date = detected.date_naive();
+    let mut candidate = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        date.and_time(time),
+        chrono::Utc,
+    );
+    if candidate.timestamp_millis() <= detected_at_ms {
+        let next_date = date.checked_add_days(chrono::Days::new(1))?;
+        candidate = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            next_date.and_time(time),
+            chrono::Utc,
+        );
+    }
+    Some(candidate.timestamp_millis())
+}
+
+fn parse_new_york_time_of_day_reset_ms(text: &str, detected_at_ms: i64) -> Option<i64> {
+    let time = parse_naive_time_of_day(text)?;
+    let date = new_york_date_for_utc_ms(detected_at_ms)?;
+    let candidate = new_york_local_datetime_ms(date, time);
+    if candidate > detected_at_ms {
+        return Some(candidate);
+    }
+    let next_date = date.checked_add_days(chrono::Days::new(1))?;
+    Some(new_york_local_datetime_ms(next_date, time))
+}
+
+fn new_york_date_for_utc_ms(detected_at_ms: i64) -> Option<chrono::NaiveDate> {
+    let detected_utc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(detected_at_ms)?;
+    let provisional = detected_utc - chrono::Duration::hours(5);
+    let offset = new_york_utc_offset_seconds_for_local(
+        provisional.year(),
+        provisional.month(),
+        provisional.day(),
+        provisional.hour(),
+    );
+    Some((detected_utc + chrono::Duration::seconds(i64::from(offset))).date_naive())
+}
+
+fn new_york_local_datetime_ms(date: chrono::NaiveDate, time: chrono::NaiveTime) -> i64 {
+    let offset =
+        new_york_utc_offset_seconds_for_local(date.year(), date.month(), date.day(), time.hour());
+    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        date.and_time(time) - chrono::Duration::seconds(i64::from(offset)),
+        chrono::Utc,
+    )
+    .timestamp_millis()
+}
+
+fn new_york_utc_offset_seconds_for_local(year: i32, month: u32, day: u32, hour: u32) -> i32 {
+    match month {
+        4..=10 => -4 * 60 * 60,
+        1 | 2 | 12 => -5 * 60 * 60,
+        3 => {
+            let transition_day = nth_weekday_of_month(year, 3, chrono::Weekday::Sun, 2);
+            if day > transition_day || (day == transition_day && hour >= 2) {
+                -4 * 60 * 60
+            } else {
+                -5 * 60 * 60
+            }
+        }
+        11 => {
+            let transition_day = nth_weekday_of_month(year, 11, chrono::Weekday::Sun, 1);
+            if day < transition_day || (day == transition_day && hour < 2) {
+                -4 * 60 * 60
+            } else {
+                -5 * 60 * 60
+            }
+        }
+        _ => -5 * 60 * 60,
+    }
+}
+
+fn nth_weekday_of_month(year: i32, month: u32, weekday: chrono::Weekday, nth: u32) -> u32 {
+    let mut found = 0;
+    for day in 1..=31 {
+        let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, day) else {
+            break;
+        };
+        if date.weekday() == weekday {
+            found += 1;
+            if found == nth {
+                return day;
+            }
+        }
+    }
+    1
+}
+
+pub(super) async fn record_limit_window_for_trigger(
+    storage: &crate::storage::StorageHandle,
+    pane_id: u64,
+    trigger: &serde_json::Value,
+    detected_at_ms: i64,
+    source: &'static str,
+) -> crate::error::Result<crate::storage::LimitWindowRecord> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    record_limit_window_for_trigger_with_cx(storage, &cx, pane_id, trigger, detected_at_ms, source)
+        .await
+}
+
+pub(super) async fn record_limit_window_for_trigger_with_cx(
+    storage: &crate::storage::StorageHandle,
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    trigger: &serde_json::Value,
+    detected_at_ms: i64,
+    source: &'static str,
+) -> crate::error::Result<crate::storage::LimitWindowRecord> {
+    let service = trigger_service(trigger);
+    let account_id = trigger_account_id(trigger);
+    let account = match account_id.as_deref() {
+        Some(account_id) => {
+            storage
+                .get_account_with_cx(cx, &service, account_id)
+                .await?
+        }
+        None => None,
+    };
+    let account_key = account_id
+        .clone()
+        .or_else(|| account.as_ref().map(|record| record.account_id.clone()))
+        .unwrap_or_else(|| UNKNOWN_LIMIT_ACCOUNT_ID.to_string());
+    let reset = limit_window_reset_from_trigger(trigger, detected_at_ms);
+    let rule_id = trigger
+        .get("rule_id")
         .and_then(|v| v.as_str())
-        .map(ToString::to_string)
+        .unwrap_or("unknown")
+        .to_string();
+    let event_type = trigger
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let agent_type = trigger
+        .get("agent_type")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let extracted = trigger
+        .get("extracted")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let account_known = account.is_some();
+
+    storage
+        .upsert_limit_window_with_cx(
+            cx,
+            crate::storage::LimitWindowRecord {
+                id: 0,
+                pane_id,
+                service,
+                account_id: account_key,
+                account_db_id: account.as_ref().map(|record| record.id),
+                account_known,
+                agent_type,
+                rule_id,
+                event_type,
+                limited_at: detected_at_ms,
+                reset_at: reset.reset_at,
+                reset_source: reset.reset_source.to_string(),
+                reset_text: reset.reset_text.clone(),
+                conservative_ttl_ms: reset.conservative_ttl_ms,
+                last_seen_at: detected_at_ms,
+                seen_count: 1,
+                metadata: Some(
+                    serde_json::json!({
+                        "source": "workflow.limit_window_ledger",
+                        "workflow": source,
+                        "account_known": account_known,
+                        "reset_source": reset.reset_source,
+                        "reset_text": reset.reset_text,
+                        "extracted": extracted,
+                    })
+                    .to_string(),
+                ),
+                created_at: detected_at_ms,
+                updated_at: detected_at_ms,
+            },
+        )
+        .await
 }
 
 #[derive(Default)]
@@ -716,6 +1205,24 @@ impl Workflow for HandleUsageLimits {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     let is_rate_limit = trigger_is_rate_limit(&trigger);
+
+                    if trigger_is_limit_window_event(&trigger) {
+                        if let Err(err) = record_limit_window_for_trigger(
+                            &storage,
+                            pane_id,
+                            &trigger,
+                            now,
+                            "handle_usage_limits",
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                pane_id,
+                                error = %err,
+                                "handle_usage_limits: failed to upsert limit window"
+                            );
+                        }
+                    }
 
                     if let Err(err) = storage
                         .record_usage_metric(crate::storage::UsageMetricRecord {
@@ -1330,6 +1837,39 @@ mod tests {
         assert!(!trigger_is_rate_limit(&trigger));
     }
 
+    #[test]
+    fn trigger_is_limit_window_event_treats_event_type_as_authoritative() {
+        let warning = serde_json::json!({
+            "event_type": "usage.warning",
+            "rule_id": "gemini.usage.reached"
+        });
+        assert!(
+            !trigger_is_limit_window_event(&warning),
+            "usage.warning must not create a hard limit window even if a rule id is misleading"
+        );
+
+        let legacy_rule_only = serde_json::json!({"rule_id": "claude_code.rate_limit.detected"});
+        assert!(trigger_is_limit_window_event(&legacy_rule_only));
+    }
+
+    #[test]
+    fn limit_window_event_rejects_generic_event_even_if_rule_matches() {
+        let trigger = serde_json::json!({
+            "event_type": "pattern.detected",
+            "rule_id": "codex.rate_limit.detected"
+        });
+        assert!(!trigger_is_limit_window_event(&trigger));
+    }
+
+    #[test]
+    fn limit_window_event_rejects_unrelated_event_and_rule() {
+        let trigger = serde_json::json!({
+            "event_type": "session.compaction",
+            "rule_id": "codex.session.compaction"
+        });
+        assert!(!trigger_is_limit_window_event(&trigger));
+    }
+
     // ========================================================================
     // trigger_retry_after
     // ========================================================================
@@ -1343,6 +1883,15 @@ mod tests {
     }
 
     #[test]
+    fn trigger_retry_after_accepts_top_level_value() {
+        let trigger = serde_json::json!({"retry_after": "45 seconds"});
+        assert_eq!(
+            trigger_retry_after(&trigger),
+            Some("45 seconds".to_string())
+        );
+    }
+
+    #[test]
     fn trigger_retry_after_missing() {
         let trigger = serde_json::json!({});
         assert!(trigger_retry_after(&trigger).is_none());
@@ -1352,6 +1901,231 @@ mod tests {
     fn trigger_retry_after_no_extracted() {
         let trigger = serde_json::json!({"event_type": "rate_limit"});
         assert!(trigger_retry_after(&trigger).is_none());
+    }
+
+    #[test]
+    fn trigger_retry_after_accepts_numeric_extracted_value() {
+        let trigger = serde_json::json!({
+            "extracted": {"retry_after": 45}
+        });
+        assert_eq!(trigger_retry_after(&trigger), Some("45".to_string()));
+    }
+
+    #[test]
+    fn limit_window_reset_parses_epoch_and_rfc3339() {
+        assert_eq!(
+            parse_absolute_reset_ms("1800000000"),
+            Some(1_800_000_000_000)
+        );
+        assert_eq!(
+            parse_absolute_reset_ms("1800000000000"),
+            Some(1_800_000_000_000)
+        );
+        assert_eq!(
+            parse_absolute_reset_ms("2026-01-01T00:00:00Z"),
+            Some(1_767_225_600_000)
+        );
+        assert_eq!(
+            parse_absolute_reset_ms("30"),
+            None,
+            "small numeric reset text is not an epoch timestamp"
+        );
+    }
+
+    #[test]
+    fn limit_window_reset_prefers_absolute_reset() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {
+                "reset_at": "2026-01-01T00:00:00Z",
+                "retry_after": "5 minutes"
+            }
+        });
+        let reset = limit_window_reset_from_trigger(&trigger, 1_800_000_000_000);
+        assert_eq!(reset.reset_source, "absolute");
+        assert_eq!(reset.reset_at, Some(1_767_225_600_000));
+        assert_eq!(reset.reset_text.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(reset.conservative_ttl_ms, 0);
+    }
+
+    #[test]
+    fn limit_window_reset_uses_retry_after_duration() {
+        let trigger = serde_json::json!({
+            "event_type": "rate_limit.detected",
+            "extracted": {"retry_after": "2 minutes"}
+        });
+        let reset = limit_window_reset_from_trigger(&trigger, 1_800_000_000_000);
+        assert_eq!(reset.reset_source, "retry_after");
+        assert_eq!(reset.reset_at, Some(1_800_000_120_000));
+        assert_eq!(reset.conservative_ttl_ms, 0);
+    }
+
+    #[test]
+    fn limit_window_reset_parses_duration_like_reset_time() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"reset_time": "30 seconds"}
+        });
+        let reset = limit_window_reset_from_trigger(&trigger, 1_800_000_000_000);
+        assert_eq!(reset.reset_source, "retry_after");
+        assert_eq!(reset.reset_at, Some(1_800_000_030_000));
+        assert_eq!(reset.conservative_ttl_ms, 0);
+    }
+
+    #[test]
+    fn limit_window_reset_parses_utc_time_of_day_into_future_deadline() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"reset_time": "10:30 AM UTC"}
+        });
+        let detected_at = 1_800_000_000_000;
+        let reset = limit_window_reset_from_trigger(&trigger, detected_at);
+        assert_eq!(reset.reset_source, "absolute");
+        assert!(
+            reset.reset_at.expect("time-of-day reset should parse") > detected_at,
+            "time-of-day reset must resolve to a future deadline"
+        );
+        assert_eq!(reset.conservative_ttl_ms, 0);
+    }
+
+    #[test]
+    fn limit_window_reset_parses_new_york_wall_clock_fixture() {
+        let detected_at = chrono::DateTime::parse_from_rfc3339("2026-06-08T16:00:00Z")
+            .expect("valid timestamp")
+            .timestamp_millis();
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"reset_time": "2pm (America/New_York)"}
+        });
+        let reset = limit_window_reset_from_trigger(&trigger, detected_at);
+        assert_eq!(reset.reset_source, "absolute");
+        assert_eq!(
+            reset.reset_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-06-08T18:00:00Z")
+                    .expect("valid timestamp")
+                    .timestamp_millis()
+            )
+        );
+    }
+
+    #[test]
+    fn limit_window_reset_degrades_unparseable_to_unknown_ttl() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"reset_time": "after lunch maybe"}
+        });
+        let reset = limit_window_reset_from_trigger(&trigger, 1_800_000_000_000);
+        assert_eq!(reset.reset_source, "unknown_ttl");
+        assert!(reset.reset_at.is_none());
+        assert_eq!(
+            reset.conservative_ttl_ms,
+            CONSERVATIVE_UNKNOWN_LIMIT_WINDOW_TTL_MS
+        );
+        assert_eq!(reset.reset_text.as_deref(), Some("after lunch maybe"));
+    }
+
+    #[test]
+    fn handle_usage_limits_step0_writes_limit_window_for_fired_rule() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("workflow test runtime");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("usage-limit-window.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let storage = std::sync::Arc::new(
+                    crate::storage::StorageHandle::new(&db_path_str)
+                        .await
+                        .expect("storage"),
+                );
+                let now = crate::storage::now_ms();
+                storage
+                    .upsert_pane(crate::storage::PaneRecord {
+                        pane_id: 88,
+                        pane_uuid: Some("pane-88".to_string()),
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("codex".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("seed pane");
+                let account_id = "acct-ledger";
+                let account_db_id = storage
+                    .upsert_account(crate::accounts::AccountRecord {
+                        id: 0,
+                        account_id: account_id.to_string(),
+                        service: "openai".to_string(),
+                        name: Some("ledger account".to_string()),
+                        percent_remaining: 0.0,
+                        reset_at: None,
+                        tokens_used: None,
+                        tokens_remaining: None,
+                        tokens_limit: None,
+                        last_refreshed_at: now,
+                        last_used_at: None,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .await
+                    .expect("seed account");
+                let trigger = serde_json::json!({
+                    "agent_type": "codex",
+                    "event_type": "rate_limit.detected",
+                    "rule_id": "codex.rate_limit.detected",
+                    "extracted": {
+                        "account_id": account_id,
+                        "retry_after": "30 seconds"
+                    }
+                });
+                let mut ctx = WorkflowContext::new(
+                    storage.clone(),
+                    88,
+                    crate::policy::PaneCapabilities::default(),
+                    "exec-limit-window",
+                )
+                .with_trigger(trigger);
+                let step = HandleUsageLimits::new().execute_step(&mut ctx, 0).await;
+                assert!(step.is_continue(), "step 0 should continue, got {step:?}");
+
+                let row = storage
+                    .get_limit_window(88, "openai", account_id)
+                    .await
+                    .expect("query limit window")
+                    .expect("limit window should be written");
+                assert_eq!(row.account_db_id, Some(account_db_id));
+                assert!(row.account_known);
+                assert_eq!(row.account_id, account_id);
+                assert_eq!(row.service, "openai");
+                assert_eq!(row.rule_id, "codex.rate_limit.detected");
+                assert_eq!(row.event_type, "rate_limit.detected");
+                assert_eq!(row.reset_source, "retry_after");
+                assert_eq!(row.reset_at, row.limited_at.checked_add(30_000));
+                assert_eq!(row.seen_count, 1);
+
+                storage.shutdown().await.expect("shutdown storage");
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     // ========================================================================
