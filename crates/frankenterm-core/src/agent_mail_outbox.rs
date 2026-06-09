@@ -7,12 +7,16 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: u8 = 1;
 pub const CONTRACT_ID: &str = "ft.agent_mail_outbox_entry.v1";
 pub const SOURCE_BEAD: &str = "ft-dezx8.1";
+pub const SURFACE_CONTRACT_ID: &str = "ft.agent_mail_outbox_surface.v1";
+pub const SURFACE_SOURCE_BEAD: &str = "ft-dezx8.4";
+pub const DEFAULT_OUTBOX_MANIFEST_PATH: &str = "fixtures/agent-mail-outage-spool/manifest.json";
 pub const MAX_SUBJECT_BYTES: usize = 200;
 pub const MAX_BODY_PREVIEW_BYTES: usize = 512;
 pub const MAX_BODY_RETAINED_BYTES: u64 = 16 * 1024;
@@ -38,6 +42,91 @@ pub const FORBIDDEN_AGENT_MAIL_RECOVERY_COMMANDS: [&str; 7] = [
     "kill am",
     "kill mcp-agent-mail",
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMailOutboxSurface {
+    pub schema_version: u8,
+    pub contract_id: String,
+    pub source_bead: String,
+    pub input_refs: Vec<String>,
+    pub summary: AgentMailOutboxSurfaceSummary,
+    pub entries: Vec<AgentMailOutboxSurfaceEntry>,
+    pub operator_explanations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMailOutboxSurfaceSummary {
+    pub total: usize,
+    pub queued: usize,
+    pub replayable: usize,
+    pub replay_failed: usize,
+    pub replayed: usize,
+    pub superseded: usize,
+    pub discarded_by_operator: usize,
+    pub reservation_intents: usize,
+    pub beads_fallbacks: usize,
+    pub stale_owner_handoffs: usize,
+    pub ack_required: usize,
+    pub delivery_unclaimed: usize,
+    pub by_failure_class: BTreeMap<String, usize>,
+    pub by_source_operation: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMailOutboxSurfaceEntry {
+    pub replay_id: String,
+    pub created_at: String,
+    pub agent_name: String,
+    pub thread_id: Option<String>,
+    pub state: OutboxState,
+    pub replay_eligibility: OutboxReplayEligibility,
+    pub delivery_claim: OutboxDeliveryClaim,
+    pub source_operation: SourceOperation,
+    pub failure_class: FailureClass,
+    pub subject: String,
+    pub recipients: OutboxSurfaceRecipients,
+    pub ack_required: bool,
+    pub body_sha256: String,
+    pub body_preview_available: bool,
+    pub attachment_count: usize,
+    pub reservation_paths: Vec<String>,
+    pub beads_fallback_bead: Option<String>,
+    pub state_reason: Option<String>,
+    pub replayed_at: Option<String>,
+    pub delivered_message_id: Option<String>,
+    pub failure_summary: Option<String>,
+    pub operator_hint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxReplayEligibility {
+    QueuedNeedsDryRun,
+    Replayable,
+    FailedNeedsOperator,
+    Delivered,
+    Superseded,
+    DiscardedByOperator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxDeliveryClaim {
+    NotDelivered,
+    ReplayReadyNotDelivered,
+    ReplayFailedNotDelivered,
+    AgentMailDeliveryRecorded,
+    SupersededNoDeliveryClaim,
+    DiscardedNoDeliveryClaim,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxSurfaceRecipients {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc_count: usize,
+    pub total: usize,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMailOutboxEntry {
@@ -316,6 +405,7 @@ pub enum FailureClass {
     DatabaseRecoveryNotice,
     ApiUnreachable,
     ApiError,
+    ReservationConflict,
     RegistrationFailed,
     ContactPermissionBlocked,
     AckUnavailable,
@@ -352,6 +442,24 @@ impl SourceOperation {
     }
 }
 
+impl FailureClass {
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::AgentMailUnavailable => "agent_mail_unavailable",
+            Self::DatabaseRecoveryNotice => "database_recovery_notice",
+            Self::ApiUnreachable => "api_unreachable",
+            Self::ApiError => "api_error",
+            Self::ReservationConflict => "reservation_conflict",
+            Self::RegistrationFailed => "registration_failed",
+            Self::ContactPermissionBlocked => "contact_permission_blocked",
+            Self::AckUnavailable => "ack_unavailable",
+            Self::Timeout => "timeout",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboxImportance {
@@ -370,6 +478,20 @@ pub enum OutboxState {
     ReplayFailed,
     Superseded,
     DiscardedByOperator,
+}
+
+impl OutboxState {
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::ReplayDryRunOk => "replay_dry_run_ok",
+            Self::Replayed => "replayed",
+            Self::ReplayFailed => "replay_failed",
+            Self::Superseded => "superseded",
+            Self::DiscardedByOperator => "discarded_by_operator",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +784,27 @@ pub enum AgentMailOutboxReplayError {
     Validation(#[from] AgentMailOutboxValidationError),
 }
 
+#[derive(Debug, Error)]
+pub enum AgentMailOutboxSurfaceError {
+    #[error("read {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("parse {path} as JSON: {source}")]
+    ParseJson {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[error(transparent)]
+    Validation(#[from] AgentMailOutboxValidationError),
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentMailOutboxFixtureManifest {
+    valid: Vec<String>,
+}
+
 pub fn build_queued_outbox_entry(
     request: AgentMailOutboxWriteRequest,
     failure: AgentMailOutboxFailure,
@@ -849,6 +992,267 @@ pub fn mark_outbox_entry_replay_failed(
     }
 }
 
+pub fn load_agent_mail_outbox_surface(
+    workspace_root: &Path,
+    manifest_path: Option<&Path>,
+    entry_paths: &[PathBuf],
+) -> Result<AgentMailOutboxSurface, AgentMailOutboxSurfaceError> {
+    let manifest_path = manifest_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTBOX_MANIFEST_PATH));
+    let manifest_path = resolve_outbox_input_path(workspace_root, &manifest_path);
+    let manifest_ref = outbox_input_ref(workspace_root, &manifest_path);
+    let manifest_bytes =
+        std::fs::read(&manifest_path).map_err(|source| AgentMailOutboxSurfaceError::Read {
+            path: manifest_ref.clone(),
+            source,
+        })?;
+    let manifest: AgentMailOutboxFixtureManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|source| AgentMailOutboxSurfaceError::ParseJson {
+            path: manifest_ref.clone(),
+            source,
+        })?;
+
+    let mut input_paths = manifest
+        .valid
+        .iter()
+        .map(PathBuf::from)
+        .chain(entry_paths.iter().cloned())
+        .map(|path| resolve_outbox_input_path(workspace_root, &path))
+        .collect::<Vec<_>>();
+    input_paths.sort();
+    input_paths.dedup();
+
+    let mut entries = Vec::with_capacity(input_paths.len());
+    let mut input_refs = vec![manifest_ref];
+    for path in input_paths {
+        let input_ref = outbox_input_ref(workspace_root, &path);
+        let bytes = std::fs::read(&path).map_err(|source| AgentMailOutboxSurfaceError::Read {
+            path: input_ref.clone(),
+            source,
+        })?;
+        let entry: AgentMailOutboxEntry = serde_json::from_slice(&bytes).map_err(|source| {
+            AgentMailOutboxSurfaceError::ParseJson {
+                path: input_ref.clone(),
+                source,
+            }
+        })?;
+        entries.push(entry);
+        input_refs.push(input_ref);
+    }
+
+    build_agent_mail_outbox_surface(&entries, input_refs).map_err(Into::into)
+}
+
+pub fn build_agent_mail_outbox_surface(
+    entries: &[AgentMailOutboxEntry],
+    mut input_refs: Vec<String>,
+) -> Result<AgentMailOutboxSurface, AgentMailOutboxValidationError> {
+    input_refs.sort();
+    input_refs.dedup();
+
+    let mut summary = AgentMailOutboxSurfaceSummary::default();
+    let mut surface_entries = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        entry.validate()?;
+        summary.total += 1;
+        increment_counter(
+            &mut summary.by_failure_class,
+            entry.failure_reason.class.wire_name(),
+        );
+        increment_counter(
+            &mut summary.by_source_operation,
+            entry.source_operation.wire_name(),
+        );
+        if entry.reservation_intent.is_some() {
+            summary.reservation_intents += 1;
+        }
+        if entry.beads_fallback.is_some() {
+            summary.beads_fallbacks += 1;
+        }
+        if entry.source_operation == SourceOperation::StaleOwnerHandoffNotice {
+            summary.stale_owner_handoffs += 1;
+        }
+        if entry.ack_required {
+            summary.ack_required += 1;
+        }
+
+        let surface_entry = build_agent_mail_outbox_surface_entry(entry);
+        match surface_entry.replay_eligibility {
+            OutboxReplayEligibility::QueuedNeedsDryRun => summary.queued += 1,
+            OutboxReplayEligibility::Replayable => summary.replayable += 1,
+            OutboxReplayEligibility::FailedNeedsOperator => summary.replay_failed += 1,
+            OutboxReplayEligibility::Delivered => summary.replayed += 1,
+            OutboxReplayEligibility::Superseded => summary.superseded += 1,
+            OutboxReplayEligibility::DiscardedByOperator => summary.discarded_by_operator += 1,
+        }
+        if surface_entry.delivery_claim != OutboxDeliveryClaim::AgentMailDeliveryRecorded {
+            summary.delivery_unclaimed += 1;
+        }
+        surface_entries.push(surface_entry);
+    }
+
+    surface_entries.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.replay_id.cmp(&right.replay_id))
+    });
+
+    Ok(AgentMailOutboxSurface {
+        schema_version: SCHEMA_VERSION,
+        contract_id: SURFACE_CONTRACT_ID.to_owned(),
+        source_bead: SURFACE_SOURCE_BEAD.to_owned(),
+        input_refs,
+        operator_explanations: outbox_surface_operator_explanations(&summary),
+        summary,
+        entries: surface_entries,
+    })
+}
+
+fn resolve_outbox_input_path(workspace_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    }
+}
+
+fn outbox_input_ref(workspace_root: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn increment_counter(counters: &mut BTreeMap<String, usize>, key: &str) {
+    *counters.entry(key.to_owned()).or_insert(0) += 1;
+}
+
+fn build_agent_mail_outbox_surface_entry(
+    entry: &AgentMailOutboxEntry,
+) -> AgentMailOutboxSurfaceEntry {
+    let (replay_eligibility, delivery_claim, operator_hint) = outbox_surface_state_semantics(entry);
+    let recipients = OutboxSurfaceRecipients {
+        to: entry.recipients.to.clone(),
+        cc: entry.recipients.cc.clone(),
+        bcc_count: entry.recipients.bcc.len(),
+        total: entry.recipients.to.len() + entry.recipients.cc.len() + entry.recipients.bcc.len(),
+    };
+    let replay_receipt = entry.replay_receipt.as_ref();
+    let reservation_paths = entry
+        .reservation_intent
+        .as_ref()
+        .map(|intent| intent.paths.clone())
+        .unwrap_or_default();
+    let beads_fallback_bead = entry
+        .beads_fallback
+        .as_ref()
+        .map(|fallback| fallback.bead_id.clone());
+
+    AgentMailOutboxSurfaceEntry {
+        replay_id: entry.replay_id.clone(),
+        created_at: entry.created_at.clone(),
+        agent_name: entry.agent.name.clone(),
+        thread_id: entry.thread_id.clone(),
+        state: entry.state,
+        replay_eligibility,
+        delivery_claim,
+        source_operation: entry.source_operation,
+        failure_class: entry.failure_reason.class,
+        subject: entry.subject.clone(),
+        recipients,
+        ack_required: entry.ack_required,
+        body_sha256: entry.body_policy.body_sha256.clone(),
+        body_preview_available: entry.body_policy.body_preview_redacted.is_some(),
+        attachment_count: entry.attachments.len(),
+        reservation_paths,
+        beads_fallback_bead,
+        state_reason: entry.state_reason.clone(),
+        replayed_at: replay_receipt.and_then(|receipt| receipt.replayed_at.clone()),
+        delivered_message_id: replay_receipt
+            .and_then(|receipt| receipt.delivered_message_id.clone()),
+        failure_summary: replay_receipt.and_then(|receipt| receipt.failure_summary.clone()),
+        operator_hint,
+    }
+}
+
+fn outbox_surface_state_semantics(
+    entry: &AgentMailOutboxEntry,
+) -> (OutboxReplayEligibility, OutboxDeliveryClaim, String) {
+    match entry.state {
+        OutboxState::Queued => (
+            OutboxReplayEligibility::QueuedNeedsDryRun,
+            OutboxDeliveryClaim::NotDelivered,
+            "Queued after the allowed Agent Mail retry; run replay dry-run before delivery."
+                .to_owned(),
+        ),
+        OutboxState::ReplayDryRunOk => (
+            OutboxReplayEligibility::Replayable,
+            OutboxDeliveryClaim::ReplayReadyNotDelivered,
+            "Dry-run verifier passed; eligible for exactly-once replay if contact policy still allows it."
+                .to_owned(),
+        ),
+        OutboxState::ReplayFailed => (
+            OutboxReplayEligibility::FailedNeedsOperator,
+            OutboxDeliveryClaim::ReplayFailedNotDelivered,
+            "Replay verifier failed; inspect failure_summary and do not replay automatically."
+                .to_owned(),
+        ),
+        OutboxState::Replayed => (
+            OutboxReplayEligibility::Delivered,
+            OutboxDeliveryClaim::AgentMailDeliveryRecorded,
+            "Agent Mail delivery is recorded by replay receipt and delivered_message_id."
+                .to_owned(),
+        ),
+        OutboxState::Superseded => (
+            OutboxReplayEligibility::Superseded,
+            OutboxDeliveryClaim::SupersededNoDeliveryClaim,
+            "Superseded by Beads fallback or operator context; keep as audit evidence only."
+                .to_owned(),
+        ),
+        OutboxState::DiscardedByOperator => (
+            OutboxReplayEligibility::DiscardedByOperator,
+            OutboxDeliveryClaim::DiscardedNoDeliveryClaim,
+            "Discarded by an operator decision; retain audit trail and do not replay.".to_owned(),
+        ),
+    }
+}
+
+fn outbox_surface_operator_explanations(summary: &AgentMailOutboxSurfaceSummary) -> Vec<String> {
+    let mut explanations = vec![OUTBOX_WRITER_DELIVERY_UNCLAIMED_NOTE.to_owned()];
+    if summary.replayable > 0 {
+        explanations.push(
+            "replay_dry_run_ok entries are replayable candidates, not delivered messages."
+                .to_owned(),
+        );
+    }
+    if summary.replay_failed > 0 {
+        explanations.push(
+            "replay_failed entries require operator review before any later retry.".to_owned(),
+        );
+    }
+    if summary.reservation_intents > 0 {
+        explanations.push(
+            "reservation_intent rows are stale-owner or ownership hints; they do not acquire live reservations."
+                .to_owned(),
+        );
+    }
+    if summary.beads_fallbacks > 0 {
+        explanations.push(
+            "beads_fallback rows show durable Beads coordination and remain distinct from Agent Mail delivery."
+                .to_owned(),
+        );
+    }
+    if summary.stale_owner_handoffs > 0 {
+        explanations.push(
+            "stale_owner_handoff_notice rows surface intended handoffs separately from delivered Agent Mail."
+                .to_owned(),
+        );
+    }
+    explanations
+}
+
 #[must_use]
 pub fn deterministic_replay_id(seed: &ReplayIdSeed<'_>) -> String {
     let mut hasher = Sha256::new();
@@ -901,6 +1305,8 @@ pub fn classify_agent_mail_failure(summary: &str) -> FailureClass {
         FailureClass::ApiUnreachable
     } else if lower.contains("agent mail") && lower.contains("unavailable") {
         FailureClass::AgentMailUnavailable
+    } else if lower.contains("reservation") && lower.contains("conflict") {
+        FailureClass::ReservationConflict
     } else if lower.contains("api")
         && (lower.contains("error") || lower.contains("failed") || lower.contains("unavailable"))
     {
@@ -1449,17 +1855,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn valid_fixture_entries_pass_validation() {
-        for fixture in [
+    fn valid_fixture_payloads() -> [&'static str; 10] {
+        [
             include_str!(
                 "../../../fixtures/agent-mail-outage-spool/valid/agent-mail-unavailable.json"
             ),
+            include_str!("../../../fixtures/agent-mail-outage-spool/valid/send-timeout.json"),
             include_str!("../../../fixtures/agent-mail-outage-spool/valid/contact-blocked.json"),
             include_str!(
                 "../../../fixtures/agent-mail-outage-spool/valid/ack-required-message.json"
             ),
             include_str!("../../../fixtures/agent-mail-outage-spool/valid/reservation-intent.json"),
+            include_str!(
+                "../../../fixtures/agent-mail-outage-spool/valid/reservation-conflict.json"
+            ),
             include_str!(
                 "../../../fixtures/agent-mail-outage-spool/valid/beads-fallback-closeout.json"
             ),
@@ -1470,11 +1879,153 @@ mod tests {
             include_str!(
                 "../../../fixtures/agent-mail-outage-spool/valid/writer-adapter-queued-send.json"
             ),
-        ] {
-            let entry: AgentMailOutboxEntry =
-                serde_json::from_str(fixture).expect("fixture parses");
+        ]
+    }
+
+    fn valid_fixture_entries() -> Vec<AgentMailOutboxEntry> {
+        valid_fixture_payloads()
+            .into_iter()
+            .map(|fixture| serde_json::from_str(fixture).expect("fixture parses"))
+            .collect()
+    }
+
+    #[test]
+    fn valid_fixture_entries_pass_validation() {
+        for entry in valid_fixture_entries() {
             entry.validate().expect("fixture validates");
         }
+    }
+
+    #[test]
+    fn outbox_surface_summarizes_replay_and_fallback_state() {
+        let surface = build_agent_mail_outbox_surface(
+            &valid_fixture_entries(),
+            vec![
+                "fixtures/agent-mail-outage-spool/valid/*.json".to_owned(),
+                "fixtures/agent-mail-outage-spool/manifest.json".to_owned(),
+            ],
+        )
+        .expect("surface builds from valid fixtures");
+
+        assert_eq!(surface.contract_id, SURFACE_CONTRACT_ID);
+        assert_eq!(surface.source_bead, SURFACE_SOURCE_BEAD);
+        assert_eq!(surface.summary.total, 10);
+        assert_eq!(surface.summary.queued, 6);
+        assert_eq!(surface.summary.replayable, 1);
+        assert_eq!(surface.summary.replay_failed, 1);
+        assert_eq!(surface.summary.replayed, 1);
+        assert_eq!(surface.summary.superseded, 1);
+        assert_eq!(surface.summary.delivery_unclaimed, 9);
+        assert_eq!(surface.summary.reservation_intents, 2);
+        assert_eq!(surface.summary.beads_fallbacks, 4);
+        assert_eq!(surface.summary.stale_owner_handoffs, 1);
+        assert_eq!(surface.summary.ack_required, 1);
+        assert_eq!(
+            surface
+                .summary
+                .by_failure_class
+                .get("agent_mail_unavailable"),
+            Some(&3)
+        );
+        assert_eq!(
+            surface.summary.by_source_operation.get("send_message"),
+            Some(&6)
+        );
+        assert_eq!(
+            surface.summary.by_source_operation.get("file_reservation"),
+            Some(&2)
+        );
+        assert_eq!(surface.summary.by_failure_class.get("timeout"), Some(&1));
+        assert_eq!(
+            surface.summary.by_failure_class.get("reservation_conflict"),
+            Some(&1)
+        );
+        assert!(
+            surface
+                .operator_explanations
+                .iter()
+                .any(|explanation| explanation.contains("delivery is not claimed"))
+        );
+        assert!(
+            surface
+                .operator_explanations
+                .iter()
+                .any(|explanation| explanation.contains("reservation_intent"))
+        );
+    }
+
+    #[test]
+    fn outbox_surface_loader_reads_manifest_and_entries() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let surface = load_agent_mail_outbox_surface(&workspace_root, None, &[])
+            .expect("default fixture manifest loads");
+
+        assert_eq!(surface.summary.total, 10);
+        assert!(
+            surface
+                .input_refs
+                .iter()
+                .any(|path| path == DEFAULT_OUTBOX_MANIFEST_PATH)
+        );
+        assert!(
+            surface
+                .entries
+                .iter()
+                .any(|entry| entry.delivery_claim == OutboxDeliveryClaim::AgentMailDeliveryRecorded)
+        );
+    }
+
+    #[test]
+    fn outbox_surface_redacts_bcc_names_and_marks_delivery_claims() {
+        let mut entry = valid_entry();
+        entry.recipients.bcc = vec!["HiddenRiver".to_owned(), "QuietHill".to_owned()];
+        let replayed = dry_run_replay_outbox_entry(
+            entry.clone(),
+            &AgentMailOutboxReplayDryRun {
+                checked_at: "2026-05-29T14:10:00Z".to_owned(),
+                available_recipients: vec![
+                    "SapphireCardinal".to_owned(),
+                    "HiddenRiver".to_owned(),
+                    "QuietHill".to_owned(),
+                ],
+                ack_available: true,
+                available_attachment_paths: Vec::new(),
+                delivered_message_id: Some("agent-mail-msg-ft-dezx8-4-1".to_owned()),
+            },
+        )
+        .expect("duplicate delivery suppresses replay");
+
+        let surface = build_agent_mail_outbox_surface(
+            &[entry, replayed],
+            vec!["fixtures/agent-mail-outage-spool/valid/bcc-case.json".to_owned()],
+        )
+        .expect("surface builds");
+
+        assert_eq!(surface.summary.total, 2);
+        assert_eq!(surface.summary.replayed, 1);
+        assert_eq!(surface.summary.delivery_unclaimed, 1);
+        let queued = surface
+            .entries
+            .iter()
+            .find(|row| row.delivery_claim == OutboxDeliveryClaim::NotDelivered)
+            .expect("queued row present");
+        assert_eq!(queued.recipients.bcc_count, 2);
+        assert_eq!(queued.recipients.total, 3);
+        assert!(
+            !serde_json::to_value(queued)
+                .expect("serialize queued row")
+                .to_string()
+                .contains("HiddenRiver")
+        );
+        let delivered = surface
+            .entries
+            .iter()
+            .find(|row| row.delivery_claim == OutboxDeliveryClaim::AgentMailDeliveryRecorded)
+            .expect("delivered row present");
+        assert_eq!(
+            delivered.delivered_message_id.as_deref(),
+            Some("agent-mail-msg-ft-dezx8-4-1")
+        );
     }
 
     #[test]
@@ -1747,6 +2298,10 @@ mod tests {
                 FailureClass::ApiUnreachable,
             ),
             ("Agent Mail request timed out", FailureClass::Timeout),
+            (
+                "Agent Mail file reservation reported a reservation conflict",
+                FailureClass::ReservationConflict,
+            ),
             (
                 "Contact permission blocked by policy",
                 FailureClass::ContactPermissionBlocked,

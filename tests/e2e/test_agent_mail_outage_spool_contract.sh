@@ -47,9 +47,11 @@ PROVENANCE = "docs/json-schema/PROVENANCE.md"
 RUST_CONTRACT = "crates/frankenterm-core/src/agent_mail_outbox.rs"
 EXPECTED_FIXTURE_IDS = %w[
   agent-mail-unavailable
+  send-timeout
   contact-blocked
   ack-required-message
   reservation-intent
+  reservation-conflict
   beads-fallback-closeout
   stale-owner-handoff
   replayed-send
@@ -78,6 +80,7 @@ EXPECTED_FAILURE_CLASSES = %w[
   database_recovery_notice
   api_unreachable
   api_error
+  reservation_conflict
   registration_failed
   contact_permission_blocked
   ack_unavailable
@@ -187,6 +190,18 @@ fail!("manifest RCH-only unit proof missing") unless manifest.fetch("verificatio
     line.include?("--no-default-features") &&
     line.include?("agent_mail_outbox")
 end
+fail!("manifest RCH-only MCP surface proof missing") unless manifest.fetch("verification").any? do |line|
+  line.include?("RCH_REQUIRE_REMOTE=1") &&
+    line.include?("cargo test --locked -p frankenterm-core --lib") &&
+    line.include?("--no-default-features") &&
+    line.include?("--features mcp") &&
+    line.match?(/\sresource\s--\s--nocapture\z/)
+end
+fail!("manifest RCH-only Robot surface proof missing") unless manifest.fetch("verification").any? do |line|
+  line.include?("RCH_REQUIRE_REMOTE=1") &&
+    line.include?("cargo test --locked -p frankenterm --bin ft") &&
+    line.include?("agent_mail_outbox")
+end
 
 fixture_paths = manifest.fetch("valid")
 fixture_ids = fixture_paths.map { |path| File.basename(path, ".json") }
@@ -196,6 +211,9 @@ fixture_paths.each { |path| fail!("missing fixture #{path}") unless File.file?(p
 states = Set.new
 operations = Set.new
 failure_classes = Set.new
+surface_counts = Hash.new(0)
+surface_failure_counts = Hash.new(0)
+surface_operation_counts = Hash.new(0)
 actual_log = []
 
 fixture_paths.each do |path|
@@ -293,6 +311,27 @@ fixture_paths.each do |path|
   states << state
   operations << payload.fetch("source_operation")
   failure_classes << failure.fetch("class")
+  surface_operation_counts[payload.fetch("source_operation")] += 1
+  surface_failure_counts[failure.fetch("class")] += 1
+  case state
+  when "queued"
+    surface_counts["queued"] += 1
+  when "replay_dry_run_ok"
+    surface_counts["replayable"] += 1
+  when "replay_failed"
+    surface_counts["replay_failed"] += 1
+  when "replayed"
+    surface_counts["replayed"] += 1
+  when "superseded"
+    surface_counts["superseded"] += 1
+  when "discarded_by_operator"
+    surface_counts["discarded_by_operator"] += 1
+  end
+  surface_counts["reservation_intents"] += 1 if payload["reservation_intent"]
+  surface_counts["beads_fallbacks"] += 1 if payload["beads_fallback"]
+  surface_counts["stale_owner_handoffs"] += 1 if payload.fetch("source_operation") == "stale_owner_handoff_notice"
+  surface_counts["ack_required"] += 1 if payload["ack_required"] == true
+  surface_counts["delivery_unclaimed"] += 1 unless state == "replayed"
   actual_log << {
     "event" => "fixture_checked",
     "fixture" => fixture_id,
@@ -310,13 +349,39 @@ actual_log << {
   "failure_classes" => failure_classes.to_a.sort
 }
 
+actual_log << {
+  "event" => "surface_summary",
+  "contract_id" => "ft.agent_mail_outbox_surface.v1",
+  "source_bead" => "ft-dezx8.4",
+  "fixtures" => fixture_paths.length,
+  "queued" => surface_counts["queued"],
+  "replayable" => surface_counts["replayable"],
+  "replay_failed" => surface_counts["replay_failed"],
+  "replayed" => surface_counts["replayed"],
+  "superseded" => surface_counts["superseded"],
+  "discarded_by_operator" => surface_counts["discarded_by_operator"],
+  "reservation_intents" => surface_counts["reservation_intents"],
+  "beads_fallbacks" => surface_counts["beads_fallbacks"],
+  "stale_owner_handoffs" => surface_counts["stale_owner_handoffs"],
+  "ack_required" => surface_counts["ack_required"],
+  "delivery_unclaimed" => surface_counts["delivery_unclaimed"],
+  "by_failure_class" => surface_failure_counts.sort.to_h,
+  "by_source_operation" => surface_operation_counts.sort.to_h
+}
+
 fail!("structured verifier log drifted") unless actual_log == expected_log
 fail!("expected ack-required fixture missing") unless read_json("fixtures/agent-mail-outage-spool/valid/ack-required-message.json")["ack_required"] == true
+fail!("expected timeout fixture missing") unless read_json("fixtures/agent-mail-outage-spool/valid/send-timeout.json").fetch("failure_reason").fetch("class") == "timeout"
 fail!("expected reservation fixture missing") unless read_json("fixtures/agent-mail-outage-spool/valid/reservation-intent.json")["reservation_intent"]
+fail!("expected reservation-conflict fixture missing") unless read_json("fixtures/agent-mail-outage-spool/valid/reservation-conflict.json").fetch("failure_reason").fetch("class") == "reservation_conflict"
 fail!("expected Beads fallback fixture missing") unless read_json("fixtures/agent-mail-outage-spool/valid/beads-fallback-closeout.json")["beads_fallback"]
 fail!("expected stale-owner fixture missing") unless read_json("fixtures/agent-mail-outage-spool/valid/stale-owner-handoff.json")["source_operation"] == "stale_owner_handoff_notice"
 fail!("provenance missing outbox schema") unless provenance.include?("`ft-agent-mail-outbox-entry.json`")
 fail!("rust contract missing replay states") unless EXPECTED_STATES.all? { |state| rust_contract.include?(state.split("_").map(&:capitalize).join) || rust_contract.include?(state) }
+fail!("rust contract missing surface contract") unless rust_contract.include?("SURFACE_CONTRACT_ID") && rust_contract.include?("ft.agent_mail_outbox_surface.v1")
+fail!("rust contract missing surface source bead") unless rust_contract.include?("SURFACE_SOURCE_BEAD") && rust_contract.include?("ft-dezx8.4")
+fail!("rust contract missing surface loader") unless rust_contract.include?("load_agent_mail_outbox_surface")
+fail!("rust contract missing delivery-claim semantics") unless rust_contract.include?("OutboxDeliveryClaim")
 
 actual_log.each { |entry| puts(JSON.generate(entry)) }
 puts "agent mail outage spool contract: static verifier passed (#{fixture_paths.length} fixtures)"

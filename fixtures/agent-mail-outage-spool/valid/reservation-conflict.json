@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.agent_mail_outbox_entry.v1",
+  "source_bead": "ft-dezx8.1",
+  "replay_id": "amq1-444444444444444444444444",
+  "created_at": "2026-05-29T13:39:00Z",
+  "agent": {
+    "name": "IvoryCreek",
+    "program": "codex-cli",
+    "model": "gpt-5-codex",
+    "project_key": "/Users/jemanuel/projects/frankenterm"
+  },
+  "thread_id": "ft-dezx8.1",
+  "recipients": {
+    "to": [
+      "SapphireCardinal"
+    ],
+    "cc": [
+      "YellowHorse"
+    ],
+    "bcc": []
+  },
+  "subject": "ft-dezx8.1 reservation conflict fallback",
+  "body_policy": {
+    "body_sha256": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    "body_storage": "digest_only",
+    "body_preview_redacted": "Reservation conflict was recorded as fallback intent without overriding ownership.",
+    "body_byte_count": 188,
+    "max_retained_bytes": 4096,
+    "raw_body_retained": false
+  },
+  "importance": "high",
+  "ack_required": false,
+  "attachments": [
+    {
+      "path": "fixtures/agent-mail-outage-spool/manifest.json",
+      "sha256": "22223333444455556666777788889999aaaabbbbccccddddeeeeffff00001111",
+      "byte_count": 1045,
+      "content_type": "application/json",
+      "retention": "digest_only"
+    }
+  ],
+  "source_operation": "file_reservation",
+  "failure_reason": {
+    "class": "reservation_conflict",
+    "summary": "Agent Mail file reservation reported a reservation conflict after retry; queued as fallback intent.",
+    "retry_count": 1,
+    "retry_limit": 1,
+    "last_attempt_at": "2026-05-29T13:39:10Z"
+  },
+  "state": "queued",
+  "state_reason": null,
+  "operator_decision": null,
+  "replay_receipt": null,
+  "retention": {
+    "retain_until": "2026-06-28T13:39:00Z",
+    "automatic_discard": false,
+    "redaction": [
+      "body_digest_only",
+      "body_preview_redacted",
+      "attachment_refs_only"
+    ]
+  },
+  "reservation_intent": {
+    "paths": [
+      "crates/frankenterm-core/src/agent_mail_outbox.rs",
+      "fixtures/agent-mail-outage-spool/manifest.json"
+    ],
+    "exclusive": true,
+    "ttl_seconds": 7200,
+    "reason_sha256": "55556666777788889999aaaabbbbccccddddeeeeffff00001111222233334444",
+    "reason_preview_redacted": "Record reservation conflict fallback for ft-dezx8.1."
+  },
+  "beads_fallback": null
+}
