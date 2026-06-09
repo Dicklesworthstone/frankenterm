@@ -45,6 +45,9 @@ fn arb_backup_manifest() -> impl Strategy<Value = BackupManifest> {
         any::<u64>(),
         "[a-f0-9]{64}",
         arb_backup_stats(),
+        "live-secret-patterns-sha256:[a-f0-9]{8,64}",
+        0usize..128usize,
+        any::<bool>(),
         any::<bool>(),
     )
         .prop_map(
@@ -56,6 +59,9 @@ fn arb_backup_manifest() -> impl Strategy<Value = BackupManifest> {
                 db_size_bytes,
                 db_checksum,
                 stats,
+                redaction_catalog_version,
+                redaction_patterns_checked,
+                redaction_applied,
                 compressed,
             )| {
                 BackupManifest {
@@ -66,6 +72,9 @@ fn arb_backup_manifest() -> impl Strategy<Value = BackupManifest> {
                     db_size_bytes,
                     db_checksum,
                     stats,
+                    redaction_catalog_version,
+                    redaction_patterns_checked,
+                    redaction_applied,
                     compressed,
                 }
             },
@@ -134,6 +143,15 @@ proptest! {
         prop_assert_eq!(manifest.db_size_bytes, decoded.db_size_bytes);
         prop_assert_eq!(&manifest.db_checksum, &decoded.db_checksum);
         prop_assert_eq!(manifest.stats.panes, decoded.stats.panes);
+        prop_assert_eq!(
+            &manifest.redaction_catalog_version,
+            &decoded.redaction_catalog_version
+        );
+        prop_assert_eq!(
+            manifest.redaction_patterns_checked,
+            decoded.redaction_patterns_checked
+        );
+        prop_assert_eq!(manifest.redaction_applied, decoded.redaction_applied);
     }
 
     /// BackupManifest JSON contains all required fields
@@ -148,6 +166,9 @@ proptest! {
         prop_assert!(parsed.get("db_size_bytes").is_some());
         prop_assert!(parsed.get("db_checksum").is_some());
         prop_assert!(parsed.get("stats").is_some());
+        prop_assert!(parsed.get("redaction_catalog_version").is_some());
+        prop_assert!(parsed.get("redaction_patterns_checked").is_some());
+        prop_assert!(parsed.get("redaction_applied").is_some());
     }
 }
 

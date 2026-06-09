@@ -121,6 +121,15 @@ pub struct BackupManifest {
     pub db_checksum: String,
     /// Statistics about the backed-up data
     pub stats: BackupStats,
+    /// Redaction catalog version/fingerprint applied to the backup payload.
+    #[serde(default)]
+    pub redaction_catalog_version: String,
+    /// Number of live secret-pattern families checked during backup redaction.
+    #[serde(default)]
+    pub redaction_patterns_checked: usize,
+    /// Whether backup payload redaction ran before manifest/checksum finalization.
+    #[serde(default)]
+    pub redaction_applied: bool,
     /// Whether the database file is zstd-compressed (`database.db.zst`).
     #[serde(default)]
     pub compressed: bool,
@@ -496,14 +505,17 @@ pub fn export_backup(
     let dest_db_path = output_dir.join("database.db");
     backup_database(db_path, &dest_db_path)?;
 
-    // Step 2: Compute checksum of the backed-up database
+    // Step 2: Redact the copied backup before checksums, SQL dump, or verification.
+    let redaction = redact_backup_database(&dest_db_path)?;
+
+    // Step 3: Compute checksum of the backed-up database
     let db_checksum = sha256_file(&dest_db_path)?;
     let db_size = fs::metadata(&dest_db_path).map_or(0, |m| m.len());
 
-    // Step 3: Gather stats from the backup copy
+    // Step 4: Gather stats from the backup copy
     let stats = gather_stats(&dest_db_path)?;
 
-    // Step 4: Build manifest
+    // Step 5: Build manifest
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
@@ -517,10 +529,13 @@ pub fn export_backup(
         db_size_bytes: db_size,
         db_checksum: db_checksum.clone(),
         stats,
+        redaction_catalog_version: redaction.catalog_version,
+        redaction_patterns_checked: redaction.patterns_checked,
+        redaction_applied: true,
         compressed: false,
     };
 
-    // Step 5: Write manifest.json
+    // Step 6: Write manifest.json
     let manifest_path = output_dir.join("manifest.json");
     let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
@@ -533,7 +548,7 @@ pub fn export_backup(
         )))
     })?;
 
-    // Step 6: Write checksums file
+    // Step 7: Write checksums file
     let checksums_path = output_dir.join("checksums.sha256");
     let manifest_checksum = sha256_bytes(manifest_json.as_bytes());
     let checksums_content = format!(
@@ -546,13 +561,13 @@ pub fn export_backup(
         )))
     })?;
 
-    // Step 7: Optionally include SQL text dump
+    // Step 8: Optionally include SQL text dump
     if opts.include_sql_dump {
         let sql_path = output_dir.join("database.sql");
         dump_database_sql(&dest_db_path, &sql_path)?;
     }
 
-    // Step 8: Verify backup integrity if requested
+    // Step 9: Verify backup integrity if requested
     if opts.verify {
         verify_backup(&output_dir, &manifest)?;
     }
@@ -849,7 +864,7 @@ pub fn verify_backup(backup_dir: &Path, manifest: &BackupManifest) -> Result<()>
             "Backup verification failed: cannot open database: {e}"
         )))
     })?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    set_backup_busy_timeout(&conn, "backup verification")?;
 
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -990,7 +1005,12 @@ pub fn import_backup(
         let journal_path = sqlite_sidecar_path(target_db_path, "-journal");
         for p in [&wal_path, &shm_path, &journal_path] {
             if p.exists() {
-                let _ = fs::remove_file(p);
+                fs::remove_file(p).map_err(|e| {
+                    Error::Storage(crate::StorageError::Database(format!(
+                        "Failed to remove stale SQLite sidecar {} before restore: {e}",
+                        p.display()
+                    )))
+                })?;
             }
         }
     }
@@ -1013,6 +1033,15 @@ fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
+fn set_backup_busy_timeout(conn: &Connection, context: &str) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to configure SQLite busy timeout for {context}: {e}"
+            )))
+        })
+}
+
 /// Use rusqlite's online backup API for a consistent snapshot.
 fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
     let src = Connection::open(src_path).map_err(|e| {
@@ -1023,7 +1052,7 @@ fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
     // Source is the LIVE production DB. Without busy_timeout, a concurrent
     // writer makes the online-backup read locks fail immediately with
     // SQLITE_BUSY and the backup aborts. Match the standard 5s recipe.
-    let _ = src.busy_timeout(std::time::Duration::from_secs(5));
+    set_backup_busy_timeout(&src, "source database backup")?;
 
     let mut dest = Connection::open(dest_path).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
@@ -1045,6 +1074,354 @@ fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct BackupRedactionInfo {
+    catalog_version: String,
+    patterns_checked: usize,
+}
+
+fn backup_redaction_catalog_version() -> String {
+    let names: Vec<&'static str> = crate::redactor::secret_pattern_names().collect();
+    let fingerprint = sha256_bytes(names.join("\n").as_bytes());
+    format!("live-secret-patterns-sha256:{fingerprint}")
+}
+
+fn redact_backup_database(db_path: &Path) -> Result<BackupRedactionInfo> {
+    let conn = Connection::open(db_path).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to open backup database for redaction: {e}"
+        )))
+    })?;
+    set_backup_busy_timeout(&conn, "backup redaction")?;
+    conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA secure_delete=ON;")
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to configure backup database redaction journaling: {e}"
+            )))
+        })?;
+
+    let redactor = crate::redactor::Redactor::new();
+    let mut redacted_cells = 0_u64;
+    for table in backup_redaction_tables(&conn)? {
+        for column in backup_redaction_columns(&conn, &table)? {
+            if backup_redaction_payload_column(&table, &column) {
+                redacted_cells += redact_backup_text_column(&conn, &redactor, &table, &column)?;
+            }
+        }
+    }
+    let rebuilt_fts = rebuild_backup_output_segments_fts(&conn)?;
+    if redacted_cells > 0 || rebuilt_fts {
+        conn.execute_batch("VACUUM").map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to vacuum redacted backup database: {e}"
+            )))
+        })?;
+    }
+
+    Ok(BackupRedactionInfo {
+        catalog_version: backup_redaction_catalog_version(),
+        patterns_checked: crate::redactor::secret_pattern_names().count(),
+    })
+}
+
+fn backup_redaction_tables(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_list").map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to list backup database tables for redaction: {e}"
+        )))
+    })?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    });
+    let rows = rows.map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to query backup database tables for redaction: {e}"
+        )))
+    })?;
+
+    let mut tables = Vec::new();
+    for row in rows {
+        let (schema, name, kind) = row.map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to read backup database table metadata for redaction: {e}"
+            )))
+        })?;
+        if schema == "main" && kind == "table" && !name.starts_with("sqlite_") {
+            tables.push(name);
+        }
+    }
+    Ok(tables)
+}
+
+fn backup_redaction_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
+    let pragma_sql = format!("PRAGMA table_xinfo({})", quote_identifier(table_name));
+    let mut stmt = conn.prepare(&pragma_sql).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to list backup database columns for {table_name}: {e}"
+        )))
+    })?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(6)?,
+        ))
+    });
+    let rows = rows.map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to query backup database columns for {table_name}: {e}"
+        )))
+    })?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        let (name, declared_type, hidden) = row.map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to read backup database column metadata for {table_name}: {e}"
+            )))
+        })?;
+        if hidden == 0 && backup_redaction_text_affinity(declared_type.as_deref()) {
+            columns.push(name);
+        }
+    }
+    Ok(columns)
+}
+
+fn backup_sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        rusqlite::params![table_name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to check backup database table {table_name}: {e}"
+        )))
+    })
+}
+
+fn rebuild_backup_output_segments_fts(conn: &Connection) -> Result<bool> {
+    if !backup_sqlite_table_exists(conn, "output_segments_fts")? {
+        return Ok(false);
+    }
+
+    conn.execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')")
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to rebuild redacted backup output_segments_fts index: {e}"
+            )))
+        })?;
+    Ok(true)
+}
+
+fn backup_redaction_text_affinity(declared_type: Option<&str>) -> bool {
+    let Some(declared_type) = declared_type else {
+        return false;
+    };
+    let upper = declared_type.trim().to_ascii_uppercase();
+    upper.contains("TEXT")
+        || upper.contains("CHAR")
+        || upper.contains("CLOB")
+        || upper.contains("JSON")
+}
+
+fn backup_redaction_payload_column(table_name: &str, column_name: &str) -> bool {
+    match table_name {
+        "output_segments" => column_name == "content",
+        "output_gaps" | "policy_denied_audit" | "pane_reservations" => column_name == "reason",
+        "events" => matches!(column_name, "extracted" | "matched_text"),
+        "event_labels" => matches!(column_name, "label" | "created_by"),
+        "event_notes" => matches!(column_name, "note" | "updated_by"),
+        "event_mutes" => matches!(column_name, "identity_key" | "created_by" | "reason"),
+        "agent_sessions" => matches!(column_name, "session_id" | "external_id" | "external_meta"),
+        "workflow_executions" => {
+            matches!(
+                column_name,
+                "wait_condition" | "context" | "result" | "error"
+            )
+        }
+        "workflow_step_logs" => {
+            matches!(
+                column_name,
+                "result_data" | "policy_summary" | "verification_refs"
+            )
+        }
+        "workflow_action_plans" => column_name == "plan_json",
+        "prepared_plans" => matches!(column_name, "params_json" | "plan_json" | "risk_summary"),
+        "audit_actions" => matches!(
+            column_name,
+            "decision_reason" | "input_summary" | "verification_summary" | "decision_context"
+        ),
+        "action_undo" => matches!(column_name, "undo_hint" | "undo_payload"),
+        "approval_tokens" => {
+            matches!(
+                column_name,
+                "workspace_id" | "action_fingerprint" | "risk_summary"
+            )
+        }
+        "panes" => matches!(column_name, "title" | "cwd" | "tty_name" | "ignore_reason"),
+        "accounts" => matches!(column_name, "account_id" | "name"),
+        "config" | "semantic_store_metadata" => column_name == "value",
+        "saved_searches" => matches!(column_name, "name" | "query" | "last_error"),
+        "maintenance_log" => matches!(column_name, "message" | "metadata"),
+        "secret_scan_reports" => matches!(column_name, "scope_json" | "report_json"),
+        "usage_metrics" => column_name == "metadata",
+        "notification_history" => matches!(
+            column_name,
+            "title" | "body" | "error_message" | "acknowledged_by" | "action_taken" | "metadata"
+        ),
+        "pane_bookmarks" => matches!(column_name, "alias" | "tags" | "description"),
+        "mux_sessions" => matches!(column_name, "topology_json" | "window_metadata_json"),
+        "session_checkpoints" => column_name == "metadata_json",
+        "mux_pane_state" => matches!(
+            column_name,
+            "cwd" | "command" | "env_json" | "terminal_state_json" | "agent_metadata_json"
+        ),
+        "agent_profiles" => matches!(
+            column_name,
+            "name" | "role" | "tags" | "shell" | "command" | "env" | "metadata"
+        ),
+        "profiles_applied_log" => matches!(column_name, "profile_name" | "panes_spawned_json"),
+        "fleet_mutation_receipts" => column_name == "receipt_json",
+        "passports" => matches!(column_name, "agent_id" | "payload"),
+        "recorder_events" => matches!(column_name, "payload_json" | "event_id" | "batch_id"),
+        "recorder_batches" => matches!(column_name, "batch_id" | "response_json"),
+        "recorder_checkpoints" => column_name == "consumer",
+        _ => matches!(column_name, "content" | "data" | "message" | "description"),
+    }
+}
+
+fn backup_redaction_unique_text_column(table_name: &str, column_name: &str) -> bool {
+    matches!(
+        (table_name, column_name),
+        ("event_labels", "label")
+            | ("event_mutes", "identity_key")
+            | ("accounts", "account_id")
+            | ("saved_searches" | "agent_profiles", "name")
+            | ("pane_bookmarks", "alias")
+            | ("passports", "agent_id")
+            | ("recorder_batches", "batch_id")
+            | ("recorder_checkpoints", "consumer")
+    )
+}
+
+fn backup_redacted_cell_value(
+    table_name: &str,
+    column_name: &str,
+    rowid: i64,
+    redacted: String,
+) -> String {
+    if backup_redaction_unique_text_column(table_name, column_name) {
+        format!("{redacted}#redacted-rowid-{rowid}")
+    } else {
+        redacted
+    }
+}
+
+fn redact_backup_text_column(
+    conn: &Connection,
+    redactor: &crate::redactor::Redactor,
+    table_name: &str,
+    column_name: &str,
+) -> Result<u64> {
+    let quoted_table = quote_identifier(table_name);
+    let quoted_column = quote_identifier(column_name);
+    let select_sql = format!(
+        "SELECT rowid, {quoted_column} FROM {quoted_table} WHERE {quoted_column} IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&select_sql).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to prepare backup redaction scan for {table_name}.{column_name}: {e}"
+        )))
+    })?;
+    let mut rows = stmt.query([]).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to query backup redaction scan for {table_name}.{column_name}: {e}"
+        )))
+    })?;
+
+    let mut updates = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to read backup redaction row for {table_name}.{column_name}: {e}"
+        )))
+    })? {
+        let rowid: i64 = row.get(0).map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to read rowid for backup redaction of {table_name}.{column_name}: {e}"
+            )))
+        })?;
+        let text = match row.get_ref(1).map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to inspect backup redaction cell for {table_name}.{column_name}: {e}"
+            )))
+        })? {
+            rusqlite::types::ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            _ => continue,
+        };
+        let redacted = redactor.redact(&text);
+        if redacted != text {
+            updates.push((
+                rowid,
+                backup_redacted_cell_value(table_name, column_name, rowid, redacted),
+            ));
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    let update_count = u64::try_from(updates.len()).unwrap_or(u64::MAX);
+    for (rowid, redacted) in updates {
+        update_backup_redacted_cell(conn, table_name, column_name, rowid, &redacted)?;
+    }
+    Ok(update_count)
+}
+
+fn update_backup_redacted_cell(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+    rowid: i64,
+    redacted: &str,
+) -> Result<()> {
+    if table_name == "output_segments" && column_name == "content" {
+        let content_len = i64::try_from(redacted.len()).map_err(|_| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Redacted output_segments content length exceeds i64 for rowid {rowid}"
+            )))
+        })?;
+        conn.execute(
+            "UPDATE output_segments
+             SET content = ?1, content_len = ?2, content_hash = NULL
+             WHERE rowid = ?3",
+            rusqlite::params![redacted, content_len, rowid],
+        )
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to update redacted backup output_segments rowid {rowid}: {e}"
+            )))
+        })?;
+        return Ok(());
+    }
+
+    let quoted_table = quote_identifier(table_name);
+    let quoted_column = quote_identifier(column_name);
+    let update_sql = format!("UPDATE {quoted_table} SET {quoted_column} = ?1 WHERE rowid = ?2");
+    conn.execute(&update_sql, rusqlite::params![redacted, rowid])
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to update redacted backup cell {table_name}.{column_name} rowid {rowid}: {e}"
+            )))
+        })?;
+    Ok(())
+}
+
 /// Dump the database to a SQL text file using sqlite3 .dump equivalent.
 fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
     let conn = Connection::open(db_path).map_err(|e| {
@@ -1054,7 +1431,7 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
     })?;
     // Reading the LIVE DB while a writer holds the write lock returns
     // SQLITE_BUSY without busy_timeout. Cheap insurance for the dump path.
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    set_backup_busy_timeout(&conn, "SQL dump")?;
 
     let mut file = fs::File::create(sql_path).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
@@ -1182,7 +1559,7 @@ fn gather_stats(db_path: &Path) -> Result<BackupStats> {
         )))
     })?;
     // Live DB; allow SQLite to retry under writer contention.
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    set_backup_busy_timeout(&conn, "backup statistics")?;
 
     let count = |table: &str| -> u64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
@@ -1664,6 +2041,9 @@ mod tests {
     use chrono::{TimeZone, Timelike};
     use tempfile::TempDir;
 
+    const BACKUP_REDACTION_TEST_SECRET: &str =
+        "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
+
     fn create_test_db(path: &Path) -> Connection {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
@@ -1678,6 +2058,253 @@ mod tests {
             INSERT INTO events (type) VALUES ('compaction_warning');
             PRAGMA user_version = 7;
             ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn create_test_db_with_backup_secret(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE panes (
+                pane_id INTEGER PRIMARY KEY,
+                title TEXT,
+                cwd TEXT,
+                tty_name TEXT,
+                ignore_reason TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE TABLE output_segments (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                content_len INTEGER NOT NULL,
+                content_hash TEXT,
+                captured_at INTEGER NOT NULL
+            );
+            CREATE VIRTUAL TABLE output_segments_fts USING fts5(
+                content,
+                content='output_segments',
+                content_rowid='id'
+            );
+            CREATE TRIGGER output_segments_ai AFTER INSERT ON output_segments BEGIN
+                INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TRIGGER output_segments_ad AFTER DELETE ON output_segments BEGIN
+                INSERT INTO output_segments_fts(output_segments_fts, rowid, content)
+                VALUES('delete', old.id, old.content);
+            END;
+            CREATE TRIGGER output_segments_au AFTER UPDATE ON output_segments BEGIN
+                INSERT INTO output_segments_fts(output_segments_fts, rowid, content)
+                VALUES('delete', old.id, old.content);
+                INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                extracted TEXT,
+                matched_text TEXT
+            );
+            CREATE TABLE audit_actions (
+                id INTEGER PRIMARY KEY,
+                input_summary TEXT,
+                verification_summary TEXT,
+                decision_context TEXT
+            );
+            CREATE TABLE policy_denied_audit (
+                id INTEGER PRIMARY KEY,
+                reason TEXT NOT NULL
+            );
+            CREATE TABLE event_labels (
+                event_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                created_by TEXT,
+                PRIMARY KEY (event_id, label)
+            );
+            CREATE TABLE approval_tokens (
+                id INTEGER PRIMARY KEY,
+                code_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                workspace_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL,
+                action_fingerprint TEXT NOT NULL,
+                risk_summary TEXT
+            );
+            CREATE TABLE agent_profiles (
+                name TEXT PRIMARY KEY NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                shell TEXT NOT NULL DEFAULT '',
+                command TEXT,
+                env TEXT NOT NULL DEFAULT '{}',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE fleet_mutation_receipts (
+                idempotency_key TEXT PRIMARY KEY NOT NULL,
+                payload_fingerprint TEXT NOT NULL,
+                action TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                dry_run INTEGER NOT NULL DEFAULT 0,
+                receipt_json TEXT NOT NULL,
+                recorded_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE passports (
+                agent_id TEXT NOT NULL,
+                pane_id INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                signed_at_ms INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (agent_id, pane_id)
+            );
+            CREATE TABLE recorder_events (
+                ordinal INTEGER PRIMARY KEY,
+                segment_id INTEGER NOT NULL DEFAULT 0,
+                byte_offset INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_bytes INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                pane_id INTEGER NOT NULL,
+                schema_version TEXT NOT NULL,
+                recorded_at_ms INTEGER NOT NULL,
+                batch_id TEXT NOT NULL,
+                inserted_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE recorder_batches (
+                batch_id TEXT PRIMARY KEY,
+                response_json TEXT NOT NULL,
+                committed_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE session_checkpoints (
+                id INTEGER PRIMARY KEY,
+                metadata_json TEXT
+            );
+            ",
+        )
+        .unwrap();
+
+        let secret = BACKUP_REDACTION_TEST_SECRET;
+        let content = format!("captured token {secret} after catalog bump");
+        let content_len = i64::try_from(content.len()).unwrap();
+        conn.execute(
+            "INSERT INTO panes (pane_id, title, cwd, tty_name, ignore_reason, first_seen_at, last_seen_at)
+             VALUES (1, ?1, ?2, ?3, ?4, 0, 0)",
+            rusqlite::params![
+                format!("pane {secret}"),
+                format!("/tmp/{secret}"),
+                format!("/dev/{secret}"),
+                format!("ignore {secret}"),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO output_segments
+             (id, pane_id, seq, content, content_len, content_hash, captured_at)
+             VALUES (1, 1, 0, ?1, ?2, 'original-hash', 0)",
+            rusqlite::params![content, content_len],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (pane_id, extracted, matched_text) VALUES (1, ?1, ?2)",
+            rusqlite::params![
+                format!(r#"{{"token":"{secret}"}}"#),
+                format!("matched {secret}"),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO audit_actions (input_summary, verification_summary, decision_context)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                format!("input {secret}"),
+                format!("verify {secret}"),
+                format!(r#"{{"secret":"{secret}"}}"#),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO policy_denied_audit (reason) VALUES (?1)",
+            rusqlite::params![format!("denied {secret}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO event_labels (event_id, label, created_at, created_by)
+             VALUES (1, ?1, 0, ?2)",
+            rusqlite::params![format!("label {secret}"), format!("operator {secret}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approval_tokens
+             (code_hash, created_at, expires_at, workspace_id, action_kind, action_fingerprint, risk_summary)
+             VALUES ('hash', 0, 1, ?1, 'send_text', ?2, ?3)",
+            rusqlite::params![
+                format!("workspace {secret}"),
+                format!("fingerprint {secret}"),
+                format!("risk {secret}"),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_profiles
+             (name, role, tags, shell, command, env, metadata, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0)",
+            rusqlite::params![
+                format!("profile {secret}"),
+                format!("role {secret}"),
+                format!(r#"["tag {secret}"]"#),
+                format!("shell {secret}"),
+                format!("command {secret}"),
+                format!(r#"{{"TOKEN":"{secret}"}}"#),
+                format!(r#"{{"note":"{secret}"}}"#),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fleet_mutation_receipts
+             (idempotency_key, payload_fingerprint, action, plan_id, dry_run, receipt_json, recorded_at_ms)
+             VALUES ('idem', 'fingerprint', 'scale', 'plan', 0, ?1, 0)",
+            rusqlite::params![format!(r#"{{"receipt":"{secret}"}}"#)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO passports (agent_id, pane_id, generation, signed_at_ms, payload)
+             VALUES (?1, 1, 1, 0, ?2)",
+            rusqlite::params![
+                format!("agent {secret}"),
+                format!(r#"{{"passport":"{secret}"}}"#),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recorder_events
+             (ordinal, segment_id, byte_offset, payload_json, payload_bytes, event_id, pane_id,
+              schema_version, recorded_at_ms, batch_id, inserted_at_ms)
+             VALUES (1, 1, 0, ?1, 1, ?2, 1, '1', 0, ?3, 0)",
+            rusqlite::params![
+                format!(r#"{{"event":"{secret}"}}"#),
+                format!("event {secret}"),
+                format!("batch {secret}"),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
+             VALUES (?1, ?2, 0)",
+            rusqlite::params![
+                format!("batch {secret}"),
+                format!(r#"{{"response":"{secret}"}}"#),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_checkpoints (id, metadata_json) VALUES (1, ?1)",
+            rusqlite::params![format!(r#"{{"metadata":"{secret}"}}"#)],
         )
         .unwrap();
         conn
@@ -1777,6 +2404,192 @@ mod tests {
         assert_eq!(result.manifest.stats.events, 1);
         assert_eq!(result.manifest.stats.audit_actions, 0);
         assert!(!result.manifest.db_checksum.is_empty());
+        assert!(result.manifest.redaction_applied);
+        assert!(!result.manifest.redaction_catalog_version.is_empty());
+        assert!(result.manifest.redaction_patterns_checked > 0);
+    }
+
+    #[test]
+    fn export_redacts_backup_database_sql_dump_and_import_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("secret.db");
+        let _conn = create_test_db_with_backup_secret(&db_path);
+        drop(_conn);
+
+        let output_dir = tmp.path().join("backup");
+        let opts = ExportOptions {
+            output: Some(output_dir.clone()),
+            include_sql_dump: true,
+            verify: true,
+        };
+
+        let result = export_backup(&db_path, tmp.path(), &opts).unwrap();
+
+        assert!(result.manifest.redaction_applied);
+        assert!(
+            result
+                .manifest
+                .redaction_catalog_version
+                .starts_with("live-secret-patterns-sha256:")
+        );
+        assert_eq!(
+            result.manifest.redaction_patterns_checked,
+            crate::redactor::secret_pattern_names().count()
+        );
+
+        let db_bytes = fs::read(output_dir.join("database.db")).unwrap();
+        let db_text = String::from_utf8_lossy(&db_bytes);
+        assert!(!db_text.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(db_text.contains("[REDACTED]"));
+        assert!(!output_dir.join("database.db-wal").exists());
+        assert!(!output_dir.join("database.db-shm").exists());
+
+        let sql_dump = fs::read_to_string(output_dir.join("database.sql")).unwrap();
+        assert!(!sql_dump.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(sql_dump.contains("[REDACTED]"));
+
+        let backup_conn = Connection::open(output_dir.join("database.db")).unwrap();
+        let (content, content_len, content_hash): (String, i64, Option<String>) = backup_conn
+            .query_row(
+                "SELECT content, content_len, content_hash FROM output_segments WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(!content.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(content.contains("[REDACTED]"));
+        assert_eq!(content_len, i64::try_from(content.len()).unwrap());
+        assert!(content_hash.is_none());
+
+        let pane_title: String = backup_conn
+            .query_row("SELECT title FROM panes WHERE pane_id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!pane_title.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(pane_title.contains("[REDACTED]"));
+
+        let denial_reason: String = backup_conn
+            .query_row(
+                "SELECT reason FROM policy_denied_audit WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!denial_reason.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(denial_reason.contains("[REDACTED]"));
+
+        let profile_env: String = backup_conn
+            .query_row("SELECT env FROM agent_profiles", [], |row| row.get(0))
+            .unwrap();
+        assert!(!profile_env.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(profile_env.contains("[REDACTED]"));
+
+        let profile_name: String = backup_conn
+            .query_row("SELECT name FROM agent_profiles", [], |row| row.get(0))
+            .unwrap();
+        assert!(!profile_name.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(profile_name.contains("[REDACTED]#redacted-rowid-"));
+
+        let event_label: String = backup_conn
+            .query_row("SELECT label FROM event_labels", [], |row| row.get(0))
+            .unwrap();
+        assert!(!event_label.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(event_label.contains("[REDACTED]#redacted-rowid-"));
+
+        let receipt_json: String = backup_conn
+            .query_row(
+                "SELECT receipt_json FROM fleet_mutation_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!receipt_json.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(receipt_json.contains("[REDACTED]"));
+
+        let passport_payload: String = backup_conn
+            .query_row("SELECT payload FROM passports", [], |row| row.get(0))
+            .unwrap();
+        assert!(!passport_payload.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(passport_payload.contains("[REDACTED]"));
+
+        let recorder_payload: String = backup_conn
+            .query_row("SELECT payload_json FROM recorder_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!recorder_payload.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(recorder_payload.contains("[REDACTED]"));
+
+        let checkpoint_metadata: String = backup_conn
+            .query_row("SELECT metadata_json FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!checkpoint_metadata.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(checkpoint_metadata.contains("[REDACTED]"));
+
+        let target_db = tmp.path().join("restored.db");
+        let import_opts = ImportOptions {
+            dry_run: false,
+            yes: true,
+            no_safety_backup: true,
+        };
+        let import = import_backup(&output_dir, &target_db, tmp.path(), &import_opts).unwrap();
+        assert!(!import.dry_run);
+
+        let restored = Connection::open(target_db).unwrap();
+        let restored_count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored_count, 1);
+        let restored_content: String = restored
+            .query_row(
+                "SELECT content FROM output_segments WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!restored_content.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(restored_content.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn export_redacts_backup_fts_when_update_trigger_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("secret-deferred-fts.db");
+        let conn = create_test_db_with_backup_secret(&db_path);
+        conn.execute_batch("DROP TRIGGER output_segments_au")
+            .unwrap();
+        drop(conn);
+
+        let output_dir = tmp.path().join("backup");
+        let opts = ExportOptions {
+            output: Some(output_dir.clone()),
+            include_sql_dump: true,
+            verify: true,
+        };
+
+        export_backup(&db_path, tmp.path(), &opts).unwrap();
+
+        let db_bytes = fs::read(output_dir.join("database.db")).unwrap();
+        let db_text = String::from_utf8_lossy(&db_bytes);
+        assert!(!db_text.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(db_text.contains("[REDACTED]"));
+
+        let sql_dump = fs::read_to_string(output_dir.join("database.sql")).unwrap();
+        assert!(!sql_dump.contains(BACKUP_REDACTION_TEST_SECRET));
+        assert!(sql_dump.contains("[REDACTED]"));
+
+        let backup_conn = Connection::open(output_dir.join("database.db")).unwrap();
+        let redacted_fts_hits: i64 = backup_conn
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH 'redacted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(redacted_fts_hits > 0);
     }
 
     #[test]
@@ -2075,6 +2888,9 @@ mod tests {
                 db_size_bytes: 0,
                 db_checksum: "deadbeef".to_string(),
                 stats: BackupStats::default(),
+                redaction_catalog_version: String::new(),
+                redaction_patterns_checked: 0,
+                redaction_applied: false,
                 compressed: false,
             };
             let data = serde_json::to_string(&manifest).unwrap();
@@ -2729,6 +3545,9 @@ mod tests {
                 audit_actions: 1,
                 workflow_executions: 0,
             },
+            redaction_catalog_version: "live-secret-patterns-sha256:test".to_string(),
+            redaction_patterns_checked: 12,
+            redaction_applied: true,
             compressed: false,
         };
         let json = serde_json::to_string(&manifest).unwrap();
@@ -2737,6 +3556,12 @@ mod tests {
         assert_eq!(back.schema_version, 7);
         assert_eq!(back.db_size_bytes, 4096);
         assert_eq!(back.stats.panes, 2);
+        assert_eq!(
+            back.redaction_catalog_version,
+            "live-secret-patterns-sha256:test"
+        );
+        assert_eq!(back.redaction_patterns_checked, 12);
+        assert!(back.redaction_applied);
     }
 
     #[test]
@@ -2800,6 +3625,9 @@ mod tests {
             db_size_bytes: 1024,
             db_checksum: "abc".to_string(),
             stats: BackupStats::default(),
+            redaction_catalog_version: String::new(),
+            redaction_patterns_checked: 0,
+            redaction_applied: false,
             compressed: false,
         };
         let result = ExportResult {
@@ -2823,6 +3651,9 @@ mod tests {
             db_size_bytes: 1024,
             db_checksum: "abc".to_string(),
             stats: BackupStats::default(),
+            redaction_catalog_version: String::new(),
+            redaction_patterns_checked: 0,
+            redaction_applied: false,
             compressed: false,
         };
         let result = ImportResult {
@@ -2863,6 +3694,9 @@ mod tests {
             db_size_bytes: db_content.len() as u64,
             db_checksum: "fakechecksum".to_string(),
             stats: BackupStats::default(),
+            redaction_catalog_version: String::new(),
+            redaction_patterns_checked: 0,
+            redaction_applied: false,
             compressed: false,
         };
         let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -2905,6 +3739,9 @@ mod tests {
             db_size_bytes: 0,
             db_checksum: String::new(),
             stats: BackupStats::default(),
+            redaction_catalog_version: String::new(),
+            redaction_patterns_checked: 0,
+            redaction_applied: false,
             compressed: false,
         };
 
