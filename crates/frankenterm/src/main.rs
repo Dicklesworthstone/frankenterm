@@ -31903,8 +31903,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         if let Some(prev) = last_event_emit {
                                             let elapsed = prev.elapsed();
                                             if elapsed < min {
-                                                frankenterm_core::runtime_async::sleep(
-                                                    min - elapsed,
+                                                let wait = min - elapsed;
+                                                let _ = frankenterm_core::runtime_async::spawn_blocking(
+                                                    move || std::thread::sleep(wait),
                                                 )
                                                 .await;
                                             }
@@ -31948,7 +31949,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                     last_emit = std::time::Instant::now();
                                 }
-                                frankenterm_core::runtime_async::sleep(poll).await;
+                                // See above: blocking-pool delay (async timer
+                                // sleep hangs without a timer-capable cx).
+                                let _ = frankenterm_core::runtime_async::spawn_blocking(
+                                    move || std::thread::sleep(poll),
+                                )
+                                .await;
                             }
 
                             storage.shutdown().await.ok();
@@ -32103,7 +32109,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 {
                                     break (false, true);
                                 }
-                                frankenterm_core::runtime_async::sleep(poll).await;
+                                // Inter-poll delay. The robot dispatch has no
+                                // ambient timer-capable cx, so an async timer
+                                // sleep hangs; offload to the blocking pool.
+                                let _ = frankenterm_core::runtime_async::spawn_blocking(
+                                    move || std::thread::sleep(poll),
+                                )
+                                .await;
                             };
 
                             let any_status: Vec<(String, bool)> =
