@@ -618,6 +618,7 @@ pub mod spectral;
 pub mod splay_tree;
 pub mod spsc_ring_buffer;
 pub mod status_bar;
+pub mod steer_plan;
 pub mod steering;
 pub mod storage;
 pub mod storage_backend_cells;
