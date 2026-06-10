@@ -2470,6 +2470,255 @@ impl ToolHandler for WaGetTextTool {
     }
 }
 
+/// Params for `wa.dom` — the semantic pane API MCP mirror (ft-7h5da.2.6).
+/// `query` deserializes directly into `DomQueryKind` (snake_case).
+#[derive(Debug, serde::Deserialize)]
+struct DomParams {
+    pane_id: u64,
+    query: crate::robot_types::DomQueryKind,
+    #[serde(default)]
+    command_index: Option<i64>,
+}
+
+/// `wa.dom` — MCP mirror of `ft robot dom` (the semantic pane API). Returns a
+/// flat list of OSC 133 zones, NOT a DOM tree. Policy-gated read, byte-equal to
+/// the robot CLI envelope by sharing `robot_dom::build_dom_data`. See
+/// docs/robot-contracts/semantic-pane-api.md.
+pub(super) struct WaDomTool {
+    config: Arc<Config>,
+    db_path: Option<Arc<PathBuf>>,
+    policy_rate_limiter: SharedRateLimiter,
+}
+
+impl WaDomTool {
+    #[cfg(test)]
+    pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
+    }
+}
+
+impl ToolHandler for WaDomTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.dom".to_string(),
+            description: Some(
+                "Semantic pane API: flat OSC 133 zones for a pane (robot parity). \
+                 Returns a flat list, NOT a DOM tree."
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "The pane ID to query" },
+                    "query": {
+                        "type": "string",
+                        "enum": ["zones", "last_command", "output_of", "exit_code"],
+                        "description": "Semantic-pane verb: zones (flat list), last_command, output_of, or exit_code"
+                    },
+                    "command_index": {
+                        "type": "integer",
+                        "description": "Command index for output_of/exit_code; -1 (default) selects the most recent"
+                    }
+                },
+                "required": ["pane_id", "query"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: DomParams = match parse_mcp_tool_params(
+            "wa.dom",
+            arguments,
+            "Expected object matching wa.dom input schema.",
+            start,
+        ) {
+            Ok(params) => params,
+            Err(response) => return response,
+        };
+
+        let config = Arc::clone(&self.config);
+        let db_path = self.db_path.as_ref().map(Arc::clone);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
+
+        let runtime = CompatRuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: std::result::Result<crate::robot_types::DomData, McpToolError> = runtime
+            .block_on(async move {
+                let open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let storage = if let Some(path) = db_path.as_ref() {
+                    Some(
+                        StorageHandle::new_with_cx(&open_cx, &path.to_string_lossy())
+                            .await
+                            .map_err(McpToolError::from_error)?,
+                    )
+                } else {
+                    None
+                };
+
+                let redactor = crate::redactor::Redactor::new();
+                let wezterm = default_wezterm_handle();
+                let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+
+                // Semantic zones require a live local pane; no remote-pane path.
+                // A missing pane is an honest "unavailable" observation, not an
+                // error (there is no content to gate).
+                let pane_info = match wezterm.get_pane_with_cx(&wezterm_cx, params.pane_id).await {
+                    Ok(pane_info) => pane_info,
+                    Err(_) => {
+                        return Ok(crate::robot_dom::dom_unavailable(
+                            params.pane_id,
+                            params.query,
+                            params.command_index,
+                            Vec::new(),
+                            "semantic data unavailable: pane not found or not a live local pane",
+                            &redactor,
+                        ));
+                    }
+                };
+                let domain = pane_info.inferred_domain();
+
+                let resolution =
+                    resolve_pane_capabilities(&config, storage.as_ref(), params.pane_id).await;
+                let capabilities = resolution.capabilities;
+
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    false,
+                    Arc::clone(&policy_rate_limiter),
+                );
+                let summary = format!("wa.dom pane_id={}", params.pane_id);
+                let mut input =
+                    mcp_get_text_policy_input(params.pane_id, domain.clone(), capabilities, &summary);
+                if let Some(title) = &pane_info.title {
+                    input = input.with_pane_title(title.clone());
+                }
+                if let Some(cwd) = &pane_info.cwd {
+                    input = input.with_pane_cwd(cwd.clone());
+                }
+
+                let decision = engine.authorize(&input);
+                if decision.is_denied() {
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Read denied by policy")
+                        .to_string();
+                    if let Some(storage_ref) = storage.as_ref() {
+                        persist_mcp_policy_denial_async(
+                            storage_ref,
+                            "wa.dom",
+                            &summary,
+                            &reason,
+                            decision.rule_id(),
+                            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                        )
+                        .await;
+                    }
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        reason,
+                        Some(POLICY_DENY_HINT.to_string()),
+                    ));
+                }
+                if decision.requires_approval() {
+                    let mut hint = approval_command(&decision);
+                    if let Some(storage) = storage.as_ref() {
+                        let workspace_id =
+                            resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                        let store = ApprovalStore::new(
+                            storage,
+                            config.safety.approval.clone(),
+                            workspace_id,
+                        );
+                        let updated = store
+                            .attach_to_decision(decision, &input, Some(summary.clone()))
+                            .await
+                            .map_err(McpToolError::from_error)?;
+                        hint = approval_command(&updated);
+                        let reason = policy_reason(&updated)
+                            .unwrap_or("Read requires approval")
+                            .to_string();
+                        persist_mcp_policy_denial_async(
+                            storage,
+                            "wa.dom",
+                            &summary,
+                            &reason,
+                            updated.rule_id(),
+                            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                        )
+                        .await;
+                        return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                    }
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Read requires approval")
+                        .to_string();
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+
+                // Fetch live OSC 133 zones and build the byte-equal envelope via
+                // the same core builder the robot CLI uses.
+                let snapshot = match wezterm
+                    .get_semantic_zones_with_cx(&wezterm_cx, params.pane_id)
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        return Ok(crate::robot_dom::dom_unavailable(
+                            params.pane_id,
+                            params.query,
+                            params.command_index,
+                            Vec::new(),
+                            format!("semantic data unavailable: {err}"),
+                            &redactor,
+                        ));
+                    }
+                };
+                Ok(crate::robot_dom::build_dom_data(
+                    params.pane_id,
+                    params.query,
+                    params.command_index,
+                    &snapshot,
+                    &redactor,
+                ))
+            });
+
+        match result {
+            Ok(data) => {
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
 pub(super) struct WaWaitForTool {
     config: Arc<Config>,
     db_path: Option<Arc<PathBuf>>,
@@ -7772,7 +8021,7 @@ mod tests {
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS,
         MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
         StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool,
-        WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
+        WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool,
         WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
         WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
         WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool,
@@ -10833,6 +11082,40 @@ exit 17",
             .expect("wa.get_text should have required fields");
         let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
         assert!(has_pane_id, "wa.get_text should require pane_id");
+    }
+
+    /// ft-7h5da.2.6: the wa.dom MCP mirror's definition must match the
+    /// semantic-pane contract — name, required fields, and the four-verb query
+    /// enum (kept in lockstep with DomQueryKind). The envelope itself is
+    /// byte-equal to the robot CLI by construction (both call
+    /// frankenterm_core::robot_dom::build_dom_data), covered by robot_dom tests
+    /// and the mcp_manifest golden.
+    #[test]
+    fn dom_tool_definition_matches_semantic_pane_contract() {
+        let def = WaDomTool::new(config(), Some(db_path())).definition();
+        assert_eq!(def.name, "wa.dom");
+        let required = def
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("wa.dom should have required fields");
+        assert!(required.iter().any(|v| v.as_str() == Some("pane_id")));
+        assert!(required.iter().any(|v| v.as_str() == Some("query")));
+        let query_enum: Vec<String> = def
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.get("query"))
+            .and_then(|q| q.get("enum"))
+            .and_then(|e| e.as_array())
+            .expect("wa.dom query must declare an enum")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            query_enum,
+            vec!["zones", "last_command", "output_of", "exit_code"],
+            "wa.dom query enum must match the DomQueryKind verbs"
+        );
     }
 
     /// ft-ii8ss: server-side bound on the `tail` field rejects oversized

@@ -8,7 +8,7 @@ use super::{
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
     WaAgentMailOutboxResource, WaAttentionCurrentResource, WaAttentionItemTemplateResource,
     WaAttentionTool, WaAttestationRetractionsResource, WaCassSearchTool, WaCassStatusTool,
-    WaCassViewTool, WaContextHorizonResource, WaEventsAnnotateTool, WaEventsLabelTool,
+    WaCassViewTool, WaContextHorizonResource, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
     WaEventsResource, WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool,
     WaEventsUnhandledTemplateResource, WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool,
     WaMissionExplainTool, WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool,
@@ -65,6 +65,7 @@ pub const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
 /// tool name, because the skipped registration is the audited/db-backed
 /// handler and degraded mode replaces it with a no-db handler.
 pub const DB_GATED_AUDITED_TOOL_NAMES: &[&str] = &[
+    "wa.dom",
     "wa.get_text",
     "wa.search",
     "wa.events",
@@ -320,6 +321,15 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
                     Arc::clone(&shared_rate_limiter),
                 ),
                 "wa.get_text",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaDomTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Some(Arc::clone(db_path)),
+                    Arc::clone(&shared_rate_limiter),
+                ),
+                "wa.dom",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(

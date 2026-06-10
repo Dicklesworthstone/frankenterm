@@ -127,8 +127,9 @@ use mcp_resources::{
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaCassSearchTool, WaCassStatusTool,
-    WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool,
-    WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool,
+    WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
+    WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
+    WaMissionObjectivePlanTool,
     WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeTool,
     WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,

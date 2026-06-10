@@ -78,16 +78,20 @@ semantic data is **not** an error — it is `ok:true` with
 ## MCP parity status
 
 `ApiSurface::Dom` is registered in the schema/endpoint registry
-(`robot_api_contracts.rs`, `api_schema.rs`, `wa-robot-dom.json`), and the CLI
-family is complete. **However, there is currently no `wa.dom` MCP tool mirror**
-— the 38 registered `wa.*` tools (`mcp_bridge.rs`) do not yet include the
-semantic-pane verbs. Closing full Robot/MCP parity (ft-7h5da.2.6) requires
-adding a `wa.dom` (or `wa.semantic_zones`) `ToolHandler` mirroring the four
-verbs and registering it in `build_server_inner`, plus a `wa_dom_mcp_conformance`
-test. This is the remaining Rust slice of .2.6 and is source-landed-pending: it
-needs RCH Cargo proof, currently blocked by the rch remote-topology-preflight
-infra issue. **This contract is the spec that mirror must satisfy** — the MCP
-tool's `data` must be byte-equal `DomData` to the robot envelope.
+(`robot_api_contracts.rs`, `api_schema.rs`, `wa-robot-dom.json`), the CLI family
+is complete, and the **`wa.dom` MCP tool mirrors all four verbs** (`WaDomTool` in
+`crates/frankenterm-core/src/mcp_tools.rs`, registered as a db-gated/audited tool
+in `mcp_bridge.rs` `DB_GATED_AUDITED_TOOL_NAMES`). It is a policy-gated read
+(deny/approval/audit path, like `wa.get_text`) that fetches live OSC 133 zones and
+builds its envelope through the **same
+`frankenterm_core::robot_dom::build_dom_data` the CLI uses — so the MCP and robot
+`DomData` envelopes are byte-equal by construction**. Params:
+`{ pane_id, query (zones|last_command|output_of|exit_code), command_index? }`
+(`query` deserializes directly to `DomQueryKind`). The tool definition is pinned
+by the `mcp_manifest` golden and asserted by
+`dom_tool_definition_matches_semantic_pane_contract` in `mcp_tools.rs`.
+Source-landed; RCH Cargo proof deferred behind the rch remote-topology-preflight
+infra block.
 
 ## Golden matrix status
 
