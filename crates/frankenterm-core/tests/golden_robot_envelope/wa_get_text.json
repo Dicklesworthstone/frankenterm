@@ -13,6 +13,7 @@
           "json",
           "toon"
         ],
+        "maxLength": 16,
         "type": "string"
       },
       "pane_id": {
@@ -57,7 +58,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.5.0"
   },
   "tool": "wa.get_text"
 }

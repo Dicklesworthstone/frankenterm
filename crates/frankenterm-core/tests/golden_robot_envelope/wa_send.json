@@ -13,6 +13,7 @@
           "json",
           "toon"
         ],
+        "maxLength": 16,
         "type": "string"
       },
       "pane_id": {
@@ -33,6 +34,7 @@
       },
       "wait_for": {
         "description": "Wait for a pattern after sending",
+        "maxLength": 65536,
         "type": "string"
       },
       "wait_for_regex": {
@@ -192,7 +194,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.1.0"
+    "version": "0.5.0"
   },
   "tool": "wa.send"
 }
