@@ -262,6 +262,7 @@ ft robot events triage <event_id> --clear [--by <actor>]
 ft robot events label <event_id> --add <label> [--by <actor>]
 ft robot events label <event_id> --remove <label>
 ft robot events label <event_id> --list
+ft robot watch-events [--follow] [--severity <sev>] [--rule-id <glob>] [--pane <id>] [--cursor <id>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>]
 
 ft robot workflow list
 ft robot workflow run <name> <pane_id> [--force] [--dry-run]

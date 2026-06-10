@@ -3359,6 +3359,47 @@ enum RobotCommands {
         command: Option<RobotEventsCommands>,
     },
 
+    /// Stream events as NDJSON (one envelope per line) with a resume cursor in
+    /// every record. With `--follow`, tail new events live via DB-cursor
+    /// polling (works whether or not the watcher is up) and emit idle
+    /// heartbeats. Filters: severity, rule-id glob, pane. Kills the
+    /// `while sleep 5` polling anti-pattern (ft-7h5da.4.1).
+    #[command(visible_alias = "watch-event")]
+    WatchEvents {
+        /// Follow mode: keep tailing new events (like `tail -f`). Without it,
+        /// emit the current batch after `--cursor` and exit.
+        #[arg(long)]
+        follow: bool,
+
+        /// Filter by severity (case-insensitive exact; e.g. "error", "warning", "info")
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Filter by rule-id glob (`*` wildcard; e.g. "codex.*", "*.usage_reached")
+        #[arg(long)]
+        rule_id: Option<String>,
+
+        /// Filter by pane ID
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Resume cursor: only emit events with id greater than this value
+        #[arg(long)]
+        cursor: Option<i64>,
+
+        /// Max events fetched per poll batch
+        #[arg(long, default_value = "100")]
+        limit: usize,
+
+        /// Idle heartbeat interval in ms (0 disables heartbeats)
+        #[arg(long, default_value = "5000")]
+        heartbeat_interval_ms: u64,
+
+        /// Poll interval in ms for DB-cursor tailing in `--follow` mode
+        #[arg(long, default_value = "500")]
+        poll_interval_ms: u64,
+    },
+
     /// Workflow management commands
     Workflow {
         #[command(subcommand)]
@@ -19573,6 +19614,188 @@ where
     cursor.and_then(|_| event_ids.into_iter().last().or(cursor))
 }
 
+/// Simple `*`-glob match for `ft robot watch-events --rule-id`. `*` matches any
+/// (possibly empty) sequence; every other character is a literal. A pattern
+/// with no `*` is an exact match (ft-7h5da.4.1).
+fn watch_rule_glob_matches(pattern: &str, rule_id: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == rule_id;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let last = parts.len() - 1;
+    let mut rest = rule_id;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Anchored prefix.
+            match rest.strip_prefix(part) {
+                Some(tail) => rest = tail,
+                None => return false,
+            }
+        } else if i == last {
+            // Anchored suffix.
+            return rest.ends_with(part);
+        } else {
+            // Floating segment: advance past its next occurrence.
+            match rest.find(part) {
+                Some(pos) => rest = &rest[pos + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Client-side severity (case-insensitive exact) + rule-id glob filter for
+/// `ft robot watch-events`. Pane is filtered server-side via `EventStreamQuery`.
+fn watch_event_passes_filters(
+    event: &frankenterm_core::storage::StoredEvent,
+    severity: Option<&str>,
+    rule_glob: Option<&str>,
+) -> bool {
+    if let Some(sev) = severity {
+        if !event.severity.eq_ignore_ascii_case(sev) {
+            return false;
+        }
+    }
+    if let Some(glob) = rule_glob {
+        if !watch_rule_glob_matches(glob, &event.rule_id) {
+            return false;
+        }
+    }
+    true
+}
+
+/// NDJSON envelope for one watched event. `cursor` equals the event id so a
+/// follower can resume after it. `matched_text` is redacted (the primary
+/// free-text field); deeper structured redaction reuse is tracked in
+/// ft-7h5da.4.4.
+fn watch_event_ndjson(event: &frankenterm_core::storage::StoredEvent) -> serde_json::Value {
+    serde_json::json!({
+        "type": "event",
+        "cursor": event.id,
+        "id": event.id,
+        "pane_id": event.pane_id,
+        "rule_id": event.rule_id,
+        "agent_type": event.agent_type,
+        "event_type": event.event_type,
+        "severity": event.severity,
+        "confidence": event.confidence,
+        "detected_at": event.detected_at,
+        "matched_text": event.matched_text.as_deref().map(redact_for_output),
+        "extracted": event.extracted,
+        "handled": event.handled_at.is_some(),
+        "handled_status": event.handled_status,
+    })
+}
+
+/// NDJSON idle-heartbeat record for `ft robot watch-events --follow`.
+fn watch_heartbeat_ndjson(cursor: Option<i64>, now: i64) -> serde_json::Value {
+    serde_json::json!({ "type": "heartbeat", "cursor": cursor, "now": now })
+}
+
+/// Write one compact NDJSON line. Returns `Ok(false)` if the consumer closed
+/// the pipe (caller should stop cleanly); `Ok(true)` otherwise.
+fn write_ndjson_line<W: std::io::Write>(
+    writer: &mut W,
+    value: &serde_json::Value,
+) -> std::io::Result<bool> {
+    match writeln!(writer, "{value}") {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod watch_events_tests {
+    use super::*;
+    use frankenterm_core::storage::StoredEvent;
+
+    fn ev(id: i64, rule_id: &str, severity: &str, matched: Option<&str>) -> StoredEvent {
+        StoredEvent {
+            id,
+            pane_id: 1,
+            rule_id: rule_id.to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "detection".to_string(),
+            severity: severity.to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: matched.map(str::to_string),
+            segment_id: None,
+            detected_at: 1000 + id,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    #[test]
+    fn glob_no_wildcard_is_exact() {
+        assert!(watch_rule_glob_matches("codex.usage", "codex.usage"));
+        assert!(!watch_rule_glob_matches("codex.usage", "codex.usagex"));
+        assert!(!watch_rule_glob_matches("codex.usage", "x.codex.usage"));
+    }
+
+    #[test]
+    fn glob_prefix_suffix_floating_and_star() {
+        assert!(watch_rule_glob_matches("codex.*", "codex.usage_reached"));
+        assert!(!watch_rule_glob_matches("codex.*", "claude.usage"));
+        assert!(watch_rule_glob_matches("*.usage_reached", "codex.usage_reached"));
+        assert!(!watch_rule_glob_matches("*.usage_reached", "codex.usage_started"));
+        assert!(watch_rule_glob_matches("codex.*reached", "codex.usage_reached"));
+        assert!(watch_rule_glob_matches("*", "anything-at-all"));
+        assert!(watch_rule_glob_matches("*usage*", "codex.usage_reached"));
+        assert!(!watch_rule_glob_matches("*usage*", "codex.quota"));
+    }
+
+    #[test]
+    fn filters_severity_case_insensitive_and_rule_glob() {
+        let e = ev(1, "codex.usage_reached", "Warning", None);
+        assert!(watch_event_passes_filters(&e, Some("warning"), Some("codex.*")));
+        assert!(watch_event_passes_filters(&e, None, None));
+        assert!(!watch_event_passes_filters(&e, Some("error"), None));
+        assert!(!watch_event_passes_filters(&e, None, Some("claude.*")));
+    }
+
+    #[test]
+    fn envelope_cursor_equals_id_and_redacts_matched_text() {
+        let e = ev(42, "codex.secret_leak", "error", Some("token=AKIAIOSFODNN7EXAMPLE"));
+        let v = watch_event_ndjson(&e);
+        assert_eq!(v["type"], "event");
+        assert_eq!(v["cursor"], 42);
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["severity"], "error");
+        assert_eq!(v["handled"], false);
+        let matched = v["matched_text"].as_str().expect("matched_text string");
+        assert!(
+            !matched.contains("AKIAIOSFODNN7EXAMPLE"),
+            "matched_text must be redacted in the NDJSON envelope, got {matched}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_envelope_shape() {
+        let v = watch_heartbeat_ndjson(Some(7), 12345);
+        assert_eq!(v["type"], "heartbeat");
+        assert_eq!(v["cursor"], 7);
+        assert_eq!(v["now"], 12345);
+    }
+
+    #[test]
+    fn write_ndjson_line_signals_broken_pipe() {
+        // A Vec<u8> never errors -> Ok(true).
+        let mut buf: Vec<u8> = Vec::new();
+        let v = serde_json::json!({"a": 1});
+        assert!(write_ndjson_line(&mut buf, &v).unwrap());
+        assert_eq!(buf, b"{\"a\":1}\n");
+    }
+}
+
 #[allow(dead_code)]
 struct RobotContext {
     effective: frankenterm_core::config::EffectiveConfig,
@@ -31256,6 +31479,145 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     print_robot_response(&response, format, stats)?;
                                 }
                             }
+                        }
+                        RobotCommands::WatchEvents {
+                            follow,
+                            severity,
+                            rule_id,
+                            pane,
+                            cursor,
+                            limit,
+                            heartbeat_interval_ms,
+                            poll_interval_ms,
+                        } => {
+                            use std::io::Write as _;
+                            if cursor.is_some_and(|c| c < 0) {
+                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    "Invalid --cursor: must be non-negative".to_string(),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage = match frankenterm_core::storage::StorageHandle::new(
+                                &db_path,
+                            )
+                            .await
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to open storage: {e}"),
+                                        Some("Is the database initialized? Run 'ft watch' first.".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            let severity_filter = severity.as_deref();
+                            let rule_glob = rule_id.as_deref();
+                            let batch_limit = limit.max(1);
+                            let heartbeat = std::time::Duration::from_millis(heartbeat_interval_ms);
+                            let poll = std::time::Duration::from_millis(poll_interval_ms.max(10));
+                            let mut current_cursor = cursor;
+                            let mut last_emit = std::time::Instant::now();
+                            let stdout = std::io::stdout();
+
+                            'follow: loop {
+                                let query = frankenterm_core::storage::EventStreamQuery {
+                                    after_id: current_cursor,
+                                    limit: Some(batch_limit),
+                                    pane_id: pane,
+                                    rule_id: None,
+                                    event_type: None,
+                                    triage_state: None,
+                                    label: None,
+                                    unhandled_only: false,
+                                    since: None,
+                                    until: None,
+                                };
+                                let events = match storage.get_events_stream(query).await {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query events: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        break 'follow;
+                                    }
+                                };
+                                let batch_len = events.len();
+
+                                {
+                                    let mut lock = stdout.lock();
+                                    for event in &events {
+                                        // Advance the cursor past every scanned
+                                        // event (even filtered ones) so the
+                                        // follower never re-scans them.
+                                        current_cursor = Some(event.id);
+                                        if !watch_event_passes_filters(
+                                            event,
+                                            severity_filter,
+                                            rule_glob,
+                                        ) {
+                                            continue;
+                                        }
+                                        let record = watch_event_ndjson(event);
+                                        if !write_ndjson_line(&mut lock, &record)? {
+                                            let _ = lock.flush();
+                                            break 'follow; // consumer closed the pipe
+                                        }
+                                        last_emit = std::time::Instant::now();
+                                    }
+                                    let _ = lock.flush();
+                                }
+
+                                if !follow {
+                                    break 'follow;
+                                }
+                                // Full batch => keep draining before idling.
+                                if batch_len >= batch_limit {
+                                    continue 'follow;
+                                }
+                                // Idle: emit a heartbeat if enabled and due.
+                                if heartbeat_interval_ms > 0 && last_emit.elapsed() >= heartbeat {
+                                    let hb = watch_heartbeat_ndjson(current_cursor, now_ms_i64());
+                                    let mut lock = stdout.lock();
+                                    let cont = write_ndjson_line(&mut lock, &hb)?;
+                                    let _ = lock.flush();
+                                    drop(lock);
+                                    if !cont {
+                                        break 'follow;
+                                    }
+                                    last_emit = std::time::Instant::now();
+                                }
+                                frankenterm_core::runtime_async::sleep(poll).await;
+                            }
+
+                            storage.shutdown().await.ok();
                         }
                         RobotCommands::Workflow { command } => {
                             match command {
