@@ -233,11 +233,11 @@ fn schema_files_have_id() {
         let id = schema.get("$id").and_then(Value::as_str);
         assert!(id.is_some(), "{name} missing '$id'");
         let id = id.unwrap();
-        let expected_domain = if name == "ft-config.json"
-            || name == "ft-pattern-pack.json"
-            || name == "ft-resource-pressure-cockpit.json"
-            || name == "ft-swarm-capacity-signal-inventory.json"
-        {
+        // `ft-*.json` are FrankenTerm-native internal contract schemas and carry
+        // the current-brand `$id` domain; `wa-*.json` are the (legacy-branded)
+        // robot/MCP endpoint schemas. Verified across the tree: all `ft-*` use
+        // `frankenterm.dev`, all `wa-*` use `wezterm-automata.dev`.
+        let expected_domain = if name.starts_with("ft-") {
             "frankenterm.dev"
         } else {
             "wezterm-automata.dev"
@@ -968,12 +968,13 @@ fn registry_covers_all_disk_schemas() {
         .iter()
         .map(|(name, _)| name.clone())
         .filter(|name| {
+            // `wa-*envelope.json` are shared envelope schemas (not endpoints).
+            // `ft-*.json` are internal contract schemas, not robot/MCP
+            // endpoints, so they are out of scope for the endpoint registry —
+            // only `wa-*` endpoint schemas must be registered there.
             name != "wa-robot-envelope.json"
                 && name != "wa-mcp-envelope.json"
-                && name != "ft-config.json"
-                && name != "ft-pattern-pack.json"
-                && name != "ft-resource-pressure-cockpit.json"
-                && name != "ft-swarm-capacity-signal-inventory.json"
+                && !name.starts_with("ft-")
         })
         .collect();
 
