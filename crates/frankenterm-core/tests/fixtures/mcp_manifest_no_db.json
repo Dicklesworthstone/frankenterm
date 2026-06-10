@@ -1,6 +1,66 @@
 {
   "resource_templates": [
     {
+      "description": "Read-only explanation for a scored attention-router item",
+      "mime_type": "application/json",
+      "name": "ft attention router item",
+      "tags": [
+        "wa",
+        "attention",
+        "operator"
+      ],
+      "uri_template": "wa://attention-router/items/{item_id}",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Compile an objective into the same dry-run surface as wa.mission_objective_plan",
+      "mime_type": "application/json",
+      "name": "ft mission objective plan",
+      "tags": [
+        "wa",
+        "mission",
+        "robot"
+      ],
+      "uri_template": "wa://mission/objective-plan/{objective}",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only operating-envelope run artifact shape",
+      "mime_type": "application/json",
+      "name": "ft operating envelope run artifact",
+      "tags": [
+        "wa",
+        "swarm",
+        "operating-envelope"
+      ],
+      "uri_template": "wa://operating-envelope/runs/{run_id}",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Filter proof history by bead, category, status, or release-blocking",
+      "mime_type": "application/json",
+      "name": "ft proof history filtered",
+      "tags": [
+        "wa",
+        "proof",
+        "proof-history"
+      ],
+      "uri_template": "wa://proof-history/{filter}/{value}/{limit}",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only score or explain receipt using the default demo manifest",
+      "mime_type": "application/json",
+      "name": "ft rehearsal score surface",
+      "tags": [
+        "wa",
+        "rehearsal",
+        "operator"
+      ],
+      "uri_template": "wa://rehearsal-score/{surface}",
+      "version": "0.5.0"
+    },
+    {
       "description": "Filter rule catalog by agent type",
       "mime_type": "application/json",
       "name": "ft rules by agent",
@@ -9,10 +69,83 @@
         "rules"
       ],
       "uri_template": "wa://rules/{agent_type}",
-      "version": "0.1.0"
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only swarm-capacity run artifact shape",
+      "mime_type": "application/json",
+      "name": "ft swarm capacity run artifact",
+      "tags": [
+        "wa",
+        "swarm-capacity",
+        "operator"
+      ],
+      "uri_template": "wa://swarm-capacity/runs/{run_id}",
+      "version": "0.5.0"
     }
   ],
   "resources": [
+    {
+      "description": "Read-only Agent Mail fallback outbox entries and replay state",
+      "mime_type": "application/json",
+      "name": "ft agent mail outbox",
+      "tags": [
+        "wa",
+        "agent-mail",
+        "outbox",
+        "coordination"
+      ],
+      "uri": "wa://agent-mail/outbox",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only attention-router status surface with degraded source health",
+      "mime_type": "application/json",
+      "name": "ft attention router current",
+      "tags": [
+        "wa",
+        "attention",
+        "operator"
+      ],
+      "uri": "wa://attention-router/current",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Active signed attestation retractions",
+      "mime_type": "application/json",
+      "name": "ft attestation retractions",
+      "tags": [
+        "wa",
+        "attestation",
+        "retractions"
+      ],
+      "uri": "wa://attestation/retractions",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only herd-wave contract and dry-run planner surface",
+      "mime_type": "application/json",
+      "name": "ft herd wave",
+      "tags": [
+        "wa",
+        "herd-wave",
+        "operator"
+      ],
+      "uri": "wa://herd-wave",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only fail-closed swarm operating-envelope status",
+      "mime_type": "application/json",
+      "name": "ft operating envelope current",
+      "tags": [
+        "wa",
+        "swarm",
+        "operating-envelope"
+      ],
+      "uri": "wa://operating-envelope/current",
+      "version": "0.5.0"
+    },
     {
       "description": "Pane snapshot (same data surface as wa.state)",
       "mime_type": "application/json",
@@ -22,7 +155,70 @@
         "panes"
       ],
       "uri": "wa://panes",
-      "version": "0.1.0"
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only input-to-photon renderer SLO status and evidence pointers",
+      "mime_type": "application/json",
+      "name": "ft renderer input-to-photon SLO",
+      "tags": [
+        "wa",
+        "perf",
+        "renderer-slo",
+        "input-to-photon"
+      ],
+      "uri": "wa://perf/renderer-slo/input_to_photon",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only SSIM parity renderer SLO status and evidence pointers",
+      "mime_type": "application/json",
+      "name": "ft renderer SSIM parity SLO",
+      "tags": [
+        "wa",
+        "perf",
+        "renderer-slo",
+        "ssim-parity"
+      ],
+      "uri": "wa://perf/renderer-slo/ssim_parity",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only proof-history rows with release-blocking summary",
+      "mime_type": "application/json",
+      "name": "ft proof history",
+      "tags": [
+        "wa",
+        "proof",
+        "proof-history"
+      ],
+      "uri": "wa://proof-history",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only proof-history rows blocking release",
+      "mime_type": "application/json",
+      "name": "ft proof history release blockers",
+      "tags": [
+        "wa",
+        "proof",
+        "proof-history",
+        "release-blocking"
+      ],
+      "uri": "wa://proof-history/release-blocking",
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only rehearsal score receipt from the default demo manifest",
+      "mime_type": "application/json",
+      "name": "ft rehearsal score current",
+      "tags": [
+        "wa",
+        "rehearsal",
+        "operator"
+      ],
+      "uri": "wa://rehearsal-score/current",
+      "version": "0.5.0"
     },
     {
       "description": "Rule catalog (same data surface as wa.rules_list with verbose output)",
@@ -33,7 +229,19 @@
         "rules"
       ],
       "uri": "wa://rules",
-      "version": "0.1.0"
+      "version": "0.5.0"
+    },
+    {
+      "description": "Read-only swarm-capacity status, doctor, and MCP resource shape",
+      "mime_type": "application/json",
+      "name": "ft swarm capacity current",
+      "tags": [
+        "wa",
+        "swarm-capacity",
+        "operator"
+      ],
+      "uri": "wa://swarm-capacity/current",
+      "version": "0.5.0"
     },
     {
       "description": "Builtin workflow catalog and metadata",
@@ -44,10 +252,62 @@
         "workflows"
       ],
       "uri": "wa://workflows",
-      "version": "0.1.0"
+      "version": "0.5.0"
     }
   ],
   "tools": [
+    {
+      "annotations": null,
+      "description": "Read attention-router status, next action, or item explanation from caller-supplied evidence (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "generated_at_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input": {
+            "description": "AttentionRouterSourceAdapterInput object; omitted input yields an explicit degraded no-input snapshot",
+            "type": "object"
+          },
+          "item_id": {
+            "description": "Attention item id to explain when surface=explain",
+            "type": "string"
+          },
+          "surface": {
+            "default": "status",
+            "enum": [
+              "status",
+              "next",
+              "explain"
+            ],
+            "type": "string"
+          },
+          "workspace": {
+            "description": "Workspace label used only when input is omitted or workspace override is desired",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.attention",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "attention"
+      ],
+      "version": "0.5.0"
+    },
     {
       "annotations": null,
       "description": "Search coding agent session history via cass",
@@ -56,6 +316,7 @@
         "properties": {
           "agent": {
             "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt",
+            "maxLength": 64,
             "type": "string"
           },
           "days": {
@@ -73,6 +334,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "limit": {
@@ -95,6 +357,7 @@
           },
           "query": {
             "description": "Search query string",
+            "maxLength": 65536,
             "type": "string"
           },
           "timeout_secs": {
@@ -121,7 +384,7 @@
         "robot",
         "cass"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -135,6 +398,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "timeout_secs": {
@@ -154,7 +418,7 @@
         "robot",
         "cass"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -174,6 +438,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "line_number": {
@@ -206,7 +471,7 @@
         "robot",
         "cass"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -225,6 +490,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "pane_id": {
@@ -251,52 +517,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.1.0"
-    },
-    {
-      "annotations": null,
-      "description": "Abort a mission, cancelling all in-flight assignments (robot parity)",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "error_code": {
-            "description": "Optional error code for the abort",
-            "type": "string"
-          },
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "type": "string"
-          },
-          "mission_file": {
-            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
-            "type": "string"
-          },
-          "reason": {
-            "description": "Reason code for the abort (required)",
-            "type": "string"
-          },
-          "requested_by": {
-            "description": "Who requested the abort (default: mcp-agent)",
-            "type": "string"
-          }
-        },
-        "required": [
-          "reason"
-        ],
-        "type": "object"
-      },
-      "name": "wa.mission_abort",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "mission"
-      ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -314,6 +535,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "mission_file": {
@@ -330,82 +552,146 @@
         "robot",
         "mission"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
-      "description": "Pause an active mission, creating a checkpoint (robot parity)",
+      "description": "Compile an operator objective into a dry-run mission plan without mutating panes, services, or Beads (robot parity)",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "active_age_seconds": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "active_assignee": {
+            "type": "string"
+          },
+          "candidate_id": {
+            "description": "Planner candidate id when no Beads target exists",
+            "type": "string"
+          },
+          "candidate_title": {
+            "description": "Human label for the candidate",
+            "type": "string"
+          },
+          "capacity_posture": {
+            "default": "admit",
+            "enum": [
+              "admit",
+              "defer",
+              "pause",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "dependency_blocked": {
+            "default": false,
+            "type": "boolean"
+          },
+          "dirty_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "execute": {
+            "default": false,
+            "description": "Always rejected; objective plans are dry-run only",
+            "type": "boolean"
+          },
+          "explain_reason": {
+            "type": "string"
+          },
+          "explain_step": {
+            "type": "string"
+          },
           "format": {
             "description": "Optional output format override for this call",
             "enum": [
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
-          "mission_file": {
-            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+          "generated_at_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "objective": {
+            "description": "Operator objective to plan",
             "type": "string"
           },
-          "reason": {
-            "description": "Reason code for the pause (required)",
+          "owned_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "proof_availability": {
+            "default": "available",
+            "enum": [
+              "not-required",
+              "available",
+              "blocked",
+              "unavailable"
+            ],
             "type": "string"
           },
-          "requested_by": {
-            "description": "Who requested the pause (default: mcp-agent)",
+          "source_degraded": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_stale": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_unavailable": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "stale_after_seconds": {
+            "minimum": 60,
+            "type": "integer"
+          },
+          "strictness": {
+            "default": "normal",
+            "enum": [
+              "advisory",
+              "normal",
+              "strict"
+            ],
             "type": "string"
+          },
+          "target_bead": {
+            "description": "Ready Beads id to rank",
+            "type": "string"
+          },
+          "testing_skill_lane": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "required": [
-          "reason"
+          "objective"
         ],
         "type": "object"
       },
-      "name": "wa.mission_pause",
+      "name": "wa.mission_objective_plan",
       "output_schema": null,
       "tags": [
         "wa",
         "robot",
         "mission"
       ],
-      "version": "0.1.0"
-    },
-    {
-      "annotations": null,
-      "description": "Resume a paused mission, restoring prior lifecycle state (robot parity)",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "type": "string"
-          },
-          "mission_file": {
-            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
-            "type": "string"
-          },
-          "requested_by": {
-            "description": "Who requested the resume (default: mcp-agent)",
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
-      "name": "wa.mission_resume",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "mission"
-      ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -435,6 +721,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "limit": {
@@ -464,7 +751,131 @@
         "robot",
         "mission"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
+    },
+    {
+      "annotations": null,
+      "description": "Read the dry-run swarm operating envelope and optional reason-code explanation",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "envelope_id": {
+            "type": "string"
+          },
+          "execute": {
+            "default": false,
+            "description": "Always rejected; operating-envelope surfaces are read-only",
+            "type": "boolean"
+          },
+          "explain_reason": {
+            "description": "Reason code to drill into when surface=explain",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "generated_at_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "objective_id": {
+            "type": "string"
+          },
+          "scenario": {
+            "default": "current",
+            "description": "Deterministic redacted source scenario; current fails closed when live collectors are unavailable",
+            "enum": [
+              "current",
+              "healthy",
+              "degraded",
+              "blocked",
+              "emergency"
+            ],
+            "type": "string"
+          },
+          "surface": {
+            "default": "status",
+            "enum": [
+              "status",
+              "explain"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.operating_envelope",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "swarm",
+        "operating-envelope"
+      ],
+      "version": "0.5.0"
+    },
+    {
+      "annotations": {
+        "destructive": false,
+        "idempotent": true,
+        "readOnly": true
+      },
+      "description": "Score or explain a demo rehearsal manifest without mutating panes, services, Beads, or storage (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "manifest": {
+            "description": "Inline DemoScenarioManifest object; overrides manifest_path when supplied",
+            "type": "object"
+          },
+          "manifest_path": {
+            "default": "fixtures/demo-lab/manifest.v1.json",
+            "description": "Workspace-relative demo scenario manifest path",
+            "type": "string"
+          },
+          "rehearsal_id": {
+            "default": "rehearsal-demo-manifest",
+            "type": "string"
+          },
+          "scenario_id": {
+            "default": "demo_lab.manifest",
+            "type": "string"
+          },
+          "surface": {
+            "default": "score",
+            "enum": [
+              "score",
+              "explain"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.rehearsal_score",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "rehearsal",
+        "demo"
+      ],
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -474,6 +885,7 @@
         "properties": {
           "agent_type": {
             "description": "Filter by agent type (codex, claude_code, gemini, wezterm)",
+            "maxLength": 64,
             "type": "string"
           },
           "format": {
@@ -482,6 +894,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "verbose": {
@@ -499,7 +912,7 @@
         "robot",
         "rules"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -513,10 +926,12 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "text": {
             "description": "Text to test pattern detection against",
+            "maxLength": 262144,
             "type": "string"
           },
           "trace": {
@@ -537,7 +952,7 @@
         "robot",
         "rules"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -546,6 +961,7 @@
         "additionalProperties": false,
         "properties": {
           "agent": {
+            "maxLength": 256,
             "type": "string"
           },
           "domain": {
@@ -557,6 +973,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "pane_id": {
@@ -572,7 +989,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -590,6 +1007,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           }
         },
@@ -602,84 +1020,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.1.0"
-    },
-    {
-      "annotations": null,
-      "description": "Execute compensation phase for committed tx steps (robot parity)",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "contract_file": {
-            "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
-            "type": "string"
-          },
-          "fail_compensation_for_step": {
-            "description": "Deterministic compensation failure injection step_id",
-            "type": "string"
-          },
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
-      "name": "wa.tx_rollback",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "tx"
-      ],
-      "version": "0.1.0"
-    },
-    {
-      "annotations": null,
-      "description": "Execute deterministic tx prepare+commit and compensation on partial failure (robot parity)",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "contract_file": {
-            "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
-            "type": "string"
-          },
-          "fail_step": {
-            "description": "Deterministic commit failure injection step_id",
-            "type": "string"
-          },
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "type": "string"
-          },
-          "kill_switch": {
-            "description": "off|safe_mode|hard_stop (safe-mode/hard-stop also accepted)",
-            "type": "string"
-          },
-          "paused": {
-            "default": false,
-            "description": "Treat mission as paused; commit returns pause-suspended outcome",
-            "type": "boolean"
-          }
-        },
-        "type": "object"
-      },
-      "name": "wa.tx_run",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "tx"
-      ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -697,6 +1038,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "include_contract": {
@@ -714,7 +1056,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     },
     {
       "annotations": null,
@@ -728,6 +1070,7 @@
               "json",
               "toon"
             ],
+            "maxLength": 16,
             "type": "string"
           },
           "pane_id": {
@@ -737,6 +1080,7 @@
           },
           "pattern": {
             "description": "Pattern to match (substring or regex)",
+            "maxLength": 65536,
             "type": "string"
           },
           "regex": {
@@ -771,7 +1115,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.1.0"
+      "version": "0.5.0"
     }
   ]
 }

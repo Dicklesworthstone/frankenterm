@@ -22,14 +22,23 @@
 use std::path::PathBuf;
 
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::build_server_with_db;
+use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use serde_json::{Map, Value, json};
 
 /// Produce a deterministic manifest of tools/resources/templates from the
 /// MCP server. The manifest is a BTree-sorted JSON `Object` so that its
 /// serialized form is canonical.
 fn capture_manifest(db_path: Option<PathBuf>) -> Value {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    // br-ft-647cj: build_server_with_db no longer accepts db_path=None (the
+    // silent no-db degradation path was removed); the database-less surface is
+    // now opt-in via build_server_degraded. Branch so the no-db golden variant
+    // exercises the real degraded catalog instead of panicking.
+    let server = match db_path {
+        Some(path) => {
+            build_server_with_db(&Config::default(), Some(path)).expect("build MCP server")
+        }
+        None => build_server_degraded(&Config::default()).expect("build degraded MCP server"),
+    };
 
     let mut tools: Vec<Value> = server
         .tools()
