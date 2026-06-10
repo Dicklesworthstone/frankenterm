@@ -3404,6 +3404,10 @@ enum RobotCommands {
         /// Poll interval in ms for DB-cursor tailing in `--follow` mode
         #[arg(long, default_value = "500")]
         poll_interval_ms: u64,
+
+        /// Bound throughput to at most N emitted events per second (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        max_hz: u32,
     },
 
     /// Workflow management commands
@@ -19675,9 +19679,11 @@ fn watch_event_passes_filters(
 }
 
 /// NDJSON envelope for one watched event. `cursor` equals the event id so a
-/// follower can resume after it. `matched_text` is redacted (the primary
-/// free-text field); deeper structured redaction reuse is tracked in
-/// ft-7h5da.4.4.
+/// follower can resume after it. The caller redacts the event first via
+/// `frankenterm_core::export::redact_event` (matched_text + nested secrets in
+/// the structured `extracted` payload), so this serializes already-redacted
+/// fields (ft-7h5da.4.4 — redaction-before-emission reused from the export
+/// streamer, not reimplemented).
 fn watch_event_ndjson(event: &frankenterm_core::storage::StoredEvent) -> serde_json::Value {
     serde_json::json!({
         "type": "event",
@@ -19690,11 +19696,22 @@ fn watch_event_ndjson(event: &frankenterm_core::storage::StoredEvent) -> serde_j
         "severity": event.severity,
         "confidence": event.confidence,
         "detected_at": event.detected_at,
-        "matched_text": event.matched_text.as_deref().map(redact_for_output),
+        "matched_text": event.matched_text,
         "extracted": event.extracted,
         "handled": event.handled_at.is_some(),
         "handled_status": event.handled_status,
     })
+}
+
+/// Minimum inter-event interval for `ft robot watch-events --max-hz N`
+/// (ft-7h5da.4.4). `0` (unlimited) → `None`; otherwise `1000/N` ms, so at most
+/// `N` events are emitted per second.
+fn watch_max_hz_interval(max_hz: u32) -> Option<std::time::Duration> {
+    if max_hz == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(1000 / u64::from(max_hz)))
+    }
 }
 
 /// NDJSON idle-heartbeat record for `ft robot watch-events --follow`.
@@ -19798,18 +19815,40 @@ mod watch_events_tests {
     }
 
     #[test]
-    fn envelope_cursor_equals_id_and_redacts_matched_text() {
-        let e = ev(42, "codex.secret_leak", "error", Some("token=AKIAIOSFODNN7EXAMPLE"));
-        let v = watch_event_ndjson(&e);
+    fn envelope_cursor_equals_id_and_redacts_matched_text_and_extracted() {
+        let mut e = ev(42, "codex.secret_leak", "error", Some("token=AKIAIOSFODNN7EXAMPLE"));
+        // A nested secret inside the structured `extracted` payload, plus a
+        // non-secret field that must survive redaction.
+        e.extracted = Some(serde_json::json!({"key": "AKIAIOSFODNN7EXAMPLE", "count": 3}));
+        let redacted = frankenterm_core::export::redact_event(
+            e,
+            &frankenterm_core::redactor::Redactor::new(),
+        );
+        let v = watch_event_ndjson(&redacted);
         assert_eq!(v["type"], "event");
         assert_eq!(v["cursor"], 42);
         assert_eq!(v["id"], 42);
         assert_eq!(v["severity"], "error");
         assert_eq!(v["handled"], false);
-        let matched = v["matched_text"].as_str().expect("matched_text string");
+        let blob = serde_json::to_string(&v).expect("serialize envelope");
         assert!(
-            !matched.contains("AKIAIOSFODNN7EXAMPLE"),
-            "matched_text must be redacted in the NDJSON envelope, got {matched}"
+            !blob.contains("AKIAIOSFODNN7EXAMPLE"),
+            "secret must be redacted in BOTH matched_text and extracted, got {blob}"
+        );
+        // Non-secret structured data survives redaction.
+        assert_eq!(v["extracted"]["count"], 3);
+    }
+
+    #[test]
+    fn max_hz_interval_maps_to_min_spacing() {
+        assert_eq!(watch_max_hz_interval(0), None);
+        assert_eq!(
+            watch_max_hz_interval(10),
+            Some(std::time::Duration::from_millis(100))
+        );
+        assert_eq!(
+            watch_max_hz_interval(1000),
+            Some(std::time::Duration::from_millis(1))
         );
     }
 
@@ -31547,6 +31586,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             limit,
                             heartbeat_interval_ms,
                             poll_interval_ms,
+                            max_hz,
                         } => {
                             use std::io::Write as _;
                             if cursor.is_some_and(|c| c < 0) {
@@ -31597,8 +31637,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let batch_limit = limit.max(1);
                             let heartbeat = std::time::Duration::from_millis(heartbeat_interval_ms);
                             let poll = std::time::Duration::from_millis(poll_interval_ms.max(10));
+                            let redactor = frankenterm_core::redactor::Redactor::new();
+                            let max_hz_interval = watch_max_hz_interval(max_hz);
                             let mut current_cursor = cursor;
                             let mut last_emit = std::time::Instant::now();
+                            let mut last_event_emit: Option<std::time::Instant> = None;
                             let stdout = std::io::stdout();
 
                             // ft-7h5da.4.2: typed cursor_expired. If --cursor
@@ -31668,28 +31711,49 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 };
                                 let batch_len = events.len();
 
-                                {
-                                    let mut lock = stdout.lock();
-                                    for event in &events {
-                                        // Advance the cursor past every scanned
-                                        // event (even filtered ones) so the
-                                        // follower never re-scans them.
-                                        current_cursor = Some(event.id);
-                                        if !watch_event_passes_filters(
-                                            event,
-                                            severity_filter,
-                                            rule_glob,
-                                        ) {
-                                            continue;
-                                        }
-                                        let record = watch_event_ndjson(event);
-                                        if !write_ndjson_line(&mut lock, &record)? {
-                                            let _ = lock.flush();
-                                            break 'follow; // consumer closed the pipe
-                                        }
-                                        last_emit = std::time::Instant::now();
+                                for event in events {
+                                    // Advance the cursor past every scanned event
+                                    // (even filtered ones) so the follower never
+                                    // re-scans them.
+                                    current_cursor = Some(event.id);
+                                    if !watch_event_passes_filters(
+                                        &event,
+                                        severity_filter,
+                                        rule_glob,
+                                    ) {
+                                        continue;
                                     }
+                                    // max_hz: pace emissions with an async sleep
+                                    // (outside the stdout lock) so throughput is
+                                    // bounded to N events/sec (ft-7h5da.4.4).
+                                    if let Some(min) = max_hz_interval {
+                                        if let Some(prev) = last_event_emit {
+                                            let elapsed = prev.elapsed();
+                                            if elapsed < min {
+                                                frankenterm_core::runtime_async::sleep(
+                                                    min - elapsed,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                    // Redaction-before-emission, reused verbatim
+                                    // from the export streamer: matched_text +
+                                    // nested secrets in `extracted`.
+                                    let redacted = frankenterm_core::export::redact_event(
+                                        event, &redactor,
+                                    );
+                                    let record = watch_event_ndjson(&redacted);
+                                    let mut lock = stdout.lock();
+                                    let cont = write_ndjson_line(&mut lock, &record)?;
                                     let _ = lock.flush();
+                                    drop(lock);
+                                    if !cont {
+                                        break 'follow; // consumer closed the pipe
+                                    }
+                                    let now = std::time::Instant::now();
+                                    last_emit = now;
+                                    last_event_emit = Some(now);
                                 }
 
                                 if !follow {

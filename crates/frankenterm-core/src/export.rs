@@ -435,7 +435,12 @@ fn redact_segment(mut seg: Segment, redactor: &Redactor) -> Segment {
     seg
 }
 
-fn redact_event(mut event: StoredEvent, redactor: &Redactor) -> StoredEvent {
+/// Redact secret material from a stored event before emission: `matched_text`
+/// and every string inside the structured `extracted` payload (via
+/// serialize → redact → reparse, so nested secrets are caught). Idempotent and
+/// secret-pattern-scoped (non-secret strings are untouched). Reused by the
+/// export path and `ft robot watch-events` (ft-7h5da.4.4).
+pub fn redact_event(mut event: StoredEvent, redactor: &Redactor) -> StoredEvent {
     if let Some(ref text) = event.matched_text {
         event.matched_text = Some(redactor.redact(text));
     }
