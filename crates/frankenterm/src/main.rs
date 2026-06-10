@@ -3364,6 +3364,12 @@ enum RobotCommands {
     /// polling (works whether or not the watcher is up) and emit idle
     /// heartbeats. Filters: severity, rule-id glob, pane. Kills the
     /// `while sleep 5` polling anti-pattern (ft-7h5da.4.1).
+    ///
+    /// Resume is at-least-once: each record's `cursor` is its resume point, so
+    /// reconnecting with `--cursor` replays anything missed (may re-deliver,
+    /// never drops). A `--cursor` that predates retained events emits a typed
+    /// `cursor_expired` record and re-baselines to the oldest retained event —
+    /// never a silent skip (ft-7h5da.4.2).
     #[command(visible_alias = "watch-event")]
     WatchEvents {
         /// Follow mode: keep tailing new events (like `tail -f`). Without it,
@@ -19696,6 +19702,35 @@ fn watch_heartbeat_ndjson(cursor: Option<i64>, now: i64) -> serde_json::Value {
     serde_json::json!({ "type": "heartbeat", "cursor": cursor, "now": now })
 }
 
+/// Detect a pruned (expired) resume cursor for `ft robot watch-events`
+/// (ft-7h5da.4.2). Returns `Some(oldest_retained)` when `requested` points
+/// before the oldest globally-retained event id — i.e. events in
+/// `(requested, oldest)` were removed by retention, so resuming silently would
+/// skip them. Returns `None` when the cursor is still within the retained
+/// window (contiguous or ahead), or when there is no cursor / no events.
+/// Pruning is global, so this is checked against the global oldest id, not a
+/// pane-filtered one.
+fn watch_cursor_expiry(requested: Option<i64>, oldest_retained: Option<i64>) -> Option<i64> {
+    match (requested, oldest_retained) {
+        (Some(c), Some(oldest)) if oldest > c + 1 => Some(oldest),
+        _ => None,
+    }
+}
+
+/// Typed `cursor_expired` NDJSON record: the requested resume cursor fell behind
+/// retention pruning, so events were lost. Never a silent skip (no-silent-gaps
+/// capture doctrine) — the stream then re-baselines and resumes from
+/// `oldest_available` (at-least-once for still-retained events).
+fn watch_cursor_expired_ndjson(requested: i64, oldest_available: i64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "cursor_expired",
+        "requested_cursor": requested,
+        "oldest_available": oldest_available,
+        "message": "resume cursor predates retained events (retention pruned the gap); \
+                    resuming from oldest_available",
+    })
+}
+
 /// Write one compact NDJSON line. Returns `Ok(false)` if the consumer closed
 /// the pipe (caller should stop cleanly); `Ok(true)` otherwise.
 fn write_ndjson_line<W: std::io::Write>(
@@ -19793,6 +19828,29 @@ mod watch_events_tests {
         let v = serde_json::json!({"a": 1});
         assert!(write_ndjson_line(&mut buf, &v).unwrap());
         assert_eq!(buf, b"{\"a\":1}\n");
+    }
+
+    #[test]
+    fn cursor_expiry_detects_pruned_gap_only() {
+        // events 6..9 pruned: requested=5, oldest=10 => expired, re-baseline 10.
+        assert_eq!(watch_cursor_expiry(Some(5), Some(10)), Some(10));
+        // contiguous (oldest == requested+1) => not expired.
+        assert_eq!(watch_cursor_expiry(Some(9), Some(10)), None);
+        // cursor within / ahead of the retained window => not expired.
+        assert_eq!(watch_cursor_expiry(Some(10), Some(10)), None);
+        assert_eq!(watch_cursor_expiry(Some(15), Some(10)), None);
+        // no cursor / no retained events => not expired.
+        assert_eq!(watch_cursor_expiry(None, Some(10)), None);
+        assert_eq!(watch_cursor_expiry(Some(5), None), None);
+    }
+
+    #[test]
+    fn cursor_expired_envelope_shape() {
+        let v = watch_cursor_expired_ndjson(5, 10);
+        assert_eq!(v["type"], "cursor_expired");
+        assert_eq!(v["requested_cursor"], 5);
+        assert_eq!(v["oldest_available"], 10);
+        assert!(v["message"].as_str().expect("message").contains("retained"));
     }
 }
 
@@ -31542,6 +31600,45 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let mut current_cursor = cursor;
                             let mut last_emit = std::time::Instant::now();
                             let stdout = std::io::stdout();
+
+                            // ft-7h5da.4.2: typed cursor_expired. If --cursor
+                            // predates the oldest globally-retained event,
+                            // retention pruned the events in between; surface an
+                            // explicit cursor_expired record (never a silent
+                            // skip) and re-baseline to the oldest retained so the
+                            // follower still gets every retained event
+                            // at-least-once.
+                            if let Some(requested) = cursor {
+                                let oldest_query = frankenterm_core::storage::EventStreamQuery {
+                                    after_id: None,
+                                    limit: Some(1),
+                                    pane_id: None, // pruning is global
+                                    rule_id: None,
+                                    event_type: None,
+                                    triage_state: None,
+                                    label: None,
+                                    unhandled_only: false,
+                                    since: None,
+                                    until: None,
+                                };
+                                let oldest = storage
+                                    .get_events_stream(oldest_query)
+                                    .await
+                                    .ok()
+                                    .and_then(|evs| evs.first().map(|e| e.id));
+                                if let Some(oldest) = watch_cursor_expiry(Some(requested), oldest) {
+                                    let rec = watch_cursor_expired_ndjson(requested, oldest);
+                                    let mut lock = stdout.lock();
+                                    let cont = write_ndjson_line(&mut lock, &rec)?;
+                                    let _ = lock.flush();
+                                    drop(lock);
+                                    if !cont {
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
+                                    }
+                                    current_cursor = Some(oldest - 1);
+                                }
+                            }
 
                             'follow: loop {
                                 let query = frankenterm_core::storage::EventStreamQuery {
