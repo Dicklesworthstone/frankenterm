@@ -3229,8 +3229,9 @@ enum RobotCommands {
         wait_for_regex: bool,
     },
 
-    /// Wait for a pattern in pane output
-    #[command(visible_aliases = ["await", "watch"])]
+    /// Wait for a pattern in pane output (single-condition; the composite
+    /// `ft robot await` generalizes this over rule/state/quiescence conditions)
+    #[command(visible_alias = "watch")]
     WaitFor {
         /// Pane ID
         pane_id: u64,
@@ -3408,6 +3409,35 @@ enum RobotCommands {
         /// Bound throughput to at most N emitted events per second (0 = unlimited)
         #[arg(long, default_value = "0")]
         max_hz: u32,
+    },
+
+    /// Block until composite conditions match (or timeout), then emit one
+    /// `await_result` NDJSON record. Conditions compose: every `--all` must
+    /// match AND (if any `--any` is given) at least one `--any` must match.
+    /// Supported source in DB-cursor mode: `rule:<glob>` (an event whose
+    /// rule-id matches appears). `state:`/`quiescence:` sources require the
+    /// watcher IPC transport (ft-7h5da.4.3 follow-on). Generalizes wait-for.
+    Await {
+        /// Condition where ANY match satisfies (repeatable). E.g. `rule:codex.*`
+        #[arg(long = "any")]
+        any: Vec<String>,
+
+        /// Condition where ALL must match (repeatable). E.g. `rule:build.done`
+        #[arg(long = "all")]
+        all: Vec<String>,
+
+        /// Timeout in seconds (0 = wait indefinitely)
+        #[arg(long, default_value = "0")]
+        timeout_secs: u64,
+
+        /// Poll interval in ms
+        #[arg(long, default_value = "500")]
+        poll_interval_ms: u64,
+
+        /// Resume cursor: consider events with id greater than this (default:
+        /// only events that arrive after the await starts)
+        #[arg(long)]
+        cursor: Option<i64>,
     },
 
     /// Workflow management commands
@@ -19714,6 +19744,87 @@ fn watch_max_hz_interval(max_hz: u32) -> Option<std::time::Duration> {
     }
 }
 
+/// A single `ft robot await` condition (ft-7h5da.4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AwaitCondition {
+    /// An event whose rule-id matches the glob has appeared since the await
+    /// started (or since `--cursor`).
+    Rule(String),
+}
+
+/// Parse one `ft robot await` condition. Supported in DB-cursor mode:
+/// `rule:<glob>` (the rule-id glob from watch-events). The `state:<pane>:<s>`
+/// and `quiescence:<pane>` sources require the watcher's live in-process state
+/// (AgentPaneState needs input-sent tracking; quiescence gauges are in-process
+/// AtomicU64s) — they ride the .4.1 IPC-subscribe transport and are rejected
+/// here with a clear, scoped message rather than silently mis-evaluated.
+fn parse_await_condition(spec: &str) -> Result<AwaitCondition, String> {
+    let spec = spec.trim();
+    if let Some(glob) = spec.strip_prefix("rule:") {
+        if glob.is_empty() {
+            return Err(format!("empty rule glob in condition `{spec}`"));
+        }
+        Ok(AwaitCondition::Rule(glob.to_string()))
+    } else if spec.starts_with("state:") || spec.starts_with("quiescence:") {
+        Err(format!(
+            "condition `{spec}`: state:/quiescence: sources need the watcher's \
+             live in-process state over the IPC transport (ft-7h5da.4.3 \
+             follow-on, blocked on the .4.1 IPC-subscribe path); only \
+             rule:<glob> is supported in DB-cursor mode"
+        ))
+    } else {
+        Err(format!(
+            "unrecognized condition `{spec}`; expected `rule:<glob>` \
+             (state:/quiescence: require the watcher IPC transport)"
+        ))
+    }
+}
+
+/// Whether a stored event satisfies an await condition.
+fn await_condition_matches(
+    cond: &AwaitCondition,
+    event: &frankenterm_core::storage::StoredEvent,
+) -> bool {
+    match cond {
+        AwaitCondition::Rule(glob) => watch_rule_glob_matches(glob, &event.rule_id),
+    }
+}
+
+/// Composite satisfaction for `ft robot await`: every `--all` condition is met
+/// AND (no `--any` given OR at least one `--any` is met).
+fn await_is_satisfied(any_met: &[bool], all_met: &[bool]) -> bool {
+    let all_ok = all_met.iter().all(|&m| m);
+    let any_ok = any_met.is_empty() || any_met.iter().any(|&m| m);
+    all_ok && any_ok
+}
+
+/// Single result envelope for `ft robot await` (NDJSON, consistent with the
+/// watch-events family).
+fn await_result_ndjson(
+    satisfied: bool,
+    timed_out: bool,
+    elapsed_ms: u64,
+    final_cursor: Option<i64>,
+    any: &[(String, bool)],
+    all: &[(String, bool)],
+) -> serde_json::Value {
+    let render = |conds: &[(String, bool)]| -> Vec<serde_json::Value> {
+        conds
+            .iter()
+            .map(|(c, met)| serde_json::json!({ "condition": c, "met": met }))
+            .collect()
+    };
+    serde_json::json!({
+        "type": "await_result",
+        "satisfied": satisfied,
+        "timed_out": timed_out,
+        "elapsed_ms": elapsed_ms,
+        "final_cursor": final_cursor,
+        "any": render(any),
+        "all": render(all),
+    })
+}
+
 /// NDJSON idle-heartbeat record for `ft robot watch-events --follow`.
 fn watch_heartbeat_ndjson(cursor: Option<i64>, now: i64) -> serde_json::Value {
     serde_json::json!({ "type": "heartbeat", "cursor": cursor, "now": now })
@@ -19850,6 +19961,68 @@ mod watch_events_tests {
             watch_max_hz_interval(1000),
             Some(std::time::Duration::from_millis(1))
         );
+    }
+
+    #[test]
+    fn parse_await_condition_rule_and_rejects_unsupported() {
+        assert_eq!(
+            parse_await_condition("rule:codex.*"),
+            Ok(AwaitCondition::Rule("codex.*".to_string()))
+        );
+        assert_eq!(
+            parse_await_condition("  rule:build.done  "),
+            Ok(AwaitCondition::Rule("build.done".to_string()))
+        );
+        assert!(parse_await_condition("rule:").is_err());
+        assert!(parse_await_condition("state:7:stuck").is_err());
+        assert!(parse_await_condition("quiescence:7").is_err());
+        assert!(parse_await_condition("bogus").is_err());
+    }
+
+    #[test]
+    fn await_is_satisfied_composition() {
+        // only --all => every all-condition must be met.
+        assert!(await_is_satisfied(&[], &[true, true]));
+        assert!(!await_is_satisfied(&[], &[true, false]));
+        // only --any => at least one any-condition met.
+        assert!(await_is_satisfied(&[false, true], &[]));
+        assert!(!await_is_satisfied(&[false, false], &[]));
+        // both => (all all) AND (some any).
+        assert!(await_is_satisfied(&[true, false], &[true]));
+        assert!(!await_is_satisfied(&[false, false], &[true]));
+        assert!(!await_is_satisfied(&[true], &[false]));
+    }
+
+    #[test]
+    fn await_condition_matches_rule_glob() {
+        let e = ev(1, "codex.usage_reached", "warning", None);
+        assert!(await_condition_matches(
+            &AwaitCondition::Rule("codex.*".to_string()),
+            &e
+        ));
+        assert!(!await_condition_matches(
+            &AwaitCondition::Rule("claude.*".to_string()),
+            &e
+        ));
+    }
+
+    #[test]
+    fn await_result_envelope_shape() {
+        let v = await_result_ndjson(
+            true,
+            false,
+            1200,
+            Some(42),
+            &[("rule:a".to_string(), true)],
+            &[("rule:b".to_string(), true)],
+        );
+        assert_eq!(v["type"], "await_result");
+        assert_eq!(v["satisfied"], true);
+        assert_eq!(v["timed_out"], false);
+        assert_eq!(v["final_cursor"], 42);
+        assert_eq!(v["any"][0]["condition"], "rule:a");
+        assert_eq!(v["any"][0]["met"], true);
+        assert_eq!(v["all"][0]["condition"], "rule:b");
     }
 
     #[test]
@@ -31778,6 +31951,177 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 frankenterm_core::runtime_async::sleep(poll).await;
                             }
 
+                            storage.shutdown().await.ok();
+                        }
+                        RobotCommands::Await {
+                            any,
+                            all,
+                            timeout_secs,
+                            poll_interval_ms,
+                            cursor,
+                        } => {
+                            use std::io::Write as _;
+                            // Parse conditions (fail fast on bad syntax).
+                            let mut any_conds: Vec<AwaitCondition> = Vec::with_capacity(any.len());
+                            let mut all_conds: Vec<AwaitCondition> = Vec::with_capacity(all.len());
+                            for spec in any.iter().chain(all.iter()) {
+                                if let Err(e) = parse_await_condition(spec) {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_INVALID_ARGS,
+                                            e,
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            }
+                            for spec in &any {
+                                any_conds.push(
+                                    parse_await_condition(spec).expect("validated above"),
+                                );
+                            }
+                            for spec in &all {
+                                all_conds.push(
+                                    parse_await_condition(spec).expect("validated above"),
+                                );
+                            }
+                            if any_conds.is_empty() && all_conds.is_empty() {
+                                let response =
+                                    RobotResponse::<serde_json::Value>::error_with_code(
+                                        ROBOT_ERR_INVALID_ARGS,
+                                        "await requires at least one --any or --all condition"
+                                            .to_string(),
+                                        Some(
+                                            "Example: ft robot await --all 'rule:build.done' \
+                                             --timeout-secs 60"
+                                                .to_string(),
+                                        ),
+                                        elapsed_ms(start),
+                                    );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage = match frankenterm_core::storage::StorageHandle::new(
+                                &db_path,
+                            )
+                            .await
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to open storage: {e}"),
+                                        Some("Is the database initialized? Run 'ft watch' first.".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            let poll = std::time::Duration::from_millis(poll_interval_ms.max(10));
+                            let start_ms = now_ms_i64();
+                            let started = std::time::Instant::now();
+                            let mut after_id = cursor;
+                            let mut any_met = vec![false; any_conds.len()];
+                            let mut all_met = vec![false; all_conds.len()];
+                            let mut final_cursor = cursor;
+                            let stdout = std::io::stdout();
+
+                            let (satisfied, timed_out) = loop {
+                                let query = frankenterm_core::storage::EventStreamQuery {
+                                    after_id,
+                                    limit: Some(500),
+                                    pane_id: None,
+                                    rule_id: None,
+                                    event_type: None,
+                                    triage_state: None,
+                                    label: None,
+                                    unhandled_only: false,
+                                    // Default (no --cursor): only events that
+                                    // arrive after the await starts.
+                                    since: if after_id.is_some() { None } else { Some(start_ms) },
+                                    until: None,
+                                };
+                                let events = match storage.get_events_stream(query).await {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query events: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        storage.shutdown().await.ok();
+                                        return Ok(());
+                                    }
+                                };
+                                let batch_len = events.len();
+                                for ev in &events {
+                                    after_id = Some(ev.id);
+                                    final_cursor = Some(ev.id);
+                                    for (i, c) in any_conds.iter().enumerate() {
+                                        if !any_met[i] && await_condition_matches(c, ev) {
+                                            any_met[i] = true;
+                                        }
+                                    }
+                                    for (i, c) in all_conds.iter().enumerate() {
+                                        if !all_met[i] && await_condition_matches(c, ev) {
+                                            all_met[i] = true;
+                                        }
+                                    }
+                                }
+                                if await_is_satisfied(&any_met, &all_met) {
+                                    break (true, false);
+                                }
+                                // Drain a full backlog batch before idling.
+                                if batch_len >= 500 {
+                                    continue;
+                                }
+                                if timeout_secs > 0
+                                    && started.elapsed()
+                                        >= std::time::Duration::from_secs(timeout_secs)
+                                {
+                                    break (false, true);
+                                }
+                                frankenterm_core::runtime_async::sleep(poll).await;
+                            };
+
+                            let any_status: Vec<(String, bool)> =
+                                any.iter().cloned().zip(any_met.iter().copied()).collect();
+                            let all_status: Vec<(String, bool)> =
+                                all.iter().cloned().zip(all_met.iter().copied()).collect();
+                            let result = await_result_ndjson(
+                                satisfied,
+                                timed_out,
+                                elapsed_ms(start),
+                                final_cursor,
+                                &any_status,
+                                &all_status,
+                            );
+                            let mut lock = stdout.lock();
+                            let _ = write_ndjson_line(&mut lock, &result)?;
+                            let _ = lock.flush();
+                            drop(lock);
                             storage.shutdown().await.ok();
                         }
                         RobotCommands::Workflow { command } => {
@@ -53297,6 +53641,29 @@ async fn handle_snapshot_command(
             let cp2: i64 = id2
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid ID: {id2}"))?;
+
+            // Verify both checkpoints exist before diffing. A checkpoint may
+            // legitimately have zero panes, so emptiness of the pane list is
+            // NOT a proxy for existence — without this guard, diffing against a
+            // missing checkpoint silently reports the other side's panes as
+            // wholly added/removed with no indication the snapshot is absent.
+            // Mirrors the existence check in the `Delete` arm below.
+            let checkpoint_exists = |cp_id: i64| -> anyhow::Result<bool> {
+                Ok(conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM session_checkpoints WHERE id = ?1",
+                        [cp_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|c| c > 0)
+                    .unwrap_or(false))
+            };
+            for cp_id in [cp1, cp2] {
+                if !checkpoint_exists(cp_id)? {
+                    eprintln!("Snapshot #{cp_id} not found");
+                    std::process::exit(1);
+                }
+            }
 
             // Get pane IDs for each checkpoint
             let get_pane_ids = |cp_id: i64| -> anyhow::Result<Vec<i64>> {

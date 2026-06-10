@@ -263,6 +263,7 @@ ft robot events label <event_id> --add <label> [--by <actor>]
 ft robot events label <event_id> --remove <label>
 ft robot events label <event_id> --list
 ft robot watch-events [--follow] [--severity <sev>] [--rule-id <glob>] [--pane <id>] [--cursor <id>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>] [--max-hz <n>]
+ft robot await [--any 'rule:<glob>'] [--all 'rule:<glob>'] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--cursor <id>]
 
 ft robot workflow list
 ft robot workflow run <name> <pane_id> [--force] [--dry-run]
