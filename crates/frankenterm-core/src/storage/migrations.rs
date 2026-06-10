@@ -1773,6 +1773,22 @@ fn ensure_panes_pane_uuid(conn: &Connection) -> Result<()> {
     )
 }
 
+/// ft-7h5da.1.5: `redaction_catalog_version` is present in the current
+/// `SCHEMA_SQL` baseline, so on a fresh DB the column already exists by the time
+/// `run_migrations(0)` reaches v29. Guard the ALTER (like the other
+/// SCHEMA_SQL-coexisting column migrations) so v29 is a no-op on fresh DBs and a
+/// real add only on pre-v29 upgrades — without it, fresh init fails with
+/// "duplicate column name: redaction_catalog_version".
+fn ensure_output_segments_redaction_catalog_version(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "output_segments",
+        "redaction_catalog_version",
+        "ALTER TABLE output_segments ADD COLUMN redaction_catalog_version TEXT;",
+        "migration v29",
+    )
+}
+
 fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
     let table_exists: i64 = conn
         .query_row(
@@ -2512,6 +2528,10 @@ pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> R
                 }
                 23 => {
                     ensure_segment_embeddings_schema(conn)?;
+                }
+                29 => {
+                    ensure_output_segments_redaction_catalog_version(conn)?;
+                    apply_raw_up_sql = false;
                 }
                 _ => {}
             }
