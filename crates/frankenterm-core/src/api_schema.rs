@@ -268,10 +268,10 @@ impl SchemaRegistry {
                 },
                 EndpointMeta {
                     id: "dom".into(),
-                    title: "Robot DOM".into(),
-                    description: "Query live OSC 133 semantic zones, command text, output, and exit status".into(),
+                    title: "Semantic Pane API".into(),
+                    description: "Query live OSC 133 semantic zones, command text, output, and exit status (flat zone list, not a DOM tree)".into(),
                     robot_command: Some("robot dom".into()),
-                    mcp_tool: None,
+                    mcp_tool: Some("wa.dom".into()),
                     schema_file: "wa-robot-dom.json".into(),
                     stable: true,
                     since: "0.1.0".into(),
