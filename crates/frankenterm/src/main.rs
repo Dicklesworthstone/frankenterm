@@ -481,6 +481,13 @@ NOTES:
         command: MissionCommands,
     },
 
+    /// Steering receipts: read-only plan preflight
+    /// (mission planner → rehearsal score → policy preflight → SteeringReceipt)
+    Steer {
+        #[command(subcommand)]
+        command: SteerCommands,
+    },
+
     /// Mission transaction control commands (plan/run/rollback/show)
     #[command(after_help = r#"EXAMPLES:
     ft tx plan                         Validate tx contract and summarize lifecycle
@@ -5027,6 +5034,34 @@ enum MissionCommands {
 
         /// Output format: plain or json
         #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SteerCommands {
+    /// Emit a deterministic steering receipt for a standard scenario (read-only:
+    /// mission planner → rehearsal score → policy preflight → SteeringReceipt;
+    /// writes only the receipt + one audit row).
+    Plan {
+        /// Operator objective description
+        #[arg(long)]
+        objective: String,
+
+        /// Scenario: clean-ready | dirty-overlap | rch-blocked | approval-required | capacity-red
+        #[arg(long)]
+        scenario: String,
+
+        /// Workspace id to bind (default: the resolved workspace root)
+        #[arg(long)]
+        workspace_id: Option<String>,
+
+        /// Receipt TTL in milliseconds (default: none = never expires)
+        #[arg(long)]
+        ttl_ms: Option<i64>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain")]
         format: String,
     },
 }
@@ -39565,6 +39600,114 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
         }
+
+        Some(Commands::Steer { command }) => match command {
+            SteerCommands::Plan {
+                objective,
+                scenario,
+                workspace_id,
+                ttl_ms,
+                format,
+            } => {
+                use frankenterm_core::steer_plan::{SteerPlanScenario, plan_status_label, steer_plan};
+                let as_json = format.eq_ignore_ascii_case("json");
+                let scenario = match SteerPlanScenario::parse(&scenario) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if as_json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"ok": false, "error": e, "version": frankenterm_core::VERSION})
+                            );
+                        } else {
+                            eprintln!("Error: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                };
+                let layout = match config.workspace_layout(Some(&workspace_root)) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("Error: Failed to get workspace layout: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let workspace_id =
+                    workspace_id.unwrap_or_else(|| layout.root.to_string_lossy().to_string());
+                let now = now_ms_i64();
+                let result = steer_plan(
+                    scenario,
+                    &objective,
+                    &workspace_id,
+                    now.max(0) as u64,
+                    now,
+                    ttl_ms,
+                );
+
+                // The only side effect: one audit row recording the preflight.
+                let db_path = layout.db_path.to_string_lossy();
+                let open_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match frankenterm_core::storage::StorageHandle::new_with_cx(&open_cx, &db_path).await
+                {
+                    Ok(storage) => {
+                        let policy_decision = if result.policy_verdict.starts_with("envelope.admit")
+                        {
+                            "allow"
+                        } else if result.policy_verdict.contains("requires_approval") {
+                            "require_approval"
+                        } else {
+                            "deny"
+                        };
+                        let audit = frankenterm_core::storage::AuditActionRecord {
+                            id: 0,
+                            ts: now,
+                            actor_kind: "robot".to_string(),
+                            actor_id: Some("ft.steer.plan".to_string()),
+                            correlation_id: Some(result.receipt.receipt_id.clone()),
+                            pane_id: None,
+                            domain: None,
+                            action_kind: "steer.plan".to_string(),
+                            policy_decision: policy_decision.to_string(),
+                            decision_reason: Some(format!(
+                                "scenario={} status={}",
+                                scenario.as_str(),
+                                plan_status_label(result.plan_status)
+                            )),
+                            rule_id: None,
+                            input_summary: Some(format!("objective={}", result.receipt.objective)),
+                            verification_summary: None,
+                            decision_context: None,
+                            result: "success".to_string(),
+                        };
+                        let _ = storage.record_audit_action(audit).await;
+                        let _ = storage.shutdown().await;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: steer receipt computed but audit row not written \
+                             (storage unavailable: {e})"
+                        );
+                    }
+                }
+
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result.receipt)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("steering receipt {}", result.receipt.receipt_id);
+                    println!("  scenario:  {}", scenario.as_str());
+                    println!("  status:    {}", plan_status_label(result.plan_status));
+                    println!("  objective: {}", result.receipt.objective);
+                    println!("  verdict:   {}", result.receipt.envelope_verdict);
+                    println!("  score:     {:?}", result.receipt.rehearsal_score);
+                    println!("  approvals: {:?}", result.receipt.required_approvals);
+                }
+            }
+        },
 
         Some(Commands::Timeline {
             last,
