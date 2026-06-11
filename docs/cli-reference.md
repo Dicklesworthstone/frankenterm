@@ -109,6 +109,7 @@ ft mission pause [--mission-file <path>] [--reason <text>] [-f <plain|json>]
 ft mission resume [--mission-file <path>] [-f <plain|json>]
 ft mission abort [--mission-file <path>] [--reason <text>] [-f <plain|json>]
 ft steer plan --objective <text> --scenario <clean-ready|dirty-overlap|rch-blocked|approval-required|capacity-red> [--workspace-id <id>] [--ttl-ms <n>] [-f <plain|json>]
+ft steer run --receipt <steer:id> [--mission-file <path>] [--plan-hash <hash>] [-f <plain|json>]
 ```
 
 Transaction-contract control is currently surfaced under robot mode as

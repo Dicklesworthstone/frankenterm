@@ -5064,6 +5064,30 @@ enum SteerCommands {
         #[arg(long, short = 'f', default_value = "plain")]
         format: String,
     },
+
+    /// Revalidate a stored steering receipt against the live contract: refuses a
+    /// stale-hash / expired / unverifiable receipt with a typed error. (The tx
+    /// prepare/commit delegation is the W5.3 execute follow-on; this performs the
+    /// revalidation gate only and executes nothing.)
+    Run {
+        /// The receipt id to load (steer:<hex>), as printed by `ft steer plan`
+        #[arg(long)]
+        receipt: String,
+
+        /// Path to the live mission JSON, to revalidate the receipt's bound
+        /// mission hash (required if the receipt bound a mission)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// The live action/tx plan hash, to revalidate the receipt's bound tx
+        /// hash (required if the receipt bound a tx contract)
+        #[arg(long)]
+        plan_hash: Option<String>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -39723,6 +39747,128 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("  verdict:   {}", result.receipt.envelope_verdict);
                     println!("  score:     {:?}", result.receipt.rehearsal_score);
                     println!("  approvals: {:?}", result.receipt.required_approvals);
+                }
+            }
+            SteerCommands::Run {
+                receipt,
+                mission_file,
+                plan_hash,
+                format,
+            } => {
+                use frankenterm_core::steer_run::steer_run_gate;
+                let as_json = format.eq_ignore_ascii_case("json");
+                let layout = match config.workspace_layout(Some(&workspace_root)) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("Error: Failed to get workspace layout: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let ft_dir = match layout.db_path.parent() {
+                    Some(d) => d.to_path_buf(),
+                    None => {
+                        eprintln!("Error: cannot resolve .ft directory");
+                        std::process::exit(1);
+                    }
+                };
+                let stored = match frankenterm_core::steer_receipt_store::load_receipt(
+                    &ft_dir, &receipt,
+                ) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        let msg = format!("no stored receipt with id {receipt}");
+                        if as_json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"ok": false, "error": msg, "version": frankenterm_core::VERSION})
+                            );
+                        } else {
+                            eprintln!("Error: {msg}");
+                        }
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: failed to load receipt: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let live_mission = match &mission_file {
+                    Some(path) => {
+                        let parsed = std::fs::read_to_string(path).ok().and_then(|s| {
+                            serde_json::from_str::<frankenterm_core::plan::Mission>(&s).ok()
+                        });
+                        match parsed {
+                            Some(m) => Some(m),
+                            None => {
+                                eprintln!(
+                                    "Error: failed to read/parse mission file {}",
+                                    path.display()
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let now = now_ms_i64();
+                let verdict =
+                    steer_run_gate(&stored, live_mission.as_ref(), plan_hash.as_deref(), now);
+                let valid = verdict.is_valid();
+                let error_code = verdict.error_code();
+
+                // Audit the revalidation (no execution occurs here).
+                let db_path = layout.db_path.to_string_lossy();
+                let open_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                if let Ok(storage) = frankenterm_core::storage::StorageHandle::new_with_cx(
+                    &open_cx, &db_path,
+                )
+                .await
+                {
+                    let audit = frankenterm_core::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now,
+                        actor_kind: "robot".to_string(),
+                        actor_id: Some("ft.steer.run".to_string()),
+                        correlation_id: Some(stored.receipt_id.clone()),
+                        pane_id: None,
+                        domain: None,
+                        action_kind: "steer.run.revalidate".to_string(),
+                        policy_decision: if valid { "allow" } else { "deny" }.to_string(),
+                        decision_reason: error_code.map(str::to_string),
+                        rule_id: None,
+                        input_summary: Some(format!("receipt={}", stored.receipt_id)),
+                        verification_summary: None,
+                        decision_context: None,
+                        result: if valid { "success" } else { "refused" }.to_string(),
+                    };
+                    let _ = storage.record_audit_action(audit).await;
+                    let _ = storage.shutdown().await;
+                }
+
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "steer_run_revalidation",
+                            "receipt_id": stored.receipt_id,
+                            "valid": valid,
+                            "error_code": error_code,
+                            "executed": false,
+                            "version": frankenterm_core::VERSION,
+                        })
+                    );
+                } else if valid {
+                    println!("receipt {} revalidated OK", stored.receipt_id);
+                    println!(
+                        "  (tx prepare/commit delegation not yet wired — W5.3 execute follow-on)"
+                    );
+                } else {
+                    println!(
+                        "receipt {} REFUSED: {}",
+                        stored.receipt_id,
+                        error_code.unwrap_or("unknown")
+                    );
                 }
             }
         },

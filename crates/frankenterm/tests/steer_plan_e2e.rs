@@ -135,3 +135,59 @@ fn steer_plan_rejects_unknown_scenario() {
         .assert()
         .failure();
 }
+
+/// Plan a clean-ready receipt and return its content-addressed id.
+fn plan_receipt_id(w: &Path, extra: &[&str]) -> String {
+    let mut args = vec![
+        "steer", "plan", "--objective", "run me", "--scenario", "clean-ready", "--format", "json",
+    ];
+    args.extend_from_slice(extra);
+    let out = stdout(ft(w).args(args).assert().success());
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json receipt");
+    v["receipt_id"].as_str().expect("receipt_id").to_string()
+}
+
+#[test]
+fn steer_run_revalidates_fresh_receipt_ok() {
+    let w = workspace();
+    let id = plan_receipt_id(w.path(), &[]);
+    let out = stdout(
+        ft(w.path())
+            .args(["steer", "run", "--receipt", &id, "--format", "json"])
+            .assert()
+            .success(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v["valid"], serde_json::json!(true), "{out}");
+    assert_eq!(v["executed"], serde_json::json!(false), "{out}");
+    assert_eq!(v["receipt_id"].as_str(), Some(id.as_str()), "{out}");
+}
+
+#[test]
+fn steer_run_refuses_expired_receipt_typed() {
+    let w = workspace();
+    // ttl 1ms; by the time the separate `run` process loads it, it is expired.
+    let id = plan_receipt_id(w.path(), &["--ttl-ms", "1"]);
+    let out = stdout(
+        ft(w.path())
+            .args(["steer", "run", "--receipt", &id, "--format", "json"])
+            .assert()
+            .success(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v["valid"], serde_json::json!(false), "{out}");
+    assert_eq!(
+        v["error_code"],
+        serde_json::json!("robot.steer_receipt_expired"),
+        "{out}"
+    );
+}
+
+#[test]
+fn steer_run_refuses_unknown_receipt() {
+    let w = workspace();
+    ft(w.path())
+        .args(["steer", "run", "--receipt", "steer:deadbeef", "--format", "json"])
+        .assert()
+        .failure();
+}
