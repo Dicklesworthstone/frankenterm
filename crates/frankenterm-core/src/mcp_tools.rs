@@ -17,7 +17,7 @@ use crate::attention_router::{
     build_attention_router_surface_payload,
 };
 use crate::demo_scenarios::DemoScenarioManifest;
-use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_REMOTE_TEXT_UNAVAILABLE};
+use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
