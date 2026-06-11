@@ -783,7 +783,11 @@ impl TriggerScanner {
         self.for_each_leftmost_match(input, |matched| {
             // ft-6db1t: array-indexed increment, no hashing / allocation.
             result.counts.add(matched.category, 1);
-            result.total_matches += 1;
+            // Saturate to match the per-category `counts.add` contract and the
+            // struct's documented saturation policy; keeps the
+            // `sum(counts) == total_matches` deserialization invariant from
+            // wrapping at the u64 boundary.
+            result.total_matches = result.total_matches.saturating_add(1);
         });
 
         result

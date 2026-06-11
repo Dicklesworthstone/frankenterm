@@ -841,16 +841,93 @@ pub fn prune_backups(
     Ok(PruneSummary { removed, kept })
 }
 
-/// Verify a backup directory's integrity.
-pub fn verify_backup(backup_dir: &Path, manifest: &BackupManifest) -> Result<()> {
-    let db_path = backup_dir.join("database.db");
-    if !db_path.exists() {
-        return Err(Error::Storage(crate::StorageError::Database(
-            "Backup verification failed: database.db not found".to_string(),
-        )));
-    }
+/// A decompressed-database temp file that removes itself on drop.
+///
+/// Compressed backups (`manifest.compressed`) store the database as
+/// `database.db.zst`; verification and restore both need a real uncompressed
+/// SQLite file to open. We materialise one in the OS temp dir and clean it up
+/// via this RAII guard so the decompressed copy never lingers.
+struct DecompressedDb {
+    path: PathBuf,
+}
 
-    let actual_checksum = sha256_file(&db_path)?;
+impl Drop for DecompressedDb {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+static DECOMPRESS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve a readable, uncompressed SQLite file for a backup directory.
+///
+/// For an uncompressed backup this returns `backup_dir/database.db` directly
+/// (no guard). For a compressed backup (`manifest.compressed == true`) it
+/// decompresses `backup_dir/database.db.zst` into a uniquely-named temp file and
+/// returns a [`DecompressedDb`] guard that deletes it on drop — callers MUST
+/// keep the guard alive for as long as they use the returned path.
+///
+/// Without this, `verify_backup`/`import_backup` only ever looked for
+/// `database.db`, so a compressed backup (produced by `compress_backup_dir`,
+/// e.g. scheduled backups with `compress = true`) could be created but never
+/// verified or restored.
+fn resolve_backup_database(
+    backup_dir: &Path,
+    manifest: &BackupManifest,
+) -> Result<(PathBuf, Option<DecompressedDb>)> {
+    if manifest.compressed {
+        let compressed_path = backup_dir.join("database.db.zst");
+        if !compressed_path.exists() {
+            return Err(Error::Storage(crate::StorageError::Database(
+                "Backup database.db.zst not found (manifest marks backup compressed)".to_string(),
+            )));
+        }
+        let compressed = fs::read(&compressed_path).map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to read compressed backup database.db.zst: {e}"
+            )))
+        })?;
+        let decompressed = zstd::decode_all(compressed.as_slice()).map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to decompress backup database.db.zst: {e}"
+            )))
+        })?;
+        // Integrity guard: the manifest records the *uncompressed* size
+        // (`compress_backup_dir` preserves it), so a mismatch means the
+        // compressed artifact is truncated or corrupt.
+        if decompressed.len() as u64 != manifest.db_size_bytes {
+            return Err(Error::Storage(crate::StorageError::Database(format!(
+                "Backup verification failed: decompressed size {} != manifest db_size_bytes {}",
+                decompressed.len(),
+                manifest.db_size_bytes
+            ))));
+        }
+        let unique = DECOMPRESS_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!(
+            "ft-backup-restore-{}-{unique}.db",
+            std::process::id()
+        ));
+        fs::write(&tmp, &decompressed).map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to materialise decompressed backup at {}: {e}",
+                tmp.display()
+            )))
+        })?;
+        Ok((tmp.clone(), Some(DecompressedDb { path: tmp })))
+    } else {
+        let db_path = backup_dir.join("database.db");
+        if !db_path.exists() {
+            return Err(Error::Storage(crate::StorageError::Database(
+                "Backup verification failed: database.db not found".to_string(),
+            )));
+        }
+        Ok((db_path, None))
+    }
+}
+
+/// Verify an already-resolved (uncompressed) database file against its manifest.
+fn verify_resolved_database(db_path: &Path, manifest: &BackupManifest) -> Result<()> {
+    let actual_checksum = sha256_file(db_path)?;
     if actual_checksum != manifest.db_checksum {
         return Err(Error::Storage(crate::StorageError::Database(format!(
             "Backup verification failed: checksum mismatch (expected {}, got {})",
@@ -859,7 +936,7 @@ pub fn verify_backup(backup_dir: &Path, manifest: &BackupManifest) -> Result<()>
     }
 
     // Verify the database can be opened and queried
-    let conn = Connection::open(&db_path).map_err(|e| {
+    let conn = Connection::open(db_path).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
             "Backup verification failed: cannot open database: {e}"
         )))
@@ -881,6 +958,15 @@ pub fn verify_backup(backup_dir: &Path, manifest: &BackupManifest) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Verify a backup directory's integrity.
+///
+/// Transparently handles compressed backups (`database.db.zst`) by
+/// decompressing to a temp file (cleaned up before return).
+pub fn verify_backup(backup_dir: &Path, manifest: &BackupManifest) -> Result<()> {
+    let (db_path, _guard) = resolve_backup_database(backup_dir, manifest)?;
+    verify_resolved_database(&db_path, manifest)
 }
 
 /// Result of an import operation.
@@ -957,14 +1043,12 @@ pub fn import_backup(
         ))));
     }
 
-    // Step 3: Verify backup integrity
-    let backup_db = backup_dir.join("database.db");
-    if !backup_db.exists() {
-        return Err(Error::Storage(crate::StorageError::Database(
-            "Backup database.db not found".to_string(),
-        )));
-    }
-    verify_backup(backup_dir, &manifest)?;
+    // Step 3: Resolve (decompressing if needed) + verify backup integrity.
+    // Compressed backups store the database as `database.db.zst`;
+    // `resolve_backup_database` materialises a temp uncompressed copy that the
+    // `_decompressed_guard` cleans up once the restore below has consumed it.
+    let (backup_db, _decompressed_guard) = resolve_backup_database(backup_dir, &manifest)?;
+    verify_resolved_database(&backup_db, &manifest)?;
 
     // Dry-run: report what would happen and return
     if opts.dry_run {
@@ -3723,6 +3807,57 @@ mod tests {
         // Verify the compressed content can be decompressed back
         let decompressed = zstd::decode_all(zst_content.as_slice()).unwrap();
         assert_eq!(decompressed, db_content);
+    }
+
+    #[test]
+    fn compressed_backup_verifies_and_imports_round_trip() {
+        // Regression: a compressed backup (database.db.zst, no database.db) must
+        // still verify and restore. Previously verify_backup/import_backup only
+        // looked for `database.db`, so compressed backups — produced by
+        // `compress_backup_dir` (e.g. scheduled backups with compress=true) —
+        // could be created but never restored.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("source.db");
+        let conn = create_test_db(&db_path);
+        drop(conn);
+
+        let output_dir = tmp.path().join("backup");
+        let opts = ExportOptions {
+            output: Some(output_dir.clone()),
+            verify: false,
+            ..Default::default()
+        };
+        let result = export_backup(&db_path, tmp.path(), &opts).unwrap();
+        assert!(!result.manifest.compressed);
+
+        let compressed = compress_backup_dir(&result).unwrap();
+        assert!(compressed.manifest.compressed);
+        assert!(output_dir.join("database.db.zst").exists());
+        assert!(!output_dir.join("database.db").exists());
+
+        // verify_backup must transparently handle the compressed artifact.
+        verify_backup(&output_dir, &compressed.manifest).unwrap();
+
+        // import_backup must restore from the compressed artifact.
+        let target_db = tmp.path().join("restored.db");
+        let import_opts = ImportOptions {
+            dry_run: false,
+            yes: true,
+            no_safety_backup: true,
+        };
+        let import =
+            import_backup(&output_dir, &target_db, tmp.path(), &import_opts).unwrap();
+        assert!(!import.dry_run);
+
+        let restored = Connection::open(&target_db).unwrap();
+        let pane_count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pane_count, 2);
+        let segment_count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(segment_count, 3);
     }
 
     #[test]

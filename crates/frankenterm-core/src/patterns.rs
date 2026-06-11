@@ -356,10 +356,29 @@ impl Detection {
         build_dedup_key(
             &self.rule_id,
             self.extracted.as_object().map_or_else(Vec::new, |obj| {
-                obj.iter().map(|(k, v)| format!("{k}:{v}")).collect()
+                obj.iter()
+                    .map(|(k, v)| match v {
+                        serde_json::Value::String(s) => dedup_key_part(k, s),
+                        other => format!("{k}:{other}"),
+                    })
+                    .collect()
             }),
         )
     }
+}
+
+/// Render one `name:value` part of a dedup key for a string value.
+///
+/// Shared by [`Detection::dedup_key`] and the pre-materialization key path in
+/// `detect_with_context` (`dedup_key_from_captures`): both feed the SAME
+/// `DetectionContext::seen_keys` store, so the two paths must render string
+/// values byte-identically or cross-path dedup silently stops matching.
+fn dedup_key_part(name: &str, value: &str) -> String {
+    // Intentional fail-fast: serializing a UTF-8 string into JSON cannot
+    // fail, so any error here would be a serde contract break.
+    let rendered =
+        serde_json::to_string(value).expect("serializing dedup key strings should not fail");
+    format!("{name}:{rendered}")
 }
 
 fn build_dedup_key(rule_id: &str, mut extracted_parts: Vec<String>) -> String {
@@ -3969,10 +3988,9 @@ impl PatternEngine {
         let mut parts = Vec::with_capacity(compiled.capture_names.len());
         for name in &compiled.capture_names {
             if let Some(value) = captures.name(name) {
-                // Intentional fail-fast: serializing a UTF-8 capture string into JSON cannot fail, so any error here would be a serde contract break.
-                let rendered = serde_json::to_string(value.as_str())
-                    .expect("serializing regex capture strings should not fail");
-                parts.push(format!("{name}:{rendered}"));
+                // dedup_key_part keeps this byte-identical with
+                // Detection::dedup_key — both feed the same seen_keys store.
+                parts.push(dedup_key_part(name, value.as_str()));
             }
         }
         build_dedup_key(rule_id, parts)

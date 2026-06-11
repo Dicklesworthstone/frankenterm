@@ -785,8 +785,20 @@ impl PaneCursor {
     ///
     /// After resyncing, subsequent captures will have sequence numbers that
     /// align with storage.
+    ///
+    /// Mirrors [`Self::bump_next_seq`]'s overflow semantics [ft-g8nbu]: a
+    /// `storage_seq` of `u64::MAX` pins `next_seq` at `u64::MAX` and records
+    /// the saturation in [`pane_cursor_seq_saturation_count`] so the
+    /// observability signal fires at the resync that saturated, not on the
+    /// next bump.
     pub fn resync_seq(&mut self, storage_seq: u64) {
-        self.next_seq = storage_seq.saturating_add(1);
+        self.next_seq = match storage_seq.checked_add(1) {
+            Some(next) => next,
+            None => {
+                PANE_CURSOR_SEQ_SATURATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                u64::MAX
+            }
+        };
         self.in_gap = true;
     }
 

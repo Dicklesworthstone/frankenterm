@@ -99,10 +99,16 @@ local ssh_remotes = {
   },
   {
     name           = 'trj',
-    remote_address = '10.10.10.1',
-    username       = 'ubuntu',
-    ssh_key        = frankenterm.home_dir .. '/.ssh/trj_ed25519',
-    cwd            = '/data/projects',
+    -- Tailscale IP (threadripperje, route-independent — up whenever both ends
+    -- are on the tailnet) is the reliable PRIMARY. The 10.10.10.1 LAN address
+    -- is only reachable on-subnet and was the root cause of trj failing to
+    -- attach at launch; it is kept here purely as a fallback. ft_proxy_command
+    -- tries these in order (Tailscale, then LAN).
+    remote_address     = '100.91.120.17',
+    fallback_addresses = { '10.10.10.1' },
+    username           = 'ubuntu',
+    ssh_key            = frankenterm.home_dir .. '/.ssh/trj_ed25519',
+    cwd                = '/data/projects',
   },
   {
     name           = 'ts1',
@@ -120,8 +126,12 @@ local ssh_remotes = {
   },
 }
 
-local function ft_proxy_command(remote)
-  return {
+-- The frankenterm mux socket on every fleet host (UID 1000 == ubuntu).
+local FT_SOCK = '/run/user/1000/frankenterm/sock'
+
+-- One `ssh ... user@addr 'nc -U <sock>'` invocation as a single shell string.
+local function ssh_nc_invocation(remote, address)
+  return table.concat({
     'ssh',
     '-i', remote.ssh_key,
     '-o', 'ConnectTimeout=10',
@@ -129,13 +139,38 @@ local function ft_proxy_command(remote)
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=4',
     '-o', 'StrictHostKeyChecking=accept-new',
-    remote.username .. '@' .. remote.remote_address,
-    -- Use nc -U (netcat-openbsd, standard on Ubuntu) to splice ssh stdio to
-    -- the frankenterm mux socket. Hard-coded to UID 1000 because that's the
-    -- ubuntu user on every host in the fleet; bake into the per-host entry
-    -- below if any host ever runs frankenterm under a different UID.
-    'nc -U /run/user/1000/frankenterm/sock',
-  }
+    remote.username .. '@' .. address,
+    "'nc -U " .. FT_SOCK .. "'",
+  }, ' ')
+end
+
+local function ft_proxy_command(remote)
+  -- nc -U (netcat-openbsd, standard on Ubuntu) splices ssh stdio to the
+  -- frankenterm mux socket.
+  local fallbacks = remote.fallback_addresses or {}
+  if #fallbacks == 0 then
+    -- No fallback: keep the simple, shell-free argv form (lowest overhead;
+    -- identical to the long-standing behaviour for css/csd/ts1/ts2).
+    return {
+      'ssh',
+      '-i', remote.ssh_key,
+      '-o', 'ConnectTimeout=10',
+      '-o', 'BatchMode=yes',
+      '-o', 'ServerAliveInterval=30',
+      '-o', 'ServerAliveCountMax=4',
+      '-o', 'StrictHostKeyChecking=accept-new',
+      remote.username .. '@' .. remote.remote_address,
+      'nc -U ' .. FT_SOCK,
+    }
+  end
+  -- With fallback(s): try each address in order under one shell; `||` advances
+  -- to the next address only when the previous ssh exits non-zero (i.e. the
+  -- connection failed), so a Tailscale outage transparently falls back to LAN.
+  local attempts = { ssh_nc_invocation(remote, remote.remote_address) }
+  for _, addr in ipairs(fallbacks) do
+    table.insert(attempts, ssh_nc_invocation(remote, addr))
+  end
+  return { 'sh', '-c', table.concat(attempts, ' || ') }
 end
 
 config.unix_domains = {}
@@ -439,6 +474,119 @@ local function domain_has_panes(domain_name)
   return false
 end
 
+-- ============================================================================
+-- ULTRA-RELIABLE DOMAIN ATTACH  (attach to ANY domain at ANY time)
+-- ============================================================================
+-- Each remote runs frankenterm-mux-server as a persistent systemd --user
+-- service, so a domain can ALWAYS be (re)attached: a fresh proxy_command
+-- connection re-syncs whatever panes the remote mux already holds. The old
+-- behaviour attached each domain exactly once at gui-startup and dropped any
+-- failure with no retry, so a single transient miss (e.g. trj's LAN IP being
+-- briefly unreachable at launch) left that host detached for the whole
+-- session. Three layers fix that:
+--   1. attach_domain_with_retry — initial attach retries with backoff;
+--   2. watchdog_sweep          — a forever loop that re-attaches ANY Detached
+--                                domain (covers launch failures, mid-session
+--                                network drops, and server restarts alike,
+--                                because every mux-client failure path ends in
+--                                DomainState::Detached);
+--   3. LEADER+r / reattach_all_now — force a full reattach sweep on demand.
+
+local ATTACH_MAX_TRIES        = 5    -- initial-attach attempts before the watchdog takes over
+local ATTACH_RETRY_SECS       = 2    -- backoff between initial-attach attempts
+local WATCHDOG_INTERVAL_SECS  = 5    -- seconds between watchdog sweeps
+local WATCHDOG_COOLDOWN_TICKS = 3    -- skip a domain for N sweeps after kicking an attach
+
+-- Attach one domain (idempotent) and seed tabs if its mux is empty.
+-- Returns true iff the domain is Attached afterwards.
+local function attach_domain_once(dcfg)
+  local domain = frankenterm.mux.get_domain(dcfg.name)
+  if not domain then
+    frankenterm.log_error('attach: domain not registered: ' .. dcfg.name)
+    return false
+  end
+  if domain:state() ~= 'Attached' then
+    domain:attach()
+  end
+  if domain:state() ~= 'Attached' then
+    return false
+  end
+  if not domain_has_panes(dcfg.name) then
+    frankenterm.log_info('attach: ' .. dcfg.name .. ' empty; seeding ' .. (dcfg.tabs or 3) .. ' tabs')
+    local _, _, rwindow = frankenterm.mux.spawn_window({
+      domain = { DomainName = dcfg.name },
+      cwd = dcfg.cwd,
+    })
+    for _ = 2, (dcfg.tabs or 3) do
+      rwindow:spawn_tab({ cwd = dcfg.cwd })
+    end
+    local rgui = rwindow:gui_window()
+    if rgui then rgui:maximize() end
+  end
+  return true
+end
+
+-- Initial attach with bounded backoff retries; the watchdog covers anything
+-- still detached after these run out.
+local function attach_domain_with_retry(dcfg, tries_left)
+  tries_left = tries_left or ATTACH_MAX_TRIES
+  local ok, attached = pcall(attach_domain_once, dcfg)
+  if ok and attached == true then
+    frankenterm.log_info('attach: ' .. dcfg.name .. ' attached')
+    return
+  end
+  tries_left = tries_left - 1
+  if tries_left > 0 then
+    frankenterm.time.call_after(ATTACH_RETRY_SECS, function()
+      attach_domain_with_retry(dcfg, tries_left)
+    end)
+  else
+    frankenterm.log_error('attach: ' .. dcfg.name ..
+      ' still detached after retries; watchdog will keep trying' ..
+      (ok and '' or (': ' .. tostring(attached))))
+  end
+end
+
+-- Forever loop: re-attach any Detached domain. Started exactly once per GUI
+-- process (from gui-startup, which never re-fires on config reload), so no
+-- duplicate loops accumulate across reloads.
+local watchdog_cooldown = {}
+local function watchdog_sweep()
+  for _, dcfg in ipairs(startup_domains) do
+    local cd = watchdog_cooldown[dcfg.name] or 0
+    if cd > 0 then
+      watchdog_cooldown[dcfg.name] = cd - 1
+    else
+      local ok, err = pcall(function()
+        local domain = frankenterm.mux.get_domain(dcfg.name)
+        if domain and domain:state() == 'Detached' then
+          frankenterm.log_info('watchdog: re-attaching detached domain ' .. dcfg.name)
+          watchdog_cooldown[dcfg.name] = WATCHDOG_COOLDOWN_TICKS
+          attach_domain_once(dcfg)
+        end
+      end)
+      if not ok then
+        frankenterm.log_error('watchdog: ' .. dcfg.name .. ': ' .. tostring(err))
+      end
+    end
+  end
+  frankenterm.time.call_after(WATCHDOG_INTERVAL_SECS, watchdog_sweep)
+end
+
+-- Force a full reattach sweep right now (bound to LEADER+r below).
+local function reattach_all_now()
+  for _, dcfg in ipairs(startup_domains) do
+    watchdog_cooldown[dcfg.name] = 0
+    pcall(attach_domain_once, dcfg)
+  end
+end
+
+-- LEADER+r: attach / re-attach every domain immediately, at any time.
+table.insert(config.keys, {
+  key = 'r', mods = 'LEADER',
+  action = frankenterm.action_callback(function() reattach_all_now() end),
+})
+
 frankenterm.on('gui-startup', function(cmd)
   if cmd and cmd.args and #cmd.args > 0 then
     local tab, pane, window = frankenterm.mux.spawn_window(cmd)
@@ -466,41 +614,14 @@ frankenterm.on('gui-startup', function(cmd)
   --    thread with full access to the Lua state.
   for idx, dcfg in ipairs(startup_domains) do
     frankenterm.time.call_after(idx * 1.0, function()
-      local info = ssh_info[dcfg.name]
-      if not info then return end
-      local ok, err = pcall(function()
-        local domain = frankenterm.mux.get_domain(dcfg.name)
-        if not domain then
-          frankenterm.log_error('gui-startup: domain not registered: ' .. dcfg.name)
-          return
-        end
-        frankenterm.log_info('gui-startup: attaching to domain ' .. dcfg.name)
-        domain:attach()
-        if not domain_has_panes(dcfg.name) then
-          frankenterm.log_info('gui-startup: ' .. dcfg.name .. ' is empty; seeding ' .. (dcfg.tabs or 3) .. ' tabs')
-          local seed_ok, seed_err = pcall(function()
-            local _, _, rwindow = frankenterm.mux.spawn_window({
-              domain = { DomainName = dcfg.name },
-              cwd = dcfg.cwd,
-            })
-            for _ = 2, (dcfg.tabs or 3) do
-              rwindow:spawn_tab({ cwd = dcfg.cwd })
-            end
-            local rgui = rwindow:gui_window()
-            if rgui then rgui:maximize() end
-          end)
-          if not seed_ok then
-            frankenterm.log_error('gui-startup: failed to seed tabs in ' .. dcfg.name .. ': ' .. tostring(seed_err))
-          end
-        else
-          frankenterm.log_info('gui-startup: ' .. dcfg.name .. ' already has panes from previous session; inheriting')
-        end
-      end)
-      if not ok then
-        frankenterm.log_error('gui-startup: failed to attach ' .. dcfg.name .. ': ' .. tostring(err))
-      end
+      attach_domain_with_retry(dcfg, ATTACH_MAX_TRIES)
     end)
   end
+
+  -- Start the single per-process reconnect watchdog, after the initial
+  -- staggered attaches have had time to land. From here on, ANY domain that is
+  -- (or becomes) Detached is re-attached automatically within a few seconds.
+  frankenterm.time.call_after(#startup_domains * 1.0 + WATCHDOG_INTERVAL_SECS, watchdog_sweep)
 end)
 
 return config

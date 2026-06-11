@@ -3050,6 +3050,18 @@ impl MissionTxContract {
 
         let mut step_ids = HashSet::new();
         let mut ordinals = HashSet::new();
+        // `execute_commit_phase` runs steps in array order, and
+        // `execute_compensation_phase` undoes them in the exact reverse of
+        // that array order. The `ordinal` field is meant to be the
+        // authoritative execution order, but nothing forces the array to be
+        // laid out in ordinal order — a contract authored (or deserialized
+        // from JSON) with steps physically out of ordinal order would commit,
+        // and compensate, in the wrong order while the receipts still report
+        // the declared ordinals. Reject any contract whose array order does
+        // not match strictly-ascending ordinal order so the two orderings can
+        // never silently diverge (fail-closed, mirroring the duplicate-ordinal
+        // and order-dependent-input rejections elsewhere in the tx engine).
+        let mut prev_ordinal: Option<usize> = None;
         for step in &self.plan.steps {
             if step.step_id.0.is_empty() {
                 return Err("Transaction plan has a step with an empty step_id".to_string());
@@ -3067,6 +3079,17 @@ impl MissionTxContract {
                     step.ordinal
                 ));
             }
+            if let Some(prev) = prev_ordinal {
+                if step.ordinal <= prev {
+                    return Err(format!(
+                        "Transaction plan steps are not in ascending ordinal order: \
+                         step {} has ordinal {} after ordinal {} \
+                         (array order is the execution order; it must match ordinal order)",
+                        step.step_id.0, step.ordinal, prev
+                    ));
+                }
+            }
+            prev_ordinal = Some(step.ordinal);
         }
 
         let mut compensation_step_ids = HashSet::new();

@@ -505,6 +505,14 @@ impl ProcessLauncher {
         shell: &str,
         cwd: &Path,
     ) -> Result<(), String> {
+        // [ft-kegvt / ft-asoso] mirror launch_agent_cx: the shell name comes
+        // from the persisted pane snapshot (`PaneStateSnapshot.shell`) and is
+        // NOT validated against `is_shell` on the `state.shell` resolution
+        // path, so a tampered snapshot could smuggle CR/LF or an ANSI escape
+        // through `exec {shell}\r` into the interactive shell. Both restore
+        // launch paths must share the same defense-in-depth contract; reject
+        // before any send_text reaches the pane.
+        let safe_shell = sanitize_restored_command(shell)?;
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         // ft-xbnl0.2.3 tick 294: cx-first send_text in launch_shell_cx.
         self.wezterm
@@ -513,14 +521,14 @@ impl ProcessLauncher {
             .map_err(|e| format!("send cd: {e}"))?;
         let _ = crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50)).await;
         let current_shell = default_shell();
-        if shell != current_shell && !shell.is_empty() {
-            let exec_cmd = format!("exec {shell}\r");
+        if safe_shell != current_shell && !safe_shell.is_empty() {
+            let exec_cmd = format!("exec {safe_shell}\r");
             self.wezterm
                 .send_text_with_cx(cx, pane_id, &exec_cmd)
                 .await
                 .map_err(|e| format!("send exec: {e}"))?;
         }
-        info!(pane = pane_id, shell = %shell, cwd = %cwd.display(), "shell launched");
+        info!(pane = pane_id, shell = %safe_shell, cwd = %cwd.display(), "shell launched");
         Ok(())
     }
 

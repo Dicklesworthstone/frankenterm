@@ -941,13 +941,22 @@ fn mutation_status_label(status: FleetMutationReceiptStatus) -> &'static str {
 }
 
 fn profile_apply_replay_value(receipt: &ApplyReceipt) -> Result<Value, ProfileHandlerError> {
+    // Idempotent replay: the panes were spawned by the *original* apply, so this
+    // call spawns nothing. Report `spawned_agents = 0` and account every
+    // requested agent as a skipped pre-existing pane. This mirrors the
+    // `idempotent_replay = true` branch of `profile_apply_receipt_value`
+    // (`spawned = completed_count` → 0, `skipped = steps.len()`) and preserves
+    // the `requested_agents == spawned_agents + skipped_existing_agents`
+    // identity. Previously both fields reported `panes_spawned.len()`, which
+    // claimed N agents were spawned AND N were skipped on a call that spawned
+    // none.
     to_value(&serde_json::json!({
         "profile_name": receipt.profile_name,
         "panes_spawned": receipt.panes_spawned,
         "dry_run": false,
         "requested_agents": receipt.count,
-        "spawned_agents": receipt.panes_spawned.len(),
-        "skipped_existing_agents": receipt.panes_spawned.len(),
+        "spawned_agents": 0,
+        "skipped_existing_agents": receipt.count,
         "policy_decisions": [],
         "idempotency_key": receipt.content_hash,
         "mutation_idempotency_key": null,

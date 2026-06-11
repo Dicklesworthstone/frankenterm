@@ -59,6 +59,12 @@ pub enum IdempotencyCheckResult {
         /// When the step was started
         started_at: i64,
     },
+    /// The idempotency ledger could not be read (storage failure or
+    /// cx-cancel). An unavailable ledger is indistinguishable from an
+    /// incomplete side-effecting step, so replay must fail closed — but
+    /// unlike [`Self::PartiallyExecuted`] there is no real `started_at` to
+    /// report, so this variant carries none rather than fabricating one.
+    LedgerUnavailable,
 }
 
 /// Check if a step has already been executed based on its idempotency key.
@@ -80,10 +86,12 @@ pub async fn check_step_idempotency(
 ///
 /// Tick 186: routes the single storage call (get_step_logs)
 /// through get_step_logs_with_cx. On cx-cancel or storage failure,
-/// the check fails closed as `PartiallyExecuted`: an unavailable
+/// the check fails closed as `LedgerUnavailable`: an unavailable
 /// idempotency ledger is indistinguishable from an incomplete
 /// side-effecting step, so replay must stop instead of running the
-/// step from scratch.
+/// step from scratch. (Previously this path fabricated a
+/// `PartiallyExecuted { started_at: now_ms() }`, which made the runner's
+/// abort reason claim the step "was started at" the time of the *check*.)
 pub async fn check_step_idempotency_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -92,9 +100,7 @@ pub async fn check_step_idempotency_with_cx(
     step_index: usize,
 ) -> IdempotencyCheckResult {
     let Ok(logs) = storage.get_step_logs_with_cx(cx, execution_id).await else {
-        return IdempotencyCheckResult::PartiallyExecuted {
-            started_at: now_ms(),
-        };
+        return IdempotencyCheckResult::LedgerUnavailable;
     };
 
     let mut latest_completed: Option<(i64, Option<String>)> = None;
@@ -516,7 +522,7 @@ mod tests {
             .await;
 
             assert!(
-                matches!(result, IdempotencyCheckResult::PartiallyExecuted { .. }),
+                matches!(result, IdempotencyCheckResult::LedgerUnavailable),
                 "cancelled ledger lookup must fail closed, got {result:?}"
             );
             storage.shutdown().await.unwrap();
@@ -534,6 +540,47 @@ mod tests {
                 .to_string();
             let storage = crate::storage::StorageHandle::new(&db_path).await.unwrap();
             let key = crate::plan::IdempotencyKey("step:malformed-policy".to_string());
+
+            // workflow_step_logs.workflow_id has an enforced FK to
+            // workflow_executions(id), which in turn FKs panes(pane_id)
+            // (foreign_keys=ON since ft-s4myu), so both parent rows must
+            // exist before the step log insert.
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 100,
+                    last_seen_at: 100,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            storage
+                .upsert_workflow(crate::storage::WorkflowRecord {
+                    id: "exec-malformed-policy".to_string(),
+                    workflow_name: "malformed-policy-test".to_string(),
+                    pane_id: 1,
+                    trigger_event_id: None,
+                    current_step: 0,
+                    status: "running".to_string(),
+                    wait_condition: None,
+                    context: None,
+                    result: None,
+                    error: None,
+                    started_at: 100,
+                    updated_at: 100,
+                    completed_at: None,
+                })
+                .await
+                .unwrap();
 
             storage
                 .insert_step_log(

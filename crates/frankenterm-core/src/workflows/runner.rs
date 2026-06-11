@@ -1194,6 +1194,20 @@ impl WorkflowRunner {
                             );
                             idempotency_abort = Some(reason);
                         }
+                        IdempotencyCheckResult::LedgerUnavailable => {
+                            let reason = format!(
+                                "Idempotency ledger unavailable for step {}; \
+                                 failing closed without replay",
+                                step_plan.step_id
+                            );
+                            tracing::warn!(
+                                execution_id,
+                                step_index = current_step,
+                                step_id = %step_plan.step_id,
+                                "Idempotency ledger unavailable; aborting"
+                            );
+                            idempotency_abort = Some(reason);
+                        }
                         IdempotencyCheckResult::NotExecuted => {}
                     }
                 }

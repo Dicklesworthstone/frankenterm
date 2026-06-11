@@ -57,6 +57,7 @@ fn arb_idempotency_result() -> impl Strategy<Value = IdempotencyCheckResult> {
             }),
         (0i64..=4_102_444_800_000i64)
             .prop_map(|started_at| IdempotencyCheckResult::PartiallyExecuted { started_at }),
+        Just(IdempotencyCheckResult::LedgerUnavailable),
     ]
 }
 
@@ -121,6 +122,12 @@ proptest! {
             ) => {
                 prop_assert_eq!(started_at, cloned_at);
                 prop_assert!(debug.contains("PartiallyExecuted"));
+            }
+            (
+                IdempotencyCheckResult::LedgerUnavailable,
+                IdempotencyCheckResult::LedgerUnavailable,
+            ) => {
+                prop_assert!(debug.contains("LedgerUnavailable"));
             }
             _ => prop_assert!(false, "cloned result changed variants"),
         }

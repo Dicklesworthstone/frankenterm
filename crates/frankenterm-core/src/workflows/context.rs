@@ -924,7 +924,12 @@ mod tests {
     fn send_text_with_cx_pre_cancelled_cx_panics_on_lock() {
         // A pre-cancelled cx might not panic on lock acquisition in 0.3.1
         // if the lock is uncontended, but it should still fail the operation.
-        tokio::runtime::Builder::new_current_thread()
+        //
+        // Driven via the canonical runtime_async surface (not run_lab):
+        // the panic must propagate from the root future to the test thread
+        // for #[should_panic] to observe it, and the expected panic depends
+        // only on the pre-cancelled Cx, not on runtime scheduling.
+        RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .unwrap()

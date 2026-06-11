@@ -664,36 +664,70 @@ impl ColdTierRetriever for NullColdRetriever {
 // Serialization helpers
 // =============================================================================
 
-/// Serialize lines to a byte buffer (newline-separated).
+/// Serialize lines to a byte buffer (u64-LE length-prefixed records).
+///
+/// Each line is encoded as `<u64 LE byte length><utf-8 bytes>`. An earlier
+/// newline-delimited encoding could not round-trip lines that themselves
+/// contained `\n`: `bytes_to_lines` split such a line into several on decode,
+/// inflating the decoded count past the page's recorded
+/// `CompressedPage::line_count` and corrupting every warm/cold offset computed
+/// by `locate_offset` / `tier_for_offset`. The length-prefixed form is the
+/// exact inverse of [`bytes_to_lines`] for all `String` contents.
 fn lines_to_bytes(lines: &[String]) -> Vec<u8> {
-    let total_len: usize = lines.iter().map(|l| l.len() + 1).sum();
+    const PREFIX: usize = std::mem::size_of::<u64>();
+    let total_len: usize = lines.iter().map(|l| l.len() + PREFIX).sum();
     let mut buf = Vec::with_capacity(total_len);
     for line in lines {
+        buf.extend_from_slice(&(line.len() as u64).to_le_bytes());
         buf.extend_from_slice(line.as_bytes());
-        buf.push(b'\n');
     }
     buf
 }
 
-/// Deserialize lines from a byte buffer.
+/// Deserialize lines from a length-prefixed byte buffer.
+///
+/// Exact inverse of [`lines_to_bytes`]. Decoding is allocation-bounded by the
+/// input: a record's length prefix is only honoured when that many bytes are
+/// actually present in the buffer, so a truncated or corrupt buffer can never
+/// trigger an oversized allocation (the unbounded-length-prefix DoS class).
+/// Decoding stops at the first malformed record; `decompress_page`'s
+/// line-count guard then rejects the page as corrupt.
 fn bytes_to_lines(data: &[u8]) -> Vec<String> {
-    if data.is_empty() {
-        return Vec::new();
-    }
-    // Split on newlines, handle trailing newline
-    let text = String::from_utf8_lossy(data);
-    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
-    // Remove trailing empty string from final newline
-    if lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
+    const PREFIX: usize = std::mem::size_of::<u64>();
+    let mut lines = Vec::new();
+    let mut pos = 0usize;
+    while data.len() - pos >= PREFIX {
+        let mut prefix = [0u8; PREFIX];
+        prefix.copy_from_slice(&data[pos..pos + PREFIX]);
+        let Ok(len) = usize::try_from(u64::from_le_bytes(prefix)) else {
+            break;
+        };
+        let start = pos + PREFIX;
+        let Some(end) = start.checked_add(len) else {
+            break;
+        };
+        if end > data.len() {
+            break;
+        }
+        lines.push(String::from_utf8_lossy(&data[start..end]).into_owned());
+        pos = end;
     }
     lines
 }
 
 /// Decompress a warm page into lines.
+///
+/// Returns `None` if decompression fails or the decoded line count does not
+/// match the page's recorded `line_count` (corruption guard: the two are
+/// written together by `flush_hot_page`, so a mismatch means the page bytes
+/// are damaged and any offset arithmetic against `line_count` would be wrong).
 fn decompress_page(compressor: &ByteCompressor, page: &CompressedPage) -> Option<Vec<String>> {
     let raw = compressor.decompress(&page.data).ok()?;
-    Some(bytes_to_lines(&raw))
+    let lines = bytes_to_lines(&raw);
+    if lines.len() != page.line_count {
+        return None;
+    }
+    Some(lines)
 }
 
 // =============================================================================
@@ -1160,6 +1194,52 @@ mod tests {
         let bytes = lines_to_bytes(&empty);
         let back = bytes_to_lines(&bytes);
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn lines_bytes_roundtrip_embedded_newlines() {
+        // Regression: the old newline-delimited encoding split a line that
+        // itself contained '\n' into multiple lines on decode, so the decoded
+        // count diverged from CompressedPage::line_count.
+        let original: Vec<String> = vec![
+            "plain".to_string(),
+            "embedded\nnewline".to_string(),
+            String::new(),
+            "trailing-newline\n".to_string(),
+            "crlf\r\nmiddle".to_string(),
+            "\n".to_string(),
+        ];
+        let bytes = lines_to_bytes(&original);
+        let back = bytes_to_lines(&bytes);
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn bytes_to_lines_truncated_buffer_stops_cleanly() {
+        // A truncated record (length prefix promises more bytes than remain)
+        // must terminate decoding without over-allocating or panicking.
+        let original: Vec<String> = vec!["complete".to_string(), "cut-off".to_string()];
+        let mut bytes = lines_to_bytes(&original);
+        bytes.truncate(bytes.len() - 3);
+        let back = bytes_to_lines(&bytes);
+        assert_eq!(back, vec!["complete".to_string()]);
+    }
+
+    #[test]
+    fn warm_page_roundtrip_preserves_embedded_newlines() {
+        // End-to-end regression for the hot→warm→decode path: a flushed page
+        // whose lines contain embedded newlines must decode to exactly the
+        // lines that were drained from the hot tier, with the decoded length
+        // matching the page's recorded line_count.
+        let mut sb = TieredScrollback::new(small_config()); // hot 10, page 5
+        let lines: Vec<String> = (0..16)
+            .map(|i| format!("line-{i}\nwith-embedded-newline-{i}"))
+            .collect();
+        sb.push_lines(lines.clone());
+        assert_eq!(sb.warm_page_count(), 1);
+        let page = sb.warm_page_lines(0).expect("warm page should decode");
+        assert_eq!(page.len(), 5);
+        assert_eq!(page, lines[..5].to_vec());
     }
 
     // ── Large scale ─────────────────────────────────────────────────

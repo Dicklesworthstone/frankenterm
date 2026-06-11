@@ -9559,6 +9559,30 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Get the current timestamp in epoch milliseconds, failing when the system
+/// clock is unavailable (reports a pre-Unix-epoch time) instead of degrading
+/// to [`now_ms`]'s `0` sentinel.
+///
+/// Security-sensitive expiry comparisons MUST use this variant: with the `0`
+/// fallback, `expires_at >= 0` matches every token ever issued, so a broken
+/// clock silently fails OPEN at the approval gate (and stamps `used_at = 0`
+/// into the consumed row). Refusing the operation keeps those gates
+/// fail-closed, matching the project-wide missing-telemetry doctrine.
+fn now_ms_strict() -> Result<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .ok_or_else(|| {
+            StorageError::Database(
+                "system clock unavailable (reports a pre-Unix-epoch time); \
+                 refusing to evaluate expiry"
+                    .to_string(),
+            )
+            .into()
+        })
+}
+
 fn u64_to_i64(value: u64, label: &str) -> Result<i64> {
     i64::try_from(value).map_err(|_| {
         StorageError::Database(format!("{label} value {value} exceeds i64 range")).into()
@@ -14081,6 +14105,17 @@ fn consume_prepared_plan_backend(
     plan_id: &str,
     now_ms: i64,
 ) -> Result<Option<PreparedPlanRecord>> {
+    // Fail closed on a broken caller clock: callers derive `now_ms` from
+    // SystemTime with a `0` fallback, and a `0` (or negative) now would make
+    // the `expires_at >= ?2` predicate below match every unconsumed plan.
+    if now_ms <= 0 {
+        return Err(StorageError::Database(
+            "non-positive now_ms for prepared-plan consume (system clock unavailable?); \
+             refusing to evaluate expiry"
+                .to_string(),
+        )
+        .into());
+    }
     let row = backend
         .query_row_typed(
             "UPDATE prepared_plans
@@ -14109,7 +14144,9 @@ fn consume_approval_token_backend(
     pane_id: Option<u64>,
     action_fingerprint: &str,
 ) -> Result<Option<ApprovalTokenRecord>> {
-    let now = now_ms();
+    // Fail closed when the clock is unavailable: a `0` now would make the
+    // `expires_at >= ?5` predicate below match every unconsumed token.
+    let now = now_ms_strict()?;
     let pane_id_i64 = pane_id
         .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
         .transpose()?;
@@ -14174,7 +14211,9 @@ fn consume_approval_token_by_code_backend(
     code_hash: &str,
     workspace_id: &str,
 ) -> Result<Option<ApprovalTokenRecord>> {
-    let now = now_ms();
+    // Fail closed when the clock is unavailable: a `0` now would make the
+    // `expires_at >= ?3` predicate below match every unconsumed token.
+    let now = now_ms_strict()?;
 
     let row = backend
         .query_row_typed(
@@ -18521,6 +18560,40 @@ fn can_insert_and_consume_prepared_plan() {
 
     let second = consume_prepared_plan_backend(&backend, "plan:abcd1234", now_ms + 2).unwrap();
     assert!(second.is_none());
+}
+
+#[test]
+fn consume_prepared_plan_rejects_non_positive_now() {
+    // Fail-closed guard: a broken system clock degrades caller-side now to 0,
+    // and `expires_at >= 0` would match every unconsumed plan. The consume
+    // gate must error out instead of evaluating expiry against a sentinel.
+    let backend = memory_backend();
+
+    let now_ms = 1_700_000_000_000i64;
+    let record = PreparedPlanRecord {
+        plan_id: "plan:clockless".to_string(),
+        plan_hash: "sha256:clockless".to_string(),
+        workspace_id: "/tmp/wa".to_string(),
+        action_kind: "send_text".to_string(),
+        pane_id: Some(1),
+        pane_uuid: None,
+        params_json: None,
+        plan_json: r#"{"plan_id":"plan:clockless","plan_hash":"sha256:clockless"}"#.to_string(),
+        requires_approval: false,
+        created_at: now_ms,
+        expires_at: now_ms + 60_000,
+        consumed_at: None,
+    };
+    insert_prepared_plan_backend(&backend, &record).unwrap();
+
+    assert!(consume_prepared_plan_backend(&backend, "plan:clockless", 0).is_err());
+    assert!(consume_prepared_plan_backend(&backend, "plan:clockless", -5).is_err());
+
+    // The plan must remain unconsumed after the rejected attempts.
+    let fetched = query_prepared_plan_backend(&backend, "plan:clockless")
+        .unwrap()
+        .unwrap();
+    assert!(fetched.consumed_at.is_none());
 }
 
 #[test]

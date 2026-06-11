@@ -919,10 +919,15 @@ impl Reconnectable {
 
     fn reconnectable(&mut self) -> bool {
         match &self.config {
-            // It doesn't make sense to reconnect to a unix socket; we only
-            // get disconnected it it dies, so respawning it would not preserve
-            // the set of tabs and we'd have confusing and inconsistent state
-            ClientDomainConfig::Unix(_) => false,
+            // A plain local unix socket only disconnects when its server dies,
+            // so reconnecting can't preserve the set of tabs and would leave us
+            // with confusing, inconsistent state. BUT when the unix domain uses
+            // a proxy_command (our remote frankenterm-mux-server reached over
+            // `ssh ... nc -U <sock>`), the *remote* mux is persistent: a dropped
+            // ssh/nc pipe is a transient transport failure, and reconnecting
+            // re-runs the proxy_command and re-syncs the exact same remote tabs.
+            // So reconnect iff there is a proxy_command.
+            ClientDomainConfig::Unix(unix) => unix.proxy_command.is_some(),
             ClientDomainConfig::Tls(_) => true,
             // It *does* make sense to reconnect with an ssh session, but we
             // need to grow some smarts about whether the disconnect was because
@@ -1388,9 +1393,25 @@ impl Client {
 
                         if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
                             if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                                // Don't reconnect for a simple EOF
-                                log::error!("server closed connection ({})", e);
-                                break;
+                                // A clean server shutdown surfaces as EOF; for a
+                                // TLS or plain-local connection that means "stop,
+                                // don't reconnect". But for a unix proxy_command
+                                // domain (remote mux reached over ssh+nc) an EOF
+                                // just means the transport pipe dropped while the
+                                // remote mux keeps running, so we reconnect and
+                                // re-sync rather than give up.
+                                let is_unix_proxy = matches!(
+                                    &reconnectable.config,
+                                    ClientDomainConfig::Unix(u) if u.proxy_command.is_some()
+                                );
+                                if !is_unix_proxy {
+                                    log::error!("server closed connection ({})", e);
+                                    break;
+                                }
+                                log::warn!(
+                                    "proxy_command connection closed ({}); will reconnect",
+                                    e
+                                );
                             }
                         }
 

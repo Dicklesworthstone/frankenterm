@@ -400,15 +400,18 @@ pub fn evaluate_wald_sprt(samples: &[EvidenceSample], cfg: &WaldSprtConfig) -> W
     let mut consumed = 0_usize;
     let mut terminal: Option<GateDecision> = None;
 
-    for (i, sample) in samples.iter().take(max_n).enumerate() {
+    for sample in samples.iter().take(max_n) {
         let x = sample.metric_value;
         if !x.is_finite() {
-            // Don't trust a NaN sample; continue but flag low confidence on
-            // the next terminal decision.
+            // Don't trust a NaN sample; skip it without counting it toward
+            // `consumed`. Counting stream position (i + 1) instead of valid
+            // observations let the min_samples gate, needed_samples, and the
+            // max_samples-exhaustion check fire on fewer real samples than
+            // intended whenever NaN samples were present.
             continue;
         }
         llr = coefficient.mul_add(x - midpoint, llr);
-        consumed = i + 1;
+        consumed += 1;
         if consumed < cfg.min_samples {
             continue;
         }
@@ -556,13 +559,17 @@ pub fn evaluate_anytime_valid_ci(
     let mut last_mean = 0.0_f64;
     let mut last_radius = f64::INFINITY;
 
-    for (i, sample) in samples.iter().take(max_n).enumerate() {
+    for sample in samples.iter().take(max_n) {
         let x = sample.metric_value;
         if !x.is_finite() {
             continue;
         }
         sum += x;
-        consumed = i + 1;
+        // Count only valid observations: `consumed` is the divisor for `mean`
+        // and the radius `n`. Using stream position (i + 1) divided the sum of
+        // valid samples by a count that included skipped NaN positions,
+        // corrupting the mean/radius and the resulting Accept/Reject decision.
+        consumed += 1;
         let n = consumed as f64;
         let mean = sum / n;
         // r(n) = sigma * sqrt( 2 * (ln(1/alpha) + ln(ln(e*n)+1)) / n )

@@ -1361,13 +1361,21 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
     Migration {
         version: 22,
         description: "Add segment embeddings table for semantic search",
+        // Historical note: this migration originally created a non-canonical
+        // shape (`segment_id INTEGER PRIMARY KEY REFERENCES segments(id)`) —
+        // a dangling FK to a table that never existed plus a single-column
+        // PK. Migration v23 (`ensure_segment_embeddings_schema`) was shipped
+        // to repair databases that ran the broken DDL. The SQL below now
+        // matches `create_segment_embeddings_table` so legacy upgrades create
+        // the canonical table directly and v23 degrades to a no-op repair.
         up_sql: r"
             CREATE TABLE IF NOT EXISTS segment_embeddings (
-                segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,
+                segment_id INTEGER NOT NULL REFERENCES output_segments(id) ON DELETE CASCADE,
                 embedder_id TEXT NOT NULL,
                 dimension INTEGER NOT NULL,
                 vector BLOB NOT NULL,
-                embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (segment_id, embedder_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_segment_embeddings_embedder
@@ -3134,17 +3142,15 @@ mod tests {
         )
         .expect("base output_segments");
 
-        let m29 = MIGRATIONS
-            .iter()
-            .find(|m| m.version == 29)
-            .expect("v29");
+        let m29 = MIGRATIONS.iter().find(|m| m.version == 29).expect("v29");
         conn.execute_batch(m29.up_sql).expect("apply v29");
         assert!(
             output_segments_has_column(&conn, "redaction_catalog_version"),
             "column must exist after v29",
         );
 
-        conn.execute_batch(m29.down_sql.unwrap()).expect("rollback v29");
+        conn.execute_batch(m29.down_sql.unwrap())
+            .expect("rollback v29");
         assert!(
             !output_segments_has_column(&conn, "redaction_catalog_version"),
             "column must be gone after down-rollback",

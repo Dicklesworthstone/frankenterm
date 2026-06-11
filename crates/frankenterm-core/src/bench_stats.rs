@@ -473,16 +473,21 @@ pub fn criterion_group_and_bench_id(
 ///   wall-time benches, this is the per-iteration timeout ceiling.
 /// - `alpha` — overall failure probability, e.g. 0.05.
 ///
-/// Returns `None` if `samples` is empty, `range <= 0`, `range` is
-/// non-finite, or `alpha` is outside `[0.0, 1.0)`.
+/// Returns `None` if `samples` has fewer than 2 observations, `range <= 0`,
+/// `range` is non-finite, or `alpha` is outside `[0.0, 1.0)`.
 ///
 /// Per ft-eebc9 fix: previously `range <= 0.0` accepted NaN
 /// (NaN comparisons all return false), and the function would
 /// then compute Some(NaN). Added `!range.is_finite()` so NaN /
 /// ±infinity are rejected.
+///
+/// A single observation is rejected (`None`): the empirical-variance term
+/// divides by `n - 1`, so `n == 1` previously produced a non-finite
+/// `Some(+inf)` bound, violating the finite-or-`None` contract. An empirical
+/// Bernstein CI is undefined for fewer than two samples.
 #[must_use]
 pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option<f64> {
-    if samples.is_empty()
+    if samples.len() < 2
         || !range.is_finite()
         || range <= 0.0
         || !alpha.is_finite()
@@ -495,11 +500,8 @@ pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option
     }
     let n = samples.len() as f64;
     let mean = samples.iter().sum::<f64>() / n;
-    let var = if samples.len() > 1 {
-        samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)
-    } else {
-        0.0
-    };
+    // `n >= 2` is guaranteed by the guard above, so `n - 1.0 >= 1.0`.
+    let var = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
 
     // Howard & Ramdas (2021), Eq. 11 — empirical Bernstein style. The
     // log term `log(1/α)` becomes `log(2/α) + log(log_2(2n))` in the
@@ -830,6 +832,14 @@ mod tests {
         assert!(empirical_bernstein_ci(&[], 1.0, 0.05).is_none());
         assert!(empirical_bernstein_ci(&[0.5], 0.0, 0.05).is_none());
         assert!(empirical_bernstein_ci(&[0.5], 1.0, 1.0).is_none());
+    }
+
+    /// Regression: a single observation with VALID range/alpha previously
+    /// produced `Some(+inf)` — the empirical-variance term divides by
+    /// `n - 1`, so `n == 1` violated the finite-or-`None` contract.
+    #[test]
+    fn empirical_bernstein_rejects_single_sample() {
+        assert!(empirical_bernstein_ci(&[0.5], 1.0, 0.05).is_none());
     }
 
     /// ft-eebc9 regression: previously `range <= 0.0` admitted NaN
