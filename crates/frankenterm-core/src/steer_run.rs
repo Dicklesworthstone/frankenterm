@@ -27,6 +27,10 @@ pub enum SteerRunGate {
     /// The receipt's bound contract hash differs from the live contract
     /// (`contract` is `"mission"` or `"tx"`).
     HashMismatch { contract: &'static str },
+    /// The receipt CAPTURED a contract binding the caller did not supply for
+    /// revalidation, so it cannot be confirmed. Fail closed — refuse rather than
+    /// execute on an unverified contract (`contract` is `"mission"` or `"tx"`).
+    UnverifiableBinding { contract: &'static str },
 }
 
 impl SteerRunGate {
@@ -38,6 +42,7 @@ impl SteerRunGate {
             Self::Invalid(_) => Some("robot.steer_receipt_invalid"),
             Self::Expired => Some("robot.steer_receipt_expired"),
             Self::HashMismatch { .. } => Some("robot.steer_hash_mismatch"),
+            Self::UnverifiableBinding { .. } => Some("robot.steer_binding_unverifiable"),
         }
     }
 
@@ -48,10 +53,15 @@ impl SteerRunGate {
 }
 
 /// Revalidate a receipt before executing it. Checks run in order — structural
-/// validity, TTL, then mission/tx hash drift — returning the first failure as a
-/// typed verdict (no silent re-plan). `live_mission` / `live_tx_hash` are the
-/// freshly-recomputed live contract bindings; pass `None` to skip a binding the
-/// receipt did not capture.
+/// validity, TTL, unverifiable bindings, then mission/tx hash drift — returning
+/// the first failure as a typed verdict (no silent re-plan).
+///
+/// `live_mission` / `live_tx_hash` are the caller's freshly-recomputed live
+/// contract bindings. The caller MUST supply a live binding for every contract
+/// the receipt captured: if the receipt bound a mission/tx hash but the matching
+/// live value is `None`, the gate fails closed with
+/// [`SteerRunGate::UnverifiableBinding`] rather than executing on an unconfirmed
+/// contract. `None` is only legitimate for a contract the receipt did not bind.
 #[must_use]
 pub fn steer_run_gate(
     receipt: &SteeringReceipt,
@@ -64,6 +74,17 @@ pub fn steer_run_gate(
     }
     if receipt.is_expired(now_ms) {
         return SteerRunGate::Expired;
+    }
+    // Fail closed: a contract the receipt CAPTURED but the caller did not supply
+    // cannot be revalidated. Refusing here prevents a caller that forgets a live
+    // binding from silently bypassing drift detection.
+    if receipt.mission_contract_hash.is_some() && live_mission.is_none() {
+        return SteerRunGate::UnverifiableBinding {
+            contract: "mission",
+        };
+    }
+    if receipt.tx_contract_hash.is_some() && live_tx_hash.is_none() {
+        return SteerRunGate::UnverifiableBinding { contract: "tx" };
     }
     if let Some(mission) = live_mission {
         if !receipt.matches_mission(mission) {
@@ -84,20 +105,34 @@ pub fn steer_run_gate(
 /// otherwise require per-step approval — the receipt as a first-class
 /// ALTERNATIVE to a one-shot approval code.
 ///
-/// Admits (returns [`SteerRunGate::Valid`]) iff the receipt passes the
-/// revalidation gate AND its bound tx contract hash equals the action's live
+/// Admits (returns [`SteerRunGate::Valid`]) iff the receipt is structurally
+/// valid, unexpired, and its bound tx contract hash equals the action's live
 /// plan hash (so it covers *this exact* plan, not a stale or different one). Any
 /// other verdict — mismatch / expired / invalid — means the receipt does NOT
 /// admit and the action falls back to requiring an approval code. Steering is
 /// never mandatory: this only *subsidizes* the pre-validated path, it never
-/// forces it and never weakens the gate.
+/// forces it and never weakens the underlying approval requirement.
+///
+/// This admission is SCOPED to the action's plan hash; a mission binding the
+/// receipt also carries is an execution concern revalidated by
+/// [`steer_run_gate`], not a precondition for admitting an individual action
+/// (so admission does not require the caller to supply the live mission).
 #[must_use]
 pub fn receipt_admits_action(
     receipt: &SteeringReceipt,
     action_plan_hash: &str,
     now_ms: i64,
 ) -> SteerRunGate {
-    steer_run_gate(receipt, None, Some(action_plan_hash), now_ms)
+    if let Err(e) = receipt.validate() {
+        return SteerRunGate::Invalid(e.to_string());
+    }
+    if receipt.is_expired(now_ms) {
+        return SteerRunGate::Expired;
+    }
+    if !receipt.matches_tx_hash(action_plan_hash) {
+        return SteerRunGate::HashMismatch { contract: "tx" };
+    }
+    SteerRunGate::Valid
 }
 
 #[cfg(test)]
@@ -151,6 +186,23 @@ mod tests {
         assert_eq!(g.error_code(), Some("robot.steer_hash_mismatch"));
         // Matching live hash -> valid.
         assert!(steer_run_gate(&r, None, Some("hash-A"), 100).is_valid());
+    }
+
+    #[test]
+    fn gate_fails_closed_on_unverifiable_tx_binding() {
+        // Receipt CAPTURED a tx binding, but the caller supplied no live tx hash
+        // -> the binding can't be revalidated -> refuse rather than pass blind.
+        let r = receipt(None, 0, Some("hash-A".to_string()));
+        let g = steer_run_gate(&r, None, None, 100);
+        assert_eq!(g, SteerRunGate::UnverifiableBinding { contract: "tx" });
+        assert_eq!(g.error_code(), Some("robot.steer_binding_unverifiable"));
+    }
+
+    #[test]
+    fn unbound_receipt_with_no_live_contracts_is_valid() {
+        // A receipt that bound NO contracts is fine with no live contracts.
+        let r = receipt(Some(10_000), 0, None);
+        assert!(steer_run_gate(&r, None, None, 1_000).is_valid());
     }
 
     #[test]

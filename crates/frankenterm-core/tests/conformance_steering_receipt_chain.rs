@@ -82,9 +82,34 @@ fn gate_refuses_mission_hash_drift_typed() {
     assert_eq!(g.error_code(), Some("robot.steer_hash_mismatch"));
 }
 
+/// The execution gate fails closed when the receipt bound a mission but the
+/// caller supplied no live mission — defense in depth against a forgotten
+/// binding. This is distinct from the scoped approval admission, which
+/// intentionally does NOT require the mission (verified in the chain test).
+#[test]
+fn gate_fails_closed_on_unverifiable_mission_binding() {
+    let bound = mission("mission:m", "Objective");
+    let receipt = SteeringReceipt::new(
+        "objective",
+        "ws-steer",
+        Some(&bound),
+        None,
+        "envelope.admit",
+        Some(900),
+        Vec::new(),
+        NOW,
+        Some(10_000),
+    );
+    let g = steer_run_gate(&receipt, None, None, NOW);
+    assert_eq!(g, SteerRunGate::UnverifiableBinding { contract: "mission" });
+    assert_eq!(g.error_code(), Some("robot.steer_binding_unverifiable"));
+}
+
 /// End-to-end chain over a single receipt bound to BOTH a mission and a tx plan
 /// hash: valid execution, contract tamper, TTL expiry, and approval admission —
-/// the full W5 plan/execute identity surface in one flow.
+/// the full W5 plan/execute identity surface in one flow. The admission step
+/// also proves the SCOPED approval does not trip the gate's mission-binding
+/// fail-closed (a mission-bound receipt still admits an action by plan hash).
 #[test]
 fn full_receipt_chain_gate_then_admission() {
     let bound = mission("mission:chain", "Chain objective");
