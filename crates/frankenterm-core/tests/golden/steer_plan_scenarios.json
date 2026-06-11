@@ -1,0 +1,91 @@
+{
+  "clean-ready": {
+    "plan_status": "actionable",
+    "policy_verdict": "envelope.admit",
+    "receipt": {
+      "schema_version": 1,
+      "receipt_id": "steer:3fd97d6c484dd2ced843b76528b0d0c0",
+      "objective": "ship the W3 family",
+      "workspace_id": "ws-golden",
+      "mission_contract_hash": null,
+      "tx_contract_hash": null,
+      "envelope_verdict": "envelope.admit",
+      "rehearsal_score": 950,
+      "required_approvals": [],
+      "created_at_ms": 1704000000000,
+      "ttl_ms": null
+    }
+  },
+  "dirty-overlap": {
+    "plan_status": "dirty_overlap",
+    "policy_verdict": "envelope.requires_approval",
+    "receipt": {
+      "schema_version": 1,
+      "receipt_id": "steer:b3b3040f08a5faa60f83cb8bb7c8681a",
+      "objective": "ship the W3 family",
+      "workspace_id": "ws-golden",
+      "mission_contract_hash": null,
+      "tx_contract_hash": null,
+      "envelope_verdict": "envelope.requires_approval",
+      "rehearsal_score": 400,
+      "required_approvals": [
+        "approval:dirty_overlap"
+      ],
+      "created_at_ms": 1704000000000,
+      "ttl_ms": null
+    }
+  },
+  "rch-blocked": {
+    "plan_status": "rch_substrate_blocked",
+    "policy_verdict": "envelope.blocked.rch_substrate",
+    "receipt": {
+      "schema_version": 1,
+      "receipt_id": "steer:739d4d04f5cfd3a6245345a98f03df62",
+      "objective": "ship the W3 family",
+      "workspace_id": "ws-golden",
+      "mission_contract_hash": null,
+      "tx_contract_hash": null,
+      "envelope_verdict": "envelope.blocked.rch_substrate",
+      "rehearsal_score": 150,
+      "required_approvals": [],
+      "created_at_ms": 1704000000000,
+      "ttl_ms": null
+    }
+  },
+  "approval-required": {
+    "plan_status": "waiting_owner",
+    "policy_verdict": "envelope.requires_approval",
+    "receipt": {
+      "schema_version": 1,
+      "receipt_id": "steer:9df25ee645b875227fb546718104dde8",
+      "objective": "ship the W3 family",
+      "workspace_id": "ws-golden",
+      "mission_contract_hash": null,
+      "tx_contract_hash": null,
+      "envelope_verdict": "envelope.requires_approval",
+      "rehearsal_score": 600,
+      "required_approvals": [
+        "approval:owner_handoff"
+      ],
+      "created_at_ms": 1704000000000,
+      "ttl_ms": null
+    }
+  },
+  "capacity-red": {
+    "plan_status": "waiting_external",
+    "policy_verdict": "envelope.blocked.capacity",
+    "receipt": {
+      "schema_version": 1,
+      "receipt_id": "steer:070753b4aa73bb2cb49482b491c6ba69",
+      "objective": "ship the W3 family",
+      "workspace_id": "ws-golden",
+      "mission_contract_hash": null,
+      "tx_contract_hash": null,
+      "envelope_verdict": "envelope.blocked.capacity",
+      "rehearsal_score": 250,
+      "required_approvals": [],
+      "created_at_ms": 1704000000000,
+      "ttl_ms": null
+    }
+  }
+}
