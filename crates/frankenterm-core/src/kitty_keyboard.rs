@@ -335,7 +335,10 @@ impl KeyEventKind {
 ///   including printable codepoints — emit
 ///   `CSI <key> ; <event> u`.
 /// - **Flag 16 (ReportAssociatedText)**: non-empty
-///   `associated_text` is appended as an extra CSI parameter.
+///   `associated_text` is appended as the THIRD CSI parameter
+///   (`key ; modifiers ; text` per the Kitty protocol); the
+///   modifier parameter is always emitted alongside it so the
+///   text never shifts into the modifier position.
 ///   (Production routes this through IME composition.)
 #[must_use]
 pub fn encode_key_event(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
@@ -401,7 +404,16 @@ fn csi_form_encoding(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
     }
 
     let report_events = flags.contains(KittyKbdFlag::ReportEventTypes);
-    if report_events || event.modifiers != 0 {
+    let assoc_text = if flags.contains(KittyKbdFlag::ReportAssociatedText) {
+        event.associated_text.as_deref().filter(|t| !t.is_empty())
+    } else {
+        None
+    };
+    // The text section is positionally the THIRD CSI parameter
+    // (`key ; modifiers[:event] ; text`), so whenever associated text is
+    // emitted the modifier parameter must be occupied — otherwise a
+    // conformant consumer parses the text codepoints as the modifier field.
+    if report_events || event.modifiers != 0 || assoc_text.is_some() {
         out.push(';');
         // Modifier param — Kitty packs as
         // `(modifier_mask + 1)`.
@@ -412,16 +424,11 @@ fn csi_form_encoding(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
         }
     }
 
-    if flags.contains(KittyKbdFlag::ReportAssociatedText) {
-        if let Some(ref text) = event.associated_text {
-            if !text.is_empty() {
-                out.push(';');
-                // Codepoints, colon-joined.
-                let codepoints: Vec<String> =
-                    text.chars().map(|c| (c as u32).to_string()).collect();
-                out.push_str(&codepoints.join(":"));
-            }
-        }
+    if let Some(text) = assoc_text {
+        out.push(';');
+        // Codepoints, colon-joined.
+        let codepoints: Vec<String> = text.chars().map(|c| (c as u32).to_string()).collect();
+        out.push_str(&codepoints.join(":"));
     }
 
     out.push('u');
@@ -778,8 +785,10 @@ mod tests {
         let mut ev = press(b'a' as u32);
         ev.associated_text = Some("ab".to_string());
         let bytes = encode_key_event(&ev, flags);
-        // Final form: CSI 97 ; 97:98 u
-        assert_eq!(bytes, b"\x1b[97;97:98u");
+        // Final form: CSI 97 ; 1 ; 97:98 u — the modifier param (default
+        // 0+1=1) must be present so the text codepoints occupy the third
+        // (text) section instead of shifting into the modifier position.
+        assert_eq!(bytes, b"\x1b[97;1;97:98u");
     }
 
     #[test]
@@ -789,7 +798,9 @@ mod tests {
         let mut ev = press(b'a' as u32);
         ev.associated_text = Some("x".to_string());
         let bytes = encode_key_event(&ev, flags);
-        assert_eq!(bytes, b"\x1b[97;120u");
+        // `;1` is the explicit default-modifier param keeping the text
+        // ("x" = 120) in the third (text) section.
+        assert_eq!(bytes, b"\x1b[97;1;120u");
     }
 
     #[test]

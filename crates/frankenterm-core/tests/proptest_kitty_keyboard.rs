@@ -229,7 +229,10 @@ proptest! {
             .map(|c| (c as u32).to_string())
             .collect::<Vec<_>>()
             .join(":");
-        let expected = format!("\x1b[{key};{expected_payload}u").into_bytes();
+        // The modifier param (default 0+1=1) must be present so the text
+        // codepoints occupy the third (text) CSI section per the Kitty
+        // protocol (`key ; modifiers ; text`).
+        let expected = format!("\x1b[{key};1;{expected_payload}u").into_bytes();
 
         prop_assert_eq!(encoded, expected);
     }

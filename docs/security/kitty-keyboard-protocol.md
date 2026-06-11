@@ -79,8 +79,10 @@ routes this through the PTY writer).
 - **Flag 8 (ReportAllKeysAsEscapes)** — every key uses CSI
   form: `a` → `\x1b[97u`.
 - **Flag 16 (ReportAssociatedText)** — IME composition
-  appended as codepoint sequence: `\x1b[97;97:98u` for
-  `a` with associated text "ab".
+  appended as the THIRD CSI section (`key ; modifiers ;
+  text` — the modifier param is always emitted alongside
+  it): `\x1b[97;1;97:98u` for `a` with associated text
+  "ab".
 
 Modifiers packed as `(modifier_mask + 1)` per Kitty
 protocol.
