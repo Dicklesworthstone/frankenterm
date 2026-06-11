@@ -232,6 +232,58 @@ pub fn capture_cursor(pane_id: u64, text: &str) -> String {
     )
 }
 
+/// ft-7h5da.3.5: derive the idempotency key for a verified-submit send. The same
+/// `(pane_id, text, caller_key)` triple always maps to the same key; a different
+/// caller-supplied key (or different text / pane) yields a distinct key, letting
+/// a meta-agent force a genuinely new send. `caller_key` is an opaque token the
+/// caller controls (e.g. a retry / session nonce); `None` keys purely by content.
+#[must_use]
+pub fn idempotency_key(pane_id: u64, text: &str, caller_key: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(pane_id.to_le_bytes());
+    hasher.update(b"\x00"); // domain separator between fields
+    hasher.update(text.as_bytes());
+    hasher.update(b"\x00");
+    if let Some(k) = caller_key {
+        hasher.update(k.as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!("idem:{pane_id}:{}", &digest[..16])
+}
+
+/// ft-7h5da.3.5: whether a fresh send keyed by an idempotency key should be
+/// suppressed as a duplicate of a prior in-flight / completed send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyOutcome {
+    /// A prior send for this key is already `submitted` or
+    /// `queued_behind_operation` — the replay is a NO-OP and the caller MUST
+    /// return the original receipt rather than re-injecting the prompt.
+    DuplicateNoop,
+    /// No conflicting prior send (never sent, or the prior attempt did not stick)
+    /// — the send proceeds.
+    Proceed,
+}
+
+/// ft-7h5da.3.5: decide a send's idempotency outcome from the last recorded
+/// receipt state for its key.
+///
+/// Only `Submitted` / `QueuedBehindOperation` suppress a replay — the prompt is
+/// already delivered or in flight, so re-sending would double-submit. Every
+/// other state (including `None` = never sent, and the non-delivered terminals
+/// `StuckInComposer` / `SendFailed` / `PaneCrashedToShell` /
+/// `VerificationUnavailable` / `PolicyDenied` / `RequiresApproval`) allows the
+/// send to proceed, because the prompt was NOT durably delivered and a
+/// disconnected meta-agent must be able to retry.
+#[must_use]
+pub fn idempotency_outcome(prior: Option<SubmitReceiptState>) -> IdempotencyOutcome {
+    match prior {
+        Some(SubmitReceiptState::Submitted | SubmitReceiptState::QueuedBehindOperation) => {
+            IdempotencyOutcome::DuplicateNoop
+        }
+        _ => IdempotencyOutcome::Proceed,
+    }
+}
+
 fn receipt_agent_type(agent_type: AgentType) -> Option<String> {
     match agent_type {
         AgentType::Codex | AgentType::ClaudeCode | AgentType::Gemini => {
@@ -594,5 +646,54 @@ mod tests {
             report.evidence_rule_ids,
             vec!["submit_profile:codex.default:capture_unavailable"]
         );
+    }
+
+    // ft-7h5da.3.5: idempotency key + duplicate protection.
+
+    #[test]
+    fn idempotency_key_is_stable_and_discriminating() {
+        let a = idempotency_key(7, "deploy now", None);
+        assert_eq!(a, idempotency_key(7, "deploy now", None), "stable for same inputs");
+        assert_ne!(a, idempotency_key(7, "deploy later", None), "text must matter");
+        assert_ne!(a, idempotency_key(8, "deploy now", None), "pane must matter");
+        assert_ne!(
+            a,
+            idempotency_key(7, "deploy now", Some("nonce")),
+            "caller key must matter"
+        );
+        assert!(a.starts_with("idem:7:"), "key was {a}");
+    }
+
+    #[test]
+    fn submitted_and_queued_suppress_replay() {
+        assert_eq!(
+            idempotency_outcome(Some(SubmitReceiptState::Submitted)),
+            IdempotencyOutcome::DuplicateNoop
+        );
+        assert_eq!(
+            idempotency_outcome(Some(SubmitReceiptState::QueuedBehindOperation)),
+            IdempotencyOutcome::DuplicateNoop
+        );
+    }
+
+    #[test]
+    fn never_sent_or_non_delivered_states_proceed() {
+        assert_eq!(idempotency_outcome(None), IdempotencyOutcome::Proceed);
+        let retryable = [
+            SubmitReceiptState::StuckInComposer,
+            SubmitReceiptState::SendFailed,
+            SubmitReceiptState::PaneCrashedToShell,
+            SubmitReceiptState::VerificationUnavailable,
+            SubmitReceiptState::PolicyDenied,
+            SubmitReceiptState::RequiresApproval,
+        ];
+        for state in retryable {
+            let label = format!("{state:?}");
+            assert_eq!(
+                idempotency_outcome(Some(state)),
+                IdempotencyOutcome::Proceed,
+                "{label} was not durably delivered and must allow retry"
+            );
+        }
     }
 }
