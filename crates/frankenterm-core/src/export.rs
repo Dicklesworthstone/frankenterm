@@ -436,23 +436,50 @@ fn redact_segment(mut seg: Segment, redactor: &Redactor) -> Segment {
 }
 
 /// Redact secret material from a stored event before emission: `matched_text`
-/// and every string inside the structured `extracted` payload (via
-/// serialize → redact → reparse, so nested secrets are caught). Idempotent and
-/// secret-pattern-scoped (non-secret strings are untouched). Reused by the
+/// and every string leaf inside the structured `extracted` payload. Idempotent
+/// and secret-pattern-scoped (non-secret strings are untouched). Reused by the
 /// export path and `ft robot watch-events` (ft-7h5da.4.4).
 pub fn redact_event(mut event: StoredEvent, redactor: &Redactor) -> StoredEvent {
     if let Some(ref text) = event.matched_text {
         event.matched_text = Some(redactor.redact(text));
     }
-    if let Some(ref extracted) = event.extracted {
-        if let Ok(s) = serde_json::to_string(extracted) {
-            let redacted = redactor.redact(&s);
-            if let Ok(v) = serde_json::from_str(&redacted) {
-                event.extracted = Some(v);
-            }
-        }
+    if let Some(extracted) = event.extracted.take() {
+        event.extracted = Some(redact_json_value(extracted, redactor));
     }
     event
+}
+
+/// Recursively redact every string LEAF of a JSON value, rebuilding the tree.
+///
+/// This replaces an earlier serialize → redact-the-JSON-string → reparse
+/// approach that **failed open**: if redacting the serialized form produced
+/// invalid JSON (a secret pattern matching across a value's closing quote or an
+/// escape sequence), the reparse failed and the ORIGINAL, unredacted value was
+/// emitted — a redaction bypass that violates the fail-closed read-path
+/// doctrine. Walking the tree and redacting each unescaped string leaf can
+/// never produce malformed JSON, never retains the original secret-bearing
+/// value, and additionally redacts the true string content (not its
+/// JSON-escaped form, e.g. a secret spanning a real newline). Object keys are
+/// schema field names, not secrets, and are left intact so downstream
+/// field lookups keep working.
+fn redact_json_value(value: serde_json::Value, redactor: &Redactor) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(redactor.redact(&s)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_json_value(item, redactor))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, val)| (key, redact_json_value(val, redactor)))
+                .collect(),
+        ),
+        // Numbers, booleans, and null cannot carry secret strings.
+        other => other,
+    }
 }
 
 fn redact_step_log(mut step: WorkflowStepLogRecord, redactor: &Redactor) -> WorkflowStepLogRecord {
@@ -610,6 +637,65 @@ mod tests {
         };
         let redacted = redact_event(event, &r);
         assert!(redacted.matched_text.unwrap().contains("[REDACTED]"));
+        // The structured `extracted` payload must ALSO be redacted (this was
+        // previously unasserted, which let the serialize→reparse fail-open
+        // bypass hide).
+        let extracted = redacted.extracted.expect("extracted preserved");
+        let key = extracted["key"].as_str().expect("key is a string");
+        assert!(key.contains("[REDACTED]"), "extracted secret not redacted: {key}");
+        assert!(!key.contains("sk-abc123"), "extracted secret leaked: {key}");
+    }
+
+    #[test]
+    fn redact_event_redacts_nested_extracted_and_never_fails_open() {
+        // ft-fresh-eyes: the tree-walk must redact secrets at every depth
+        // (nested object, array elements) and must redact the true string
+        // content even when it contains JSON-significant characters (embedded
+        // quote + real newline) that would have broken the old
+        // serialize→redact→reparse path and caused it to fail open (emit the
+        // original, unredacted value).
+        let r = Redactor::new();
+        let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+        let event = StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "test".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "auth.error".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(serde_json::json!({
+                "nested": { "token": format!("prefix \"{secret}\"\nmore") },
+                "list": [ format!("a {secret} b"), "clean", 42 ],
+                "count": 7,
+                "flag": true,
+                "missing": serde_json::Value::Null
+            })),
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let redacted = redact_event(event, &r).extracted.expect("extracted");
+
+        // No copy of the secret survives anywhere in the structured payload.
+        let serialized = serde_json::to_string(&redacted).expect("serialize");
+        assert!(
+            !serialized.contains(secret),
+            "secret leaked through redaction: {serialized}"
+        );
+        // Redaction reached both the nested object and the array element.
+        assert!(redacted["nested"]["token"].as_str().unwrap().contains("[REDACTED]"));
+        assert!(redacted["list"][0].as_str().unwrap().contains("[REDACTED]"));
+        // Non-secret leaves are untouched, including non-string types.
+        assert_eq!(redacted["list"][1], "clean");
+        assert_eq!(redacted["list"][2], 42);
+        assert_eq!(redacted["count"], 7);
+        assert_eq!(redacted["flag"], true);
+        assert!(redacted["missing"].is_null());
     }
 
     #[test]
