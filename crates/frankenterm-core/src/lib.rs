@@ -619,6 +619,7 @@ pub mod splay_tree;
 pub mod spsc_ring_buffer;
 pub mod status_bar;
 pub mod steer_plan;
+pub mod steer_receipt_store;
 pub mod steer_run;
 pub mod steering;
 pub mod storage;

@@ -96,6 +96,38 @@ fn steer_plan_deterministic_receipt_id() {
 }
 
 #[test]
+fn steer_plan_persists_receipt_artifact() {
+    let w = workspace();
+    let out = stdout(
+        ft(w.path())
+            .args([
+                "steer", "plan", "--objective", "persist me", "--scenario", "clean-ready",
+                "--format", "json",
+            ])
+            .assert()
+            .success(),
+    );
+    let receipt: serde_json::Value = serde_json::from_str(&out).expect("json receipt");
+    let id = receipt["receipt_id"].as_str().expect("receipt_id");
+    let safe = id.replace(':', "_");
+    let path = w
+        .path()
+        .join(".ft/steer_receipts")
+        .join(format!("{safe}.json"));
+    assert!(
+        path.exists(),
+        "receipt artifact must be persisted at {}",
+        path.display()
+    );
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read stored")).expect("json");
+    assert_eq!(
+        stored["receipt_id"], receipt["receipt_id"],
+        "persisted receipt must match the printed one"
+    );
+}
+
+#[test]
 fn steer_plan_rejects_unknown_scenario() {
     let w = workspace();
     ft(w.path())

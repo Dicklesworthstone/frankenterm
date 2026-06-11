@@ -39644,7 +39644,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     ttl_ms,
                 );
 
-                // The only side effect: one audit row recording the preflight.
+                // Persist the receipt as a content-addressed artifact so
+                // `ft steer run --receipt <id>` (W5.3 execute) can load +
+                // revalidate it later.
+                if let Some(ft_dir) = layout.db_path.parent() {
+                    match frankenterm_core::steer_receipt_store::persist_receipt(
+                        ft_dir,
+                        &result.receipt,
+                    ) {
+                        Ok(path) if !as_json => {
+                            eprintln!("receipt stored at {}", path.display());
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("Warning: receipt computed but not persisted: {e}");
+                        }
+                    }
+                }
+
+                // The only side effect beyond the receipt artifact: one audit row.
                 let db_path = layout.db_path.to_string_lossy();
                 let open_cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
