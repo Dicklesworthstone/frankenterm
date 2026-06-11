@@ -239,13 +239,26 @@ pub fn capture_cursor(pane_id: u64, text: &str) -> String {
 /// caller controls (e.g. a retry / session nonce); `None` keys purely by content.
 #[must_use]
 pub fn idempotency_key(pane_id: u64, text: &str, caller_key: Option<&str>) -> String {
+    // Length-prefix every variable-length field and tag the Option so field
+    // boundaries are unambiguous. Without framing, ("a\x00b", None) vs
+    // ("a", Some("b\x00")) — or a None vs Some("") caller key — would hash to
+    // the same key, and a *different* prompt could then be suppressed as a
+    // duplicate (a silent prompt drop). Decimal lengths keep the encoding
+    // platform-independent (matching the canonical-string pattern in
+    // `steering.rs`).
     let mut hasher = Sha256::new();
     hasher.update(pane_id.to_le_bytes());
-    hasher.update(b"\x00"); // domain separator between fields
+    hasher.update(text.len().to_string().as_bytes());
+    hasher.update(b":");
     hasher.update(text.as_bytes());
-    hasher.update(b"\x00");
-    if let Some(k) = caller_key {
-        hasher.update(k.as_bytes());
+    match caller_key {
+        Some(k) => {
+            hasher.update(b"some:");
+            hasher.update(k.len().to_string().as_bytes());
+            hasher.update(b":");
+            hasher.update(k.as_bytes());
+        }
+        None => hasher.update(b"none"),
     }
     let digest = hex::encode(hasher.finalize());
     format!("idem:{pane_id}:{}", &digest[..16])
@@ -662,6 +675,29 @@ mod tests {
             "caller key must matter"
         );
         assert!(a.starts_with("idem:7:"), "key was {a}");
+    }
+
+    #[test]
+    fn idempotency_key_field_framing_is_unambiguous() {
+        // Field boundaries must be length-framed: a NUL embedded in the text
+        // must not collide with the same bytes split across (text, caller_key),
+        // and an absent caller key must differ from an empty one. A collision
+        // here would suppress a *different* prompt as a duplicate.
+        assert_ne!(
+            idempotency_key(7, "foo\u{0}bar", None),
+            idempotency_key(7, "foo", Some("bar\u{0}")),
+            "embedded NUL must not shift the field boundary"
+        );
+        assert_ne!(
+            idempotency_key(7, "foo\u{0}", Some("bar")),
+            idempotency_key(7, "foo", Some("\u{0}bar")),
+            "bytes must not migrate between text and caller_key"
+        );
+        assert_ne!(
+            idempotency_key(7, "deploy now", None),
+            idempotency_key(7, "deploy now", Some("")),
+            "absent caller key must differ from empty caller key"
+        );
     }
 
     #[test]
