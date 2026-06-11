@@ -501,6 +501,42 @@ impl CassClient {
         parse_json(&output, self.max_error_bytes)
     }
 
+    /// Whether `session_path` is a session cass has actually indexed.
+    ///
+    /// [ft-0uzlr] Security boundary for `wa.cass_view`: `cass view` is a
+    /// GENERAL file reader (it will happily print `/etc/passwd` or
+    /// `~/.ssh/id_rsa`), so any surface that lets a caller pick the path —
+    /// e.g. a prompt-injected agent invoking the unauthenticated
+    /// `wa.cass_view` MCP tool — is an arbitrary-file-read exfil unless the
+    /// readable set is constrained to cass's own index. `cass context
+    /// <path>` resolves ONLY indexed session paths: it returns a `source`
+    /// object for an indexed file and a `{"error": {"kind": "not-found"}}`
+    /// object for anything else. We treat the presence of that `source`
+    /// object as the membership signal and **fail closed** on every other
+    /// shape (not-found, argument-parsing error, unparseable output).
+    ///
+    /// Binding the gate to cass's index introduces no new exposure: for a
+    /// secret path to pass, the operator would have had to index its
+    /// directory into cass, in which case `cass search` already surfaces
+    /// it. This is the exact set of files `wa.cass_view` is meant to read.
+    pub async fn is_session_indexed(&self, session_path: &Path) -> Result<bool, CassError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.is_session_indexed_with_cx(&cx, session_path).await
+    }
+
+    /// [ft-0uzlr] Cx-first index-membership probe (see [`is_session_indexed`]).
+    ///
+    /// [`is_session_indexed`]: Self::is_session_indexed
+    pub async fn is_session_indexed_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_path: &Path,
+    ) -> Result<bool, CassError> {
+        let args = build_context_args(session_path);
+        let output = self.run_with_cx(cx, &args).await?;
+        Ok(cass_context_output_indicates_indexed(&output))
+    }
+
     /// Check cass health via `cass status`.
     pub async fn status(&self) -> Result<CassStatus, CassError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -705,6 +741,42 @@ fn build_query_args(session_path: &Path, line_number: usize, options: &ViewOptio
     args.push(session_path.to_string_lossy().to_string());
 
     args
+}
+
+/// Build cass context (index-membership probe) args. [ft-0uzlr]
+///
+/// Same argv flag-injection guard as [`build_query_args`]: emit the
+/// `--flag` pairs first, then the `--` end-of-options sentinel, then the
+/// positional path — so a `session_path` beginning with `-` (or equal to a
+/// cass flag) cannot be reparsed as an option. `--json` placed BEFORE the
+/// sentinel is required: cass treats anything after `--` as positional, so a
+/// trailing `--json` would be parsed as a second positional and rejected.
+fn build_context_args(session_path: &Path) -> Vec<String> {
+    vec![
+        "context".to_string(),
+        "--json".to_string(),
+        "--".to_string(),
+        session_path.to_string_lossy().to_string(),
+    ]
+}
+
+/// Decide cass-index membership from `cass context --json` output. [ft-0uzlr]
+///
+/// Indexed ⟺ a top-level `source` OBJECT is present and there is no
+/// top-level `error` field. Every other shape fails closed (returns
+/// `false`): the `{"error": {"kind": "not-found"}}` object cass emits for a
+/// non-indexed path, the `{"status": "error", "kind": "argument_parsing"}`
+/// shape for a malformed invocation, and any output that does not parse as
+/// JSON at all. Failing closed here is the security-relevant default: an
+/// ambiguous probe result must never be read as "indexed".
+fn cass_context_output_indicates_indexed(output: &str) -> bool {
+    match serde_json::from_str::<Value>(output) {
+        Ok(value) => {
+            value.get("error").is_none()
+                && value.get("source").is_some_and(Value::is_object)
+        }
+        Err(_) => false,
+    }
 }
 
 /// Build cass index-refresh args. Extracted so `trigger_index` and
@@ -1873,6 +1945,63 @@ mod tests {
         let args = build_query_args(Path::new("--malicious-flag"), 1, &opts);
         let tail = &args[args.len() - 2..];
         assert_eq!(tail, &["--".to_string(), "--malicious-flag".to_string()]);
+    }
+
+    // ── ft-0uzlr: cass context index-membership probe ───────────────────
+
+    #[test]
+    fn build_context_args_puts_json_before_sentinel_and_path_last() {
+        let args = build_context_args(Path::new("/tmp/s.jsonl"));
+        assert_eq!(
+            args,
+            vec![
+                "context".to_string(),
+                "--json".to_string(),
+                "--".to_string(),
+                "/tmp/s.jsonl".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_context_args_blocks_path_starting_with_dash() {
+        // SECURITY REGRESSION TEST (ft-0uzlr / br-ft-5j45l): a path
+        // beginning with `-` must land after the `--` sentinel so cass
+        // cannot reparse it as a flag.
+        let args = build_context_args(Path::new("--rf"));
+        let tail = &args[args.len() - 2..];
+        assert_eq!(tail, &["--".to_string(), "--rf".to_string()]);
+    }
+
+    #[test]
+    fn cass_context_indexed_only_on_source_object() {
+        // ACCEPT: the shape `cass context` returns for an indexed session.
+        assert!(cass_context_output_indicates_indexed(
+            r#"{"counts":{},"related":[],"source":{"path":"/x/s.jsonl","agent":"claude_code"}}"#
+        ));
+    }
+
+    #[test]
+    fn cass_context_not_indexed_fails_closed_on_every_other_shape() {
+        // REJECT: not-found error object (the path is not in cass's index).
+        assert!(!cass_context_output_indicates_indexed(
+            r#"{"error":{"code":4,"kind":"not-found","message":"No session found at path: /etc/passwd"}}"#
+        ));
+        // REJECT: argument-parsing error shape.
+        assert!(!cass_context_output_indicates_indexed(
+            r#"{"status":"error","kind":"argument_parsing","error":"unexpected argument"}"#
+        ));
+        // REJECT: `source` present but not an object (cannot be a hit).
+        assert!(!cass_context_output_indicates_indexed(r#"{"source":"/etc/passwd"}"#));
+        assert!(!cass_context_output_indicates_indexed(r#"{"source":null}"#));
+        // REJECT: `source` object BUT an `error` is also present (ambiguous).
+        assert!(!cass_context_output_indicates_indexed(
+            r#"{"source":{"path":"/x"},"error":{"kind":"partial"}}"#
+        ));
+        // REJECT: no `source` at all, and unparseable output.
+        assert!(!cass_context_output_indicates_indexed(r#"{"counts":{}}"#));
+        assert!(!cass_context_output_indicates_indexed("not json at all"));
+        assert!(!cass_context_output_indicates_indexed(""));
     }
 
     #[test]

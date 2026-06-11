@@ -2054,23 +2054,47 @@ impl ToolHandler for WaCassViewTool {
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result: std::result::Result<CassViewResult, CassError> = runtime.block_on(async {
-            let client = cass_client_with_timeout(params.timeout_secs);
-            let options = CassViewOptions {
-                context_lines: Some(params.context_lines),
-            };
-            client
-                .query(
-                    std::path::Path::new(&params.source_path),
-                    params.line_number,
-                    &options,
-                )
-                .await
-        });
+        // [ft-0uzlr] Arbitrary-file-read gate. `cass view` is a general file
+        // reader, and wa.cass_view is a BASE tool with no policy gate, so a
+        // prompt-injected agent could otherwise exfiltrate any path the
+        // watcher UID can read (/etc/passwd, ~/.ssh/id_rsa, ~/.aws/credentials).
+        // Constrain the readable set to cass's OWN index via `cass context`,
+        // which resolves only indexed session paths. `Ok(None)` => the path is
+        // not an indexed session (refuse, never read it); `Err` => the probe
+        // itself failed (fail closed, surface the cass error). Only `Ok(Some)`
+        // — a confirmed indexed session — proceeds to read.
+        let result: std::result::Result<Option<CassViewResult>, CassError> =
+            runtime.block_on(async {
+                let client = cass_client_with_timeout(params.timeout_secs);
+                let path = std::path::Path::new(&params.source_path);
+                if !client.is_session_indexed(path).await? {
+                    return Ok(None);
+                }
+                let options = CassViewOptions {
+                    context_lines: Some(params.context_lines),
+                };
+                client
+                    .query(path, params.line_number, &options)
+                    .await
+                    .map(Some)
+            });
 
         match result {
-            Ok(result) => {
+            Ok(Some(result)) => {
                 let envelope = McpEnvelope::success(result, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Ok(None) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    "source_path is not an indexed cass session".to_string(),
+                    Some(
+                        "wa.cass_view reads only files cass has indexed. Use wa.cass_search and \
+                         pass back a source_path from its results."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
                 envelope_to_content(envelope)
             }
             Err(err) => {
@@ -10357,8 +10381,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cass_view_tool_executes_cass_with_expected_args() {
+        // [ft-0uzlr] wa.cass_view now probes `cass context` for index
+        // membership BEFORE `cass view`. The fake cass branches on the
+        // subcommand: `context` returns a `source` object (path is indexed
+        // -> gate passes); `view` returns the actual view result. The args
+        // file is truncated per-invocation, so env.args() reflects the LAST
+        // (view) call.
         let env = CassToolTestEnv::install(
-            r#"printf '%s' '{"source_path":"/tmp/session.md","line_number":42,"match_line":{"line_number":42,"content":"needle hit","role":"assistant"},"context_before":[{"line_number":41,"content":"before","role":"user"}],"context_after":[{"line_number":43,"content":"after","role":"assistant"}]}'"#,
+            r#"if [ "$1" = context ]; then printf '%s' '{"source":{"path":"/tmp/session.md"}}'; else printf '%s' '{"source_path":"/tmp/session.md","line_number":42,"match_line":{"line_number":42,"content":"needle hit","role":"assistant"},"context_before":[{"line_number":41,"content":"before","role":"user"}],"context_after":[{"line_number":43,"content":"after","role":"assistant"}]}'; fi"#,
         );
         let tool = WaCassViewTool;
 
@@ -10392,6 +10422,52 @@ mod tests {
         assert_eq!(envelope["data"]["source_path"], "/tmp/session.md");
         assert_eq!(envelope["data"]["match_line"]["content"], "needle hit");
         assert_eq!(envelope["data"]["context_before"][0]["line_number"], 41);
+    }
+
+    /// [ft-0uzlr] SECURITY REGRESSION: wa.cass_view must REFUSE a path that
+    /// cass has not indexed, and must NOT invoke `cass view` on it — closing
+    /// the prompt-injection arbitrary-file-read exfil. The fake cass returns
+    /// the `not-found` error object for `cass context`, mirroring cass's real
+    /// behavior on a non-session path like /etc/passwd.
+    #[cfg(unix)]
+    #[test]
+    fn ft_0uzlr_cass_view_refuses_non_indexed_path() {
+        let env = CassToolTestEnv::install(
+            r#"if [ "$1" = context ]; then printf '%s' '{"error":{"code":4,"kind":"not-found","message":"No session found at path"}}'; else printf '%s' 'SECRET-FILE-CONTENTS-LEAKED'; fi"#,
+        );
+        let tool = WaCassViewTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "source_path": "/etc/passwd",
+                    "line_number": 1,
+                    "timeout_secs": 11
+                }),
+            )
+            .expect("cass view call must produce an envelope"),
+        );
+
+        // Refused with a typed error, no file content returned.
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not an indexed cass session"),
+            "expected index-membership refusal, got: {}",
+            envelope["error"]
+        );
+        // The gate must short-circuit BEFORE `cass view`: the last (and only)
+        // invocation is the `context` probe, never `view`.
+        let args = env.args();
+        assert_eq!(args.first().map(String::as_str), Some("context"));
+        assert!(
+            !args.iter().any(|a| a == "view"),
+            "cass view must NOT run for a non-indexed path; args were {args:?}"
+        );
     }
 
     #[cfg(unix)]
