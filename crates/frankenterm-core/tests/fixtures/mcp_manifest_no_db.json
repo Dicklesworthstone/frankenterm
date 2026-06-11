@@ -993,6 +993,60 @@
     },
     {
       "annotations": null,
+      "description": "Emit a deterministic steering receipt for a standard scenario (robot parity, read-only)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "objective": {
+            "description": "Operator objective description",
+            "type": "string"
+          },
+          "scenario": {
+            "description": "Standard steer-plan scenario",
+            "enum": [
+              "clean-ready",
+              "dirty-overlap",
+              "rch-blocked",
+              "approval-required",
+              "capacity-red"
+            ],
+            "type": "string"
+          },
+          "ttl_ms": {
+            "description": "Receipt TTL in milliseconds (default: none)",
+            "type": "integer"
+          },
+          "workspace_id": {
+            "description": "Workspace id to bind (default: mcp)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scenario",
+          "objective"
+        ],
+        "type": "object"
+      },
+      "name": "wa.steer_plan",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "steer"
+      ],
+      "version": "0.5.0"
+    },
+    {
+      "annotations": null,
       "description": "Validate and summarize mission transaction contract metadata (robot parity)",
       "input_schema": {
         "additionalProperties": false,

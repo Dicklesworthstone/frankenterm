@@ -132,7 +132,8 @@ use mcp_tools::{
     WaMissionObjectivePlanTool,
     WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeTool,
     WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool,
+    WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
 };
 pub use mcp_tools::{mcp_clock_anomaly_count, mcp_workflow_plan_serde_drop_count};

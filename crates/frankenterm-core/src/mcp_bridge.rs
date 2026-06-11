@@ -20,6 +20,7 @@ use super::{
     WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
+    WaSteerPlanTool,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSwarmCapacityCurrentResource,
     WaSwarmCapacityRunTemplateResource, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
     WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool, WaWorkflowsResource,
@@ -52,6 +53,7 @@ pub const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.attention",
     "wa.rehearsal_score",
     "wa.mission_objective_plan",
+    "wa.steer_plan",
     "wa.operating_envelope",
     "wa.mission_state",
     "wa.mission_explain",
@@ -252,6 +254,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             ),
         ))
         .tool(FormatAwareToolHandler::new(WaRulesListTool))
+        .tool(FormatAwareToolHandler::new(WaSteerPlanTool))
         .tool(FormatAwareToolHandler::new(WaRulesTestTool))
         .tool(FormatAwareToolHandler::new(WaCassSearchTool))
         .tool(FormatAwareToolHandler::new(WaCassViewTool))

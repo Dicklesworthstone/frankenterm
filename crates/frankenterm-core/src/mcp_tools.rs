@@ -1510,6 +1510,101 @@ impl ToolHandler for WaRehearsalScoreTool {
     }
 }
 
+/// Params for `wa.steer_plan` (ft-7h5da.6.5). `scenario` is validated against
+/// the steer-plan scenario set.
+#[derive(Debug, serde::Deserialize)]
+struct SteerPlanParams {
+    scenario: String,
+    objective: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    ttl_ms: Option<i64>,
+}
+
+/// `wa.steer_plan` — MCP mirror of `ft steer plan` (ft-7h5da.6.5). Read-only,
+/// deterministic: returns the same `SteeringReceipt` the CLI emits for a
+/// scenario (byte-equal by sharing `frankenterm_core::steer_plan::steer_plan`).
+/// A base tool — no pane content, no policy gate, no DB (the receipt is pure;
+/// the CLI's audit row is a CLI-side concern).
+pub(super) struct WaSteerPlanTool;
+
+impl ToolHandler for WaSteerPlanTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.steer_plan".to_string(),
+            description: Some(
+                "Emit a deterministic steering receipt for a standard scenario \
+                 (robot parity, read-only)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scenario": {
+                        "type": "string",
+                        "enum": ["clean-ready", "dirty-overlap", "rch-blocked", "approval-required", "capacity-red"],
+                        "description": "Standard steer-plan scenario"
+                    },
+                    "objective": { "type": "string", "description": "Operator objective description" },
+                    "workspace_id": { "type": "string", "description": "Workspace id to bind (default: mcp)" },
+                    "ttl_ms": { "type": "integer", "description": "Receipt TTL in milliseconds (default: none)" }
+                },
+                "required": ["scenario", "objective"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "steer".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: SteerPlanParams = match parse_mcp_tool_params(
+            "wa.steer_plan",
+            arguments,
+            "Expected object with scenario + objective.",
+            start,
+        ) {
+            Ok(p) => p,
+            Err(response) => return response,
+        };
+        let scenario = match crate::steer_plan::SteerPlanScenario::parse(&params.scenario) {
+            Ok(s) => s,
+            Err(e) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    e,
+                    Some(
+                        "scenario must be one of: clean-ready, dirty-overlap, \
+                         rch-blocked, approval-required, capacity-red"
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let workspace_id = params
+            .workspace_id
+            .unwrap_or_else(|| "mcp".to_string());
+        let now = now_ms();
+        let result = crate::steer_plan::steer_plan(
+            scenario,
+            &params.objective,
+            &workspace_id,
+            now,
+            i64::try_from(now).unwrap_or(i64::MAX),
+            params.ttl_ms,
+        );
+        let envelope = McpEnvelope::success(result.receipt, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
 // wa.rules_list tool
 pub(super) struct WaRulesListTool;
 
@@ -8026,7 +8121,8 @@ mod tests {
         WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
         WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool,
         WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
-        WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
+        WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
+        WaTxShowTool,
         WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
         authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
@@ -11115,6 +11211,45 @@ exit 17",
             query_enum,
             vec!["zones", "last_command", "output_of", "exit_code"],
             "wa.dom query enum must match the DomQueryKind verbs"
+        );
+    }
+
+    /// ft-7h5da.6.5: the wa.steer_plan MCP mirror's definition must list the
+    /// five standard scenarios + require scenario/objective. The envelope is the
+    /// same SteeringReceipt the CLI emits (both call
+    /// frankenterm_core::steer_plan::steer_plan), pinned by the steer-plan
+    /// golden + the mcp_manifest golden.
+    #[test]
+    fn steer_plan_tool_definition_lists_all_scenarios() {
+        let def = WaSteerPlanTool.definition();
+        assert_eq!(def.name, "wa.steer_plan");
+        let required = def
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("wa.steer_plan should have required fields");
+        assert!(required.iter().any(|v| v.as_str() == Some("scenario")));
+        assert!(required.iter().any(|v| v.as_str() == Some("objective")));
+        let scenarios: Vec<String> = def
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.get("scenario"))
+            .and_then(|s| s.get("enum"))
+            .and_then(|e| e.as_array())
+            .expect("wa.steer_plan scenario must declare an enum")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            scenarios,
+            vec![
+                "clean-ready",
+                "dirty-overlap",
+                "rch-blocked",
+                "approval-required",
+                "capacity-red"
+            ],
+            "wa.steer_plan scenario enum must match SteerPlanScenario"
         );
     }
 
