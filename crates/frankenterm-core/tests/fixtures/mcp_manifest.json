@@ -1819,7 +1819,7 @@
             "type": "integer"
           },
           "workspace_id": {
-            "description": "Workspace id to bind (default: mcp)",
+            "description": "Workspace id to bind (default: resolved workspace root, matching the CLI)",
             "type": "string"
           }
         },

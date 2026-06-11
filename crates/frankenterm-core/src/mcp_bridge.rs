@@ -20,11 +20,10 @@ use super::{
     WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
-    WaSteerPlanTool,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSwarmCapacityCurrentResource,
-    WaSwarmCapacityRunTemplateResource, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
-    WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool, WaWorkflowsResource,
-    build_mcp_shared_rate_limiter,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool,
+    WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource, WaTxPlanTool,
+    WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+    WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
     FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
@@ -254,7 +253,9 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             ),
         ))
         .tool(FormatAwareToolHandler::new(WaRulesListTool))
-        .tool(FormatAwareToolHandler::new(WaSteerPlanTool))
+        .tool(FormatAwareToolHandler::new(WaSteerPlanTool::new(
+            Arc::clone(&config),
+        )))
         .tool(FormatAwareToolHandler::new(WaRulesTestTool))
         .tool(FormatAwareToolHandler::new(WaCassSearchTool))
         .tool(FormatAwareToolHandler::new(WaCassViewTool))

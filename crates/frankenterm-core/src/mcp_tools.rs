@@ -17,7 +17,7 @@ use crate::attention_router::{
     build_attention_router_surface_payload,
 };
 use crate::demo_scenarios::DemoScenarioManifest;
-use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
+use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_REMOTE_TEXT_UNAVAILABLE};
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
@@ -1527,7 +1527,22 @@ struct SteerPlanParams {
 /// scenario (byte-equal by sharing `frankenterm_core::steer_plan::steer_plan`).
 /// A base tool — no pane content, no policy gate, no DB (the receipt is pure;
 /// the CLI's audit row is a CLI-side concern).
-pub(super) struct WaSteerPlanTool;
+///
+/// Carries `Arc<Config>` so the default `workspace_id` binds the SAME
+/// resolved workspace root the CLI binds (`config.workspace_layout`):
+/// `receipt_id` is content-addressed over `workspace_id`, so a
+/// surface-specific default (the original hardcoded `"mcp"`) made the CLI
+/// and MCP mirrors emit DIFFERENT receipt ids for the same logical call,
+/// contradicting the byte-equal parity contract above.
+pub(super) struct WaSteerPlanTool {
+    config: Arc<Config>,
+}
+
+impl WaSteerPlanTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
 
 impl ToolHandler for WaSteerPlanTool {
     fn definition(&self) -> Tool {
@@ -1547,7 +1562,7 @@ impl ToolHandler for WaSteerPlanTool {
                         "description": "Standard steer-plan scenario"
                     },
                     "objective": { "type": "string", "description": "Operator objective description" },
-                    "workspace_id": { "type": "string", "description": "Workspace id to bind (default: mcp)" },
+                    "workspace_id": { "type": "string", "description": "Workspace id to bind (default: resolved workspace root, matching the CLI)" },
                     "ttl_ms": { "type": "integer", "description": "Receipt TTL in milliseconds (default: none)" }
                 },
                 "required": ["scenario", "objective"],
@@ -1588,9 +1603,25 @@ impl ToolHandler for WaSteerPlanTool {
                 return envelope_to_content(envelope);
             }
         };
-        let workspace_id = params
-            .workspace_id
-            .unwrap_or_else(|| "mcp".to_string());
+        // Receipt parity with the CLI (`ft steer plan`): receipt_id is
+        // content-addressed over workspace_id, so the default must be the
+        // same resolved workspace root the CLI binds — never a
+        // surface-specific constant.
+        let workspace_id = match params.workspace_id {
+            Some(id) => id,
+            None => match self.config.workspace_layout(None) {
+                Ok(layout) => layout.root.to_string_lossy().to_string(),
+                Err(e) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_CONFIG,
+                        format!("Failed to resolve workspace layout: {e}"),
+                        Some("Pass an explicit workspace_id, or set FT_WORKSPACE.".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            },
+        };
         let now = now_ms();
         let result = crate::steer_plan::steer_plan(
             scenario,
@@ -2705,8 +2736,12 @@ impl ToolHandler for WaDomTool {
                     Arc::clone(&policy_rate_limiter),
                 );
                 let summary = format!("wa.dom pane_id={}", params.pane_id);
-                let mut input =
-                    mcp_get_text_policy_input(params.pane_id, domain.clone(), capabilities, &summary);
+                let mut input = mcp_get_text_policy_input(
+                    params.pane_id,
+                    domain.clone(),
+                    capabilities,
+                    &summary,
+                );
                 if let Some(title) = &pane_info.title {
                     input = input.with_pane_title(title.clone());
                 }
@@ -8122,9 +8157,8 @@ mod tests {
         WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool,
         WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
         WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-        WaTxShowTool,
-        WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
-        authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
@@ -11221,7 +11255,7 @@ exit 17",
     /// golden + the mcp_manifest golden.
     #[test]
     fn steer_plan_tool_definition_lists_all_scenarios() {
-        let def = WaSteerPlanTool.definition();
+        let def = WaSteerPlanTool::new(config()).definition();
         assert_eq!(def.name, "wa.steer_plan");
         let required = def
             .input_schema

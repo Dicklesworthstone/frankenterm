@@ -80,6 +80,26 @@ pub fn steer_run_gate(
     SteerRunGate::Valid
 }
 
+/// ft-7h5da.6.4: whether a steering receipt admits an action that would
+/// otherwise require per-step approval — the receipt as a first-class
+/// ALTERNATIVE to a one-shot approval code.
+///
+/// Admits (returns [`SteerRunGate::Valid`]) iff the receipt passes the
+/// revalidation gate AND its bound tx contract hash equals the action's live
+/// plan hash (so it covers *this exact* plan, not a stale or different one). Any
+/// other verdict — mismatch / expired / invalid — means the receipt does NOT
+/// admit and the action falls back to requiring an approval code. Steering is
+/// never mandatory: this only *subsidizes* the pre-validated path, it never
+/// forces it and never weakens the gate.
+#[must_use]
+pub fn receipt_admits_action(
+    receipt: &SteeringReceipt,
+    action_plan_hash: &str,
+    now_ms: i64,
+) -> SteerRunGate {
+    steer_run_gate(receipt, None, Some(action_plan_hash), now_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +170,29 @@ mod tests {
             steer_run_gate(&r, None, Some("hash-B"), 5_000),
             SteerRunGate::Expired
         );
+    }
+
+    // ft-7h5da.6.4: receipt-as-approval-alternative admission.
+
+    #[test]
+    fn receipt_admits_matching_action_plan() {
+        let r = receipt(Some(10_000), 0, Some("plan-hash-XYZ".to_string()));
+        // Covers exactly this action's plan hash, valid + unexpired -> admits.
+        assert!(receipt_admits_action(&r, "plan-hash-XYZ", 1_000).is_valid());
+    }
+
+    #[test]
+    fn receipt_does_not_admit_a_different_action() {
+        let r = receipt(Some(10_000), 0, Some("plan-hash-XYZ".to_string()));
+        // A receipt for a DIFFERENT plan must never bypass approval.
+        let g = receipt_admits_action(&r, "plan-hash-OTHER", 1_000);
+        assert!(!g.is_valid());
+        assert_eq!(g.error_code(), Some("robot.steer_hash_mismatch"));
+    }
+
+    #[test]
+    fn expired_receipt_does_not_admit() {
+        let r = receipt(Some(1_000), 0, Some("plan-hash-XYZ".to_string()));
+        assert!(!receipt_admits_action(&r, "plan-hash-XYZ", 5_000).is_valid());
     }
 }
