@@ -127,7 +127,18 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
     pub fn remove_node(&mut self, node: &N) -> bool {
         if let Some(positions) = self.node_positions.remove(node) {
             for pos in positions {
-                self.ring.remove(&pos);
+                // Only clear the ring slot if it is still owned by THIS node.
+                // Two physical nodes' virtual nodes can (astronomically rarely,
+                // ~2^-44 on a 64-bit ring) hash to the same position; whichever
+                // `add_node` ran last overwrote the slot, so it may now belong
+                // to a different node while still appearing in this node's
+                // `positions`. Removing it unconditionally would silently delete
+                // the OTHER node's vnode from the ring, leaving its
+                // `node_positions` desynced from `ring` and shifting its keys.
+                // Guarding the remove by ownership keeps the two maps consistent.
+                if self.ring.get(&pos).is_some_and(|(owner, _)| owner == node) {
+                    self.ring.remove(&pos);
+                }
             }
             true
         } else {
@@ -312,6 +323,51 @@ mod tests {
         let ring: HashRing<&str> = HashRing::new(100);
         assert!(ring.is_empty());
         assert_eq!(ring.get_node("key"), None);
+    }
+
+    #[test]
+    fn remove_node_preserves_a_colliding_foreign_vnode() {
+        // A 64-bit ring position can (astronomically rarely) be shared by two
+        // physical nodes' vnodes: whichever add_node ran last overwrote the
+        // ring slot, so it is owned by node B in `ring` yet still listed in
+        // node A's `node_positions`. Removing A must NOT evict B's slot.
+        // The collision is impractical to force through fnv1a, so we inject
+        // the post-collision state directly via the in-module private fields.
+        let mut ring: HashRing<String> = HashRing::new(1);
+        let shared = 0x0123_4567_89ab_cdefu64;
+        // Slot is owned by B (last writer wins on the overwrite).
+        ring.ring.insert(shared, ("B".to_string(), 0));
+        // Both A and B believe they occupy `shared`.
+        ring.node_positions.insert("A".to_string(), vec![shared]);
+        ring.node_positions.insert("B".to_string(), vec![shared]);
+
+        assert!(ring.remove_node(&"A".to_string()));
+        assert!(
+            ring.ring.contains_key(&shared),
+            "removing A must not delete the slot now owned by B"
+        );
+        assert_eq!(
+            ring.ring.get(&shared).map(|(owner, _)| owner.as_str()),
+            Some("B"),
+            "the surviving slot must still belong to B"
+        );
+        // B remains resolvable on the ring.
+        assert!(ring.contains_node(&"B".to_string()));
+    }
+
+    #[test]
+    fn remove_node_clears_its_own_uncontested_vnodes() {
+        // Baseline: with no collision, remove_node still clears every slot the
+        // node owns (the guard must not over-conserve in the common case).
+        let mut ring: HashRing<&str> = HashRing::new(50);
+        ring.add_node("A");
+        ring.add_node("B");
+        let before = ring.vnode_count();
+        assert!(ring.remove_node(&"A"));
+        assert!(!ring.contains_node(&"A"));
+        // Every remaining ring slot belongs to B (none of A's survived).
+        assert!(ring.ring.values().all(|(owner, _)| *owner == "B"));
+        assert!(ring.vnode_count() < before);
     }
 
     #[test]

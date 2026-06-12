@@ -135,11 +135,16 @@ impl EventCuckooDedup {
     ///
     /// # Capacity behavior
     ///
-    /// If the filter is full (`InsertResult::Full`), the verdict
-    /// returned to the caller is still `New` (the caller should treat
-    /// this event as a fresh observation), but the key is NOT
-    /// recorded. Callers that care about full-state should check
-    /// [`Self::load_factor`] periodically and call [`Self::clear`]
+    /// If the filter is full (`InsertResult::Full`), the verdict is
+    /// [`CuckooDedupVerdict::NewButFull`] — semantically still "fresh"
+    /// (the caller should treat the event as a new observation, NOT a
+    /// duplicate), but the key was NOT recorded, so a later observation
+    /// of the same key will also read as new until the filter has room.
+    /// Match on `NewButFull` explicitly, or treat both `New` and
+    /// `NewButFull` as non-duplicate; do NOT collapse the comparison to
+    /// `== New` (that would mis-classify a fresh-but-full event as a
+    /// duplicate and drop it). Callers that care about full-state should
+    /// check [`Self::load_factor`] periodically and call [`Self::clear`]
     /// when load exceeds a threshold (e.g., 0.95).
     pub fn check(&mut self, key: &str) -> CuckooDedupVerdict {
         if self.filter.lookup(key) {
