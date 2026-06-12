@@ -61,6 +61,39 @@ async fn teardown(storage: StorageHandle, db_path: &std::path::Path) {
     let _ = std::fs::remove_file(format!("{db_str}-shm"));
 }
 
+/// Insert raw segment content directly via rusqlite, bypassing the production
+/// append path. `StorageHandle::append_segment` redacts secrets at rest
+/// (`redact_segment_for_persistence`) before the row is written, so a complete
+/// secret appended through it is masked to `[REDACTED]` and the scanner under
+/// test finds zero raw matches. Tests that assert the scanner FINDS planted
+/// secrets must plant them raw, mirroring the inline fixture in
+/// `secrets.rs` (ft-r14kr).
+fn insert_raw_secret_scan_fixture(db_path: &std::path::Path, pane_id: u64, content: &str) {
+    let conn = rusqlite::Connection::open(db_path).expect("open raw fixture db");
+    let pane_id_i64 = i64::try_from(pane_id).expect("pane id fits in i64");
+    let next_seq: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(seq) + 1, 0) FROM output_segments WHERE pane_id = ?1",
+            [pane_id_i64],
+            |row| row.get(0),
+        )
+        .expect("query next raw fixture seq");
+    let content_len = i64::try_from(content.len()).expect("content length fits in i64");
+    let captured_at = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis(),
+    )
+    .expect("epoch ms fits in i64");
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+        rusqlite::params![pane_id_i64, next_seq, content, content_len, captured_at],
+    )
+    .expect("insert raw secret scan fixture");
+}
+
 const E2E_SECRETS: &[(&str, &str)] = &[
     ("openai", "sk-abc1234567890abcdef1234567890abcdef12345678"),
     ("anthropic", "sk-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXX"),
@@ -100,22 +133,17 @@ fn scan_storage_empty_database() {
 fn scan_storage_with_secrets_finds_matches() {
     RuntimeFixture::current_thread().block_on(async {
         let (storage, db_path) = setup_storage("matches").await;
-        storage
-            .append_segment(
-                1,
-                "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
-                None,
-            )
-            .await
-            .expect("insert segment");
-        storage
-            .append_segment(1, "Hello, no secrets here.", None)
-            .await
-            .expect("insert segment");
-        storage
-            .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-            .await
-            .expect("insert segment");
+        insert_raw_secret_scan_fixture(
+            &db_path,
+            1,
+            "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+        );
+        insert_raw_secret_scan_fixture(&db_path, 1, "Hello, no secrets here.");
+        insert_raw_secret_scan_fixture(
+            &db_path,
+            1,
+            "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        );
         let engine = SecretScanEngine::new();
         let report = engine
             .scan_storage(&storage, SecretScanOptions::default())
@@ -181,14 +209,11 @@ fn scan_storage_incremental_resumes_from_checkpoint() {
     RuntimeFixture::current_thread().block_on(async {
         let (storage, db_path) = setup_storage("incr").await;
         for i in 0..3u64 {
-            storage
-                .append_segment(
-                    1,
-                    &format!("line {i}: sk-abc{i}234567890abcdef1234567890abcdef12345678"),
-                    None,
-                )
-                .await
-                .expect("insert");
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                &format!("line {i}: sk-abc{i}234567890abcdef1234567890abcdef12345678"),
+            );
         }
         let engine = SecretScanEngine::new();
         let options = SecretScanOptions::default();
@@ -201,14 +226,11 @@ fn scan_storage_incremental_resumes_from_checkpoint() {
         assert!(first_matches > 0);
 
         for i in 3..5u64 {
-            storage
-                .append_segment(
-                    1,
-                    &format!("line {i}: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678{i}"),
-                    None,
-                )
-                .await
-                .expect("insert");
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                &format!("line {i}: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678{i}"),
+            );
         }
         let report2 = engine
             .scan_storage_incremental(&storage, options)
@@ -234,20 +256,22 @@ fn scan_storage_filters_by_pane_id() {
             .upsert_pane(make_pane(2))
             .await
             .expect("register pane 2");
-        storage
-            .append_segment(1, "sk-abc1234567890abcdef1234567890abcdef12345678", None)
-            .await
-            .expect("insert");
-        storage
-            .append_segment(2, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-            .await
-            .expect("insert");
+        insert_raw_secret_scan_fixture(
+            &db_path,
+            1,
+            "sk-abc1234567890abcdef1234567890abcdef12345678",
+        );
+        insert_raw_secret_scan_fixture(&db_path, 2, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
         let engine = SecretScanEngine::new();
         let options = SecretScanOptions {
             pane_id: Some(1),
             ..Default::default()
         };
         let report = engine.scan_storage(&storage, options).await.expect("scan");
+        assert!(
+            !report.samples.is_empty(),
+            "pane-filtered scan should find the pane-1 secret"
+        );
         for sample in &report.samples {
             assert_eq!(sample.pane_id, 1);
         }
@@ -266,10 +290,7 @@ fn e2e_fixtures_report_never_contains_raw_secrets() {
 
         // Insert each secret as a distinct segment
         for (label, secret) in E2E_SECRETS {
-            storage
-                .append_segment(1, &format!("{label}_key={secret}"), None)
-                .await
-                .expect("insert fixture");
+            insert_raw_secret_scan_fixture(&db_path, 1, &format!("{label}_key={secret}"));
         }
 
         let engine = SecretScanEngine::new();
@@ -321,14 +342,11 @@ fn e2e_incremental_scan_skips_prior_segments() {
 
         // Phase 1: insert 3 segments with secrets
         for i in 0..3u64 {
-            storage
-                .append_segment(
-                    1,
-                    &format!("phase1-{i}: sk-key{i}234567890abcdef1234567890abcdef12345678"),
-                    None,
-                )
-                .await
-                .expect("insert phase1");
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                &format!("phase1-{i}: sk-key{i}234567890abcdef1234567890abcdef12345678"),
+            );
         }
 
         let engine = SecretScanEngine::new();
@@ -342,18 +360,12 @@ fn e2e_incremental_scan_skips_prior_segments() {
         let phase1_matches = r1.matches_total;
 
         // Phase 2: insert 2 more segments (one clean, one with secret)
-        storage
-            .append_segment(1, "phase2: clean output", None)
-            .await
-            .expect("insert phase2 clean");
-        storage
-            .append_segment(
-                1,
-                "phase2: ghp_NEWTOKEN123456789012345678901234567890",
-                None,
-            )
-            .await
-            .expect("insert phase2 secret");
+        insert_raw_secret_scan_fixture(&db_path, 1, "phase2: clean output");
+        insert_raw_secret_scan_fixture(
+            &db_path,
+            1,
+            "phase2: ghp_NEWTOKEN123456789012345678901234567890",
+        );
 
         let r2 = engine
             .scan_storage_incremental(&storage, opts.clone())
@@ -391,18 +403,16 @@ fn e2e_report_json_artifact_stable() {
         let (storage, db_path) = setup_storage("e2e_json").await;
 
         // Insert fixtures
-        storage
-            .append_segment(
-                1,
-                "export KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
-                None,
-            )
-            .await
-            .expect("insert");
-        storage
-            .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-            .await
-            .expect("insert");
+        insert_raw_secret_scan_fixture(
+            &db_path,
+            1,
+            "export KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+        );
+        insert_raw_secret_scan_fixture(
+            &db_path,
+            1,
+            "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        );
 
         let engine = SecretScanEngine::new();
 
@@ -415,6 +425,14 @@ fn e2e_report_json_artifact_stable() {
             .scan_storage(&storage, SecretScanOptions::default())
             .await
             .expect("scan2");
+
+        // The scans must actually find the planted secrets — determinism
+        // assertions over empty reports would be vacuous.
+        assert!(
+            r1.matches_total >= 2,
+            "should find both planted secrets, got {}",
+            r1.matches_total
+        );
 
         // Core metrics should be identical
         assert_eq!(r1.scanned_segments, r2.scanned_segments);
@@ -450,10 +468,7 @@ fn e2e_multi_pattern_per_segment_counts() {
             "STRIPE=sk_live_abcdefghijklmnopqrstuvwxyz0123 ",
             "DB=postgres://root:hunter2@db:5432/prod",
         );
-        storage
-            .append_segment(1, content, None)
-            .await
-            .expect("insert");
+        insert_raw_secret_scan_fixture(&db_path, 1, content);
 
         let engine = SecretScanEngine::new();
         let report = engine
@@ -494,10 +509,11 @@ fn e2e_sample_limit_across_storage() {
 
         // Insert many segments, each with a secret
         for i in 0..20u64 {
-            storage
-                .append_segment(1, &format!("password=super_secret_pass_{i:03}xx"), None)
-                .await
-                .expect("insert");
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                &format!("password=super_secret_pass_{i:03}xx"),
+            );
         }
 
         let engine = SecretScanEngine::new();
