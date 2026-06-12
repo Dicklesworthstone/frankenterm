@@ -861,9 +861,10 @@ fn normalize_time_of_day_text(text: &str) -> Option<String> {
 fn normalize_meridiem_time_text(time: &str, suffix: &str) -> Option<String> {
     let (hour_text, minute_text) = time
         .split_once(':')
-        .map_or((time.trim(), None), |(hour, minute)| {
-            (hour.trim(), Some(minute.trim()))
-        });
+        .map_or_else(
+            || (time.trim(), None),
+            |(hour, minute)| (hour.trim(), Some(minute.trim())),
+        );
     let hour = hour_text.parse::<u32>().ok()?;
     if !(1..=12).contains(&hour) {
         return None;
@@ -883,8 +884,7 @@ fn normalize_meridiem_time_text(time: &str, suffix: &str) -> Option<String> {
 
 fn parse_naive_time_of_day(text: &str) -> Option<chrono::NaiveTime> {
     parse_meridiem_time_of_day(text).or_else(|| {
-        ["%H:%M"]
-            .iter()
+        std::iter::once(&"%H:%M")
             .find_map(|format| chrono::NaiveTime::parse_from_str(text, format).ok())
     })
 }

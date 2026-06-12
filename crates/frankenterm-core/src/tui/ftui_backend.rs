@@ -3139,7 +3139,7 @@ fn render_search_view(
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
-            let llen = text_width(&line);
+            let llen = text_width(line);
             if llen < detail_width {
                 let fill = " ".repeat((detail_width - llen) as usize);
                 write_styled(frame, detail_x + llen, drow, &fill, CellStyle::new());
@@ -3213,7 +3213,7 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
             CellStyle::new()
         };
         write_styled(frame, 0, row, line, style);
-        let llen = text_width(&line);
+        let llen = text_width(line);
         if llen < width {
             let fill = " ".repeat((width - llen) as usize);
             write_styled(frame, llen, row, &fill, CellStyle::new());
@@ -3308,7 +3308,7 @@ fn render_events_view(
             "  No events match the current filters."
         };
         write_styled(frame, 0, row, msg, CellStyle::new().dim());
-        let msg_len = text_width(&msg);
+        let msg_len = text_width(msg);
         if msg_len < list_width {
             let fill = " ".repeat((list_width - msg_len) as usize);
             write_styled(frame, msg_len, row, &fill, CellStyle::new());
@@ -3425,7 +3425,7 @@ fn render_events_view(
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
-            let llen = text_width(&line);
+            let llen = text_width(line);
             if llen < detail_width {
                 let fill = " ".repeat((detail_width - llen) as usize);
                 write_styled(frame, detail_x + llen, drow, &fill, CellStyle::new());
@@ -3515,7 +3515,7 @@ fn render_triage_view(
         if row < list_end {
             let msg = "  All clear. No items need attention.";
             write_styled(frame, 0, row, msg, CellStyle::new().dim());
-            let mlen = text_width(&msg);
+            let mlen = text_width(msg);
             if mlen < width {
                 let fill = " ".repeat((width - mlen) as usize);
                 write_styled(frame, mlen, row, &fill, CellStyle::new());
@@ -3653,7 +3653,7 @@ fn render_triage_view(
     let detail_header = "  Details / Actions (Enter or 1-9 to run, m to mute, e to expand)";
     if row < max_row {
         write_styled(frame, 0, row, detail_header, CellStyle::new().bold());
-        let dhlen = text_width(&detail_header);
+        let dhlen = text_width(detail_header);
         if dhlen < width {
             let fill = " ".repeat((width - dhlen) as usize);
             write_styled(frame, dhlen, row, &fill, CellStyle::new());
@@ -3682,7 +3682,7 @@ fn render_triage_view(
         if !item.action_labels.is_empty() && row < max_row {
             let actions_header = "  Actions:";
             write_styled(frame, 0, row, actions_header, CellStyle::new().bold());
-            let ahlen = text_width(&actions_header);
+            let ahlen = text_width(actions_header);
             if ahlen < width {
                 let fill = " ".repeat((width - ahlen) as usize);
                 write_styled(frame, ahlen, row, &fill, CellStyle::new());
@@ -3815,7 +3815,7 @@ fn render_history_view(
             "  No entries match the current filters."
         };
         write_styled(frame, 0, row, msg, CellStyle::new().dim());
-        let msg_len = text_width(&msg);
+        let msg_len = text_width(msg);
         if msg_len < list_width {
             let fill = " ".repeat((list_width - msg_len) as usize);
             write_styled(frame, msg_len, row, &fill, CellStyle::new());
@@ -3937,7 +3937,7 @@ fn render_history_view(
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
-            let llen = text_width(&line);
+            let llen = text_width(line);
             if llen < detail_width {
                 let fill = " ".repeat((detail_width - llen) as usize);
                 write_styled(frame, detail_x + llen, drow, &fill, CellStyle::new());
@@ -4057,7 +4057,7 @@ fn render_timeline_view(
     if rows.is_empty() && row < list_end {
         let msg = "  No timeline events in the current window.";
         write_styled(frame, 0, row, msg, CellStyle::new().dim());
-        let msg_len = text_width(&msg);
+        let msg_len = text_width(msg);
         if msg_len < list_width {
             let fill = " ".repeat((list_width - msg_len) as usize);
             write_styled(frame, msg_len, row, &fill, CellStyle::new());
@@ -4158,7 +4158,7 @@ fn render_timeline_view(
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
-            let llen = text_width(&line);
+            let llen = text_width(line);
             if llen < detail_width {
                 let fill = " ".repeat((detail_width - llen) as usize);
                 write_styled(frame, detail_x + llen, drow, &fill, CellStyle::new());
