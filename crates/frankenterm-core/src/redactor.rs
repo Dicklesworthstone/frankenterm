@@ -1102,6 +1102,12 @@ impl StreamingRedactor {
     }
 
     /// Text currently retained to protect the next chunk boundary.
+    ///
+    /// Test-only introspection: the segment-persistence path no longer reads the
+    /// pending tail (ft-e8hd7 replaced its `StreamingRedactor` use with a raw
+    /// lookback), so this accessor now exists solely for `StreamingRedactor`
+    /// unit tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn pending_text(&self) -> &str {
         self.pending.as_str()

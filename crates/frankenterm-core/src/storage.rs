@@ -53,7 +53,7 @@ use crate::policy::Redactor;
 use crate::recorder_invariants::InvariantReport;
 #[cfg(test)]
 use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
-use crate::redactor::StreamingRedactor;
+use crate::redactor::DEFAULT_STREAMING_REDACTOR_TAIL_BYTES;
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
@@ -7732,7 +7732,7 @@ fn dispatch_write_command_batch(
     mut batch: VecDeque<WriteCommand>,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
 ) {
     let mut pending_io = HashMap::<u64, WriteCommand>::new();
@@ -7837,7 +7837,7 @@ fn flush_storage_io_pending_commands(
     pending_io: &mut HashMap<u64, WriteCommand>,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
 ) -> Option<String> {
     while !pending_io.is_empty() && !*should_break {
@@ -8020,7 +8020,7 @@ fn dispatch_write_command_raw_recovering(
     cmd: WriteCommand,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) -> Option<String> {
     let command_was_shutdown = matches!(cmd, WriteCommand::Shutdown { .. });
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8224,7 +8224,7 @@ fn writer_loop(
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     queued_depth: &AtomicUsize,
 ) {
-    let mut segment_redactors = HashMap::<u64, StreamingRedactor>::new();
+    let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
     let mut io_gate = StorageIoWriterGate::default();
 
     // ft-ixgqo: removed the per-thread asupersync runtime + `block_on`
@@ -8588,7 +8588,7 @@ mod writer_io_scheduler_tests {
             let mut gate = tiny_writer_gate();
             let mut should_break = false;
             let mut mmap_mirror = None;
-            let mut segment_redactors = HashMap::<u64, StreamingRedactor>::new();
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
             let (panic_tx, panic_rx) = oneshot::channel();
             let (tail_tx, tail_rx) = oneshot::channel();
             let mut batch = VecDeque::new();
@@ -8798,7 +8798,7 @@ fn dispatch_write_command_raw(
     cmd: WriteCommand,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) {
     frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
         "storage::dispatch_write_command_raw",
@@ -9401,68 +9401,141 @@ fn dispatch_write_command_raw(
     }
 }
 
+/// Per-pane state for append-time secret redaction at rest (ft-e8hd7).
+///
+/// Replaces the prior per-pane `StreamingRedactor`, which withheld a rolling
+/// anchor-prefix *tail* from every persisted segment so a credential split
+/// across two appends could still be caught. That withholding truncated the
+/// live edge of each segment and pushed boundary bytes into the *next* segment,
+/// so per-segment `search`/`get-text`/`export`/`dom` saw short or
+/// boundary-split content (the `mcp_conformance_wa_search` + export-suite
+/// regressions diagnosed under ft-00gvk).
+///
+/// Instead we persist the fully-redacted content of every segment *immediately*
+/// (no withholding) and keep only a bounded **raw lookback** of the most recent
+/// appended bytes. The lookback is used solely to detect a secret that
+/// straddles an append boundary; when one is found its head is masked in the
+/// current segment and its raw prior-segment bytes are stripped from however
+/// many prior segments it spans (multi-segment retroactive masking). The
+/// lookback holds *raw* (un-redacted) bytes so a credential whose body is split
+/// mid-token is re-detected in full, preserving the prior design's cross-append
+/// coverage.
+#[derive(Debug, Default, Clone)]
+struct SegmentPersistRedactor {
+    /// Trailing *raw* bytes of the appended stream, capped at
+    /// [`SEGMENT_REDACTION_LOOKBACK_BYTES`]. In-memory only; never persisted.
+    lookback: String,
+}
+
+/// Lookback window for cross-append secret detection at persist time
+/// (ft-e8hd7). Matches the streaming redactor's retained-tail bound so a
+/// credential split across appends is caught with the same span budget the
+/// prior held-tail design used.
+const SEGMENT_REDACTION_LOOKBACK_BYTES: usize = DEFAULT_STREAMING_REDACTOR_TAIL_BYTES;
+
+/// Smallest char-boundary index `>= index` in `text` (clamped to `text.len()`).
+/// Dropping *more* than requested is always safe for the lookback window.
+fn next_char_boundary(text: &str, mut index: usize) -> usize {
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Redact a segment for at-rest persistence, returning the redacted content and
+/// whether a prior segment was retroactively edited (which invalidates the mmap
+/// mirror). See [`SegmentPersistRedactor`] for the design.
+///
+/// Security invariant: a secret is never *complete* in persisted storage. A
+/// secret fully inside `content` is redacted by [`Redactor::redact`]; a secret
+/// straddling the prior↔current append boundary has its completing bytes (the
+/// portion living in `content`) masked here, so even if the retroactive strip
+/// of the prior raw prefix is skipped (lookback drift / pruning) no usable
+/// credential survives.
 fn redact_segment_for_persistence(
     backend: &dyn StorageBackend,
     pane_id: u64,
     content: &str,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) -> Result<(String, bool)> {
-    let streaming_redactor = segment_redactors.entry(pane_id).or_default();
-    let pending_before = streaming_redactor.pending_text().to_string();
-    let redacted = streaming_redactor.redact_chunk(content.as_bytes());
-    let redacted_content = String::from_utf8(redacted.bytes).map_err(|error| {
-        StorageError::Database(format!(
-            "streaming redactor emitted invalid UTF-8 for pane {pane_id}: {error}"
-        ))
-    })?;
-
     let redactor = Redactor::new();
-    if pending_before.is_empty() {
-        return Ok((redacted_content, false));
-    }
+    let state = segment_redactors.entry(pane_id).or_default();
+    let boundary = state.lookback.len();
+    // Raw stream window = retained lookback ++ this chunk. Used for both
+    // straddle detection and the next window; never withheld from persistence.
+    let combined = format!("{}{content}", state.lookback);
 
-    let combined = format!("{pending_before}{content}");
-    let boundary = pending_before.len();
-    let crosses_boundary = redactor
-        .detect(&combined)
-        .iter()
-        .any(|(_, start, end)| *start < boundary && boundary < *end);
-
-    if crosses_boundary {
-        let updated_prior =
-            remove_suffix_from_last_segment_backend(backend, pane_id, &pending_before)?;
-        return Ok((redacted_content, updated_prior));
-    }
-
-    Ok((redacted_content, false))
-}
-
-fn flush_segment_redactor_for_pane(
-    backend: &dyn StorageBackend,
-    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
-    pane_id: u64,
-) -> Result<()> {
-    let Some(mut redactor) = segment_redactors.remove(&pane_id) else {
-        return Ok(());
+    let persisted;
+    let mut edited_prior = false;
+    // At most one detected secret can contain the single boundary point, so the
+    // first crossing span is the only straddle.
+    let straddle = if boundary == 0 {
+        None
+    } else {
+        redactor
+            .detect(&combined)
+            .into_iter()
+            .find(|&(_, start, end)| start < boundary && boundary < end)
     };
 
-    let redacted = redactor.finish();
-    if redacted.bytes.is_empty() {
-        return Ok(());
+    if let Some((_, start, end)) = straddle {
+        // Bytes of the straddling secret that live in `content`
+        // (`combined[boundary..] == content`, and `end` is char-aligned).
+        let head_len = end - boundary;
+        // One canonical marker for the whole straddled secret, then the
+        // remainder of the segment redacted normally.
+        let marker = redactor.redact(&combined[start..end]);
+        persisted = format!("{marker}{}", redactor.redact(&content[head_len..]));
+        // Strip the secret's raw prior-segment bytes from already-persisted
+        // segments. They are an incomplete prefix that only completes with
+        // `content`, so removing them loses no non-secret content.
+        edited_prior = mask_split_secret_in_prior_segments_backend(
+            backend,
+            pane_id,
+            &combined[start..boundary],
+        )?;
+    } else {
+        persisted = redactor.redact(content);
     }
 
-    let redacted_tail = String::from_utf8(redacted.bytes).map_err(|error| {
-        StorageError::Database(format!(
-            "streaming redactor emitted invalid UTF-8 while flushing pane {pane_id}: {error}"
-        ))
-    })?;
-    let segment = append_segment_backend(backend, pane_id, &redacted_tail, None)?;
-    mirror_segment_into_mmap(mmap_mirror, &segment);
+    // Advance the raw lookback window to the tail of `combined`.
+    let keep_from = if combined.len() > SEGMENT_REDACTION_LOOKBACK_BYTES {
+        next_char_boundary(&combined, combined.len() - SEGMENT_REDACTION_LOOKBACK_BYTES)
+    } else {
+        0
+    };
+    state.lookback = combined[keep_from..].to_string();
+
+    Ok((persisted, edited_prior))
+}
+
+/// Drop the per-pane cross-append lookback (ft-e8hd7). A gap or shutdown is a
+/// stream discontinuity, so any retained lookback must not be combined with the
+/// next chunk (that would manufacture a false straddle). Nothing is withheld
+/// from persistence anymore, so there is no tail to flush as a new segment.
+fn flush_segment_redactor_for_pane(
+    _backend: &dyn StorageBackend,
+    _mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+    pane_id: u64,
+) -> Result<()> {
+    segment_redactors.remove(&pane_id);
     Ok(())
 }
 
-fn remove_suffix_from_last_segment_backend(
+/// Strip the trailing `suffix` bytes from the persisted segment stream for
+/// `pane_id`, walking newest→oldest across as many segments as the suffix spans
+/// (ft-e8hd7). `suffix` is the raw prior-segment portion of a secret that
+/// straddles an append boundary — an incomplete prefix that only completes with
+/// the current chunk, so removing it loses no non-secret content. Returns
+/// whether any prior segment was edited.
+///
+/// Defense-in-depth only: if the walk stops early because the persisted bytes
+/// no longer match (the prior portion was itself a complete secret and got
+/// redacted, or retention pruned the row), the straddling secret is still never
+/// *complete* in storage — its completing bytes were masked in the current
+/// segment by the caller.
+fn mask_split_secret_in_prior_segments_backend(
     backend: &dyn StorageBackend,
     pane_id: u64,
     suffix: &str,
@@ -9472,46 +9545,80 @@ fn remove_suffix_from_last_segment_backend(
     }
 
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-    let Some(row) = backend
-        .query_row_typed(
-            "SELECT id, content
-             FROM output_segments
-             WHERE pane_id = ?1
-             ORDER BY seq DESC, id DESC
-             LIMIT 1",
-            &[ToSqlValue::Integer(pane_id_i64)],
+    let mut remaining = suffix;
+    let mut edited_any = false;
+    // `id` cursor walks strictly older segments without re-reading rows we have
+    // already emptied (per-pane `seq` and `id` are both monotonic with append).
+    let mut cursor: Option<i64> = None;
+
+    while !remaining.is_empty() {
+        let row = match cursor {
+            None => backend.query_row_typed(
+                "SELECT id, content
+                 FROM output_segments
+                 WHERE pane_id = ?1
+                 ORDER BY seq DESC, id DESC
+                 LIMIT 1",
+                &[ToSqlValue::Integer(pane_id_i64)],
+            ),
+            Some(prev_id) => backend.query_row_typed(
+                "SELECT id, content
+                 FROM output_segments
+                 WHERE pane_id = ?1 AND id < ?2
+                 ORDER BY seq DESC, id DESC
+                 LIMIT 1",
+                &[
+                    ToSqlValue::Integer(pane_id_i64),
+                    ToSqlValue::Integer(prev_id),
+                ],
+            ),
+        }
+        .map_err(|err| storage_backend_error("Failed to query prior segment", err))?;
+
+        let Some(row) = row else { break };
+        let reader = RowReader::new(&row);
+        let segment_id = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Failed to parse prior segment id", err))?;
+        let content = reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Failed to parse prior segment content", err))?;
+        cursor = Some(segment_id);
+
+        let new_content = if content.len() >= remaining.len() {
+            // The straddle tail ends inside this segment.
+            let Some(kept) = content.strip_suffix(remaining) else {
+                break;
+            };
+            remaining = "";
+            kept.to_string()
+        } else {
+            // This whole segment is part of the straddle tail; empty it and
+            // continue stripping the rest from older segments.
+            if !remaining.ends_with(content.as_str()) {
+                break;
+            }
+            remaining = &remaining[..remaining.len() - content.len()];
+            String::new()
+        };
+
+        let content_len_i64 = usize_to_i64(new_content.len(), "content_len")?;
+        execute_typed(
+            backend,
+            "UPDATE output_segments
+             SET content = ?1, content_len = ?2, content_hash = NULL
+             WHERE id = ?3",
+            &[
+                ToSqlValue::Text(&new_content),
+                ToSqlValue::Integer(content_len_i64),
+                ToSqlValue::Integer(segment_id),
+            ],
         )
-        .map_err(|err| storage_backend_error("Failed to query last segment", err))?
-    else {
-        return Ok(false);
-    };
+        .map_err(|err| storage_backend_error("Failed to strip split secret tail", err))?;
+        edited_any = true;
+    }
 
-    let reader = RowReader::new(&row);
-    let segment_id = reader
-        .i64(0)
-        .map_err(|err| storage_backend_error("Failed to parse last segment id", err))?;
-    let mut content = reader
-        .string(1)
-        .map_err(|err| storage_backend_error("Failed to parse last segment content", err))?;
-    let Some(stripped_len) = content.strip_suffix(suffix).map(str::len) else {
-        return Ok(false);
-    };
-    content.truncate(stripped_len);
-    let content_len_i64 = usize_to_i64(content.len(), "content_len")?;
-
-    execute_typed(
-        backend,
-        "UPDATE output_segments
-         SET content = ?1, content_len = ?2, content_hash = NULL
-         WHERE id = ?3",
-        &[
-            ToSqlValue::Text(&content),
-            ToSqlValue::Integer(content_len_i64),
-            ToSqlValue::Integer(segment_id),
-        ],
-    )
-    .map_err(|err| storage_backend_error("Failed to remove split secret tail", err))?;
-    Ok(true)
+    Ok(edited_any)
 }
 
 fn disable_mmap_mirror_after_retained_tail_move(
@@ -9527,23 +9634,15 @@ fn disable_mmap_mirror_after_retained_tail_move(
     }
 }
 
+/// Drop all per-pane cross-append lookback state (ft-e8hd7). Nothing is
+/// withheld from persistence, so shutdown/teardown only needs to release the
+/// in-memory lookback windows.
 fn flush_segment_redactors(
-    backend: &dyn StorageBackend,
-    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    _backend: &dyn StorageBackend,
+    _mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) {
-    let pane_ids = segment_redactors.keys().copied().collect::<Vec<_>>();
-    for pane_id in pane_ids {
-        if let Err(error) =
-            flush_segment_redactor_for_pane(backend, mmap_mirror, segment_redactors, pane_id)
-        {
-            tracing::warn!(
-                pane_id,
-                error = %error,
-                "failed to flush pending segment redaction tail"
-            );
-        }
-    }
+    segment_redactors.clear();
 }
 
 // =============================================================================
@@ -22239,6 +22338,213 @@ fn storage_segment_redactor_flushes_retained_tail_before_gap() {
             .collect::<String>();
         assert_eq!(persisted, content);
 
+        storage.shutdown().await.unwrap();
+    });
+}
+
+// ── ft-e8hd7 adversarial matrix: append-time redaction must not truncate the
+// live edge or split boundary content across segments, while still masking a
+// secret that straddles an append boundary (multi-segment retroactive masking).
+// Mirrors the coverage CobaltOtter required: in-segment / 2-append straddle /
+// 3+-append straddle / multiple secrets / non-secret anchor-prefix tail /
+// UTF-8 / gap-clears-lookback. ──────────────────────────────────────────────
+
+#[cfg(test)]
+fn e8hd7_pane(pane_id: u64) -> PaneRecord {
+    PaneRecord {
+        pane_id,
+        pane_uuid: None,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: Some("e8hd7".to_string()),
+        cwd: None,
+        tty_name: None,
+        first_seen_at: 1_700_000_000_000,
+        last_seen_at: 1_700_000_000_000,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    }
+}
+
+#[cfg(test)]
+async fn e8hd7_persisted_concat(storage: &StorageHandle, pane_id: u64) -> String {
+    let mut segments = storage.get_segments(pane_id, 1000).await.unwrap();
+    segments.sort_by_key(|segment| segment.seq);
+    segments
+        .iter()
+        .map(|segment| segment.content.as_str())
+        .collect::<String>()
+}
+
+#[test]
+fn e8hd7_benign_anchor_prefix_tail_persists_in_full() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("e8hd7_benign.db").to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        // Trailing chars are prefixes of streaming anchors ('e' -> esecret_/eyJ,
+        // 't' -> token, ...). The old held-tail design withheld these; they are
+        // not secrets, so they must persist verbatim and be readable
+        // immediately (no gap/shutdown flush required).
+        let content = "conformance needle stable";
+        storage.append_segment(1, content, None).await.unwrap();
+
+        assert_eq!(
+            e8hd7_persisted_concat(&storage, 1).await,
+            content,
+            "live edge must not be truncated before any flush"
+        );
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn e8hd7_multibyte_utf8_persists_without_corruption() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("e8hd7_utf8.db").to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        let content = "café ☕ 日本語 contenu — tail é";
+        storage.append_segment(1, content, None).await.unwrap();
+
+        assert_eq!(e8hd7_persisted_concat(&storage, 1).await, content);
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn e8hd7_in_segment_secret_redacted_surrounding_intact() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("e8hd7_inseg.db").to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        let key = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let content = format!("before {key} after");
+        storage.append_segment(1, &content, None).await.unwrap();
+
+        let persisted = e8hd7_persisted_concat(&storage, 1).await;
+        assert!(persisted.contains(crate::redactor::REDACTED_MARKER), "secret masked: {persisted}");
+        assert!(!persisted.contains(key), "raw key must not persist: {persisted}");
+        assert!(persisted.starts_with("before "), "leading text intact: {persisted}");
+        assert!(persisted.ends_with(" after"), "trailing text intact: {persisted}");
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn e8hd7_two_append_straddle_masks_split_secret() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("e8hd7_two.db").to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        // "sk-" + 26-char body split exactly at the anchor.
+        storage.append_segment(1, "prefix sk-", None).await.unwrap();
+        storage
+            .append_segment(1, "abcdefghijklmnopqrstuvwxyz suffix", None)
+            .await
+            .unwrap();
+
+        let persisted = e8hd7_persisted_concat(&storage, 1).await;
+        assert!(
+            !persisted.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "split key must not survive across the boundary: {persisted}"
+        );
+        assert!(persisted.contains(crate::redactor::REDACTED_MARKER), "straddle masked: {persisted}");
+        assert!(persisted.contains("prefix "), "benign prefix preserved: {persisted}");
+        assert!(persisted.contains(" suffix"), "benign suffix preserved: {persisted}");
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn e8hd7_multi_append_straddle_masks_across_segments() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("e8hd7_multi.db").to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        // A single "sk-<27 body>" key split across THREE appends. The retroactive
+        // masker must reach back through the fully-consumed middle segment into
+        // the head segment — what single-segment `remove_suffix` could not do.
+        storage.append_segment(1, "sk-", None).await.unwrap();
+        storage.append_segment(1, "abcdefghij", None).await.unwrap();
+        storage
+            .append_segment(1, "klmnopqrstuvwxyz0", None)
+            .await
+            .unwrap();
+
+        let persisted = e8hd7_persisted_concat(&storage, 1).await;
+        assert!(
+            !persisted.contains("sk-abcdefghijklmnopqrstuvwxyz0"),
+            "key spanning 3 segments must not survive: {persisted}"
+        );
+        assert!(persisted.contains(crate::redactor::REDACTED_MARKER), "straddle masked: {persisted}");
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn e8hd7_multiple_secrets_in_one_segment_all_masked() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("e8hd7_many.db").to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        let k1 = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let k2 = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let content = format!("k1={k1} k2={k2}");
+        storage.append_segment(1, &content, None).await.unwrap();
+
+        let persisted = e8hd7_persisted_concat(&storage, 1).await;
+        assert!(!persisted.contains(k1), "openai key masked: {persisted}");
+        assert!(!persisted.contains(k2), "github token masked: {persisted}");
+        assert!(
+            persisted.matches(crate::redactor::REDACTED_MARKER).count() >= 2,
+            "both secrets masked: {persisted}"
+        );
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn e8hd7_gap_clears_cross_append_lookback() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("e8hd7_gap.db").to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        // A gap is a stream discontinuity: the pre-gap "sk-" must not combine
+        // with the post-gap body into a straddle, so post-gap content is
+        // persisted verbatim (not falsely redacted) and the pre-gap edge is
+        // preserved.
+        storage.append_segment(1, "tail sk-", None).await.unwrap();
+        storage.record_gap(1, "discontinuity").await.unwrap();
+        storage
+            .append_segment(1, "abcdefghijklmnopqrstuvwxyz body", None)
+            .await
+            .unwrap();
+
+        let mut segments = storage.get_segments(1, 100).await.unwrap();
+        segments.sort_by_key(|segment| segment.seq);
+        assert_eq!(segments.first().unwrap().content, "tail sk-");
+        assert_eq!(
+            segments.last().unwrap().content,
+            "abcdefghijklmnopqrstuvwxyz body",
+            "post-gap content must not be redacted by a stale lookback"
+        );
         storage.shutdown().await.unwrap();
     });
 }
