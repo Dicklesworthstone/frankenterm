@@ -1,4 +1,4 @@
-//! Work-stealing deque — lock-free concurrent scheduling primitive.
+//! Work-stealing deque — mutex-backed concurrent scheduling primitive.
 //!
 //! A work-stealing deque allows one owner thread to push/pop from the bottom
 //! (LIFO) while multiple stealers can steal from the top (FIFO). This enables
@@ -6,10 +6,12 @@
 //!
 //! # Design
 //!
-//! Based on the Chase-Lev algorithm, adapted for safe Rust (no unsafe code).
-//! Uses `std::sync::Mutex` for the internal buffer since `#![forbid(unsafe_code)]`.
-//! For the hot path (owner push/pop), contention is minimal since stealers
-//! only touch the top index.
+//! Chase-Lev *interface*, adapted for safe Rust: the classic lock-free
+//! algorithm requires `unsafe` (raw circular buffers + acquire/release
+//! races), so under `#![forbid(unsafe_code)]` the buffer lives behind a
+//! `std::sync::Mutex` and stealers use `try_lock` to avoid blocking the
+//! owner. This is **not** lock-free; it is low-contention in practice
+//! because stealers back off (`Empty`/`Retry`) instead of waiting.
 //!
 //! ```text
 //!   ┌──────────────────────────────────────┐

@@ -54,7 +54,15 @@ fn hash_indices(data: &[u8], k: u32, m: usize) -> Vec<usize> {
         return Vec::new();
     }
     let h1 = fnv1a(data);
-    let h2 = djb2(data);
+    let mut h2 = djb2(data);
+    // h2 ≡ 0 (mod m) would collapse all k probes onto the single index
+    // h1 % m, silently degrading the filter to one effective hash function
+    // (worse false-positive rate; never false negatives). Substitute a
+    // step of 1 for exactly that degenerate case so all other inputs keep
+    // their original probe sequences.
+    if h2 % m as u64 == 0 {
+        h2 = 1;
+    }
     (0..k)
         .map(|i| {
             let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
@@ -497,6 +505,22 @@ mod tests {
             bf.count(),
             usize::MAX,
             "insert counter must saturate at usize::MAX, not wrap to 0"
+        );
+    }
+
+    // djb2(b"a") == 177_670, which is ≡ 0 (mod 10): without the h2
+    // substitution in hash_indices, every probe for this input would
+    // collapse onto the single index fnv1a(b"a") % 10, silently reducing
+    // the filter to one effective hash function.
+    #[test]
+    fn double_hash_degenerate_step_does_not_collapse_probes() {
+        assert_eq!(djb2(b"a") % 10, 0, "test premise: h2 ≡ 0 (mod m)");
+        let indices = hash_indices(b"a", 4, 10);
+        assert_eq!(indices.len(), 4);
+        let unique: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        assert!(
+            unique.len() > 1,
+            "degenerate h2 collapsed all probes: {indices:?}"
         );
     }
 

@@ -1,12 +1,16 @@
 //! Wavelet tree for rank/select/quantile queries on sequences.
 //!
-//! A wavelet tree recursively partitions an alphabet to support O(log σ)
-//! rank, select, and range quantile queries on a sequence.
+//! A wavelet tree recursively partitions an alphabet to support
+//! logarithmic rank, select, and range quantile queries on a sequence.
 //!
 //! # Properties
 //!
-//! - **O(log σ)** rank, select, quantile, range frequency
-//! - **O(n log σ)** construction time and space
+//! - **O(log σ)** rank, quantile, range count
+//! - **O(log n · log σ)** select (binary search over rank)
+//! - **O(n log σ)** construction time and space; the original sequence is
+//!   additionally retained (O(n)) for O(1) `access` and linear-time
+//!   `range_frequencies` / `alphabet_size`, so this is not a succinct
+//!   representation
 //! - **σ** = alphabet size (e.g. 256 for bytes)
 //!
 //! # Use in FrankenTerm
@@ -246,24 +250,31 @@ impl WaveletTree {
 
     /// Finds the position of the `nth` occurrence (1-indexed) of `symbol`.
     /// Returns None if there are fewer than `nth` occurrences.
+    ///
+    /// O(log n · log σ): binary search over positions, with one O(log σ)
+    /// `rank` probe per step. `rank(symbol, ·)` is monotone non-decreasing,
+    /// so the smallest `pos` with `rank(symbol, pos) >= nth` is `i + 1`
+    /// where `i` is the index of the nth occurrence.
     #[must_use]
     pub fn select(&self, symbol: u8, nth: usize) -> Option<usize> {
-        if nth == 0 || self.root.is_none() {
+        if nth == 0 || self.root.is_none() || self.rank(symbol, self.data_len) < nth {
             return None;
         }
 
-        // Linear scan using rank for correctness
-        // (A proper implementation would use binary search)
-        let mut count = 0;
-        for i in 0..self.data_len {
-            if self.original[i] == symbol {
-                count += 1;
-                if count == nth {
-                    return Some(i);
-                }
+        // Invariant: rank(symbol, lo) < nth <= rank(symbol, hi).
+        // Holds initially because rank(symbol, 0) == 0 < nth and the
+        // guard above established rank(symbol, data_len) >= nth.
+        let mut lo = 0usize;
+        let mut hi = self.data_len;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.rank(symbol, mid) >= nth {
+                hi = mid;
+            } else {
+                lo = mid;
             }
         }
-        None
+        Some(hi - 1)
     }
 
     /// Counts occurrences of `symbol` in range [lo, hi).

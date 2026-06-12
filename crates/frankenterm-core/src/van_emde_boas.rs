@@ -1,30 +1,42 @@
-//! Van Emde Boas tree for O(log log u) integer set operations.
+//! Bounded-universe integer set (van Emde Boas interface, bitmap-backed).
 //!
 //! Supports successor, predecessor, min, max, insert, and delete on
 //! integer keys from a bounded universe [0, u).
 //!
 //! # Properties
 //!
-//! - **O(log log u)**: insert, remove, successor, predecessor, contains
+//! - **O(1)**: insert, remove, contains, min, max (min/max are cached)
+//! - **O(u / 64)** worst-case word scan: successor, predecessor (and the
+//!   min/max recomputation inside `remove`); with the enforced
+//!   u ≤ 2^20 cap that is at most 16 384 words, and for dense sets the
+//!   scan terminates at the first non-zero word
 //! - **O(u)** space for universe of size u
 //! - Bounded universe: keys must be in [0, u)
 //!
 //! # Implementation
 //!
-//! Uses a simplified bitset-based approach for small universes (u ≤ 65536)
-//! which provides the O(log log u) guarantees through a layered structure.
+//! This exposes the van Emde Boas *interface* but is implemented as a
+//! flat bitmap with cached min/max, not the recursive O(log log u)
+//! cluster/summary structure. Successor/predecessor are linear scans
+//! over 64-bit words. If a profiled call site ever needs asymptotic
+//! O(log log u) successor queries, add summary layers (or the true
+//! recursive structure) at that point; for the capped universe the flat
+//! scan has been sufficient.
 //!
 //! # Use in FrankenTerm
 //!
-//! Useful for pane-ID priority queues, timer scheduling with bounded
-//! timestamps, and fast integer set operations on small universes.
+//! Substrate module (no production call sites yet). Candidate uses:
+//! pane-ID priority queues, timer scheduling with bounded timestamps,
+//! and fast integer set operations on small universes.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Van Emde Boas tree supporting integer keys in [0, universe_size).
+/// Bounded-universe integer set supporting keys in [0, universe_size).
 ///
-/// Uses a layered bitmap structure for O(log log u) operations.
+/// Flat-bitmap implementation of the van Emde Boas interface: O(1)
+/// insert/remove/contains and cached min/max, with successor and
+/// predecessor performed as linear word scans (see module docs).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VanEmdeBoas {
     universe: usize,

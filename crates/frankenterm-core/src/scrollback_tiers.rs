@@ -60,6 +60,21 @@ impl Default for ScrollbackConfig {
     }
 }
 
+impl ScrollbackConfig {
+    /// Clamp out-of-range values to safe equivalents.
+    ///
+    /// `page_size = 0` would make every hot-tier overflow flush drain zero
+    /// lines while still appending an empty warm page: the hot tier grows
+    /// without bound and the warm tier fills with empty pages. Clamped to
+    /// ≥ 1 at construction so the all-`pub` config struct cannot put the
+    /// scrollback into that state.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.page_size = self.page_size.max(1);
+        self
+    }
+}
+
 // =============================================================================
 // Scrollback Page
 // =============================================================================
@@ -203,9 +218,14 @@ pub struct ScrollbackTierSnapshot {
 }
 
 impl TieredScrollback {
-    /// Create a new tiered scrollback with default configuration.
+    /// Create a new tiered scrollback with the given configuration.
+    ///
+    /// The configuration is passed through [`ScrollbackConfig::sanitized`]
+    /// first, so a zero `page_size` is clamped instead of degrading the
+    /// tier-migration loop.
     #[must_use]
     pub fn new(config: ScrollbackConfig) -> Self {
+        let config = config.sanitized();
         let compressor = ByteCompressor::new(config.compression);
         Self {
             config,
@@ -1141,6 +1161,29 @@ mod tests {
         assert_eq!(sb.config.hot_lines, 1000);
         assert_eq!(sb.config.page_size, 256);
         assert_eq!(sb.config.warm_max_bytes, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn zero_page_size_is_clamped_and_hot_tier_stays_bounded() {
+        let config = ScrollbackConfig {
+            hot_lines: 4,
+            page_size: 0,
+            ..ScrollbackConfig::default()
+        };
+        let mut sb = TieredScrollback::new(config);
+        assert_eq!(sb.config.page_size, 1, "sanitized() must clamp page_size");
+
+        sb.push_lines((0..100).map(|i| format!("line {i}")));
+        assert!(
+            sb.hot.len() <= 4 + sb.config.page_size,
+            "hot tier must stay bounded ({} lines retained)",
+            sb.hot.len()
+        );
+        assert!(
+            sb.warm.iter().all(|page| page.line_count > 0),
+            "no empty warm pages may be created"
+        );
+        assert_eq!(sb.total_line_count(), 100);
     }
 
     // ── ScrollbackTier serde ────────────────────────────────────────

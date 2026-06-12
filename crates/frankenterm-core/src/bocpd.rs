@@ -193,11 +193,24 @@ pub struct BocpdModel {
 
 impl BocpdModel {
     /// Create a new BOCPD model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hazard_rate` or `detection_threshold` is non-finite, or if
+    /// `detection_threshold` is outside `(0.0, 1.0]`. The change-point
+    /// posterior is a probability, so a threshold above 1.0 could never fire
+    /// (a silently disabled detector) and a threshold at or below 0.0 would
+    /// fire on every observation past `min_observations`.
     #[must_use]
     pub fn new(config: BocpdConfig) -> Self {
         assert!(
             config.hazard_rate.is_finite() && config.detection_threshold.is_finite(),
             "BOCPD config hazard_rate and detection_threshold must be finite"
+        );
+        assert!(
+            config.detection_threshold > 0.0 && config.detection_threshold <= 1.0,
+            "BOCPD detection_threshold must be in (0, 1], got {}",
+            config.detection_threshold
         );
         let mut run_length_log_probs = Vec::with_capacity(config.max_run_length + 1);
         run_length_log_probs.push(0.0); // log(1.0) — start with run length 0
@@ -922,6 +935,39 @@ mod tests {
             "should detect regime change: detected={detected}, \
              max_change_prob={max_change_prob}, map_rl={map_rl}"
         );
+    }
+
+    // The change-point posterior P(r=0) is a probability and, per the
+    // Adams–MacKay recursion, hovers near the hazard rate even across a
+    // dramatic regime shift (growth and change-point branches weight the
+    // observation by the same predictive). A threshold above 1.0 therefore
+    // can never fire — a silently disabled detector — and one at or below
+    // 0.0 fires on every observation. The constructor rejects both.
+    #[test]
+    #[should_panic(expected = "detection_threshold must be in (0, 1]")]
+    fn detection_threshold_above_one_is_rejected() {
+        let _ = BocpdModel::new(BocpdConfig {
+            detection_threshold: 2.0,
+            ..BocpdConfig::default()
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "detection_threshold must be in (0, 1]")]
+    fn detection_threshold_of_zero_is_rejected() {
+        let _ = BocpdModel::new(BocpdConfig {
+            detection_threshold: 0.0,
+            ..BocpdConfig::default()
+        });
+    }
+
+    #[test]
+    fn detection_threshold_of_one_is_accepted() {
+        let model = BocpdModel::new(BocpdConfig {
+            detection_threshold: 1.0,
+            ..BocpdConfig::default()
+        });
+        assert_eq!(model.change_point_count(), 0);
     }
 
     #[test]

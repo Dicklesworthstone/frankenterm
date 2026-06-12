@@ -1,14 +1,15 @@
-//! Binomial heap — a mergeable priority queue with worst-case O(log n) operations.
+//! Binomial heap — a mergeable priority queue, arena-allocated.
 //!
 //! A binomial heap is a forest of binomial trees satisfying the
-//! min-heap property. Unlike Fibonacci heaps (amortized bounds),
-//! binomial heaps provide worst-case O(log n) guarantees for all
-//! operations including merge.
+//! min-heap property. This implementation provides worst-case
+//! O(log n) insert and extract-min; see the merge caveat below.
 //!
 //! # Complexity
 //!
-//! - **O(1)**: find-min (cached), insert (amortized)
-//! - **O(log n)**: insert (worst-case), merge, extract-min
+//! - **O(1)**: find-min (cached)
+//! - **O(log n)**: insert, extract-min (worst-case; both re-consolidate
+//!   the root list, which holds at most one tree per order)
+//! - **O(m)**: merge, where m is the donor's arena size — see below
 //!
 //! # Design
 //!
@@ -17,11 +18,18 @@
 //! analogous to binary addition. Merge operates like binary addition
 //! with carry.
 //!
+//! Because each heap owns its own node arena, `merge` must copy every
+//! donor node (and remap its indices) into the receiver's arena before
+//! the O(log n) root-list meld. The textbook O(log n) meld requires a
+//! shared allocation domain (pointer nodes or a common arena); if a
+//! merge-heavy call site ever needs that, restructure to share the
+//! arena rather than assuming this merge is cheap.
+//!
 //! # Use in FrankenTerm
 //!
-//! Priority scheduling where worst-case guarantees matter more than
-//! amortized performance, merge-heavy workloads combining multiple
-//! task queues.
+//! Substrate module (no production call sites yet). Candidate uses:
+//! priority scheduling where worst-case (non-amortized) bounds matter
+//! for insert/extract-min on a single queue.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

@@ -3614,15 +3614,15 @@ This section catalogs every non-trivial algorithm or data structure the project 
 | Structure | Where | Why this one |
 |---|---|---|
 | **Adaptive Radix Tree (ART)** | `adaptive_radix_tree.rs` | Memory-efficient prefix-keyed structure; outperforms B-tree for string keys with shared prefixes. |
-| **Van Emde Boas tree** | `van_emde_boas.rs` | O(log log U) ops on bounded-universe keys; used in time-bucketed event indexing. |
-| **Wavelet tree** | `wavelet_tree.rs` | Succinct rank/select over text; sub-linear search support. |
-| **Binomial heap** | `binomial_heap.rs` | Cheap meld; ideal for merging priority queues across worker threads. |
+| **Van Emde Boas (interface)** | `van_emde_boas.rs` | Bounded-universe integer set with O(1) insert/remove/min/max and word-scan successor/predecessor; substrate for time-bucketed event indexing. |
+| **Wavelet tree** | `wavelet_tree.rs` | O(log σ) rank/quantile and O(log n · log σ) select over byte sequences; substrate for scrollback byte-distribution analysis. |
+| **Binomial heap** | `binomial_heap.rs` | Worst-case O(log n) insert/extract-min; arena-allocated, so meld copies the donor arena (O(m)) — substrate for single-queue priority scheduling. |
 | **Compact bitset** | `compact_bitset.rs` | Dense membership representation; faster than `HashSet<u32>` for small universes. |
-| **Bimap** | `bimap.rs` | Bidirectional `HashMap`; used for pane-id ↔ session-id mappings. |
+| **Bimap** | `bimap.rs` | Bidirectional `HashMap`; substrate for pane-id ↔ session-id style mappings. |
 | **Consistent hash** | `consistent_hash.rs` | Stable load distribution across shards (mux sharding); minimizes shuffle when a shard joins/leaves. |
-| **Union-find** | `union_find.rs` | Disjoint-set partition tracking; used in tx step grouping and pattern equivalence classes. |
-| **Bounded edit distance** | `bounded_edit_distance.rs` | Levenshtein with an early-bail bound; used in suggestion engine ("did you mean…?"). |
-| **Work-stealing deque** | `work_stealing_deque.rs` | Single-producer multi-consumer queue with lock-free push and steal; backs the pattern-engine worker pool. |
+| **Union-find** | `union_find.rs` | Disjoint-set partition tracking; the error-clustering engine merges MinHash clusters with a module-local equivalent. |
+| **Bounded edit distance** | `bounded_edit_distance.rs` | Levenshtein with an early-bail bound (Ukkonen banded DP); used by output compression for line-similarity checks. |
+| **Work-stealing deque** | `work_stealing_deque.rs` | Single-producer multi-consumer queue (mutex-backed with try-lock steal; safe-Rust Chase-Lev interface); scheduling substrate for worker pools. |
 
 ---
 
