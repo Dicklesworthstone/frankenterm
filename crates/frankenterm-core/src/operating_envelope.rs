@@ -2528,12 +2528,19 @@ fn admission_windows_for(
             static_window("docs_only", input, input.budgets.docs_static_checks),
         ],
         OperatingEnvelopeOutcome::Degrade => {
+            // A docs-only static-check window must be bounded by the
+            // static-check budget, not by the interactive-agent cap. The
+            // prior `max(max_parallel_agents, docs_static_checks)` made the
+            // budget a floor rather than a ceiling: under the conservative
+            // default (interactive_agents.min(4) = 4, docs_static_checks = 2)
+            // the degraded window was granted 4 concurrent static checks —
+            // more than the budget of 2, and more than the healthy Admit
+            // state's identical window. Use the budget directly, matching the
+            // Admit and Defer `docs_only` call sites.
             let mut windows = vec![static_window(
                 "docs_only",
                 input,
-                decision
-                    .max_parallel_agents
-                    .max(input.budgets.docs_static_checks),
+                input.budgets.docs_static_checks,
             )];
             if facts.agent_mail_unavailable || facts.agent_mail_degraded {
                 windows.push(wait_window(
@@ -3526,6 +3533,48 @@ mod tests {
             vec!["docs_only", "admit_after_agent_mail_recovers"]
         );
         assert_eq!(plan.decision.max_parallel_proofs, 0);
+    }
+
+    #[test]
+    fn degraded_docs_window_never_exceeds_static_budget() {
+        // Regression: under the conservative budget (interactive_agents = 4,
+        // docs_static_checks = 2) the agent-mail-degraded `docs_only` window
+        // must not be granted more concurrent static checks than the budget,
+        // and must not exceed the healthy Admit state's identical window.
+        // The prior `max(max_parallel_agents, docs_static_checks)` granted 4.
+        let mut domains = base_domains();
+        domains.agent_mail = source(
+            "agent-mail-red",
+            OperatingEnvelopeSourceKind::AgentMail,
+            "agent_mail.unavailable_after_retry",
+        )
+        .unavailable("agent_mail.unavailable_after_retry");
+
+        let input = OperatingEnvelopePlannerInput::new(
+            NOW_MS,
+            "test-envelope",
+            "test-objective",
+            domains,
+        )
+        .target_class(
+            OperatingEnvelopeTargetClass::target_64_core_256g()
+                .proof_state(OperatingEnvelopeProofState::Measured),
+        )
+        .budgets(OperatingEnvelopeBudgets::conservative());
+
+        let plan = plan_operating_envelope(input);
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+
+        let docs_window = plan
+            .admission_windows
+            .iter()
+            .find(|w| w.window_id == "docs_only")
+            .expect("degraded plan must expose a docs_only window");
+        assert_eq!(
+            docs_window.max_parallel_agents,
+            OperatingEnvelopeBudgets::conservative().docs_static_checks,
+            "degraded docs_only window must be bounded by the static-check budget"
+        );
     }
 
     #[test]
