@@ -1,7 +1,7 @@
 use smithay_client_toolkit::seat::pointer::ThemeSpec;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use wayland_client::protocol::wl_seat::WlSeat;
-use wayland_client::{Connection, QueueHandle};
+use wayland_client::{Connection, Proxy, QueueHandle};
 
 use crate::wayland::keyboard::KeyboardData;
 use crate::wayland::pointer::PointerUserData;
@@ -100,7 +100,7 @@ impl SeatHandler for WaylandState {
                 if self.seat_bindings.clear_pointer_if_matches(&seat.id()) {
                     log::trace!("Lost pointer capability for seat {:?}", seat.id());
                     if let Some(pointer) = self.pointer.take() {
-                        pointer.release();
+                        pointer.pointer().release();
                     }
                 }
             }
@@ -128,7 +128,7 @@ impl SeatHandler for WaylandState {
 
         if cleanup.pointer {
             if let Some(pointer) = self.pointer.take() {
-                pointer.release();
+                pointer.pointer().release();
             }
         }
 
