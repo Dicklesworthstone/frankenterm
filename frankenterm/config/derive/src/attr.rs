@@ -348,6 +348,12 @@ mod tests {
         let err = field_info_error(field);
 
         assert!(err.contains("unhandled type for unsupported"));
-        assert!(err.contains("(String, String)"));
+        // The unsupported type is rendered via `ty.to_token_stream()` (see the
+        // error site at the top of this module), whose Display inserts a space
+        // between adjacent tokens — exactly like the sibling test's expected
+        // `Result < String >`. The tuple therefore renders with a space before
+        // the comma; the original `(String, String)` expectation had the wrong
+        // spacing and could never match the real `to_token_stream()` output.
+        assert!(err.contains("(String , String)"));
     }
 }
