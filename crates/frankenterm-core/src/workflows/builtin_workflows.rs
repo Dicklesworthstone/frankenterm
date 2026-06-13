@@ -768,9 +768,61 @@ fn parse_absolute_reset_ms(text: &str) -> Option<i64> {
         };
     }
 
-    chrono::DateTime::parse_from_rfc3339(trimmed)
+    if let Some(ms) = chrono::DateTime::parse_from_rfc3339(trimmed)
         .ok()
         .map(|dt| dt.timestamp_millis())
+    {
+        return Some(ms);
+    }
+
+    // Space-separated absolute datetimes carrying an explicit UTC marker, e.g.
+    // the canonical usage-limit fixture "2026-01-20 12:34 UTC" (and the "…Z" /
+    // " GMT" variants). Only an explicit UTC marker is honored: a zone-less
+    // wall clock is deliberately NOT treated as absolute, so it degrades to a
+    // conservative unknown TTL rather than silently mis-scheduling against the
+    // wrong timezone.
+    parse_utc_datetime_ms(trimmed)
+}
+
+/// Parse a full `YYYY-MM-DD[ T]HH:MM[:SS]` datetime that carries an explicit
+/// UTC marker (`Z`, ` UTC`, or ` GMT`) into epoch milliseconds. Returns `None`
+/// when no UTC marker is present or the body is not a recognized datetime.
+fn parse_utc_datetime_ms(text: &str) -> Option<i64> {
+    let body = strip_utc_zone_marker(text)?.trim();
+    const FORMATS: [&str; 4] = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ];
+    FORMATS.iter().find_map(|format| {
+        chrono::NaiveDateTime::parse_from_str(body, format)
+            .ok()
+            .map(|naive| {
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+                    .timestamp_millis()
+            })
+    })
+}
+
+/// Strip a trailing explicit-UTC marker (` UTC`, ` GMT`, or a `Z`/`z` suffix
+/// that immediately follows a digit) and return the datetime body. Returns
+/// `None` when no explicit UTC marker is present. UTF-8 safe: suffix slicing
+/// only happens on verified char boundaries.
+fn strip_utc_zone_marker(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    let cut = trimmed.len().checked_sub(4)?;
+    if let Some(tail) = trimmed.get(cut..) {
+        if tail.eq_ignore_ascii_case(" UTC") || tail.eq_ignore_ascii_case(" GMT") {
+            return trimmed.get(..cut).map(str::trim_end);
+        }
+    }
+    if let Some(stripped) = trimmed.strip_suffix(['Z', 'z']) {
+        if stripped.chars().last().is_some_and(|ch| ch.is_ascii_digit()) {
+            return Some(stripped);
+        }
+    }
+    None
 }
 
 fn parse_reset_deadline_ms(text: &str, detected_at_ms: i64) -> Option<(&'static str, i64)> {
@@ -1930,6 +1982,65 @@ mod tests {
             None,
             "small numeric reset text is not an epoch timestamp"
         );
+    }
+
+    #[test]
+    fn parse_absolute_reset_ms_parses_canonical_space_utc_fixture() {
+        // The canonical usage-limit fixture string
+        // ("…try again at 2026-01-20 12:34 UTC.") must resolve to an absolute
+        // deadline, not degrade to a conservative unknown TTL.
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-20T12:34:00Z")
+            .expect("valid timestamp")
+            .timestamp_millis();
+        assert_eq!(
+            parse_absolute_reset_ms("2026-01-20 12:34 UTC"),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_absolute_reset_ms("2026-01-20 12:34:56 UTC"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-20T12:34:56Z")
+                    .expect("valid timestamp")
+                    .timestamp_millis()
+            )
+        );
+        // `Z` and ` gmt` (case-insensitive) UTC markers parse identically.
+        assert_eq!(parse_absolute_reset_ms("2026-01-20T12:34Z"), Some(expected));
+        assert_eq!(
+            parse_absolute_reset_ms("2026-01-20 12:34 gmt"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn parse_absolute_reset_ms_rejects_zoneless_wall_clock() {
+        // Without an explicit UTC marker a full datetime is NOT treated as
+        // absolute — it must degrade (caller falls back to unknown TTL) rather
+        // than mis-schedule against the wrong timezone.
+        assert_eq!(parse_absolute_reset_ms("2026-01-20 12:34"), None);
+        assert_eq!(parse_absolute_reset_ms("2026-01-20T12:34"), None);
+    }
+
+    #[test]
+    fn limit_window_reset_parses_canonical_usage_limit_fixture() {
+        // Mirrors the patterns.rs codex.usage.reached fixture
+        // ("…try again at 2026-01-20 12:34 UTC.").
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"reset_time": "2026-01-20 12:34 UTC"}
+        });
+        let reset = limit_window_reset_from_trigger(&trigger, 1_700_000_000_000);
+        assert_eq!(reset.reset_source, "absolute");
+        assert_eq!(
+            reset.reset_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-20T12:34:00Z")
+                    .expect("valid timestamp")
+                    .timestamp_millis()
+            )
+        );
+        assert_eq!(reset.conservative_ttl_ms, 0);
+        assert_eq!(reset.reset_text.as_deref(), Some("2026-01-20 12:34 UTC"));
     }
 
     #[test]
