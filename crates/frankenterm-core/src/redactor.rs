@@ -163,6 +163,35 @@ const STREAMING_SECRET_ANCHORS: &[&str] = &[
     "DATADOG_API_KEY",
 ];
 
+/// Longest [`STREAMING_SECRET_ANCHORS`] entry, computed at compile time so the
+/// tail-window floor below tracks the anchor set automatically.
+const fn longest_streaming_anchor_len() -> usize {
+    let mut max = 0usize;
+    let mut i = 0;
+    while i < STREAMING_SECRET_ANCHORS.len() {
+        let len = STREAMING_SECRET_ANCHORS[i].len();
+        if len > max {
+            max = len;
+        }
+        i += 1;
+    }
+    max
+}
+
+/// Minimum open-anchor scan window the streaming redactor must keep.
+///
+/// A keyed secret (`key=value`) is only retained across a chunk boundary while
+/// the scan window in [`StreamingRedactor::earliest_secret_like_suffix_start`]
+/// still reaches back to the `key=` anchor. Once a partial value pushes the
+/// anchor out of that window the prefix is emitted early and the value leaks.
+/// The window must therefore always cover the longest anchor plus the largest
+/// partial value that cannot yet form a standalone detection — `GENERIC_TOKEN`
+/// requires ≥16 chars, so a 15-char value prefix is the worst-case undetected
+/// remainder. Flooring the effective tail to this value makes the test-only
+/// [`StreamingRedactor::with_tail_bytes`] knob safe to tune below it without
+/// re-opening that cross-boundary leak.
+const STREAMING_ANCHOR_TAIL_FLOOR: usize = longest_streaming_anchor_len() + 16;
+
 /// Pattern definition for secret detection.
 struct SecretPattern {
     /// Human-readable name for the pattern.
@@ -1196,7 +1225,15 @@ impl StreamingRedactor {
     }
 
     fn effective_tail_bytes(&self) -> usize {
-        self.tail_bytes.min(self.max_pending_bytes)
+        // Never scan an open-anchor window smaller than
+        // `STREAMING_ANCHOR_TAIL_FLOOR`: below it a keyed `key=value` secret
+        // whose value prefix has scrolled past a small `with_tail_bytes`
+        // window stops pulling the safe-emit boundary back and leaks. The
+        // floor is still bounded by `max_pending_bytes` so the overflow path
+        // (which compares against the cap) stays consistent under degenerate
+        // caps.
+        let floor = STREAMING_ANCHOR_TAIL_FLOOR.min(self.max_pending_bytes);
+        self.tail_bytes.max(floor).min(self.max_pending_bytes)
     }
 
     fn emit_prefix(&mut self, boundary: usize) -> RedactionResult {
@@ -2076,11 +2113,46 @@ mod tests {
         let mut streaming = StreamingRedactor::new().with_tail_bytes(8);
         let first = streaming.redact_chunk(b"plain text with no secret");
         assert!(!first.bytes.is_empty());
+        // Retention here is anchor-driven ("secret" = 6 bytes), so it stays
+        // under 8 even though the effective scan window is now floored to
+        // `STREAMING_ANCHOR_TAIL_FLOOR`.
         assert!(streaming.pending_bytes() <= 8);
 
         let mut out = first.bytes;
         out.extend(streaming.finish().bytes);
         assert_eq!(out, b"plain text with no secret");
+    }
+
+    /// br-B1 regression: a small `with_tail_bytes` must NOT leak a keyed
+    /// secret whose value is split across a chunk boundary. Before the
+    /// `STREAMING_ANCHOR_TAIL_FLOOR` floor on `effective_tail_bytes`,
+    /// `with_tail_bytes(4)` let the `token=` anchor scroll out of the
+    /// open-anchor scan window once a few value bytes arrived, so the prefix
+    /// was emitted early and the value leaked unredacted while batch
+    /// redaction caught it.
+    #[test]
+    fn streaming_small_tail_does_not_leak_split_keyed_secret() {
+        let value = "AAAABBBBCCCCDDDDEEEE"; // ≥16 chars → a complete token
+        let full = format!("token={value}");
+        // Precondition: batch redaction actually removes the value, so the
+        // streaming assertion below is meaningful.
+        let batch = Redactor::new().redact(&full);
+        assert!(
+            !batch.contains(value),
+            "precondition: batch redaction must mask {value}; got {batch:?}"
+        );
+
+        let mut streaming = StreamingRedactor::new().with_tail_bytes(4);
+        let mut out = Vec::new();
+        out.extend(streaming.redact_chunk(b"token=AAAA").bytes);
+        out.extend(streaming.redact_chunk(b"BBBBCCCCDDDDEEEE").bytes);
+        out.extend(streaming.finish().bytes);
+        let out_str = String::from_utf8_lossy(&out);
+
+        assert!(
+            !out_str.contains(value),
+            "br-B1: streaming with a tiny tail leaked a split keyed secret: {out_str:?}"
+        );
     }
 
     // ─── br-ft-4socw: pending overflow guard + observability ─────────

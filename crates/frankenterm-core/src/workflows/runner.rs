@@ -2570,6 +2570,26 @@ impl WorkflowRunner {
                                             }
                                         }
                                     });
+                                } else {
+                                    // The workflow that
+                                    // `handle_detection_with_cx` matched and
+                                    // started vanished from the registry before
+                                    // we could spawn its runner. The success
+                                    // path already `defuse()`d the pane lock
+                                    // (handing release ownership to the spawned
+                                    // `run_workflow_inner`), so skipping the
+                                    // spawn would leak the lock and brick the
+                                    // pane for every future workflow
+                                    // (`PaneLocked` forever). Release the
+                                    // orphaned lock so the pane recovers.
+                                    tracing::error!(
+                                        workflow_name = %workflow_name,
+                                        execution_id = %execution_id,
+                                        pane_id,
+                                        explicit_cx = true,
+                                        "Started workflow missing from registry before spawn; releasing orphaned pane lock (cx)"
+                                    );
+                                    self.lock_manager.release(pane_id, &execution_id);
                                 }
                             }
                             WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
@@ -2731,6 +2751,25 @@ impl WorkflowRunner {
                         continue;
                     }
                 };
+
+            // ft-j0ufc: re-enforce the source-pane trust scope on resume. The
+            // trigger-time check in `handle_detection_with_cx` is point-in-time;
+            // a restart must not blindly resume a workflow whose source pane is
+            // no longer in the (possibly tightened) trust scope and then run its
+            // remaining `SendText` steps. Gate before lock acquisition, exactly
+            // as the trigger path does. The source pane equals the acted-on pane
+            // at trigger time (`source_pane_id = pane_id`), so `execution.pane_id`
+            // is the correct re-check key.
+            if !workflow.trigger_policy().allows_source_pane(execution.pane_id) {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    pane_id = execution.pane_id,
+                    workflow = %execution.workflow_name,
+                    explicit_cx = true,
+                    "ft-j0ufc: refusing resume; source pane no longer in trust scope (cx)"
+                );
+                continue;
+            }
 
             let lock_result = self.lock_manager.try_acquire(
                 execution.pane_id,

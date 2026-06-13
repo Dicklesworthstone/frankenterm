@@ -47,26 +47,50 @@ fn djb2(data: &[u8]) -> u64 {
     h
 }
 
+/// Greatest common divisor (Euclid), used to keep the double-hash step
+/// coprime to the table size so all `k` probes land on distinct slots.
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
 /// Generate `k` hash indices using double hashing: h(i) = (h1 + i*h2) mod m.
 fn hash_indices(data: &[u8], k: u32, m: usize) -> Vec<usize> {
     // Defensive guard for deserialized/corrupt states that bypass constructors.
     if m == 0 || k == 0 {
         return Vec::new();
     }
+    let mm = m as u64;
     let h1 = fnv1a(data);
-    let mut h2 = djb2(data);
-    // h2 ≡ 0 (mod m) would collapse all k probes onto the single index
-    // h1 % m, silently degrading the filter to one effective hash function
-    // (worse false-positive rate; never false negatives). Substitute a
-    // step of 1 for exactly that degenerate case so all other inputs keep
-    // their original probe sequences.
-    if h2 % m as u64 == 0 {
+    // Double hashing (h1 + i*h2) mod m only visits m / gcd(h2, m) distinct
+    // residues, so any step h2 sharing a common factor with m collapses the
+    // k probes onto fewer slots (worse false-positive rate; never false
+    // negatives). The previous guard only repaired the fully-degenerate
+    // h2 ≡ 0 (mod m) case; `m` here is `optimal_num_bits(...)`, an arbitrary
+    // integer that is never forced prime, so non-trivial gcds are common —
+    // e.g. any even `m` paired with an even `h2` halves the probe set.
+    // Repair the step to be coprime with `m` so all probes are spread.
+    // `1` is coprime to every `m`, so the search always terminates (the
+    // sentinel below guarantees it lands on `1` at worst); the common
+    // already-coprime case keeps its original step after a single gcd check.
+    let mut h2 = djb2(data) % mm;
+    if h2 == 0 {
         h2 = 1;
+    }
+    while gcd_u64(h2, mm) != 1 {
+        h2 = (h2 + 1) % mm;
+        if h2 == 0 {
+            h2 = 1;
+        }
     }
     (0..k)
         .map(|i| {
             let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
-            (combined % m as u64) as usize
+            (combined % mm) as usize
         })
         .collect()
 }
@@ -883,6 +907,67 @@ mod tests {
         assert_eq!(indices.len(), 10);
         for &idx in &indices {
             assert!(idx < 500, "index {idx} out of range");
+        }
+    }
+
+    #[test]
+    fn gcd_helper_matches_definition() {
+        assert_eq!(gcd_u64(0, 0), 0);
+        assert_eq!(gcd_u64(12, 8), 4);
+        assert_eq!(gcd_u64(7, 13), 1);
+        assert_eq!(gcd_u64(1024, 512), 512);
+        assert_eq!(gcd_u64(0, 9), 9);
+        assert_eq!(gcd_u64(9, 0), 9);
+    }
+
+    /// Regression: double hashing `(h1 + i*h2) mod m` collapses onto
+    /// `m / gcd(h2, m)` distinct slots, so a step `h2` that shares a factor
+    /// with `m` used to map all `k` probes onto a handful of indices (a
+    /// silent false-positive-rate degradation). These (data, m) pairs each
+    /// produced a step with `gcd(h2, m) > 1` under the old code; the coprime
+    /// repair must now spread them across `k` distinct slots.
+    #[test]
+    fn hash_indices_no_gcd_collapse() {
+        // (data, m) pairs whose raw djb2 step shares a non-trivial factor
+        // with m (verified to collapse to 2 distinct slots pre-fix).
+        let cases: &[(&[u8], usize)] = &[
+            (b"*", 10),
+            (b"#", 16),
+            (b"M", 100),
+            (b"[", 1024),
+        ];
+        for &(data, m) in cases {
+            let k = 4u32;
+            let indices = hash_indices(data, k, m);
+            assert_eq!(indices.len(), k as usize);
+            let distinct: std::collections::HashSet<_> = indices.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                k as usize,
+                "probes collapsed for data={data:?} m={m}: {indices:?}"
+            );
+            for &idx in &indices {
+                assert!(idx < m, "index {idx} out of range for m={m}");
+            }
+        }
+    }
+
+    /// Across a broad sweep of small `m`, the repaired step must always be
+    /// coprime to `m` so the `k <= m` probes are guaranteed distinct.
+    #[test]
+    fn hash_indices_step_is_coprime_to_m() {
+        for m in 2usize..=257 {
+            for seed in 0u8..32 {
+                let data = [seed, seed.wrapping_mul(3), seed ^ 0x5a];
+                let k = 6u32.min(m as u32);
+                let indices = hash_indices(&data, k, m);
+                let distinct: std::collections::HashSet<_> = indices.iter().copied().collect();
+                assert_eq!(
+                    distinct.len(),
+                    k as usize,
+                    "collapse for m={m} seed={seed}: {indices:?}"
+                );
+            }
         }
     }
 

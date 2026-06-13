@@ -197,9 +197,12 @@ pub struct ChunkedPipelineState {
     /// The incremental overlap-based trigger scan is approximate because
     /// Aho-Corasick LeftmostFirst non-overlapping matching is not composable
     /// across chunk boundaries. At flush time, we re-scan the full accumulated
-    /// bytes in batch mode for exact parity with `process()`. When compression
-    /// is enabled, `uncompressed_buffer` already holds those bytes, so this
-    /// buffer stays empty to avoid duplicate accumulation.
+    /// bytes in batch mode for exact parity with `process()` **over the same
+    /// accumulated window** — `flush()` then `reset()`s, so each flush window is
+    /// an independent segment and a match straddling a flush boundary is not
+    /// re-stitched across windows. When compression is enabled,
+    /// `uncompressed_buffer` already holds those bytes, so this buffer stays
+    /// empty to avoid duplicate accumulation.
     trigger_data_buffer: Vec<u8>,
     /// Maximum buffer size before flushing compression.
     max_buffer_bytes: usize,
@@ -708,9 +711,13 @@ impl ScanPipeline {
 
         let triggers = if self.config.enable_triggers {
             // Definitive batch scan on accumulated data for exact parity with
-            // process(). The incremental overlap-based counts are approximate
+            // process() over this flush window (the bytes accumulated since the
+            // last reset). The incremental overlap-based counts are approximate
             // because Aho-Corasick LeftmostFirst non-overlapping matching is
-            // context-dependent and not composable across chunk boundaries.
+            // context-dependent and not composable across chunk boundaries;
+            // this re-scan is authoritative for the window, but the trailing
+            // `state.reset()` means a match straddling a flush boundary is not
+            // carried into the next window.
             Some(
                 self.trigger_scanner
                     .scan_counts(self.definitive_trigger_bytes(state)),

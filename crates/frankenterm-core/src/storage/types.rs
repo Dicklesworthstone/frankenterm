@@ -205,6 +205,19 @@ pub struct HybridSearchBundle {
 /// Since FTS5 indexing is trigger-driven (same transaction as
 /// `INSERT`), segments and FTS rows are always in sync under
 /// normal operation. A mismatch indicates index corruption.
+///
+/// **FTS consistency granularity.** `output_segments_fts` is an
+/// *external-content* FTS5 table (`content='output_segments'`). For such
+/// tables there is no cheap way to count the FTS index's posting-list rows
+/// independently of the content table — a non-`MATCH` scan re-enumerates the
+/// content table's rowids, so a `COUNT(*)` over the FTS table always equals
+/// `segment_count` even when the index is genuinely corrupt. The only
+/// authoritative consistency signal is FTS5's `'integrity-check'`, which is
+/// run once globally and applied across all panes in
+/// `build_indexing_health_report`. Consequently `fts_consistent` and
+/// `IndexingHealthReport::inconsistent_panes` are **global** (all-or-nothing)
+/// verdicts, not independent per-pane comparisons; `fts_row_count` is the
+/// expected count (`= segment_count` when the global integrity-check passes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneIndexingStats {
     /// Pane ID.
@@ -217,9 +230,16 @@ pub struct PaneIndexingStats {
     pub max_seq: Option<u64>,
     /// Timestamp of the most recent segment (epoch ms).
     pub last_segment_at: Option<i64>,
-    /// Number of FTS rows for this pane (should equal `segment_count`).
+    /// Expected number of FTS rows for this pane (`= segment_count`). The FTS
+    /// index of an external-content table cannot be counted independently, so
+    /// this mirrors `segment_count`; trust `fts_consistent` (driven by the
+    /// global `'integrity-check'`) for actual corruption detection.
     pub fts_row_count: u64,
-    /// Whether FTS index is consistent (`fts_row_count == segment_count`).
+    /// Whether the FTS index is consistent. Reflects the **global** FTS5
+    /// `'integrity-check'` result applied in `build_indexing_health_report`,
+    /// not an independent per-pane `fts_row_count == segment_count` comparison
+    /// (which is impossible for an external-content FTS5 table — see the
+    /// struct-level note).
     pub fts_consistent: bool,
 }
 
@@ -232,9 +252,13 @@ pub struct IndexingHealthReport {
     pub total_segments: u64,
     /// Total bytes across all panes.
     pub total_bytes: u64,
-    /// Total FTS rows across all panes.
+    /// Total FTS rows across all panes (sum of the per-pane expected counts;
+    /// see [`PaneIndexingStats::fts_row_count`]).
     pub total_fts_rows: u64,
-    /// Number of panes with FTS inconsistency.
+    /// Number of panes with FTS inconsistency. Because the consistency signal
+    /// is the **global** FTS5 `'integrity-check'`, this is all-or-nothing:
+    /// `0` when the check passes, or the full pane count when it fails — it
+    /// does not pinpoint individual corrupt panes.
     pub inconsistent_panes: u64,
     /// Overall health: all panes consistent and no errors.
     pub healthy: bool,

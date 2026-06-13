@@ -15188,6 +15188,14 @@ fn pane_indexing_stats_from_backend_cells(row: &[SqlCell]) -> Result<PaneIndexin
         total_bytes,
         max_seq,
         last_segment_at,
+        // `output_segments_fts` is an external-content FTS5 table, so its
+        // posting-list rows cannot be counted independently of
+        // `output_segments` (a non-MATCH scan re-enumerates the content
+        // table's rowids, always yielding `segment_count`). Seed the expected
+        // count and an optimistic-consistent default here; the authoritative
+        // verdict is the global FTS5 `'integrity-check'` applied across every
+        // pane in `build_indexing_health_report` (which flips `fts_consistent`
+        // to false on failure). See `PaneIndexingStats` docs.
         fts_row_count: segment_count,
         fts_consistent: true,
     })

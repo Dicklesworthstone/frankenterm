@@ -6,7 +6,10 @@
 //! - **Linux**: reads `/proc/pressure/memory` (PSI avg10) and `/proc/meminfo`
 //! - **macOS**: reads memory stats via `vm_stat` and `sysctl`
 //! - **Windows**: reads physical memory totals through `sysinfo`
-//! - **Other**: returns `Green` (no monitoring available)
+//! - **Other / read failure**: no telemetry is available, so the sample fails
+//!   closed to `Red` (most-severe tier) rather than fabricating a healthy
+//!   `Green` — a swarm controller must not pretend memory is safe when it
+//!   cannot measure it (mirrors the disk-pressure NaN→Black precedent).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1379,10 +1382,17 @@ impl MemoryPressureMonitor {
     /// Take a single memory pressure sample.
     pub fn sample(&self) -> MemorySample {
         let (total_kb, available_kb) = read_memory_info();
+        // `total_kb == 0` means the platform memory read failed (a healthy
+        // host always reports a non-zero MemTotal / hw.memsize; an idle host
+        // still has a real total). Fabricating `0.0` used would classify
+        // unreadable telemetry as Green — a fail-OPEN that lets the fleet
+        // memory controller silently drop the memory dimension while real
+        // memory is exhausted. Encode NaN so `classify` fails closed, mirroring
+        // the disk-pressure NaN→Black precedent (ft-761tz / ft-j4fnv).
         let used_percent = if total_kb > 0 {
             (total_kb.saturating_sub(available_kb) as f64 / total_kb as f64) * 100.0
         } else {
-            0.0
+            f64::NAN
         };
         let tier = self.classify(used_percent);
         self.latest_tier
@@ -1471,6 +1481,16 @@ impl MemoryPressureMonitor {
 
     /// Classify memory utilization into a tier.
     fn classify(&self, used_percent: f64) -> MemoryPressureTier {
+        // Fail closed on NaN: an unreadable memory source produces NaN
+        // (see `sample`), and every `>=` against NaN is false, which would
+        // otherwise fall through to Green ("healthy") for telemetry we never
+        // measured. Red is this enum's most-severe tier (→ Emergency via
+        // `fleet_memory_controller::map_memory_pressure`); a later clean
+        // sample reclassifies. Mirrors `disk_pressure::classify_tier`'s
+        // NaN→Black guard.
+        if used_percent.is_nan() {
+            return MemoryPressureTier::Red;
+        }
         if used_percent >= self.config.red_threshold {
             MemoryPressureTier::Red
         } else if used_percent >= self.config.orange_threshold {
@@ -1728,6 +1748,16 @@ mod tests {
         let monitor = MemoryPressureMonitor::new(test_config());
         assert_eq!(monitor.classify(95.0), MemoryPressureTier::Red);
         assert_eq!(monitor.classify(100.0), MemoryPressureTier::Red);
+    }
+
+    /// Fail closed on unreadable telemetry: `sample()` encodes an unreadable
+    /// memory source as `used_percent = NaN`, which must classify as the
+    /// most-severe tier (Red → Emergency downstream), not Green. Regression
+    /// for the fail-OPEN sibling of the disk-pressure NaN→Black fix.
+    #[test]
+    fn classify_nan_fails_closed_to_red() {
+        let monitor = MemoryPressureMonitor::new(test_config());
+        assert_eq!(monitor.classify(f64::NAN), MemoryPressureTier::Red);
     }
 
     #[test]

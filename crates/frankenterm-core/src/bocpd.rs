@@ -293,6 +293,20 @@ impl BocpdModel {
         self.sufficient_stats = new_ss;
 
         // Step 6: Check for change-point
+        //
+        // KNOWN DEFECT (ft-ia05b): `run_length_log_probs[0]` is the normalized
+        // posterior `P(r_t = 0 | x_1:t)`, which under a CONSTANT hazard `h`
+        // equals `h` EXACTLY, independent of the data — the predictive
+        // likelihood cancels between the change-numerator (`h·S`) and the
+        // evidence (`S`). So `change_prob` here is always ≈ the (clamped)
+        // hazard rate, and with the default `detection_threshold = 0.7` >
+        // `hazard_rate = 0.005` this alarm can NEVER fire (a threshold ≤ h
+        // fires on every observation instead). The data-driven signal lives in
+        // the run-length posterior's reset (see `map_run_length`, which the
+        // `detects_regime_change` test shows resets correctly); the proper fix
+        // is to detect a MAP-run-length collapse rather than thresholding
+        // `P(r=0)`. Tracked under ft-ia05b — do not "fix" by only nudging the
+        // threshold; the statistic itself is wrong.
         if self.observation_count as usize >= self.config.min_observations {
             let change_prob = self.run_length_log_probs[0].exp();
             if change_prob >= self.config.detection_threshold {
@@ -319,7 +333,14 @@ impl BocpdModel {
             .unwrap_or(0)
     }
 
-    /// Probability of a change-point at the current step.
+    /// Posterior `P(r_t = 0 | x_1:t)` — the run-length-zero mass.
+    ///
+    /// NOTE (ft-ia05b): under a constant hazard `h` this is `≈ h` regardless of
+    /// the data (the predictive likelihood cancels in the Adams–MacKay
+    /// recursion), so it is NOT a reliable data-driven change alarm. For actual
+    /// regime-change detection use the run-length posterior's reset
+    /// ([`Self::map_run_length`]); this accessor returns the (near-constant)
+    /// hazard-rate floor.
     #[must_use]
     pub fn change_point_probability(&self) -> f64 {
         if self.run_length_log_probs.is_empty() {
@@ -943,6 +964,12 @@ mod tests {
     // observation by the same predictive). A threshold above 1.0 therefore
     // can never fire — a silently disabled detector — and one at or below
     // 0.0 fires on every observation. The constructor rejects both.
+    //
+    // CAVEAT (ft-ia05b): the `(0, 1]` constructor guard does NOT make the
+    // detector work. P(r=0) ≡ hazard exactly under constant hazard, so the
+    // default 0.7 threshold can never fire and any threshold ≤ hazard fires
+    // every step. The real fix is to change the detection statistic (see
+    // `update` Step 6); these range tests only pin the constructor guard.
     #[test]
     #[should_panic(expected = "detection_threshold must be in (0, 1]")]
     fn detection_threshold_above_one_is_rejected() {
