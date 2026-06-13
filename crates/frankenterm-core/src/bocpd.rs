@@ -1585,13 +1585,15 @@ mod tests {
     #[test]
     fn model_change_point_probability_initially() {
         let model = BocpdModel::new(BocpdConfig::default());
-        // Before any observations, the run length posterior is [0.0] (log(1.0)),
-        // so change_point_probability() = exp(0) = 1.0.
+        // The alarm statistic is the recent-change mass `P(1 ≤ r ≤ W)`, which
+        // EXCLUDES the `r = 0` hazard floor (ft-ia05b). A fresh model has all
+        // mass on `r = 0`, so the recent-change mass is exactly 0.0 — i.e. no
+        // change has been observed yet. (The old `P(r=0)` statistic reported
+        // 1.0 here, which is meaningless as a "change probability".)
         let p = model.change_point_probability();
         assert!(
-            (p - 1.0).abs() < 1e-10,
-            "initially change_point_prob should be 1.0 (all mass on r=0), got {}",
-            p
+            (p - 0.0).abs() < 1e-10,
+            "initially change_point_prob should be 0.0 (no recent change), got {p}"
         );
     }
 
