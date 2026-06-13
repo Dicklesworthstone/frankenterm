@@ -183,6 +183,34 @@ pub fn pane_health_snapshot_from_watchdoged_health(
     }
 }
 
+/// Poll every live terminal-state triple-buffer pane in `panes`, refresh
+/// `health` with the resulting per-pane snapshots, and drop retained
+/// snapshots for panes that no longer have a live owner.
+///
+/// This is the GUI frame-timer / status-tick bridge. It lives in the lib
+/// (not the `termwindow` binary module) so the bridge stays unit-testable on
+/// CI/RCH workers that lack the XCB/xkb runtime packages the GUI binary links
+/// against (ft-r9kr6).
+#[must_use]
+pub fn poll_terminal_state_buffer_health_snapshots(
+    panes: &mut TerminalStateTripleBufferRegistry,
+    health: &mut HashMap<u64, PaneHealthSnapshot>,
+    now: Instant,
+    now_ms: u64,
+    alert_policy: ConsecutiveRecyclePolicy,
+) -> Vec<GuiTripleBufferPollReport> {
+    health.retain(|pane_id, _| panes.contains(*pane_id));
+
+    let reports = panes
+        .panes_mut()
+        .map(|pane| pane.poll(now, now_ms, alert_policy))
+        .collect::<Vec<_>>();
+    for report in &reports {
+        health.insert(report.pane_id, report.snapshot);
+    }
+    reports
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +349,48 @@ mod tests {
         }
 
         assert_eq!(pane.watchdog_force_recycle_history_ms(), &[1_200]);
+    }
+
+    #[test]
+    fn terminal_state_health_poll_records_live_snapshots_and_prunes_stale_panes() {
+        let origin = Instant::now();
+        let mut registry = TerminalStateTripleBufferRegistry::default();
+        registry.publish(7, terminal_state(1));
+        registry.publish(8, terminal_state(2));
+
+        {
+            let guard = registry
+                .pane(7)
+                .expect("pane 7 should have a live terminal-state buffer")
+                .acquire(origin);
+            assert_eq!(guard.cursor_row, 1);
+        }
+
+        let mut retained_health = HashMap::new();
+        retained_health.insert(
+            99,
+            PaneHealthSnapshot {
+                pane_id: PaneId(99),
+                force_recycles: 1,
+                watchdog_active: true,
+                ..PaneHealthSnapshot::default()
+            },
+        );
+
+        let reports = poll_terminal_state_buffer_health_snapshots(
+            &mut registry,
+            &mut retained_health,
+            origin + Duration::from_millis(1),
+            1_000,
+            ConsecutiveRecyclePolicy::default(),
+        );
+
+        assert_eq!(reports.len(), 2);
+        assert!(!retained_health.contains_key(&99));
+        assert!(retained_health.contains_key(&7));
+        assert!(retained_health.contains_key(&8));
+        assert_eq!(retained_health[&7].pane_id, PaneId(7));
+        assert_eq!(retained_health[&7].acquires, 1);
+        assert_eq!(retained_health[&7].releases, 1);
     }
 }

@@ -52,7 +52,7 @@ use frankenterm_gui::floating_panes::{
     GuiFloatingPaneController, emit_floating_pane_a11y_messages,
 };
 use frankenterm_gui::triple_buffer_gui::{
-    GuiTripleBufferPollReport, TerminalStateTripleBufferRegistry,
+    TerminalStateTripleBufferRegistry, poll_terminal_state_buffer_health_snapshots,
 };
 use frankenterm_toast_notification::persistent_toast_notification;
 use lfucache::*;
@@ -781,25 +781,6 @@ fn unix_epoch_ms_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
-}
-
-pub(crate) fn poll_terminal_state_buffer_health_snapshots(
-    panes: &mut TerminalStateTripleBufferRegistry,
-    health: &mut HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
-    now: Instant,
-    now_ms: u64,
-    alert_policy: frankenterm_core::triple_buffer_fleet_health::ConsecutiveRecyclePolicy,
-) -> Vec<GuiTripleBufferPollReport> {
-    health.retain(|pane_id, _| panes.contains(*pane_id));
-
-    let reports = panes
-        .panes_mut()
-        .map(|pane| pane.poll(now, now_ms, alert_policy))
-        .collect::<Vec<_>>();
-    for report in &reports {
-        health.insert(report.pane_id, report.snapshot);
-    }
-    reports
 }
 
 /// Snapshot of the workspace-wide ElasticBuffer policy state. Read
@@ -6073,12 +6054,12 @@ mod tests {
         classify_webgpu_surface_error, default_frame_budget_cost_ns,
         evaluate_frame_budget_reduce_motion_gate, frame_budget, mark_cursor_rows_dirty,
         mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
-        pane_health_snapshot_from_watchdoged_health, poll_terminal_state_buffer_health_snapshots,
-        record_drained_frame_budget_ops, record_frame_budget_execution_outstanding,
-        record_sync_output_mux_event, reduce_motion_state_from_preference, render,
-        run_clear_dirty_lines_after_frame, should_force_paint_for_frame_budget,
-        should_run_frame_budget_decision, should_skip_clean_line, terminal_pane_id_to_u64,
-        terminal_u16_from_stable_delta, terminal_u16_from_usize,
+        pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
+        record_frame_budget_execution_outstanding, record_sync_output_mux_event,
+        reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
+        should_force_paint_for_frame_budget, should_run_frame_budget_decision,
+        should_skip_clean_line, terminal_pane_id_to_u64, terminal_u16_from_stable_delta,
+        terminal_u16_from_usize,
     };
 
     #[test]
@@ -6409,54 +6390,6 @@ mod tests {
         assert_eq!(aggregate.total_panes, 2);
         assert_eq!(aggregate.panes_ever_force_recycled, 1);
         assert_eq!(aggregate.total_force_recycles, hung_snapshot.force_recycles);
-    }
-
-    #[test]
-    fn terminal_state_health_poll_records_live_snapshots_and_prunes_stale_panes() {
-        use frankenterm_core::triple_buffer_fleet_health::{
-            ConsecutiveRecyclePolicy, PaneHealthSnapshot, PaneId,
-        };
-        use frankenterm_gui::triple_buffer_gui::TerminalStateTripleBufferRegistry;
-
-        let origin = std::time::Instant::now();
-        let mut registry = TerminalStateTripleBufferRegistry::default();
-        registry.publish(7, terminal_state_for_watchdog_tests(1));
-        registry.publish(8, terminal_state_for_watchdog_tests(2));
-
-        {
-            let guard = registry
-                .pane(7)
-                .expect("pane 7 should have a live terminal-state buffer")
-                .acquire(origin);
-            assert_eq!(guard.cursor_row, 1);
-        }
-
-        let mut retained_health = HashMap::new();
-        retained_health.insert(
-            99,
-            PaneHealthSnapshot {
-                pane_id: PaneId(99),
-                force_recycles: 1,
-                watchdog_active: true,
-                ..PaneHealthSnapshot::default()
-            },
-        );
-
-        let reports = poll_terminal_state_buffer_health_snapshots(
-            &mut registry,
-            &mut retained_health,
-            origin + std::time::Duration::from_millis(1),
-            1_000,
-            ConsecutiveRecyclePolicy::default(),
-        );
-
-        assert_eq!(reports.len(), 2);
-        assert!(!retained_health.contains_key(&99));
-        assert!(retained_health.contains_key(&7));
-        assert!(retained_health.contains_key(&8));
-        assert_eq!(retained_health[&7].pane_id, PaneId(7));
-        assert_eq!(retained_health[&7].acquires, 1);
-        assert_eq!(retained_health[&7].releases, 1);
     }
 
     /// ft-a9eu1: SyncOutputDoctorSnapshot folds both substrate
