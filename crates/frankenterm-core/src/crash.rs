@@ -7341,7 +7341,7 @@ mod tests {
     fn incident_agent_mail_collects_available_read_only_snapshot() {
         let _guard = INCIDENT_AGENT_MAIL_TEST_LOCK
             .lock()
-            .expect("incident Agent Mail test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentAgentMailSnapshot::clear_global_for_test();
 
         IncidentAgentMailSnapshot::update_global(
@@ -7433,7 +7433,7 @@ mod tests {
     fn incident_agent_mail_records_unavailable_after_allowed_retry() {
         let _guard = INCIDENT_AGENT_MAIL_TEST_LOCK
             .lock()
-            .expect("incident Agent Mail test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentAgentMailSnapshot::clear_global_for_test();
 
         IncidentAgentMailSnapshot::update_global(
@@ -7517,7 +7517,7 @@ mod tests {
     fn incident_agent_mail_redacts_attempt_messages_before_payload() {
         let _guard = INCIDENT_AGENT_MAIL_TEST_LOCK
             .lock()
-            .expect("incident Agent Mail test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentAgentMailSnapshot::clear_global_for_test();
 
         IncidentAgentMailSnapshot::update_global(
