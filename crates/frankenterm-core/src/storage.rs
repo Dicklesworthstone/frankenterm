@@ -6048,6 +6048,36 @@ impl StorageHandle {
         .await
     }
 
+    /// List durable limit windows that are still active at `now_ms` (their
+    /// effective reset deadline — parsed reset or conservative TTL — is in the
+    /// future), ordered deterministically by pane/service/account. This is the
+    /// read path behind the `ft robot limits` capacity forecast (W7.2).
+    pub async fn list_active_limit_windows(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<LimitWindowRecord>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_active_limit_windows_with_cx(&cx, now_ms).await
+    }
+
+    /// Cx-first sibling of [`list_active_limit_windows`].
+    pub async fn list_active_limit_windows_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        now_ms: i64,
+    ) -> Result<Vec<LimitWindowRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("list_active_limit_windows cancelled: {err}"))
+        })?;
+        let db_path = self.db_path.clone();
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                list_active_limit_windows_backend(backend, now_ms)
+            })
+        })
+        .await
+    }
+
     /// Select the best account for a service according to selection policy
     ///
     /// This combines fetching accounts with the selection algorithm from the
@@ -13918,6 +13948,26 @@ fn get_limit_window_backend(
         .transpose()
 }
 
+fn list_active_limit_windows_backend(
+    backend: &dyn StorageBackend,
+    now_ms: i64,
+) -> Result<Vec<LimitWindowRecord>> {
+    // Effective reset deadline mirrors `LimitWindowRecord::effective_reset_at_ms`:
+    // the parsed `reset_at` when present, otherwise the conservative
+    // `last_seen_at + conservative_ttl_ms` fallback.
+    let sql = format!(
+        "{} WHERE COALESCE(reset_at, last_seen_at + conservative_ttl_ms) > ?1
+         ORDER BY pane_id ASC, service ASC, account_id ASC",
+        limit_window_select_sql()
+    );
+    let rows = backend
+        .query_map_typed(&sql, &[ToSqlValue::Integer(now_ms)])
+        .map_err(|err| storage_backend_error("Failed to list active limit windows", err))?;
+    rows.iter()
+        .map(|row| limit_window_record_from_backend_row(row))
+        .collect()
+}
+
 // =============================================================================
 // Pane Reservation Sync Operations
 // =============================================================================
@@ -20445,6 +20495,143 @@ fn limit_window_upsert_is_idempotent_by_pane_service_account() {
             .expect("limit window should be queryable by pane/service/account");
         assert_eq!(fetched.id, first.id);
         assert_eq!(fetched.seen_count, 3);
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+    });
+}
+
+#[test]
+fn list_active_limit_windows_filters_expired_and_orders_deterministically() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("limit-window-list.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+        let now = 1_800_000_000_000;
+
+        for pane_id in [10_u64, 20_u64] {
+            storage
+                .upsert_pane_with_cx(
+                    &cx,
+                    PaneRecord {
+                        pane_id,
+                        pane_uuid: Some(format!("pane-{pane_id}")),
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("codex".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let mk = |pane_id: u64,
+                  service: &str,
+                  account_id: &str,
+                  reset_at: Option<i64>,
+                  reset_source: &str,
+                  last_seen_at: i64,
+                  conservative_ttl_ms: i64| LimitWindowRecord {
+            id: 0,
+            pane_id,
+            service: service.to_string(),
+            account_id: account_id.to_string(),
+            account_db_id: None,
+            account_known: false,
+            agent_type: Some("codex".to_string()),
+            rule_id: "codex.usage.reached".to_string(),
+            event_type: "usage.reached".to_string(),
+            limited_at: last_seen_at,
+            reset_at,
+            reset_source: reset_source.to_string(),
+            reset_text: None,
+            conservative_ttl_ms,
+            last_seen_at,
+            seen_count: 1,
+            metadata: None,
+            created_at: last_seen_at,
+            updated_at: last_seen_at,
+        };
+
+        // Active absolute on pane 10 (openai) + active absolute on pane 10
+        // (anthropic) + active unknown_ttl on pane 20 + an expired window on
+        // pane 10 (google) that must be filtered out.
+        for record in [
+            mk(10, "openai", "acct-a", Some(now + 60_000), "absolute", now, 0),
+            mk(
+                10,
+                "anthropic",
+                "acct-d",
+                Some(now + 90_000),
+                "absolute",
+                now,
+                0,
+            ),
+            mk(20, "openai", "acct-b", None, "unknown_ttl", now, 300_000),
+            mk(
+                10,
+                "google",
+                "acct-e",
+                Some(now - 5_000),
+                "absolute",
+                now - 5_000,
+                0,
+            ),
+        ] {
+            storage
+                .upsert_limit_window_with_cx(&cx, record)
+                .await
+                .unwrap();
+        }
+
+        let active = storage
+            .list_active_limit_windows_with_cx(&cx, now)
+            .await
+            .unwrap();
+
+        // Expired window excluded; result ordered by (pane_id, service, account).
+        let keys: Vec<(u64, String, String)> = active
+            .iter()
+            .map(|w| (w.pane_id, w.service.clone(), w.account_id.clone()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (10, "anthropic".to_string(), "acct-d".to_string()),
+                (10, "openai".to_string(), "acct-a".to_string()),
+                (20, "openai".to_string(), "acct-b".to_string()),
+            ],
+        );
+
+        // The unknown_ttl window's effective deadline is last_seen + TTL — the
+        // SQL COALESCE must agree with `effective_reset_at_ms`.
+        let unknown = active
+            .iter()
+            .find(|w| w.pane_id == 20)
+            .expect("pane 20 window present");
+        assert_eq!(unknown.effective_reset_at_ms(), now + 300_000);
+
+        // End-to-end: the read path feeds a deterministic forecast.
+        let forecast = crate::limit_forecast::build_limits_forecast(now, 2, &active);
+        assert_eq!(forecast.limited_now, 2, "panes 10 and 20 are limited");
+        assert_eq!(forecast.usable_now, 0);
+        assert_eq!(forecast.timeline.len(), 2);
+        // Pane 10 recovers at its latest window (now + 90_000), then pane 20.
+        assert_eq!(forecast.timeline[0].at_ms, now + 90_000);
+        assert_eq!(forecast.timeline[0].recovering_panes, vec![10]);
+        assert_eq!(forecast.timeline[0].usable_panes, 1);
+        assert_eq!(forecast.timeline[1].at_ms, now + 300_000);
+        assert_eq!(forecast.timeline[1].recovering_panes, vec![20]);
+        assert_eq!(forecast.timeline[1].usable_panes, 2);
 
         storage.shutdown_with_cx(&cx).await.unwrap();
     });

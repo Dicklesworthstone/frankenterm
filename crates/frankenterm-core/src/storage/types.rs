@@ -923,6 +923,32 @@ pub struct LimitWindowRecord {
     pub updated_at: i64,
 }
 
+impl LimitWindowRecord {
+    /// Effective reset deadline (epoch ms): the parsed [`Self::reset_at`] when
+    /// known, otherwise the conservative deadline
+    /// `last_seen_at + conservative_ttl_ms`. Saturating so a corrupt TTL can
+    /// never overflow.
+    #[must_use]
+    pub fn effective_reset_at_ms(&self) -> i64 {
+        self.reset_at
+            .unwrap_or_else(|| self.last_seen_at.saturating_add(self.conservative_ttl_ms))
+    }
+
+    /// True when the window is still limiting at `now_ms` (its effective reset
+    /// deadline is in the future).
+    #[must_use]
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        self.effective_reset_at_ms() > now_ms
+    }
+
+    /// True unless the reset deadline was a conservative fallback derived from
+    /// an unparseable/missing reset (`reset_source == "unknown_ttl"`).
+    #[must_use]
+    pub fn reset_known(&self) -> bool {
+        self.reset_source != "unknown_ttl"
+    }
+}
+
 /// Aggregated daily summary row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyMetricSummary {
