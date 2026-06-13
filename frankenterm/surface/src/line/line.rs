@@ -73,6 +73,19 @@ impl HyperlinkScanRun {
                 byte_range: start..end,
                 cell_index: cell.cell_index(),
             });
+            // A wide cell occupies `width` columns but contributes a single
+            // grapheme to `text`; the trailing column(s) are blank spacer
+            // cells that `visible_cells()` skips. Emit them as spaces so the
+            // wide grapheme is not glued to the following cell's text. Without
+            // this, a CJK/emoji cell immediately before an ASCII URL (e.g.
+            // "中http://example.com") is swallowed into the rule's `\w+` run
+            // and the whole "中http://example.com" is mis-linked onto the wide
+            // cell. The padding bytes are intentionally NOT recorded in
+            // `self.cells`, so they belong to no cell and can never receive an
+            // implicit hyperlink (mirrors the spacer cells they stand in for).
+            for _ in 1..cell.width() {
+                self.text.push(' ');
+            }
         }
     }
 
