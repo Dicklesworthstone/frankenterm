@@ -435,6 +435,12 @@ config.scrollback_lines = 100000
 config.mux_output_parser_buffer_size = 512 * 1024
 config.mux_output_parser_coalesce_delay_ms = 3
 
+-- Renderer: Metal-backed WebGpu, NOT legacy OpenGL. On Apple Silicon the OpenGL
+-- backend (_NSOpenGLViewBackingLayer) causes multi-second/minute render stalls
+-- under heavy multi-pane agent-swarm output; WebGpu eliminates them.
+config.front_end = "WebGpu"
+config.webgpu_power_preference = "HighPerformance"
+
 -- ============================================================================
 -- GUI STARTUP: one local window + one window per remote frankenterm mux
 -- ============================================================================
