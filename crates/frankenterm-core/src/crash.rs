@@ -2738,6 +2738,7 @@ fn add_pane_text_summaries_source(
             "generated_at": exported_at,
             "captured_at_ms": snapshot.captured_at_ms,
             "freshness_ms": freshness_ms,
+            "source_surface": source_surface.clone(),
             "tail_lines": snapshot.tail_lines,
             "max_summary_bytes": snapshot.max_summary_bytes,
             "privacy_allowed": snapshot.privacy_allowed,
@@ -6309,16 +6310,16 @@ mod tests {
         (
             INCIDENT_ROBOT_STATE_TEST_LOCK
                 .lock()
-                .expect("incident robot-state test lock"),
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
                 .lock()
-                .expect("incident pane text summary test lock"),
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             INCIDENT_PROOF_RCH_EVIDENCE_TEST_LOCK
                 .lock()
-                .expect("incident proof RCH evidence test lock"),
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             INCIDENT_AGENT_MAIL_TEST_LOCK
                 .lock()
-                .expect("incident agent mail test lock"),
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
 
@@ -6438,7 +6439,7 @@ mod tests {
     fn incident_robot_state_source_collects_published_pane_metadata() {
         let _guard = INCIDENT_ROBOT_STATE_TEST_LOCK
             .lock()
-            .expect("incident robot-state test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentRobotStateSnapshot::clear_global_for_test();
 
         let captured_at_ms = epoch_millis();
@@ -6537,7 +6538,7 @@ mod tests {
     fn incident_robot_state_source_records_unavailable_without_provider() {
         let _guard = INCIDENT_ROBOT_STATE_TEST_LOCK
             .lock()
-            .expect("incident robot-state test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentRobotStateSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6581,7 +6582,7 @@ mod tests {
     fn incident_pane_text_summaries_collect_redacted_bounded_rows() {
         let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
             .lock()
-            .expect("incident pane text summary test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentPaneTextSummariesSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6661,7 +6662,7 @@ mod tests {
     fn incident_pane_text_summaries_sanitize_provider_rows_before_payload() {
         let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
             .lock()
-            .expect("incident pane text summary test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentPaneTextSummariesSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6726,7 +6727,7 @@ mod tests {
     fn incident_pane_text_summaries_sanitize_provider_error_messages() {
         let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
             .lock()
-            .expect("incident pane text summary test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentPaneTextSummariesSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6791,7 +6792,7 @@ mod tests {
     fn incident_pane_text_summaries_redact_allowed_privacy_reason() {
         let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
             .lock()
-            .expect("incident pane text summary test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentPaneTextSummariesSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6859,7 +6860,7 @@ mod tests {
     fn incident_pane_text_summaries_redact_provider_source_surface() {
         let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
             .lock()
-            .expect("incident pane text summary test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentPaneTextSummariesSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6932,7 +6933,7 @@ mod tests {
     fn incident_pane_text_summaries_write_privacy_excluded_placeholders() {
         let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
             .lock()
-            .expect("incident pane text summary test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentPaneTextSummariesSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -7012,7 +7013,7 @@ mod tests {
     fn incident_pane_text_summaries_redact_privacy_reason_warnings() {
         let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
             .lock()
-            .expect("incident pane text summary test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentPaneTextSummariesSnapshot::clear_global_for_test();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -7139,7 +7140,7 @@ mod tests {
     fn incident_proof_rch_evidence_collects_retained_snapshot_without_running_proof() {
         let _guard = INCIDENT_PROOF_RCH_EVIDENCE_TEST_LOCK
             .lock()
-            .expect("incident proof RCH evidence test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentProofRchEvidenceSnapshot::clear_global_for_test();
 
         IncidentProofRchEvidenceSnapshot::update_global(
@@ -7243,7 +7244,7 @@ mod tests {
     fn incident_proof_rch_evidence_warns_when_only_setup_chatter_is_attached() {
         let _guard = INCIDENT_PROOF_RCH_EVIDENCE_TEST_LOCK
             .lock()
-            .expect("incident proof RCH evidence test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncidentProofRchEvidenceSnapshot::clear_global_for_test();
 
         IncidentProofRchEvidenceSnapshot::update_global(
@@ -10020,7 +10021,10 @@ not-json
         assert_eq!(payload["counts"]["total"], 4);
         assert_eq!(payload["counts"]["tracked_dirty"], 3);
         assert_eq!(payload["counts"]["untracked"], 1);
-        assert_eq!(payload["counts"]["staged"], 2);
+        // Only `A  Cargo.toml` has an index (X-column) change; ` M` and ` D`
+        // are worktree-only. Per git porcelain XY semantics that is 1 staged
+        // and 2 unstaged entries.
+        assert_eq!(payload["counts"]["staged"], 1);
         assert_eq!(payload["counts"]["unstaged"], 2);
         assert_eq!(payload["counts"]["deleted"], 1);
 
