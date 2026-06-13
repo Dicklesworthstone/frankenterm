@@ -124,12 +124,27 @@ impl WaylandState {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SeatBindings<T: Clone + Eq> {
     keyboard: Option<T>,
     pointer: Option<T>,
     data_device: Option<T>,
     primary_selection: Option<T>,
+}
+
+// Hand-written `Default` so the `T` of `SeatBindings<T>` does not need to be
+// `Default`. The derived impl would add a spurious `T: Default` bound, which the
+// real binding type (`wayland_backend` `ObjectId`) does not satisfy; every field
+// is an `Option<T>` whose default is `None` regardless of `T`.
+impl<T: Clone + Eq> Default for SeatBindings<T> {
+    fn default() -> Self {
+        Self {
+            keyboard: None,
+            pointer: None,
+            data_device: None,
+            primary_selection: None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
