@@ -346,12 +346,29 @@ pub fn is_drained(state: &KillSwitchModelState) -> bool {
 }
 
 /// The bead's load-bearing liveness rule: from any state with
-/// `kill_switch == HardStop`, the model's transition relation
-/// admits a finite path to a drained state (no infinite spinning).
+/// `kill_switch == HardStop` where commit work is in flight, the model's
+/// transition relation admits a finite path to a drained state WITHOUT
+/// requiring an operator to lower the switch (no infinite spinning, and the
+/// kill switch itself drains the work it interrupted).
 ///
-/// This is checked by the test harness's BFS: every visited
-/// state with HardStop must have at least one enabled action
-/// that progresses toward drained, OR it's already drained.
+/// This is checked by the test harness's BFS over every reachable state.
+///
+/// IMPORTANT (ft-ia05b-adjacent vacuity fix): the previous predicate accepted
+/// "flip the kill switch to Off" as progress, which made it **unfalsifiable** —
+/// `enabled_actions` always offers `FlipKillSwitch { to: Off }` while HardStop
+/// is set, so the function could never return `false` and the BFS assertion
+/// proved nothing. The real safety property is that HardStop drains the *work
+/// already in flight* on its own. So:
+///   * Once commit work exists (`Committing` / `Compensating` / any committed
+///     step), a genuine tx-advancing action (e.g. `FailCommit`) MUST be enabled
+///     under HardStop — relying on the operator flipping the switch off is NOT
+///     acceptable here.
+///   * Pre-commit states (`Draft`/`Planned`/`Prepared` with no committed steps)
+///     have nothing to drain; halting until an operator lowers the switch is
+///     the correct behavior, so the absence of a forward action is allowed.
+/// The current model satisfies this; the predicate now *fails* if a regression
+/// (e.g. dropping `FailCommit` from `Committing` under HardStop) strands
+/// in-flight work.
 #[must_use]
 pub fn hard_stop_admits_progress(state: &KillSwitchModelState) -> bool {
     if state.kill_switch != MissionKillSwitchLevel::HardStop {
@@ -360,24 +377,23 @@ pub fn hard_stop_admits_progress(state: &KillSwitchModelState) -> bool {
     if is_drained(state) {
         return true;
     }
-    // Some progressing action MUST be enabled. "Progressing"
-    // means: takes us toward a drained state. The only enabled
-    // non-FlipKillSwitch action when HardStop is set is from
-    // Failed/Compensating/Compensated paths (per
-    // enabled_actions). We allow flipping the switch off as
-    // progress because operators downgrading mid-recovery is a
-    // legitimate path.
-    enabled_actions(state)
+    // A genuine progressing action advances the tx state machine toward a
+    // drained state without lowering the kill switch.
+    let has_progressing_action = enabled_actions(state)
         .iter()
-        .any(|a| !matches!(a, KillSwitchAction::FlipKillSwitch { .. }))
-        || enabled_actions(state).iter().any(|a| {
-            matches!(
-                a,
-                KillSwitchAction::FlipKillSwitch {
-                    to: MissionKillSwitchLevel::Off
-                }
-            )
-        })
+        .any(|a| !matches!(a, KillSwitchAction::FlipKillSwitch { .. }));
+    if has_progressing_action {
+        return true;
+    }
+    // No forward tx action under HardStop is only acceptable when no commit
+    // work is in flight — there is nothing to drain. `committed_steps` can only
+    // be non-empty after `Committing` began, so this correctly demands a real
+    // drain action for any state with potential side effects.
+    let commit_work_in_flight = matches!(
+        state.tx_state,
+        MissionTxState::Committing | MissionTxState::Compensating
+    ) || !state.committed_steps.is_empty();
+    !commit_work_in_flight
 }
 
 // ============================================================================
@@ -447,6 +463,38 @@ mod tests {
         assert_eq!(s.tx_state, MissionTxState::Committed);
         assert!(check_safety(&s).is_empty());
         assert!(is_drained(&s));
+    }
+
+    #[test]
+    fn hard_stop_admits_progress_is_not_vacuous() {
+        // Committing under HardStop genuinely drains: FailCommit is always
+        // enabled, so a real progressing action exists.
+        let mut committing = KillSwitchModelState::initial(2);
+        committing.tx_state = MissionTxState::Committing;
+        committing.kill_switch = MissionKillSwitchLevel::HardStop;
+        committing.committed_steps.insert(0);
+        assert!(hard_stop_admits_progress(&committing));
+
+        // Pre-commit states under HardStop have nothing to drain, so the
+        // absence of a forward action is acceptable (halt until operator).
+        let mut draft = KillSwitchModelState::initial(2);
+        draft.kill_switch = MissionKillSwitchLevel::HardStop;
+        assert!(hard_stop_admits_progress(&draft));
+
+        // The predicate MUST be falsifiable: a synthesized state with commit
+        // work in flight (a committed step) but a tx_state that offers no
+        // forward action under HardStop (`Prepared` gates BeginCommit behind
+        // `!hard`) strands the work — the old "flip-to-Off counts as progress"
+        // predicate could never flag this.
+        let mut stranded = KillSwitchModelState::initial(2);
+        stranded.tx_state = MissionTxState::Prepared;
+        stranded.kill_switch = MissionKillSwitchLevel::HardStop;
+        stranded.committed_steps.insert(0);
+        assert!(
+            !hard_stop_admits_progress(&stranded),
+            "predicate is vacuous: it accepted a state with in-flight commit \
+             work and no drain action under HardStop"
+        );
     }
 
     #[test]

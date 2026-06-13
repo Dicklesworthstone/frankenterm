@@ -325,9 +325,12 @@ static DEVICE_CODE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Device code regex")
 });
 
-/// OAuth URLs with tokens/codes in query params.
+/// OAuth URLs with tokens/codes in query params OR the URL fragment.
+/// The `#` delimiter is required because the OAuth *implicit* flow returns the
+/// token in the fragment (`https://app/cb#access_token=…`), not a query param;
+/// the old `[?&]`-only class let that form leak unredacted.
 static OAUTH_URL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https?://[^\s]*[?&](?:access_token|code|token)=[^\s&;'""]+"#)
+    Regex::new(r#"https?://[^\s]*[?&#](?:access_token|code|token)=[^\s&;'""]+"#)
         .expect("OAuth URL regex")
 });
 
@@ -2536,6 +2539,33 @@ mod tests {
             "ft-3xek9: Google OAuth token leaked: {out:?}"
         );
         assert!(out.contains("[REDACTED:google_oauth_token]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_oauth_implicit_flow_fragment_token() {
+        let r = redactor_with_named_markers();
+        // OAuth implicit flow returns the token in the URL *fragment*, not a
+        // query param. The old `[?&]`-only delimiter let this leak.
+        for (raw, secret) in [
+            (
+                "https://app.example.com/cb#access_token=SECRETtok123456&token_type=bearer",
+                "SECRETtok123456",
+            ),
+            ("https://app.example.com/cb#code=AUTHCODE7890", "AUTHCODE7890"),
+        ] {
+            let msg = format!("redirected to {raw}");
+            let out = r.redact(&msg);
+            // The real security property: the secret value must not survive.
+            // (Which named marker wins the overlap is an implementation detail.)
+            assert!(
+                !out.contains(secret),
+                "OAuth fragment token leaked: {out:?}"
+            );
+            assert!(out.contains("[REDACTED"), "expected a redaction: {out:?}");
+        }
+        // A fragment with no token must NOT be redacted (no false positive).
+        let plain = "see https://example.com/docs#installation for setup";
+        assert_eq!(r.redact(plain), plain);
     }
 
     #[test]
