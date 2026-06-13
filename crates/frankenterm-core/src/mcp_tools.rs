@@ -1963,7 +1963,11 @@ impl ToolHandler for WaCassSearchTool {
         });
 
         match result {
-            Ok(result) => {
+            Ok(mut result) => {
+                // Redact secrets in indexed-session content before returning,
+                // mirroring every other MCP read tool (see
+                // `redact_cass_search_result`).
+                redact_cass_search_result(&mut result);
                 let envelope = McpEnvelope::success(result, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
@@ -2080,7 +2084,11 @@ impl ToolHandler for WaCassViewTool {
             });
 
         match result {
-            Ok(Some(result)) => {
+            Ok(Some(mut result)) => {
+                // Redact secrets in the match line + context before returning,
+                // mirroring every other MCP read tool (see
+                // `redact_cass_view_result`).
+                redact_cass_view_result(&mut result);
                 let envelope = McpEnvelope::success(result, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
@@ -2217,6 +2225,44 @@ fn redact_mcp_pane_state_fields(states: &mut [McpPaneState]) {
         if let Some(ignore_reason) = state.ignore_reason.as_mut() {
             let redacted = REDACTOR.redact(ignore_reason);
             *ignore_reason = redacted;
+        }
+    }
+}
+
+/// Redact secret material in cass search hits before they leave the MCP
+/// surface. Indexed cass sessions routinely contain pasted credentials and
+/// `.env` dumps; every other read tool (`wa.get_text`/`wa.search`/`wa.state`)
+/// redacts its content, so these must too — otherwise a prompt-injected caller
+/// exfiltrates secrets via e.g. `wa.cass_search "sk- OR api_key OR AKIA"`. The
+/// cass-index gate (ft-0uzlr) bounds *which* sessions are readable but says
+/// nothing about *what their content contains*.
+fn redact_cass_search_result(result: &mut CassSearchResult) {
+    for hit in &mut result.hits {
+        if let Some(content) = hit.content.as_mut() {
+            *content = redact_mcp_output_secrets(content);
+        }
+    }
+}
+
+/// Redact secret material in a cass view (match line + surrounding context)
+/// before it leaves the MCP surface. See [`redact_cass_search_result`].
+fn redact_cass_view_result(result: &mut CassViewResult) {
+    if let Some(content) = result
+        .match_line
+        .as_mut()
+        .and_then(|line| line.content.as_mut())
+    {
+        *content = redact_mcp_output_secrets(content);
+    }
+    for lines in [
+        result.context_before.as_mut(),
+        result.context_after.as_mut(),
+    ] {
+        let Some(lines) = lines else { continue };
+        for line in lines {
+            if let Some(content) = line.content.as_mut() {
+                *content = redact_mcp_output_secrets(content);
+            }
         }
     }
 }

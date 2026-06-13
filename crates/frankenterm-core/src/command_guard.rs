@@ -205,20 +205,33 @@ struct SecurityPack {
 // Pack: core.filesystem
 // ---------------------------------------------------------------------------
 
+// `(?:-[a-z]*r[a-z]*|--recursive)` / `(?:-[a-z]*f[a-z]*|--force)`: the
+// short-flag clusters (`-r`, `-rf`, `-R`) AND the GNU long forms. The previous
+// patterns matched only single-dash clusters, so `rm --recursive --force /`
+// (and `rm --force --recursive /`) slipped past the catastrophic-deletion
+// hard-deny entirely — in default `Native` dcg mode these regexes are the whole
+// enforcement, so that was a fail-OPEN on `rm -rf /`-class commands.
 static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*\s+(-[a-z]*f[a-z]*\s+)?|-[a-z]*f[a-z]*\s+(-[a-z]*r[a-z]*\s+)?)\s*(/\s*$|~\s*$|\$HOME\s*$)").unwrap()
+    Regex::new(r"(?i)\brm\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:(?:-[a-z]*f[a-z]*|--force)\s+)?|(?:-[a-z]*f[a-z]*|--force)\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+)?)\s*(/\s*$|~\s*$|\$HOME\s*$)").unwrap()
 });
 static RM_RF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\brm\s+(-[a-z]*r[a-z]*\s+(-[a-z]*f[a-z]*\s+)?|-[a-z]*f[a-z]*\s+(-[a-z]*r[a-z]*\s+)?)",
+        r"(?i)\brm\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:(?:-[a-z]*f[a-z]*|--force)\s+)?|(?:-[a-z]*f[a-z]*|--force)\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+)?)",
     )
     .unwrap()
 });
 static RM_RF_SAFE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*f?[a-z]*\s+)(node_modules|target|__pycache__|\.cache|dist|build|\.next|\.turbo|tmp)\s*(?:;|$|&&|\|\||\||\n)").unwrap()
 });
-static CHMOD_RECURSIVE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bchmod\s+(-[a-z]*R[a-z]*\s+)?(777|666|000)\s").unwrap());
+// Accept the long `--recursive` flag (not just `-R`), and treat any
+// world-writable octal mode as wide-open, not just the literal `777|666|000`
+// — the old list let `chmod -R 757 /x` (and `--recursive 777`) through.
+// `[0-7]{0,2}[2367]` matches a 1–3 digit octal whose final (other) digit has
+// the write bit set; `755`/`644`/`750` stay allowed.
+static CHMOD_RECURSIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bchmod\s+(?:(?:-[a-z]*R[a-z]*|--recursive)\s+)?(?:000|[0-7]{0,2}[2367])\s")
+        .unwrap()
+});
 static DD_OF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bdd\b.*\bof=\s*/dev/(sd[a-z]|nvme|disk|hd[a-z])").unwrap());
 static MKFS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(mkfs|mke2fs)\b").unwrap());
@@ -267,14 +280,29 @@ static PACK_FILESYSTEM: SecurityPack = SecurityPack {
 // Pack: core.git
 // ---------------------------------------------------------------------------
 
-static GIT_PUSH_FORCE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+push\b.*(\s--force\b|\s-f\b)").unwrap());
+// `\bgit\b(?:\s+(?:-flag|key=val))*\s+<subcmd>`: allow global options
+// (`--no-pager`, `-c x=y`, `--git-dir=/x`) between `git` and the subcommand so
+// `git --no-pager push --force` / `git --git-dir=/x reset --hard` no longer
+// bypass the force-push / reset-hard denies. The prefix only consumes
+// flag-shaped or `key=value` tokens, so `git config push.default …` (a non-flag
+// subcommand) is NOT matched — avoiding a false positive. The lease safe rule
+// is broadened the same way so `--force-with-lease` stays exempt with globals.
+static GIT_PUSH_FORCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+push\b.*(\s--force\b|\s-f\b)",
+    )
+    .unwrap()
+});
 static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+push\b[^;&|\n]*--force-with-lease[^;&|\n]*(?:;|$|&&|\|\||\||\n)")
+    Regex::new(r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+push\b[^;&|\n]*--force-with-lease[^;&|\n]*(?:;|$|&&|\|\||\||\n)")
         .unwrap()
 });
-static GIT_RESET_HARD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap());
+static GIT_RESET_HARD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+reset\s+--hard\b",
+    )
+    .unwrap()
+});
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\bgit\s+clean\b[^;&|\n]*(?:-[a-z]*f[a-z]*d[a-z]*|-[a-z]*d[a-z]*f[a-z]*|(?:-[a-z]*f[a-z]*|--force)\b[^;&|\n]*(?:-[a-z]*d[a-z]*|--directory)\b|(?:-[a-z]*d[a-z]*|--directory)\b[^;&|\n]*(?:-[a-z]*f[a-z]*|--force)\b)",
@@ -352,8 +380,14 @@ static SQL_DROP: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SQL_TRUNCATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bTRUNCATE\s+(TABLE\s+)?\w").unwrap());
-static SQL_DELETE_NO_WHERE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bDELETE\s+FROM\s+\w+\s*;").unwrap());
+// Terminate on `;`, end-of-string, or a closing quote/backtick — not only a
+// semicolon. `DELETE FROM users` (no trailing `;`, the normal form for
+// `psql -c`, ORMs, and REPLs) previously slipped through. A `WHERE` clause
+// still keeps the statement allowed because the terminator can't follow the
+// table name when `WHERE` does.
+static SQL_DELETE_NO_WHERE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\bDELETE\s+FROM\s+\w+\s*(?:;|$|["'`])"#).unwrap()
+});
 static SQL_ALTER_DROP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bALTER\s+TABLE\s+\w+\s+DROP\s+(COLUMN|CONSTRAINT|INDEX)\b").unwrap()
 });
@@ -527,8 +561,14 @@ static PACK_CLOUD: SecurityPack = SecurityPack {
 // Pack: system
 // ---------------------------------------------------------------------------
 
-static KILL_MINUS_9: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(kill\s+-9|kill\s+-KILL|killall\s+-9)\b").unwrap());
+// Catch SIGKILL in all common spellings and the `pkill` variant: `-9`,
+// `-KILL`/`-SIGKILL`, and `-s 9` / `-s KILL`. The old rule only matched
+// `kill -9`, `kill -KILL`, `killall -9` — so `pkill -9`, `kill -s 9`,
+// `kill -SIGKILL`, and `killall -KILL` all bypassed it.
+static KILL_MINUS_9: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:p?kill|killall)\s+(?:-9\b|-(?:sig)?kill\b|-s\s*(?:9|(?:sig)?kill)\b)")
+        .unwrap()
+});
 static SYSTEMCTL_STOP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(systemctl|service)\s+(stop|disable|mask)\b").unwrap());
 static REBOOT: LazyLock<Regex> =
@@ -2022,6 +2062,61 @@ mod tests {
         let (rule_id, pack, _reason, _suggestions) = result.unwrap();
         assert!(!rule_id.is_empty());
         assert!(!pack.is_empty());
+    }
+
+    /// Regression: long-flag (`--recursive`/`--force`) spellings and global
+    /// options must not bypass the destructive-command denies. In default
+    /// `Native` dcg mode these regexes are the entire enforcement, so a miss is
+    /// a fail-OPEN on catastrophic commands.
+    #[test]
+    fn stateless_long_flag_bypasses_are_now_denied() {
+        // rm: catastrophic hard-deny (root/home) + general recursive deny.
+        let rid = |cmd: &str| evaluate_stateless(cmd).map(|r| r.0);
+        assert_eq!(
+            rid("rm --recursive --force /").as_deref(),
+            Some("core.filesystem:rm-rf-root")
+        );
+        assert_eq!(
+            rid("rm --force --recursive ~").as_deref(),
+            Some("core.filesystem:rm-rf-root")
+        );
+        assert!(evaluate_stateless("rm --recursive --force /home/u/project").is_some());
+        // chmod: long flag + world-writable mode the old `777|666|000` missed.
+        assert!(evaluate_stateless("chmod --recursive 777 /x").is_some());
+        assert!(evaluate_stateless("chmod -R 757 /x").is_some());
+        // git: global options between `git` and the subcommand.
+        assert!(evaluate_stateless("git --no-pager push --force").is_some());
+        assert!(evaluate_stateless("git -c color.ui=always push --force").is_some());
+        assert!(evaluate_stateless("git --git-dir=/x reset --hard").is_some());
+        // kill: pkill + signal-name + `-s` spellings.
+        assert!(evaluate_stateless("pkill -9 node").is_some());
+        assert!(evaluate_stateless("kill -s 9 1234").is_some());
+        assert!(evaluate_stateless("kill -SIGKILL 1234").is_some());
+        assert!(evaluate_stateless("killall -KILL node").is_some());
+        // DELETE without a trailing semicolon.
+        assert!(evaluate_stateless("DELETE FROM users").is_some());
+    }
+
+    /// Guard against false positives introduced by broadening the denies:
+    /// safe forms must still be allowed.
+    #[test]
+    fn stateless_broadened_denies_do_not_overmatch_safe_commands() {
+        assert!(evaluate_stateless("rm -rf /tmp/scratch").is_some()); // recursive elsewhere still denied
+        assert!(evaluate_stateless("rm file.txt").is_none());
+        assert!(evaluate_stateless("chmod -R 755 /x").is_none());
+        assert!(evaluate_stateless("chmod 644 file").is_none());
+        // --force-with-lease is the SAFE alternative — exempt via the safe rule,
+        // including with global options in front of `push`.
+        assert!(evaluate_stateless("git push --force-with-lease").is_none());
+        assert!(evaluate_stateless("git --no-pager push --force-with-lease").is_none());
+        // a non-flag subcommand named like a flag target must not match.
+        assert!(evaluate_stateless("git config push.default current").is_none());
+        assert!(evaluate_stateless("git reset --soft HEAD~1").is_none());
+        // graceful signals stay allowed.
+        assert!(evaluate_stateless("kill -15 1234").is_none());
+        assert!(evaluate_stateless("kill -TERM 1234").is_none());
+        // DELETE with a WHERE clause is allowed.
+        assert!(evaluate_stateless("DELETE FROM users WHERE id = 1").is_none());
     }
 
     #[test]
