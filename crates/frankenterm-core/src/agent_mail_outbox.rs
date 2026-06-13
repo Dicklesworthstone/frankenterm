@@ -997,6 +997,21 @@ pub fn load_agent_mail_outbox_surface(
     manifest_path: Option<&Path>,
     entry_paths: &[PathBuf],
 ) -> Result<AgentMailOutboxSurface, AgentMailOutboxSurfaceError> {
+    // Fail closed on path traversal (ft-0uzlr class). The manifest and entry
+    // paths are caller-supplied through `ft robot agent-mail-outbox`, an
+    // AI-drivable surface; without containment a caller could point them at an
+    // absolute path or escape the workspace with `..` and turn this read-only
+    // review command into an arbitrary-file probe / unbounded-read DoS. Every
+    // input path that reaches `std::fs::read` below must be a workspace-
+    // relative path with no escaping components. The default manifest is a
+    // trusted in-tree const but is workspace-relative and validates anyway.
+    if let Some(path) = manifest_path {
+        validate_outbox_input_path("manifest", path)?;
+    }
+    for path in entry_paths {
+        validate_outbox_input_path("entry", path)?;
+    }
+
     let manifest_path = manifest_path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTBOX_MANIFEST_PATH));
@@ -1012,6 +1027,12 @@ pub fn load_agent_mail_outbox_surface(
             path: manifest_ref.clone(),
             source,
         })?;
+
+    // The manifest's own `valid` list also reaches `std::fs::read`; a
+    // workspace manifest could still name an escaping path, so guard each.
+    for path in &manifest.valid {
+        validate_repo_relative_path("manifest.valid", path)?;
+    }
 
     let mut input_paths = manifest
         .valid
@@ -1683,6 +1704,24 @@ fn validate_sha256(field: &'static str, value: &str) -> Result<(), AgentMailOutb
     Ok(())
 }
 
+/// Fail-closed guard for a caller-supplied filesystem input path (the
+/// `--manifest` / `--entry` arguments). Rejects non-UTF-8 paths outright and
+/// otherwise delegates to [`validate_repo_relative_path`], so the path must be
+/// a workspace-relative path with no absolute prefix, `~`, backslash, URL
+/// scheme, or `.`/`..`/empty component before it can reach `std::fs::read`.
+fn validate_outbox_input_path(
+    field: &'static str,
+    path: &Path,
+) -> Result<(), AgentMailOutboxValidationError> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| AgentMailOutboxValidationError::UnsafePath {
+            field,
+            value: path.to_string_lossy().into_owned(),
+        })?;
+    validate_repo_relative_path(field, value)
+}
+
 fn validate_repo_relative_path(
     field: &'static str,
     value: &str,
@@ -1972,6 +2011,43 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.delivery_claim == OutboxDeliveryClaim::AgentMailDeliveryRecorded)
+        );
+    }
+
+    #[test]
+    fn outbox_surface_loader_rejects_traversal_input_paths() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        // Absolute path (would read an arbitrary host file).
+        let abs = load_agent_mail_outbox_surface(
+            &workspace_root,
+            None,
+            &[PathBuf::from("/etc/passwd")],
+        );
+        assert!(
+            matches!(
+                abs,
+                Err(AgentMailOutboxSurfaceError::Validation(
+                    AgentMailOutboxValidationError::UnsafePath { .. }
+                ))
+            ),
+            "absolute --entry must be rejected, got {abs:?}"
+        );
+
+        // Parent-escape via `..` (would escape the workspace root).
+        let escape = load_agent_mail_outbox_surface(
+            &workspace_root,
+            Some(Path::new("../../../../etc/hosts")),
+            &[],
+        );
+        assert!(
+            matches!(
+                escape,
+                Err(AgentMailOutboxSurfaceError::Validation(
+                    AgentMailOutboxValidationError::UnsafePath { .. }
+                ))
+            ),
+            "escaping --manifest must be rejected, got {escape:?}"
         );
     }
 
