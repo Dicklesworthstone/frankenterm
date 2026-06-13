@@ -178,7 +178,13 @@ impl NormalGammaSS {
 /// BOCPD model for a single observed time series.
 ///
 /// Tracks the run length posterior distribution and detects change-points when
-/// P(rₜ=0) exceeds the detection threshold.
+/// the *recent-change mass* `P(1 ≤ rₜ ≤ W | x₁:ₜ)` exceeds the detection
+/// threshold. That mass — not `P(rₜ=0)` — is the data-driven alarm: under the
+/// Adams–MacKay recursion with a constant hazard, `P(rₜ=0)` is pinned to the
+/// hazard rate regardless of the data, whereas the short-run mass decays toward
+/// zero under a stable regime and rises toward one when the run-length
+/// posterior collapses after a regime shift (see [`Self::recent_change_mass`]
+/// and ft-ia05b).
 pub struct BocpdModel {
     config: BocpdConfig,
     /// Run length posterior (log-probabilities for numerical stability).
@@ -189,6 +195,12 @@ pub struct BocpdModel {
     observation_count: u64,
     /// Total change-points detected.
     change_point_count: u64,
+    /// Schmitt-trigger latch for the change alarm. Set when the recent-change
+    /// mass crosses `detection_threshold` (and a change-point fires) and held
+    /// until the run re-establishes (mass falls back below the rearm level), so
+    /// a single regime shift produces a single alarm rather than one per
+    /// observation while the new run is still short.
+    change_alarm_latched: bool,
 }
 
 impl BocpdModel {
@@ -197,10 +209,11 @@ impl BocpdModel {
     /// # Panics
     ///
     /// Panics if `hazard_rate` or `detection_threshold` is non-finite, or if
-    /// `detection_threshold` is outside `(0.0, 1.0]`. The change-point
-    /// posterior is a probability, so a threshold above 1.0 could never fire
-    /// (a silently disabled detector) and a threshold at or below 0.0 would
-    /// fire on every observation past `min_observations`.
+    /// `detection_threshold` is outside `(0.0, 1.0]`. The detection statistic
+    /// (the recent-change mass `P(1 ≤ rₜ ≤ W)`) is a probability, so a
+    /// threshold above 1.0 could never fire (a silently disabled detector) and
+    /// a threshold at or below 0.0 would fire on every observation past
+    /// `min_observations`.
     #[must_use]
     pub fn new(config: BocpdConfig) -> Self {
         assert!(
@@ -224,6 +237,7 @@ impl BocpdModel {
             sufficient_stats,
             observation_count: 0,
             change_point_count: 0,
+            change_alarm_latched: false,
         }
     }
 
@@ -292,34 +306,83 @@ impl BocpdModel {
         self.run_length_log_probs = new_log_probs;
         self.sufficient_stats = new_ss;
 
-        // Step 6: Check for change-point
+        // Step 6: Check for change-point.
         //
-        // KNOWN DEFECT (ft-ia05b): `run_length_log_probs[0]` is the normalized
-        // posterior `P(r_t = 0 | x_1:t)`, which under a CONSTANT hazard `h`
-        // equals `h` EXACTLY, independent of the data — the predictive
-        // likelihood cancels between the change-numerator (`h·S`) and the
-        // evidence (`S`). So `change_prob` here is always ≈ the (clamped)
-        // hazard rate, and with the default `detection_threshold = 0.7` >
-        // `hazard_rate = 0.005` this alarm can NEVER fire (a threshold ≤ h
-        // fires on every observation instead). The data-driven signal lives in
-        // the run-length posterior's reset (see `map_run_length`, which the
-        // `detects_regime_change` test shows resets correctly); the proper fix
-        // is to detect a MAP-run-length collapse rather than thresholding
-        // `P(r=0)`. Tracked under ft-ia05b — do not "fix" by only nudging the
-        // threshold; the statistic itself is wrong.
+        // The alarm statistic is the *recent-change mass* `P(1 ≤ r_t ≤ W)`
+        // ([`Self::recent_change_mass`]), NOT `P(r_t = 0)`. Under a constant
+        // hazard `h` the Adams–MacKay recursion pins `P(r_t = 0 | x_1:t)` to
+        // `h` exactly — the predictive likelihood cancels between the
+        // change-numerator (`h·S`) and the evidence (`S`) — so it carries no
+        // data signal (ft-ia05b). The short-run mass, by contrast, decays
+        // toward zero while a regime is stable (the posterior concentrates at
+        // large `r`) and rises toward one when a regime shift collapses the
+        // run-length posterior onto small `r`.
+        //
+        // Firing is gated by a Schmitt trigger so a single shift yields a
+        // single alarm: fire on the rising edge across `detection_threshold`,
+        // then suppress until the new run re-establishes and the mass falls
+        // back below `rearm_level`. Without this, the mass stays high for ~W
+        // observations after a shift and would fire on every one of them — a
+        // snapshot storm across a large fleet.
         if self.observation_count as usize >= self.config.min_observations {
-            let change_prob = self.run_length_log_probs[0].exp();
-            if change_prob >= self.config.detection_threshold {
+            let mass = self.recent_change_mass();
+            let threshold = self.config.detection_threshold;
+            // Hysteresis gap: de-assert well below the fire threshold so noise
+            // near the threshold cannot chatter fire/rearm/fire.
+            let rearm_level = threshold * 0.5;
+            if self.change_alarm_latched {
+                if mass < rearm_level {
+                    self.change_alarm_latched = false;
+                }
+            } else if mass >= threshold {
+                self.change_alarm_latched = true;
                 self.change_point_count = self.change_point_count.saturating_add(1);
                 return Some(ChangePoint {
                     observation_index: self.observation_count,
-                    posterior_probability: change_prob,
+                    posterior_probability: mass,
                     map_run_length: self.map_run_length(),
                 });
             }
         }
 
         None
+    }
+
+    /// Run-length window (in observations) that counts as "recent" for the
+    /// change alarm. A change is signalled when posterior mass concentrates
+    /// within the first `change_window()` run lengths — i.e. the run-length
+    /// posterior has reset.
+    ///
+    /// Derived from `min_observations` (one quarter of it, capped to `[1, 10]`)
+    /// so the window is always strictly shorter than the establishment horizon.
+    /// If the window were as long as `min_observations`, a freshly-established
+    /// run would still fall inside it and the detector would alarm forever.
+    fn change_window(&self) -> usize {
+        (self.config.min_observations / 4).clamp(1, 10)
+    }
+
+    /// Posterior probability that a change-point occurred within the last
+    /// `change_window()` observations: `P(1 ≤ r_t ≤ W | x_1:t)`.
+    ///
+    /// This is the data-driven change alarm. The `r = 0` mass is excluded
+    /// because the Adams–MacKay recursion pins it to the (constant) hazard rate
+    /// regardless of the data (ft-ia05b); the `1..=W` mass, by contrast, is
+    /// near zero under a stable regime (the posterior sits at large `r`) and
+    /// near one just after a regime shift (the posterior collapses onto small
+    /// `r`). Always in `[0.0, 1.0]`.
+    #[must_use]
+    fn recent_change_mass(&self) -> f64 {
+        let window = self.change_window();
+        // run_length_log_probs[0] is r=0 (the hazard floor); sum r in 1..=W.
+        let upper = (window + 1).min(self.run_length_log_probs.len());
+        if upper <= 1 {
+            return 0.0;
+        }
+        // The slice holds log-probabilities of the normalized run-length
+        // posterior, so exp(log_sum_exp(..)) is the contained probability mass.
+        log_sum_exp(&self.run_length_log_probs[1..upper])
+            .exp()
+            .clamp(0.0, 1.0)
     }
 
     /// Maximum a posteriori run length (most likely current run length).
@@ -333,20 +396,17 @@ impl BocpdModel {
             .unwrap_or(0)
     }
 
-    /// Posterior `P(r_t = 0 | x_1:t)` — the run-length-zero mass.
+    /// The current change-point alarm probability: the recent-change mass
+    /// `P(1 ≤ r_t ≤ W | x_1:t)` ([`Self::recent_change_mass`]).
     ///
-    /// NOTE (ft-ia05b): under a constant hazard `h` this is `≈ h` regardless of
-    /// the data (the predictive likelihood cancels in the Adams–MacKay
-    /// recursion), so it is NOT a reliable data-driven change alarm. For actual
-    /// regime-change detection use the run-length posterior's reset
-    /// ([`Self::map_run_length`]); this accessor returns the (near-constant)
-    /// hazard-rate floor.
+    /// This is the data-driven statistic the detector thresholds. It is near
+    /// zero while a regime is stable and rises toward one after a regime shift.
+    /// It deliberately excludes the `r = 0` mass, which the Adams–MacKay
+    /// recursion pins to the constant hazard rate regardless of the data and is
+    /// therefore useless as a change alarm (ft-ia05b). Always in `[0.0, 1.0]`.
     #[must_use]
     pub fn change_point_probability(&self) -> f64 {
-        if self.run_length_log_probs.is_empty() {
-            return 0.0;
-        }
-        self.run_length_log_probs[0].exp()
+        self.recent_change_mass()
     }
 
     /// Total observations processed.
@@ -915,61 +975,104 @@ mod tests {
 
     #[test]
     fn detects_regime_change() {
-        // BOCPD needs multiple observations of the new regime to accumulate
-        // evidence for a change-point. With hazard_rate H, the initial
-        // change-point mass is H, and it grows as new-regime observations
-        // accumulate evidence via higher likelihood under the reset prior.
+        // The detector must actually FIRE on a clear regime shift — driven by
+        // the data, not by the constant hazard floor (ft-ia05b). The earlier
+        // version of this test passed only via a `map_rl < 20` escape clause
+        // because the old `P(r=0)` statistic could never cross the threshold;
+        // this version asserts a real change-point.
         let mut model = BocpdModel::new(BocpdConfig {
-            hazard_rate: 0.1, // expect change every ~10 observations
-            detection_threshold: 0.3,
+            hazard_rate: 0.01,
+            detection_threshold: 0.5,
             min_observations: 10,
             max_run_length: 100,
         });
 
-        // Regime 1: constant values around 10
+        // Regime 1: a stable regime. The run length grows and the
+        // recent-change mass stays near zero, so NO change-point fires.
         for _ in 0..30 {
             let _ = model.update(10.0);
         }
+        assert_eq!(
+            model.change_point_count(),
+            0,
+            "a stable regime must not produce a change-point"
+        );
+        let grown_run = model.map_run_length();
+        assert!(
+            grown_run > 10,
+            "run length should have grown across the stable regime: {grown_run}"
+        );
 
-        // Regime 2: large shift — over many observations, change probability
-        // should grow as the prior-based model explains new data better than
-        // the old-regime posterior.
-        let mut max_change_prob = 0.0f64;
+        // Regime 2: a large shift. The run-length posterior collapses onto
+        // small run lengths, the recent-change mass crosses the threshold, and
+        // a change-point fires within a few observations.
         let mut detected = false;
-        for _ in 0..50 {
-            let cp = model.update(1000.0);
-            let p = model.change_point_probability();
-            if p > max_change_prob {
-                max_change_prob = p;
-            }
-            if cp.is_some() {
+        for _ in 0..10 {
+            if let Some(cp) = model.update(1000.0) {
+                assert!(
+                    cp.posterior_probability >= 0.5,
+                    "change-point fired below the detection threshold: {}",
+                    cp.posterior_probability
+                );
                 detected = true;
                 break;
             }
         }
+        assert!(detected, "should detect the regime shift to a new value");
 
-        // The MAP run length should have shifted from ~30 to a short value,
-        // confirming the model detected the new regime.
-        let map_rl = model.map_run_length();
+        // The MAP run length collapsed across the shift — the canonical
+        // Adams–MacKay reset signature.
         assert!(
-            detected || max_change_prob > 0.1 || map_rl < 20,
-            "should detect regime change: detected={detected}, \
-             max_change_prob={max_change_prob}, map_rl={map_rl}"
+            model.map_run_length() < grown_run,
+            "MAP run length should reset after the change (was {grown_run})"
         );
     }
 
-    // The change-point posterior P(r=0) is a probability and, per the
-    // Adams–MacKay recursion, hovers near the hazard rate even across a
-    // dramatic regime shift (growth and change-point branches weight the
-    // observation by the same predictive). A threshold above 1.0 therefore
-    // can never fire — a silently disabled detector — and one at or below
-    // 0.0 fires on every observation. The constructor rejects both.
-    //
-    // CAVEAT (ft-ia05b): the `(0, 1]` constructor guard does NOT make the
-    // detector work. P(r=0) ≡ hazard exactly under constant hazard, so the
-    // default 0.7 threshold can never fire and any threshold ≤ hazard fires
-    // every step. The real fix is to change the detection statistic (see
-    // `update` Step 6); these range tests only pin the constructor guard.
+    #[test]
+    fn change_probability_is_data_driven_not_hazard_floor() {
+        // Regression guard for ft-ia05b: the change statistic must respond to
+        // the DATA, not collapse to the constant hazard rate. Under the old
+        // (dead) `P(r=0)` statistic this value was identically the hazard rate
+        // (0.2 here) regardless of the data, so BOTH assertions below would
+        // have failed.
+        let mut model = BocpdModel::new(BocpdConfig {
+            hazard_rate: 0.2, // deliberately large; the old bug pinned P(r=0) here
+            detection_threshold: 0.5,
+            min_observations: 10,
+            max_run_length: 100,
+        });
+
+        // A stable regime: the recent-change mass must decay well BELOW the
+        // hazard rate (the old statistic would sit AT 0.2).
+        for _ in 0..40 {
+            model.update(5.0);
+        }
+        let stable = model.change_point_probability();
+        assert!(
+            stable < 0.05,
+            "stable recent-change mass {stable} should decay toward 0, \
+             not sit at the hazard floor (0.2)"
+        );
+
+        // A regime shift must drive the statistic ABOVE the hazard rate and
+        // across the detection threshold.
+        let mut peak = stable;
+        for _ in 0..10 {
+            model.update(500.0);
+            peak = peak.max(model.change_point_probability());
+        }
+        assert!(
+            peak >= 0.5,
+            "post-shift recent-change mass {peak} should cross the threshold"
+        );
+    }
+
+    // The detection statistic — the recent-change mass `P(1 ≤ r ≤ W)` — is a
+    // probability in `[0, 1]`. A threshold above 1.0 could never fire (a
+    // silently disabled detector) and one at or below 0.0 would fire on every
+    // observation past `min_observations`. The constructor rejects both. These
+    // range tests pin that guard; the statistic itself is exercised by
+    // `detects_regime_change` and `change_probability_is_data_driven_not_hazard_floor`.
     #[test]
     #[should_panic(expected = "detection_threshold must be in (0, 1]")]
     fn detection_threshold_above_one_is_rejected() {
