@@ -816,6 +816,37 @@ SEE ALSO:
         dry_run: bool,
     },
 
+    /// Policy-gated operator intervention controls for a pane
+    #[command(after_help = r#"EXAMPLES:
+    ft intervene pause 3 --reason "operator review"
+    ft intervene resume 3
+    ft intervene quarantine 3 --reason "credential leak"
+    ft intervene takeover 3 --reason "manual fix"
+
+SEE ALSO:
+    ft approvals list      Show pending one-shot approval tokens
+    ft audit -k intervene.pause"#)]
+    Intervene {
+        #[command(subcommand)]
+        command: InterveneCommands,
+    },
+
+    /// Inspect and consume one-shot approval tokens
+    #[command(after_help = r#"EXAMPLES:
+    ft approvals list
+    ft approvals list --all --json
+    ft approvals approve 12
+    ft approvals approve AB12CD34
+
+NOTES:
+    `approve` accepts either a queue row id from `ft approvals list` or the
+    original 8-character approval code. Approval consumes the same one-shot
+    token row used by retry/commit approval paths."#)]
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommands,
+    },
+
     /// Show audit trail (recent actions, policy decisions)
     #[command(after_help = r#"EXAMPLES:
     ft audit                          Recent audit records (last 20)
@@ -2485,6 +2516,137 @@ enum AuditCommands {
         /// Poll interval while following (milliseconds)
         #[arg(long, default_value = "1000")]
         poll_interval_ms: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum InterveneCommands {
+    /// Pause agent activity for a pane by taking a manual reservation
+    Pause {
+        /// Pane ID to pause
+        pane_id: u64,
+
+        /// Human-readable reason for the intervention
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Reservation TTL in seconds
+        #[arg(long, default_value = "1800")]
+        ttl: u64,
+
+        /// Approval code to consume inline if policy requires approval
+        #[arg(long)]
+        approval_code: Option<String>,
+
+        /// Preview policy/audit outcome without mutating storage
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Resume agent activity by releasing active intervention reservations
+    Resume {
+        /// Pane ID to resume
+        pane_id: u64,
+
+        /// Approval code to consume inline if policy requires approval
+        #[arg(long)]
+        approval_code: Option<String>,
+
+        /// Preview policy/audit outcome without mutating storage
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Quarantine a pane by taking a manual reservation
+    Quarantine {
+        /// Pane ID to quarantine
+        pane_id: u64,
+
+        /// Human-readable quarantine reason
+        #[arg(long)]
+        reason: String,
+
+        /// Reservation TTL in seconds
+        #[arg(long, default_value = "1800")]
+        ttl: u64,
+
+        /// Approval code to consume inline if policy requires approval
+        #[arg(long)]
+        approval_code: Option<String>,
+
+        /// Preview policy/audit outcome without mutating storage
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Take manual control of a pane by taking a manual reservation
+    Takeover {
+        /// Pane ID to take over
+        pane_id: u64,
+
+        /// Human-readable reason for takeover
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Reservation TTL in seconds
+        #[arg(long, default_value = "1800")]
+        ttl: u64,
+
+        /// Approval code to consume inline if policy requires approval
+        #[arg(long)]
+        approval_code: Option<String>,
+
+        /// Preview policy/audit outcome without mutating storage
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsCommands {
+    /// List approval token queue rows for the current workspace
+    List {
+        /// Include expired and already-consumed approval rows
+        #[arg(long)]
+        all: bool,
+
+        /// Maximum rows to show
+        #[arg(long, short = 'l', default_value = "50")]
+        limit: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Consume a one-shot approval token by row id or approval code
+    Approve {
+        /// Queue row id from `ft approvals list` or an 8-character approval code
+        token: String,
+
+        /// Validate status without consuming the token
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -11692,6 +11854,62 @@ struct RobotReservationsListData {
     total: usize,
 }
 
+#[derive(serde::Serialize)]
+struct ApprovalQueueItem {
+    id: i64,
+    status: String,
+    action_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_id: Option<u64>,
+    created_at: i64,
+    expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used_at: Option<i64>,
+    expires_in_ms: i64,
+    code_hash_prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_version: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    risk_summary: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ApprovalsListData {
+    approvals: Vec<ApprovalQueueItem>,
+    total: usize,
+    active: usize,
+}
+
+#[derive(serde::Serialize)]
+struct ApprovalConsumeData {
+    token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_id: Option<i64>,
+    dry_run: bool,
+    consumed: bool,
+    approval: ApprovalQueueItem,
+}
+
+#[derive(serde::Serialize)]
+struct InterveneCliData {
+    verb: String,
+    pane_id: u64,
+    policy_decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<String>,
+    dry_run: bool,
+    result: frankenterm_core::intervention_console::InterventionResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reservation: Option<RobotReservationInfo>,
+    released_reservations: Vec<RobotReservationInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_id: Option<i64>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct RobotAgentInventorySummary {
     installed: usize,
@@ -15509,6 +15727,227 @@ fn build_ipc_rpc_decision_context(
         context.add_evidence("request_id", request_id);
     }
     serde_json::to_string(&context).ok()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InterventionVerb {
+    Pause,
+    Resume,
+    Quarantine,
+    Takeover,
+}
+
+impl InterventionVerb {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Quarantine => "quarantine",
+            Self::Takeover => "takeover",
+        }
+    }
+
+    const fn audit_action_kind(self) -> &'static str {
+        match self {
+            Self::Pause => "intervene.pause",
+            Self::Resume => "intervene.resume",
+            Self::Quarantine => "intervene.quarantine",
+            Self::Takeover => "intervene.takeover",
+        }
+    }
+
+    const fn policy_action(self) -> frankenterm_core::policy::ActionKind {
+        match self {
+            Self::Resume => frankenterm_core::policy::ActionKind::ReleasePane,
+            Self::Pause | Self::Quarantine | Self::Takeover => {
+                frankenterm_core::policy::ActionKind::ReservePane
+            }
+        }
+    }
+
+    const fn owner_id(self) -> &'static str {
+        match self {
+            Self::Pause => "intervene:pause",
+            Self::Resume => "intervene:resume",
+            Self::Quarantine => "intervene:quarantine",
+            Self::Takeover => "intervene:takeover",
+        }
+    }
+
+    const fn default_reason(self) -> &'static str {
+        match self {
+            Self::Pause => "operator pause",
+            Self::Resume => "operator resume",
+            Self::Quarantine => "operator quarantine",
+            Self::Takeover => "operator manual takeover",
+        }
+    }
+
+    fn action(
+        self,
+        pane_id: u64,
+        reason: &str,
+    ) -> frankenterm_core::intervention_console::InterventionAction {
+        use frankenterm_core::intervention_console::InterventionAction;
+        match self {
+            Self::Pause => InterventionAction::PausePane { pane_id },
+            Self::Resume => InterventionAction::ResumePane { pane_id },
+            Self::Quarantine => InterventionAction::QuarantinePane {
+                pane_id,
+                reason: reason.to_string(),
+            },
+            Self::Takeover => InterventionAction::TakeoverPane { pane_id },
+        }
+    }
+
+    fn release_action_for_owner(
+        owner_id: &str,
+        pane_id: u64,
+    ) -> frankenterm_core::intervention_console::InterventionAction {
+        use frankenterm_core::intervention_console::InterventionAction;
+        match owner_id {
+            "intervene:takeover" => InterventionAction::ReleaseTakeover { pane_id },
+            "intervene:quarantine" => InterventionAction::ReleaseQuarantine { pane_id },
+            _ => InterventionAction::ResumePane { pane_id },
+        }
+    }
+}
+
+fn reservation_info_from_record(
+    r: frankenterm_core::storage::PaneReservation,
+) -> RobotReservationInfo {
+    RobotReservationInfo {
+        id: r.id,
+        pane_id: r.pane_id,
+        owner_kind: r.owner_kind,
+        owner_id: r.owner_id,
+        reason: r.reason,
+        created_at: r.created_at,
+        expires_at: r.expires_at,
+        released_at: r.released_at,
+        status: r.status,
+    }
+}
+
+fn approval_token_status(
+    token: &frankenterm_core::storage::ApprovalTokenRecord,
+    now_ms: i64,
+) -> &'static str {
+    if token.used_at.is_some() {
+        "consumed"
+    } else if token.expires_at < now_ms {
+        "expired"
+    } else {
+        "pending"
+    }
+}
+
+fn approval_code_hash_prefix(code_hash: &str) -> String {
+    const PREFIX_LEN: usize = 19;
+    code_hash.chars().take(PREFIX_LEN).collect()
+}
+
+fn approval_queue_item_from_token(
+    token: frankenterm_core::storage::ApprovalTokenRecord,
+    now_ms: i64,
+) -> ApprovalQueueItem {
+    ApprovalQueueItem {
+        id: token.id,
+        status: approval_token_status(&token, now_ms).to_string(),
+        action_kind: token.action_kind,
+        pane_id: token.pane_id,
+        created_at: token.created_at,
+        expires_at: token.expires_at,
+        used_at: token.used_at,
+        expires_in_ms: token.expires_at.saturating_sub(now_ms),
+        code_hash_prefix: approval_code_hash_prefix(&token.code_hash),
+        plan_hash: token.plan_hash,
+        plan_version: token.plan_version,
+        risk_summary: token.risk_summary,
+    }
+}
+
+fn intervention_plain_output(data: &InterveneCliData) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Intervention {} pane {}: {}\n",
+        data.verb, data.pane_id, data.policy_decision
+    ));
+    if let Some(reason) = &data.decision_reason {
+        out.push_str(&format!("  policy_reason: {reason}\n"));
+    }
+    out.push_str(&format!("  result: {}\n", data.result.message));
+    if let Some(reservation) = &data.reservation {
+        out.push_str(&format!(
+            "  reservation: id={} owner={} expires_at={}\n",
+            reservation.id,
+            reservation.owner_id,
+            format_epoch_ms(reservation.expires_at)
+        ));
+    }
+    for released in &data.released_reservations {
+        out.push_str(&format!(
+            "  released_reservation: id={} owner={}\n",
+            released.id, released.owner_id
+        ));
+    }
+    if let Some(audit_id) = data.audit_id {
+        out.push_str(&format!("  audit_id: {audit_id}\n"));
+    }
+    if data.dry_run {
+        out.push_str("  dry_run: true\n");
+    }
+    out
+}
+
+fn approvals_list_plain_output(data: &ApprovalsListData) -> String {
+    if data.approvals.is_empty() {
+        return "No approval tokens.\n".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<6} {:<9} {:<18} {:<8} {:<12} HASH\n",
+        "ID", "STATUS", "ACTION", "PANE", "EXPIRES_IN"
+    ));
+    for item in &data.approvals {
+        let pane = item
+            .pane_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let expires = if item.expires_in_ms <= 0 {
+            "expired".to_string()
+        } else {
+            format!("{}s", item.expires_in_ms / 1000)
+        };
+        out.push_str(&format!(
+            "{:<6} {:<9} {:<18} {:<8} {:<12} {}\n",
+            item.id, item.status, item.action_kind, pane, expires, item.code_hash_prefix
+        ));
+    }
+    out.push_str(&format!(
+        "\n{} approval token(s), {} active.\n",
+        data.total, data.active
+    ));
+    out
+}
+
+fn approval_consume_plain_output(data: &ApprovalConsumeData) -> String {
+    let action = &data.approval.action_kind;
+    let pane = data
+        .approval
+        .pane_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    if data.dry_run {
+        return format!(
+            "Approval token {} is {} for action={} pane={}.\n",
+            data.approval.id, data.approval.status, action, pane
+        );
+    }
+    format!(
+        "Approval token {} consumed for action={} pane={}.\n",
+        data.approval.id, action, pane
+    )
 }
 
 async fn evaluate_approve(
@@ -22479,6 +22918,7 @@ fn print_herd_wave_doctor_section(report: &serde_json::Value) {
     println!("  MCP: deferred to ft-5bwjf.8");
 }
 
+#[cfg(feature = "subprocess-bridge")]
 fn print_shadow_mode_doctor_section(
     report: &frankenterm_core::shadow_mode_evaluator::ShadowModeDoctorReport,
 ) {
@@ -30559,18 +30999,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::Send {
                             pane_id,
                             text,
-                            no_paste,
-                            no_newline,
                             dry_run,
                             approval_code,
-                            verify_submit,
-                            submit_level,
                             wait_for,
                             timeout_secs,
                             wait_for_regex,
                         } => {
                             use std::fmt::Write as _;
 
+                            let no_paste = false;
+                            let no_newline = false;
+                            let verify_submit = false;
+                            let submit_level: Option<SubmitGuaranteeLevelArg> = None;
                             let redacted_text = redact_for_output(&text);
                             let redacted_wait_for = wait_for
                                 .as_ref()
@@ -37001,7 +37441,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::CoordinationRisk { .. } => unreachable!("handled above"),
                         RobotCommands::BlockerRadar { .. } => unreachable!("handled above"),
                         RobotCommands::ProofDoctor { .. } => unreachable!("handled above"),
-                        RobotCommands::Proof { .. } => unreachable!("handled above"),
                     }
                 }
             }
@@ -38825,6 +39264,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             no_newline,
             dry_run,
             approval_code,
+            verify_submit: _,
+            submit_level: _,
             wait_for,
             timeout_secs,
             wait_for_regex,
@@ -42859,6 +43300,539 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Approvals { command }) => {
+            let db_path = layout.db_path.to_string_lossy();
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let storage =
+                match frankenterm_core::storage::StorageHandle::new_with_cx(&storage_cx, &db_path)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error: Failed to open database: {e}");
+                        eprintln!("Is the watcher running? Try: ft watch --foreground");
+                        std::process::exit(1);
+                    }
+                };
+            let workspace_id = layout.root.to_string_lossy().to_string();
+            let now = now_ms_i64();
+
+            match command {
+                ApprovalsCommands::List { all, limit, json } => {
+                    let tokens = match storage
+                        .list_approval_tokens_with_cx(&storage_cx, &workspace_id, all, limit, now)
+                        .await
+                    {
+                        Ok(tokens) => tokens,
+                        Err(e) => {
+                            eprintln!("Error: Failed to list approval tokens: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let approvals: Vec<ApprovalQueueItem> = tokens
+                        .into_iter()
+                        .map(|token| approval_queue_item_from_token(token, now))
+                        .collect();
+                    let active = approvals
+                        .iter()
+                        .filter(|item| item.status == "pending")
+                        .count();
+                    let data = ApprovalsListData {
+                        total: approvals.len(),
+                        active,
+                        approvals,
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&data)?);
+                    } else {
+                        print!("{}", approvals_list_plain_output(&data));
+                    }
+                }
+                ApprovalsCommands::Approve {
+                    token,
+                    dry_run,
+                    json,
+                } => {
+                    let parsed_id = token.parse::<i64>().ok();
+                    let record = if let Some(token_id) = parsed_id {
+                        if dry_run {
+                            match storage
+                                .get_approval_token_by_id_with_cx(
+                                    &storage_cx,
+                                    token_id,
+                                    &workspace_id,
+                                )
+                                .await
+                            {
+                                Ok(Some(record)) => record,
+                                Ok(None) => {
+                                    eprintln!("Error: No approval token row {token_id}");
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: Failed to read approval token: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else {
+                            match storage
+                                .consume_approval_token_by_id_with_cx(
+                                    &storage_cx,
+                                    token_id,
+                                    &workspace_id,
+                                )
+                                .await
+                            {
+                                Ok(Some(record)) => record,
+                                Ok(None) => {
+                                    eprintln!(
+                                        "Error: Approval token row {token_id} is missing, expired, or already consumed."
+                                    );
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: Failed to consume approval token: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    } else {
+                        let code_hash = frankenterm_core::approval::hash_allow_once_code(&token);
+                        if dry_run {
+                            match storage
+                                .get_approval_token_by_code_with_cx(
+                                    &storage_cx,
+                                    &code_hash,
+                                    &workspace_id,
+                                )
+                                .await
+                            {
+                                Ok(Some(record)) => record,
+                                Ok(None) => {
+                                    eprintln!("Error: No approval token found for that code.");
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: Failed to read approval token: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else {
+                            match storage
+                                .consume_approval_token_by_code_with_cx(
+                                    &storage_cx,
+                                    &code_hash,
+                                    &workspace_id,
+                                )
+                                .await
+                            {
+                                Ok(Some(record)) => record,
+                                Ok(None) => {
+                                    eprintln!(
+                                        "Error: Approval code is invalid, expired, or already consumed."
+                                    );
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: Failed to consume approval token: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    };
+                    let token_id = Some(record.id);
+                    let data = ApprovalConsumeData {
+                        token,
+                        token_id,
+                        dry_run,
+                        consumed: !dry_run,
+                        approval: approval_queue_item_from_token(record, now_ms_i64()),
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&data)?);
+                    } else {
+                        print!("{}", approval_consume_plain_output(&data));
+                    }
+                }
+            }
+
+            storage.shutdown().await?;
+        }
+
+        Some(Commands::Intervene { command }) => {
+            let (verb, pane_id, reason, ttl, approval_code, dry_run, json) = match command {
+                InterveneCommands::Pause {
+                    pane_id,
+                    reason,
+                    ttl,
+                    approval_code,
+                    dry_run,
+                    json,
+                } => (
+                    InterventionVerb::Pause,
+                    pane_id,
+                    reason.unwrap_or_else(|| InterventionVerb::Pause.default_reason().to_string()),
+                    ttl,
+                    approval_code,
+                    dry_run,
+                    json,
+                ),
+                InterveneCommands::Resume {
+                    pane_id,
+                    approval_code,
+                    dry_run,
+                    json,
+                } => (
+                    InterventionVerb::Resume,
+                    pane_id,
+                    InterventionVerb::Resume.default_reason().to_string(),
+                    0,
+                    approval_code,
+                    dry_run,
+                    json,
+                ),
+                InterveneCommands::Quarantine {
+                    pane_id,
+                    reason,
+                    ttl,
+                    approval_code,
+                    dry_run,
+                    json,
+                } => (
+                    InterventionVerb::Quarantine,
+                    pane_id,
+                    reason,
+                    ttl,
+                    approval_code,
+                    dry_run,
+                    json,
+                ),
+                InterveneCommands::Takeover {
+                    pane_id,
+                    reason,
+                    ttl,
+                    approval_code,
+                    dry_run,
+                    json,
+                } => (
+                    InterventionVerb::Takeover,
+                    pane_id,
+                    reason.unwrap_or_else(|| {
+                        InterventionVerb::Takeover.default_reason().to_string()
+                    }),
+                    ttl,
+                    approval_code,
+                    dry_run,
+                    json,
+                ),
+            };
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let storage =
+                match frankenterm_core::storage::StorageHandle::new_with_cx(&storage_cx, &db_path)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error: Failed to open database: {e}");
+                        eprintln!("Is the watcher running? Try: ft watch --foreground");
+                        std::process::exit(1);
+                    }
+                };
+            let workspace_id = layout.root.to_string_lossy().to_string();
+            let _ = storage.expire_stale_reservations_with_cx(&storage_cx).await;
+
+            let stored_pane = storage
+                .get_pane_with_cx(&storage_cx, pane_id)
+                .await
+                .ok()
+                .flatten();
+            let domain = stored_pane.as_ref().map(|pane| pane.domain.clone());
+            let capabilities = resolve_pane_capabilities(
+                pane_id,
+                Some(&storage),
+                Some(layout.ipc_socket_path.as_path()),
+            )
+            .await
+            .capabilities;
+
+            let mut engine = frankenterm_core::policy::PolicyEngine::new(
+                config.safety.rate_limit_per_pane,
+                config.safety.rate_limit_global,
+                config.safety.require_prompt_active,
+            )
+            .with_tuning(&config.tuning)
+            .with_command_gate_config(config.safety.command_gate.clone())
+            .with_policy_rules(config.safety.rules.clone());
+            let raw_summary = format!(
+                "ft intervene {} pane={} reason={}",
+                verb.as_str(),
+                pane_id,
+                reason
+            );
+            let summary = engine.redact_secrets(&raw_summary);
+            let mut input =
+                frankenterm_core::policy::PolicyInput::new(
+                    verb.policy_action(),
+                    frankenterm_core::policy::ActorKind::Human,
+                )
+                .with_surface(frankenterm_core::policy::PolicySurface::Mux)
+                .with_pane(pane_id)
+                .with_capabilities(capabilities)
+                .with_text_summary(&summary)
+                .with_command_text(format!("ft intervene {} {pane_id}", verb.as_str()));
+            if let Some(domain) = domain.clone() {
+                input = input.with_domain(domain);
+            }
+
+            let mut decision = engine.authorize(&input);
+            if !dry_run {
+                decision = match resolve_inline_send_approval(
+                    decision,
+                    &storage,
+                    config.safety.approval.clone(),
+                    &workspace_id,
+                    &input,
+                    &summary,
+                    approval_code.as_deref(),
+                    "human",
+                    "ft intervene",
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        eprintln!(
+                            "Hint: Retry the original intervene command with the exact --approval-code issued for this action."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            }
+
+            let mut console = frankenterm_core::intervention_console::InterventionConsole::new();
+            console.register_pane(pane_id);
+            let mut reservation = None;
+            let mut released_reservations = Vec::new();
+            let mut result = if decision.is_allowed() || dry_run {
+                if dry_run {
+                    console.execute("cli:dry-run", verb.action(pane_id, &reason))
+                } else {
+                    match verb {
+                        InterventionVerb::Pause
+                        | InterventionVerb::Quarantine
+                        | InterventionVerb::Takeover => {
+                            let ttl_ms = i64::try_from(ttl.saturating_mul(1000))
+                                .unwrap_or(i64::MAX);
+                            match storage
+                                .create_reservation_with_cx(
+                                    &storage_cx,
+                                    pane_id,
+                                    "manual",
+                                    verb.owner_id(),
+                                    Some(&reason),
+                                    ttl_ms,
+                                )
+                                .await
+                            {
+                                Ok(record) => {
+                                    reservation = Some(reservation_info_from_record(record));
+                                    console.execute("cli", verb.action(pane_id, &reason))
+                                }
+                                Err(e) => frankenterm_core::intervention_console::InterventionResult {
+                                    success: false,
+                                    message: format!("failed to reserve pane {pane_id}: {e}"),
+                                    previous_state: None,
+                                    new_state: None,
+                                },
+                            }
+                        }
+                        InterventionVerb::Resume => {
+                            match storage
+                                .list_active_reservations_with_cx(&storage_cx)
+                                .await
+                            {
+                                Err(e) => {
+                                    frankenterm_core::intervention_console::InterventionResult {
+                                        success: false,
+                                        message: format!(
+                                            "failed to list active reservations: {e}"
+                                        ),
+                                        previous_state: None,
+                                        new_state: None,
+                                    }
+                                }
+                                Ok(reservations) => {
+                                    if reservations.is_empty() {
+                                        frankenterm_core::intervention_console::InterventionResult {
+                                            success: false,
+                                            message: format!(
+                                                "no active reservation found for pane {pane_id}"
+                                            ),
+                                            previous_state: None,
+                                            new_state: None,
+                                        }
+                                    } else {
+                                        let intervention_reservations: Vec<_> = reservations
+                                            .into_iter()
+                                            .filter(|record| {
+                                                record.pane_id == pane_id
+                                                    && record.owner_kind == "manual"
+                                                    && record.owner_id.starts_with("intervene:")
+                                            })
+                                            .collect();
+                                        if let Some(first) = intervention_reservations.first() {
+                                            let first_owner_id = first.owner_id.clone();
+                                            let replay_action = match first_owner_id.as_str() {
+                                                "intervene:takeover" => {
+                                                    InterventionVerb::Takeover
+                                                        .action(pane_id, &reason)
+                                                }
+                                                "intervene:quarantine" => {
+                                                    InterventionVerb::Quarantine
+                                                        .action(pane_id, &reason)
+                                                }
+                                                _ => {
+                                                    InterventionVerb::Pause.action(pane_id, &reason)
+                                                }
+                                            };
+                                            let _ = console.execute("storage:replay", replay_action);
+                                            for record in intervention_reservations {
+                                                match storage
+                                                    .release_reservation_with_cx(
+                                                        &storage_cx,
+                                                        record.id,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(true) => released_reservations
+                                                        .push(reservation_info_from_record(record)),
+                                                    Ok(false) => {}
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            reservation_id = record.id,
+                                                            "Failed to release intervention reservation: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if released_reservations.is_empty() {
+                                                frankenterm_core::intervention_console::InterventionResult {
+                                                    success: false,
+                                                    message: format!(
+                                                        "no active intervention reservation released for pane {pane_id}"
+                                                    ),
+                                                    previous_state: None,
+                                                    new_state: None,
+                                                }
+                                            } else {
+                                                let release_action =
+                                                    InterventionVerb::release_action_for_owner(
+                                                        &first_owner_id,
+                                                        pane_id,
+                                                    );
+                                                console.execute("cli", release_action)
+                                            }
+                                        } else {
+                                            frankenterm_core::intervention_console::InterventionResult {
+                                                success: false,
+                                                message: format!(
+                                                    "no active intervention reservation found for pane {pane_id}"
+                                                ),
+                                                previous_state: None,
+                                                new_state: None,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                frankenterm_core::intervention_console::InterventionResult {
+                    success: false,
+                    message: decision
+                        .reason()
+                        .unwrap_or("intervention blocked by policy")
+                        .to_string(),
+                    previous_state: None,
+                    new_state: None,
+                }
+            };
+            if decision.requires_approval() && !dry_run {
+                result.success = false;
+                result.message = policy_approval_command(&decision)
+                    .unwrap_or_else(|| "intervention requires approval".to_string());
+            }
+
+            let mut audit_id = None;
+            if !dry_run {
+                let verification_summary = if console.audit_log().is_empty() {
+                    serde_json::to_string(&result).ok()
+                } else {
+                    serde_json::to_string(console.audit_log()).ok()
+                };
+                let audit_result = if decision.requires_approval() {
+                    "requires_approval"
+                } else if result.success {
+                    "success"
+                } else {
+                    "failed"
+                };
+                let audit = frankenterm_core::storage::AuditActionRecord {
+                    id: 0,
+                    ts: now_ms_i64(),
+                    actor_kind: "human".to_string(),
+                    actor_id: None,
+                    correlation_id: None,
+                    pane_id: Some(pane_id),
+                    domain,
+                    action_kind: verb.audit_action_kind().to_string(),
+                    policy_decision: decision.as_str().to_string(),
+                    decision_reason: decision.reason().map(String::from),
+                    rule_id: decision.rule_id().map(String::from),
+                    input_summary: Some(summary.clone()),
+                    verification_summary,
+                    decision_context: decision
+                        .context()
+                        .and_then(|context| serde_json::to_string(context).ok()),
+                    result: audit_result.to_string(),
+                };
+                match storage
+                    .record_audit_action_redacted_with_cx(&storage_cx, audit)
+                    .await
+                {
+                    Ok(id) => audit_id = Some(id),
+                    Err(e) => tracing::warn!("Failed to record intervention audit: {e}"),
+                }
+            }
+
+            let data = InterveneCliData {
+                verb: verb.as_str().to_string(),
+                pane_id,
+                policy_decision: decision.as_str().to_string(),
+                decision_reason: decision.reason().map(String::from),
+                rule_id: decision.rule_id().map(String::from),
+                dry_run,
+                result,
+                reservation,
+                released_reservations,
+                audit_id,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&data)?);
+            } else {
+                print!("{}", intervention_plain_output(&data));
+            }
+
+            storage.shutdown().await?;
+        }
+
         Some(Commands::Event {
             from_uservar,
             pane,
@@ -44084,8 +45058,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let attestation_report = build_attestation_doctor_report(&workspace_root);
             let renderer_slos_report =
                 frankenterm_core::render_quality::renderer_slos_doctor_report();
+            #[cfg(feature = "subprocess-bridge")]
             let shadow_mode_report =
                 frankenterm_core::shadow_mode_evaluator::shadow_mode_doctor_report();
+            #[cfg(not(feature = "subprocess-bridge"))]
+            let shadow_mode_report = serde_json::json!({
+                "schema_version": 1,
+                "status": "feature_unavailable",
+                "feature": "subprocess-bridge",
+                "observe_only": true,
+                "live_mutation_allowed": false,
+                "production_behavior_changed": false,
+            });
             all_checks.push(attestation_doctor_check(&attestation_report));
 
             // Determine overall status
@@ -44172,8 +45156,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 result["attestation"] = attestation_report;
                 result["renderer_slos"] =
                     serde_json::to_value(&renderer_slos_report).unwrap_or(serde_json::Value::Null);
-                result["shadow_mode"] =
-                    serde_json::to_value(&shadow_mode_report).unwrap_or(serde_json::Value::Null);
+                #[cfg(feature = "subprocess-bridge")]
+                {
+                    result["shadow_mode"] = serde_json::to_value(&shadow_mode_report)
+                        .unwrap_or(serde_json::Value::Null);
+                }
+                #[cfg(not(feature = "subprocess-bridge"))]
+                {
+                    result["shadow_mode"] = shadow_mode_report.clone();
+                }
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
                         serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
@@ -44232,7 +45223,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 print_blocker_radar_doctor_section(&blocker_radar_report);
                 print_herd_wave_doctor_section(&herd_wave_report);
                 print_attestation_doctor_section(&attestation_report);
+                #[cfg(feature = "subprocess-bridge")]
                 print_shadow_mode_doctor_section(&shadow_mode_report);
+                #[cfg(not(feature = "subprocess-bridge"))]
+                {
+                    println!();
+                    println!("Shadow Mode:");
+                    println!("  Status: feature unavailable (enable subprocess-bridge)");
+                }
 
                 println!();
                 println!("Renderer SLOs:");
@@ -80457,6 +81455,7 @@ A  docs/new-proof.md\n";
     }
 
     #[test]
+    #[cfg(feature = "subprocess-bridge")]
     fn doctor_json_exposes_shadow_mode_contract() {
         let shadow_mode_report =
             frankenterm_core::shadow_mode_evaluator::shadow_mode_doctor_report();
