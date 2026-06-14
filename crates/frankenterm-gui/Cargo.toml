@@ -39,6 +39,11 @@ path = "benches/renderer_slo/input_to_photon.rs"
 harness = false
 required-features = ["headless-render"]
 
+[[bench]]
+name = "ssim_parity"
+path = "benches/renderer_slo/ssim_parity.rs"
+harness = false
+
 [features]
 # `jemalloc` ships in the default set so release builds get the same
 # fragmentation-resistant allocator as `frankenterm` and `frankenterm-mux-server`.
