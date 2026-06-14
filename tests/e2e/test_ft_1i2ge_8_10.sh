@@ -47,7 +47,7 @@ SCENARIO_ID="ft_1i2ge_8_10_tx_correctness"
 CORRELATION_ID="ft-1i2ge.8.10-${RUN_ID}"
 DEFAULT_TARGET_DIR="target/rch-e2e-ft-1i2ge-8-10-${RUN_ID}"
 REQUESTED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
-if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+if [[ -n "${REQUESTED_TARGET_DIR}" ]]; then
   TARGET_DIR="${REQUESTED_TARGET_DIR}"
 else
   TARGET_DIR="${DEFAULT_TARGET_DIR}"
@@ -111,6 +111,18 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "ft-1i2ge.8.10 tx correctness e2e"
 
+command_requires_subprocess_bridge() {
+  local previous=""
+  local arg
+  for arg in "$@"; do
+    if [[ "${previous}" == "--features" && ",${arg}," == *",subprocess-bridge,"* ]]; then
+      return 0
+    fi
+    previous="${arg}"
+  done
+  return 1
+}
+
 TESTS=(
   "sm_commit_requires_prepared_or_committing"
   "sm_commit_accepts_prepared"
@@ -153,14 +165,29 @@ FAIL_COUNT=0
 
 for test_name in "${TESTS[@]}"; do
   test_stdout_file="${LOG_DIR}/${STDOUT_BASENAME}.${test_name}.stdout.log"
+  test_cmd=(
+    cargo test -p frankenterm-core
+    --features subprocess-bridge
+    --test tx_correctness_suite
+    "${test_name}"
+    --
+    --nocapture
+  )
 
   emit_log "running" "cargo_test" "none" "none" \
     "$(basename "${test_stdout_file}")" "test=${test_name}"
 
+  if ! command_requires_subprocess_bridge "${test_cmd[@]}"; then
+    emit_log "failed" "preflight_features" "required_feature_missing" \
+      "tx_subprocess_bridge_missing" "$(basename "${test_stdout_file}")" \
+      "test=${test_name}"
+    exit 1
+  fi
+
   set +e
   run_rch_cargo_logged "${test_stdout_file}" \
     env CARGO_TARGET_DIR="${TARGET_DIR}" \
-    cargo test -p frankenterm-core --features subprocess-bridge --test tx_correctness_suite "${test_name}" -- --nocapture
+    "${test_cmd[@]}"
   rc=$?
   set -e
 

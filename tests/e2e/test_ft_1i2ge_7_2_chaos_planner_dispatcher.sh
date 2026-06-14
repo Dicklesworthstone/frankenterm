@@ -25,6 +25,18 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
+command_requires_subprocess_bridge() {
+  local previous=""
+  local arg
+  for arg in "$@"; do
+    if [[ "${previous}" == "--features" && ",${arg}," == *",subprocess-bridge,"* ]]; then
+      return 0
+    fi
+    previous="${arg}"
+  done
+  return 1
+}
+
 echo "=== ft-1i2ge.7.2 E2E: Chaos/Fault Injection for Planner+Dispatcher ==="
 echo "Log directory: $LOG_DIR"
 echo ""
@@ -59,12 +71,19 @@ echo ""
 # Step 2: Regression check against tx_e2e_scenario_matrix
 echo "[2/3] Running tx E2E scenario matrix (regression check)..."
 matrix_log="$LOG_DIR/scenario_matrix_${RUN_ID}.log"
+matrix_cmd=(
+  cargo test --package frankenterm-core
+  --features subprocess-bridge
+  --test tx_e2e_scenario_matrix
+  --
+  --nocapture
+)
+if ! command_requires_subprocess_bridge "${matrix_cmd[@]}"; then
+  echo "FAIL: tx_e2e_scenario_matrix command is missing subprocess-bridge" >&2
+  exit 1
+fi
 set +e
-run_rch_cargo_logged "${matrix_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo \
-  test --package frankenterm-core \
-  --features subprocess-bridge \
-  --test tx_e2e_scenario_matrix \
-  -- --nocapture
+run_rch_cargo_logged "${matrix_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" "${matrix_cmd[@]}"
 matrix_rc=$?
 set -e
 if [[ ${matrix_rc} -ne 0 ]]; then
@@ -77,12 +96,19 @@ echo ""
 # Step 3: Regression check against tx_correctness_suite
 echo "[3/3] Running tx correctness suite (regression check)..."
 correctness_log="$LOG_DIR/correctness_suite_${RUN_ID}.log"
+correctness_cmd=(
+  cargo test --package frankenterm-core
+  --features subprocess-bridge
+  --test tx_correctness_suite
+  --
+  --nocapture
+)
+if ! command_requires_subprocess_bridge "${correctness_cmd[@]}"; then
+  echo "FAIL: tx_correctness_suite command is missing subprocess-bridge" >&2
+  exit 1
+fi
 set +e
-run_rch_cargo_logged "${correctness_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo \
-  test --package frankenterm-core \
-  --features subprocess-bridge \
-  --test tx_correctness_suite \
-  -- --nocapture
+run_rch_cargo_logged "${correctness_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" "${correctness_cmd[@]}"
 correctness_rc=$?
 set -e
 if [[ ${correctness_rc} -ne 0 ]]; then
