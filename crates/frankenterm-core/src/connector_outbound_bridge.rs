@@ -53,6 +53,12 @@ pub struct ConnectorOutboundBridgeConfig {
     /// Whether to enforce sandbox capability checks before dispatch.
     #[serde(default = "default_enforce_sandbox")]
     pub enforce_sandbox: bool,
+    /// Per-connector reliability/governor enforcement switch.
+    ///
+    /// Missing connectors remain log-only so existing connectors can be rolled
+    /// into enforcement deliberately.
+    #[serde(default)]
+    pub enforce_connector_admission: HashMap<String, bool>,
 }
 
 fn default_dedup_capacity() -> usize {
@@ -84,6 +90,7 @@ impl Default for ConnectorOutboundBridgeConfig {
             dispatch_history_capacity: default_dispatch_history_capacity(),
             reject_unmatched_events: false,
             enforce_sandbox: default_enforce_sandbox(),
+            enforce_connector_admission: HashMap::new(),
         }
     }
 }
@@ -512,6 +519,14 @@ fn severity_rank(s: OutboundSeverity) -> u8 {
     }
 }
 
+fn circuit_state_reason_code(state: crate::circuit_breaker::CircuitStateKind) -> &'static str {
+    match state {
+        crate::circuit_breaker::CircuitStateKind::Closed => "circuit_closed",
+        crate::circuit_breaker::CircuitStateKind::Open => "circuit_open",
+        crate::circuit_breaker::CircuitStateKind::HalfOpen => "circuit_half_open",
+    }
+}
+
 // =============================================================================
 // Dispatch result
 // =============================================================================
@@ -525,7 +540,7 @@ pub struct OutboundDispatchResult {
     pub deduplicated: bool,
     /// Actions that were dispatched (or queued for dispatch).
     pub actions_dispatched: Vec<DispatchedAction>,
-    /// Actions that were blocked by policy, sandbox, or backpressure.
+    /// Actions that were blocked by policy, sandbox, reliability, governor, or queue gates.
     pub actions_blocked: Vec<BlockedAction>,
 }
 
@@ -548,7 +563,72 @@ pub struct BlockedAction {
     pub action_kind: ConnectorActionKind,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub denial: Option<ConnectorDispatchDenialEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_decision: Option<PolicyDecision>,
+}
+
+/// Machine-readable connector dispatch denial payload.
+///
+/// The human `reason` string remains useful for logs, while this envelope gives
+/// robot/MCP clients a stable code path for policy, sandbox, reliability,
+/// governor, and queue denials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorDispatchDenialEnvelope {
+    pub error_code: String,
+    pub reason_code: String,
+    pub rule_id: String,
+    pub connector_id: String,
+    pub action_kind: ConnectorActionKind,
+    pub at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ConnectorDispatchDenialEnvelope {
+    #[must_use]
+    pub fn new(
+        error_code: impl Into<String>,
+        reason_code: impl Into<String>,
+        rule_id: &str,
+        connector_id: &str,
+        action_kind: ConnectorActionKind,
+        at_ms: u64,
+    ) -> Self {
+        Self {
+            error_code: error_code.into(),
+            reason_code: reason_code.into(),
+            rule_id: rule_id.to_string(),
+            connector_id: connector_id.to_string(),
+            action_kind,
+            at_ms,
+            verdict: None,
+            delay_ms: None,
+            detail: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_verdict(mut self, verdict: impl Into<String>) -> Self {
+        self.verdict = Some(verdict.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.delay_ms = Some(delay_ms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
 }
 
 // =============================================================================
@@ -882,6 +962,25 @@ impl ConnectorOutboundBridge {
         self.sandbox.register_zone(connector, zone);
     }
 
+    /// Enable or disable reliability/governor enforcement for a connector.
+    pub fn set_connector_admission_enforced(
+        &mut self,
+        connector: impl Into<String>,
+        enforce: bool,
+    ) {
+        self.config
+            .enforce_connector_admission
+            .insert(connector.into(), enforce);
+    }
+
+    fn connector_admission_enforced(&self, connector: &str) -> bool {
+        self.config
+            .enforce_connector_admission
+            .get(connector)
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn policy_actor_for_event(event: &OutboundEvent) -> ActorKind {
         match event.source {
             OutboundEventSource::UserAction => ActorKind::Robot,
@@ -1145,6 +1244,17 @@ impl ConnectorOutboundBridge {
                             target_connector: rule.target_connector.clone(),
                             action_kind: rule.action_kind,
                             reason: format!("credential_action: {reason}"),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.credential_denied",
+                                    "credential_action_invalid",
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_detail(reason),
+                            ),
                             policy_decision: None,
                         });
                         continue;
@@ -1168,6 +1278,7 @@ impl ConnectorOutboundBridge {
                 self.telemetry.actions_blocked_policy =
                     self.telemetry.actions_blocked_policy.saturating_add(1);
                 let decision_kind = policy_decision.as_str();
+                let policy_rule_id = policy_decision.rule_id().unwrap_or("policy.unknown");
                 let reason = policy_decision
                     .reason()
                     .unwrap_or("connector action blocked by policy")
@@ -1177,7 +1288,7 @@ impl ConnectorOutboundBridge {
                     connector = %rule.target_connector,
                     action = %rule.action_kind,
                     decision = %decision_kind,
-                    policy_rule_id = policy_decision.rule_id().unwrap_or("policy.unknown"),
+                    policy_rule_id = policy_rule_id,
                     "outbound action blocked by policy"
                 );
                 blocked.push(BlockedAction {
@@ -1185,6 +1296,18 @@ impl ConnectorOutboundBridge {
                     target_connector: rule.target_connector.clone(),
                     action_kind: rule.action_kind,
                     reason: format!("policy({decision_kind}): {reason}"),
+                    denial: Some(
+                        ConnectorDispatchDenialEnvelope::new(
+                            "connector.policy_denied",
+                            policy_rule_id,
+                            &rule.rule_id,
+                            &rule.target_connector,
+                            rule.action_kind,
+                            now_ms,
+                        )
+                        .with_verdict(decision_kind)
+                        .with_detail(reason),
+                    ),
                     policy_decision: Some(policy_decision),
                 });
                 continue;
@@ -1214,6 +1337,17 @@ impl ConnectorOutboundBridge {
                             target_connector: rule.target_connector.clone(),
                             action_kind: rule.action_kind,
                             reason: format!("sandbox: {reason}"),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.sandbox_denied",
+                                    &reason,
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_detail(format!("zone_id={zone_id}")),
+                            ),
                             policy_decision: Some(policy_decision.clone()),
                         });
                         continue;
@@ -1239,6 +1373,17 @@ impl ConnectorOutboundBridge {
                             target_connector: rule.target_connector.clone(),
                             action_kind: rule.action_kind,
                             reason: format!("credential_broker: {reason}"),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.credential_denied",
+                                    "credential_broker_denied",
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_detail(reason),
+                            ),
                             policy_decision: Some(policy_decision.clone()),
                         });
                         continue;
@@ -1254,6 +1399,7 @@ impl ConnectorOutboundBridge {
                 params,
                 created_at_ms: now_ms,
             };
+            let admission_enforced = self.connector_admission_enforced(&action.target_connector);
 
             // 3d. Reliability + governor admission checks. These must run
             // before an action is visible to the production dispatch queue.
@@ -1269,26 +1415,51 @@ impl ConnectorOutboundBridge {
                 }
             };
             if let Some(status) = reliability_block {
-                self.telemetry.actions_blocked_reliability =
-                    self.telemetry.actions_blocked_reliability.saturating_add(1);
                 warn!(
                     rule_id = %rule.rule_id,
                     connector = %rule.target_connector,
                     action = %rule.action_kind,
                     circuit_state = ?status.state,
-                    "outbound action blocked by connector reliability gate"
+                    enforced = admission_enforced,
+                    "outbound action denied by connector reliability gate"
                 );
-                blocked.push(BlockedAction {
-                    rule_id: rule.rule_id.clone(),
-                    target_connector: rule.target_connector.clone(),
-                    action_kind: rule.action_kind,
-                    reason: format!(
-                        "reliability(circuit={:?}, consecutive_failures={}, cooldown_remaining_ms={:?})",
-                        status.state, status.consecutive_failures, status.cooldown_remaining_ms
-                    ),
-                    policy_decision: Some(policy_decision.clone()),
-                });
-                continue;
+                if !admission_enforced {
+                    debug!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        circuit_state = ?status.state,
+                        "connector reliability denial observed in log-only mode"
+                    );
+                } else {
+                    self.telemetry.actions_blocked_reliability =
+                        self.telemetry.actions_blocked_reliability.saturating_add(1);
+                    blocked.push(BlockedAction {
+                        rule_id: rule.rule_id.clone(),
+                        target_connector: rule.target_connector.clone(),
+                        action_kind: rule.action_kind,
+                        reason: format!(
+                            "reliability(circuit={:?}, consecutive_failures={}, cooldown_remaining_ms={:?})",
+                            status.state, status.consecutive_failures, status.cooldown_remaining_ms
+                        ),
+                        denial: Some(
+                            ConnectorDispatchDenialEnvelope::new(
+                                "connector.reliability_denied",
+                                circuit_state_reason_code(status.state),
+                                &rule.rule_id,
+                                &rule.target_connector,
+                                rule.action_kind,
+                                now_ms,
+                            )
+                            .with_detail(format!(
+                                "consecutive_failures={},cooldown_remaining_ms={:?}",
+                                status.consecutive_failures, status.cooldown_remaining_ms
+                            )),
+                        ),
+                        policy_decision: Some(policy_decision.clone()),
+                    });
+                    continue;
+                }
             }
 
             let queue_depth = self.dispatch_queue.len();
@@ -1298,8 +1469,6 @@ impl ConnectorOutboundBridge {
                 governor.evaluate(&action, now_ms)
             };
             if !matches!(&governor_decision.verdict, GovernorVerdict::Allow) {
-                self.telemetry.actions_blocked_governor =
-                    self.telemetry.actions_blocked_governor.saturating_add(1);
                 warn!(
                     rule_id = %rule.rule_id,
                     connector = %rule.target_connector,
@@ -1307,21 +1476,48 @@ impl ConnectorOutboundBridge {
                     verdict = %governor_decision.verdict,
                     reason = %governor_decision.reason,
                     delay_ms = governor_decision.delay_ms,
-                    "outbound action blocked by connector governor"
+                    enforced = admission_enforced,
+                    "outbound action denied by connector governor"
                 );
-                blocked.push(BlockedAction {
-                    rule_id: rule.rule_id.clone(),
-                    target_connector: rule.target_connector.clone(),
-                    action_kind: rule.action_kind,
-                    reason: format!(
-                        "governor({}: {}, delay_ms={})",
-                        governor_decision.verdict,
-                        governor_decision.reason,
-                        governor_decision.delay_ms
-                    ),
-                    policy_decision: Some(policy_decision.clone()),
-                });
-                continue;
+                if !admission_enforced {
+                    debug!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        verdict = %governor_decision.verdict,
+                        reason = %governor_decision.reason,
+                        delay_ms = governor_decision.delay_ms,
+                        "connector governor denial observed in log-only mode"
+                    );
+                } else {
+                    self.telemetry.actions_blocked_governor =
+                        self.telemetry.actions_blocked_governor.saturating_add(1);
+                    blocked.push(BlockedAction {
+                        rule_id: rule.rule_id.clone(),
+                        target_connector: rule.target_connector.clone(),
+                        action_kind: rule.action_kind,
+                        reason: format!(
+                            "governor({}: {}, delay_ms={})",
+                            governor_decision.verdict,
+                            governor_decision.reason,
+                            governor_decision.delay_ms
+                        ),
+                        denial: Some(
+                            ConnectorDispatchDenialEnvelope::new(
+                                "connector.governor_denied",
+                                governor_decision.reason.to_string(),
+                                &rule.rule_id,
+                                &rule.target_connector,
+                                rule.action_kind,
+                                now_ms,
+                            )
+                            .with_verdict(governor_decision.verdict.to_string())
+                            .with_delay_ms(governor_decision.delay_ms),
+                        ),
+                        policy_decision: Some(policy_decision.clone()),
+                    });
+                    continue;
+                }
             }
 
             // 3e. Enqueue
@@ -1334,6 +1530,17 @@ impl ConnectorOutboundBridge {
                     target_connector: rule.target_connector.clone(),
                     action_kind: rule.action_kind,
                     reason: "dispatch_queue_full(capacity=0)".to_string(),
+                    denial: Some(
+                        ConnectorDispatchDenialEnvelope::new(
+                            "connector.queue_denied",
+                            "dispatch_queue_full",
+                            &rule.rule_id,
+                            &rule.target_connector,
+                            rule.action_kind,
+                            now_ms,
+                        )
+                        .with_detail("capacity=0"),
+                    ),
                     policy_decision: Some(policy_decision.clone()),
                 });
                 continue;
@@ -1527,6 +1734,7 @@ mod tests {
         assert_eq!(config.dispatch_history_capacity, 256);
         assert!(!config.reject_unmatched_events);
         assert!(config.enforce_sandbox);
+        assert!(config.enforce_connector_admission.is_empty());
     }
 
     #[test]
@@ -1538,6 +1746,7 @@ mod tests {
             dispatch_history_capacity: 128,
             reject_unmatched_events: true,
             enforce_sandbox: false,
+            enforce_connector_admission: [("slack".to_string(), true)].into(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ConnectorOutboundBridgeConfig = serde_json::from_str(&json).unwrap();
@@ -1545,6 +1754,13 @@ mod tests {
         assert_eq!(deserialized.dedup_ttl_secs, 600);
         assert!(deserialized.reject_unmatched_events);
         assert!(!deserialized.enforce_sandbox);
+        assert_eq!(
+            deserialized
+                .enforce_connector_admission
+                .get("slack")
+                .copied(),
+            Some(true)
+        );
     }
 
     // ---- Event source ----
@@ -2039,6 +2255,7 @@ mod tests {
     #[test]
     fn connector_outbound_bridge_open_circuit_blocks_dispatch_ft_x3211() {
         let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_connector_admission_enforced("slack", true);
         bridge.register_sandbox_zone("slack", permissive_zone());
         bridge.add_rule(make_rule(
             "r1",
@@ -2082,6 +2299,15 @@ mod tests {
                 .reason
                 .contains("reliability(circuit=Open")
         );
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("reliability block should emit typed denial envelope");
+        assert_eq!(denial.error_code, "connector.reliability_denied");
+        assert_eq!(denial.reason_code, "circuit_open");
+        assert_eq!(denial.rule_id, "r1");
+        assert_eq!(denial.connector_id, "slack");
+        assert_eq!(denial.action_kind, ConnectorActionKind::Notify);
         assert_eq!(bridge.pending_action_count(), 0);
 
         let tel = bridge.telemetry();
@@ -2092,6 +2318,60 @@ mod tests {
 
     #[test]
     fn connector_outbound_bridge_governor_blocks_dispatch_ft_x3211() {
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        bridge.set_connector_admission_enforced("slack", true);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let first = make_event("event.first", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let first_result = bridge.process_event(&first).unwrap();
+        assert_eq!(first_result.actions_dispatched.len(), 1);
+
+        let second =
+            make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
+        let second_result = bridge.process_event(&second).unwrap();
+
+        assert!(second_result.actions_dispatched.is_empty());
+        assert_eq!(second_result.actions_blocked.len(), 1);
+        assert!(
+            second_result.actions_blocked[0]
+                .reason
+                .contains("governor(reject: connector_quota_exhausted")
+        );
+        let denial = second_result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("governor block should emit typed denial envelope");
+        assert_eq!(denial.error_code, "connector.governor_denied");
+        assert_eq!(denial.reason_code, "connector_quota_exhausted");
+        assert_eq!(denial.rule_id, "r1");
+        assert_eq!(denial.connector_id, "slack");
+        assert_eq!(denial.action_kind, ConnectorActionKind::Notify);
+        assert_eq!(denial.verdict.as_deref(), Some("reject"));
+        assert_eq!(denial.delay_ms, Some(0));
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_blocked_governor, 1);
+        assert_eq!(tel.actions_blocked_reliability, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_governor_log_only_by_default_ft_x3211() {
         let mut safety = crate::config::SafetyConfig::default();
         safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
             max_actions: 1,
@@ -2117,19 +2397,13 @@ mod tests {
             make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
         let second_result = bridge.process_event(&second).unwrap();
 
-        assert!(second_result.actions_dispatched.is_empty());
-        assert_eq!(second_result.actions_blocked.len(), 1);
-        assert!(
-            second_result.actions_blocked[0]
-                .reason
-                .contains("governor(reject: connector_quota_exhausted")
-        );
-        assert_eq!(bridge.pending_action_count(), 1);
+        assert_eq!(second_result.actions_dispatched.len(), 1);
+        assert!(second_result.actions_blocked.is_empty());
+        assert_eq!(bridge.pending_action_count(), 2);
 
         let tel = bridge.telemetry();
-        assert_eq!(tel.actions_dispatched, 1);
-        assert_eq!(tel.actions_blocked_governor, 1);
-        assert_eq!(tel.actions_blocked_reliability, 0);
+        assert_eq!(tel.actions_dispatched, 2);
+        assert_eq!(tel.actions_blocked_governor, 0);
     }
 
     #[test]

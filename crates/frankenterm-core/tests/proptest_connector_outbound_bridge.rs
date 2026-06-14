@@ -3,7 +3,7 @@
 //! Tests cover routing rule matching, deduplication, sandbox enforcement,
 //! dispatch queue bounds, telemetry accuracy, and serde roundtrips.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use proptest::prelude::*;
@@ -166,6 +166,7 @@ fn arb_config() -> impl Strategy<Value = ConnectorOutboundBridgeConfig> {
                     dispatch_history_capacity: hist_cap,
                     reject_unmatched_events: reject,
                     enforce_sandbox: enforce,
+                    enforce_connector_admission: HashMap::new(),
                 }
             },
         )
