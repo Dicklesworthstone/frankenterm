@@ -7,6 +7,8 @@ use crate::wezterm::{MuxSemanticSnapshot, MuxSemanticZoneKind};
 
 const CAPTURE_CURSOR_PREFIX: &str = "pane";
 const MAX_CLASSIFIER_CAPTURE_BYTES: usize = 32 * 1024;
+const VERIFIED_SUBMIT_CANARY_PREFIX: &str = "\u{2063}ft-vs:";
+const VERIFIED_SUBMIT_CANARY_DIGEST_CHARS: usize = 16;
 
 /// Inputs sampled around a policy-approved send operation.
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +92,8 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
 
     let after_tail = capture_tail(after_text).to_ascii_lowercase();
     let command_lower = input.command_text.trim().to_ascii_lowercase();
+    let verification_canary =
+        extract_verification_canary(input.command_text).map(str::to_ascii_lowercase);
 
     if let Some(evidence_id) = first_anchor_match(
         profile,
@@ -123,6 +127,44 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
             cursor_after,
             vec![evidence_id],
         );
+    }
+
+    if let Some(canary) = verification_canary.as_deref() {
+        return match semantic_canary_status(input.after_semantic_snapshot, canary) {
+            CanarySemanticStatus::Submitted => report_with_profile(
+                SubmitReceiptState::Submitted,
+                profile,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                vec![format!(
+                    "submit_profile:{}:canary_semantic_output_after_input",
+                    profile.id
+                )],
+            ),
+            CanarySemanticStatus::StuckInComposer => report_with_profile(
+                SubmitReceiptState::StuckInComposer,
+                profile,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                vec![format!(
+                    "submit_profile:{}:canary_semantic_input_without_output",
+                    profile.id
+                )],
+            ),
+            CanarySemanticStatus::Missing => unavailable_with_profile(
+                profile,
+                agent_type,
+                attempts,
+                input.polls,
+                cursor_before,
+                cursor_after,
+                "canary_semantic_unavailable",
+            ),
+        };
     }
 
     if semantic_has_output_after_matching_input(input.after_semantic_snapshot, &command_lower) {
@@ -229,6 +271,30 @@ pub fn capture_cursor(pane_id: u64, text: &str) -> String {
     format!(
         "{CAPTURE_CURSOR_PREFIX}:{pane_id}:capture:sha256:{}",
         &digest[..16]
+    )
+}
+
+#[must_use]
+pub fn append_verification_canary(pane_id: u64, command_text: &str) -> String {
+    let marker = verification_canary(pane_id, command_text);
+    let mut marked = String::with_capacity(command_text.len() + marker.len());
+    marked.push_str(command_text);
+    marked.push_str(&marker);
+    marked
+}
+
+#[must_use]
+pub fn verification_canary(pane_id: u64, command_text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"verified-submit-canary-v1");
+    hasher.update(pane_id.to_le_bytes());
+    hasher.update(command_text.len().to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(command_text.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!(
+        "{VERIFIED_SUBMIT_CANARY_PREFIX}{}",
+        &digest[..VERIFIED_SUBMIT_CANARY_DIGEST_CHARS]
     )
 }
 
@@ -378,6 +444,63 @@ fn capture_tail(text: &str) -> &str {
     &text[start..]
 }
 
+fn extract_verification_canary(command_text: &str) -> Option<&str> {
+    let marker_start = command_text.rfind(VERIFIED_SUBMIT_CANARY_PREFIX)?;
+    let marker_end =
+        marker_start + VERIFIED_SUBMIT_CANARY_PREFIX.len() + VERIFIED_SUBMIT_CANARY_DIGEST_CHARS;
+    if marker_end != command_text.len() {
+        return None;
+    }
+    let marker = &command_text[marker_start..marker_end];
+    let digest = &marker[VERIFIED_SUBMIT_CANARY_PREFIX.len()..];
+    digest
+        .chars()
+        .all(|ch| ch.is_ascii_hexdigit())
+        .then_some(marker)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanarySemanticStatus {
+    Submitted,
+    StuckInComposer,
+    Missing,
+}
+
+fn semantic_canary_status(
+    snapshot: Option<&MuxSemanticSnapshot>,
+    canary_lower: &str,
+) -> CanarySemanticStatus {
+    let Some(snapshot) = snapshot else {
+        return CanarySemanticStatus::Missing;
+    };
+    if canary_lower.is_empty() {
+        return CanarySemanticStatus::Missing;
+    }
+
+    if let Some(input_index) = snapshot.zones.iter().rposition(|zone| {
+        zone.semantic_type == MuxSemanticZoneKind::Input
+            && zone.text.to_ascii_lowercase().contains(canary_lower)
+    }) {
+        let has_later_output = snapshot.zones[input_index + 1..].iter().any(|later| {
+            later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
+        });
+        return if has_later_output {
+            CanarySemanticStatus::Submitted
+        } else {
+            CanarySemanticStatus::StuckInComposer
+        };
+    }
+
+    if snapshot.zones.iter().any(|zone| {
+        zone.semantic_type == MuxSemanticZoneKind::Output
+            && zone.text.to_ascii_lowercase().contains(canary_lower)
+    }) {
+        CanarySemanticStatus::Submitted
+    } else {
+        CanarySemanticStatus::Missing
+    }
+}
+
 fn semantic_has_output_after_matching_input(
     snapshot: Option<&MuxSemanticSnapshot>,
     command_lower: &str,
@@ -490,6 +613,17 @@ mod tests {
             after_semantic_snapshot: None,
             attempts: 1,
             polls: 1,
+        }
+    }
+
+    fn zone(kind: MuxSemanticZoneKind, y: isize, text: &str) -> MuxSemanticZone {
+        MuxSemanticZone {
+            start_y: y,
+            start_x: 0,
+            end_y: y,
+            end_x: text.chars().count(),
+            semantic_type: kind,
+            text: text.to_string(),
         }
     }
 
@@ -612,6 +746,90 @@ mod tests {
     }
 
     #[test]
+    fn verification_canary_is_invisible_stable_and_discriminating() {
+        let marked = append_verification_canary(7, "run tests");
+        let marker = verification_canary(7, "run tests");
+
+        assert_eq!(
+            marked,
+            format!("run tests{marker}"),
+            "marker must append at payload end"
+        );
+        assert!(marker.starts_with("\u{2063}ft-vs:"));
+        assert_eq!(marker, verification_canary(7, "run tests"));
+        assert_ne!(marker, verification_canary(8, "run tests"));
+        assert_ne!(marker, verification_canary(7, "run something else"));
+    }
+
+    #[test]
+    fn canary_semantic_output_after_input_is_submitted() {
+        let profile = profile();
+        let marked = append_verification_canary(7, "run tests");
+        let snapshot = MuxSemanticSnapshot {
+            zones: vec![
+                zone(MuxSemanticZoneKind::Input, 0, &marked),
+                zone(MuxSemanticZoneKind::Output, 1, "Running"),
+            ],
+            last_exit_code: None,
+        };
+
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            command_text: &marked,
+            after_semantic_snapshot: Some(&snapshot),
+            after_text: Some("run tests\nRunning"),
+            ..input(Some(&profile), Some("run tests\nRunning"))
+        });
+
+        assert_eq!(report.state, SubmitReceiptState::Submitted);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:codex.default:canary_semantic_output_after_input"]
+        );
+    }
+
+    #[test]
+    fn canary_latest_input_without_output_stays_stuck_despite_text_anchors() {
+        let profile = profile();
+        let marked = append_verification_canary(7, "run tests");
+        let snapshot = MuxSemanticSnapshot {
+            zones: vec![zone(MuxSemanticZoneKind::Input, 0, &marked)],
+            last_exit_code: None,
+        };
+
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            command_text: &marked,
+            after_semantic_snapshot: Some(&snapshot),
+            after_text: Some("Thinking\n"),
+            ..input(Some(&profile), Some("Thinking\n"))
+        });
+
+        assert_eq!(report.state, SubmitReceiptState::StuckInComposer);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:codex.default:canary_semantic_input_without_output"]
+        );
+    }
+
+    #[test]
+    fn canary_missing_semantic_evidence_does_not_fall_back_to_text_submission() {
+        let profile = profile();
+        let marked = append_verification_canary(7, "run tests");
+
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            command_text: &marked,
+            after_text: Some("Thinking\n"),
+            after_semantic_snapshot: None,
+            ..input(Some(&profile), Some("Thinking\n"))
+        });
+
+        assert_eq!(report.state, SubmitReceiptState::VerificationUnavailable);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:codex.default:canary_semantic_unavailable"]
+        );
+    }
+
+    #[test]
     fn capture_delta_without_command_echo_is_submitted() {
         let profile = profile();
         let report = classify_verified_submit(input(Some(&profile), Some("done\n")));
@@ -666,9 +884,21 @@ mod tests {
     #[test]
     fn idempotency_key_is_stable_and_discriminating() {
         let a = idempotency_key(7, "deploy now", None);
-        assert_eq!(a, idempotency_key(7, "deploy now", None), "stable for same inputs");
-        assert_ne!(a, idempotency_key(7, "deploy later", None), "text must matter");
-        assert_ne!(a, idempotency_key(8, "deploy now", None), "pane must matter");
+        assert_eq!(
+            a,
+            idempotency_key(7, "deploy now", None),
+            "stable for same inputs"
+        );
+        assert_ne!(
+            a,
+            idempotency_key(7, "deploy later", None),
+            "text must matter"
+        );
+        assert_ne!(
+            a,
+            idempotency_key(8, "deploy now", None),
+            "pane must matter"
+        );
         assert_ne!(
             a,
             idempotency_key(7, "deploy now", Some("nonce")),

@@ -29869,6 +29869,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     submit_agent_type,
                                 );
                                 let use_verified_submit_path = submit_profile.is_some();
+                                let verified_submit_text = (use_verified_submit_path
+                                    && !text.trim().is_empty())
+                                .then(|| {
+                                    frankenterm_core::verified_submit::append_verification_canary(
+                                        pane_id, &text,
+                                    )
+                                });
+                                let outbound_submit_text =
+                                    verified_submit_text.as_deref().unwrap_or(&text);
 
                                 let mut engine = PolicyEngine::new(
                                     config.safety.rate_limit_per_pane,
@@ -29942,7 +29951,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         let send_result = if use_verified_submit_path {
                                             match wezterm
                                                 .send_text_with_options_with_cx(
-                                                    &cx, pane_id, &text, false, true,
+                                                    &cx,
+                                                    pane_id,
+                                                    outbound_submit_text,
+                                                    false,
+                                                    true,
                                                 )
                                                 .await
                                             {
@@ -30095,7 +30108,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             &wezterm,
                                             &cx,
                                             pane_id,
-                                            &text,
+                                            outbound_submit_text,
                                             submit_agent_type,
                                             submit_profile.as_ref(),
                                             submit_before_text.as_deref(),
@@ -38064,6 +38077,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     submit_agent_type,
                 );
                 let use_verified_submit_path = submit_profile.is_some() && !no_newline;
+                let verified_submit_text = (use_verified_submit_path && !text.trim().is_empty())
+                    .then(|| {
+                        frankenterm_core::verified_submit::append_verification_canary(
+                            pane_id, &text,
+                        )
+                    });
+                let outbound_submit_text = verified_submit_text.as_deref().unwrap_or(&text);
 
                 let mut engine = frankenterm_core::policy::PolicyEngine::new(
                     config.safety.rate_limit_per_pane,
@@ -38128,7 +38148,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                         let send_result = if use_verified_submit_path {
                             match wezterm
-                                .send_text_with_options_with_cx(&cx, pane_id, &text, no_paste, true)
+                                .send_text_with_options_with_cx(
+                                    &cx,
+                                    pane_id,
+                                    outbound_submit_text,
+                                    no_paste,
+                                    true,
+                                )
                                 .await
                             {
                                 Ok(()) => {
@@ -38275,7 +38301,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             &wezterm,
                             &cx,
                             pane_id,
-                            &text,
+                            outbound_submit_text,
                             submit_agent_type,
                             effective_submit_profile,
                             submit_before_text.as_deref(),
