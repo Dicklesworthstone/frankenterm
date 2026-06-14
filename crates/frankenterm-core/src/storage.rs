@@ -9713,7 +9713,7 @@ fn dispatch_write_command_raw(
         #[cfg(test)]
         WriteCommand::PanicForTest { respond } => {
             let _respond = WriterResultResponder::new(respond);
-            panic!("storage writer panic injection for test");
+            std::panic::panic_any("storage writer panic injection for test");
         }
         WriteCommand::Shutdown { respond } => {
             let respond = WriterShutdownResponder::new(respond);

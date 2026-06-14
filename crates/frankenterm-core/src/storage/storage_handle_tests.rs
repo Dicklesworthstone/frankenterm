@@ -887,6 +887,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
             content: "late".to_string(),
             content_hash: None,
             respond: append_tx,
+            zone_type: None,
         })
         .is_ok()
     );
