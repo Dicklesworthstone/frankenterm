@@ -13,6 +13,15 @@ use std::cmp::Ordering;
 use std::convert::TryFrom;
 use window::{KeyCode, Modifiers};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DomainCommandEntry {
+    name: String,
+    label: String,
+    state: DomainState,
+    spawnable: bool,
+    detachable: bool,
+}
+
 /// Describes an argument/parameter/context that is required
 /// in order for the command to have meaning.
 /// The intent is for this to be used when filtering the items
@@ -79,6 +88,116 @@ pub struct ExpandedCommand {
     pub keys: Vec<(Modifiers, KeyCode)>,
     pub menubar: &'static [&'static str],
     pub icon: Option<Cow<'static, str>>,
+}
+
+fn domain_display_label(name: &str, label: &str) -> String {
+    if label.is_empty() || label == name {
+        format!("domain `{name}`")
+    } else {
+        format!("domain `{name}` - {label}")
+    }
+}
+
+fn collect_domain_command_entries_sync(mux: &Mux) -> Vec<DomainCommandEntry> {
+    let mut domains = mux.iter_domains();
+    domains.sort_by(|a, b| {
+        let a_state = a.state();
+        let b_state = b.state();
+        if a_state != b_state {
+            return if a_state == DomainState::Attached {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        a.domain_id().cmp(&b.domain_id())
+    });
+
+    domains
+        .iter()
+        .map(|dom| {
+            let name = dom.domain_name().to_string();
+            DomainCommandEntry {
+                label: domain_display_label(&name, &name),
+                name,
+                state: dom.state(),
+                spawnable: dom.spawnable(),
+                detachable: dom.detachable(),
+            }
+        })
+        .collect()
+}
+
+async fn collect_domain_command_entries_async(mux: &Mux) -> Vec<DomainCommandEntry> {
+    let mut domains = mux.iter_domains();
+    domains.sort_by(|a, b| {
+        let a_state = a.state();
+        let b_state = b.state();
+        if a_state != b_state {
+            return if a_state == DomainState::Attached {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        a.domain_id().cmp(&b.domain_id())
+    });
+
+    let mut entries = Vec::with_capacity(domains.len());
+    for dom in &domains {
+        let name = dom.domain_name().to_string();
+        let label = dom.domain_label().await;
+        entries.push(DomainCommandEntry {
+            label: domain_display_label(&name, &label),
+            name,
+            state: dom.state(),
+            spawnable: dom.spawnable(),
+            detachable: dom.detachable(),
+        });
+    }
+    entries
+}
+
+fn push_domain_commands(result: &mut Vec<ExpandedCommand>, domains: &[DomainCommandEntry]) {
+    for dom in domains {
+        if dom.spawnable {
+            if dom.state == DomainState::Attached {
+                result.push(ExpandedCommand {
+                    brief: format!("New Tab ({})", dom.label).into(),
+                    doc: "".into(),
+                    keys: vec![],
+                    action: KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
+                        domain: SpawnTabDomain::DomainName(dom.name.clone()),
+                        ..SpawnCommand::default()
+                    }),
+                    menubar: &["Shell"],
+                    icon: Some("md_tab_plus".into()),
+                });
+            } else {
+                result.push(ExpandedCommand {
+                    brief: format!("Attach {}", dom.label).into(),
+                    doc: "".into(),
+                    keys: vec![],
+                    action: KeyAssignment::AttachDomain(dom.name.clone()),
+                    menubar: &["Shell", "Attach"],
+                    icon: Some("md_pipe".into()),
+                });
+            }
+        }
+    }
+
+    for dom in domains {
+        if domain_detach_command_is_available(&dom.name, dom.state, dom.detachable) {
+            result.push(ExpandedCommand {
+                brief: format!("Detach {}", dom.label).into(),
+                doc: "".into(),
+                keys: vec![],
+                action: KeyAssignment::DetachDomain(SpawnTabDomain::DomainName(dom.name.clone())),
+                menubar: &["Shell", "Detach"],
+                icon: Some("md_pipe_disconnected".into()),
+            });
+        }
+    }
 }
 
 impl std::fmt::Debug for CommandDef {
@@ -204,7 +323,40 @@ impl CommandDef {
         result
     }
 
+    /// Produces the palette commands with async domain labels resolved.
+    pub async fn actions_for_palette(config: &ConfigHandle) -> Vec<ExpandedCommand> {
+        match Mux::try_get() {
+            Some(mux) => {
+                let domains = collect_domain_command_entries_async(&mux).await;
+                Self::actions_for_palette_and_menubar_with_domain_entries(
+                    config,
+                    Some(mux.as_ref()),
+                    &domains,
+                )
+            }
+            None => Self::actions_for_palette_and_menubar_with_domain_entries(config, None, &[]),
+        }
+    }
+
     pub fn actions_for_palette_and_menubar(config: &ConfigHandle) -> Vec<ExpandedCommand> {
+        match Mux::try_get() {
+            Some(mux) => {
+                let domains = collect_domain_command_entries_sync(&mux);
+                Self::actions_for_palette_and_menubar_with_domain_entries(
+                    config,
+                    Some(mux.as_ref()),
+                    &domains,
+                )
+            }
+            None => Self::actions_for_palette_and_menubar_with_domain_entries(config, None, &[]),
+        }
+    }
+
+    fn actions_for_palette_and_menubar_with_domain_entries(
+        config: &ConfigHandle,
+        mux: Option<&Mux>,
+        domains: &[DomainCommandEntry],
+    ) -> Vec<ExpandedCommand> {
         let mut result = Self::expanded_commands(config);
 
         // Generate some stuff based on the config
@@ -227,68 +379,8 @@ impl CommandDef {
         }
 
         // Generate some stuff based on the mux state
-        if let Some(mux) = Mux::try_get() {
-            let mut domains = mux.iter_domains();
-            domains.sort_by(|a, b| {
-                let a_state = a.state();
-                let b_state = b.state();
-                if a_state != b_state {
-                    return if a_state == DomainState::Attached {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    };
-                }
-                a.domain_id().cmp(&b.domain_id())
-            });
-            for dom in &domains {
-                let name = dom.domain_name();
-                // FIXME: use domain_label here, but needs to be async
-                let label = name;
-
-                if dom.spawnable() {
-                    if dom.state() == DomainState::Attached {
-                        result.push(ExpandedCommand {
-                            brief: format!("New Tab (Domain {label})").into(),
-                            doc: "".into(),
-                            keys: vec![],
-                            action: KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
-                                domain: SpawnTabDomain::DomainName(name.to_string()),
-                                ..SpawnCommand::default()
-                            }),
-                            menubar: &["Shell"],
-                            icon: Some("md_tab_plus".into()),
-                        });
-                    } else {
-                        result.push(ExpandedCommand {
-                            brief: format!("Attach Domain {label}").into(),
-                            doc: "".into(),
-                            keys: vec![],
-                            action: KeyAssignment::AttachDomain(name.to_string()),
-                            menubar: &["Shell", "Attach"],
-                            icon: Some("md_pipe".into()),
-                        });
-                    }
-                }
-            }
-            for dom in &domains {
-                let name = dom.domain_name();
-                // FIXME: use domain_label here, but needs to be async
-                let label = name;
-
-                if domain_detach_command_is_available(name, dom.state(), dom.detachable()) {
-                    result.push(ExpandedCommand {
-                        brief: format!("Detach Domain {label}").into(),
-                        doc: "".into(),
-                        keys: vec![],
-                        action: KeyAssignment::DetachDomain(SpawnTabDomain::DomainName(
-                            name.to_string(),
-                        )),
-                        menubar: &["Shell", "Detach"],
-                        icon: Some("md_pipe_disconnected".into()),
-                    });
-                }
-            }
+        if let Some(mux) = mux {
+            push_domain_commands(&mut result, domains);
 
             let active_workspace = mux.active_workspace();
             for workspace in mux.iter_workspaces() {
@@ -2119,4 +2211,130 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        name: &str,
+        label: &str,
+        state: DomainState,
+        spawnable: bool,
+        detachable: bool,
+    ) -> DomainCommandEntry {
+        DomainCommandEntry {
+            name: name.to_string(),
+            label: domain_display_label(name, label),
+            state,
+            spawnable,
+            detachable,
+        }
+    }
+
+    #[test]
+    fn domain_command_labels_fall_back_to_launcher_shape() {
+        assert_eq!(domain_display_label("ssh", ""), "domain `ssh`");
+        assert_eq!(domain_display_label("ssh", "ssh"), "domain `ssh`");
+        assert_eq!(
+            domain_display_label("ssh", "production"),
+            "domain `ssh` - production"
+        );
+    }
+
+    #[test]
+    fn domain_commands_use_async_friendly_labels_for_spawn_attach_and_detach() {
+        let domains = vec![
+            entry("ssh-prod", "Production", DomainState::Attached, true, true),
+            entry("serial-lab", "Rack Lab", DomainState::Detached, true, true),
+        ];
+        let mut commands = Vec::new();
+        push_domain_commands(&mut commands, &domains);
+
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.brief == "New Tab (domain `ssh-prod` - Production)")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.brief == "Attach domain `serial-lab` - Rack Lab")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.brief == "Detach domain `ssh-prod` - Production")
+        );
+
+        let spawn = commands
+            .iter()
+            .find(|cmd| cmd.brief == "New Tab (domain `ssh-prod` - Production)")
+            .expect("spawn command with friendly domain label");
+        assert!(matches!(
+            &spawn.action,
+            KeyAssignment::SpawnCommandInNewTab(cmd)
+                if cmd.domain == SpawnTabDomain::DomainName("ssh-prod".to_string())
+        ));
+
+        let attach = commands
+            .iter()
+            .find(|cmd| cmd.brief == "Attach domain `serial-lab` - Rack Lab")
+            .expect("attach command with friendly domain label");
+        assert!(matches!(
+            &attach.action,
+            KeyAssignment::AttachDomain(name) if name == "serial-lab"
+        ));
+
+        let detach = commands
+            .iter()
+            .find(|cmd| cmd.brief == "Detach domain `ssh-prod` - Production")
+            .expect("detach command with friendly domain label");
+        assert!(matches!(
+            &detach.action,
+            KeyAssignment::DetachDomain(SpawnTabDomain::DomainName(name))
+                if name == "ssh-prod"
+        ));
+    }
+
+    #[test]
+    fn domain_commands_preserve_raw_and_empty_label_fallbacks() {
+        let domains = vec![
+            entry("local", "local", DomainState::Attached, true, false),
+            entry("empty", "", DomainState::Detached, true, false),
+        ];
+        let mut commands = Vec::new();
+        push_domain_commands(&mut commands, &domains);
+
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.brief == "New Tab (domain `local`)")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.brief == "Attach domain `empty`")
+        );
+    }
+
+    #[test]
+    fn detach_domain_commands_require_detachable_attached_non_local_domain() {
+        let domains = vec![
+            entry("local", "Local", DomainState::Attached, true, true),
+            entry("remote", "Remote", DomainState::Attached, true, false),
+            entry("detached", "Detached", DomainState::Detached, true, true),
+            entry("ssh", "SSH", DomainState::Attached, true, true),
+        ];
+        let mut commands = Vec::new();
+        push_domain_commands(&mut commands, &domains);
+
+        let detach_briefs: Vec<&str> = commands
+            .iter()
+            .filter(|cmd| matches!(cmd.action, KeyAssignment::DetachDomain(_)))
+            .map(|cmd| cmd.brief.as_ref())
+            .collect();
+        assert_eq!(detach_briefs, vec!["Detach domain `ssh` - SSH"]);
+    }
 }

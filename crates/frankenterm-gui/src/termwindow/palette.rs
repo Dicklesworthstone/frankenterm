@@ -94,7 +94,7 @@ pub(crate) async fn build_commands(
     pane: Option<MuxPane>,
     filter_copy_mode: bool,
 ) -> Vec<ExpandedCommand> {
-    let mut commands = CommandDef::actions_for_palette_and_menubar(&config::configuration());
+    let mut commands = CommandDef::actions_for_palette(&config::configuration()).await;
 
     match config::run_immediate_with_lua_config(|lua| {
         let mut entries: Vec<UserPaletteEntry> = vec![];
