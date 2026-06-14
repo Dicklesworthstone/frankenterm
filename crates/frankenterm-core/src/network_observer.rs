@@ -5,6 +5,7 @@
 //! or unreachable state to backpressure tier signals.
 
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -197,7 +198,9 @@ impl NetworkObserver {
 
     /// Check if `rano` is available.
     pub fn is_available(&self) -> bool {
-        Command::new(&self.binary).arg("--version").output().is_ok()
+        self.rano_command()
+            .map(|mut command| command.arg("--version").output().is_ok())
+            .unwrap_or(false)
     }
 
     /// Access the config.
@@ -260,7 +263,7 @@ impl NetworkObserver {
             .checked_add(Duration::from_secs(timeout_secs))
             .ok_or(NetworkObserverError::InvalidTimeout { timeout_secs })?;
 
-        let mut command = Command::new(&self.binary);
+        let mut command = self.rano_command()?;
         command
             .args(args)
             .stdout(Stdio::piped())
@@ -408,6 +411,42 @@ impl NetworkObserver {
             ConnectivityStatus::Unreachable => NetworkPressureTier::Black,
             ConnectivityStatus::Unknown => NetworkPressureTier::Black,
         }
+    }
+
+    fn rano_command(&self) -> Result<Command, NetworkObserverError> {
+        let path_dir = self.validated_rano_path_dir()?;
+        let mut command = Command::new("rano");
+        if let Some(path_dir) = path_dir {
+            command.env("PATH", path_dir);
+        }
+        Ok(command)
+    }
+
+    fn validated_rano_path_dir(&self) -> Result<Option<&Path>, NetworkObserverError> {
+        let binary = self.binary.as_str();
+        if binary.trim() != binary || binary.is_empty() {
+            return Err(NetworkObserverError::BinaryNotFound(format!(
+                "invalid rano executable {:?}",
+                self.binary
+            )));
+        }
+        if binary == "rano" {
+            return Ok(None);
+        }
+
+        let path = Path::new(binary);
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let basename_is_rano = path.file_name().and_then(|name| name.to_str()) == Some("rano");
+        if let (Some(parent), true) = (parent, basename_is_rano) {
+            return Ok(Some(parent));
+        }
+
+        Err(NetworkObserverError::BinaryNotFound(format!(
+            "invalid rano executable {:?}: only `rano` or an explicit path ending in `rano` is allowed",
+            self.binary
+        )))
     }
 }
 
@@ -687,8 +726,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("slow-rano");
-        fs::write(&script, "#!/bin/sh\nsleep 2\n").unwrap();
+        let script = dir.path().join("rano");
+        fs::write(&script, "#!/bin/sh\n/bin/sleep 2\n").unwrap();
         let mut perms = fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
