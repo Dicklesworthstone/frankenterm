@@ -1394,11 +1394,12 @@ mod tests {
         ));
 
         let (covered, total) = matrix.surface_coverage();
+        let expected_total = ApiSurface::ALL.len();
         assert_eq!(covered, 1);
-        assert_eq!(total, 36);
+        assert_eq!(total, expected_total);
 
         let uncovered = matrix.uncovered_surfaces();
-        assert_eq!(uncovered.len(), 35);
+        assert_eq!(uncovered.len(), expected_total - covered);
     }
 
     // ---- Standard matrix ----

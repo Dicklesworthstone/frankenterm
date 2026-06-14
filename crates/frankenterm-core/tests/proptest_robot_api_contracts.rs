@@ -283,7 +283,7 @@ proptest! {
         }
         let (covered, total_surfaces) = matrix.surface_coverage();
         prop_assert!(covered <= total_surfaces);
-        prop_assert_eq!(total_surfaces, 34);
+        prop_assert_eq!(total_surfaces, ApiSurface::ALL.len());
     }
 
     #[test]
@@ -296,8 +296,9 @@ proptest! {
         }
         let (covered, _) = matrix.surface_coverage();
         let uncovered = matrix.uncovered_surfaces().len();
-        prop_assert_eq!(covered + uncovered, 34,
-            "covered ({}) + uncovered ({}) should equal 34", covered, uncovered);
+        let expected_total = ApiSurface::ALL.len();
+        prop_assert_eq!(covered + uncovered, expected_total,
+            "covered ({}) + uncovered ({}) should equal {}", covered, uncovered, expected_total);
     }
 }
 
