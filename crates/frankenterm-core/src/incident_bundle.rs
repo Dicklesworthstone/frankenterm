@@ -32,7 +32,10 @@
 //! - **Rules** — validates event structure and bounded text
 //! - **WorkflowTrace** — validates workflow step logs and timing
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::crash::IncidentKind;
 
@@ -515,6 +518,412 @@ pub struct RedactionSummary {
     pub total_redactions: usize,
     /// Number of files that had at least one redaction.
     pub files_with_redactions: usize,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Evidence lifecycle receipts
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Stable contract id for evidence lifecycle receipts.
+pub const EVIDENCE_LIFECYCLE_CONTRACT_ID: &str = "ft.evidence_lifecycle.v1";
+
+/// Current evidence lifecycle receipt schema version.
+pub const EVIDENCE_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
+
+/// Source class for an evidence artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceArtifactKind {
+    /// Pane output or captured terminal text.
+    PaneOutput,
+    /// Runtime or detection event log.
+    EventLog,
+    /// Policy-denial/audit evidence.
+    PolicyDenial,
+    /// Submit/steering/transaction receipt.
+    Receipt,
+    /// Incident bundle artifact.
+    IncidentBundle,
+    /// Minimized fixture promoted for tests/replay.
+    Fixture,
+    /// Derived index or cache that can be rebuilt.
+    DerivedStore,
+    /// Other evidence class not yet modeled.
+    Other,
+}
+
+impl EvidenceArtifactKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PaneOutput => "pane_output",
+            Self::EventLog => "event_log",
+            Self::PolicyDenial => "policy_denial",
+            Self::Receipt => "receipt",
+            Self::IncidentBundle => "incident_bundle",
+            Self::Fixture => "fixture",
+            Self::DerivedStore => "derived_store",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Inventory row used by the evidence lifecycle planner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceInventoryEntry {
+    /// Stable artifact identifier supplied by the caller.
+    pub evidence_id: String,
+    /// Evidence source class.
+    pub kind: EvidenceArtifactKind,
+    /// Artifact size in bytes after any current redaction/minimization.
+    pub size_bytes: u64,
+    /// Whether this artifact has passed through the project redactor.
+    pub redacted: bool,
+    /// Whether this artifact is already minimized to fixture-safe content.
+    pub minimized: bool,
+    /// Caller requests promotion into a retained fixture corpus.
+    pub fixture_candidate: bool,
+    /// Optional active hold deadline. Active holds prevent expiry.
+    pub hold_until_ms: Option<u64>,
+    /// Optional expiry deadline.
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Lifecycle policy knobs applied to an inventory batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLifecyclePolicy {
+    /// Decision time in epoch milliseconds.
+    pub now_ms: u64,
+    /// Default TTL assigned to retained artifacts with no explicit expiry.
+    pub default_retention_ms: u64,
+    /// TTL assigned to newly promoted fixture artifacts.
+    pub fixture_retention_ms: u64,
+    /// Maximum byte size for fixture promotion.
+    pub max_fixture_bytes: u64,
+}
+
+impl Default for EvidenceLifecyclePolicy {
+    fn default() -> Self {
+        Self {
+            now_ms: 0,
+            default_retention_ms: 7 * 24 * 60 * 60 * 1000,
+            fixture_retention_ms: 30 * 24 * 60 * 60 * 1000,
+            max_fixture_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// Planned lifecycle action for one evidence artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceLifecycleAction {
+    /// Retain as-is under the assigned expiry.
+    Retain,
+    /// Minimize/redact further before any durable use.
+    Minimize,
+    /// Promote to a fixture corpus.
+    PromoteToFixture,
+    /// Keep because an active hold is in force.
+    Hold,
+    /// Expire/delete according to the caller's destructive-operation policy.
+    Expire,
+    /// Refuse fixture promotion; evidence remains governed by normal retention.
+    RefusePromotion,
+}
+
+impl EvidenceLifecycleAction {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retain => "retain",
+            Self::Minimize => "minimize",
+            Self::PromoteToFixture => "promote_to_fixture",
+            Self::Hold => "hold",
+            Self::Expire => "expire",
+            Self::RefusePromotion => "refuse_promotion",
+        }
+    }
+}
+
+/// Machine-readable reason for a lifecycle action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceLifecycleReason {
+    /// Artifact already satisfies policy.
+    WithinPolicy,
+    /// Retention deadline has elapsed and no hold is active.
+    RetentionExpired,
+    /// Artifact has an active hold.
+    HoldActive,
+    /// Artifact exceeded the configured privacy budget.
+    OverPrivacyBudget,
+    /// Artifact is not yet minimized.
+    MinimizationRequired,
+    /// Fixture promotion requires redacted content.
+    PromotionRequiresRedaction,
+    /// Fixture promotion requires minimized content.
+    PromotionRequiresMinimization,
+    /// Fixture promotion exceeds size policy.
+    PromotionTooLarge,
+    /// No expiry existed, so the planner assigned the default expiry.
+    DefaultExpiryAssigned,
+}
+
+impl EvidenceLifecycleReason {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WithinPolicy => "within_policy",
+            Self::RetentionExpired => "retention_expired",
+            Self::HoldActive => "hold_active",
+            Self::OverPrivacyBudget => "over_privacy_budget",
+            Self::MinimizationRequired => "minimization_required",
+            Self::PromotionRequiresRedaction => "promotion_requires_redaction",
+            Self::PromotionRequiresMinimization => "promotion_requires_minimization",
+            Self::PromotionTooLarge => "promotion_too_large",
+            Self::DefaultExpiryAssigned => "default_expiry_assigned",
+        }
+    }
+}
+
+/// Lifecycle decision for one evidence artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLifecycleDecision {
+    /// Artifact identifier from the inventory row.
+    pub evidence_id: String,
+    /// Evidence source class.
+    pub kind: EvidenceArtifactKind,
+    /// Planned action.
+    pub action: EvidenceLifecycleAction,
+    /// Why the action was selected.
+    pub reason: EvidenceLifecycleReason,
+    /// Effective expiry after this decision, if one applies.
+    pub effective_expires_at_ms: Option<u64>,
+}
+
+/// Batch receipt for an evidence lifecycle planning pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLifecycleReceipt {
+    /// Stable contract id.
+    pub contract_id: String,
+    /// Schema version.
+    pub schema_version: u16,
+    /// Decision time in epoch milliseconds.
+    pub generated_at_ms: u64,
+    /// Deterministic content-addressed receipt id.
+    pub receipt_id: String,
+    /// Per-artifact lifecycle decisions.
+    pub decisions: Vec<EvidenceLifecycleDecision>,
+    /// Count of artifacts planned for minimization.
+    pub minimize_count: usize,
+    /// Count of artifacts planned for fixture promotion.
+    pub promote_count: usize,
+    /// Count of fixture promotion requests refused.
+    pub refused_promotion_count: usize,
+    /// Count of artifacts under active hold.
+    pub hold_count: usize,
+    /// Count of artifacts whose retention has expired.
+    pub expire_count: usize,
+}
+
+impl EvidenceLifecycleReceipt {
+    /// Deterministic receipt id from stable decision fields.
+    #[must_use]
+    pub fn compute_receipt_id(&self) -> String {
+        let mut payload = String::new();
+        payload.push_str(&self.contract_id);
+        payload.push('\n');
+        let _ = write!(&mut payload, "{}", self.schema_version);
+        payload.push('\n');
+        let _ = write!(&mut payload, "{}", self.generated_at_ms);
+        for decision in &self.decisions {
+            payload.push('\n');
+            payload.push_str(&decision.evidence_id);
+            payload.push('|');
+            payload.push_str(decision.kind.as_str());
+            payload.push('|');
+            payload.push_str(decision.action.as_str());
+            payload.push('|');
+            payload.push_str(decision.reason.as_str());
+            payload.push('|');
+            if let Some(expiry) = decision.effective_expires_at_ms {
+                let _ = write!(&mut payload, "{expiry}");
+            }
+        }
+        let digest = hex::encode(Sha256::digest(payload.as_bytes()));
+        format!("evidence:lifecycle:{}", &digest[..32])
+    }
+}
+
+/// Plan evidence lifecycle actions for an inventory batch.
+#[must_use]
+pub fn plan_evidence_lifecycle(
+    inventory: &[EvidenceInventoryEntry],
+    policy: &EvidenceLifecyclePolicy,
+    budget: &PrivacyBudget,
+) -> EvidenceLifecycleReceipt {
+    let mut inventory = inventory.to_vec();
+    inventory.sort_by(|a, b| a.evidence_id.cmp(&b.evidence_id));
+
+    let decisions: Vec<EvidenceLifecycleDecision> = inventory
+        .iter()
+        .map(|entry| plan_evidence_entry(entry, policy, budget))
+        .collect();
+
+    let mut receipt = EvidenceLifecycleReceipt {
+        contract_id: EVIDENCE_LIFECYCLE_CONTRACT_ID.to_string(),
+        schema_version: EVIDENCE_LIFECYCLE_SCHEMA_VERSION,
+        generated_at_ms: policy.now_ms,
+        receipt_id: String::new(),
+        minimize_count: decisions
+            .iter()
+            .filter(|decision| decision.action == EvidenceLifecycleAction::Minimize)
+            .count(),
+        promote_count: decisions
+            .iter()
+            .filter(|decision| decision.action == EvidenceLifecycleAction::PromoteToFixture)
+            .count(),
+        refused_promotion_count: decisions
+            .iter()
+            .filter(|decision| decision.action == EvidenceLifecycleAction::RefusePromotion)
+            .count(),
+        hold_count: decisions
+            .iter()
+            .filter(|decision| decision.action == EvidenceLifecycleAction::Hold)
+            .count(),
+        expire_count: decisions
+            .iter()
+            .filter(|decision| decision.action == EvidenceLifecycleAction::Expire)
+            .count(),
+        decisions,
+    };
+    receipt.receipt_id = receipt.compute_receipt_id();
+    receipt
+}
+
+fn plan_evidence_entry(
+    entry: &EvidenceInventoryEntry,
+    policy: &EvidenceLifecyclePolicy,
+    budget: &PrivacyBudget,
+) -> EvidenceLifecycleDecision {
+    if entry
+        .hold_until_ms
+        .is_some_and(|hold_until_ms| hold_until_ms > policy.now_ms)
+    {
+        return evidence_decision(
+            entry,
+            EvidenceLifecycleAction::Hold,
+            EvidenceLifecycleReason::HoldActive,
+            entry.hold_until_ms,
+        );
+    }
+
+    if entry
+        .expires_at_ms
+        .is_some_and(|expires_at_ms| expires_at_ms <= policy.now_ms)
+    {
+        return evidence_decision(
+            entry,
+            EvidenceLifecycleAction::Expire,
+            EvidenceLifecycleReason::RetentionExpired,
+            entry.expires_at_ms,
+        );
+    }
+
+    if entry.fixture_candidate {
+        return plan_fixture_candidate(entry, policy, budget);
+    }
+
+    let privacy_cap = privacy_budget_file_cap_bytes(budget);
+    if entry.size_bytes > privacy_cap {
+        return evidence_decision(
+            entry,
+            EvidenceLifecycleAction::Minimize,
+            EvidenceLifecycleReason::OverPrivacyBudget,
+            entry.expires_at_ms,
+        );
+    }
+    if !entry.minimized {
+        return evidence_decision(
+            entry,
+            EvidenceLifecycleAction::Minimize,
+            EvidenceLifecycleReason::MinimizationRequired,
+            entry.expires_at_ms,
+        );
+    }
+
+    let effective_expiry = entry
+        .expires_at_ms
+        .or_else(|| Some(policy.now_ms.saturating_add(policy.default_retention_ms)));
+    let reason = if entry.expires_at_ms.is_some() {
+        EvidenceLifecycleReason::WithinPolicy
+    } else {
+        EvidenceLifecycleReason::DefaultExpiryAssigned
+    };
+    evidence_decision(
+        entry,
+        EvidenceLifecycleAction::Retain,
+        reason,
+        effective_expiry,
+    )
+}
+
+fn plan_fixture_candidate(
+    entry: &EvidenceInventoryEntry,
+    policy: &EvidenceLifecyclePolicy,
+    budget: &PrivacyBudget,
+) -> EvidenceLifecycleDecision {
+    if !entry.redacted {
+        return evidence_decision(
+            entry,
+            EvidenceLifecycleAction::RefusePromotion,
+            EvidenceLifecycleReason::PromotionRequiresRedaction,
+            entry.expires_at_ms,
+        );
+    }
+    if !entry.minimized {
+        return evidence_decision(
+            entry,
+            EvidenceLifecycleAction::RefusePromotion,
+            EvidenceLifecycleReason::PromotionRequiresMinimization,
+            entry.expires_at_ms,
+        );
+    }
+    let privacy_cap = privacy_budget_file_cap_bytes(budget);
+    if entry.size_bytes > policy.max_fixture_bytes || entry.size_bytes > privacy_cap {
+        return evidence_decision(
+            entry,
+            EvidenceLifecycleAction::RefusePromotion,
+            EvidenceLifecycleReason::PromotionTooLarge,
+            entry.expires_at_ms,
+        );
+    }
+
+    evidence_decision(
+        entry,
+        EvidenceLifecycleAction::PromoteToFixture,
+        EvidenceLifecycleReason::WithinPolicy,
+        Some(policy.now_ms.saturating_add(policy.fixture_retention_ms)),
+    )
+}
+
+fn evidence_decision(
+    entry: &EvidenceInventoryEntry,
+    action: EvidenceLifecycleAction,
+    reason: EvidenceLifecycleReason,
+    effective_expires_at_ms: Option<u64>,
+) -> EvidenceLifecycleDecision {
+    EvidenceLifecycleDecision {
+        evidence_id: entry.evidence_id.clone(),
+        kind: entry.kind,
+        action,
+        reason,
+        effective_expires_at_ms,
+    }
+}
+
+fn privacy_budget_file_cap_bytes(budget: &PrivacyBudget) -> u64 {
+    u64::try_from(budget.max_bytes_per_file).unwrap_or(u64::MAX)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1102,6 +1511,130 @@ mod tests {
         assert_eq!(summary.tier, "custom");
     }
 
+    // --- Evidence lifecycle ---
+
+    #[test]
+    fn evidence_lifecycle_plans_inventory_actions() {
+        let policy = EvidenceLifecyclePolicy {
+            now_ms: 1_000,
+            default_retention_ms: 100,
+            fixture_retention_ms: 500,
+            max_fixture_bytes: 64,
+        };
+        let budget = PrivacyBudget {
+            max_bytes_per_file: 64,
+            ..PrivacyBudget::default()
+        };
+        let inventory = vec![
+            evidence_entry("retain-default-expiry", EvidenceArtifactKind::Receipt, 16)
+                .with_minimized(true),
+            evidence_entry("fixture-ok", EvidenceArtifactKind::PaneOutput, 16)
+                .with_redacted(true)
+                .with_minimized(true)
+                .with_fixture_candidate(true),
+            evidence_entry("raw-fixture", EvidenceArtifactKind::PaneOutput, 16)
+                .with_minimized(true)
+                .with_fixture_candidate(true),
+            evidence_entry("needs-minimize", EvidenceArtifactKind::EventLog, 16),
+            evidence_entry("expired", EvidenceArtifactKind::DerivedStore, 16)
+                .with_minimized(true)
+                .with_expires_at_ms(Some(999)),
+            evidence_entry("held-expired", EvidenceArtifactKind::IncidentBundle, 16)
+                .with_minimized(true)
+                .with_expires_at_ms(Some(900))
+                .with_hold_until_ms(Some(2_000)),
+            evidence_entry("large-fixture", EvidenceArtifactKind::PaneOutput, 65)
+                .with_redacted(true)
+                .with_minimized(true)
+                .with_fixture_candidate(true),
+        ];
+
+        let receipt = plan_evidence_lifecycle(&inventory, &policy, &budget);
+
+        assert_eq!(receipt.promote_count, 1);
+        assert_eq!(receipt.refused_promotion_count, 2);
+        assert_eq!(receipt.minimize_count, 1);
+        assert_eq!(receipt.hold_count, 1);
+        assert_eq!(receipt.expire_count, 1);
+        assert_eq!(
+            lifecycle_decision(&receipt, "fixture-ok").action,
+            EvidenceLifecycleAction::PromoteToFixture
+        );
+        assert_eq!(
+            lifecycle_decision(&receipt, "fixture-ok").effective_expires_at_ms,
+            Some(1_500)
+        );
+        assert_eq!(
+            lifecycle_decision(&receipt, "raw-fixture").reason,
+            EvidenceLifecycleReason::PromotionRequiresRedaction
+        );
+        assert_eq!(
+            lifecycle_decision(&receipt, "large-fixture").reason,
+            EvidenceLifecycleReason::PromotionTooLarge
+        );
+        assert_eq!(
+            lifecycle_decision(&receipt, "held-expired").action,
+            EvidenceLifecycleAction::Hold
+        );
+        assert_eq!(
+            lifecycle_decision(&receipt, "expired").action,
+            EvidenceLifecycleAction::Expire
+        );
+        assert_eq!(
+            lifecycle_decision(&receipt, "retain-default-expiry").reason,
+            EvidenceLifecycleReason::DefaultExpiryAssigned
+        );
+        assert_eq!(
+            lifecycle_decision(&receipt, "retain-default-expiry").effective_expires_at_ms,
+            Some(1_100)
+        );
+    }
+
+    #[test]
+    fn evidence_lifecycle_receipt_id_is_inventory_order_independent() {
+        let policy = EvidenceLifecyclePolicy {
+            now_ms: 10,
+            ..EvidenceLifecyclePolicy::default()
+        };
+        let budget = PrivacyBudget::strict();
+        let first = vec![
+            evidence_entry("b", EvidenceArtifactKind::Receipt, 8).with_minimized(true),
+            evidence_entry("a", EvidenceArtifactKind::PaneOutput, 8)
+                .with_redacted(true)
+                .with_minimized(true)
+                .with_fixture_candidate(true),
+        ];
+        let second = vec![first[1].clone(), first[0].clone()];
+
+        let receipt_a = plan_evidence_lifecycle(&first, &policy, &budget);
+        let receipt_b = plan_evidence_lifecycle(&second, &policy, &budget);
+
+        assert_eq!(receipt_a.decisions, receipt_b.decisions);
+        assert_eq!(receipt_a.receipt_id, receipt_b.receipt_id);
+        assert!(receipt_a.receipt_id.starts_with("evidence:lifecycle:"));
+    }
+
+    #[test]
+    fn evidence_lifecycle_receipt_roundtrips_json() {
+        let policy = EvidenceLifecyclePolicy {
+            now_ms: 42,
+            ..EvidenceLifecyclePolicy::default()
+        };
+        let budget = PrivacyBudget::strict();
+        let inventory = vec![
+            evidence_entry("fixture", EvidenceArtifactKind::Fixture, 8)
+                .with_redacted(true)
+                .with_minimized(true)
+                .with_fixture_candidate(true),
+        ];
+        let receipt = plan_evidence_lifecycle(&inventory, &policy, &budget);
+
+        let json = serde_json::to_string(&receipt).unwrap();
+        let parsed: EvidenceLifecycleReceipt = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, receipt);
+    }
+
     // --- Replay modes ---
 
     #[test]
@@ -1407,6 +1940,69 @@ mod tests {
     }
 
     // --- Helpers ---
+
+    fn evidence_entry(
+        evidence_id: &str,
+        kind: EvidenceArtifactKind,
+        size_bytes: u64,
+    ) -> EvidenceInventoryEntry {
+        EvidenceInventoryEntry {
+            evidence_id: evidence_id.to_string(),
+            kind,
+            size_bytes,
+            redacted: false,
+            minimized: false,
+            fixture_candidate: false,
+            hold_until_ms: None,
+            expires_at_ms: None,
+        }
+    }
+
+    trait EvidenceEntryTestExt {
+        fn with_redacted(self, redacted: bool) -> Self;
+        fn with_minimized(self, minimized: bool) -> Self;
+        fn with_fixture_candidate(self, fixture_candidate: bool) -> Self;
+        fn with_hold_until_ms(self, hold_until_ms: Option<u64>) -> Self;
+        fn with_expires_at_ms(self, expires_at_ms: Option<u64>) -> Self;
+    }
+
+    impl EvidenceEntryTestExt for EvidenceInventoryEntry {
+        fn with_redacted(mut self, redacted: bool) -> Self {
+            self.redacted = redacted;
+            self
+        }
+
+        fn with_minimized(mut self, minimized: bool) -> Self {
+            self.minimized = minimized;
+            self
+        }
+
+        fn with_fixture_candidate(mut self, fixture_candidate: bool) -> Self {
+            self.fixture_candidate = fixture_candidate;
+            self
+        }
+
+        fn with_hold_until_ms(mut self, hold_until_ms: Option<u64>) -> Self {
+            self.hold_until_ms = hold_until_ms;
+            self
+        }
+
+        fn with_expires_at_ms(mut self, expires_at_ms: Option<u64>) -> Self {
+            self.expires_at_ms = expires_at_ms;
+            self
+        }
+    }
+
+    fn lifecycle_decision<'a>(
+        receipt: &'a EvidenceLifecycleReceipt,
+        evidence_id: &str,
+    ) -> &'a EvidenceLifecycleDecision {
+        receipt
+            .decisions
+            .iter()
+            .find(|decision| decision.evidence_id == evidence_id)
+            .unwrap()
+    }
 
     fn sample_manifest() -> IncidentManifest {
         IncidentManifest {
