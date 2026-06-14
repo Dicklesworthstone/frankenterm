@@ -351,6 +351,8 @@ fail!("doc must reject dry-run as proof") unless doc.include?("dry-run") && doc.
   command.target_dir
   cargo_jobs
   estimated_slots
+  selected_worker
+  worker_slots_available
   slot_estimate_mismatch
 ].each do |term|
   fail!("doc missing cargo analyzer term #{term}") unless doc.include?(term)
@@ -374,6 +376,8 @@ end
   analyze_rch_admission_cargo_command
   CARGO_BUILD_JOBS
   --target-dir
+  selected_worker
+  worker_slots_available
   slot_estimate_mismatch
   no_workers_passed_health
   disk_free_below_critical_gb
@@ -407,6 +411,8 @@ end
   assert_error_category_contract
   RchAdmissionQueueDiagnostic
   with_rch_queue
+  selected_worker
+  worker_slots_available
   --exclude
   --target-dir
   CARGO_BUILD_JOBS

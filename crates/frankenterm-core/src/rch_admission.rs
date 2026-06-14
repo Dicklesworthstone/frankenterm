@@ -273,13 +273,13 @@ where
     V: AsRef<str>,
 {
     let raw = raw.as_ref().trim().to_string();
-    let tokens = shell_words_lossy(&raw);
-    let cargo_index = tokens.iter().position(|token| token == "cargo");
+    let words = shell_words_lossy(&raw);
+    let cargo_index = words.iter().position(|word| word == "cargo");
     let mut command_env = env
         .into_iter()
         .map(|(key, value)| (key.as_ref().to_string(), value.as_ref().to_string()))
         .collect::<Vec<_>>();
-    collect_inline_env_assignments(&tokens, cargo_index, &mut command_env);
+    collect_inline_env_assignments(&words, cargo_index, &mut command_env);
 
     let installed_selector_estimated_slots =
         installed_selector_estimated_slots.map(|value| value.max(1));
@@ -304,8 +304,8 @@ where
         };
     };
 
-    let cargo_tokens = tokens[cargo_index..].to_vec();
-    let normalized = cargo_tokens.join(" ");
+    let cargo_words = words.get(cargo_index..).unwrap_or(&[]).to_vec();
+    let normalized = cargo_words.join(" ");
     let mut cargo_subcommand = None;
     let mut package_scope = Vec::new();
     let mut test_scope = Vec::new();
@@ -314,9 +314,8 @@ where
     let mut i = 1;
     let mut after_double_dash = false;
 
-    while i < cargo_tokens.len() {
-        let token = &cargo_tokens[i];
-        if token == "--" {
+    while let Some(word) = cargo_words.get(i) {
+        if word == "--" {
             after_double_dash = true;
             i += 1;
             continue;
@@ -326,20 +325,20 @@ where
             continue;
         }
 
-        if let Some(value) = token.strip_prefix("--jobs=") {
+        if let Some(value) = word.strip_prefix("--jobs=") {
             jobs_flag = parse_positive_u32(value);
             i += 1;
             continue;
         }
-        if let Some(value) = token.strip_prefix("-j") {
+        if let Some(value) = word.strip_prefix("-j") {
             if !value.is_empty() {
                 jobs_flag = parse_positive_u32(value);
                 i += 1;
                 continue;
             }
         }
-        if matches!(token.as_str(), "-j" | "--jobs") {
-            if let Some(value) = cargo_tokens
+        if matches!(word.as_str(), "-j" | "--jobs") {
+            if let Some(value) = cargo_words
                 .get(i + 1)
                 .and_then(|value| parse_positive_u32(value))
             {
@@ -349,52 +348,52 @@ where
             continue;
         }
 
-        if let Some(value) = token.strip_prefix("--target-dir=") {
+        if let Some(value) = word.strip_prefix("--target-dir=") {
             target_dir = Some(nonempty_string(value, "unknown"));
             i += 1;
             continue;
         }
-        if token == "--target-dir" {
-            if let Some(value) = cargo_tokens.get(i + 1) {
+        if word == "--target-dir" {
+            if let Some(value) = cargo_words.get(i + 1) {
                 target_dir = Some(nonempty_string(value, "unknown"));
             }
             i += 2;
             continue;
         }
 
-        if token.starts_with("--exclude=") {
+        if word.starts_with("--exclude=") {
             i += 1;
             continue;
         }
-        if token == "--exclude" {
+        if word == "--exclude" {
             i += 2;
             continue;
         }
 
-        if let Some(value) = token.strip_prefix("--package=") {
+        if let Some(value) = word.strip_prefix("--package=") {
             push_nonempty_unique(&mut package_scope, value);
             i += 1;
             continue;
         }
-        if matches!(token.as_str(), "-p" | "--package") {
-            if let Some(value) = cargo_tokens.get(i + 1) {
+        if matches!(word.as_str(), "-p" | "--package") {
+            if let Some(value) = cargo_words.get(i + 1) {
                 push_nonempty_unique(&mut package_scope, value);
             }
             i += 2;
             continue;
         }
 
-        if cargo_subcommand.is_none() && !token.starts_with('-') && !token.starts_with('+') {
-            cargo_subcommand = Some(token.clone());
+        if cargo_subcommand.is_none() && !word.starts_with('-') && !word.starts_with('+') {
+            cargo_subcommand = Some(word.clone());
             i += 1;
             continue;
         }
 
-        if cargo_subcommand.as_deref() == Some("test") && !token.starts_with('-') {
-            push_nonempty_unique(&mut test_scope, token);
+        if cargo_subcommand.as_deref() == Some("test") && !word.starts_with('-') {
+            push_nonempty_unique(&mut test_scope, word);
         }
 
-        if cargo_option_takes_value(token) {
+        if cargo_option_takes_value(word) {
             i += 2;
         } else {
             i += 1;
@@ -567,6 +566,8 @@ pub struct RchAdmissionQueueDiagnostic {
     pub active_project_exclusion: bool,
     pub active_builds: u32,
     pub queued_builds: u32,
+    pub selected_worker: Option<String>,
+    pub worker_slots_available: Option<u32>,
     pub workers_healthy: Option<u32>,
     pub workers_total: Option<u32>,
 }
@@ -579,6 +580,8 @@ impl RchAdmissionQueueDiagnostic {
             active_project_exclusion: false,
             active_builds: 0,
             queued_builds: 0,
+            selected_worker: None,
+            worker_slots_available: None,
             workers_healthy: None,
             workers_total: None,
         }
@@ -883,7 +886,9 @@ pub fn build_rch_admission_report(input: &RchAdmissionCollectorInput) -> RchAdmi
     collect_rch_queue_reasons(input, &mut reason_codes);
 
     for rejection in &input.worker_rejections {
-        reason_codes.insert(rejection.reason_code);
+        if worker_rejection_blocks_proof(input, rejection) {
+            reason_codes.insert(rejection.reason_code);
+        }
     }
 
     for observation in &input.collector_observations {
@@ -921,10 +926,6 @@ pub fn build_rch_admission_report(input: &RchAdmissionCollectorInput) -> RchAdmi
                 dirty_path.status, dirty_path.path, dirty_path.category
             ),
         });
-    }
-
-    if reason_codes.is_empty() {
-        reason_codes.insert(RchAdmissionReasonCode::Unknown);
     }
 
     let reason_codes = reason_codes.into_iter().collect::<Vec<_>>();
@@ -1003,16 +1004,29 @@ fn collect_rch_queue_reasons(
     if input.command.would_intercept == Some(true)
         && input.rch_queue.workers_total.unwrap_or(0) > 0
         && input.rch_queue.workers_healthy == Some(0)
+        && input.rch_queue.selected_worker.is_none()
     {
         reason_codes.insert(RchAdmissionReasonCode::NoAdmissibleWorkers);
     }
-    if let (Some(estimated_slots), Some(workers_healthy)) =
-        (input.estimated_slots, input.rch_queue.workers_healthy)
+    let available_slots = input
+        .rch_queue
+        .worker_slots_available
+        .or(input.rch_queue.workers_healthy);
+    if let (Some(estimated_slots), Some(available_slots)) = (input.estimated_slots, available_slots)
     {
-        if workers_healthy > 0 && estimated_slots > workers_healthy {
+        if available_slots > 0 && estimated_slots > available_slots {
             reason_codes.insert(RchAdmissionReasonCode::InsufficientSlots);
         }
     }
+}
+
+fn worker_rejection_blocks_proof(
+    input: &RchAdmissionCollectorInput,
+    rejection: &RchAdmissionWorkerRejection,
+) -> bool {
+    input.rch_queue.selected_worker.is_none()
+        || rejection.worker.is_none()
+        || rejection.reason_code == RchAdmissionReasonCode::NoAdmissibleWorkers
 }
 
 fn proof_status_for(
@@ -1175,21 +1189,16 @@ fn shell_words_lossy(input: &str) -> Vec<String> {
 }
 
 fn collect_inline_env_assignments(
-    tokens: &[String],
+    words: &[String],
     cargo_index: Option<usize>,
     command_env: &mut Vec<(String, String)>,
 ) {
-    let limit = cargo_index.unwrap_or(tokens.len());
-    for token in tokens.iter().take(limit) {
-        if token == "env"
-            || token == "--"
-            || token == "rch"
-            || token == "exec"
-            || token == "diagnose"
-        {
+    let limit = cargo_index.unwrap_or(words.len());
+    for word in words.iter().take(limit) {
+        if word == "env" || word == "--" || word == "rch" || word == "exec" || word == "diagnose" {
             continue;
         }
-        if let Some((key, value)) = token.split_once('=') {
+        if let Some((key, value)) = word.split_once('=') {
             if is_supported_cargo_env_key(key) {
                 command_env.push((key.to_string(), value.to_string()));
             }
@@ -1211,9 +1220,9 @@ fn parse_positive_u32(value: &str) -> Option<u32> {
     value.parse::<u32>().ok().filter(|value| *value > 0)
 }
 
-fn cargo_option_takes_value(token: &str) -> bool {
+fn cargo_option_takes_value(word: &str) -> bool {
     matches!(
-        token,
+        word,
         "--bin"
             | "--bench"
             | "--example"
@@ -1334,11 +1343,9 @@ mod tests {
         );
         assert!(analysis.slot_estimate_mismatch);
         assert!(analysis.explanation.contains("explicit cargo job count 1"));
-        assert!(
-            analysis
-                .explanation
-                .contains("installed_selector_estimated_slots=4")
-        );
+        assert!(analysis
+            .explanation
+            .contains("installed_selector_estimated_slots=4"));
         assert!(analysis.explanation.contains("slot_estimate_mismatch=true"));
     }
 
@@ -1462,16 +1469,12 @@ mod tests {
             ]
         );
         assert!(report.advisory_only);
-        assert!(
-            report
-                .forbidden_actions
-                .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof)
-        );
-        assert!(
-            report
-                .forbidden_actions
-                .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval)
-        );
+        assert!(report
+            .forbidden_actions
+            .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof));
+        assert!(report
+            .forbidden_actions
+            .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval));
         assert!(report.recommendations[0].operator_approval_required);
     }
 
@@ -1496,11 +1499,9 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::LocalEnoSpace)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::LocalEnoSpace));
         assert_eq!(report.citations.len(), 1);
         let citation = &report.citations[0];
         assert_eq!(citation.kind, RchAdmissionCitationKind::CommandOutput);
@@ -1529,16 +1530,12 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::CriticalPressure)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
     }
 
     #[test]
@@ -1566,21 +1563,15 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::CriticalPressure)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::TelemetryGap)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::TelemetryGap));
     }
 
     #[test]
@@ -1595,6 +1586,8 @@ mod tests {
             active_project_exclusion: true,
             active_builds: 1,
             queued_builds: 2,
+            selected_worker: None,
+            worker_slots_available: Some(0),
             workers_healthy: Some(0),
             workers_total: Some(8),
         })
@@ -1609,25 +1602,131 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::ActiveProjectExclusion)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::CriticalPressure)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::ActiveProjectExclusion));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
         assert_eq!(
             report.worker_rejections[0].worker.as_deref(),
             Some("vmi1149989")
         );
+    }
+
+    #[test]
+    fn rch_queue_with_no_blockers_is_runnable_without_unknown_reason() {
+        let analysis = analyze_rch_admission_cargo_command(
+            "cargo test -j 1 -p frankenterm-core rch_admission --lib",
+            std::iter::empty::<(&str, &str)>(),
+            Some(4),
+        );
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.runnable_queue",
+            RchAdmissionCommandDiagnostic::new("placeholder"),
+        )
+        .with_cargo_command_analysis(&analysis)
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("healthy".to_string()),
+            active_project_exclusion: false,
+            active_builds: 0,
+            queued_builds: 0,
+            selected_worker: Some("vmi-healthy".to_string()),
+            worker_slots_available: Some(2),
+            workers_healthy: Some(1),
+            workers_total: Some(8),
+        });
+
+        let report = build_rch_admission_report(&input);
+
+        assert_eq!(report.proof_status, RchAdmissionProofStatus::Runnable);
+        assert!(report.reason_codes.is_empty());
+        assert!(report.recommendations.is_empty());
+        assert_eq!(report.cargo_jobs, Some(1));
+        assert_eq!(report.estimated_slots, Some(1));
+    }
+
+    #[test]
+    fn partial_capacity_selected_worker_does_not_inherit_other_worker_rejections() {
+        let analysis = analyze_rch_admission_cargo_command(
+            "cargo test --jobs=1 -p frankenterm-core-rch-types --lib",
+            std::iter::empty::<(&str, &str)>(),
+            Some(4),
+        );
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.partial_capacity_selected_worker",
+            RchAdmissionCommandDiagnostic::new("placeholder"),
+        )
+        .with_cargo_command_analysis(&analysis)
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("degraded".to_string()),
+            active_project_exclusion: false,
+            active_builds: 1,
+            queued_builds: 0,
+            selected_worker: Some("vmi1264463".to_string()),
+            worker_slots_available: Some(2),
+            workers_healthy: Some(1),
+            workers_total: Some(8),
+        })
+        .with_worker_rejection(RchAdmissionWorkerRejection::new(
+            Some("vmi1149989"),
+            RchAdmissionReasonCode::CriticalPressure,
+            "disk_free_below_critical_gb",
+            RchAdmissionSeverity::Critical,
+        ))
+        .with_worker_rejection(RchAdmissionWorkerRejection::new(
+            Some("vmi1167313"),
+            RchAdmissionReasonCode::CriticalPressure,
+            "disk_ratio_below_critical",
+            RchAdmissionSeverity::Critical,
+        ));
+
+        let report = build_rch_admission_report(&input);
+
+        assert_eq!(report.proof_status, RchAdmissionProofStatus::Runnable);
+        assert!(!report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::InsufficientSlots));
+        assert!(!report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert_eq!(
+            report.rch_queue.selected_worker.as_deref(),
+            Some("vmi1264463")
+        );
+        assert_eq!(report.rch_queue.worker_slots_available, Some(2));
+    }
+
+    #[test]
+    fn insufficient_slots_uses_available_slots_when_reported() {
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.available_slots",
+            intercepted_command(),
+        )
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("degraded".to_string()),
+            active_project_exclusion: false,
+            active_builds: 1,
+            queued_builds: 0,
+            selected_worker: None,
+            worker_slots_available: Some(2),
+            workers_healthy: Some(1),
+            workers_total: Some(8),
+        })
+        .with_estimated_slots(3);
+
+        let report = build_rch_admission_report(&input);
+
+        assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::InsufficientSlots));
     }
 
     #[test]
@@ -1655,23 +1754,17 @@ mod tests {
 
         assert_eq!(report.beads.active_bead.as_deref(), Some("ft-69gwh.2"));
         assert_eq!(report.beads.blocking_beads, vec!["ft-4tp7g"]);
-        assert!(
-            report
-                .citations
-                .iter()
-                .any(|citation| citation.summary.contains("ready bead ft-69gwh.3"))
-        );
-        assert!(
-            report
-                .citations
-                .iter()
-                .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1"))
-        );
-        assert!(
-            report
-                .citations
-                .iter()
-                .any(|citation| citation.summary.contains("git status reported M"))
-        );
+        assert!(report
+            .citations
+            .iter()
+            .any(|citation| citation.summary.contains("ready bead ft-69gwh.3")));
+        assert!(report
+            .citations
+            .iter()
+            .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1")));
+        assert!(report
+            .citations
+            .iter()
+            .any(|citation| citation.summary.contains("git status reported M")));
     }
 }

@@ -2,11 +2,12 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use frankenterm_core::rch_admission::{
+    analyze_rch_admission_cargo_command, build_rch_admission_report,
     RchAdmissionAgentMailDiagnostic, RchAdmissionCargoCommandAnalysis, RchAdmissionCollectorInput,
     RchAdmissionCollectorObservation, RchAdmissionCommandDiagnostic,
     RchAdmissionLocalDiskDiagnostic, RchAdmissionProbeDiagnostic, RchAdmissionProofStatus,
     RchAdmissionQueueDiagnostic, RchAdmissionReasonCode, RchAdmissionSeverity,
-    RchAdmissionWorkerRejection, analyze_rch_admission_cargo_command, build_rch_admission_report,
+    RchAdmissionWorkerRejection,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -120,6 +121,8 @@ struct QueueInput {
     active_project_exclusion: bool,
     active_builds: u8,
     queued_builds: u8,
+    selected_worker: OptionalBool,
+    worker_slots_available: OptionalU8,
     workers_healthy: OptionalU8,
     workers_total: OptionalU8,
 }
@@ -160,6 +163,8 @@ impl<'a> FuzzInput<'a> {
 
         assert_analysis_invariants(&analysis);
 
+        let queue = self.queue.diagnostic();
+        let selected_worker_present = queue.selected_worker.is_some();
         let mut input = RchAdmissionCollectorInput::new(
             GENERATED_AT_MS,
             "fuzz.rch_admission_cargo",
@@ -168,23 +173,27 @@ impl<'a> FuzzInput<'a> {
         .with_cargo_command_analysis(&analysis)
         .with_local_disk(self.local_disk.diagnostic())
         .with_agent_mail(self.agent_mail.diagnostic())
-        .with_rch_queue(self.queue.diagnostic())
+        .with_rch_queue(queue)
         .with_collector_observation(
             self.observation_error
                 .observation()
                 .unwrap_or_else(|| analysis.collector_observation()),
         );
 
-        input = input.with_worker_rejection(RchAdmissionWorkerRejection::new(
-            Some("fuzz-worker"),
-            self.reason.reason_code(),
-            self.reason.error_category(),
-            severity_for(self.reason.reason_code()),
-        ));
+        if !selected_worker_present {
+            input = input.with_worker_rejection(RchAdmissionWorkerRejection::new(
+                Some("fuzz-worker"),
+                self.reason.reason_code(),
+                self.reason.error_category(),
+                severity_for(self.reason.reason_code()),
+            ));
+        }
 
         let report = build_rch_admission_report(&input);
         assert_report_invariants(&report, &analysis);
-        assert_reason_contract(self.reason.reason_code(), report.proof_status);
+        if !selected_worker_present {
+            assert_reason_contract(self.reason.reason_code(), report.proof_status);
+        }
         assert_error_category_contract(self.reason);
     }
 }
@@ -400,6 +409,11 @@ impl QueueInput {
             active_project_exclusion: self.active_project_exclusion,
             active_builds: u32::from(self.active_builds),
             queued_builds: u32::from(self.queued_builds),
+            selected_worker: self
+                .selected_worker
+                .value()
+                .and_then(|selected| selected.then(|| "fuzz-selected-worker".to_string())),
+            worker_slots_available: self.worker_slots_available.value(),
             workers_healthy,
             workers_total: workers_total.map(|total| total.max(workers_healthy.unwrap_or(0))),
         }
@@ -465,12 +479,10 @@ fn assert_analysis_invariants(analysis: &RchAdmissionCargoCommandAnalysis) {
     assert!(!analysis.explanation.is_empty());
     let diagnostic = analysis.command_diagnostic();
     assert!(!diagnostic.raw.is_empty());
-    assert!(
-        diagnostic
-            .classification
-            .as_deref()
-            .is_some_and(|classification| !classification.is_empty())
-    );
+    assert!(diagnostic
+        .classification
+        .as_deref()
+        .is_some_and(|classification| !classification.is_empty()));
 }
 
 fn assert_report_invariants(
@@ -480,8 +492,16 @@ fn assert_report_invariants(
     assert_eq!(report.schema_version, 1);
     assert!(!report.contract_id.is_empty());
     assert!(!report.command.raw.is_empty());
-    assert!(!report.reason_codes.is_empty());
-    assert!(!report.recommendations.is_empty());
+    if report.reason_codes.is_empty() {
+        assert!(matches!(
+            report.proof_status,
+            RchAdmissionProofStatus::AdvisoryOnly | RchAdmissionProofStatus::Runnable
+        ));
+        assert!(report.recommendations.is_empty());
+    } else {
+        assert_ne!(report.proof_status, RchAdmissionProofStatus::Runnable);
+        assert!(!report.recommendations.is_empty());
+    }
     assert!(!report.forbidden_actions.is_empty());
     assert!(report.estimated_slots.unwrap_or(1) >= 1);
     if let Some(cargo_jobs) = report.cargo_jobs {
@@ -553,6 +573,8 @@ fn assert_error_category_contract(reason: ReasonInput) {
             active_project_exclusion: false,
             active_builds: 0,
             queued_builds: 0,
+            selected_worker: None,
+            worker_slots_available: Some(1),
             workers_healthy: Some(1),
             workers_total: Some(1),
         })
@@ -594,7 +616,9 @@ fn positive_slot(value: u16) -> u32 {
 }
 
 fn limited_lossy(bytes: &[u8]) -> String {
-    let capped = &bytes[..bytes.len().min(MAX_TEXT_CHARS)];
+    let capped = bytes
+        .get(..bytes.len().min(MAX_TEXT_CHARS))
+        .unwrap_or(bytes);
     let value = String::from_utf8_lossy(capped).into_owned();
     if value.trim().is_empty() {
         "cargo test".to_string()

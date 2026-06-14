@@ -92,7 +92,6 @@
     },
     "reason_codes": {
       "type": "array",
-      "minItems": 1,
       "items": {
         "$ref": "#/$defs/reason_code"
       }
@@ -334,6 +333,19 @@
         },
         "queued_builds": {
           "type": "integer",
+          "minimum": 0
+        },
+        "selected_worker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worker_slots_available": {
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 0
         },
         "workers_healthy": {

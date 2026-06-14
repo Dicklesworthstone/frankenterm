@@ -22,11 +22,11 @@ The schema lives at `docs/json-schema/ft-rch-admission.json` and uses
 | `local_disk` | `/System/Volumes/Data`, `/private/tmp`, repo write probe, and RCH cache write probe. |
 | `beads` | Beads DB/JSONL writeability and active/blocking bead context. |
 | `agent_mail` | Agent Mail API/DB state plus reservation conflicts. |
-| `rch_queue` | Queue posture, active project exclusion, active/queued builds, and worker counts. |
+| `rch_queue` | Queue posture, active project exclusion, active/queued builds, selected worker, available worker slots, and worker counts. |
 | `worker_rejections` | Per-worker or aggregate rejection rows. |
 | `cargo_jobs` | Parsed explicit Cargo job count when available. |
 | `estimated_slots` | Final RCH slot estimate when available. |
-| `reason_codes` | Stable blocker or advisory reason codes. |
+| `reason_codes` | Stable blocker or advisory reason codes; empty when the read-only inputs show the command is runnable. |
 | `recommendations` | Safe next actions tied back to reason codes. |
 | `forbidden_actions` | Actions that must not be taken by normal agents. |
 
@@ -38,7 +38,7 @@ The schema lives at `docs/json-schema/ft-rch-admission.json` and uses
 | `no_admissible_workers` | RCH selected no worker for the command. | Inspect worker rejection details and block the proof bead rather than falling back locally. |
 | `critical_pressure` | Workers were rejected for root, project, or cache pressure. | Wait for worker recovery or operator-approved cleanup on the worker side. |
 | `telemetry_gap` | Worker health or capability data is stale or missing. | Refresh read-only status/probe data; do not mutate workers. |
-| `insufficient_slots` | Healthy workers lacked enough free slots for the estimated job. | Reduce explicit Cargo jobs when appropriate, queue, or wait. |
+| `insufficient_slots` | Healthy workers lacked enough available slots for the estimated job. | Reduce explicit Cargo jobs when appropriate, queue, or wait. |
 | `active_project_exclusion` | Same-project RCH active build excludes another proof lane. | Wait for that build or use Beads/Agent Mail to coordinate ownership. |
 | `speedscore_response_shape` | SpeedScore or related RCH API response shape failed parsing. | Treat ranking data as unavailable and rely on stable worker/status evidence. |
 | `dry_run_inconsistent_worker` | Dry-run envelope claims worker availability while selected worker is null or skipped. | Preserve both fields and classify the result as advisory/inconclusive. |
@@ -92,7 +92,7 @@ before an RCH proof lane can run:
 | `critical-pressure` | Worker root, project, or cache pressure is critical. | `critical_pressure` |
 | `critical-pressure-current-fleet` | Current retained FrankenTerm dry-run selected no worker because five admissible Rust workers were under critical pressure. | `critical_pressure` |
 | `remote-required-local-fallback-refusal` | Remote-required RCH execution selected no worker and refused host-side local fallback before Cargo could run. | `no_admissible_workers` |
-| `insufficient-slots` | The parsed Cargo job request needs more slots than workers can admit. | `insufficient_slots` |
+| `insufficient-slots` | The parsed Cargo job request needs more available worker slots than workers can admit. | `insufficient_slots` |
 | `active-project-exclusion` | Another same-project build is already active. | `active_project_exclusion` |
 | `local-eno-space` | Local disk or cache write probes failed with ENOSPC. | `local_eno_space` |
 | `speedscore-parse-failure` | SpeedScore response shape could not be parsed. | `speedscore_response_shape` |
@@ -131,6 +131,12 @@ rejections, Cargo job estimates, and dirty git paths, then emits the existing
 command/API, freshness, and error-category metadata in citations so later
 doctor wiring can explain where evidence came from without expanding the stable
 schema.
+
+When the queue input includes `selected_worker`, non-selected worker rejections
+remain visible in `worker_rejections` but do not become blocking
+`reason_codes`. `worker_slots_available` is the preferred comparator for
+`estimated_slots`; the normalizer only falls back to `workers_healthy` when a
+collector cannot report available slots.
 
 The core module intentionally does not shell out, write Beads state, probe Agent
 Mail databases, restart services, mutate RCH workers, cancel builds, run Cargo,
