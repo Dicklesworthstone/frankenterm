@@ -1,8 +1,9 @@
 # Robot Family Contract: `operating-envelope`
 
 **Bead:** `ft-booek.1`
-**Status:** planning contract only. No runtime controller implementation is
-shipped by this document.
+**Status:** contract plus shipped read-only human, robot, and MCP explanation
+surfaces. This document defines the data contract; the operator workflow lives
+in [`docs/operator-runbook.md`](../operator-runbook.md#2a-operating-envelope-admission-gate).
 
 ## Purpose
 

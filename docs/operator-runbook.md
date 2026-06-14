@@ -501,11 +501,14 @@ window is reduced, and lists forbidden action classes. It is never permission
 to mutate panes, claim Beads, restart services, cancel RCH jobs, or substitute
 local Cargo proof.
 
-Current status: the contract, planner, and fixtures exist, but the operator,
-robot, and MCP explain surfaces are still tracked by `ft-booek.4`. Until that
-surface bead lands, use the existing fallback commands in this runbook and cite
-the retained fixture or command artifact that most closely matches the live
-state.
+Current status: the contract, planner, fixtures, and read-only explain surfaces
+are shipped. Use `ft swarm envelope` for the human surface,
+`ft robot swarm envelope` for the robot surface, `wa.operating_envelope` for the
+MCP tool, and `wa://operating-envelope/current` or
+`wa://operating-envelope/runs/{run_id}` for MCP resources. These surfaces are
+operator guidance only: they can explain why an admission window is green,
+degraded, blocked, or waiting, but they do not claim Beads, mutate panes, repair
+services, cancel builds, or prove Rust source health.
 
 ### 2A.1 Trust boundaries
 
@@ -538,14 +541,18 @@ Use the fixture states as examples of the operator posture:
 
 ### 2A.3 Surface examples
 
-These are the target operator shapes for `ft-booek.4`; do not present them as
-live commands until that bead ships. The expected degraded fields are pinned by
-the fixture JSON today.
+Use deterministic `--scenario` values when you need a fixture-backed example.
+Use `--scenario current` only when you are prepared for live collectors to fail
+closed and lower the envelope.
 
 Human surface:
 
 ```bash
-ft swarm envelope --explain rch.no_workers_passed_health
+ft swarm envelope \
+  --scenario blocked \
+  --surface explain \
+  --explain-reason rch.no_workers_passed_health \
+  --format plain
 ```
 
 Expected degraded summary:
@@ -561,7 +568,10 @@ remote_cargo_reached=false
 Robot surface:
 
 ```bash
-ft robot --format toon swarm envelope
+ft robot --format toon swarm envelope \
+  --scenario blocked \
+  --surface explain \
+  --explain-reason rch.no_workers_passed_health
 ```
 
 Expected degraded fields:
@@ -581,8 +591,9 @@ admission_windows[0]:
 MCP surface:
 
 ```text
-resource: wa://swarm/operating-envelope
-tool: wa.swarm_envelope_explain {"reason_code":"dirty_overlap.present"}
+resource: wa://operating-envelope/current
+resource-template: wa://operating-envelope/runs/{run_id}
+tool: wa.operating_envelope {"scenario":"blocked","surface":"explain","explain_reason":"dirty_overlap.present"}
 ```
 
 Expected degraded fields:
