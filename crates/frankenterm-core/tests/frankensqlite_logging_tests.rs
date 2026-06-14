@@ -318,6 +318,12 @@ impl MockTargetStorage {
     }
 }
 
+// Mock trait impl: the async methods satisfy the `RecorderStorage` async-trait
+// contract but return canned values without `.await`. The workspace
+// `[lints.clippy] unused_async = "allow"` is defeated in test targets by the
+// CI lane's trailing `-- -D warnings` (a command-line group-deny that wins over
+// the inherited command-line allow), so the allow must be in-source here.
+#[allow(clippy::unused_async)]
 impl RecorderStorage for MockTargetStorage {
     fn backend_kind(&self) -> RecorderBackendKind {
         self.health.backend
