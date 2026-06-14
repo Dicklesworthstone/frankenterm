@@ -8270,10 +8270,13 @@ fn flush_append_segment_group_recovering(
     }
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dispatch_append_segment_group_commit(backend, group, mmap_mirror, segment_redactors);
+        append_segment_group_commit_backend(backend, &group, segment_redactors)
     }));
     match outcome {
-        Ok(()) => None,
+        Ok(result) => {
+            dispatch_append_segment_group_commit_result(result, group, mmap_mirror);
+            None
+        }
         Err(payload) => {
             STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             let message = format!(
@@ -8285,19 +8288,19 @@ fn flush_append_segment_group_recovering(
                 error = %message,
                 "storage writer append group commit panic recovered; failing undispatched batch commands"
             );
+            rollback_append_segment_group_best_effort(backend, "append group panic");
             flush_segment_redactors(backend, mmap_mirror, segment_redactors);
+            fail_pending_append_segments(group, message.clone());
             Some(message)
         }
     }
 }
 
-fn dispatch_append_segment_group_commit(
-    backend: &dyn StorageBackend,
+fn dispatch_append_segment_group_commit_result(
+    result: Result<Vec<CommittedAppendSegment>>,
     group: Vec<PendingAppendSegmentWrite>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) {
-    let result = append_segment_group_commit_backend(backend, &group, segment_redactors);
     match result {
         Ok(committed_segments) => {
             for (pending, committed) in group.into_iter().zip(committed_segments) {
@@ -9107,6 +9110,154 @@ mod writer_io_scheduler_tests {
             assert_eq!(
                 insert_queries, 2,
                 "both grouped segments should insert inside the transaction; got {writer_queries:?}"
+            );
+        });
+    }
+
+    struct PanicOnQueryBackend {
+        inner: crate::storage_backend_trait::MockBackend,
+    }
+
+    impl PanicOnQueryBackend {
+        fn new() -> Self {
+            Self {
+                inner: crate::storage_backend_trait::MockBackend::new(),
+            }
+        }
+
+        fn executed(&self) -> Vec<String> {
+            self.inner.executed()
+        }
+    }
+
+    impl StorageBackend for PanicOnQueryBackend {
+        fn execute(&self, sql: &str) -> std::result::Result<usize, BackendError> {
+            self.inner.execute(sql)
+        }
+
+        fn execute_batch(&self, sql: &str) -> std::result::Result<(), BackendError> {
+            self.inner.execute_batch(sql)
+        }
+
+        fn set_busy_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> std::result::Result<(), BackendError> {
+            self.inner.set_busy_timeout(timeout)
+        }
+
+        fn query_scalar(&self, sql: &str) -> std::result::Result<Option<String>, BackendError> {
+            self.inner.query_scalar(sql)
+        }
+
+        fn begin_transaction(
+            &self,
+        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
+        {
+            self.inner.begin_transaction()
+        }
+
+        fn user_version(&self) -> std::result::Result<u32, BackendError> {
+            self.inner.user_version()
+        }
+
+        fn set_user_version(&self, version: u32) -> std::result::Result<(), BackendError> {
+            self.inner.set_user_version(version)
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "panic_on_query"
+        }
+
+        fn query_row_strings(
+            &self,
+            _sql: &str,
+            _params: &[&str],
+        ) -> std::result::Result<Option<Vec<String>>, BackendError> {
+            std::panic::panic_any("append group panic after begin")
+        }
+
+        fn query_map_strings(
+            &self,
+            sql: &str,
+            params: &[&str],
+        ) -> std::result::Result<Vec<Vec<String>>, BackendError> {
+            self.inner.query_map_strings(sql, params)
+        }
+
+        fn execute_many(
+            &self,
+            sql: &str,
+            param_rows: &[Vec<ToSqlValue<'_>>],
+        ) -> std::result::Result<usize, BackendError> {
+            self.inner.execute_many(sql, param_rows)
+        }
+    }
+
+    #[test]
+    fn writer_batch_group_commit_panic_rolls_back_open_transaction() {
+        reset_storage_writer_panics_total_for_test();
+
+        run_storage_async_test(async {
+            let backend = PanicOnQueryBackend::new();
+            let mut gate = StorageIoWriterGate::default();
+            let mut should_break = false;
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let (first_tx, first_rx) = oneshot::channel();
+            let (second_tx, second_rx) = oneshot::channel();
+            let mut batch = VecDeque::new();
+            batch.push_back(WriteCommand::AppendSegment {
+                pane_id: 77,
+                content: "first panic group append".to_string(),
+                content_hash: None,
+                zone_type: None,
+                respond: first_tx,
+            });
+            batch.push_back(WriteCommand::AppendSegment {
+                pane_id: 77,
+                content: "second panic group append".to_string(),
+                content_hash: None,
+                zone_type: None,
+                respond: second_tx,
+            });
+
+            dispatch_write_command_batch(
+                &backend,
+                batch,
+                &mut should_break,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+                &mut gate,
+            );
+
+            assert!(!should_break);
+            assert_eq!(storage_writer_panics_total(), 1);
+            assert_eq!(
+                backend.executed(),
+                vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+                "append-group panic recovery must close the open transaction"
+            );
+
+            let first_result = crate::runtime_async::oneshot_recv(first_rx)
+                .await
+                .expect("first grouped append should receive a recovered panic error");
+            let first_error = first_result.expect_err("first grouped append should fail closed");
+            assert!(
+                first_error
+                    .to_string()
+                    .contains("storage writer recovered from append group commit panic"),
+                "{first_error}"
+            );
+            let second_result = crate::runtime_async::oneshot_recv(second_rx)
+                .await
+                .expect("second grouped append should receive a recovered panic error");
+            let second_error = second_result.expect_err("second grouped append should fail closed");
+            assert!(
+                second_error
+                    .to_string()
+                    .contains("storage writer recovered from append group commit panic"),
+                "{second_error}"
             );
         });
     }
@@ -10417,7 +10568,10 @@ fn query_approval_token_by_id_backend(
              WHERE id = ?1
                AND workspace_id = ?2
              LIMIT 1",
-            &[ToSqlValue::Integer(token_id), ToSqlValue::Text(workspace_id)],
+            &[
+                ToSqlValue::Integer(token_id),
+                ToSqlValue::Text(workspace_id),
+            ],
         )
         .map_err(|err| storage_backend_error("Query approval token by id", err))?;
 
