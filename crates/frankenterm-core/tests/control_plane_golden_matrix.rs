@@ -286,6 +286,7 @@ fn matrix_covers_required_control_plane_surfaces_and_scenarios() {
         "profile",
         "checkpoint",
         "context",
+        "dom",
         "work",
         "fleet",
     ] {
@@ -480,6 +481,59 @@ fn matrix_covers_representative_contract_cases() {
                 })
         }),
         "matrix must not keep the retired fleet capability-unavailable stub"
+    );
+}
+
+#[test]
+fn matrix_covers_semantic_pane_api_verbs_for_robot_and_mcp() {
+    let matrix = load_matrix();
+
+    for transport in ["robot", "mcp"] {
+        for action in ["zones", "last_command", "output_of", "exit_code"] {
+            let entry = matrix
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.family == "dom"
+                        && entry.transport == transport
+                        && entry.action == action
+                        && entry.status == "ok"
+                })
+                .unwrap_or_else(|| {
+                    panic!("matrix must pin semantic-pane {transport} {action} envelope")
+                });
+            let envelope = entry
+                .envelope
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} must embed a semantic-pane envelope", entry.id));
+            assert_eq!(
+                envelope.pointer("/data/semantic_data_unavailable"),
+                Some(&Value::Bool(false)),
+                "{} must pin available OSC 133 semantic data",
+                entry.id
+            );
+            assert!(
+                envelope.pointer("/data/children").is_none()
+                    && envelope.pointer("/data/parent").is_none()
+                    && envelope.pointer("/data/root").is_none(),
+                "{} must keep the honest flat semantic-pane API shape, not a DOM tree",
+                entry.id
+            );
+        }
+    }
+
+    assert!(
+        matrix.entries.iter().any(|entry| {
+            entry.family == "dom"
+                && entry.scenario == "degraded"
+                && entry.status == "ok"
+                && entry
+                    .envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.pointer("/data/semantic_data_unavailable"))
+                    == Some(&Value::Bool(true))
+        }),
+        "matrix must pin the semantic_data_unavailable degradation contract"
     );
 }
 
