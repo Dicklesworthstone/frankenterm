@@ -14,6 +14,7 @@ use std::fmt::{Display, Formatter};
 const H0_DIMENSION: u8 = 0;
 const H1_DIMENSION: u8 = 1;
 pub const DEADWIRE_WIRING_STATUS_SCHEMA_VERSION: u32 = 1;
+pub const GOVERNED_SUBTRACTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapSizeError {
@@ -256,6 +257,101 @@ pub struct DecisionApiWiringReport {
     pub passed: bool,
 }
 
+/// Reversible disposition for a surface in the governed-subtraction inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedSubtractionDisposition {
+    Wire,
+    Park,
+    AttestAsDormant,
+}
+
+/// Bead-backed rationale required for any non-wired disposition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedSubtractionProvenance {
+    pub bead_id: String,
+    pub rationale: String,
+}
+
+impl GovernedSubtractionProvenance {
+    pub fn new(bead_id: impl Into<String>, rationale: impl Into<String>) -> Self {
+        Self {
+            bead_id: bead_id.into(),
+            rationale: rationale.into(),
+        }
+    }
+}
+
+/// One candidate surface considered for wiring, parking, or dormant attestation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedSubtractionSurface {
+    pub surface_id: String,
+    pub path: String,
+    pub current_disposition: GovernedSubtractionDisposition,
+    pub proposed_disposition: GovernedSubtractionDisposition,
+    pub provenance: Option<GovernedSubtractionProvenance>,
+    pub restore_action: Option<String>,
+    pub attestation_ref: Option<String>,
+}
+
+/// Report-only decision for a governed-subtraction candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedSubtractionDecision {
+    ReportOnlyReviewRequired,
+    Blocked,
+}
+
+/// Machine-stable reasons emitted by the governed-subtraction planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedSubtractionReason {
+    ReportOnly,
+    NoDeletion,
+    ExplicitHumanReviewRequired,
+    SurfaceBudgetExceeded,
+    HardProtectedPath,
+    MissingProvenance,
+    MissingRestoreAction,
+    MissingAttestationReference,
+}
+
+/// Per-surface report row. This intentionally has no apply/delete mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedSubtractionPlanItem {
+    pub surface: GovernedSubtractionSurface,
+    pub decision: GovernedSubtractionDecision,
+    pub reasons: Vec<GovernedSubtractionReason>,
+    pub mutates_files: bool,
+    pub deletes_files: bool,
+    pub requires_human_approval: bool,
+}
+
+/// Report-only surface-budget plan for reversible governed subtraction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedSubtractionPlan {
+    pub schema_version: u32,
+    pub produced_by_bead: String,
+    pub generated_at_ms: u64,
+    pub active_surface_budget: usize,
+    pub proposed_wired_surfaces: usize,
+    pub report_only: bool,
+    pub mutates_files: bool,
+    pub deletes_files: bool,
+    pub hard_protected_paths: Vec<String>,
+    pub items: Vec<GovernedSubtractionPlanItem>,
+    pub blocked: usize,
+    pub review_required: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GovernedSubtractionInput<'a> {
+    pub surfaces: &'a [GovernedSubtractionSurface],
+    pub active_surface_budget: usize,
+    pub produced_by_bead: &'a str,
+    pub generated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DecisionApiWiringInput<'a> {
     pub declarations: &'a [DecisionApiDeclaration],
@@ -319,6 +415,141 @@ pub fn analyze_decision_api_wiring(input: DecisionApiWiringInput<'_>) -> Decisio
         violations,
         passed,
     }
+}
+
+/// Build a no-mutation governed-subtraction plan.
+///
+/// The planner only classifies surface dispositions. It never deletes files,
+/// edits manifests, or treats a parked surface as removed from the repository.
+pub fn plan_governed_subtraction(input: GovernedSubtractionInput<'_>) -> GovernedSubtractionPlan {
+    let proposed_wired_surfaces = input
+        .surfaces
+        .iter()
+        .filter(|surface| surface.proposed_disposition == GovernedSubtractionDisposition::Wire)
+        .count();
+    let mut wired_seen = 0;
+    let items: Vec<_> = input
+        .surfaces
+        .iter()
+        .cloned()
+        .map(|surface| {
+            let wired_index =
+                if surface.proposed_disposition == GovernedSubtractionDisposition::Wire {
+                    wired_seen += 1;
+                    Some(wired_seen)
+                } else {
+                    None
+                };
+            classify_governed_subtraction_surface(surface, wired_index, input.active_surface_budget)
+        })
+        .collect();
+
+    let blocked = items
+        .iter()
+        .filter(|item| item.decision == GovernedSubtractionDecision::Blocked)
+        .count();
+    let review_required = items.len().saturating_sub(blocked);
+
+    GovernedSubtractionPlan {
+        schema_version: GOVERNED_SUBTRACTION_SCHEMA_VERSION,
+        produced_by_bead: input.produced_by_bead.to_string(),
+        generated_at_ms: input.generated_at_ms,
+        active_surface_budget: input.active_surface_budget,
+        proposed_wired_surfaces,
+        report_only: true,
+        mutates_files: false,
+        deletes_files: false,
+        hard_protected_paths: vec![
+            "AGENTS.md".to_string(),
+            "crates/frankenterm-core".to_string(),
+        ],
+        items,
+        blocked,
+        review_required,
+    }
+}
+
+fn classify_governed_subtraction_surface(
+    surface: GovernedSubtractionSurface,
+    wired_index: Option<usize>,
+    active_surface_budget: usize,
+) -> GovernedSubtractionPlanItem {
+    let mut reasons = vec![
+        GovernedSubtractionReason::ReportOnly,
+        GovernedSubtractionReason::NoDeletion,
+        GovernedSubtractionReason::ExplicitHumanReviewRequired,
+    ];
+
+    if is_hard_protected_governed_subtraction_path(&surface.path) {
+        reasons.push(GovernedSubtractionReason::HardProtectedPath);
+    }
+
+    if matches!(
+        surface.proposed_disposition,
+        GovernedSubtractionDisposition::Park | GovernedSubtractionDisposition::AttestAsDormant
+    ) && surface.provenance.as_ref().is_none_or(|provenance| {
+        provenance.bead_id.trim().is_empty() || provenance.rationale.trim().is_empty()
+    }) {
+        reasons.push(GovernedSubtractionReason::MissingProvenance);
+    }
+
+    if surface.proposed_disposition == GovernedSubtractionDisposition::Park
+        && surface
+            .restore_action
+            .as_deref()
+            .is_none_or(|action| action.trim().is_empty())
+    {
+        reasons.push(GovernedSubtractionReason::MissingRestoreAction);
+    }
+
+    if surface.proposed_disposition == GovernedSubtractionDisposition::AttestAsDormant
+        && surface
+            .attestation_ref
+            .as_deref()
+            .is_none_or(|reference| reference.trim().is_empty())
+    {
+        reasons.push(GovernedSubtractionReason::MissingAttestationReference);
+    }
+
+    if wired_index.is_some_and(|index| index > active_surface_budget) {
+        reasons.push(GovernedSubtractionReason::SurfaceBudgetExceeded);
+    }
+
+    let decision = if reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            GovernedSubtractionReason::SurfaceBudgetExceeded
+                | GovernedSubtractionReason::HardProtectedPath
+                | GovernedSubtractionReason::MissingProvenance
+                | GovernedSubtractionReason::MissingRestoreAction
+                | GovernedSubtractionReason::MissingAttestationReference
+        )
+    }) {
+        GovernedSubtractionDecision::Blocked
+    } else {
+        GovernedSubtractionDecision::ReportOnlyReviewRequired
+    };
+
+    GovernedSubtractionPlanItem {
+        surface,
+        decision,
+        reasons,
+        mutates_files: false,
+        deletes_files: false,
+        requires_human_approval: true,
+    }
+}
+
+fn is_hard_protected_governed_subtraction_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    let normalized = trimmed
+        .strip_prefix("./")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    normalized == "AGENTS.md"
+        || normalized.ends_with("/AGENTS.md")
+        || normalized == "crates/frankenterm-core"
+        || normalized.starts_with("crates/frankenterm-core/")
 }
 
 pub fn betti_curve(bitmap: &GrayBitmap) -> Vec<BettiSample> {
@@ -584,14 +815,17 @@ fn is_yyyy_mm_dd(value: &str) -> bool {
 
 fn parse_four_digits(value: &str) -> Option<u16> {
     match value.as_bytes() {
-        [thousands @ b'0'..=b'9', hundreds @ b'0'..=b'9', tens @ b'0'..=b'9', ones @ b'0'..=b'9'] => {
-            Some(
-                u16::from(thousands - b'0') * 1000
-                    + u16::from(hundreds - b'0') * 100
-                    + u16::from(tens - b'0') * 10
-                    + u16::from(ones - b'0'),
-            )
-        }
+        [
+            thousands @ b'0'..=b'9',
+            hundreds @ b'0'..=b'9',
+            tens @ b'0'..=b'9',
+            ones @ b'0'..=b'9',
+        ] => Some(
+            u16::from(thousands - b'0') * 1000
+                + u16::from(hundreds - b'0') * 100
+                + u16::from(tens - b'0') * 10
+                + u16::from(ones - b'0'),
+        ),
         _ => None,
     }
 }
@@ -962,6 +1196,173 @@ mod tests {
         })
     }
 
+    fn governed_surface(
+        id: &str,
+        path: &str,
+        proposed_disposition: GovernedSubtractionDisposition,
+    ) -> GovernedSubtractionSurface {
+        GovernedSubtractionSurface {
+            surface_id: id.to_string(),
+            path: path.to_string(),
+            current_disposition: GovernedSubtractionDisposition::Wire,
+            proposed_disposition,
+            provenance: Some(GovernedSubtractionProvenance::new(
+                "ft-7h5da.11.14",
+                "surface budget review",
+            )),
+            restore_action: Some("restore by reverting the feature-gate entry".to_string()),
+            attestation_ref: Some("docs/attestations/doctrine/wiring-status.json".to_string()),
+        }
+    }
+
+    fn governed_plan(surfaces: &[GovernedSubtractionSurface]) -> GovernedSubtractionPlan {
+        plan_governed_subtraction(GovernedSubtractionInput {
+            surfaces,
+            active_surface_budget: 8,
+            produced_by_bead: "ft-7h5da.11.14",
+            generated_at_ms: 1_704_000_000_000,
+        })
+    }
+
+    #[test]
+    fn governed_subtraction_plan_is_report_only_and_deletion_free() {
+        let surfaces = [governed_surface(
+            "mcp_connector_extract",
+            "crates/frankenterm-core-mcp/Cargo.toml",
+            GovernedSubtractionDisposition::Park,
+        )];
+
+        let plan = governed_plan(&surfaces);
+
+        assert_eq!(plan.schema_version, GOVERNED_SUBTRACTION_SCHEMA_VERSION);
+        assert!(plan.report_only);
+        assert!(!plan.mutates_files);
+        assert!(!plan.deletes_files);
+        assert_eq!(plan.review_required, 1);
+        assert!(plan.items.iter().any(|item| {
+            item.decision == GovernedSubtractionDecision::ReportOnlyReviewRequired
+                && !item.mutates_files
+                && !item.deletes_files
+                && item.requires_human_approval
+                && item
+                    .reasons
+                    .contains(&GovernedSubtractionReason::NoDeletion)
+                && item
+                    .reasons
+                    .contains(&GovernedSubtractionReason::ExplicitHumanReviewRequired)
+        }));
+    }
+
+    #[test]
+    fn governed_subtraction_blocks_protected_paths() {
+        for path in [
+            "AGENTS.md",
+            "docs/AGENTS.md",
+            "crates/frankenterm-core",
+            "crates/frankenterm-core/src/lib.rs",
+            "./crates/frankenterm-core/",
+        ] {
+            let surfaces = [governed_surface(
+                "protected",
+                path,
+                GovernedSubtractionDisposition::Park,
+            )];
+            let plan = governed_plan(&surfaces);
+
+            assert!(
+                plan.items
+                    .iter()
+                    .any(|item| item.decision == GovernedSubtractionDecision::Blocked
+                        && item
+                            .reasons
+                            .contains(&GovernedSubtractionReason::HardProtectedPath)
+                        && !item.deletes_files),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn governed_subtraction_requires_parking_provenance_and_restore_action() {
+        let mut surface = governed_surface(
+            "parked_subsystem",
+            "crates/frankenterm-core-fleet/Cargo.toml",
+            GovernedSubtractionDisposition::Park,
+        );
+        surface.provenance = None;
+        surface.restore_action = None;
+
+        let plan = governed_plan(&[surface]);
+
+        assert!(plan.items.iter().any(|item| {
+            item.decision == GovernedSubtractionDecision::Blocked
+                && item
+                    .reasons
+                    .contains(&GovernedSubtractionReason::MissingProvenance)
+                && item
+                    .reasons
+                    .contains(&GovernedSubtractionReason::MissingRestoreAction)
+        }));
+    }
+
+    #[test]
+    fn governed_subtraction_requires_dormant_attestation_reference() {
+        let mut surface = governed_surface(
+            "dormant_connector",
+            "crates/frankenterm-core-connectors/Cargo.toml",
+            GovernedSubtractionDisposition::AttestAsDormant,
+        );
+        surface.attestation_ref = None;
+
+        let plan = governed_plan(&[surface]);
+
+        assert!(plan.items.iter().any(|item| {
+            item.decision == GovernedSubtractionDecision::Blocked
+                && item
+                    .reasons
+                    .contains(&GovernedSubtractionReason::MissingAttestationReference)
+        }));
+    }
+
+    #[test]
+    fn governed_subtraction_enforces_active_surface_budget() {
+        let surfaces = [
+            governed_surface(
+                "wire_one",
+                "crates/frankenterm-core-resource-types/Cargo.toml",
+                GovernedSubtractionDisposition::Wire,
+            ),
+            governed_surface(
+                "wire_two",
+                "crates/frankenterm-core-policy-types/Cargo.toml",
+                GovernedSubtractionDisposition::Wire,
+            ),
+        ];
+        let plan = plan_governed_subtraction(GovernedSubtractionInput {
+            surfaces: &surfaces,
+            active_surface_budget: 1,
+            produced_by_bead: "ft-7h5da.11.14",
+            generated_at_ms: 1_704_000_000_000,
+        });
+
+        assert_eq!(plan.items.len(), 2);
+        assert!(
+            plan.items
+                .iter()
+                .any(|item| item.surface.surface_id == "wire_one"
+                    && item.decision == GovernedSubtractionDecision::ReportOnlyReviewRequired)
+        );
+        assert!(plan.items.iter().any(|item| {
+            item.surface.surface_id == "wire_two"
+                && item.decision == GovernedSubtractionDecision::Blocked
+                && item
+                    .reasons
+                    .contains(&GovernedSubtractionReason::SurfaceBudgetExceeded)
+        }));
+        assert_eq!(plan.proposed_wired_surfaces, 2);
+        assert_eq!(plan.blocked, 1);
+    }
+
     #[test]
     fn deadwire_gate_fails_unwired_api_without_dormant_exemption() {
         let declarations = [DecisionApiDeclaration::new(
@@ -1182,12 +1583,14 @@ mod tests {
         assert_eq!(curve[0].beta1, 1);
 
         let diagram = persistence_diagram(&image);
-        assert!(diagram
-            .features
-            .iter()
-            .any(|feature| feature.dimension == H1_DIMENSION
-                && (feature.birth - 255.0).abs() < f64::EPSILON
-                && (feature.death - 0.0).abs() < f64::EPSILON));
+        assert!(
+            diagram
+                .features
+                .iter()
+                .any(|feature| feature.dimension == H1_DIMENSION
+                    && (feature.birth - 255.0).abs() < f64::EPSILON
+                    && (feature.death - 0.0).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
