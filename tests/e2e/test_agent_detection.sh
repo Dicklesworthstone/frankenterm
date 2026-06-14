@@ -12,7 +12,7 @@ RUN_ID="$(date +%Y%m%dT%H%M%S)"
 LOG_FILE="${LOG_DIR}/test_agent_detection_${RUN_ID}.jsonl"
 DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-agent-detection-${RUN_ID}"
 INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
-if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" ]]; then
     CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
 else
     CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"

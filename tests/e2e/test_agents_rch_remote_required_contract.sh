@@ -31,6 +31,14 @@ LIVE_RCH_SURFACES=(
   "tests/fixtures/terminal-conformance/README.md"
   "tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json"
 )
+ABSOLUTE_TARGET_DIR_HARNESSES=(
+  "tests/e2e/test_agent_detection.sh"
+  "tests/e2e/test_agent_detection_graceful.sh"
+  "tests/e2e/test_agent_autoconfig.sh"
+  "tests/e2e/test_ft_1i2ge_4_6.sh"
+  "tests/e2e/test_ft_1i2ge_3_8.sh"
+  "tests/e2e/test_ft_1i2ge_8_10.sh"
+)
 DOCS=(
   "docs/adr/0012-asupersync-runtime-doctrine.md"
   "docs/asupersync-migration-baseline.md"
@@ -93,6 +101,9 @@ require_file "${MAIN_RS}"
 for surface in "${LIVE_RCH_SURFACES[@]}"; do
   require_file "${surface}"
 done
+for surface in "${ABSOLUTE_TARGET_DIR_HARNESSES[@]}"; do
+  require_file "${surface}"
+done
 for doc in "${DOCS[@]}"; do
   require_file "${doc}"
 done
@@ -126,6 +137,14 @@ LIVE_RCH_SURFACES = [
   "tests/fixtures/terminal-conformance/manifest.json",
   "tests/fixtures/terminal-conformance/README.md",
   "tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json"
+]
+ABSOLUTE_TARGET_DIR_HARNESSES = [
+  "tests/e2e/test_agent_detection.sh",
+  "tests/e2e/test_agent_detection_graceful.sh",
+  "tests/e2e/test_agent_autoconfig.sh",
+  "tests/e2e/test_ft_1i2ge_4_6.sh",
+  "tests/e2e/test_ft_1i2ge_3_8.sh",
+  "tests/e2e/test_ft_1i2ge_8_10.sh"
 ]
 CONTRACT_DOCS = [
   "docs/adr/0012-asupersync-runtime-doctrine.md",
@@ -260,6 +279,17 @@ LIVE_RCH_SURFACES.each do |path|
   required_snippets.each do |snippet|
     fail!("#{path} missing #{snippet}") unless surface.include?(snippet)
   end
+end
+
+target_dir_rejection = /
+  if \s+ \[\[ \s+ -n \s+ "\$\{(?<var>INHERITED_CARGO_TARGET_DIR|REQUESTED_TARGET_DIR|REQUESTED_CARGO_TARGET_DIR)\}" \s+
+  && \s+ "\$\{\k<var>\}" \s+ != \s+ \/\* \s+ \]\] ; \s+ then
+/x
+
+ABSOLUTE_TARGET_DIR_HARNESSES.each do |path|
+  surface = File.read(path)
+  fail!("#{path} missing CARGO_TARGET_DIR selection") unless surface.include?("CARGO_TARGET_DIR")
+  fail!("#{path} still rejects absolute CARGO_TARGET_DIR overrides") if surface.match?(target_dir_rejection)
 end
 
 %w[

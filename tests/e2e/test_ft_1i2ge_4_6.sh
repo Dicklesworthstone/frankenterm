@@ -24,7 +24,7 @@ SCENARIO_ID="ft_1i2ge_4_6_kill_switch"
 CORRELATION_ID="ft-1i2ge.4.6-${RUN_ID}"
 DEFAULT_TARGET_DIR="target/rch-e2e-ft-1i2ge-4-6-${RUN_ID}"
 REQUESTED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
-if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+if [[ -n "${REQUESTED_TARGET_DIR}" ]]; then
   TARGET_DIR="${REQUESTED_TARGET_DIR}"
 else
   TARGET_DIR="${DEFAULT_TARGET_DIR}"
