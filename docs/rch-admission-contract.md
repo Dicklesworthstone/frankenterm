@@ -101,8 +101,10 @@ before an RCH proof lane can run:
 The static verifier treats these as retained evidence, not live service proof.
 It validates that every case carries the standard `forbidden_actions`, that its
 recorded read-only commands do not contain service-restart, repair, worker
-mutation, build-cancel, or destructive filesystem command fragments, and that
-every collector side-effect flag is false. The verifier also emits ignored
+mutation, build-cancel, or destructive filesystem command fragments, that
+retained evidence summaries do not smuggle those forbidden command fragments
+back into the closeout record, and that every collector side-effect flag is
+false. The verifier also emits ignored
 artifacts under `tests/e2e/artifacts/`: a JSONL `structured.log` plus a
 `summary.json`. Every emitted event must keep `service_actions_invoked`,
 `local_cargo_proof`, and `side_effects_executed` set to false. The emitted
@@ -111,6 +113,13 @@ structured log must byte-match
 deterministic summary fields must match
 `fixtures/rch-admission/summary.golden.json`; intentional fixture changes
 update those committed goldens in the same review.
+
+The forbidden command-fragment vocabulary is pinned by the verifier, not merely
+documented in the fixture. It must continue to include the full shared-service
+protection set from `AGENTS.md`: Agent Mail service stop/restart, doctor
+fix/repair/reconstruct, process-kill fragments for Agent Mail and RCH, RCH
+daemon stop/restart, worker enable/disable/clean operations, build cancellation,
+destructive git reset/clean commands, and `rm -rf`.
 
 ## Read-only Collector Substrate
 

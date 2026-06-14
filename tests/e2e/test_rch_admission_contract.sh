@@ -136,9 +136,18 @@ EXPECTED_SIDE_EFFECT_FLAGS = %w[
 ].freeze
 REQUIRED_FORBIDDEN_COMMAND_FRAGMENTS = [
   "am service restart",
+  "am service stop",
+  "am doctor fix",
   "am doctor repair",
+  "am doctor reconstruct",
+  "kill am",
+  "kill mcp-agent-mail",
+  "kill rch",
   "rch daemon restart",
+  "rch daemon stop",
   "rch workers disable",
+  "rch workers enable",
+  "rch workers clean",
   "cancel build",
   "git reset --hard",
   "git clean -fd",
@@ -272,6 +281,12 @@ no_service_cases.each do |entry|
   evidence.each do |record|
     fail!("no-service case #{fixture_id} evidence missing kind") unless record.key?("kind")
     fail!("no-service case #{fixture_id} evidence missing summary") unless record.key?("summary")
+    summary = record.fetch("summary")
+    forbidden_fragments.each do |fragment|
+      if summary.downcase.include?(fragment.downcase)
+        fail!("no-service case #{fixture_id} evidence summary contains forbidden fragment #{fragment}: #{summary}")
+      end
+    end
   end
 
   side_effects = entry.fetch("collector_side_effects")
