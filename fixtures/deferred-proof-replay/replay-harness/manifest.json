@@ -36,6 +36,7 @@
       "blocked_no_admissible_workers": 0,
       "blocked_exit_143": 0,
       "blocked_remote_timeout": 0,
+      "blocked_stuck_detector_cancelled": 0,
       "blocked_topology_preflight": 0,
       "blocked_remote_not_confirmed": 0
     }

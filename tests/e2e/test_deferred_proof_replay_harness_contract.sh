@@ -101,6 +101,7 @@ ATTEMPT_OUTCOMES = %w[
   blocked_no_admissible_workers
   blocked_exit_143
   blocked_remote_timeout
+  blocked_stuck_detector_cancelled
   blocked_topology_preflight
   blocked_remote_not_confirmed
 ].freeze
@@ -364,6 +365,11 @@ def assert_live_attempt!(record, schema, where)
     fail!("#{where}: timeout must not be local fallback") if record["local_fallback_detected"]
     fail!("#{where}: timeout must retain selected worker") unless record["selected_worker"].is_a?(String)
     fail!("#{where}: timeout must retain RCH job id") unless record["rch_job_id"].is_a?(String)
+  when "blocked_stuck_detector_cancelled"
+    fail!("#{where}: stuck detector must carry rch.stuck_detector_cancelled") unless record["blockers"].include?("rch.stuck_detector_cancelled")
+    fail!("#{where}: stuck detector cancellation must not be local fallback") if record["local_fallback_detected"]
+    fail!("#{where}: stuck detector cancellation must retain selected worker") unless record["selected_worker"].is_a?(String)
+    fail!("#{where}: stuck detector cancellation must retain RCH job id") unless record["rch_job_id"].is_a?(String)
   when "blocked_local_fallback"
     fail!("#{where}: local fallback must be detected") unless record["local_fallback_detected"] == true
     fail!("#{where}: local fallback must carry blocker") unless record["blockers"].include?("rch.local_fallback")
@@ -573,6 +579,30 @@ timeout_fixture = {
 }
 assert_live_attempt!(timeout_fixture, attempt_schema, "synthetic timeout invariant")
 
+stuck_detector_fixture = {
+  "schema_version" => 1,
+  "contract_id" => ATTEMPT_CONTRACT_ID,
+  "bead_id" => "ft-stuck1",
+  "receipt_id" => "ft-stuck1:comment-6610",
+  "source_receipt_digest" => "sha256:#{"1" * 64}",
+  "source_text_sha256" => nil,
+  "command_argv" => ["rch", "--no-self-healing", "exec", "--", "env", "CARGO_TARGET_DIR=/tmp/ft-stuck1", "cargo", "test"],
+  "command_env" => [{ "name" => "RCH_REQUIRE_REMOTE", "value" => "1" }, { "name" => "RCH_NO_SELF_HEALING", "value" => "1" }],
+  "target_dir" => "/tmp/ft-stuck1",
+  "selected_worker" => "vmi1152480",
+  "rch_job_id" => "j-29884604911452440",
+  "remote_exit_status" => 130,
+  "outcome" => "blocked_stuck_detector_cancelled",
+  "blockers" => ["rch.stuck_detector_cancelled"],
+  "remote_cargo_reached" => true,
+  "local_fallback_detected" => false,
+  "stdout_path" => passed.fetch("stdout_path"),
+  "stderr_path" => passed.fetch("stderr_path"),
+  "attempt_record_path" => passed.fetch("attempt_record_path"),
+  "note" => "RCH selected a remote worker/job but the stuck detector cancelled the proof lane before a terminal Cargo result."
+}
+assert_live_attempt!(stuck_detector_fixture, attempt_schema, "synthetic stuck-detector invariant")
+
 # --- Tamper corpus: fail-closed invariants ------------------------------
 fail!("tamper contract drifted") unless tamper["contract_id"] == TAMPER_CONTRACT_ID
 cases = tamper.fetch("cases")
@@ -642,10 +672,12 @@ end
   "defer_remote_blocked",
   "remote_proof_passed",
   "blocked_remote_timeout",
+  "blocked_stuck_detector_cancelled",
   "reject_non_remote_command",
   "reject_stale_command",
   "rch.topology_preflight_failed",
   "rch.remote_timeout",
+  "rch.stuck_detector_cancelled",
   "RCH_REQUIRE_REMOTE=1",
   "RCH_NO_SELF_HEALING=1",
   "remote_exit_status",

@@ -225,6 +225,8 @@ pub enum ProofQualityBlocker {
     RchExit143,
     /// RCH selected a remote worker but timed out.
     RchRemoteTimeout,
+    /// RCH stuck detector cancelled the proof before a terminal result.
+    RchStuckDetectorCancelled,
     /// RCH topology preflight failed before proof execution.
     RchTopologyPreflight,
     /// Remote execution was not confirmed.
@@ -250,6 +252,7 @@ impl ProofQualityBlocker {
             Self::RchNoAdmissibleWorkers => "rch.no_admissible_workers",
             Self::RchExit143 => "rch.exit_143",
             Self::RchRemoteTimeout => "rch.remote_timeout",
+            Self::RchStuckDetectorCancelled => "rch.stuck_detector_cancelled",
             Self::RchTopologyPreflight => "rch.topology_preflight_failed",
             Self::RchRemoteNotConfirmed => "rch.remote_not_confirmed",
             Self::CodeFailure => "proof.code_failure",
@@ -470,6 +473,7 @@ fn terminal_class(
         | DeferredProofReplayAttemptOutcome::BlockedNoAdmissibleWorkers
         | DeferredProofReplayAttemptOutcome::BlockedExit143
         | DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout
+        | DeferredProofReplayAttemptOutcome::BlockedStuckDetectorCancelled
         | DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight
         | DeferredProofReplayAttemptOutcome::BlockedRemoteNotConfirmed => {
             ProofTerminalClass::TerminalInfraBlocker
@@ -522,6 +526,12 @@ fn blockers_for_attempt(
         }
         DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout => {
             push_unique_blocker(&mut blockers, ProofQualityBlocker::RchRemoteTimeout);
+        }
+        DeferredProofReplayAttemptOutcome::BlockedStuckDetectorCancelled => {
+            push_unique_blocker(
+                &mut blockers,
+                ProofQualityBlocker::RchStuckDetectorCancelled,
+            );
         }
         DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight => {
             push_unique_blocker(&mut blockers, ProofQualityBlocker::RchTopologyPreflight);
@@ -578,8 +588,8 @@ fn nibble_to_hex(nibble: u8) -> char {
 mod tests {
     use super::*;
     use crate::deferred_proof_replay::{
-        DEFERRED_PROOF_REPLAY_ATTEMPT_CONTRACT_ID, DEFERRED_PROOF_REPLAY_SCHEMA_VERSION,
-        DeferredProofEnvVar,
+        DeferredProofEnvVar, DEFERRED_PROOF_REPLAY_ATTEMPT_CONTRACT_ID,
+        DEFERRED_PROOF_REPLAY_SCHEMA_VERSION,
     };
     use crate::proof_intent::{ProofRedactionPolicy, ProofScope};
 
@@ -946,6 +956,10 @@ mod tests {
             (
                 DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout,
                 "rch.remote_timeout",
+            ),
+            (
+                DeferredProofReplayAttemptOutcome::BlockedStuckDetectorCancelled,
+                "rch.stuck_detector_cancelled",
             ),
             (
                 DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight,

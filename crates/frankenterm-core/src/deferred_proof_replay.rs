@@ -169,6 +169,7 @@ pub enum DeferredProofReplayBlocker {
     RchNoAdmissibleWorkers,
     RchExit143,
     RchRemoteTimeout,
+    RchStuckDetectorCancelled,
     RchRemoteNotConfirmed,
     OverlapDirtyPaths,
     PrereqBeadOpen,
@@ -189,6 +190,7 @@ impl DeferredProofReplayBlocker {
             Self::RchNoAdmissibleWorkers => "rch.no_admissible_workers",
             Self::RchExit143 => "rch.exit_143",
             Self::RchRemoteTimeout => "rch.remote_timeout",
+            Self::RchStuckDetectorCancelled => "rch.stuck_detector_cancelled",
             Self::RchRemoteNotConfirmed => "rch.remote_not_confirmed",
             Self::OverlapDirtyPaths => "overlap.dirty_paths",
             Self::PrereqBeadOpen => "prereq.bead_open",
@@ -289,8 +291,15 @@ impl DeferredProofCommandExecutor for StdDeferredProofCommandExecutor {
             ));
         };
 
-        let mut command = Command::new(program);
-        command.args(&invocation.argv[1..]);
+        if program != "rch" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deferred-proof live replay only executes the rch binary",
+            ));
+        }
+
+        let mut command = Command::new("rch");
+        command.args(invocation.argv.iter().skip(1));
         for env in &invocation.env {
             command.env(&env.name, &env.value);
         }
@@ -313,6 +322,7 @@ pub enum DeferredProofReplayAttemptOutcome {
     BlockedNoAdmissibleWorkers,
     BlockedExit143,
     BlockedRemoteTimeout,
+    BlockedStuckDetectorCancelled,
     BlockedTopologyPreflight,
     BlockedRemoteNotConfirmed,
 }
@@ -725,8 +735,9 @@ pub fn remote_only_command(command: &DeferredProofCommand) -> bool {
     if argv.get(exec_index + 1).map(String::as_str) != Some("--") {
         return false;
     }
-    if !argv[..exec_index]
+    if !argv
         .iter()
+        .take(exec_index)
         .any(|arg| arg == "--no-self-healing")
     {
         return false;
@@ -832,6 +843,12 @@ fn classify_live_output(
             vec![DeferredProofReplayBlocker::RchRemoteTimeout],
         );
     }
+    if contains_stuck_detector_cancellation(lower_output) {
+        return (
+            DeferredProofReplayAttemptOutcome::BlockedStuckDetectorCancelled,
+            vec![DeferredProofReplayBlocker::RchStuckDetectorCancelled],
+        );
+    }
     if !remote_cargo_reached {
         return (
             DeferredProofReplayAttemptOutcome::BlockedRemoteNotConfirmed,
@@ -874,12 +891,19 @@ fn contains_remote_timeout(lower_output: &str) -> bool {
         || lower_output.contains("command timed out after")
 }
 
+fn contains_stuck_detector_cancellation(lower_output: &str) -> bool {
+    lower_output.contains("stuck_detector")
+        || lower_output.contains("stuck detector")
+        || lower_output.contains("cancelled by stuck")
+        || lower_output.contains("canceled by stuck")
+}
+
 fn selected_worker_from_text(text: &str) -> Option<String> {
     text.split(|ch: char| !ch.is_ascii_alphanumeric())
         .find(|token| {
-            token.len() > 3
-                && token.starts_with("vmi")
-                && token[3..].chars().all(|ch| ch.is_ascii_digit())
+            token.strip_prefix("vmi").is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+            })
         })
         .map(ToString::to_string)
 }
@@ -887,9 +911,9 @@ fn selected_worker_from_text(text: &str) -> Option<String> {
 fn rch_job_from_text(text: &str) -> Option<String> {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
         .find(|token| {
-            token.len() > 2
-                && token.starts_with("j-")
-                && token[2..].chars().all(|ch| ch.is_ascii_digit())
+            token.strip_prefix("j-").is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+            })
         })
         .map(ToString::to_string)
 }
@@ -947,6 +971,9 @@ fn note_for_attempt(outcome: DeferredProofReplayAttemptOutcome) -> &'static str 
         DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout => {
             "RCH selected a remote worker and reached Cargo/test, but the remote command timed out before a terminal proof result."
         }
+        DeferredProofReplayAttemptOutcome::BlockedStuckDetectorCancelled => {
+            "RCH selected a remote worker/job but the stuck detector cancelled the proof lane before a terminal Cargo result."
+        }
         DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight => {
             "RCH selected a worker but failed remote topology preflight before Cargo/test."
         }
@@ -973,10 +1000,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn nibble_to_hex(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => unreachable!("nibble masked to four bits"),
+    match nibble & 0x0f {
+        value @ 0..=9 => (b'0' + value) as char,
+        value => (b'a' + (value - 10)) as char,
     }
 }
 
@@ -1156,6 +1182,25 @@ mod tests {
     }
 
     #[test]
+    fn std_executor_rejects_non_rch_program_before_spawn() {
+        let invocation = DeferredProofCommandInvocation {
+            argv: vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "frankenterm-core".to_string(),
+            ],
+            env: Vec::new(),
+        };
+
+        let err = StdDeferredProofCommandExecutor
+            .run(&invocation)
+            .expect_err("non-rch executable is rejected before spawn");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn dry_run_prefers_static_over_remote_candidate() {
         let remote = remote_receipt("ft-rdy1");
         let static_one = static_receipt("ft-stat1");
@@ -1296,5 +1341,31 @@ mod tests {
         assert!(record.remote_cargo_reached);
         assert!(!record.local_fallback_detected);
         assert_eq!(record.blockers, vec!["rch.remote_timeout"]);
+    }
+
+    #[test]
+    fn live_attempt_blocks_stuck_detector_cancellation_without_code_failure() {
+        let receipt = remote_receipt("ft-stuck1");
+        let output = DeferredProofProcessOutput {
+            exit_status: Some(130),
+            stdout: br#"[W] Worker: vmi1152480 | Job: j-29884604911452440
+{"cancellation":{"origin":"stuck_detector","reason_code":"stuck_detector"}}
+build cancelled by stuck_detector before terminal Cargo result
+"#
+            .to_vec(),
+            stderr: Vec::new(),
+        };
+
+        let record = build_live_attempt_record(&receipt, &output);
+
+        assert_eq!(
+            record.outcome,
+            DeferredProofReplayAttemptOutcome::BlockedStuckDetectorCancelled
+        );
+        assert_eq!(record.selected_worker.as_deref(), Some("vmi1152480"));
+        assert_eq!(record.rch_job_id.as_deref(), Some("j-29884604911452440"));
+        assert!(record.remote_cargo_reached);
+        assert!(!record.local_fallback_detected);
+        assert_eq!(record.blockers, vec!["rch.stuck_detector_cancelled"]);
     }
 }

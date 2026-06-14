@@ -119,6 +119,7 @@
         "blocked_no_admissible_workers",
         "blocked_exit_143",
         "blocked_remote_timeout",
+        "blocked_stuck_detector_cancelled",
         "blocked_topology_preflight",
         "blocked_remote_not_confirmed"
       ]
@@ -133,6 +134,7 @@
           "rch.no_admissible_workers",
           "rch.exit_143",
           "rch.remote_timeout",
+          "rch.stuck_detector_cancelled",
           "rch.topology_preflight_failed",
           "rch.remote_not_confirmed"
         ]

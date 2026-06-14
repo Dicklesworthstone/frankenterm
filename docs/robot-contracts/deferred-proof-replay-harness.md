@@ -117,12 +117,13 @@ fixture is `fixtures/deferred-proof-replay/replay-harness/live-attempts.v1.jsonl
 Current outcome vocabulary:
 `remote_proof_passed`, `remote_proof_failed`, `blocked_local_fallback`,
 `blocked_worker_null`, `blocked_no_admissible_workers`, `blocked_exit_143`,
-`blocked_remote_timeout`, `blocked_topology_preflight`, and
-`blocked_remote_not_confirmed`.
+`blocked_remote_timeout`, `blocked_stuck_detector_cancelled`,
+`blocked_topology_preflight`, and `blocked_remote_not_confirmed`.
 
 Live blockers are RCH-specific: `rch.local_fallback`, `rch.worker_null`,
 `rch.no_admissible_workers`, `rch.exit_143`, `rch.remote_timeout`,
-`rch.topology_preflight_failed`, and `rch.remote_not_confirmed`.
+`rch.stuck_detector_cancelled`, `rch.topology_preflight_failed`, and
+`rch.remote_not_confirmed`.
 
 ## Next candidate selection
 
