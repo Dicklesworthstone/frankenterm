@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Changed-file UBS gate for FrankenTerm's large CLI file.
+"""Changed-file UBS gate for FrankenTerm's legacy large Rust files.
 
 The global `ubs <files>` runner scans whole files. That is correct for normal
-files, but `crates/frankenterm/src/main.rs` is large enough that whole-file UBS
-currently replays historical panic/unwrap inventory and can stall in ast-grep.
-This helper keeps the ordinary UBS path for normal files and line-gates only the
-known oversized CLI file.
+files, but a small set of legacy CLI/MCP files is large enough that whole-file
+UBS currently replays historical panic/unwrap inventory and can stall in
+ast-grep. This helper keeps the ordinary UBS path for normal files and
+changed-line-gates only the known legacy files.
 """
 
 from __future__ import annotations
@@ -23,6 +23,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GIT_TIMEOUT_SECS = 15
 UBS_TIMEOUT_SECS = 300
 LINE_GATED_RUST_FILES = {
+    "crates/frankenterm-core/src/mcp.rs",
+    "crates/frankenterm-core/src/mcp_bridge.rs",
+    "crates/frankenterm-core/src/mcp_tools.rs",
+    "crates/frankenterm-core/src/mcp_types.rs",
+    "crates/frankenterm-core/tests/mcp_manifest_golden.rs",
+    "crates/frankenterm-core/tests/proptest_mcp_bridge.rs",
+    "crates/frankenterm-core/tests/wa_events_mcp_conformance.rs",
     "crates/frankenterm/src/main.rs",
 }
 
@@ -262,7 +269,7 @@ def run_line_gate(files: list[str], staged: bool) -> int:
             findings.extend(line_findings(line))
 
     if not findings:
-        print("line-gated UBS: no panic/unwrap findings in changed CLI hunks")
+        print("line-gated UBS: no panic/unwrap findings in changed legacy hunks")
         return 0
 
     print("line-gated UBS findings:", file=sys.stderr)
@@ -297,6 +304,7 @@ def run_ubs(files: list[str]) -> int:
 def self_test() -> int:
     safe = ChangedLine("crates/frankenterm/src/main.rs", 10, "let x = value?;")
     risky = ChangedLine("crates/frankenterm/src/main.rs", 11, "let x = value.unwrap();")
+    mcp_risky = ChangedLine("crates/frankenterm-core/src/mcp_tools.rs", 42, "unreachable!();")
     ignored = ChangedLine(
         "crates/frankenterm/src/main.rs",
         12,
@@ -320,12 +328,24 @@ def self_test() -> int:
         if test_line.line_number in rust_test_context_lines(test_path)
         else line_findings(test_line)
     )
+    expected_line_gated = {
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/mcp.rs",
+        "crates/frankenterm-core/src/mcp_bridge.rs",
+        "crates/frankenterm-core/src/mcp_tools.rs",
+        "crates/frankenterm-core/src/mcp_types.rs",
+        "crates/frankenterm-core/tests/proptest_mcp_bridge.rs",
+        "crates/frankenterm-core/tests/mcp_manifest_golden.rs",
+        "crates/frankenterm-core/tests/wa_events_mcp_conformance.rs",
+    }
     checks = [
         (line_findings(safe), 0),
         (line_findings(risky), 1),
+        (line_findings(mcp_risky), 1),
         (line_findings(ignored), 0),
         (line_findings(bad_ignore), 1),
         (test_findings, 0),
+        (sorted(expected_line_gated - LINE_GATED_RUST_FILES), 0),
     ]
     failures = [
         index
@@ -342,9 +362,23 @@ def self_test() -> int:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run UBS on changed files, using changed-line checks for the oversized "
-            "frankenterm CLI file."
-        )
+            "Run UBS on changed files, using changed-line checks for legacy "
+            "large Rust files whose whole-file UBS baseline is intentionally noisy."
+        ),
+        epilog=(
+            "Example:\n"
+            "  UBS_SKIP_RUST_BUILD=1 scripts/ubs_changed_file_gate.py --staged \\\n"
+            "    crates/frankenterm/src/main.rs \\\n"
+            "    crates/frankenterm-core/src/mcp.rs \\\n"
+            "    crates/frankenterm-core/src/mcp_bridge.rs \\\n"
+            "    crates/frankenterm-core/src/mcp_tools.rs \\\n"
+            "    crates/frankenterm-core/src/mcp_types.rs \\\n"
+            "    crates/frankenterm-core/tests/proptest_mcp_bridge.rs \\\n"
+            "    crates/frankenterm-core/tests/mcp_manifest_golden.rs \\\n"
+            "    crates/frankenterm-core/tests/wa_events_mcp_conformance.rs \\\n"
+            "    crates/frankenterm-core/tests/fixtures/mcp_manifest.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--staged", action="store_true", help="inspect staged hunks")
