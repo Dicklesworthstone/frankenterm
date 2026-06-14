@@ -436,18 +436,19 @@ pub enum IpcRequest {
         /// Robot command arguments (e.g., ["state"] or ["send", "1", "ls"]).
         args: Vec<String>,
     },
-    /// Subscribe to a live NDJSON stream of detection events over IPC
-    /// (ft-7h5da.4.1). Unlike every other request, this does NOT return a
-    /// single `IpcResponse` — the server keeps the connection open and fans
-    /// `Event::PatternDetected` from the in-process `EventBus` to the socket
-    /// as one already-redacted NDJSON record per line. Each event record
-    /// carries `cursor = <storage event id>` (the same monotonic key the
-    /// DB-cursor fallback tails), so a follower can dedupe across transports
-    /// and resume on the DB path if the watcher dies mid-stream. Idle
-    /// heartbeats keep the stream live and let the server notice a closed
-    /// consumer. This is the low-latency transport for
-    /// `ft robot watch-events --follow`; the CLI falls back to storage-cursor
-    /// tailing when the watcher is down.
+    /// Subscribe to a live NDJSON stream of watch events over IPC. Unlike every
+    /// other request, this does NOT return a single `IpcResponse` — the server
+    /// keeps the connection open and fans selected `EventBus` records to the
+    /// socket as one already-redacted NDJSON record per line.
+    ///
+    /// Persisted detection records carry `cursor = <storage event id>` (the
+    /// same monotonic key the DB-cursor fallback tails), so a follower can
+    /// dedupe across transports and resume on the DB path if the watcher dies
+    /// mid-stream. Non-persisted live signal records carry `cursor = null`;
+    /// they are live notifications, not DB-resumable history. Idle heartbeats
+    /// keep the stream live and let the server notice a closed consumer. This
+    /// is the low-latency transport for `ft robot watch-events --follow`; the
+    /// CLI falls back to storage-cursor tailing when the watcher is down.
     SubscribeEvents {
         /// Restrict to a single pane (server-side filter).
         pane: Option<u64>,
@@ -1615,11 +1616,10 @@ fn watch_heartbeat_record(now: i64) -> serde_json::Value {
 }
 
 /// ft-7h5da.4.2 explicit gap record for the streaming subscribe path. When the
-/// bounded broadcast buffer drops `missed_count` detections (the subscriber
-/// fell behind), the server emits this instead of silently skipping — the
-/// no-silent-gaps capture doctrine. The follower passes it through and
-/// re-baselines via the DB-cursor path (those events are persisted), so the
-/// dropped events are still delivered at-least-once, never lost.
+/// bounded broadcast buffer drops `missed_count` live bus records (the
+/// subscriber fell behind), the server emits this instead of silently skipping.
+/// Persisted detection records can still be re-baselined through the DB cursor;
+/// non-persisted signal records are honestly reported as missed live signals.
 #[cfg(unix)]
 fn watch_lag_gap_record(missed_count: u64) -> serde_json::Value {
     serde_json::json!({
@@ -1627,19 +1627,19 @@ fn watch_lag_gap_record(missed_count: u64) -> serde_json::Value {
         "reason": "broadcast_lag",
         "missed_count": missed_count,
         "cursor": serde_json::Value::Null,
-        "message": "live broadcast buffer overflowed; missed events are still \
-                    persisted — resync via the DB cursor (at-least-once, no silent loss)",
+        "message": "live broadcast buffer overflowed; persisted detections can \
+                    resync via the DB cursor, while non-persisted live signals were missed",
     })
 }
 
-/// ft-7h5da.4.1: build the NDJSON record for one live detection, applying the
-/// same pane/severity/rule-glob filters as the DB-cursor path and redacting
+/// ft-7h5da.4.1/ft-0q7a2: build the NDJSON record for one live bus event.
+/// Detection records keep the DB-cursor-compatible shape and apply the same
+/// pane/severity/rule-glob filters as the DB-cursor path while redacting
 /// `matched_text` + nested `extracted` secrets before emission (defense in
 /// depth — the runtime publisher already redacts via `redact_detection`, but
-/// other EventBus publishers may not). Returns `None` when the event is
-/// filtered out, is not a `PatternDetected`, or has no storage id: a record
-/// without a cursor would break the per-record resume invariant the DB path
-/// relies on, and the DB path likewise only ever surfaces persisted events.
+/// other EventBus publishers may not). Pane lifecycle signals are emitted with
+/// `cursor = null` because they are live-only notifications rather than
+/// persisted event-history rows.
 #[cfg(unix)]
 fn subscribe_event_record(
     event: &Event,
@@ -1647,61 +1647,113 @@ fn subscribe_event_record(
     severity: Option<&str>,
     rule_glob: Option<&str>,
 ) -> Option<serde_json::Value> {
-    let Event::PatternDetected {
-        pane_id,
-        detection,
-        event_id,
-        ..
-    } = event
-    else {
-        return None;
-    };
-    let cursor = (*event_id)?;
     if let Some(want) = pane {
-        if *pane_id != want {
+        if event.pane_id() != Some(want) {
             return None;
         }
     }
-    let severity_label = match detection.severity {
-        crate::patterns::Severity::Info => "info",
-        crate::patterns::Severity::Warning => "warning",
-        crate::patterns::Severity::Critical => "critical",
-    };
-    if let Some(want) = severity {
-        if !severity_label.eq_ignore_ascii_case(want) {
-            return None;
+
+    match event {
+        Event::PatternDetected {
+            pane_id,
+            detection,
+            event_id,
+            ..
+        } => {
+            let cursor = (*event_id)?;
+            let severity_label = match detection.severity {
+                crate::patterns::Severity::Info => "info",
+                crate::patterns::Severity::Warning => "warning",
+                crate::patterns::Severity::Critical => "critical",
+            };
+            if let Some(want) = severity {
+                if !severity_label.eq_ignore_ascii_case(want) {
+                    return None;
+                }
+            }
+            if let Some(glob) = rule_glob {
+                if !crate::events::rule_glob_matches(glob, &detection.rule_id) {
+                    return None;
+                }
+            }
+            let redacted = crate::runtime::redact_detection(detection);
+            Some(serde_json::json!({
+                "type": "event",
+                "cursor": cursor,
+                "id": cursor,
+                "pane_id": pane_id,
+                "rule_id": redacted.rule_id,
+                "agent_type": redacted.agent_type.to_string(),
+                "event_type": redacted.event_type,
+                "severity": severity_label,
+                "confidence": redacted.confidence,
+                "detected_at": now_ms_i64(),
+                "matched_text": redacted.matched_text,
+                "extracted": redacted.extracted,
+                "handled": false,
+                "handled_status": serde_json::Value::Null,
+            }))
         }
-    }
-    if let Some(glob) = rule_glob {
-        if !crate::events::rule_glob_matches(glob, &detection.rule_id) {
-            return None;
+        Event::PaneDiscovered {
+            pane_id,
+            domain,
+            title,
+        } => {
+            if severity.is_some() || rule_glob.is_some() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "event",
+                "cursor": serde_json::Value::Null,
+                "id": serde_json::Value::Null,
+                "pane_id": pane_id,
+                "rule_id": serde_json::Value::Null,
+                "agent_type": serde_json::Value::Null,
+                "event_type": "pane_discovered",
+                "severity": serde_json::Value::Null,
+                "confidence": serde_json::Value::Null,
+                "detected_at": now_ms_i64(),
+                "matched_text": serde_json::Value::Null,
+                "extracted": serde_json::json!({
+                    "domain": domain,
+                    "title": title,
+                }),
+                "handled": false,
+                "handled_status": serde_json::Value::Null,
+            }))
         }
+        Event::PaneDisappeared { pane_id } => {
+            if severity.is_some() || rule_glob.is_some() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "event",
+                "cursor": serde_json::Value::Null,
+                "id": serde_json::Value::Null,
+                "pane_id": pane_id,
+                "rule_id": serde_json::Value::Null,
+                "agent_type": serde_json::Value::Null,
+                "event_type": "pane_disappeared",
+                "severity": serde_json::Value::Null,
+                "confidence": serde_json::Value::Null,
+                "detected_at": now_ms_i64(),
+                "matched_text": serde_json::Value::Null,
+                "extracted": serde_json::json!({}),
+                "handled": false,
+                "handled_status": serde_json::Value::Null,
+            }))
+        }
+        _ => None,
     }
-    let redacted = crate::runtime::redact_detection(detection);
-    Some(serde_json::json!({
-        "type": "event",
-        "cursor": cursor,
-        "id": cursor,
-        "pane_id": pane_id,
-        "rule_id": redacted.rule_id,
-        "agent_type": redacted.agent_type.to_string(),
-        "event_type": redacted.event_type,
-        "severity": severity_label,
-        "confidence": redacted.confidence,
-        "detected_at": now_ms_i64(),
-        "matched_text": redacted.matched_text,
-        "extracted": redacted.extracted,
-        "handled": false,
-        "handled_status": serde_json::Value::Null,
-    }))
 }
 
-/// ft-7h5da.4.1: stream `EventBus` detections to a subscribed client as
-/// NDJSON, one already-redacted record per line, each carrying
-/// `cursor = <storage event id>`. Idle heartbeats keep the stream live and
-/// surface a closed consumer (the next write fails). Returns `Ok(())` when the
-/// consumer disconnects (broken pipe) or the watcher cx is cancelled — a
-/// cancelled cx ends the stream within at most one heartbeat interval.
+/// ft-7h5da.4.1/ft-0q7a2: stream selected `EventBus` records to a subscribed
+/// client as NDJSON, one already-redacted record per line. Persisted detections
+/// carry `cursor = <storage event id>`; live-only signal records carry
+/// `cursor = null`. Idle heartbeats keep the stream live and surface a closed
+/// consumer (the next write fails). Returns `Ok(())` when the consumer
+/// disconnects (broken pipe) or the watcher cx is cancelled — a cancelled cx
+/// ends the stream within at most one heartbeat interval.
 #[cfg(unix)]
 async fn stream_subscribe_events<W>(
     cx: &crate::cx::Cx,
@@ -1717,7 +1769,7 @@ where
 {
     use crate::events::RecvError;
 
-    let mut subscriber = ctx.event_bus.subscribe_detections();
+    let mut subscriber = ctx.event_bus.subscribe();
     let heartbeat = Duration::from_millis(heartbeat_interval_ms.max(1));
 
     loop {
@@ -1751,9 +1803,7 @@ where
                 // gap record (ft-7h5da.4.2, no-silent-gaps) so the follower
                 // re-baselines the missed (but still persisted) events via the
                 // DB cursor — at-least-once, never a silent drop.
-                Ok(Err(RecvError::Lagged { missed_count })) => {
-                    watch_lag_gap_record(missed_count)
-                }
+                Ok(Err(RecvError::Lagged { missed_count })) => watch_lag_gap_record(missed_count),
             }
         } else {
             match subscriber.recv_cx(cx).await {
@@ -3000,8 +3050,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn subscribe_event_record_ignores_non_detection_events() {
+    fn subscribe_event_record_emits_live_pane_discovered_signal() {
+        let event = Event::PaneDiscovered {
+            pane_id: 11,
+            domain: "local".to_string(),
+            title: "shell".to_string(),
+        };
+        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        assert_eq!(rec["type"], "event");
+        assert!(rec["cursor"].is_null());
+        assert!(rec["id"].is_null());
+        assert_eq!(rec["pane_id"], 11);
+        assert_eq!(rec["event_type"], "pane_discovered");
+        assert_eq!(rec["extracted"]["domain"], "local");
+        assert_eq!(rec["extracted"]["title"], "shell");
+        assert_eq!(rec["handled"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_emits_live_pane_disappeared_signal() {
         let event = Event::PaneDisappeared { pane_id: 1 };
+        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        assert_eq!(rec["type"], "event");
+        assert!(rec["cursor"].is_null());
+        assert_eq!(rec["pane_id"], 1);
+        assert_eq!(rec["event_type"], "pane_disappeared");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_filters_live_signals_by_pane_only() {
+        let event = Event::PaneDisappeared { pane_id: 9 };
+        assert!(subscribe_event_record(&event, Some(8), None, None).is_none());
+        assert!(subscribe_event_record(&event, Some(9), None, None).is_some());
+        assert!(subscribe_event_record(&event, None, Some("warning"), None).is_none());
+        assert!(subscribe_event_record(&event, None, None, Some("codex.*")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_ignores_non_watch_signal_events() {
+        let event = Event::WorkflowCompleted {
+            workflow_id: "w1".to_string(),
+            success: true,
+            reason: None,
+        };
         assert!(subscribe_event_record(&event, None, None, None).is_none());
     }
 
