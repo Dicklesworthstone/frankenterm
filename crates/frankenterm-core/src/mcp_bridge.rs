@@ -7,12 +7,12 @@ use super::{
     AuditedToolHandler, Config, FormatAwareToolHandler, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
     WaAgentMailOutboxResource, WaAttentionCurrentResource, WaAttentionItemTemplateResource,
-    WaAttentionTool, WaAttestationRetractionsResource, WaCassSearchTool, WaCassStatusTool,
-    WaCassViewTool, WaContextHorizonResource, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
-    WaEventsResource, WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool,
-    WaEventsUnhandledTemplateResource, WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool,
-    WaMissionExplainTool, WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool,
-    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
+    WaAttentionTool, WaAttestationRetractionsResource, WaAwaitEventTool, WaCassSearchTool,
+    WaCassStatusTool, WaCassViewTool, WaContextHorizonResource, WaDomTool, WaEventsAnnotateTool,
+    WaEventsLabelTool, WaEventsResource, WaEventsTemplateResource, WaEventsTool,
+    WaEventsTriageTool, WaEventsUnhandledTemplateResource, WaGetTextTool, WaHerdWaveResource,
+    WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTemplateResource,
+    WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
     WaOperatingEnvelopeCurrentResource, WaOperatingEnvelopeRunTemplateResource,
     WaOperatingEnvelopeTool, WaPanesResource, WaProofHistoryReleaseBlockingResource,
     WaProofHistoryResource, WaProofHistoryTemplateResource, WaRehearsalScoreCurrentResource,
@@ -70,6 +70,7 @@ pub const DB_GATED_AUDITED_TOOL_NAMES: &[&str] = &[
     "wa.get_text",
     "wa.search",
     "wa.events",
+    "wa.await_event",
     "wa.events_annotate",
     "wa.events_triage",
     "wa.events_label",
@@ -348,6 +349,11 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaEventsTool::new(Arc::clone(db_path)),
                 "wa.events",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaAwaitEventTool::new(Arc::clone(db_path)),
+                "wa.await_event",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(

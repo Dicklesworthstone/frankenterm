@@ -3397,6 +3397,14 @@ enum RobotCommands {
         #[arg(long)]
         pane: Option<u64>,
 
+        /// Only emit unhandled events
+        #[arg(long, visible_alias = "unhandled-only")]
+        unhandled: bool,
+
+        /// Mark emitted events handled by this stream
+        #[arg(long)]
+        claim: bool,
+
         /// Resume cursor: only emit events with id greater than this value
         #[arg(long)]
         cursor: Option<i64>,
@@ -19741,6 +19749,32 @@ fn watch_event_passes_filters(
     true
 }
 
+const WATCH_EVENTS_CLAIM_WORKFLOW_ID: &str = "robot.watch_events";
+const WATCH_EVENTS_CLAIM_STATUS: &str = "claimed";
+
+fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
+    unhandled || claim
+}
+
+async fn mark_watch_event_claimed(
+    storage: &frankenterm_core::storage::StorageHandle,
+    event: &mut frankenterm_core::storage::StoredEvent,
+) -> frankenterm_core::Result<()> {
+    if event.handled_at.is_none() {
+        storage
+            .mark_event_handled(
+                event.id,
+                Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
+                WATCH_EVENTS_CLAIM_STATUS,
+            )
+            .await?;
+        event.handled_at = Some(now_ms_i64());
+        event.handled_by_workflow_id = Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string());
+        event.handled_status = Some(WATCH_EVENTS_CLAIM_STATUS.to_string());
+    }
+    Ok(())
+}
+
 /// NDJSON envelope for one watched event. `cursor` equals the event id so a
 /// follower can resume after it. The caller redacts the event first via
 /// `frankenterm_core::export::redact_event` (matched_text + nested secrets in
@@ -19948,9 +19982,10 @@ async fn relay_ipc_event_line(
     current_cursor: &mut Option<i64>,
     max_hz_interval: Option<std::time::Duration>,
     last_event_emit: &mut Option<std::time::Instant>,
+    claim_storage: Option<&frankenterm_core::storage::StorageHandle>,
 ) -> std::io::Result<IpcRelayAction> {
     use std::io::Write as _;
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
         // Unparseable line — skip defensively rather than corrupt the stream.
         return Ok(IpcRelayAction::Skipped);
     };
@@ -19960,6 +19995,27 @@ async fn relay_ipc_event_line(
             let cursor = value.get("cursor").and_then(serde_json::Value::as_i64);
             if ipc_event_is_duplicate(cursor, *current_cursor) {
                 return Ok(IpcRelayAction::Skipped); // already emitted via DB drain
+            }
+            if let (Some(storage), Some(event_id)) = (claim_storage, cursor) {
+                storage
+                    .mark_event_handled(
+                        event_id,
+                        Some(WATCH_EVENTS_CLAIM_WORKFLOW_ID.to_string()),
+                        WATCH_EVENTS_CLAIM_STATUS,
+                    )
+                    .await
+                    .map_err(|err| {
+                        std::io::Error::other(format!(
+                            "failed to claim IPC event {event_id}: {err}"
+                        ))
+                    })?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("handled".to_string(), serde_json::Value::Bool(true));
+                    object.insert(
+                        "handled_status".to_string(),
+                        serde_json::Value::String(WATCH_EVENTS_CLAIM_STATUS.to_string()),
+                    );
+                }
             }
             // max_hz pacing on emitted events (blocking sleep off the runtime
             // thread, mirroring the DB-cursor path).
@@ -20063,9 +20119,18 @@ mod watch_events_tests {
     fn glob_prefix_suffix_floating_and_star() {
         assert!(watch_rule_glob_matches("codex.*", "codex.usage_reached"));
         assert!(!watch_rule_glob_matches("codex.*", "claude.usage"));
-        assert!(watch_rule_glob_matches("*.usage_reached", "codex.usage_reached"));
-        assert!(!watch_rule_glob_matches("*.usage_reached", "codex.usage_started"));
-        assert!(watch_rule_glob_matches("codex.*reached", "codex.usage_reached"));
+        assert!(watch_rule_glob_matches(
+            "*.usage_reached",
+            "codex.usage_reached"
+        ));
+        assert!(!watch_rule_glob_matches(
+            "*.usage_reached",
+            "codex.usage_started"
+        ));
+        assert!(watch_rule_glob_matches(
+            "codex.*reached",
+            "codex.usage_reached"
+        ));
         assert!(watch_rule_glob_matches("*", "anything-at-all"));
         assert!(watch_rule_glob_matches("*usage*", "codex.usage_reached"));
         assert!(!watch_rule_glob_matches("*usage*", "codex.quota"));
@@ -20074,7 +20139,11 @@ mod watch_events_tests {
     #[test]
     fn filters_severity_case_insensitive_and_rule_glob() {
         let e = ev(1, "codex.usage_reached", "Warning", None);
-        assert!(watch_event_passes_filters(&e, Some("warning"), Some("codex.*")));
+        assert!(watch_event_passes_filters(
+            &e,
+            Some("warning"),
+            Some("codex.*")
+        ));
         assert!(watch_event_passes_filters(&e, None, None));
         assert!(!watch_event_passes_filters(&e, Some("error"), None));
         assert!(!watch_event_passes_filters(&e, None, Some("claude.*")));
@@ -20116,6 +20185,14 @@ mod watch_events_tests {
             watch_max_hz_interval(1000),
             Some(std::time::Duration::from_millis(1))
         );
+    }
+
+    #[test]
+    fn watch_claim_implies_unhandled_filter() {
+        assert!(!watch_events_unhandled_only(false, false));
+        assert!(watch_events_unhandled_only(true, false));
+        assert!(watch_events_unhandled_only(false, true));
+        assert!(watch_events_unhandled_only(true, true));
     }
 
     #[test]
@@ -31925,6 +32002,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             severity,
                             rule_id,
                             pane,
+                            unhandled,
+                            claim,
                             cursor,
                             limit,
                             heartbeat_interval_ms,
@@ -31998,8 +32077,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
                             #[cfg(unix)]
-                            let mut ipc_stream: Option<frankenterm_core::ipc::IpcEventStream> =
-                                None;
+                            let mut ipc_stream: Option<
+                                frankenterm_core::ipc::IpcEventStream,
+                            > = None;
 
                             // ft-7h5da.4.2: typed cursor_expired. If --cursor
                             // predates the oldest globally-retained event,
@@ -32049,26 +32129,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     event_type: None,
                                     triage_state: None,
                                     label: None,
-                                    unhandled_only: false,
+                                    unhandled_only: watch_events_unhandled_only(unhandled, claim),
                                     since: None,
                                     until: None,
                                 };
                                 let events = match storage.get_events_stream(query).await {
                                     Ok(e) => e,
                                     Err(e) => {
-                                        let response = RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_STORAGE,
-                                            format!("Failed to query events: {e}"),
-                                            None,
-                                            elapsed_ms(start),
-                                        );
+                                        let response =
+                                            RobotResponse::<serde_json::Value>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to query events: {e}"),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
                                         print_robot_response(&response, format, stats)?;
                                         break 'follow;
                                     }
                                 };
                                 let batch_len = events.len();
 
-                                for event in events {
+                                for mut event in events {
                                     // Advance the cursor past every scanned event
                                     // (even filtered ones) so the follower never
                                     // re-scans them.
@@ -32079,6 +32160,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         rule_glob,
                                     ) {
                                         continue;
+                                    }
+                                    if claim {
+                                        if let Err(e) =
+                                            mark_watch_event_claimed(&storage, &mut event).await
+                                        {
+                                            let response =
+                                                RobotResponse::<serde_json::Value>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!(
+                                                        "Failed to claim event {}: {e}",
+                                                        event.id
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            break 'follow;
+                                        }
                                     }
                                     // max_hz: pace emissions with an async sleep
                                     // (outside the stdout lock) so throughput is
@@ -32098,9 +32197,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Redaction-before-emission, reused verbatim
                                     // from the export streamer: matched_text +
                                     // nested secrets in `extracted`.
-                                    let redacted = frankenterm_core::export::redact_event(
-                                        event, &redactor,
-                                    );
+                                    let redacted =
+                                        frankenterm_core::export::redact_event(event, &redactor);
                                     let record = watch_event_ndjson(&redacted);
                                     let mut lock = stdout.lock();
                                     let cont = write_ndjson_line(&mut lock, &record)?;
@@ -32144,6 +32242,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         &mut current_cursor,
                                                         max_hz_interval,
                                                         &mut last_event_emit,
+                                                        claim.then_some(&storage),
                                                     )
                                                     .await?
                                                     {

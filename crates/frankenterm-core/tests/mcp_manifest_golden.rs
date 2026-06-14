@@ -312,6 +312,7 @@ fn mcp_manifest_matches_golden_without_db() {
     for expected_absent_tool in [
         "wa.accounts",
         "wa.events",
+        "wa.await_event",
         "wa.reserve",
         "wa.release",
         "wa.search",

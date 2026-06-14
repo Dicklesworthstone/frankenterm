@@ -126,26 +126,25 @@ use mcp_resources::{
     WaWorkflowsResource,
 };
 use mcp_tools::{
-    WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaCassSearchTool, WaCassStatusTool,
-    WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
-    WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-    WaMissionObjectivePlanTool,
-    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeTool,
-    WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool,
-    WaTxRollbackTool,
-    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+    WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool, WaCassSearchTool,
+    WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
+    WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
+    WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
+    WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool,
+    WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
+    WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool,
+    WaWorkflowRunTool, WaWorkflowStatusTool,
 };
 pub use mcp_tools::{mcp_clock_anomaly_count, mcp_workflow_plan_serde_drop_count};
 #[cfg(feature = "fuzz")]
 use mcp_types::{
-    AccountsParams, AccountsRefreshParams, AttentionParams, CassSearchParams, CassStatusParams,
-    CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams,
-    GetTextParams, MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams,
-    MissionPauseParams, MissionResumeParams, OperatingEnvelopeParams, RehearsalScoreParams,
-    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
-    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
-    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
+    AccountsParams, AccountsRefreshParams, AttentionParams, AwaitEventParams, CassSearchParams,
+    CassStatusParams, CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams,
+    EventsTriageParams, GetTextParams, MissionAbortParams, MissionExplainParams,
+    MissionObjectivePlanParams, MissionPauseParams, MissionResumeParams, OperatingEnvelopeParams,
+    RehearsalScoreParams, ReleaseParams, ReservationsParams, ReserveParams, RulesListParams,
+    RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
+    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
 };
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
@@ -209,6 +208,7 @@ fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str 
         "wa.wait_for" => fuzz_parse_params::<WaitForParams>(arguments),
         "wa.search" => fuzz_parse_params::<SearchParams>(arguments),
         "wa.events" => fuzz_parse_params_or_default::<EventsParams>(arguments),
+        "wa.await_event" => fuzz_parse_params_or_default::<AwaitEventParams>(arguments),
         "wa.send" => fuzz_parse_params::<SendParams>(arguments),
         "wa.workflow_run" => fuzz_parse_params::<WorkflowRunParams>(arguments),
         "wa.workflow_status" => fuzz_parse_params_or_default::<WorkflowStatusParams>(arguments),
@@ -1833,6 +1833,7 @@ mod tests {
             "wa.wait_for",
             "wa.search",
             "wa.events",
+            "wa.await_event",
             "wa.workflow_run",
             "wa.workflow_status",
             "wa.tx_plan",
@@ -1891,6 +1892,7 @@ mod tests {
         let storage_only = [
             "wa.search",
             "wa.events",
+            "wa.await_event",
             "wa.workflow_run",
             "wa.accounts",
             "wa.accounts_refresh",
@@ -2405,6 +2407,7 @@ mod tests {
         let audited_tools = [
             "wa.search",
             "wa.events",
+            "wa.await_event",
             "wa.events_annotate",
             "wa.events_triage",
             "wa.events_label",

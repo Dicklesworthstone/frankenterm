@@ -745,6 +745,89 @@
     },
     {
       "annotations": null,
+      "description": "Long-poll for pattern events with ft robot await envelope parity",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "all": {
+            "default": [],
+            "description": "Every condition in this set must match; supported condition: rule:<glob>",
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "any": {
+            "default": [],
+            "description": "At least one condition in this set must match; supported condition: rule:<glob>",
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "claim": {
+            "default": false,
+            "description": "Mark matched emitted events handled by wa.await_event",
+            "type": "boolean"
+          },
+          "cursor": {
+            "description": "Resume cursor; only events with id greater than this are considered",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "pane": {
+            "description": "Filter by pane ID",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "poll_interval_ms": {
+            "default": 250,
+            "description": "DB cursor poll interval while awaiting events",
+            "maximum": 30000,
+            "minimum": 10,
+            "type": "integer"
+          },
+          "timeout_secs": {
+            "default": 30,
+            "description": "Maximum long-poll duration in seconds",
+            "maximum": 300,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "unhandled": {
+            "default": false,
+            "description": "Only consider unhandled events",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.await_event",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "events"
+      ],
+      "version": "0.5.0"
+    },
+    {
+      "annotations": null,
       "description": "Set or clear an event note (robot parity)",
       "input_schema": {
         "additionalProperties": false,

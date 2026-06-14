@@ -393,6 +393,52 @@ fn call_events(harness: &mut TestHarness, args: Value) -> Value {
     )
 }
 
+fn call_await_event(harness: &mut TestHarness, args: Value) -> Value {
+    parse_tool_envelope(
+        &harness
+            .client
+            .call_tool("wa.await_event", args)
+            .expect("call wa.await_event"),
+    )
+}
+
+fn assert_await_event_success_data(envelope: &Value, claim: bool) {
+    let data = envelope["data"]
+        .as_object()
+        .expect("wa.await_event data object");
+    assert_eq!(data["type"], Value::String("await_result".to_string()));
+    assert_eq!(data["satisfied"], Value::Bool(true));
+    assert_eq!(data["timed_out"], Value::Bool(false));
+    assert_eq!(data["final_cursor"], Value::from(1));
+    assert_eq!(data["unhandled_only"], Value::Bool(claim));
+    assert_eq!(data["claim"], Value::Bool(claim));
+    assert_eq!(data["any"][0]["condition"], "rule:codex.*");
+    assert_eq!(data["any"][0]["met"], Value::Bool(true));
+
+    let events = data["events"]
+        .as_array()
+        .expect("wa.await_event events array");
+    assert_eq!(events.len(), 1, "expected one matching event");
+    let event = events.first().expect("matching event");
+    assert_eq!(event["id"], Value::from(1));
+    assert_eq!(event["pane_id"], Value::from(FIXTURE_PANE_ID));
+    assert_eq!(event["rule_id"], Value::String(FIXTURE_RULE_ID.to_string()));
+    assert_eq!(
+        event["event_type"],
+        Value::String("usage_limit".to_string())
+    );
+    if claim {
+        assert!(event["handled_at"].is_number());
+        assert_eq!(
+            event["workflow_id"],
+            Value::String("mcp.wa.await_event".to_string())
+        );
+    } else {
+        assert!(event.get("handled_at").is_none());
+        assert!(event.get("workflow_id").is_none());
+    }
+}
+
 #[test]
 fn mcp_conformance_wa_events_empty_storage_returns_empty_events() {
     let mut harness = new_harness();
@@ -436,6 +482,85 @@ fn mcp_conformance_wa_events_rule_id_filter_excludes_non_matching() {
     );
     assert_eq!(events[0]["rule_id"], "claude_code.compaction.offered");
     assert_eq!(data["total_count"], Value::from(1));
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_contract_matches_expected_envelope() {
+    let mut harness = new_harness();
+    seed_events_fixture(&harness);
+    let input_schema = tool_input_schema(&mut harness.client, "wa.await_event");
+    assert_schema_matches_manifest("wa.await_event", &input_schema);
+
+    let envelope = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10
+        }),
+    );
+    assert_success_envelope_shape(&envelope);
+    assert_await_event_success_data(&envelope, false);
+
+    let err = harness
+        .client
+        .call_tool(
+            "wa.await_event",
+            json!({
+                "any": ["rule:codex.*"],
+                "timeout_secs": 0
+            }),
+        )
+        .err()
+        .map(|err| err.to_string())
+        .expect("timeout_secs:0 must fail framework schema validation");
+    assert!(
+        err.contains("[-32602]"),
+        "expected framework invalid-params code in error: {err}"
+    );
+    assert!(
+        err.contains("root.timeout_secs: value must be >= 1"),
+        "expected wa.await_event timeout lower-bound schema failure in error: {err}"
+    );
+}
+
+#[test]
+fn mcp_conformance_wa_await_event_claim_marks_event_handled() {
+    let mut harness = new_harness();
+    seed_events_fixture(&harness);
+
+    let envelope = call_await_event(
+        &mut harness,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
+    assert_success_envelope_shape(&envelope);
+    assert_await_event_success_data(&envelope, true);
+
+    let after_claim = call_events(
+        &mut harness,
+        json!({
+            "limit": 10,
+            "pane": FIXTURE_PANE_ID,
+            "unhandled": true
+        }),
+    );
+    let data = after_claim["data"]
+        .as_object()
+        .expect("wa.events data object");
+    assert_eq!(
+        data["events"],
+        json!([]),
+        "claimed event must no longer appear in unhandled wa.events results"
+    );
 }
 
 #[test]

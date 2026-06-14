@@ -67,6 +67,7 @@ proptest! {
 
         prop_assert!(tools.contains("wa.search"));
         prop_assert!(tools.contains("wa.events"));
+        prop_assert!(tools.contains("wa.await_event"));
         prop_assert!(tools.contains("wa.events_annotate"));
         prop_assert!(tools.contains("wa.reservations"));
         prop_assert!(tools.contains("wa.accounts"));
@@ -101,6 +102,7 @@ proptest! {
 
         prop_assert!(!no_db_tools.contains("wa.search"));
         prop_assert!(!no_db_tools.contains("wa.events"));
+        prop_assert!(!no_db_tools.contains("wa.await_event"));
         prop_assert!(!no_db_resources.contains("wa://events"));
         prop_assert!(!no_db_templates.contains(events_template));
 
@@ -128,6 +130,7 @@ proptest! {
         let db_tools = as_btree_set(&[
             "wa.search",
             "wa.events",
+            "wa.await_event",
             "wa.events_annotate",
             "wa.events_triage",
             "wa.events_label",

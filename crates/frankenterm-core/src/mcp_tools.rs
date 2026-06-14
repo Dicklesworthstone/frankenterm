@@ -48,26 +48,27 @@ use fs2::FileExt;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
 use super::mcp_types::{
-    self, AccountsParams, AccountsRefreshParams, AttentionParams, CassSearchParams,
-    CassStatusParams, CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams,
-    EventsTriageParams, GetTextParams, McpAccountInfo, McpAccountsData, McpAccountsRefreshData,
-    McpEnvelope, McpEventItem, McpEventMutationData, McpEventsData, McpGetTextData,
-    McpMissionControlData, McpMissionExplainData, McpMissionStateData, McpPaneState,
-    McpReleaseData, McpReservationInfo, McpReservationsData, McpReserveData, McpRuleItem,
-    McpRuleMatchItem, McpRuleTraceInfo, McpRulesListData, McpRulesTestData, McpSearchData,
-    McpSearchHit, McpSendData, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
-    McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
-    MissionObjectivePlanParams, MissionPauseParams, MissionResumeParams, MissionStateParams,
-    OperatingEnvelopeParams, RehearsalScoreParams, ReleaseParams, ReservationsParams,
-    ReserveParams, RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams,
-    TxPlanParams, TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
-    WorkflowStatusParams, apply_tail_truncation, now_ms,
+    self, AccountsParams, AccountsRefreshParams, AttentionParams, AwaitEventParams,
+    CassSearchParams, CassStatusParams, CassViewParams, EventsAnnotateParams, EventsLabelParams,
+    EventsParams, EventsTriageParams, GetTextParams, McpAccountInfo, McpAccountsData,
+    McpAccountsRefreshData, McpAwaitConditionStatus, McpAwaitEventData, McpEnvelope, McpEventItem,
+    McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
+    McpMissionExplainData, McpMissionStateData, McpPaneState, McpReleaseData, McpReservationInfo,
+    McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
+    McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData, McpTxPlanData,
+    McpTxRollbackData, McpTxRunData, McpTxShowData, McpWaitForData, McpWorkflowRunData,
+    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
+    MissionResumeParams, MissionStateParams, OperatingEnvelopeParams, RehearsalScoreParams,
+    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
+    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
+    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams, apply_tail_truncation,
+    now_ms,
 };
 #[allow(unused_imports)]
 use super::{
     AccountRecord, ActionKind, ActorKind, AgentProvider, AgentType, ApprovalStore, CassAgent,
     CassClient, CassError, CassSearchOptions, CassSearchResult, CassStatus, CassViewOptions,
-    CassViewResult, CautClient, CautService, Config, DecisionContext, EventQuery,
+    CassViewResult, CautClient, CautService, Config, DecisionContext, EventQuery, EventStreamQuery,
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
     HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
     MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
@@ -3706,6 +3707,107 @@ impl ToolHandler for WaSearchTool {
     }
 }
 
+const MCP_AWAIT_EVENT_TIMEOUT_SECS_MIN: u64 = 1;
+const MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX: u64 = 300;
+const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MIN: u64 = 10;
+const MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX: u64 = 30_000;
+const MCP_AWAIT_EVENT_BATCH_LIMIT: usize = 500;
+const MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID: &str = "mcp.wa.await_event";
+const MCP_AWAIT_EVENT_CLAIM_STATUS: &str = "claimed";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpAwaitEventCondition {
+    Rule(String),
+}
+
+fn parse_mcp_await_event_condition(
+    spec: &str,
+) -> std::result::Result<McpAwaitEventCondition, String> {
+    let spec = spec.trim();
+    if let Some(glob) = spec.strip_prefix("rule:") {
+        if glob.is_empty() {
+            return Err(format!("empty rule glob in condition `{spec}`"));
+        }
+        Ok(McpAwaitEventCondition::Rule(glob.to_string()))
+    } else if spec.starts_with("state:") || spec.starts_with("quiescence:") {
+        Err(format!(
+            "condition `{spec}` requires live watcher state; wa.await_event currently supports \
+             DB-backed event conditions only (`rule:<glob>`)"
+        ))
+    } else {
+        Err(format!(
+            "unrecognized condition `{spec}`; expected `rule:<glob>`"
+        ))
+    }
+}
+
+fn mcp_await_event_condition_matches(
+    condition: &McpAwaitEventCondition,
+    event: &crate::storage::StoredEvent,
+) -> bool {
+    match condition {
+        McpAwaitEventCondition::Rule(glob) => {
+            crate::events::rule_glob_matches(glob, &event.rule_id)
+        }
+    }
+}
+
+fn mcp_await_event_is_satisfied(any_met: &[bool], all_met: &[bool]) -> bool {
+    let all_ok = all_met.iter().all(|met| *met);
+    let any_ok = any_met.is_empty() || any_met.iter().any(|met| *met);
+    all_ok && any_ok
+}
+
+fn mcp_await_condition_status(specs: &[String], met: &[bool]) -> Vec<McpAwaitConditionStatus> {
+    specs
+        .iter()
+        .cloned()
+        .zip(met.iter().copied())
+        .map(|(condition, met)| McpAwaitConditionStatus { condition, met })
+        .collect()
+}
+
+async fn mcp_event_item_from_stored_event(
+    storage: &StorageHandle,
+    cx: &crate::cx::Cx,
+    event: crate::storage::StoredEvent,
+    redactor: &crate::redactor::Redactor,
+) -> McpEventItem {
+    let event = crate::export::redact_event(event, redactor);
+    let pack_id = event.rule_id.split('.').next().map_or_else(
+        || "builtin:unknown".to_string(),
+        |agent| format!("builtin:{agent}"),
+    );
+
+    let annotations = match storage.get_event_annotations_with_cx(cx, event.id).await {
+        Ok(Some(a)) => Some(a),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                event_id = event.id,
+                "Failed to load event annotations"
+            );
+            None
+        }
+    };
+
+    McpEventItem {
+        id: event.id,
+        pane_id: event.pane_id,
+        rule_id: event.rule_id,
+        pack_id,
+        event_type: event.event_type,
+        severity: event.severity,
+        confidence: event.confidence,
+        extracted: event.extracted,
+        annotations,
+        captured_at: event.detected_at,
+        handled_at: event.handled_at,
+        workflow_id: event.handled_by_workflow_id,
+    }
+}
+
 pub(super) struct WaEventsTool {
     db_path: Arc<PathBuf>,
 }
@@ -3814,43 +3916,12 @@ impl ToolHandler for WaEventsTool {
             let events = storage.get_events_with_cx(&events_cx, query).await?;
             let total_count = events.len();
 
+            let redactor = crate::redactor::Redactor::new();
             let mut items: Vec<McpEventItem> = Vec::with_capacity(events.len());
             for e in events {
-                let pack_id = e.rule_id.split('.').next().map_or_else(
-                    || "builtin:unknown".to_string(),
-                    |agent| format!("builtin:{agent}"),
+                items.push(
+                    mcp_event_item_from_stored_event(&storage, &events_cx, e, &redactor).await,
                 );
-
-                let annotations = match storage
-                    .get_event_annotations_with_cx(&events_cx, e.id)
-                    .await
-                {
-                    Ok(Some(a)) => Some(a),
-                    Ok(None) => None,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            event_id = e.id,
-                            "Failed to load event annotations"
-                        );
-                        None
-                    }
-                };
-
-                items.push(McpEventItem {
-                    id: e.id,
-                    pane_id: e.pane_id,
-                    rule_id: e.rule_id,
-                    pack_id,
-                    event_type: e.event_type,
-                    severity: e.severity,
-                    confidence: e.confidence,
-                    extracted: e.extracted,
-                    annotations,
-                    captured_at: e.detected_at,
-                    handled_at: e.handled_at,
-                    workflow_id: e.handled_by_workflow_id,
-                });
             }
 
             Ok(McpEventsData {
@@ -3864,6 +3935,296 @@ impl ToolHandler for WaEventsTool {
                 label_filter: params.label,
                 unhandled_only: params.unhandled,
                 since_filter: params.since,
+            })
+        });
+
+        match result {
+            Ok(data) => {
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_mcp_error(&err);
+                let envelope =
+                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+pub(super) struct WaAwaitEventTool {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaAwaitEventTool {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ToolHandler for WaAwaitEventTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.await_event".to_string(),
+            description: Some(
+                "Long-poll for pattern events with ft robot await envelope parity".to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "any": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "default": [],
+                        "maxItems": 16,
+                        "description": "At least one condition in this set must match; supported condition: rule:<glob>"
+                    },
+                    "all": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "default": [],
+                        "maxItems": 16,
+                        "description": "Every condition in this set must match; supported condition: rule:<glob>"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": MCP_AWAIT_EVENT_TIMEOUT_SECS_MIN,
+                        "maximum": MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
+                        "default": 30,
+                        "description": "Maximum long-poll duration in seconds"
+                    },
+                    "poll_interval_ms": {
+                        "type": "integer",
+                        "minimum": MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MIN,
+                        "maximum": MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX,
+                        "default": 250,
+                        "description": "DB cursor poll interval while awaiting events"
+                    },
+                    "cursor": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Resume cursor; only events with id greater than this are considered"
+                    },
+                    "pane": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Filter by pane ID"
+                    },
+                    "unhandled": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Only consider unhandled events"
+                    },
+                    "claim": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Mark matched emitted events handled by wa.await_event"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "events".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: AwaitEventParams = if arguments.is_null() {
+            AwaitEventParams::default()
+        } else {
+            match parse_mcp_tool_params(
+                "wa.await_event",
+                arguments,
+                "Expected object with any/all rule:<glob> conditions plus optional timeout_secs, poll_interval_ms, cursor, pane, unhandled, claim",
+                start,
+            ) {
+                Ok(p) => p,
+                Err(response) => return response,
+            }
+        };
+
+        if params.any.is_empty() && params.all.is_empty() {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "wa.await_event requires at least one any/all condition".to_string(),
+                Some("Example: {\"all\":[\"rule:codex.*\"],\"timeout_secs\":30}".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+        if params.timeout_secs < MCP_AWAIT_EVENT_TIMEOUT_SECS_MIN
+            || params.timeout_secs > MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX
+        {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "timeout_secs must be in {MCP_AWAIT_EVENT_TIMEOUT_SECS_MIN}..={MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX} (got {})",
+                    params.timeout_secs
+                ),
+                None,
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+        if params.poll_interval_ms < MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MIN
+            || params.poll_interval_ms > MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX
+        {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "poll_interval_ms must be in {MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MIN}..={MCP_AWAIT_EVENT_POLL_INTERVAL_MS_MAX} (got {})",
+                    params.poll_interval_ms
+                ),
+                None,
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+        if params.cursor.is_some_and(|cursor| cursor < 0) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "cursor must be non-negative".to_string(),
+                None,
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let any_conditions: Vec<McpAwaitEventCondition> = match params
+            .any
+            .iter()
+            .map(|spec| parse_mcp_await_event_condition(spec))
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(conditions) => conditions,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(MCP_ERR_INVALID_ARGS, err, None, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let all_conditions: Vec<McpAwaitEventCondition> = match params
+            .all
+            .iter()
+            .map(|spec| parse_mcp_await_event_condition(spec))
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(conditions) => conditions,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(MCP_ERR_INVALID_ARGS, err, None, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = CompatRuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: crate::Result<McpAwaitEventData> = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let storage = StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy()).await?;
+            let redactor = crate::redactor::Redactor::new();
+            let started = Instant::now();
+            let start_ms = mcp_now_ms_i64();
+            let timeout = std::time::Duration::from_secs(params.timeout_secs);
+            let poll = std::time::Duration::from_millis(params.poll_interval_ms);
+            let mut after_id = params.cursor;
+            let mut final_cursor = params.cursor;
+            let mut any_met = vec![false; any_conditions.len()];
+            let mut all_met = vec![false; all_conditions.len()];
+            let mut matched_events = Vec::new();
+
+            let (satisfied, timed_out) = loop {
+                let query = EventStreamQuery {
+                    after_id,
+                    limit: Some(MCP_AWAIT_EVENT_BATCH_LIMIT),
+                    pane_id: params.pane,
+                    rule_id: None,
+                    event_type: None,
+                    triage_state: None,
+                    label: None,
+                    unhandled_only: params.unhandled || params.claim,
+                    since: if after_id.is_some() {
+                        None
+                    } else {
+                        Some(start_ms)
+                    },
+                    until: None,
+                };
+                let events = storage.get_events_stream(query).await?;
+                let batch_len = events.len();
+                for mut event in events {
+                    after_id = Some(event.id);
+                    final_cursor = Some(event.id);
+
+                    let mut event_matched = false;
+                    for (index, condition) in any_conditions.iter().enumerate() {
+                        if !any_met[index] && mcp_await_event_condition_matches(condition, &event) {
+                            any_met[index] = true;
+                            event_matched = true;
+                        }
+                    }
+                    for (index, condition) in all_conditions.iter().enumerate() {
+                        if !all_met[index] && mcp_await_event_condition_matches(condition, &event) {
+                            all_met[index] = true;
+                            event_matched = true;
+                        }
+                    }
+
+                    if event_matched {
+                        if params.claim && event.handled_at.is_none() {
+                            storage
+                                .mark_event_handled_with_cx(
+                                    &cx,
+                                    event.id,
+                                    Some(MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID.to_string()),
+                                    MCP_AWAIT_EVENT_CLAIM_STATUS,
+                                )
+                                .await?;
+                            event.handled_at = Some(mcp_now_ms_i64());
+                            event.handled_by_workflow_id =
+                                Some(MCP_AWAIT_EVENT_CLAIM_WORKFLOW_ID.to_string());
+                            event.handled_status = Some(MCP_AWAIT_EVENT_CLAIM_STATUS.to_string());
+                        }
+                        matched_events.push(
+                            mcp_event_item_from_stored_event(&storage, &cx, event, &redactor).await,
+                        );
+                    }
+                }
+
+                if mcp_await_event_is_satisfied(&any_met, &all_met) {
+                    break (true, false);
+                }
+                if batch_len >= MCP_AWAIT_EVENT_BATCH_LIMIT {
+                    continue;
+                }
+                if started.elapsed() >= timeout {
+                    break (false, true);
+                }
+                let _ =
+                    crate::runtime_async::spawn_blocking(move || std::thread::sleep(poll)).await;
+            };
+
+            storage.shutdown().await.ok();
+            Ok(McpAwaitEventData {
+                record_type: "await_result",
+                satisfied,
+                timed_out,
+                elapsed_ms: elapsed_ms(start),
+                final_cursor,
+                any: mcp_await_condition_status(&params.any, &any_met),
+                all: mcp_await_condition_status(&params.all, &all_met),
+                events: matched_events,
+                unhandled_only: params.unhandled || params.claim,
+                claim: params.claim,
             })
         });
 
@@ -8221,13 +8582,13 @@ mod tests {
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS,
         MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
         StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool,
-        WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool,
-        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
-        WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool,
-        WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool,
-        WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
-        WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        WaAwaitEventTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaDomTool,
+        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
+        WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
+        WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool,
+        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
+        WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool,
+        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
         accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
@@ -8727,7 +9088,7 @@ mod tests {
         }
     }
 
-    /// Collect definitions for all 34 tools. Guarantees no panics during construction.
+    /// Collect definitions for all 35 tools. Guarantees no panics during construction.
     fn all_definitions() -> Vec<Tool> {
         let db = db_path();
         let cfg = config();
@@ -8742,6 +9103,7 @@ mod tests {
             WaWaitForTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
             WaSearchTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaEventsTool::new(Arc::clone(&db)).definition(),
+            WaAwaitEventTool::new(Arc::clone(&db)).definition(),
             WaSendTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaWorkflowRunTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaWorkflowStatusTool::new(Arc::clone(&db)).definition(),
@@ -8774,8 +9136,8 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn tool_count_is_34() {
-        assert_eq!(all_definitions().len(), 34);
+    fn tool_count_is_35() {
+        assert_eq!(all_definitions().len(), 35);
     }
 
     #[test]

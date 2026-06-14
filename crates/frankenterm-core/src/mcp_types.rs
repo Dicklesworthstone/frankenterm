@@ -234,6 +234,50 @@ pub(super) fn default_events_limit() -> usize {
     20
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct AwaitEventParams {
+    #[serde(default)]
+    pub any: Vec<String>,
+    #[serde(default)]
+    pub all: Vec<String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_await_event_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    pub cursor: Option<i64>,
+    pub pane: Option<u64>,
+    #[serde(default)]
+    pub unhandled: bool,
+    #[serde(default)]
+    pub claim: bool,
+}
+
+pub(super) fn default_await_event_poll_interval_ms() -> u64 {
+    250
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct McpAwaitConditionStatus {
+    pub condition: String,
+    pub met: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct McpAwaitEventData {
+    #[serde(rename = "type")]
+    pub record_type: &'static str,
+    pub satisfied: bool,
+    pub timed_out: bool,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_cursor: Option<i64>,
+    pub any: Vec<McpAwaitConditionStatus>,
+    pub all: Vec<McpAwaitConditionStatus>,
+    pub events: Vec<McpEventItem>,
+    pub unhandled_only: bool,
+    pub claim: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct McpEventsData {
     pub events: Vec<McpEventItem>,
