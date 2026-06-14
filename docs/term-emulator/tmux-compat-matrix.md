@@ -10,12 +10,13 @@ Same cross-reference pattern as `ft-2okh0.5.1 ↔ ft-kscfg`,
 `ft-2okh0.2.3 ↔ ft-mpc9b.5.1`.
 
 **Speaker substrate:** `ft-hs5f6` (closed) — `crates/frankenterm-core/src/tmux_control_protocol.rs`.
-**Daemon integration:** `ft-l4cef` (blocked by `ft-4tp7g`) — the Unix listener
+**Daemon integration:** `ft-l4cef` (in progress) — the Unix listener
 now probes tmux line protocol separately from the binary mux PDU protocol and
-routes read-only `list-sessions` / `list-windows` to live mux state. Mutating
-Tier-1 command dispatch and the notification stream remain pending; `ft-2h56m`
-is closed as a socket-lock/listener slice only and did not promote all rows to
-wired-pass.
+routes `list-sessions`, `list-windows`, `capture-pane -p -t %<pane_id>`, and
+`send-keys -t %<pane_id>` to live mux state. The remaining Tier-1 topology and
+client-lifecycle commands plus the notification stream remain pending;
+`ft-2h56m` is closed as a socket-lock/listener slice only and did not promote
+all rows to wired-pass.
 **Parent epic:** `ft-2okh0.5` (crash-safe scrollback + native tmux speaker).
 
 This document is the matrix the parent bead's acceptance criterion calls
@@ -42,9 +43,9 @@ against the speaker we actually ship, not the spec we wish we shipped.
 
 | Tool | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
-| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (29/29 green) + mux-server tmux probe/list tests | Tier-1 verbs parse + encode; daemon path now supports read-only `list-sessions` / `list-windows` and returns tmux `%error` frames for unsupported parsed commands. Mutating command round-trips remain blocked on the rest of ft-l4cef. |
-| neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | substrate-pass | parse_send_keys_with_target_and_payload + parse_list_windows_with_session_target | Pane navigator emits `send-keys -t <pane> <keystroke>` — covered by send-keys parse path. End-to-end blocked on ft-l4cef. |
-| vscode tmux extension (`vscode-tmux`) | substrate-pass | parse_attach_session_with_target + response_encode_success_uses_end_trailer | Extension speaks attach-session + capture-pane. Both wire-syntax shapes covered. End-to-end blocked on ft-l4cef. |
+| tmux 3.5+ direct RPC (`tmux -S <sock> <cmd>`) | partial | tmux_control_protocol.rs::tests (29/29 green) + mux-server tmux probe/list/send/capture tests | Tier-1 verbs parse + encode; daemon path now supports `list-sessions`, `list-windows`, `capture-pane -p -t %<pane_id>`, and `send-keys -t %<pane_id>`, and returns tmux `%error` frames for unsupported parsed commands. Topology/client-lifecycle command round-trips and notification stream remain blocked on the rest of ft-l4cef. |
+| neovim tmux integration (`vim-tmux-navigator`, `tmux.nvim`) | partial | parse_send_keys_with_target_and_payload + tmux_control_send_keys_writes_live_pane_input | Pane navigator emits `send-keys -t <pane> <keystroke>`; explicit `%<pane_id>` targets now write live pane input. Rich tmux target expressions and lifecycle notifications remain pending. |
+| vscode tmux extension (`vscode-tmux`) | partial | parse_attach_session_with_target + tmux_control_capture_pane_prints_live_pane_lines | `capture-pane -p -t %<pane_id>` is live; `attach-session` remains a parsed-but-unsupported `%error` until ft-l4cef wires client lifecycle semantics. |
 
 **Tier-1 acceptance**: substrate-pass for all three. The bead's
 acceptance criterion ("Tier-1 rows all pass") is graded against the
@@ -140,10 +141,11 @@ test path. ft-l4cef's close-out is responsible for that revision.
   `crates/frankenterm-core/src/tmux_control_protocol.rs`.
 - **ft-2h56m** (closed partial) — socket-lock/listener slice only; it
   did not wire the tmux line-protocol dispatcher or notification stream.
-- **ft-l4cef** (blocked) — daemon side: tmux line-protocol dispatch
-  + notification stream. The current source slice routes read-only
-  `list-sessions` / `list-windows` and preserves graceful `%error` frames;
-  remaining Tier-1 mutations and notifications promote rows above to
+- **ft-l4cef** (in progress) — daemon side: tmux line-protocol dispatch
+  + notification stream. The current source routes `list-sessions`,
+  `list-windows`, `capture-pane -p -t %<pane_id>`, and `send-keys -t
+  %<pane_id>`, and preserves graceful `%error` frames; remaining topology,
+  client-lifecycle, rich-target, and notification work promotes rows above to
   wired-pass.
 - **ft-2okh0.5** (parent epic) — crash-safe scrollback + native tmux
   speaker. This matrix is one of the parent's acceptance criteria.

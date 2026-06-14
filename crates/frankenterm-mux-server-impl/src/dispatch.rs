@@ -1105,6 +1105,10 @@ fn tmux_command_response_at(
     command: TmuxCommand,
 ) -> TmuxResponse {
     match command {
+        TmuxCommand::SendKeys { target, keys } => match tmux_dispatch_send_keys(target, &keys) {
+            Ok(output) => tmux_success_response(timestamp_secs, command_id, output),
+            Err(err) => tmux_error_response(timestamp_secs, command_id, &err),
+        },
         TmuxCommand::ListSessions => match Mux::try_get() {
             Some(mux) => tmux_success_response(
                 timestamp_secs,
@@ -1120,6 +1124,12 @@ fn tmux_command_response_at(
             },
             None => tmux_error_response(timestamp_secs, command_id, "mux singleton is unavailable"),
         },
+        TmuxCommand::CapturePane { target, print } => {
+            match tmux_dispatch_capture_pane(target, print) {
+                Ok(output) => tmux_success_response(timestamp_secs, command_id, output),
+                Err(err) => tmux_error_response(timestamp_secs, command_id, &err),
+            }
+        }
         TmuxCommand::Unknown { verb, .. } => tmux_error_response(
             timestamp_secs,
             command_id,
@@ -1134,6 +1144,95 @@ fn tmux_command_response_at(
             ),
         ),
     }
+}
+
+fn tmux_control_target_pane_id(target: Option<&str>) -> Result<usize, String> {
+    let target = target.ok_or_else(|| {
+        "missing target pane; native tmux dispatcher currently requires -t %<pane_id>".to_string()
+    })?;
+    let pane_id = target.strip_prefix('%').unwrap_or(target);
+    if pane_id.is_empty() || !pane_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("unsupported pane target; expected -t %<pane_id>".to_string());
+    }
+    pane_id
+        .parse::<usize>()
+        .map_err(|_| "pane target is too large for this platform".to_string())
+}
+
+fn tmux_dispatch_send_keys(target: Option<String>, keys: &[String]) -> Result<Vec<String>, String> {
+    let pane_id = tmux_control_target_pane_id(target.as_deref())?;
+    let payload = tmux_send_keys_payload(keys);
+    let mux = Mux::try_get().ok_or_else(|| "mux singleton is unavailable".to_string())?;
+    let pane = mux
+        .get_pane(pane_id)
+        .ok_or_else(|| format!("pane not found: %{pane_id}"))?;
+    let mut writer = pane.writer();
+    std::io::Write::write_all(&mut *writer, &payload)
+        .map_err(|err| format!("send-keys write failed: {err}"))?;
+    std::io::Write::flush(&mut *writer).map_err(|err| format!("send-keys flush failed: {err}"))?;
+    Ok(Vec::new())
+}
+
+fn tmux_send_keys_payload(keys: &[String]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for key in keys {
+        match key.as_str() {
+            "Enter" | "Return" => payload.push(b'\r'),
+            "Space" => payload.push(b' '),
+            "Tab" => payload.push(b'\t'),
+            "Escape" | "Esc" => payload.push(0x1b),
+            "BSpace" | "Backspace" => payload.push(0x7f),
+            literal => {
+                if let Some(byte) = tmux_control_key_byte(literal) {
+                    payload.push(byte);
+                } else {
+                    payload.extend_from_slice(literal.as_bytes());
+                }
+            }
+        }
+    }
+    payload
+}
+
+fn tmux_control_key_byte(key: &str) -> Option<u8> {
+    let name = key.strip_prefix("C-")?;
+    let mut chars = name.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || !ch.is_ascii() {
+        return None;
+    }
+    match ch {
+        '@' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        ascii if ascii.is_ascii_alphabetic() => Some(ascii.to_ascii_uppercase() as u8 - b'@'),
+        _ => None,
+    }
+}
+
+fn tmux_dispatch_capture_pane(target: Option<String>, print: bool) -> Result<Vec<String>, String> {
+    if !print {
+        return Err("capture-pane without -p is unsupported by native tmux dispatcher".to_string());
+    }
+    let pane_id = tmux_control_target_pane_id(target.as_deref())?;
+    let mux = Mux::try_get().ok_or_else(|| "mux singleton is unavailable".to_string())?;
+    let pane = mux
+        .get_pane(pane_id)
+        .ok_or_else(|| format!("pane not found: %{pane_id}"))?;
+    let dimensions = pane.get_dimensions();
+    let row_count = dimensions
+        .scrollback_rows
+        .saturating_add(dimensions.viewport_rows);
+    let row_end = isize::try_from(row_count).unwrap_or(isize::MAX);
+    let (_first_row, lines) = pane.get_lines(0..row_end);
+    Ok(lines
+        .into_iter()
+        .map(|line| line.columns_as_str(0..usize::MAX).trim_end().to_string())
+        .collect())
 }
 
 fn tmux_command_name(command: &TmuxCommand) -> &'static str {
@@ -1484,35 +1583,212 @@ mod tests {
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use async_channel::unbounded;
     use codec::{CompressionMode, Ping, Pong, SendPaste, WriteToPane};
+    use mux::domain::DomainId;
+    use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
+    use mux::renderable::{RenderableDimensions, StableCursorPosition};
+    use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
     use proptest::prelude::*;
+    use rangeset::RangeSet;
     use std::io;
     use std::io::Cursor;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     use std::io::Write;
+    use std::ops::Range;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+    use termwiz::surface::{Line, SequenceNo};
+    use wezterm_term::color::ColorPalette;
     use wezterm_term::terminal::{Alert, ClipboardSelection};
+    use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
 
-    struct ScopedMux(Option<Arc<Mux>>);
+    static TMUX_CONTROL_MUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ScopedMux {
+        prior: Option<Arc<Mux>>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl ScopedMux {
         fn install(mux: &Arc<Mux>) -> Self {
+            let lock = TMUX_CONTROL_MUX_TEST_LOCK.lock().unwrap();
             let prior = Mux::try_get();
             Mux::set_mux(mux);
-            Self(prior)
+            Self { prior, _lock: lock }
         }
     }
 
     impl Drop for ScopedMux {
         fn drop(&mut self) {
-            if let Some(prior) = self.0.take() {
+            if let Some(prior) = self.prior.take() {
                 Mux::set_mux(&prior);
             } else {
                 Mux::shutdown();
             }
         }
+    }
+
+    struct CapturingPane {
+        pane_id: usize,
+        lines: ParkingMutex<Vec<Line>>,
+        writes: ParkingMutex<Vec<u8>>,
+        dimensions: RenderableDimensions,
+    }
+
+    impl CapturingPane {
+        fn new(pane_id: usize, lines: &[&str]) -> Self {
+            let line_count = lines.len();
+            Self {
+                pane_id,
+                lines: ParkingMutex::new(
+                    lines
+                        .iter()
+                        .map(|line| Line::from_text(line, &Default::default(), 1, None))
+                        .collect(),
+                ),
+                writes: ParkingMutex::new(Vec::new()),
+                dimensions: RenderableDimensions {
+                    cols: 80,
+                    viewport_rows: line_count,
+                    scrollback_rows: 0,
+                    physical_top: 0,
+                    scrollback_top: 0,
+                    dpi: 96,
+                    pixel_width: 800,
+                    pixel_height: 600,
+                    reverse_video: false,
+                },
+            }
+        }
+
+        fn written_bytes(&self) -> Vec<u8> {
+            self.writes.lock().clone()
+        }
+    }
+
+    impl Pane for CapturingPane {
+        fn pane_id(&self) -> usize {
+            self.pane_id
+        }
+
+        fn get_cursor_position(&self) -> StableCursorPosition {
+            StableCursorPosition::default()
+        }
+
+        fn get_current_seqno(&self) -> SequenceNo {
+            1
+        }
+
+        fn get_changed_since(
+            &self,
+            _lines: Range<StableRowIndex>,
+            _seqno: SequenceNo,
+        ) -> RangeSet<StableRowIndex> {
+            RangeSet::new()
+        }
+
+        fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+            let start = usize::try_from(lines.start.max(0)).unwrap_or(usize::MAX);
+            let end = usize::try_from(lines.end.max(lines.start).max(0)).unwrap_or(usize::MAX);
+            (
+                lines.start,
+                self.lines
+                    .lock()
+                    .iter()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .cloned()
+                    .collect(),
+            )
+        }
+
+        fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
+            mux::pane::impl_with_lines_via_get_lines(self, lines, with_lines);
+        }
+
+        fn for_each_logical_line_in_stable_range_mut(
+            &self,
+            lines: Range<StableRowIndex>,
+            for_line: &mut dyn ForEachPaneLogicalLine,
+        ) {
+            mux::pane::impl_for_each_logical_line_via_get_logical_lines(self, lines, for_line);
+        }
+
+        fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
+            mux::pane::impl_get_logical_lines_via_get_lines(self, lines)
+        }
+
+        fn get_dimensions(&self) -> RenderableDimensions {
+            self.dimensions
+        }
+
+        fn get_title(&self) -> String {
+            "capture-pane-test".to_string()
+        }
+
+        fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+            self.writes.lock().extend_from_slice(text.as_bytes());
+            Ok(())
+        }
+
+        fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
+            Ok(None)
+        }
+
+        fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
+            ParkingMutexGuard::map(self.writes.lock(), |writes| {
+                let writer: &mut dyn std::io::Write = writes;
+                writer
+            })
+        }
+
+        fn resize(&self, _size: TerminalSize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn key_up(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn is_dead(&self) -> bool {
+            false
+        }
+
+        fn palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
+        fn domain_id(&self) -> DomainId {
+            DomainId::default()
+        }
+
+        fn is_mouse_grabbed(&self) -> bool {
+            false
+        }
+
+        fn is_alt_screen_active(&self) -> bool {
+            false
+        }
+
+        fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<url::Url> {
+            None
+        }
+    }
+
+    fn install_mux_with_pane(pane: &Arc<dyn Pane>) -> (Arc<Mux>, ScopedMux) {
+        let mux = Arc::new(Mux::new(None));
+        let guard = ScopedMux::install(&mux);
+        mux.add_pane(pane).unwrap();
+        (mux, guard)
     }
 
     #[test]
@@ -1607,7 +1883,7 @@ mod tests {
         let response = tmux_control_response_at(11, 8, "send-keys secret-token Enter\n");
         let encoded = response.encode();
 
-        assert!(encoded.contains("unsupported command in native tmux dispatcher: send-keys"));
+        assert!(encoded.contains("missing target pane"));
         assert!(!encoded.contains("secret-token"));
         assert!(encoded.ends_with("%error 11 8 0\n"));
     }
@@ -1638,6 +1914,60 @@ mod tests {
 
         assert!(response.outcome.is_err());
         assert_eq!(response.output, vec!["session not found: missing"]);
+    }
+
+    #[test]
+    fn tmux_control_capture_pane_prints_live_pane_lines() {
+        let pane = Arc::new(CapturingPane::new(42, &["alpha", "beta"]));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, _guard) = install_mux_with_pane(&pane_dyn);
+
+        let response = tmux_control_response_at(14, 11, "capture-pane -p -t %42\n");
+
+        assert!(response.outcome.is_ok());
+        assert_eq!(response.output, vec!["alpha", "beta"]);
+        assert!(response.encode().ends_with("%end 14 11 0\n"));
+    }
+
+    #[test]
+    fn tmux_control_capture_pane_requires_print_mode() {
+        let pane = Arc::new(CapturingPane::new(42, &["alpha"]));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, _guard) = install_mux_with_pane(&pane_dyn);
+
+        let response = tmux_control_response_at(14, 11, "capture-pane -t %42\n");
+
+        assert!(response.outcome.is_err());
+        assert_eq!(
+            response.output,
+            vec!["capture-pane without -p is unsupported by native tmux dispatcher"]
+        );
+    }
+
+    #[test]
+    fn tmux_control_send_keys_writes_live_pane_input() {
+        let pane = Arc::new(CapturingPane::new(42, &[]));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, _guard) = install_mux_with_pane(&pane_dyn);
+
+        let response =
+            tmux_control_response_at(14, 11, "send-keys -t %42 echo Space hi Enter C-c\n");
+
+        assert!(response.outcome.is_ok());
+        assert!(response.output.is_empty());
+        assert_eq!(pane.written_bytes(), b"echo hi\r\x03");
+    }
+
+    #[test]
+    fn tmux_control_send_keys_rejects_non_pane_target_without_payload_echo() {
+        let response =
+            tmux_control_response_at(14, 11, "send-keys -t session:window secret-token Enter\n");
+        let encoded = response.encode();
+
+        assert!(response.outcome.is_err());
+        assert!(encoded.contains("unsupported pane target"));
+        assert!(!encoded.contains("secret-token"));
+        assert!(encoded.ends_with("%error 14 11 0\n"));
     }
 
     #[derive(Debug, Default)]
