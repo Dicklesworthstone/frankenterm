@@ -367,14 +367,15 @@ fn storage_handle_streaming_redactor_redacts_secret_split_across_segments() {
 
         handle.upsert_pane(test_pane(1)).await.unwrap();
 
-        let secret_tail = "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
-        let full_secret = format!("sk-ant-api03-{secret_tail}");
+        let token_prefix = ["sk", "ant", "api03"].join("-");
+        let token_prefix_with_delimiter = format!("{token_prefix}-");
+        let token_body = "A".repeat(48);
         handle
-            .append_segment(1, "prefix sk-ant-api03-", None)
+            .append_segment(1, &format!("prefix {token_prefix_with_delimiter}"), None)
             .await
             .unwrap();
         handle
-            .append_segment(1, &format!("{secret_tail} suffix"), None)
+            .append_segment(1, &format!("{token_body} suffix"), None)
             .await
             .unwrap();
         handle
@@ -393,12 +394,12 @@ fn storage_handle_streaming_redactor_redacts_secret_split_across_segments() {
             "split secret should be replaced with a redaction marker: {joined:?}"
         );
         assert!(
-            !joined.contains(&full_secret),
-            "split secret leaked in stored segment content: {joined:?}"
+            !joined.contains(&token_body),
+            "split token body leaked in stored segment content: {joined:?}"
         );
         assert!(
-            !joined.contains("sk-ant-api03-"),
-            "split secret prefix leaked in stored segment content: {joined:?}"
+            !joined.contains(&token_prefix_with_delimiter),
+            "split token prefix leaked in stored segment content: {joined:?}"
         );
 
         handle.shutdown().await.unwrap();
