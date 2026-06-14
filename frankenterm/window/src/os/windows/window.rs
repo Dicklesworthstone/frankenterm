@@ -21,7 +21,6 @@ use shared_library::shared_library;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::ffi::OsString;
 use std::io::{self, Error as IoError};
 use std::num::NonZeroIsize;
@@ -197,14 +196,15 @@ fn adjust_client_to_window_dimensions(
     (rect_width(&rect), rect_height(&rect))
 }
 
-fn rc_to_pointer(arc: &Rc<RefCell<WindowInner>>) -> *const RefCell<WindowInner> {
+fn rc_to_pointer(arc: &Rc<RefCell<WindowInner>>) -> LPVOID {
     let cloned = Rc::clone(arc);
-    Rc::into_raw(cloned)
+    Rc::into_raw(cloned) as LPVOID
 }
 
 fn rc_from_pointer(lparam: LPVOID) -> Rc<RefCell<WindowInner>> {
     // Turn it into an Rc
-    let arc = unsafe { Rc::from_raw(std::mem::transmute(lparam)) };
+    let ptr = lparam.cast::<RefCell<WindowInner>>() as *const RefCell<WindowInner>;
+    let arc = unsafe { Rc::from_raw(ptr) };
     // Add a ref for the caller
     let cloned = Rc::clone(&arc);
 
@@ -224,7 +224,8 @@ fn rc_from_hwnd(hwnd: HWND) -> Option<Rc<RefCell<WindowInner>>> {
 }
 
 fn take_rc_from_pointer(lparam: LPVOID) -> Rc<RefCell<WindowInner>> {
-    unsafe { Rc::from_raw(std::mem::transmute(lparam)) }
+    let ptr = lparam.cast::<RefCell<WindowInner>>() as *const RefCell<WindowInner>;
+    unsafe { Rc::from_raw(ptr) }
 }
 
 fn callback_behavior() -> glium::debug::DebugCallbackBehavior {
@@ -292,7 +293,7 @@ impl WindowInner {
             })
         })?;
 
-        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        let mut rect = RECT::default();
         unsafe {
             GetClientRect(self.hwnd.0, &mut rect);
         }
@@ -316,7 +317,7 @@ impl WindowInner {
         }
 
         unsafe {
-            let mut mi: MONITORINFOEXW = std::mem::zeroed();
+            let mut mi = MONITORINFOEXW::default();
             mi.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
             let mon = MonitorFromWindow(self.hwnd.0, MONITOR_DEFAULTTONEAREST);
             GetMonitorInfoW(mon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
@@ -469,7 +470,7 @@ impl Window {
         class_name: &str,
         name: &str,
         geometry: ResolvedGeometry,
-        lparam: *const RefCell<WindowInner>,
+        lparam: LPVOID,
     ) -> anyhow::Result<HWND> {
         let class_name = wide_string(class_name);
         let h_inst = unsafe { GetModuleHandleW(null()) };
@@ -514,7 +515,7 @@ impl Window {
                     // We pick the middle of the primary monitor
 
                     unsafe {
-                        let mut mi: MONITORINFO = std::mem::zeroed();
+                        let mut mi = MONITORINFO::default();
                         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
                         GetMonitorInfoW(
                             MonitorFromWindow(std::ptr::null_mut(), MONITOR_DEFAULTTOPRIMARY),
@@ -547,7 +548,7 @@ impl Window {
                 null_mut(),
                 null_mut(),
                 null_mut(),
-                std::mem::transmute(lparam),
+                lparam,
             )
         };
 
@@ -614,7 +615,7 @@ impl Window {
             Ok(hwnd) => HWindow(hwnd),
             Err(err) => {
                 // Ensure that we drop the extra ref to raw before we return
-                drop(unsafe { Rc::from_raw(raw) });
+                drop(take_rc_from_pointer(raw));
                 return Err(err);
             }
         };
@@ -763,12 +764,13 @@ impl WindowInner {
                 })
                 .detach();
             } else {
-                let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+                let mut placement = WINDOWPLACEMENT::default();
+                placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as _;
                 GetWindowPlacement(hwnd, &mut placement);
 
                 self.saved_placement.replace(placement);
                 promise::spawn::spawn(async move {
-                    let mut mi: MONITORINFO = std::mem::zeroed();
+                    let mut mi = MONITORINFO::default();
                     mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
                     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mut mi);
                     SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as i32));
@@ -1351,10 +1353,10 @@ fn get_window_state(hwnd: HWND) -> WindowState {
         SW_SHOWMAXIMIZED => WindowState::MAXIMIZED,
         SW_SHOWMINIMIZED => WindowState::HIDDEN,
         _ => unsafe {
-            let mut rect = std::mem::zeroed();
+            let mut rect = RECT::default();
             GetWindowRect(hwnd, &mut rect);
 
-            let mut mi: MONITORINFO = std::mem::zeroed();
+            let mut mi = MONITORINFO::default();
             mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
             GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
 
@@ -1755,22 +1757,26 @@ fn nc_mouse_coords(hwnd: HWND, lparam: LPARAM) -> Point {
     screen_to_client(hwnd, point)
 }
 
+fn isize_to_win32_coord(value: isize) -> i32 {
+    value.clamp(i32::MIN as isize, i32::MAX as isize) as i32
+}
+
 fn screen_to_client(hwnd: HWND, point: ScreenPoint) -> Point {
     let mut point = POINT {
-        x: point.x.try_into().unwrap(),
-        y: point.y.try_into().unwrap(),
+        x: isize_to_win32_coord(point.x),
+        y: isize_to_win32_coord(point.y),
     };
     unsafe { ScreenToClient(hwnd, &mut point as *mut _) };
-    Point::new(point.x.try_into().unwrap(), point.y.try_into().unwrap())
+    Point::new(point.x as isize, point.y as isize)
 }
 
 fn client_to_screen(hwnd: HWND, point: Point) -> ScreenPoint {
     let mut point = POINT {
-        x: point.x.try_into().unwrap(),
-        y: point.y.try_into().unwrap(),
+        x: isize_to_win32_coord(point.x),
+        y: isize_to_win32_coord(point.y),
     };
     unsafe { ClientToScreen(hwnd, &mut point as *mut _) };
-    ScreenPoint::new(point.x.try_into().unwrap(), point.y.try_into().unwrap())
+    ScreenPoint::new(point.x as isize, point.y as isize)
 }
 
 fn apply_mouse_cursor(cursor: Option<MouseCursor>) {

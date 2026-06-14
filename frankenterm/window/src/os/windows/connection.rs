@@ -70,7 +70,7 @@ impl ConnectionOps for Connection {
     }
 
     fn run_message_loop(&self) -> anyhow::Result<()> {
-        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        let mut msg = MSG::default();
         loop {
             SPAWN_QUEUE.run();
 
@@ -209,11 +209,11 @@ impl ScreenInfoHelper {
             data: LPARAM,
         ) -> i32 {
             let info: &mut ScreenInfoHelper = &mut *(data as *mut ScreenInfoHelper);
-            let mut mi: MONITORINFOEXW = std::mem::zeroed();
+            let mut mi = MONITORINFOEXW::default();
             mi.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
             GetMonitorInfoW(mon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
 
-            let mut devmode: DEVMODEW = std::mem::zeroed();
+            let mut devmode = DEVMODEW::default();
             devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
             let max_fps =
                 if EnumDisplaySettingsW(mi.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut devmode)
@@ -288,7 +288,7 @@ impl ScreenInfoHelper {
                 None => {
                     // Fall back to EnumDisplayDevicesW.
                     // It likely has a terribly generic name like "Generic PnP Monitor".
-                    let mut display_device: DISPLAY_DEVICEW = std::mem::zeroed();
+                    let mut display_device = DISPLAY_DEVICEW::default();
                     display_device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
 
                     if EnumDisplayDevicesW(mi.szDevice.as_ptr(), 0, &mut display_device, 0) != 0 {
@@ -331,7 +331,7 @@ fn wstr(slice: &[u16]) -> String {
 fn gdi_display_name_to_adapter_names() -> HashMap<String, String> {
     let mut map = HashMap::new();
 
-    let mut display_device: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+    let mut display_device = DISPLAY_DEVICEW::default();
     display_device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
 
     for n in 0.. {
@@ -367,10 +367,8 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
             return Err(std::io::Error::last_os_error()).context("GetDisplayConfigBufferSizes");
         }
 
-        unsafe {
-            paths.resize_with(path_count as usize, || std::mem::zeroed());
-            modes.resize_with(mode_count as usize, || std::mem::zeroed());
-        }
+        paths.resize_with(path_count as usize, DISPLAYCONFIG_PATH_INFO::default);
+        modes.resize_with(mode_count as usize, DISPLAYCONFIG_MODE_INFO::default);
 
         let result = unsafe {
             QueryDisplayConfig(
@@ -385,10 +383,8 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
 
         // Shrink down if fewer paths than were requested were
         // returned to us
-        unsafe {
-            paths.resize_with(path_count as usize, || std::mem::zeroed());
-            modes.resize_with(mode_count as usize, || std::mem::zeroed());
-        }
+        paths.resize_with(path_count as usize, DISPLAYCONFIG_PATH_INFO::default);
+        modes.resize_with(mode_count as usize, DISPLAYCONFIG_MODE_INFO::default);
 
         if result == ERROR_INSUFFICIENT_BUFFER as i32 {
             continue;
@@ -402,7 +398,7 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
     }
 
     for path in &paths {
-        let mut target_name: DISPLAYCONFIG_TARGET_DEVICE_NAME = unsafe { std::mem::zeroed() };
+        let mut target_name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
 
         target_name.header.adapterId = path.targetInfo.adapterId;
         target_name.header.id = path.targetInfo.id;
@@ -415,7 +411,7 @@ fn gdi_display_name_to_friendly_monitor_names() -> anyhow::Result<HashMap<String
                 .context("DisplayConfigGetDeviceInfo DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME");
         }
 
-        let mut source_name: DISPLAYCONFIG_SOURCE_DEVICE_NAME = unsafe { std::mem::zeroed() };
+        let mut source_name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
         source_name.header.adapterId = path.targetInfo.adapterId;
         source_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         source_name.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
