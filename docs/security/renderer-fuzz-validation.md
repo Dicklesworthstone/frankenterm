@@ -78,7 +78,7 @@ the contract module:
 | Shipped (golden + CI lane) | 4 |
 | Partial (related fixture exists, additive needed) | 2 |
 | Gap (`ft-ruona` non-a11y fixture work) | 11 |
-| Blocked on sub-bead | 1 (`screen-reader-active` — `ft-0q5zm`) |
+| Headless-shipped (a11y event-stream contract; native via `ft-5pk4h`) | 1 (`screen-reader-active` — `ft-0q5zm`) |
 | **Total** | **18** |
 
 Source of truth:
@@ -159,9 +159,9 @@ the doctor wires it to a WARN-level message when
 | Item | Status |
 |---|---|
 | Failure-artifact contract (`runs/<run_id>/` layout, classification) | ✓ `gpu_regression_fuzz_report` module + lib tests |
-| Scenario manifest with status (shipped/partial/gap/blocked) | ✓ `scenario_manifest()` + `coverage_snapshot()` |
+| Scenario manifest with status (shipped/partial/gap/blocked/headless-shipped) | ✓ `scenario_manifest()` + `coverage_snapshot()` |
 | Non-a11y missing/additive scenario fixtures | ⏳ `ft-ruona`; fuzz CLI wiring does not generate golden fixtures |
-| `screen-reader-active` a11y comparator | ⏳ `ft-0q5zm`; requires the renderer golden/a11y comparator lane |
+| `screen-reader-active` a11y comparator | ✓ `ft-0q5zm` ships the headless a11y event-stream contract (`ScreenReaderSession` / `screen_reader_active_golden` / `screen_reader_active_violations`, built on `a11y_tree`); native per-platform comparator tracked by `ft-5pk4h` |
 | Harness CLI flag wiring (`--fuzz-seed`, `--fuzz-duration`, etc.) | ✓ harness binary parses `FuzzCliFlags`, dispatches to `FuzzStream`, and writes `runs/<run_id>/` artifacts |
 | GitHub Actions workflow | ✓ `.github/workflows/renderer-fuzz.yml` uses `ubuntu-24.04` llvmpipe preflight before the matrix |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |

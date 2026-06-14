@@ -45,6 +45,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::a11y_tree::{
+    AccessibilityEvent, AccessibilityPlatform, AccessibilityScenario, AnnouncePriority,
+    InvariantViolation, check_invariants,
+};
+
 // ============================================================================
 // Run identity
 // ============================================================================
@@ -326,6 +331,13 @@ pub enum ScenarioStatus {
     /// Cross-references another bead's harness (e.g.,
     /// screen-reader-active needs the A11y comparator).
     BlockedOnSubBead,
+    /// A platform-agnostic, headless contract scenario ships and
+    /// runs in CI (e.g. `screen-reader-active` via the
+    /// [`crate::a11y_tree`] event-stream comparator). The native
+    /// per-platform comparator (AT-SPI / `NSAccessibility` /
+    /// UIAutomation) is still a tracked follow-up, named in
+    /// `blocked_on`.
+    HeadlessShipped,
 }
 
 /// One scenario in the manifest.
@@ -348,7 +360,7 @@ pub struct ScenarioRecord {
 /// description.
 #[must_use]
 pub fn scenario_manifest() -> Vec<ScenarioRecord> {
-    use ScenarioStatus::{BlockedOnSubBead, Gap, Partial, Shipped};
+    use ScenarioStatus::{Gap, HeadlessShipped, Partial, Shipped};
     let req = |s: &str| s.to_string();
     let scenario_corpus = Some("ft-ruona");
     let row = |slug: &str,
@@ -382,11 +394,15 @@ pub fn scenario_manifest() -> Vec<ScenarioRecord> {
         row("wide-gamut", &[], Gap, scenario_corpus),
         row("rtl-script", &[], Shipped, None),
         row("cjk-mixed", &[], Shipped, None),
+        // The headless a11y event-stream contract for this scenario
+        // ships here (see `screen_reader_active_golden` /
+        // `screen_reader_active_violations`); the native per-platform
+        // comparator is tracked by ft-5pk4h.
         row(
             "screen-reader-active",
             &[],
-            BlockedOnSubBead,
-            Some("ft-0q5zm"),
+            HeadlessShipped,
+            Some("ft-5pk4h"),
         ),
     ]
 }
@@ -400,6 +416,9 @@ pub struct ScenarioCoverageSnapshot {
     pub partial: u32,
     pub gap: u32,
     pub blocked: u32,
+    /// Scenarios whose headless contract ships in CI while their
+    /// native per-platform comparator is a tracked follow-up.
+    pub headless_shipped: u32,
     pub scenarios: Vec<ScenarioRecord>,
 }
 
@@ -410,12 +429,14 @@ pub fn coverage_snapshot() -> ScenarioCoverageSnapshot {
     let mut partial = 0;
     let mut gap = 0;
     let mut blocked = 0;
+    let mut headless_shipped = 0;
     for s in &scenarios {
         match s.status {
             ScenarioStatus::Shipped => shipped += 1,
             ScenarioStatus::Partial => partial += 1,
             ScenarioStatus::Gap => gap += 1,
             ScenarioStatus::BlockedOnSubBead => blocked += 1,
+            ScenarioStatus::HeadlessShipped => headless_shipped += 1,
         }
     }
     ScenarioCoverageSnapshot {
@@ -424,8 +445,160 @@ pub fn coverage_snapshot() -> ScenarioCoverageSnapshot {
         partial,
         gap,
         blocked,
+        headless_shipped,
         scenarios,
     }
+}
+
+// ============================================================================
+// screen-reader-active scenario (#18) — headless a11y contract
+// ============================================================================
+
+/// Stable slug for the renderer-golden `screen-reader-active`
+/// scenario (#18) — matches `tests/renderer_golden/SCENARIOS.md`.
+pub const SCREEN_READER_ACTIVE_SLUG: &str = "screen-reader-active";
+
+/// Active assistive-technology session state for the
+/// `screen-reader-active` renderer scenario (#18).
+///
+/// The renderer/terminal accessibility path is gated on whether a
+/// screen reader is actually attached: while one is active it must
+/// surface focus, text, and announcement events through the
+/// [`crate::a11y_tree`] contract; when none is attached it must NOT
+/// spend work emitting announcements no AT client will consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenReaderSession {
+    /// Whether an assistive-technology client is attached.
+    pub active: bool,
+    /// Which platform AT framework the session speaks. `Synthetic`
+    /// is the headless contract this scenario runs against until the
+    /// per-platform comparators (ft-5pk4h) land.
+    pub platform: AccessibilityPlatform,
+}
+
+impl ScreenReaderSession {
+    /// An attached (active) screen-reader session on `platform`.
+    #[must_use]
+    pub const fn active(platform: AccessibilityPlatform) -> Self {
+        Self {
+            active: true,
+            platform,
+        }
+    }
+
+    /// A detached (inactive) session on `platform`.
+    #[must_use]
+    pub const fn inactive(platform: AccessibilityPlatform) -> Self {
+        Self {
+            active: false,
+            platform,
+        }
+    }
+}
+
+/// Contract violations specific to the `screen-reader-active`
+/// scenario, layered on top of the structural
+/// [`InvariantViolation`]s the shared a11y contract enforces.
+// Externally tagged (no `tag = "kind"`): the `A11yInvariant`
+// newtype wraps `InvariantViolation`, which is itself internally
+// tagged on `kind`, so an internal tag here would collide on that
+// key. External tagging nests the inner violation cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenReaderContractViolation {
+    /// The session was active but the stream carried no
+    /// announcement — a live screen reader would have nothing to
+    /// speak.
+    ActiveSessionMissingAnnouncement,
+    /// The session was active but the terminal never reported
+    /// focus, so no element is addressable by the AT client.
+    ActiveSessionMissingFocus,
+    /// An inactive session still emitted an announcement — wasted
+    /// AT work for a detached client.
+    InactiveSessionEmittedAnnouncement { index: usize },
+    /// A shared a11y-contract invariant was violated.
+    A11yInvariant(InvariantViolation),
+}
+
+/// Deterministic, headless golden event stream for the
+/// `screen-reader-active` scenario.
+///
+/// Models a focused terminal pane under an attached screen reader:
+/// the pane gains AT focus, its text value changes as the agent
+/// types, and (only when a reader is attached) an assertive
+/// announcement is surfaced. The structural focus/text events are
+/// identical whether or not a reader is attached; only announcement
+/// emission is gated on `session.active`.
+#[must_use]
+pub fn screen_reader_active_golden(session: ScreenReaderSession) -> Vec<AccessibilityEvent> {
+    let mut events = vec![
+        AccessibilityEvent::FocusChanged {
+            ts_ms: 0,
+            role: "Terminal".to_string(),
+            name: "pane:1".to_string(),
+        },
+        AccessibilityEvent::TextValueChanged {
+            ts_ms: 10,
+            role: "Terminal".to_string(),
+            name: "pane:1".to_string(),
+            value: "build succeeded".to_string(),
+        },
+    ];
+    if session.active {
+        events.push(AccessibilityEvent::AnnounceMessage {
+            ts_ms: 20,
+            priority: AnnouncePriority::Assertive,
+            value: "build succeeded".to_string(),
+        });
+    }
+    events
+}
+
+/// Compare a recorded `screen-reader-active` event stream against
+/// the scenario contract. Returns the accumulated violations (empty
+/// = the recorder honored the active/inactive announcement gate and
+/// every shared a11y invariant).
+///
+/// The scenario maps onto the contract's steady-typing flow (a
+/// focused element receiving text), so the shared
+/// [`check_invariants`] pass runs against
+/// [`AccessibilityScenario::SteadyTyping`].
+#[must_use]
+pub fn screen_reader_active_violations(
+    session: ScreenReaderSession,
+    events: &[AccessibilityEvent],
+) -> Vec<ScreenReaderContractViolation> {
+    let mut violations = Vec::new();
+
+    let has_announcement = events
+        .iter()
+        .any(|e| matches!(e, AccessibilityEvent::AnnounceMessage { .. }));
+    let has_focus = events
+        .iter()
+        .any(|e| matches!(e, AccessibilityEvent::FocusChanged { .. }));
+
+    if session.active {
+        if !has_focus {
+            violations.push(ScreenReaderContractViolation::ActiveSessionMissingFocus);
+        }
+        if !has_announcement {
+            violations.push(ScreenReaderContractViolation::ActiveSessionMissingAnnouncement);
+        }
+    } else {
+        for (index, event) in events.iter().enumerate() {
+            if matches!(event, AccessibilityEvent::AnnounceMessage { .. }) {
+                violations.push(
+                    ScreenReaderContractViolation::InactiveSessionEmittedAnnouncement { index },
+                );
+            }
+        }
+    }
+
+    for violation in check_invariants(AccessibilityScenario::SteadyTyping, events) {
+        violations.push(ScreenReaderContractViolation::A11yInvariant(violation));
+    }
+
+    violations
 }
 
 // ============================================================================
@@ -722,8 +895,123 @@ mod tests {
                         scenario.slug
                     );
                 }
+                ScenarioStatus::HeadlessShipped => {
+                    assert_eq!(
+                        scenario.blocked_on.as_deref(),
+                        Some("ft-5pk4h"),
+                        "headless scenario {} should point at its per-platform follow-up",
+                        scenario.slug
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn screen_reader_active_golden_satisfies_contract() {
+        let session = ScreenReaderSession::active(AccessibilityPlatform::Synthetic);
+        let events = screen_reader_active_golden(session);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AccessibilityEvent::AnnounceMessage { .. })),
+            "active session must surface an announcement"
+        );
+        let violations = screen_reader_active_violations(session, &events);
+        assert!(
+            violations.is_empty(),
+            "active golden must satisfy the contract: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn screen_reader_inactive_suppresses_announcements() {
+        let session = ScreenReaderSession::inactive(AccessibilityPlatform::Synthetic);
+        let events = screen_reader_active_golden(session);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AccessibilityEvent::AnnounceMessage { .. })),
+            "inactive session must not emit announcements"
+        );
+        let violations = screen_reader_active_violations(session, &events);
+        assert!(
+            violations.is_empty(),
+            "inactive golden must satisfy the contract: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn active_session_without_announcement_is_a_violation() {
+        let session = ScreenReaderSession::active(AccessibilityPlatform::Synthetic);
+        // A live reader that gets focus but no announcement would be
+        // silent — the comparator must catch it.
+        let events = vec![AccessibilityEvent::FocusChanged {
+            ts_ms: 0,
+            role: "Terminal".to_string(),
+            name: "pane:1".to_string(),
+        }];
+        let violations = screen_reader_active_violations(session, &events);
+        assert!(
+            violations.contains(&ScreenReaderContractViolation::ActiveSessionMissingAnnouncement),
+            "missing announcement under an active session must be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn inactive_session_emitting_announcement_is_a_violation() {
+        let session = ScreenReaderSession::inactive(AccessibilityPlatform::Synthetic);
+        let events = vec![
+            AccessibilityEvent::FocusChanged {
+                ts_ms: 0,
+                role: "Terminal".to_string(),
+                name: "pane:1".to_string(),
+            },
+            AccessibilityEvent::AnnounceMessage {
+                ts_ms: 10,
+                priority: AnnouncePriority::Polite,
+                value: "leaked".to_string(),
+            },
+        ];
+        let violations = screen_reader_active_violations(session, &events);
+        assert_eq!(
+            violations,
+            vec![ScreenReaderContractViolation::InactiveSessionEmittedAnnouncement { index: 1 }],
+            "an announcement with no attached reader must be the sole violation"
+        );
+    }
+
+    #[test]
+    fn screen_reader_active_scenario_is_headless_shipped() {
+        let row = scenario_manifest()
+            .into_iter()
+            .find(|s| s.slug == SCREEN_READER_ACTIVE_SLUG)
+            .expect("manifest must contain screen-reader-active");
+        assert_eq!(row.status, ScenarioStatus::HeadlessShipped);
+        assert_eq!(
+            row.blocked_on.as_deref(),
+            Some("ft-5pk4h"),
+            "headless contract must track its per-platform follow-up"
+        );
+        // No native AT framework is wired yet; the headless
+        // Synthetic contract stands in until ft-5pk4h lands.
+        assert!(!AccessibilityPlatform::MacosNsAccessibility.is_wired());
+        assert!(!AccessibilityPlatform::LinuxAtSpi.is_wired());
+        assert!(!AccessibilityPlatform::WindowsUiAutomation.is_wired());
+        assert!(AccessibilityPlatform::Synthetic.is_wired());
+    }
+
+    #[test]
+    fn coverage_snapshot_counts_headless_shipped() {
+        let snap = coverage_snapshot();
+        assert_eq!(
+            snap.headless_shipped, 1,
+            "exactly screen-reader-active is headless-shipped"
+        );
+        assert_eq!(
+            snap.blocked, 0,
+            "no scenario should remain blocked on an unnamed a11y sub-bead"
+        );
     }
 
     #[test]

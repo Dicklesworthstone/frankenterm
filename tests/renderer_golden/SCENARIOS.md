@@ -38,7 +38,7 @@ under this catalog must conform to the same fixture format
 | 15 | `wide-gamut` | — | gap | ft-ruona | — |
 | 16 | `rtl-script` | `text-rtl-arabic-hebrew` | shipped | — | — |
 | 17 | `cjk-mixed` | `text-cjk-mixed` | shipped | — | — |
-| 18 | `screen-reader-active` | — | blocked on a11y comparator | ft-0q5zm | — |
+| 18 | `screen-reader-active` | a11y event-stream contract (`gpu_regression_fuzz_report.rs`) | headless-shipped | ft-5pk4h (native) | — |
 
 Status legend:
 
@@ -49,6 +49,11 @@ Status legend:
 - **gap** — no matching fixture; `ft-ruona` delivers the non-a11y fixture
 - **blocked** — no matching fixture; a separate harness/comparator bead is
   needed before the fixture can be generated
+- **headless-shipped** — a platform-agnostic headless contract ships and
+  runs in CI (here, the `screen-reader-active` accessibility event-stream
+  comparator in `crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`,
+  built on the `a11y_tree` contract); the native per-platform comparator
+  (AT-SPI / NSAccessibility / UIAutomation) is the named follow-up `ft-5pk4h`
 
 ## Existing fixtures not in the bead's 18
 
@@ -86,8 +91,10 @@ Cross-references:
 
 - the bead's 18-scenario plan is now reconciled with the existing
   `tests/golden/gpu/` inventory; the non-a11y **gap** and **partial**
-  rows above flow into `ft-ruona`, and `screen-reader-active` flows
-  into `ft-0q5zm`
+  rows above flow into `ft-ruona`, and `screen-reader-active` ships its
+  headless a11y event-stream contract under `ft-0q5zm` (see
+  `gpu_regression_fuzz_report.rs`), with the native per-platform
+  comparator tracked by `ft-5pk4h`
 - RQ-S4 (24h fuzz, 0 critical artifacts) in the SLO catalog now has a
   concrete seed-generator owner — the comparator already exists
   (`compare_images`), so the integration bead is just plumbing
@@ -137,9 +144,14 @@ the contract module agree on `tests/golden/gpu/`.
   **partial** rows. Each fixture needs `input.json`, `meta.json`,
   `expected.json`, and a captured `golden.png` from the headless
   renderer. This corpus work is tracked by `ft-ruona`.
-- A11y harness for `screen-reader-active` (scenario 18) — tracked by
-  `ft-0q5zm` because it needs the platform accessibility tree
-  comparator before a renderer golden can be generated.
+- A11y harness for `screen-reader-active` (scenario 18) — the headless
+  accessibility event-stream contract (`ScreenReaderSession`,
+  `screen_reader_active_golden`, `screen_reader_active_violations` in
+  `crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`, built on
+  the `a11y_tree` contract) ships under `ft-0q5zm` and runs in CI. The
+  native per-platform comparator (AT-SPI / NSAccessibility /
+  UIAutomation) that records against a real assistive-tech client is
+  tracked by the follow-up `ft-5pk4h`.
 - Per-release attestation entry at
   `docs/attestations/render-parity-<version>.json` (depends on
   `BR-RC-FOUNDATION.G3.1` / `ft-syqcz.1` attestation graph schema).
