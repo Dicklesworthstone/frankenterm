@@ -20,6 +20,7 @@
 //! ```rust,ignore
 //! let mut dash = DashboardManager::new();
 //! dash.update_costs(cost_tracker.dashboard_snapshot());
+//! dash.update_cost_attribution_estimates(cost_tracker.attribution_estimates());
 //! dash.update_backpressure(bp_manager.snapshot(&depths));
 //! let state = dash.snapshot();
 //! // Serialize for robot mode or pass to TUI renderer
@@ -31,7 +32,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::backpressure::{BackpressureSnapshot, BackpressureTier};
-use crate::cost_tracker::{AlertSeverity, BudgetAlert, CostDashboardSnapshot};
+use crate::cost_tracker::{
+    AlertSeverity, BudgetAlert, CostAttributionEstimateSummary, CostDashboardSnapshot,
+};
 use crate::quota_gate::{LaunchVerdict, QuotaGateSnapshot};
 use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
@@ -91,6 +94,8 @@ pub struct CostPanel {
     pub providers: BTreeMap<String, ProviderCostView>,
     /// Active budget alerts (sorted by severity desc, then provider).
     pub alerts: Vec<BudgetAlertView>,
+    /// Proxy-based, non-attested cost-attribution estimates for operator panels.
+    pub attribution_estimates: Vec<CostAttributionEstimateSummary>,
     /// Grand total cost across all providers.
     pub total_cost_usd: f64,
     /// Grand total tokens across all providers.
@@ -268,6 +273,7 @@ pub struct DashboardTelemetrySnapshot {
 #[derive(Debug)]
 pub struct DashboardManager {
     cost_snapshot: Option<CostDashboardSnapshot>,
+    cost_attribution_estimates: Vec<CostAttributionEstimateSummary>,
     rate_limit_summaries: Vec<ProviderRateLimitSummary>,
     backpressure_snapshot: Option<BackpressureSnapshot>,
     quota_snapshot: Option<QuotaGateSnapshot>,
@@ -279,6 +285,7 @@ impl DashboardManager {
     pub fn new() -> Self {
         Self {
             cost_snapshot: None,
+            cost_attribution_estimates: Vec::new(),
             rate_limit_summaries: Vec::new(),
             backpressure_snapshot: None,
             quota_snapshot: None,
@@ -290,6 +297,17 @@ impl DashboardManager {
     pub fn update_costs(&mut self, snapshot: CostDashboardSnapshot) {
         self.cost_snapshot = Some(snapshot);
         self.telemetry.cost_updates += 1;
+    }
+
+    /// Update proxy-based cost-attribution estimates for the cost panel.
+    ///
+    /// Estimates are displayed as operator guidance only. Producers must label
+    /// them as proxy estimates and keep `attestation_eligible` false.
+    pub fn update_cost_attribution_estimates(
+        &mut self,
+        estimates: Vec<CostAttributionEstimateSummary>,
+    ) {
+        self.cost_attribution_estimates = estimates;
     }
 
     /// Update rate limit data for all providers.
@@ -377,6 +395,7 @@ impl DashboardManager {
             return CostPanel {
                 providers: BTreeMap::new(),
                 alerts: Vec::new(),
+                attribution_estimates: self.cost_attribution_estimates.clone(),
                 total_cost_usd: 0.0,
                 total_tokens: 0,
                 pane_count: 0,
@@ -411,6 +430,7 @@ impl DashboardManager {
         CostPanel {
             providers,
             alerts,
+            attribution_estimates: self.cost_attribution_estimates.clone(),
             total_cost_usd: snap.grand_total_cost_usd,
             total_tokens: snap.grand_total_tokens,
             pane_count: snap.panes.len(),
@@ -611,7 +631,9 @@ mod tests {
     use super::*;
     use crate::backpressure::BackpressureTier;
     use crate::cost_tracker::{
-        AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
+        AlertSeverity, BudgetAlert, COST_ATTRIBUTION_ESTIMATE_LABEL, COST_ATTRIBUTION_METHODOLOGY,
+        CostAttributionEstimateSummary, CostAttributionKind, CostDashboardSnapshot,
+        PaneCostSummary, ProviderCostSummary,
     };
     use crate::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
     use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
@@ -718,6 +740,7 @@ mod tests {
         let state = mgr.snapshot();
         assert_eq!(state.overall_health, SystemHealthTier::Green);
         assert_eq!(state.costs.pane_count, 0);
+        assert!(state.costs.attribution_estimates.is_empty());
         assert_eq!(state.rate_limits.limited_provider_count, 0);
         assert_eq!(state.backpressure.paused_pane_count, 0);
         assert_eq!(state.quota.evaluations, 0);
@@ -741,6 +764,7 @@ mod tests {
         assert_eq!(state.costs.total_tokens, 70_000);
         assert_eq!(state.costs.alerts.len(), 1);
         assert_eq!(state.costs.alerts[0].severity, "warning");
+        assert!(state.costs.attribution_estimates.is_empty());
 
         // Rate limit panel
         assert_eq!(state.rate_limits.providers.len(), 2);
@@ -761,6 +785,38 @@ mod tests {
 
         // Overall health: Yellow from backpressure + rate limits
         assert_eq!(state.overall_health, SystemHealthTier::Yellow);
+    }
+
+    #[test]
+    fn cost_panel_carries_proxy_attribution_estimates_without_attestation() {
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(sample_cost_snapshot());
+        mgr.update_cost_attribution_estimates(vec![CostAttributionEstimateSummary {
+            kind: CostAttributionKind::Bead,
+            attribution_id: "ft-7h5da.8.5".to_string(),
+            estimate_label: COST_ATTRIBUTION_ESTIMATE_LABEL.to_string(),
+            methodology: COST_ATTRIBUTION_METHODOLOGY.to_string(),
+            attestation_eligible: false,
+            pane_count: 2,
+            bytes_captured: 3_072,
+            active_seconds: 20.0,
+            detection_count: 5,
+            estimated_tokens: 1_200,
+            estimated_cost_usd: 0.06,
+            record_count: 2,
+            last_updated_ms: 200,
+        }]);
+
+        let state = mgr.snapshot();
+        assert_eq!(state.costs.attribution_estimates.len(), 1);
+        let estimate = &state.costs.attribution_estimates[0];
+        assert_eq!(estimate.kind, CostAttributionKind::Bead);
+        assert_eq!(estimate.attribution_id, "ft-7h5da.8.5");
+        assert_eq!(estimate.estimate_label, COST_ATTRIBUTION_ESTIMATE_LABEL);
+        assert_eq!(estimate.methodology, COST_ATTRIBUTION_METHODOLOGY);
+        assert!(!estimate.attestation_eligible);
+        assert_eq!(estimate.bytes_captured, 3_072);
+        assert_eq!(estimate.detection_count, 5);
     }
 
     #[test]

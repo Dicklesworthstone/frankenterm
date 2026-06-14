@@ -48,6 +48,7 @@ fn render_prometheus_includes_prefix() {
             native_output_max_batch_bytes: 0,
             native_output_coalesce_ratio: 0.0,
             event_bus: None,
+            cost_attribution_estimates: Vec::new(),
         };
 
         let rendered = snapshot.render_prometheus("wa");
@@ -86,6 +87,7 @@ fn metrics_server_serves_metrics() {
             native_output_max_batch_bytes: 0,
             native_output_coalesce_ratio: 0.0,
             event_bus: None,
+            cost_attribution_estimates: Vec::new(),
         };
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -124,9 +126,10 @@ fn metrics_server_refuses_public_bind_without_opt_in() {
         let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
         let server = MetricsServer::new("0.0.0.0:0", "wa", collector, shutdown_flag);
 
-        let err = match server.start().await {
-            Ok(_) => panic!("public bind should be refused"),
-            Err(err) => err,
+        let result = server.start().await;
+        assert!(result.is_err(), "public bind should be refused");
+        let Err(err) = result else {
+            return;
         };
         assert!(
             err.to_string()

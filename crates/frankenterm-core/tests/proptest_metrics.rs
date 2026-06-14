@@ -129,6 +129,7 @@ fn arb_metrics_snapshot() -> impl Strategy<Value = MetricsSnapshot> {
                     native_output_max_batch_bytes: no_max_bytes,
                     native_output_coalesce_ratio: coalesce,
                     event_bus: bus,
+                    cost_attribution_estimates: Vec::new(),
                 }
             },
         )
@@ -144,12 +145,14 @@ fn parse_metric_blocks(rendered: &str) -> Vec<(String, String, String)> {
     let lines: Vec<&str> = rendered.lines().collect();
     let mut blocks = Vec::new();
     let mut i = 0;
-    while i + 2 < lines.len() {
-        if lines[i].starts_with("# HELP ") && lines[i + 1].starts_with("# TYPE ") {
+    while let (Some(help), Some(metric_type), Some(value)) =
+        (lines.get(i), lines.get(i + 1), lines.get(i + 2))
+    {
+        if help.starts_with("# HELP ") && metric_type.starts_with("# TYPE ") {
             blocks.push((
-                lines[i].to_string(),
-                lines[i + 1].to_string(),
-                lines[i + 2].to_string(),
+                (*help).to_string(),
+                (*metric_type).to_string(),
+                (*value).to_string(),
             ));
             i += 3;
         } else {

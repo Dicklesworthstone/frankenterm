@@ -5,6 +5,13 @@
 //! - Aggregating per-provider and per-pane totals
 //! - Budget alerts (configurable thresholds)
 //! - Serializable snapshots for Robot Mode / MCP API
+//! - Proxy-based attribution estimates grouped by bead, mission, workflow, or
+//!   correlation id
+//!
+//! Attribution estimates are operator guidance only. They are labeled
+//! `proxy_estimate`, use the `pane_activity_proxy_non_attested` methodology,
+//! and set `attestation_eligible = false` so they cannot be confused with
+//! billing truth or release evidence.
 //!
 //! # Integration
 //!
@@ -17,11 +24,18 @@
 //!                  CostTracker.provider_summary()  → Dashboard
 //!                  CostTracker.pane_summary()      → Per-pane view
 //!                  CostTracker.budget_alerts()     → Alerts
+//!                  CostTracker.attribution_estimates()
+//!                                                → Dashboard / Prometheus
 //! ```
 
 use crate::patterns::AgentType;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Stable label for proxy-based cost-attribution estimates.
+pub const COST_ATTRIBUTION_ESTIMATE_LABEL: &str = "proxy_estimate";
+/// Methodology tag for pane-activity proxy estimates.
+pub const COST_ATTRIBUTION_METHODOLOGY: &str = "pane_activity_proxy_non_attested";
 
 // =============================================================================
 // Telemetry
@@ -272,6 +286,129 @@ pub struct PaneCostSummary {
     pub last_updated_ms: i64,
 }
 
+/// Attribution target for proxy-based cost estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostAttributionKind {
+    /// Attribute the estimate to a Beads issue id.
+    Bead,
+    /// Attribute the estimate to a mission id.
+    Mission,
+    /// Attribute the estimate to a workflow id when no mission id exists.
+    Workflow,
+    /// Attribute the estimate to a correlation id when it is the only stable key.
+    Correlation,
+}
+
+impl CostAttributionKind {
+    /// Stable snake_case label used in JSON and Prometheus labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bead => "bead",
+            Self::Mission => "mission",
+            Self::Workflow => "workflow",
+            Self::Correlation => "correlation",
+        }
+    }
+}
+
+/// Activity proxy sample for estimating cost attribution.
+///
+/// This is intentionally estimate-only. The values may be derived from pane
+/// bytes, active seconds, detection counts, or token proxies; they are not a
+/// billing source of truth and must not feed release-attestation slots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostAttributionProxyRecord {
+    /// Target namespace for this estimate.
+    pub kind: CostAttributionKind,
+    /// Bead, mission, workflow, or correlation id.
+    pub attribution_id: String,
+    /// Optional pane that produced the activity.
+    pub pane_id: Option<u64>,
+    /// Captured output bytes used as an activity proxy.
+    pub bytes_captured: u64,
+    /// Active-state seconds used as an activity proxy.
+    pub active_seconds: f64,
+    /// Detection/event count used as an activity proxy.
+    pub detection_count: u64,
+    /// Estimated token count, when a token proxy is available.
+    pub estimated_tokens: u64,
+    /// Estimated USD cost derived from proxy methodology.
+    pub estimated_cost_usd: f64,
+    /// When this estimate was recorded (epoch milliseconds).
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CostAttributionKey {
+    kind: CostAttributionKind,
+    attribution_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CostAttributionState {
+    pane_ids: BTreeSet<u64>,
+    bytes_captured: u64,
+    active_seconds: f64,
+    detection_count: u64,
+    estimated_tokens: u64,
+    estimated_cost_usd: f64,
+    record_count: u64,
+    last_updated_ms: i64,
+}
+
+impl CostAttributionState {
+    fn record(&mut self, sample: &CostAttributionProxyRecord) {
+        if let Some(pane_id) = sample.pane_id {
+            self.pane_ids.insert(pane_id);
+        }
+        self.bytes_captured = self.bytes_captured.saturating_add(sample.bytes_captured);
+        self.active_seconds = finite_saturating_add(self.active_seconds, sample.active_seconds);
+        self.detection_count = self.detection_count.saturating_add(sample.detection_count);
+        self.estimated_tokens = self
+            .estimated_tokens
+            .saturating_add(sample.estimated_tokens);
+        self.estimated_cost_usd =
+            finite_saturating_add(self.estimated_cost_usd, sample.estimated_cost_usd);
+        self.record_count = self.record_count.saturating_add(1);
+        if sample.recorded_at_ms > self.last_updated_ms {
+            self.last_updated_ms = sample.recorded_at_ms;
+        }
+    }
+}
+
+/// Aggregated, explicitly labeled cost-attribution estimate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostAttributionEstimateSummary {
+    /// Target namespace for this estimate.
+    pub kind: CostAttributionKind,
+    /// Bead, mission, workflow, or correlation id.
+    pub attribution_id: String,
+    /// Stable label that keeps this out of actual-billing and attestation paths.
+    pub estimate_label: String,
+    /// Human/machine-readable methodology tag.
+    pub methodology: String,
+    /// Always false: proxy estimates are operator guidance, not proof artifacts.
+    pub attestation_eligible: bool,
+    /// Distinct panes contributing samples.
+    pub pane_count: usize,
+    /// Total captured bytes used as an activity proxy.
+    pub bytes_captured: u64,
+    /// Total active-state seconds used as an activity proxy.
+    pub active_seconds: f64,
+    /// Total detection/event count used as an activity proxy.
+    pub detection_count: u64,
+    /// Estimated tokens from proxy sources.
+    pub estimated_tokens: u64,
+    /// Estimated USD cost from proxy sources.
+    pub estimated_cost_usd: f64,
+    /// Number of proxy samples folded into this estimate.
+    pub record_count: u64,
+    /// Last sample timestamp (epoch milliseconds).
+    pub last_updated_ms: i64,
+}
+
 /// Budget alert for a provider exceeding a cost threshold.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetAlert {
@@ -322,6 +459,7 @@ pub struct CostDashboardSnapshot {
 #[derive(Debug)]
 pub struct CostTracker {
     panes: BTreeMap<u64, PaneCostState>,
+    attribution_estimates: BTreeMap<CostAttributionKey, CostAttributionState>,
     /// Insertion order for LRU eviction when MAX_TRACKED_PANES exceeded.
     pane_order: VecDeque<u64>,
     /// Budget configuration.
@@ -336,6 +474,7 @@ impl CostTracker {
     pub fn new() -> Self {
         Self {
             panes: BTreeMap::new(),
+            attribution_estimates: BTreeMap::new(),
             pane_order: VecDeque::new(),
             config: CostTrackerConfig::default(),
             telemetry: CostTelemetry::new(),
@@ -347,6 +486,7 @@ impl CostTracker {
     pub fn with_config(config: CostTrackerConfig) -> Self {
         Self {
             panes: BTreeMap::new(),
+            attribution_estimates: BTreeMap::new(),
             pane_order: VecDeque::new(),
             config: config.normalized(),
             telemetry: CostTelemetry::new(),
@@ -388,6 +528,33 @@ impl CostTracker {
         state.agent_type = agent_type;
         state.record(tokens, cost_usd, at_ms);
         self.touch_pane_order(pane_id);
+    }
+
+    /// Record a proxy-based cost-attribution estimate.
+    ///
+    /// These estimates are deliberately separated from [`Self::record_usage`]:
+    /// they can power operator panels and Prometheus-style gauges, but they are
+    /// not billing truth and are never attestation-eligible.
+    pub fn record_attribution_estimate(&mut self, sample: CostAttributionProxyRecord) {
+        let attribution_id = sample.attribution_id.trim();
+        if attribution_id.is_empty()
+            || !sample.active_seconds.is_finite()
+            || sample.active_seconds < 0.0
+            || !sample.estimated_cost_usd.is_finite()
+            || sample.estimated_cost_usd < 0.0
+        {
+            self.telemetry.record_invalid_usage_rejected();
+            return;
+        }
+
+        let key = CostAttributionKey {
+            kind: sample.kind,
+            attribution_id: attribution_id.to_string(),
+        };
+        self.attribution_estimates
+            .entry(key)
+            .or_default()
+            .record(&sample);
     }
 
     /// Get cost summary for a specific provider.
@@ -453,6 +620,29 @@ impl CostTracker {
                 agent_type: state.agent_type.to_string(),
                 total_tokens: state.total_tokens,
                 total_cost_usd: state.total_cost_usd,
+                record_count: state.record_count,
+                last_updated_ms: state.last_updated_ms,
+            })
+            .collect()
+    }
+
+    /// Return proxy-based cost-attribution estimates sorted by kind and id.
+    #[must_use]
+    pub fn attribution_estimates(&self) -> Vec<CostAttributionEstimateSummary> {
+        self.attribution_estimates
+            .iter()
+            .map(|(key, state)| CostAttributionEstimateSummary {
+                kind: key.kind,
+                attribution_id: key.attribution_id.clone(),
+                estimate_label: COST_ATTRIBUTION_ESTIMATE_LABEL.to_string(),
+                methodology: COST_ATTRIBUTION_METHODOLOGY.to_string(),
+                attestation_eligible: false,
+                pane_count: state.pane_ids.len(),
+                bytes_captured: state.bytes_captured,
+                active_seconds: state.active_seconds,
+                detection_count: state.detection_count,
+                estimated_tokens: state.estimated_tokens,
+                estimated_cost_usd: state.estimated_cost_usd,
                 record_count: state.record_count,
                 last_updated_ms: state.last_updated_ms,
             })
@@ -582,6 +772,11 @@ fn finite_usage_fraction(current_cost_usd: f64, max_cost_usd: f64) -> f64 {
     }
 }
 
+fn finite_saturating_add(current: f64, delta: f64) -> f64 {
+    let next = current + delta;
+    if next.is_finite() { next } else { f64::MAX }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -616,6 +811,93 @@ mod tests {
         assert_eq!(tracker.tracked_pane_count(), 1);
         assert!((tracker.grand_total_cost() - 0.09).abs() < 1e-10);
         assert_eq!(tracker.grand_total_tokens(), 3000);
+    }
+
+    #[test]
+    fn attribution_estimates_group_by_bead_and_stay_non_attested() {
+        let mut tracker = CostTracker::new();
+
+        tracker.record_attribution_estimate(CostAttributionProxyRecord {
+            kind: CostAttributionKind::Bead,
+            attribution_id: " ft-123 ".to_string(),
+            pane_id: Some(7),
+            bytes_captured: 2_048,
+            active_seconds: 12.5,
+            detection_count: 3,
+            estimated_tokens: 800,
+            estimated_cost_usd: 0.04,
+            recorded_at_ms: 100,
+        });
+        tracker.record_attribution_estimate(CostAttributionProxyRecord {
+            kind: CostAttributionKind::Bead,
+            attribution_id: "ft-123".to_string(),
+            pane_id: Some(8),
+            bytes_captured: 1_024,
+            active_seconds: 7.5,
+            detection_count: 2,
+            estimated_tokens: 400,
+            estimated_cost_usd: 0.02,
+            recorded_at_ms: 200,
+        });
+
+        let estimates = tracker.attribution_estimates();
+        assert_eq!(estimates.len(), 1);
+        let estimate = &estimates[0];
+        assert_eq!(estimate.kind, CostAttributionKind::Bead);
+        assert_eq!(estimate.attribution_id, "ft-123");
+        assert_eq!(estimate.estimate_label, "proxy_estimate");
+        assert_eq!(estimate.methodology, "pane_activity_proxy_non_attested");
+        assert!(!estimate.attestation_eligible);
+        assert_eq!(estimate.pane_count, 2);
+        assert_eq!(estimate.bytes_captured, 3_072);
+        assert!((estimate.active_seconds - 20.0).abs() < f64::EPSILON);
+        assert_eq!(estimate.detection_count, 5);
+        assert_eq!(estimate.estimated_tokens, 1_200);
+        assert!((estimate.estimated_cost_usd - 0.06).abs() < f64::EPSILON);
+        assert_eq!(estimate.record_count, 2);
+        assert_eq!(estimate.last_updated_ms, 200);
+    }
+
+    #[test]
+    fn attribution_estimates_reject_blank_or_non_finite_samples() {
+        let mut tracker = CostTracker::new();
+
+        tracker.record_attribution_estimate(CostAttributionProxyRecord {
+            kind: CostAttributionKind::Mission,
+            attribution_id: " ".to_string(),
+            pane_id: Some(1),
+            bytes_captured: 1,
+            active_seconds: 1.0,
+            detection_count: 1,
+            estimated_tokens: 1,
+            estimated_cost_usd: 0.01,
+            recorded_at_ms: 1,
+        });
+        tracker.record_attribution_estimate(CostAttributionProxyRecord {
+            kind: CostAttributionKind::Mission,
+            attribution_id: "mission-a".to_string(),
+            pane_id: Some(1),
+            bytes_captured: 1,
+            active_seconds: f64::NAN,
+            detection_count: 1,
+            estimated_tokens: 1,
+            estimated_cost_usd: 0.01,
+            recorded_at_ms: 1,
+        });
+        tracker.record_attribution_estimate(CostAttributionProxyRecord {
+            kind: CostAttributionKind::Mission,
+            attribution_id: "mission-a".to_string(),
+            pane_id: Some(1),
+            bytes_captured: 1,
+            active_seconds: 1.0,
+            detection_count: 1,
+            estimated_tokens: 1,
+            estimated_cost_usd: f64::INFINITY,
+            recorded_at_ms: 1,
+        });
+
+        assert!(tracker.attribution_estimates().is_empty());
+        assert_eq!(tracker.telemetry().invalid_usages_rejected, 3);
     }
 
     #[test]

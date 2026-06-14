@@ -13,6 +13,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::Result;
+use crate::cost_tracker::CostAttributionEstimateSummary;
 use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
 use crate::runtime_async::io::AsyncWriteExt;
@@ -66,6 +67,8 @@ pub struct MetricsSnapshot {
     pub native_output_max_batch_bytes: u64,
     pub native_output_coalesce_ratio: f64,
     pub event_bus: Option<EventBusSnapshot>,
+    /// Proxy-based, non-attested cost attribution estimates for Prometheus.
+    pub cost_attribution_estimates: Vec<CostAttributionEstimateSummary>,
 }
 
 impl MetricsSnapshot {
@@ -286,6 +289,8 @@ impl MetricsSnapshot {
             );
         }
 
+        render_cost_attribution_estimates(&mut output, &prefix, &self.cost_attribution_estimates);
+
         output
     }
 }
@@ -354,6 +359,7 @@ impl MetricsCollector for RuntimeMetricsCollector {
                 native_output_max_batch_bytes: metrics.native_output_max_batch_bytes(),
                 native_output_coalesce_ratio,
                 event_bus,
+                cost_attribution_estimates: Vec::new(),
             }
         })
     }
@@ -772,6 +778,139 @@ fn push_metric(output: &mut String, name: String, help: &str, metric_type: &str,
     let _ = writeln!(output, "{name} {value}");
 }
 
+fn render_cost_attribution_estimates(
+    output: &mut String,
+    prefix: &str,
+    estimates: &[CostAttributionEstimateSummary],
+) {
+    if estimates.is_empty() {
+        return;
+    }
+
+    push_cost_attribution_gauge(
+        output,
+        prefix,
+        "cost_attribution_proxy_estimated_cost_usd",
+        "Estimated cost attributed by pane-activity proxy; not billing or attestation truth",
+        estimates,
+        |estimate| format_float(estimate.estimated_cost_usd),
+    );
+    push_cost_attribution_gauge(
+        output,
+        prefix,
+        "cost_attribution_proxy_estimated_tokens",
+        "Estimated tokens attributed by pane-activity proxy",
+        estimates,
+        |estimate| estimate.estimated_tokens.to_string(),
+    );
+    push_cost_attribution_gauge(
+        output,
+        prefix,
+        "cost_attribution_proxy_bytes_captured",
+        "Captured bytes used as the activity proxy for attribution",
+        estimates,
+        |estimate| estimate.bytes_captured.to_string(),
+    );
+    push_cost_attribution_gauge(
+        output,
+        prefix,
+        "cost_attribution_proxy_active_seconds",
+        "Active-state seconds used as the activity proxy for attribution",
+        estimates,
+        |estimate| format_float(estimate.active_seconds),
+    );
+    push_cost_attribution_gauge(
+        output,
+        prefix,
+        "cost_attribution_proxy_detection_count",
+        "Detection count used as the activity proxy for attribution",
+        estimates,
+        |estimate| estimate.detection_count.to_string(),
+    );
+    push_cost_attribution_gauge(
+        output,
+        prefix,
+        "cost_attribution_proxy_pane_count",
+        "Distinct panes contributing to this proxy attribution estimate",
+        estimates,
+        |estimate| estimate.pane_count.to_string(),
+    );
+    push_cost_attribution_gauge(
+        output,
+        prefix,
+        "cost_attribution_proxy_record_count",
+        "Proxy attribution samples folded into this estimate",
+        estimates,
+        |estimate| estimate.record_count.to_string(),
+    );
+}
+
+fn push_cost_attribution_gauge<F>(
+    output: &mut String,
+    prefix: &str,
+    metric_suffix: &str,
+    help: &str,
+    estimates: &[CostAttributionEstimateSummary],
+    value: F,
+) where
+    F: Fn(&CostAttributionEstimateSummary) -> String,
+{
+    use std::fmt::Write as _;
+
+    let name = metric_name(prefix, metric_suffix);
+    let _ = writeln!(output, "# HELP {name} {help}");
+    let _ = writeln!(output, "# TYPE {name} gauge");
+    for estimate in estimates {
+        let labels = cost_attribution_labels(estimate);
+        let _ = writeln!(output, "{name}{labels} {}", value(estimate));
+    }
+}
+
+fn cost_attribution_labels(estimate: &CostAttributionEstimateSummary) -> String {
+    let labels = [
+        ("kind", estimate.kind.as_str()),
+        ("attribution_id", estimate.attribution_id.as_str()),
+        ("estimate_label", estimate.estimate_label.as_str()),
+        ("methodology", estimate.methodology.as_str()),
+        (
+            "attestation_eligible",
+            if estimate.attestation_eligible {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+    ];
+    format_prometheus_labels(&labels)
+}
+
+fn format_prometheus_labels(labels: &[(&str, &str)]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("{");
+    for (index, (key, value)) in labels.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, r#"{key}="{}""#, escape_prometheus_label_value(value));
+    }
+    out.push('}');
+    out
+}
+
+fn escape_prometheus_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str(r"\\"),
+            '"' => escaped.push_str(r#"\""#),
+            '\n' => escaped.push_str(r"\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
@@ -798,6 +937,7 @@ mod pure_tests {
         assert_eq!(snap.native_output_input_events, 0);
         assert_eq!(snap.native_output_batches_emitted, 0);
         assert!(snap.event_bus.is_none());
+        assert!(snap.cost_attribution_estimates.is_empty());
     }
 
     #[test]
@@ -955,6 +1095,49 @@ mod pure_tests {
         assert!(rendered.contains("ft_native_output_input_events_total 500"));
         assert!(rendered.contains("ft_native_output_batches_emitted_total 100"));
         assert!(rendered.contains("ft_native_output_coalesce_ratio 5"));
+    }
+
+    #[test]
+    fn render_prometheus_cost_attribution_estimates_are_labeled_proxy_gauges() {
+        let snap = MetricsSnapshot {
+            cost_attribution_estimates: vec![CostAttributionEstimateSummary {
+                kind: crate::cost_tracker::CostAttributionKind::Bead,
+                attribution_id: "ft-7h5da.8.5".to_string(),
+                estimate_label: crate::cost_tracker::COST_ATTRIBUTION_ESTIMATE_LABEL.to_string(),
+                methodology: crate::cost_tracker::COST_ATTRIBUTION_METHODOLOGY.to_string(),
+                attestation_eligible: false,
+                pane_count: 2,
+                bytes_captured: 3_072,
+                active_seconds: 20.0,
+                detection_count: 5,
+                estimated_tokens: 1_200,
+                estimated_cost_usd: 0.06,
+                record_count: 2,
+                last_updated_ms: 200,
+            }],
+            ..MetricsSnapshot::default()
+        };
+
+        let rendered = snap.render_prometheus("ft");
+        let labels = r#"{kind="bead",attribution_id="ft-7h5da.8.5",estimate_label="proxy_estimate",methodology="pane_activity_proxy_non_attested",attestation_eligible="false"}"#;
+        assert!(rendered.contains("# TYPE ft_cost_attribution_proxy_estimated_cost_usd gauge"));
+        assert!(rendered.contains(&format!(
+            "ft_cost_attribution_proxy_estimated_cost_usd{labels} 0.06"
+        )));
+        assert!(rendered.contains(&format!(
+            "ft_cost_attribution_proxy_estimated_tokens{labels} 1200"
+        )));
+        assert!(rendered.contains(&format!(
+            "ft_cost_attribution_proxy_bytes_captured{labels} 3072"
+        )));
+        assert!(rendered.contains(&format!(
+            "ft_cost_attribution_proxy_active_seconds{labels} 20"
+        )));
+        assert!(rendered.contains(&format!(
+            "ft_cost_attribution_proxy_detection_count{labels} 5"
+        )));
+        assert!(rendered.contains(&format!("ft_cost_attribution_proxy_pane_count{labels} 2")));
+        assert!(!rendered.contains(r#"attestation_eligible="true""#));
     }
 
     // -----------------------------------------------------------------------
@@ -1284,6 +1467,7 @@ mod tests {
                 native_output_max_batch_bytes: 0,
                 native_output_coalesce_ratio: 0.0,
                 event_bus: None,
+                cost_attribution_estimates: Vec::new(),
             };
 
             let rendered = snapshot.render_prometheus("wa");
@@ -1317,6 +1501,7 @@ mod tests {
                 native_output_max_batch_bytes: 0,
                 native_output_coalesce_ratio: 0.0,
                 event_bus: None,
+                cost_attribution_estimates: Vec::new(),
             };
 
             let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -1372,9 +1557,9 @@ mod tests {
             );
 
             let result = server.start_with_cx(&cx).await;
-            let err = match result {
-                Ok(_) => panic!("pre-cancelled start_with_cx should fail"),
-                Err(e) => e,
+            assert!(result.is_err(), "pre-cancelled start_with_cx should fail");
+            let Err(err) = result else {
+                return;
             };
 
             let msg = err.to_string();
@@ -1531,9 +1716,10 @@ mod tests {
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let server = MetricsServer::new("0.0.0.0:0", "wa", collector, shutdown_flag);
 
-            let err = match server.start().await {
-                Ok(_) => panic!("public bind should be refused"),
-                Err(err) => err,
+            let result = server.start().await;
+            assert!(result.is_err(), "public bind should be refused");
+            let Err(err) = result else {
+                return;
             };
             assert!(
                 err.to_string()
