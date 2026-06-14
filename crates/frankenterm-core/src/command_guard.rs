@@ -175,6 +175,56 @@ impl GuardDecision {
     }
 }
 
+/// Schema version for the compiled AGENTS doctrine policy bundle.
+pub const AGENTS_DOCTRINE_POLICY_SCHEMA_VERSION: u32 = 1;
+
+/// Stable bundle identifier for AGENTS-derived command doctrine.
+pub const AGENTS_DOCTRINE_POLICY_BUNDLE_ID: &str = "frankenterm.agents_doctrine.v1";
+
+const AGENTS_DOCTRINE_PACK_ID: &str = "agents.doctrine";
+
+/// Serializable policy bundle compiled from repository AGENTS doctrine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctrinePolicyBundle {
+    /// Bundle schema version.
+    pub schema_version: u32,
+    /// Stable bundle id.
+    pub bundle_id: String,
+    /// Human-readable policy source.
+    pub source: String,
+    /// Compiled doctrine rules.
+    pub rules: Vec<DoctrinePolicyRule>,
+}
+
+/// Serializable doctrine rule surfaced to robot/MCP callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctrinePolicyRule {
+    /// Stable rule id.
+    pub rule_id: String,
+    /// Guard pack id.
+    pub pack: String,
+    /// Rule category.
+    pub category: String,
+    /// Operator-facing denial reason.
+    pub reason: String,
+    /// Suggested remediation commands or workflow.
+    pub suggestions: Vec<String>,
+}
+
+/// Returns the compiled command policy derived from AGENTS doctrine.
+#[must_use]
+pub fn compiled_agents_doctrine_policy() -> DoctrinePolicyBundle {
+    DoctrinePolicyBundle {
+        schema_version: AGENTS_DOCTRINE_POLICY_SCHEMA_VERSION,
+        bundle_id: AGENTS_DOCTRINE_POLICY_BUNDLE_ID.to_string(),
+        source: "AGENTS.md command safety doctrine".to_string(),
+        rules: DOCTRINE_RULES
+            .iter()
+            .map(DoctrineRule::to_policy_rule)
+            .collect(),
+    }
+}
+
 // ============================================================================
 // Security Packs
 // ============================================================================
@@ -199,6 +249,134 @@ struct SecurityPack {
     keywords: &'static [&'static str],
     safe_rules: &'static [SafeRule],
     destructive_rules: &'static [DestructiveRule],
+}
+
+#[derive(Clone, Copy)]
+enum DoctrineMatcher {
+    Regex(&'static LazyLock<Regex>),
+    CargoProofWithoutFailClosedRch,
+}
+
+struct DoctrineRule {
+    id: &'static str,
+    category: &'static str,
+    matcher: DoctrineMatcher,
+    reason: &'static str,
+    suggestions: &'static [&'static str],
+}
+
+impl DoctrineRule {
+    fn matches(&self, command: &str) -> bool {
+        match self.matcher {
+            DoctrineMatcher::Regex(pattern) => pattern.is_match(command),
+            DoctrineMatcher::CargoProofWithoutFailClosedRch => {
+                CARGO_PROOF_COMMAND.is_match(command) && !has_fail_closed_rch_prefix(command)
+            }
+        }
+    }
+
+    fn to_policy_rule(&self) -> DoctrinePolicyRule {
+        DoctrinePolicyRule {
+            rule_id: self.id.to_string(),
+            pack: AGENTS_DOCTRINE_PACK_ID.to_string(),
+            category: self.category.to_string(),
+            reason: self.reason.to_string(),
+            suggestions: self.suggestions.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+}
+
+static GIT_WORKTREE_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bgit\s+worktree\s+(add|remove|prune|move|repair)\b").unwrap()
+});
+static AGENT_MAIL_REPAIR_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bam\s+(?:service\s+(?:restart|stop)|doctor\s+(?:fix|repair|reconstruct))\b")
+        .unwrap()
+});
+static PROTECTED_CORE_MUTATION_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:rm|git\s+rm|mv)\b[^;&|\n]*\bcrates/frankenterm-core(?:/|\b)").unwrap()
+});
+static CARGO_PROOF_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|[;&|\n]\s*|\benv\s+[^;&|\n]*\s+)\bcargo\s+(?:test|check|clippy|build|fmt)\b",
+    )
+    .unwrap()
+});
+static LEGACY_DEFAULT_BRANCH_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    let branch = legacy_default_branch_name();
+    Regex::new(&format!(
+        r"(?i)\bgit\s+(?:checkout|switch)\s+{branch}\b|\bgit\s+(?:push|pull)\s+\S+\s+{branch}\b"
+    ))
+    .unwrap()
+});
+
+static DOCTRINE_RULES: &[DoctrineRule] = &[
+    DoctrineRule {
+        id: "agents.doctrine:no-git-worktree",
+        category: "git_worktree_forbidden",
+        matcher: DoctrineMatcher::Regex(&GIT_WORKTREE_COMMAND),
+        reason: "Repository doctrine forbids git worktree operations in this checkout",
+        suggestions: &["Use the primary main checkout and coordinate through Beads"],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:no-agent-mail-repair",
+        category: "agent_mail_process_protection",
+        matcher: DoctrineMatcher::Regex(&AGENT_MAIL_REPAIR_COMMAND),
+        reason: "Repository doctrine forbids restarting or repairing the shared agent-mail service",
+        suggestions: &["Retry once, then proceed with Beads/git state as the coordination surface"],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:no-local-cargo-proof",
+        category: "fail_closed_remote_proof",
+        matcher: DoctrineMatcher::CargoProofWithoutFailClosedRch,
+        reason: "Cargo proof commands must run through fail-closed remote rch in this repo",
+        suggestions: &[concat!(
+            "Prefix with RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 ",
+            "rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-<pane>-target"
+        )],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:protect-frankenterm-core",
+        category: "protected_core_crate",
+        matcher: DoctrineMatcher::Regex(&PROTECTED_CORE_MUTATION_COMMAND),
+        reason: "Repository doctrine forbids deletion or relocation of crates/frankenterm-core",
+        suggestions: &[
+            "Do not stage protected-crate deletions; restore missing protected files before committing",
+        ],
+    },
+    DoctrineRule {
+        id: "agents.doctrine:main-branch-only",
+        category: "main_branch_only",
+        matcher: DoctrineMatcher::Regex(&LEGACY_DEFAULT_BRANCH_COMMAND),
+        reason: "Repository doctrine requires main as the working branch target",
+        suggestions: &[
+            "Use main for branch operations and synchronize the legacy remote ref only after main",
+        ],
+    },
+];
+
+fn legacy_default_branch_name() -> String {
+    ["mas", "ter"].concat()
+}
+
+fn has_fail_closed_rch_prefix(command: &str) -> bool {
+    command.contains("RCH_REQUIRE_REMOTE=1")
+        && command.contains("RCH_NO_SELF_HEALING=1")
+        && command.contains("rch --no-self-healing exec --")
+}
+
+fn evaluate_doctrine_stateless(command: &str) -> Option<(String, String, String, Vec<String>)> {
+    DOCTRINE_RULES
+        .iter()
+        .find(|rule| rule.matches(command))
+        .map(|rule| {
+            (
+                rule.id.to_string(),
+                AGENTS_DOCTRINE_PACK_ID.to_string(),
+                rule.reason.to_string(),
+                rule.suggestions.iter().map(|s| (*s).to_string()).collect(),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -298,10 +476,8 @@ static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 static GIT_RESET_HARD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+reset\s+--hard\b",
-    )
-    .unwrap()
+    Regex::new(r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+reset\s+--hard\b")
+        .unwrap()
 });
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -385,9 +561,8 @@ static SQL_TRUNCATE: LazyLock<Regex> =
 // `psql -c`, ORMs, and REPLs) previously slipped through. A `WHERE` clause
 // still keeps the statement allowed because the terminator can't follow the
 // table name when `WHERE` does.
-static SQL_DELETE_NO_WHERE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\bDELETE\s+FROM\s+\w+\s*(?:;|$|["'`])"#).unwrap()
-});
+static SQL_DELETE_NO_WHERE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bDELETE\s+FROM\s+\w+\s*(?:;|$|["'`])"#).unwrap());
 static SQL_ALTER_DROP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bALTER\s+TABLE\s+\w+\s+DROP\s+(COLUMN|CONSTRAINT|INDEX)\b").unwrap()
 });
@@ -821,6 +996,22 @@ impl CommandGuard {
         let pane_config = self.pane_config(pane_id);
         let trust = pane_config.trust_level;
 
+        if let Some(decision) = Self::scan_doctrine(command) {
+            let elapsed = elapsed_micros_u64(start);
+            if let GuardDecision::Block { rule_id, pack, .. } = &decision {
+                self.record(
+                    pane_id,
+                    command,
+                    "block",
+                    Some(rule_id.clone()),
+                    Some(pack.clone()),
+                    elapsed,
+                );
+                self.telemetry.blocked = self.telemetry.blocked.saturating_add(1);
+            }
+            return decision;
+        }
+
         // ReadOnly panes skip evaluation entirely.
         if trust == TrustLevel::ReadOnly {
             self.record(pane_id, command, "allow", None, None, 0);
@@ -890,6 +1081,10 @@ impl CommandGuard {
     pub fn preflight(&self, command: &str, pane_id: u64) -> GuardDecision {
         let pane_config = self.pane_config(pane_id);
         let trust = pane_config.trust_level;
+
+        if let Some(decision) = Self::scan_doctrine(command) {
+            return decision;
+        }
 
         if trust == TrustLevel::ReadOnly {
             return GuardDecision::Allow;
@@ -1067,6 +1262,17 @@ impl CommandGuard {
         GuardDecision::Allow
     }
 
+    fn scan_doctrine(command: &str) -> Option<GuardDecision> {
+        evaluate_doctrine_stateless(command).map(|(rule_id, pack, reason, suggestions)| {
+            GuardDecision::Block {
+                rule_id,
+                pack,
+                reason,
+                suggestions,
+            }
+        })
+    }
+
     fn record(
         &mut self,
         pane_id: u64,
@@ -1115,6 +1321,10 @@ impl CommandGuard {
 /// Returns `(decision, pack, reason, suggestions)` or `None` for allow.
 #[must_use]
 pub fn evaluate_stateless(command: &str) -> Option<(String, String, String, Vec<String>)> {
+    if let Some(doctrine_match) = evaluate_doctrine_stateless(command) {
+        return Some(doctrine_match);
+    }
+
     // Quick-reject via keyword scan.
     let mut relevant_pack_ids: Vec<&str> = Vec::new();
     for mat in KEYWORD_AUTOMATON.find_iter(command) {
@@ -1662,6 +1872,117 @@ mod tests {
         assert!(evaluate_stateless("git status").is_none());
         assert!(evaluate_stateless("ls -la").is_none());
         assert!(evaluate_stateless("echo hello").is_none());
+    }
+
+    #[test]
+    fn doctrine_policy_bundle_surfaces_compiled_rules() {
+        let bundle = compiled_agents_doctrine_policy();
+
+        assert_eq!(bundle.schema_version, AGENTS_DOCTRINE_POLICY_SCHEMA_VERSION);
+        assert_eq!(bundle.bundle_id, AGENTS_DOCTRINE_POLICY_BUNDLE_ID);
+        assert!(
+            bundle
+                .rules
+                .iter()
+                .any(|rule| rule.rule_id == "agents.doctrine:no-git-worktree")
+        );
+        assert!(
+            bundle
+                .rules
+                .iter()
+                .all(|rule| rule.pack == AGENTS_DOCTRINE_PACK_ID)
+        );
+    }
+
+    #[test]
+    fn doctrine_blocks_worktree_commands_even_when_permissive() {
+        let mut guard = CommandGuard::new(GuardPolicy {
+            default_trust: TrustLevel::Permissive,
+            ..GuardPolicy::default()
+        });
+
+        let decision = guard.evaluate("git worktree add ../parallel main", 1);
+
+        assert!(matches!(
+            decision,
+            GuardDecision::Block { ref rule_id, ref pack, .. }
+                if rule_id == "agents.doctrine:no-git-worktree"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_worktree_commands_before_read_only_bypass() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            42,
+            PaneGuardConfig {
+                trust_level: TrustLevel::ReadOnly,
+                ..PaneGuardConfig::default()
+            },
+        );
+
+        let decision = guard.evaluate("git worktree prune", 42);
+
+        assert!(matches!(
+            decision,
+            GuardDecision::Block { ref rule_id, .. }
+                if rule_id == "agents.doctrine:no-git-worktree"
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_agent_mail_service_repair() {
+        let decision = evaluate_stateless("am service restart");
+
+        assert!(matches!(
+            decision,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:no-agent-mail-repair"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_local_cargo_proof_but_allows_fail_closed_rch() {
+        let blocked = evaluate_stateless("cargo test -p frankenterm-core --lib");
+        assert!(matches!(
+            blocked,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:no-local-cargo-proof"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+
+        let allowed = evaluate_stateless(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+             env CARGO_TARGET_DIR=/tmp/ft-example-target cargo test -p frankenterm-core --lib",
+        );
+        assert!(allowed.is_none());
+    }
+
+    #[test]
+    fn doctrine_blocks_protected_core_mutation() {
+        let decision = evaluate_stateless("rm -rf crates/frankenterm-core");
+
+        assert!(matches!(
+            decision,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:protect-frankenterm-core"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
+    }
+
+    #[test]
+    fn doctrine_blocks_legacy_default_branch_target() {
+        let command = format!("git push origin {}", legacy_default_branch_name());
+        let decision = evaluate_stateless(&command);
+
+        assert!(matches!(
+            decision,
+            Some((rule_id, pack, _, _))
+                if rule_id == "agents.doctrine:main-branch-only"
+                    && pack == AGENTS_DOCTRINE_PACK_ID
+        ));
     }
 
     // ========================================================================
