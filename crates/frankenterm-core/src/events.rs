@@ -248,6 +248,44 @@ impl Event {
     }
 }
 
+/// Simple `*`-glob match for rule-id filters (`ft robot watch-events
+/// --rule-id` and the IPC `SubscribeEvents` server-side filter, ft-7h5da.4.1).
+/// `*` matches any (possibly empty) sequence; every other character is a
+/// literal. A pattern with no `*` is an exact match. This is the single
+/// canonical matcher shared by the DB-cursor CLI path and the live IPC
+/// transport so the two never drift.
+#[must_use]
+pub fn rule_glob_matches(pattern: &str, rule_id: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == rule_id;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let last = parts.len() - 1;
+    let mut rest = rule_id;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Anchored prefix.
+            match rest.strip_prefix(part) {
+                Some(tail) => rest = tail,
+                None => return false,
+            }
+        } else if i == last {
+            // Anchored suffix.
+            return rest.ends_with(part);
+        } else {
+            // Floating segment: advance past its next occurrence.
+            match rest.find(part) {
+                Some(pos) => rest = &rest[pos + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
 // =============================================================================
 // Event Causality Clocks
 // =============================================================================
@@ -2481,6 +2519,21 @@ impl NotificationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_glob_matches_canonical_semantics() {
+        // Exact match when no wildcard.
+        assert!(rule_glob_matches("codex.usage.reached", "codex.usage.reached"));
+        assert!(!rule_glob_matches("codex.usage.reached", "codex.usage"));
+        // Prefix, suffix, floating, and bare star.
+        assert!(rule_glob_matches("codex.*", "codex.usage.reached"));
+        assert!(rule_glob_matches("*.usage.reached", "codex.usage.reached"));
+        assert!(rule_glob_matches("codex.*reached", "codex.usage.reached"));
+        assert!(rule_glob_matches("*", "anything.at.all"));
+        // Non-matches.
+        assert!(!rule_glob_matches("claude_code.*", "codex.usage.reached"));
+        assert!(!rule_glob_matches("*.reached", "codex.usage.failed"));
+    }
 
     /// Regression (unbounded-growth defect): `ChannelLagTracker::register` must
     /// prune positions for dropped subscribers so `subscriber_positions` stays

@@ -40,8 +40,8 @@ const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 mod socket_transport {
     #[cfg(unix)]
     pub use crate::runtime_async::unix::{
-        AsyncReadExt, AsyncWriteExt, UnixListener, UnixStream, bind, buffered, connect, lines,
-        next_line_with_cx,
+        AsyncReadExt, AsyncWrite, AsyncWriteExt, UnixListener, UnixStream, bind, buffered, connect,
+        lines, next_line_with_cx,
     };
 
     #[cfg(windows)]
@@ -205,6 +205,10 @@ fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// `now_ms()` as `i64` for NDJSON timestamp fields (matches the
+/// `detected_at` / heartbeat `now` shape the DB-cursor path emits). Consumed
+/// unconditionally by the search-status payload and (on unix) by the
+/// `SubscribeEvents` streaming path (ft-7h5da.4.1).
 fn now_ms_i64() -> i64 {
     i64::try_from(now_ms()).unwrap_or(i64::MAX)
 }
@@ -432,6 +436,28 @@ pub enum IpcRequest {
         /// Robot command arguments (e.g., ["state"] or ["send", "1", "ls"]).
         args: Vec<String>,
     },
+    /// Subscribe to a live NDJSON stream of detection events over IPC
+    /// (ft-7h5da.4.1). Unlike every other request, this does NOT return a
+    /// single `IpcResponse` — the server keeps the connection open and fans
+    /// `Event::PatternDetected` from the in-process `EventBus` to the socket
+    /// as one already-redacted NDJSON record per line. Each event record
+    /// carries `cursor = <storage event id>` (the same monotonic key the
+    /// DB-cursor fallback tails), so a follower can dedupe across transports
+    /// and resume on the DB path if the watcher dies mid-stream. Idle
+    /// heartbeats keep the stream live and let the server notice a closed
+    /// consumer. This is the low-latency transport for
+    /// `ft robot watch-events --follow`; the CLI falls back to storage-cursor
+    /// tailing when the watcher is down.
+    SubscribeEvents {
+        /// Restrict to a single pane (server-side filter).
+        pane: Option<u64>,
+        /// Severity filter (case-insensitive exact, e.g. "warning").
+        severity: Option<String>,
+        /// Rule-id `*`-glob filter (e.g. "codex.*").
+        rule_id: Option<String>,
+        /// Idle heartbeat interval in ms (0 disables heartbeats).
+        heartbeat_interval_ms: u64,
+    },
 }
 
 impl IpcRequest {
@@ -440,6 +466,7 @@ impl IpcRequest {
         match self {
             Self::UserVar { .. } => IpcScope::Write,
             Self::Ping | Self::Status | Self::PaneState { .. } => IpcScope::Read,
+            Self::SubscribeEvents { .. } => IpcScope::Read,
             Self::SetPanePriority { .. } | Self::ClearPanePriority { .. } => IpcScope::Write,
             Self::Rpc { args } => rpc_required_scope(args),
         }
@@ -1444,23 +1471,57 @@ async fn handle_client_with_context_with_cx(
         return Ok(());
     }
 
-    let response = match serde_json::from_str::<IpcEnvelope>(&line) {
-        Ok(envelope) => {
-            if let Some(auth) = ctx.auth.as_ref() {
-                if let Err(err) =
-                    auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
-                {
-                    IpcResponse::error(err.message())
-                } else {
-                    handle_request_with_context_with_cx(&cx, envelope, &ctx).await
-                }
-            } else {
-                handle_request_with_context_with_cx(&cx, envelope, &ctx).await
-            }
+    let envelope = match serde_json::from_str::<IpcEnvelope>(&line) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            let response = IpcResponse::error(format!("invalid request: {e}")).with_timing(start);
+            let response_json = serde_json::to_string(&response)
+                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
         }
-        Err(e) => IpcResponse::error(format!("invalid request: {e}")),
     };
 
+    if let Some(auth) = ctx.auth.as_ref() {
+        if let Err(err) =
+            auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
+        {
+            let response = IpcResponse::error(err.message()).with_timing(start);
+            let response_json = serde_json::to_string(&response)
+                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    }
+
+    // ft-7h5da.4.1: SubscribeEvents is a streaming request. Intercept it
+    // before the single-response dispatch and keep the connection open,
+    // fanning EventBus detections to the socket as NDJSON until the
+    // consumer disconnects or the watcher cx is cancelled.
+    if let IpcRequest::SubscribeEvents {
+        pane,
+        severity,
+        rule_id,
+        heartbeat_interval_ms,
+    } = &envelope.request
+    {
+        return stream_subscribe_events(
+            &cx,
+            &mut writer,
+            &ctx,
+            *pane,
+            severity.clone(),
+            rule_id.clone(),
+            *heartbeat_interval_ms,
+        )
+        .await;
+    }
+
+    let response = handle_request_with_context_with_cx(&cx, envelope, &ctx).await;
     let response = response.with_timing(start);
 
     let response_json = serde_json::to_string(&response)
@@ -1500,23 +1561,39 @@ async fn handle_client_with_context_with_cx(
         return Ok(());
     }
 
-    let response = match serde_json::from_str::<IpcEnvelope>(&line) {
-        Ok(envelope) => {
-            if let Some(auth) = ctx.auth.as_ref() {
-                if let Err(err) =
-                    auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
-                {
-                    IpcResponse::error(err.message())
-                } else {
-                    handle_request_with_context_with_cx(&cx, envelope, &ctx).await
-                }
-            } else {
-                handle_request_with_context_with_cx(&cx, envelope, &ctx).await
-            }
+    let envelope = match serde_json::from_str::<IpcEnvelope>(&line) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            let response = IpcResponse::error(format!("invalid request: {e}")).with_timing(start);
+            let response_json = serde_json::to_string(&response)
+                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
+            stream.write_all(response_json.as_bytes()).await?;
+            stream.write_all(b"\n").await?;
+            stream.flush().await?;
+            return Ok(());
         }
-        Err(e) => IpcResponse::error(format!("invalid request: {e}")),
     };
 
+    if let Some(auth) = ctx.auth.as_ref() {
+        if let Err(err) =
+            auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
+        {
+            let response = IpcResponse::error(err.message()).with_timing(start);
+            let response_json = serde_json::to_string(&response)
+                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
+            stream.write_all(response_json.as_bytes()).await?;
+            stream.write_all(b"\n").await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    }
+
+    // ft-7h5da.4.1: the live SubscribeEvents streaming transport is a
+    // unix-only optimization (its CLI consumer, `IpcEventStream`, is
+    // unix-gated). On Windows a SubscribeEvents request falls through to the
+    // single-response dispatcher, which returns a typed
+    // `ipc.subscribe_events.not_streamed` error rather than hanging.
+    let response = handle_request_with_context_with_cx(&cx, envelope, &ctx).await;
     let response = response.with_timing(start);
 
     let response_json = serde_json::to_string(&response)
@@ -1526,6 +1603,162 @@ async fn handle_client_with_context_with_cx(
     stream.flush().await?;
 
     Ok(())
+}
+
+/// ft-7h5da.4.1 idle-heartbeat NDJSON record for the streaming subscribe
+/// path. Mirrors the DB-cursor path's heartbeat shape (`type`/`cursor`/`now`);
+/// `cursor` is null because the server doesn't track a global cursor — the
+/// follower advances its own cursor from the per-event records.
+#[cfg(unix)]
+fn watch_heartbeat_record(now: i64) -> serde_json::Value {
+    serde_json::json!({ "type": "heartbeat", "cursor": serde_json::Value::Null, "now": now })
+}
+
+/// ft-7h5da.4.1: build the NDJSON record for one live detection, applying the
+/// same pane/severity/rule-glob filters as the DB-cursor path and redacting
+/// `matched_text` + nested `extracted` secrets before emission (defense in
+/// depth — the runtime publisher already redacts via `redact_detection`, but
+/// other EventBus publishers may not). Returns `None` when the event is
+/// filtered out, is not a `PatternDetected`, or has no storage id: a record
+/// without a cursor would break the per-record resume invariant the DB path
+/// relies on, and the DB path likewise only ever surfaces persisted events.
+#[cfg(unix)]
+fn subscribe_event_record(
+    event: &Event,
+    pane: Option<u64>,
+    severity: Option<&str>,
+    rule_glob: Option<&str>,
+) -> Option<serde_json::Value> {
+    let Event::PatternDetected {
+        pane_id,
+        detection,
+        event_id,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let cursor = (*event_id)?;
+    if let Some(want) = pane {
+        if *pane_id != want {
+            return None;
+        }
+    }
+    let severity_label = match detection.severity {
+        crate::patterns::Severity::Info => "info",
+        crate::patterns::Severity::Warning => "warning",
+        crate::patterns::Severity::Critical => "critical",
+    };
+    if let Some(want) = severity {
+        if !severity_label.eq_ignore_ascii_case(want) {
+            return None;
+        }
+    }
+    if let Some(glob) = rule_glob {
+        if !crate::events::rule_glob_matches(glob, &detection.rule_id) {
+            return None;
+        }
+    }
+    let redacted = crate::runtime::redact_detection(detection);
+    Some(serde_json::json!({
+        "type": "event",
+        "cursor": cursor,
+        "id": cursor,
+        "pane_id": pane_id,
+        "rule_id": redacted.rule_id,
+        "agent_type": redacted.agent_type.to_string(),
+        "event_type": redacted.event_type,
+        "severity": severity_label,
+        "confidence": redacted.confidence,
+        "detected_at": now_ms_i64(),
+        "matched_text": redacted.matched_text,
+        "extracted": redacted.extracted,
+        "handled": false,
+        "handled_status": serde_json::Value::Null,
+    }))
+}
+
+/// ft-7h5da.4.1: stream `EventBus` detections to a subscribed client as
+/// NDJSON, one already-redacted record per line, each carrying
+/// `cursor = <storage event id>`. Idle heartbeats keep the stream live and
+/// surface a closed consumer (the next write fails). Returns `Ok(())` when the
+/// consumer disconnects (broken pipe) or the watcher cx is cancelled — a
+/// cancelled cx ends the stream within at most one heartbeat interval.
+#[cfg(unix)]
+async fn stream_subscribe_events<W>(
+    cx: &crate::cx::Cx,
+    writer: &mut W,
+    ctx: &IpcHandlerContext,
+    pane: Option<u64>,
+    severity: Option<String>,
+    rule_glob: Option<String>,
+    heartbeat_interval_ms: u64,
+) -> std::io::Result<()>
+where
+    W: socket_transport::AsyncWrite + Unpin,
+{
+    use crate::events::RecvError;
+
+    let mut subscriber = ctx.event_bus.subscribe_detections();
+    let heartbeat = Duration::from_millis(heartbeat_interval_ms.max(1));
+
+    loop {
+        if cx.checkpoint().is_err() {
+            return Ok(());
+        }
+
+        let record = if heartbeat_interval_ms > 0 {
+            match crate::runtime_async::timeout_with_cx(cx, heartbeat, subscriber.recv_cx(cx)).await
+            {
+                // Idle heartbeat tick (or cx-cancel surfaced as a timeout
+                // error). Re-check cancellation before emitting so a cancelled
+                // watcher doesn't loop forever writing heartbeats.
+                Err(_) => {
+                    if cx.checkpoint().is_err() {
+                        return Ok(());
+                    }
+                    watch_heartbeat_record(now_ms_i64())
+                }
+                Ok(Ok(event)) => match subscribe_event_record(
+                    &event,
+                    pane,
+                    severity.as_deref(),
+                    rule_glob.as_deref(),
+                ) {
+                    Some(record) => record,
+                    None => continue,
+                },
+                Ok(Err(RecvError::Cancelled | RecvError::Closed)) => return Ok(()),
+                // Fell behind the broadcast buffer: the follower will
+                // re-baseline any missed events via the DB-cursor path, so
+                // just resume live streaming.
+                Ok(Err(RecvError::Lagged { .. })) => continue,
+            }
+        } else {
+            match subscriber.recv_cx(cx).await {
+                Ok(event) => match subscribe_event_record(
+                    &event,
+                    pane,
+                    severity.as_deref(),
+                    rule_glob.as_deref(),
+                ) {
+                    Some(record) => record,
+                    None => continue,
+                },
+                Err(RecvError::Cancelled | RecvError::Closed) => return Ok(()),
+                Err(RecvError::Lagged { .. }) => continue,
+            }
+        };
+
+        let mut buf = serde_json::to_string(&record).unwrap_or_default();
+        buf.push('\n');
+        if writer.write_all(buf.as_bytes()).await.is_err() {
+            return Ok(()); // consumer closed the pipe
+        }
+        if writer.flush().await.is_err() {
+            return Ok(());
+        }
+    }
 }
 
 /// Handle a parsed IPC request with full context.
@@ -1667,6 +1900,16 @@ async fn handle_request_with_context(
             })
             .await
         }
+        // SubscribeEvents is a streaming request: the connection handler
+        // (`handle_client_with_context_with_cx`) intercepts it before the
+        // single-response dispatch and never routes it here. Reaching this
+        // arm means the streaming intercept was bypassed — fail closed with
+        // a typed error rather than silently dropping the subscription.
+        IpcRequest::SubscribeEvents { .. } => IpcResponse::error_with_code(
+            "ipc.subscribe_events.not_streamed",
+            "SubscribeEvents must be handled by the streaming connection path",
+            None,
+        ),
     }
 }
 
@@ -2324,6 +2567,122 @@ impl IpcClient {
     // checkpoint-instrumented, primitive-using path.
 }
 
+/// ft-7h5da.4.1 live event stream returned by
+/// [`IpcClient::subscribe_events_with_cx`]. Yields one NDJSON line per
+/// detection event (plus idle heartbeats) fanned out from the watcher's
+/// in-process `EventBus`. The lower-latency transport for
+/// `ft robot watch-events --follow`; the CLI falls back to storage-cursor
+/// tailing when the watcher is down.
+#[cfg(unix)]
+pub struct IpcEventStream {
+    lines: crate::runtime_async::unix::LineReader<crate::runtime_async::unix::UnixStream>,
+}
+
+#[cfg(unix)]
+impl IpcEventStream {
+    /// Read the next NDJSON line from the live event stream. `Ok(None)` means
+    /// the watcher closed the connection (it shut down or dropped the
+    /// `EventBus`) — callers should fall back to DB-cursor tailing. Honors `cx`
+    /// cancellation at the pre-read checkpoint.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the underlying socket read fails.
+    pub async fn next_line_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+    ) -> std::io::Result<Option<String>> {
+        socket_transport::next_line_with_cx(cx, &mut self.lines).await
+    }
+}
+
+#[cfg(unix)]
+impl IpcClient {
+    /// ft-7h5da.4.1: open a live NDJSON event subscription over IPC. Connects
+    /// to the watcher socket, sends a `SubscribeEvents` request, and returns a
+    /// stream of NDJSON lines the watcher pushes as it detects events (each
+    /// carrying `cursor = <storage event id>`). This is the low-latency
+    /// transport for `ft robot watch-events --follow`; when the watcher is down
+    /// (socket missing / connect fails) the caller transparently falls back to
+    /// storage-cursor tailing.
+    ///
+    /// # Errors
+    /// Returns [`UserVarError::WatcherNotRunning`] when the socket is absent and
+    /// [`UserVarError::IpcSendFailed`] on connect/serialize/write/cancel
+    /// failures.
+    pub async fn subscribe_events_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane: Option<u64>,
+        severity: Option<String>,
+        rule_id: Option<String>,
+        heartbeat_interval_ms: u64,
+    ) -> Result<IpcEventStream, UserVarError> {
+        cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
+            message: format!("cancelled pre-start: {err}"),
+        })?;
+
+        if !self.socket_path.exists() {
+            return Err(UserVarError::WatcherNotRunning {
+                socket_path: self.socket_path.display().to_string(),
+            });
+        }
+
+        cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
+            message: format!("cancelled before connect: {err}"),
+        })?;
+
+        let mut stream = socket_transport::connect(&self.socket_path)
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to connect: {e}"),
+            })?;
+
+        let envelope = IpcEnvelope {
+            token: self.auth_token.clone(),
+            request_id: None,
+            request: IpcRequest::SubscribeEvents {
+                pane,
+                severity,
+                rule_id,
+                heartbeat_interval_ms,
+            },
+        };
+        let request_json =
+            serde_json::to_string(&envelope).map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to serialize request: {e}"),
+            })?;
+
+        cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
+            message: format!("cancelled before write: {err}"),
+        })?;
+
+        // Write the one-shot subscribe request, then reuse the same stream
+        // for the (read-only from here) NDJSON line stream. `UnixStream`
+        // implements both `AsyncRead` and `AsyncWrite`, so no split is needed.
+        stream
+            .write_all(request_json.as_bytes())
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to send: {e}"),
+            })?;
+        stream
+            .write_all(b"\n")
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to send newline: {e}"),
+            })?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to flush: {e}"),
+            })?;
+
+        let lines = socket_transport::lines(socket_transport::buffered(stream));
+        Ok(IpcEventStream { lines })
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 impl IpcClient {
     /// IPC is unavailable on this platform; return a clear error.
@@ -2506,6 +2865,123 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("test error"));
+    }
+
+    #[test]
+    fn subscribe_events_required_scope_is_read() {
+        // ft-7h5da.4.1: a live event subscription is a read-only surface.
+        let req = IpcRequest::SubscribeEvents {
+            pane: Some(3),
+            severity: Some("warning".into()),
+            rule_id: Some("codex.*".into()),
+            heartbeat_interval_ms: 5000,
+        };
+        assert_eq!(req.required_scope(), IpcScope::Read);
+    }
+
+    #[cfg(unix)]
+    fn sample_detection(
+        rule_id: &str,
+        severity: crate::patterns::Severity,
+        matched: &str,
+    ) -> crate::patterns::Detection {
+        crate::patterns::Detection {
+            rule_id: rule_id.into(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "usage.reached".into(),
+            severity,
+            confidence: 0.9,
+            extracted: serde_json::json!({"k": "v"}),
+            matched_text: matched.into(),
+            span: (0, matched.len()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_emits_cursor_and_filtered_fields() {
+        let event = Event::PatternDetected {
+            pane_id: 7,
+            pane_uuid: None,
+            detection: sample_detection(
+                "codex.usage.reached",
+                crate::patterns::Severity::Warning,
+                "limit reached",
+            ),
+            event_id: Some(42),
+        };
+        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        assert_eq!(rec["type"], "event");
+        assert_eq!(rec["cursor"], 42);
+        assert_eq!(rec["id"], 42);
+        assert_eq!(rec["pane_id"], 7);
+        assert_eq!(rec["rule_id"], "codex.usage.reached");
+        assert_eq!(rec["severity"], "warning");
+        assert_eq!(rec["event_type"], "usage.reached");
+        assert_eq!(rec["handled"], false);
+        assert!(rec["handled_status"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_requires_event_id() {
+        // No storage id => no cursor => skipped, preserving the per-record
+        // resume invariant the DB-cursor follower relies on.
+        let event = Event::PatternDetected {
+            pane_id: 1,
+            pane_uuid: None,
+            detection: sample_detection("codex.x", crate::patterns::Severity::Info, "hi"),
+            event_id: None,
+        };
+        assert!(subscribe_event_record(&event, None, None, None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_applies_pane_severity_rule_filters() {
+        let event = Event::PatternDetected {
+            pane_id: 3,
+            pane_uuid: None,
+            detection: sample_detection(
+                "codex.usage.reached",
+                crate::patterns::Severity::Critical,
+                "x",
+            ),
+            event_id: Some(5),
+        };
+        // Pane filter.
+        assert!(subscribe_event_record(&event, Some(4), None, None).is_none());
+        assert!(subscribe_event_record(&event, Some(3), None, None).is_some());
+        // Severity filter (case-insensitive exact).
+        assert!(subscribe_event_record(&event, None, Some("warning"), None).is_none());
+        assert!(subscribe_event_record(&event, None, Some("CRITICAL"), None).is_some());
+        // Rule-id glob filter.
+        assert!(subscribe_event_record(&event, None, None, Some("claude_code.*")).is_none());
+        assert!(subscribe_event_record(&event, None, None, Some("codex.*")).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_redacts_matched_text() {
+        // A GitHub-token-shaped secret in matched_text must be redacted before
+        // it ever reaches the socket (defense in depth — INV-RED-1).
+        let secret = "ghp_0123456789012345678901234567890123456789";
+        let event = Event::PatternDetected {
+            pane_id: 1,
+            pane_uuid: None,
+            detection: sample_detection("codex.x", crate::patterns::Severity::Info, secret),
+            event_id: Some(9),
+        };
+        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        let matched = rec["matched_text"].as_str().unwrap_or_default();
+        assert!(!matched.contains(secret), "secret leaked: {matched}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_ignores_non_detection_events() {
+        let event = Event::PaneDisappeared { pane_id: 1 };
+        assert!(subscribe_event_record(&event, None, None, None).is_none());
     }
 
     #[test]

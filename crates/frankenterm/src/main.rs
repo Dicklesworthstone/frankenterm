@@ -19713,38 +19713,12 @@ where
     cursor.and_then(|_| event_ids.into_iter().last().or(cursor))
 }
 
-/// Simple `*`-glob match for `ft robot watch-events --rule-id`. `*` matches any
-/// (possibly empty) sequence; every other character is a literal. A pattern
-/// with no `*` is an exact match (ft-7h5da.4.1).
+/// Simple `*`-glob match for `ft robot watch-events --rule-id`. Delegates to
+/// the canonical [`frankenterm_core::events::rule_glob_matches`] so the
+/// DB-cursor CLI path and the live IPC `SubscribeEvents` server filter share
+/// one implementation and never drift (ft-7h5da.4.1).
 fn watch_rule_glob_matches(pattern: &str, rule_id: &str) -> bool {
-    if !pattern.contains('*') {
-        return pattern == rule_id;
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let last = parts.len() - 1;
-    let mut rest = rule_id;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            // Anchored prefix.
-            match rest.strip_prefix(part) {
-                Some(tail) => rest = tail,
-                None => return false,
-            }
-        } else if i == last {
-            // Anchored suffix.
-            return rest.ends_with(part);
-        } else {
-            // Floating segment: advance past its next occurrence.
-            match rest.find(part) {
-                Some(pos) => rest = &rest[pos + part.len()..],
-                None => return false,
-            }
-        }
-    }
-    true
+    frankenterm_core::events::rule_glob_matches(pattern, rule_id)
 }
 
 /// Client-side severity (case-insensitive exact) + rule-id glob filter for
@@ -19931,6 +19905,111 @@ fn write_ndjson_line<W: std::io::Write>(
     }
 }
 
+/// Classify what `relay_ipc_event_line` did with one NDJSON line from the live
+/// IPC `SubscribeEvents` stream (ft-7h5da.4.1).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcRelayAction {
+    /// A record was written to stdout.
+    Emitted,
+    /// A duplicate event (cursor already emitted via the DB drain) was skipped.
+    Skipped,
+    /// The downstream consumer closed the pipe; the follower should stop.
+    PipeClosed,
+}
+
+/// Decide whether a live IPC event record with the given `cursor` is a
+/// duplicate of what the DB-cursor backlog drain already emitted
+/// (ft-7h5da.4.1). The two transports share the monotonic `events.id` cursor,
+/// so any event id `<= current_cursor` was already delivered. A record with no
+/// cursor is never treated as a duplicate. Pure helper, unit-tested.
+#[cfg(unix)]
+fn ipc_event_is_duplicate(cursor: Option<i64>, current_cursor: Option<i64>) -> bool {
+    match (cursor, current_cursor) {
+        (Some(c), Some(cur)) => c <= cur,
+        _ => false,
+    }
+}
+
+/// Relay one NDJSON line received from the watcher's IPC `SubscribeEvents`
+/// stream to stdout (ft-7h5da.4.1). Event records are de-duplicated against
+/// `current_cursor` (the follower may have already emitted them via the
+/// DB-cursor backlog drain) and advance the cursor; heartbeats are re-emitted
+/// carrying the follower's own cursor; any other control record passes through.
+/// `max_hz` pacing mirrors the DB path; the server already redacts event
+/// payloads before sending.
+#[cfg(unix)]
+async fn relay_ipc_event_line(
+    stdout: &std::io::Stdout,
+    line: &str,
+    current_cursor: &mut Option<i64>,
+    max_hz_interval: Option<std::time::Duration>,
+    last_event_emit: &mut Option<std::time::Instant>,
+) -> std::io::Result<IpcRelayAction> {
+    use std::io::Write as _;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        // Unparseable line — skip defensively rather than corrupt the stream.
+        return Ok(IpcRelayAction::Skipped);
+    };
+    let record_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match record_type {
+        "event" => {
+            let cursor = value.get("cursor").and_then(serde_json::Value::as_i64);
+            if ipc_event_is_duplicate(cursor, *current_cursor) {
+                return Ok(IpcRelayAction::Skipped); // already emitted via DB drain
+            }
+            // max_hz pacing on emitted events (blocking sleep off the runtime
+            // thread, mirroring the DB-cursor path).
+            if let (Some(min), Some(prev)) = (max_hz_interval, *last_event_emit) {
+                let elapsed = prev.elapsed();
+                if elapsed < min {
+                    let wait = min - elapsed;
+                    let _ = frankenterm_core::runtime_async::spawn_blocking(move || {
+                        std::thread::sleep(wait);
+                    })
+                    .await;
+                }
+            }
+            let mut lock = stdout.lock();
+            let cont = write_ndjson_line(&mut lock, &value)?;
+            let _ = lock.flush();
+            drop(lock);
+            if !cont {
+                return Ok(IpcRelayAction::PipeClosed);
+            }
+            if let Some(c) = cursor {
+                *current_cursor = Some(c);
+            }
+            *last_event_emit = Some(std::time::Instant::now());
+            Ok(IpcRelayAction::Emitted)
+        }
+        "heartbeat" => {
+            // Re-emit with the follower's own cursor (the server sends a null
+            // cursor since it doesn't track the follower's position).
+            let hb = watch_heartbeat_ndjson(*current_cursor, now_ms_i64());
+            let mut lock = stdout.lock();
+            let cont = write_ndjson_line(&mut lock, &hb)?;
+            let _ = lock.flush();
+            drop(lock);
+            if !cont {
+                return Ok(IpcRelayAction::PipeClosed);
+            }
+            Ok(IpcRelayAction::Emitted)
+        }
+        _ => {
+            // Pass through any other control record unchanged.
+            let mut lock = stdout.lock();
+            let cont = write_ndjson_line(&mut lock, &value)?;
+            let _ = lock.flush();
+            drop(lock);
+            if !cont {
+                return Ok(IpcRelayAction::PipeClosed);
+            }
+            Ok(IpcRelayAction::Emitted)
+        }
+    }
+}
+
 #[cfg(test)]
 mod watch_events_tests {
     use super::*;
@@ -20099,6 +20178,21 @@ mod watch_events_tests {
         let v = serde_json::json!({"a": 1});
         assert!(write_ndjson_line(&mut buf, &v).unwrap());
         assert_eq!(buf, b"{\"a\":1}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_event_dedup_uses_shared_cursor() {
+        // ft-7h5da.4.1: the IPC live transport and the DB-cursor backlog drain
+        // share the monotonic events.id, so an IPC event id <= the follower's
+        // current cursor was already emitted and must be skipped.
+        assert!(ipc_event_is_duplicate(Some(5), Some(5))); // equal id => dup
+        assert!(ipc_event_is_duplicate(Some(4), Some(5))); // older id => dup
+        assert!(!ipc_event_is_duplicate(Some(6), Some(5))); // newer id => fresh
+        // No follower cursor yet => nothing is a duplicate.
+        assert!(!ipc_event_is_duplicate(Some(1), None));
+        // A record without a cursor is never treated as a duplicate.
+        assert!(!ipc_event_is_duplicate(None, Some(5)));
     }
 
     #[test]
@@ -31876,6 +31970,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let mut last_event_emit: Option<std::time::Instant> = None;
                             let stdout = std::io::stdout();
 
+                            // ft-7h5da.4.1: live IPC transport state. When the
+                            // watcher is up, `--follow` subscribes to its
+                            // EventBus over IPC and relays detections as they
+                            // happen (low latency); when the watcher is down or
+                            // dies mid-stream, it transparently falls back to the
+                            // DB-cursor poll loop below. Unix-only optimization —
+                            // other platforms always use the DB path.
+                            #[cfg(unix)]
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            #[cfg(unix)]
+                            let mut ipc_stream: Option<frankenterm_core::ipc::IpcEventStream> =
+                                None;
+
                             // ft-7h5da.4.2: typed cursor_expired. If --cursor
                             // predates the oldest globally-retained event,
                             // retention pruned the events in between; surface an
@@ -31996,6 +32104,77 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 if batch_len >= batch_limit {
                                     continue 'follow;
                                 }
+
+                                // ft-7h5da.4.1: caught up on the DB backlog.
+                                // Prefer the live IPC transport when the watcher
+                                // is up; relay events as they're detected instead
+                                // of DB-polling. Falls back transparently to the
+                                // heartbeat+poll tail below when the watcher is
+                                // down or closes the stream.
+                                #[cfg(unix)]
+                                {
+                                    if let Some(mut stream) = ipc_stream.take() {
+                                        // `take()` leaves `ipc_stream` None;
+                                        // relay live events until the watcher
+                                        // closes the stream (or the consumer
+                                        // closes the pipe).
+                                        loop {
+                                            match stream.next_line_with_cx(&cx).await {
+                                                Ok(Some(line)) => {
+                                                    match relay_ipc_event_line(
+                                                        &stdout,
+                                                        &line,
+                                                        &mut current_cursor,
+                                                        max_hz_interval,
+                                                        &mut last_event_emit,
+                                                    )
+                                                    .await?
+                                                    {
+                                                        IpcRelayAction::PipeClosed => {
+                                                            break 'follow;
+                                                        }
+                                                        IpcRelayAction::Emitted
+                                                        | IpcRelayAction::Skipped => {
+                                                            last_emit =
+                                                                std::time::Instant::now();
+                                                        }
+                                                    }
+                                                }
+                                                // Watcher closed the stream
+                                                // (shutdown) or read failed —
+                                                // `ipc_stream` is already None, so
+                                                // fall through to the DB poll
+                                                // fallback and retry IPC on the
+                                                // next iteration.
+                                                Ok(None) | Err(_) => break,
+                                            }
+                                        }
+                                    } else {
+                                        // Not subscribed yet: try now. On success
+                                        // loop back to drain any gap between the
+                                        // last DB read and the subscribe, then
+                                        // relay on the next idle. The shared
+                                        // monotonic cursor dedupes the overlap.
+                                        let client = frankenterm_core::ipc::IpcClient::new(
+                                            &layout.ipc_socket_path,
+                                        );
+                                        if let Ok(stream) = client
+                                            .subscribe_events_with_cx(
+                                                &cx,
+                                                pane,
+                                                severity.clone(),
+                                                rule_id.clone(),
+                                                heartbeat_interval_ms,
+                                            )
+                                            .await
+                                        {
+                                            ipc_stream = Some(stream);
+                                            continue 'follow;
+                                        }
+                                        // Watcher down: fall through to DB poll.
+                                    }
+                                }
+
                                 // Idle: emit a heartbeat if enabled and due.
                                 if heartbeat_interval_ms > 0 && last_emit.elapsed() >= heartbeat {
                                     let hb = watch_heartbeat_ndjson(current_cursor, now_ms_i64());
