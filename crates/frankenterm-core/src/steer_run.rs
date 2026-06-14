@@ -24,6 +24,8 @@ pub enum SteerRunGate {
     Invalid(String),
     /// The receipt's TTL has elapsed.
     Expired,
+    /// The receipt was not admitted by the planning envelope.
+    NotAdmitted { verdict: String },
     /// The receipt's bound contract hash differs from the live contract
     /// (`contract` is `"mission"` or `"tx"`).
     HashMismatch { contract: &'static str },
@@ -41,6 +43,7 @@ impl SteerRunGate {
             Self::Valid => None,
             Self::Invalid(_) => Some("robot.steer_receipt_invalid"),
             Self::Expired => Some("robot.steer_receipt_expired"),
+            Self::NotAdmitted { .. } => Some("robot.steer_receipt_not_admitted"),
             Self::HashMismatch { .. } => Some("robot.steer_hash_mismatch"),
             Self::UnverifiableBinding { .. } => Some("robot.steer_binding_unverifiable"),
         }
@@ -74,6 +77,11 @@ pub fn steer_run_gate(
     }
     if receipt.is_expired(now_ms) {
         return SteerRunGate::Expired;
+    }
+    if receipt.envelope_verdict != "envelope.admit" {
+        return SteerRunGate::NotAdmitted {
+            verdict: receipt.envelope_verdict.clone(),
+        };
     }
     // Fail closed: a contract the receipt CAPTURED but the caller did not supply
     // cannot be revalidated. Refusing here prevents a caller that forgets a live
@@ -129,6 +137,11 @@ pub fn receipt_admits_action(
     if receipt.is_expired(now_ms) {
         return SteerRunGate::Expired;
     }
+    if receipt.envelope_verdict != "envelope.admit" {
+        return SteerRunGate::NotAdmitted {
+            verdict: receipt.envelope_verdict.clone(),
+        };
+    }
     if !receipt.matches_tx_hash(action_plan_hash) {
         return SteerRunGate::HashMismatch { contract: "tx" };
     }
@@ -176,6 +189,23 @@ mod tests {
     fn no_ttl_never_expires() {
         let r = receipt(None, 0, None);
         assert!(steer_run_gate(&r, None, None, i64::MAX).is_valid());
+    }
+
+    #[test]
+    fn non_admitted_receipt_is_typed_refusal() {
+        let mut r = receipt(Some(10_000), 1_000, None);
+        r.envelope_verdict = "envelope.blocked.rch_substrate".to_string();
+        r.receipt_id = r.compute_id();
+
+        let g = steer_run_gate(&r, None, None, 5_000);
+
+        assert_eq!(
+            g,
+            SteerRunGate::NotAdmitted {
+                verdict: "envelope.blocked.rch_substrate".to_string()
+            }
+        );
+        assert_eq!(g.error_code(), Some("robot.steer_receipt_not_admitted"));
     }
 
     #[test]
@@ -246,5 +276,17 @@ mod tests {
     fn expired_receipt_does_not_admit() {
         let r = receipt(Some(1_000), 0, Some("plan-hash-XYZ".to_string()));
         assert!(!receipt_admits_action(&r, "plan-hash-XYZ", 5_000).is_valid());
+    }
+
+    #[test]
+    fn non_admitted_receipt_does_not_admit_action() {
+        let mut r = receipt(Some(10_000), 0, Some("plan-hash-XYZ".to_string()));
+        r.envelope_verdict = "envelope.requires_approval".to_string();
+        r.receipt_id = r.compute_id();
+
+        let g = receipt_admits_action(&r, "plan-hash-XYZ", 1_000);
+
+        assert!(!g.is_valid());
+        assert_eq!(g.error_code(), Some("robot.steer_receipt_not_admitted"));
     }
 }

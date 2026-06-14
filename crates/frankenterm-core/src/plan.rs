@@ -3178,6 +3178,61 @@ pub struct MissionTxContract {
 }
 
 impl MissionTxContract {
+    /// Compute the canonical immutable hash for this tx contract.
+    ///
+    /// The hash intentionally excludes lifecycle state, outcome, and appended
+    /// receipts so the same planned tx remains hash-stable while it moves
+    /// through prepare/commit/compensation. Steering receipts use this as the
+    /// plan/execute identity binding for tx execution.
+    #[must_use]
+    pub fn compute_hash(&self) -> String {
+        #[derive(Serialize)]
+        struct ImmutableTxStep<'a> {
+            step_id: &'a TxStepId,
+            ordinal: usize,
+            action: &'a StepAction,
+            description: &'a str,
+        }
+
+        #[derive(Serialize)]
+        struct ImmutableTxContract<'a> {
+            tx_version: u32,
+            tx_id: &'a TxId,
+            requested_by: &'a MissionActorRole,
+            summary: &'a str,
+            correlation_id: &'a str,
+            plan_id: &'a TxPlanId,
+            steps: Vec<ImmutableTxStep<'a>>,
+            preconditions: &'a [TxPrecondition],
+            compensations: &'a [TxCompensation],
+        }
+
+        let canonical = serde_json::to_string(&ImmutableTxContract {
+            tx_version: self.tx_version,
+            tx_id: &self.intent.tx_id,
+            requested_by: &self.intent.requested_by,
+            summary: &self.intent.summary,
+            correlation_id: &self.intent.correlation_id,
+            plan_id: &self.plan.plan_id,
+            steps: self
+                .plan
+                .steps
+                .iter()
+                .map(|step| ImmutableTxStep {
+                    step_id: &step.step_id,
+                    ordinal: step.ordinal,
+                    action: &step.action,
+                    description: &step.description,
+                })
+                .collect(),
+            preconditions: &self.plan.preconditions,
+            compensations: &self.plan.compensations,
+        })
+        .expect("serializing immutable tx contract should not fail");
+        let hash = sha256_hex(&canonical);
+        format!("sha256:{}", &hash[..32])
+    }
+
     /// Attach or replace the token budget for this mission transaction.
     pub fn attach_token_budget(&mut self, token_budget: MissionTokenBudget) -> Result<(), String> {
         token_budget.validate()?;
@@ -8778,6 +8833,37 @@ mod tests {
         assert_eq!(key1, key2);
         assert!(key1.starts_with("txk:"));
         assert_eq!(key1.len(), 20);
+    }
+
+    #[test]
+    fn tx_contract_hash_is_stable_across_lifecycle_and_receipts() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut progressed = contract.clone();
+        progressed.lifecycle_state = MissionTxState::Committing;
+        progressed.outcome = TxOutcome::Pending;
+        progressed.receipts.push(serde_json::json!({
+            "kind": "ft.steering_receipt.run",
+            "receipt_id": "steer:0123456789abcdef0123456789abcdef",
+        }));
+
+        let hash = contract.compute_hash();
+
+        assert_eq!(hash, progressed.compute_hash());
+        assert!(hash.starts_with("sha256:"));
+        assert_eq!(hash.len(), "sha256:".len() + 32);
+    }
+
+    #[test]
+    fn tx_contract_hash_changes_when_immutable_contract_changes() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut different = contract.clone();
+        different.plan.steps[0].action = StepAction::SendText {
+            pane_id: 9,
+            text: "changed".to_string(),
+            paste_mode: Some(true),
+        };
+
+        assert_ne!(contract.compute_hash(), different.compute_hash());
     }
 
     #[test]

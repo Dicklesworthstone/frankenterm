@@ -12,10 +12,10 @@
 //!   struct is safe for positional binary (varbincode) persistence as well as
 //!   JSON — every field always serializes, in declaration order.
 //! - The mission hash reuses the existing canonical [`Mission::compute_hash`].
-//!   `MissionTxContract` has no `compute_hash` yet, so the tx hash is supplied
-//!   by the caller (the W5.2 planner computes it; W5.3 recomputes it the same
-//!   way). Adding `MissionTxContract::compute_hash` + a `matches_tx` helper is a
-//!   tracked follow-up for W5.2/W5.3.
+//!   The tx hash is supplied by the caller from
+//!   `MissionTxContract::compute_hash`, letting W5.3 recompute the live tx
+//!   contract hash before execution without coupling this foundational receipt
+//!   type to the larger tx contract surface.
 //! - `receipt_id` is content-addressed over the *binding* (objective, workspace,
 //!   bound hashes, verdict, rehearsal score, sorted approvals) and deliberately
 //!   EXCLUDES timestamps, so an identical plan always yields an identical id.

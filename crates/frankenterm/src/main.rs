@@ -5440,24 +5440,42 @@ enum SteerCommands {
         format: String,
     },
 
-    /// Revalidate a stored steering receipt against the live contract: refuses a
-    /// stale-hash / expired / unverifiable receipt with a typed error. (The tx
-    /// prepare/commit delegation is the W5.3 execute follow-on; this performs the
-    /// revalidation gate only and executes nothing.)
+    /// Execute a tx contract through a stored steering receipt after revalidating
+    /// the receipt against the live contract hash.
     Run {
         /// The receipt id to load (steer:<hex>), as printed by `ft steer plan`
         #[arg(long)]
         receipt: String,
+
+        /// Tx contract JSON file (default: .ft/mission/tx-active.json)
+        #[arg(long)]
+        contract_file: Option<PathBuf>,
 
         /// Path to the live mission JSON, to revalidate the receipt's bound
         /// mission hash (required if the receipt bound a mission)
         #[arg(long)]
         mission_file: Option<PathBuf>,
 
-        /// The live action/tx plan hash, to revalidate the receipt's bound tx
-        /// hash (required if the receipt bound a tx contract)
+        /// Expected live tx contract hash. When supplied it must match the
+        /// hash recomputed from --contract-file.
         #[arg(long)]
         plan_hash: Option<String>,
+
+        /// Inject a deterministic commit failure at this step ID
+        #[arg(long)]
+        fail_step: Option<String>,
+
+        /// Treat mission as paused (commit is suspended)
+        #[arg(long)]
+        paused: bool,
+
+        /// Kill-switch level for prepare/commit gates
+        #[arg(long, value_enum, default_value = "off")]
+        kill_switch: RobotMissionKillSwitchLevelArg,
+
+        /// Preview prepare-phase results without executing commit/compensation
+        #[arg(long)]
+        dry_run: bool,
 
         /// Output format: plain or json
         #[arg(long, short = 'f', default_value = "plain")]
@@ -10272,6 +10290,10 @@ struct RobotTxRunData {
     contract_file: String,
     tx_id: String,
     plan_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steering_receipt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steering_tx_hash: Option<String>,
     prepare_report: frankenterm_core::plan::TxPrepareReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     commit_report: Option<frankenterm_core::plan::TxCommitReport>,
@@ -41462,8 +41484,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
             SteerCommands::Run {
                 receipt,
+                contract_file,
                 mission_file,
                 plan_hash,
+                fail_step,
+                paused,
+                kill_switch,
+                dry_run,
                 format,
             } => {
                 use frankenterm_core::steer_run::steer_run_gate;
@@ -41503,6 +41530,57 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 };
+                let contract_path = resolve_mission_tx_file_path(&layout, contract_file);
+                let mut contract = match load_mission_tx_contract_from_path(&contract_path) {
+                    Ok(contract) => contract,
+                    Err(err) => {
+                        if as_json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error_code": err.error_code,
+                                    "error": err.message,
+                                    "hint": err.hint,
+                                    "version": frankenterm_core::VERSION,
+                                })
+                            );
+                        } else {
+                            eprintln!("Error: {}", err.message);
+                            if let Some(hint) = err.hint {
+                                eprintln!("Hint: {hint}");
+                            }
+                        }
+                        std::process::exit(err.exit_code);
+                    }
+                };
+                if let Some(fail_step_id) = fail_step.as_deref()
+                    && !contract
+                        .plan
+                        .steps
+                        .iter()
+                        .any(|step| step.step_id.0 == fail_step_id)
+                {
+                    let msg = format!("Unknown --fail-step: {fail_step_id}");
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": false,
+                                "error_code": "mission.tx.unknown_fail_step",
+                                "error": msg,
+                                "hint": "Use `ft tx show --include-contract` to inspect valid step IDs.",
+                                "version": frankenterm_core::VERSION,
+                            })
+                        );
+                    } else {
+                        eprintln!("Error: {msg}");
+                        eprintln!(
+                            "Hint: Use `ft tx show --include-contract` to inspect valid step IDs."
+                        );
+                    }
+                    std::process::exit(MISSION_EXIT_INVALID_INPUT);
+                }
                 let live_mission = match &mission_file {
                     Some(path) => {
                         let parsed = std::fs::read_to_string(path).ok().and_then(|s| {
@@ -41521,20 +41599,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                     None => None,
                 };
-                let now = now_ms_i64();
-                let verdict =
-                    steer_run_gate(&stored, live_mission.as_ref(), plan_hash.as_deref(), now);
+                let now = mission_now_ms();
+                let live_tx_hash = steering_tx_contract_hash(&contract);
+                let verdict = if plan_hash
+                    .as_deref()
+                    .is_some_and(|expected| expected != live_tx_hash.as_str())
+                {
+                    frankenterm_core::steer_run::SteerRunGate::HashMismatch { contract: "tx" }
+                } else {
+                    steer_run_gate(&stored, live_mission.as_ref(), Some(&live_tx_hash), now)
+                };
                 let valid = verdict.is_valid();
                 let error_code = verdict.error_code();
 
-                // Audit the revalidation (no execution occurs here).
+                // Audit the receipt gate before any commit-side effect can run.
                 let db_path = layout.db_path.to_string_lossy();
                 let open_cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
-                if let Ok(storage) = frankenterm_core::storage::StorageHandle::new_with_cx(
-                    &open_cx, &db_path,
-                )
-                .await
+                if let Ok(storage) =
+                    frankenterm_core::storage::StorageHandle::new_with_cx(&open_cx, &db_path).await
                 {
                     let audit = frankenterm_core::storage::AuditActionRecord {
                         id: 0,
@@ -41544,42 +41627,182 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         correlation_id: Some(stored.receipt_id.clone()),
                         pane_id: None,
                         domain: None,
-                        action_kind: "steer.run.revalidate".to_string(),
+                        action_kind: if valid {
+                            "steer.run.execute"
+                        } else {
+                            "steer.run.refuse"
+                        }
+                        .to_string(),
                         policy_decision: if valid { "allow" } else { "deny" }.to_string(),
                         decision_reason: error_code.map(str::to_string),
                         rule_id: None,
                         input_summary: Some(format!("receipt={}", stored.receipt_id)),
                         verification_summary: None,
                         decision_context: None,
-                        result: if valid { "success" } else { "refused" }.to_string(),
+                        result: if valid { "started" } else { "refused" }.to_string(),
                     };
                     let _ = storage.record_audit_action(audit).await;
                     let _ = storage.shutdown().await;
                 }
 
+                if !valid {
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "type": "steer_run",
+                                "receipt_id": stored.receipt_id,
+                                "valid": false,
+                                "error_code": error_code,
+                                "executed": false,
+                                "contract_file": contract_path.display().to_string(),
+                                "live_tx_hash": live_tx_hash,
+                                "version": frankenterm_core::VERSION,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "receipt {} REFUSED: {}",
+                            stored.receipt_id,
+                            error_code.unwrap_or("unknown")
+                        );
+                    }
+                    std::process::exit(1);
+                }
+
+                contract
+                    .receipts
+                    .push(steering_receipt_tx_attachment(&stored, &live_tx_hash, now));
+
+                let kill_switch = kill_switch.into();
+                let (real_runtime, fallback_reason) =
+                    resolve_real_tx_runtime(&config, &layout).await;
+                let executor_label = if real_runtime.is_some() {
+                    "pane_executor"
+                } else {
+                    "synthetic_fallback"
+                };
+                let data = if let Some((storage, wezterm)) = real_runtime {
+                    let policy_engine = std::cell::RefCell::new(
+                        frankenterm_core::policy::PolicyEngine::new(
+                            config.safety.rate_limit_per_pane,
+                            config.safety.rate_limit_global,
+                            config.safety.require_prompt_active,
+                        )
+                        .with_tuning(&config.tuning)
+                        .with_command_gate_config(config.safety.command_gate.clone())
+                        .with_policy_rules(config.safety.rules.clone()),
+                    );
+                    let approvals =
+                        frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(Some(
+                            &storage,
+                        ));
+                    let targets = frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                        None,
+                        Some(&storage),
+                    );
+                    let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
+                        layout.root.to_string_lossy().to_string(),
+                    );
+                    let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
+                        wezterm,
+                        policy_engine,
+                        approvals,
+                        targets,
+                        prepare_context,
+                    );
+                    execute_tx_run_with_executor(
+                        SteeringReceiptRevalidatingExecutor::new(
+                            executor,
+                            stored.clone(),
+                            live_mission.clone(),
+                        ),
+                        &contract_path,
+                        &mut contract,
+                        kill_switch,
+                        paused,
+                        fail_step.clone(),
+                        dry_run,
+                        now,
+                    )
+                } else {
+                    if let Some(reason) = fallback_reason.as_deref() {
+                        tracing::warn!(%reason, "falling back to synthetic steer run executor");
+                    }
+                    execute_tx_run_with_executor(
+                        SteeringReceiptRevalidatingExecutor::new(
+                            frankenterm_core::tx_execution::SyntheticStepExecutor,
+                            stored.clone(),
+                            live_mission.clone(),
+                        ),
+                        &contract_path,
+                        &mut contract,
+                        kill_switch,
+                        paused,
+                        fail_step.clone(),
+                        dry_run,
+                        now,
+                    )
+                };
+                let mut data = match data {
+                    Ok(data) => data,
+                    Err(err) => {
+                        if as_json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error_code": "mission.tx.execution_failed",
+                                    "error": err,
+                                    "version": frankenterm_core::VERSION,
+                                })
+                            );
+                        } else {
+                            eprintln!("Error: {err}");
+                        }
+                        std::process::exit(MISSION_EXIT_VALIDATION);
+                    }
+                };
+                data.steering_receipt_id = Some(stored.receipt_id.clone());
+                data.steering_tx_hash = Some(live_tx_hash.clone());
+
                 if as_json {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "type": "steer_run_revalidation",
+                            "type": "steer_run",
                             "receipt_id": stored.receipt_id,
-                            "valid": valid,
-                            "error_code": error_code,
-                            "executed": false,
+                            "valid": true,
+                            "error_code": serde_json::Value::Null,
+                            "executed": !dry_run && data.commit_report.is_some(),
+                            "contract_file": contract_path.display().to_string(),
+                            "live_tx_hash": live_tx_hash,
+                            "tx": data,
                             "version": frankenterm_core::VERSION,
                         })
                     );
-                } else if valid {
-                    println!("receipt {} revalidated OK", stored.receipt_id);
-                    println!(
-                        "  (tx prepare/commit delegation not yet wired — W5.3 execute follow-on)"
-                    );
                 } else {
+                    println!("receipt {} revalidated OK", stored.receipt_id);
+                    println!("  tx hash: {}", live_tx_hash);
+                    println!("  contract: {}", data.contract_file);
+                    println!("  mode: {}", if dry_run { "dry_run" } else { "execute" });
+                    println!("  executor: {executor_label}");
+                    if let Some(reason) = fallback_reason.as_deref() {
+                        println!("  fallback reason: {reason}");
+                    }
                     println!(
-                        "receipt {} REFUSED: {}",
-                        stored.receipt_id,
-                        error_code.unwrap_or("unknown")
+                        "  prepare outcome: {}",
+                        tx_prepare_outcome_label(&data.prepare_report.outcome)
                     );
+                    if let Some(commit_report) = data.commit_report.as_ref() {
+                        println!(
+                            "  commit outcome: {}",
+                            tx_commit_outcome_label(&commit_report.outcome)
+                        );
+                    } else {
+                        println!("  commit outcome: not_started");
+                    }
+                    println!("  final state: {}", data.final_state);
                 }
             }
         },
@@ -53044,6 +53267,104 @@ async fn resolve_real_tx_runtime(
     }
 }
 
+fn steering_tx_contract_hash(contract: &frankenterm_core::plan::MissionTxContract) -> String {
+    contract.compute_hash()
+}
+
+fn steering_receipt_tx_attachment(
+    receipt: &frankenterm_core::steering::SteeringReceipt,
+    live_tx_hash: &str,
+    attached_at_ms: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "ft.steering_receipt.run",
+        "schema_version": 1,
+        "receipt_id": receipt.receipt_id.as_str(),
+        "workspace_id": receipt.workspace_id.as_str(),
+        "objective": receipt.objective.as_str(),
+        "mission_contract_hash": receipt.mission_contract_hash.as_deref(),
+        "tx_contract_hash": receipt.tx_contract_hash.as_deref(),
+        "live_tx_contract_hash": live_tx_hash,
+        "envelope_verdict": receipt.envelope_verdict.as_str(),
+        "attached_at_ms": attached_at_ms,
+    })
+}
+
+#[derive(Clone)]
+struct SteeringReceiptRevalidatingExecutor<E> {
+    inner: E,
+    receipt: frankenterm_core::steering::SteeringReceipt,
+    live_mission: Option<frankenterm_core::plan::Mission>,
+}
+
+impl<E> SteeringReceiptRevalidatingExecutor<E> {
+    fn new(
+        inner: E,
+        receipt: frankenterm_core::steering::SteeringReceipt,
+        live_mission: Option<frankenterm_core::plan::Mission>,
+    ) -> Self {
+        Self {
+            inner,
+            receipt,
+            live_mission,
+        }
+    }
+}
+
+impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execution::StepExecutor
+    for SteeringReceiptRevalidatingExecutor<E>
+{
+    fn evaluate_gates(
+        &self,
+        contract: &frankenterm_core::plan::MissionTxContract,
+        now_ms: i64,
+    ) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
+        self.inner.evaluate_gates(contract, now_ms)
+    }
+
+    fn execute_steps(
+        &self,
+        contract: &frankenterm_core::plan::MissionTxContract,
+        fail_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+        let live_tx_hash = steering_tx_contract_hash(contract);
+        let verdict = frankenterm_core::steer_run::steer_run_gate(
+            &self.receipt,
+            self.live_mission.as_ref(),
+            Some(&live_tx_hash),
+            now_ms,
+        );
+        if let Some(error_code) = verdict.error_code() {
+            return contract
+                .plan
+                .steps
+                .iter()
+                .map(|step| frankenterm_core::plan::TxCommitStepInput {
+                    step_id: step.step_id.clone(),
+                    success: false,
+                    reason_code: "steering_receipt_revalidation_failed".to_string(),
+                    error_code: Some(error_code.to_string()),
+                    completed_at_ms: now_ms,
+                })
+                .collect();
+        }
+
+        self.inner.execute_steps(contract, fail_step, now_ms)
+    }
+
+    fn execute_compensations(
+        &self,
+        contract: &frankenterm_core::plan::MissionTxContract,
+        commit_report: &frankenterm_core::plan::TxCommitReport,
+        fail_for_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<frankenterm_core::plan::TxCompensationStepInput> {
+        self.inner
+            .execute_compensations(contract, commit_report, fail_for_step, now_ms)
+    }
+}
+
 // TX execution threads contract state, approval, dry-run, IO, and clock inputs through one executor call.
 #[allow(clippy::too_many_arguments)]
 fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>(
@@ -53074,6 +53395,8 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
             contract_file: contract_path.display().to_string(),
             tx_id,
             plan_id,
+            steering_receipt_id: None,
+            steering_tx_hash: None,
             final_state: tx_prepare_target_state(&prepare_report.outcome),
             prepare_report,
             commit_report: None,
@@ -53097,6 +53420,8 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
         contract_file: contract_path.display().to_string(),
         tx_id,
         plan_id,
+        steering_receipt_id: None,
+        steering_tx_hash: None,
         final_state: result.final_state,
         prepare_report: result.prepare_report,
         commit_report: result.commit_report,
@@ -63650,6 +63975,63 @@ reason = "overly conservative pending threshold"
     }
 
     #[test]
+    fn steer_run_command_parses_receipt_bound_tx_execution_flags() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "steer",
+            "run",
+            "--receipt",
+            "steer:0123456789abcdef0123456789abcdef",
+            "--contract-file",
+            "/tmp/tx.json",
+            "--mission-file",
+            "/tmp/mission.json",
+            "--plan-hash",
+            "sha256:expected",
+            "--fail-step",
+            "tx-step:commit",
+            "--paused",
+            "--kill-switch",
+            "safe-mode",
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .expect("steer run should parse");
+
+        match cli.command.map(|cmd| *cmd) {
+            Some(Commands::Steer {
+                command:
+                    SteerCommands::Run {
+                        receipt,
+                        contract_file,
+                        mission_file,
+                        plan_hash,
+                        fail_step,
+                        paused,
+                        kill_switch,
+                        dry_run,
+                        format,
+                    },
+            }) => {
+                assert_eq!(
+                    receipt,
+                    "steer:0123456789abcdef0123456789abcdef".to_string()
+                );
+                assert_eq!(contract_file, Some(PathBuf::from("/tmp/tx.json")));
+                assert_eq!(mission_file, Some(PathBuf::from("/tmp/mission.json")));
+                assert_eq!(plan_hash.as_deref(), Some("sha256:expected"));
+                assert_eq!(fail_step.as_deref(), Some("tx-step:commit"));
+                assert!(paused);
+                assert_eq!(kill_switch, RobotMissionKillSwitchLevelArg::SafeMode);
+                assert!(dry_run);
+                assert_eq!(format, "json");
+            }
+            _ => panic!("unexpected steer run parse result"),
+        }
+    }
+
+    #[test]
     fn replay_parity_command_parses_with_artifact_options() {
         let cli = Cli::try_parse_from([
             "ft",
@@ -64428,6 +64810,9 @@ reason = "overly conservative pending threshold"
         );
         assert!(data.commit_report.is_none());
         assert!(data.compensation_report.is_none());
+        let data_json = serde_json::to_value(&data).expect("serialize tx run data");
+        assert!(data_json.get("steering_receipt_id").is_none());
+        assert!(data_json.get("steering_tx_hash").is_none());
         assert_eq!(
             contract.lifecycle_state,
             frankenterm_core::plan::MissionTxState::Planned
@@ -64476,6 +64861,123 @@ reason = "overly conservative pending threshold"
         assert_eq!(
             contract.lifecycle_state,
             frankenterm_core::plan::MissionTxState::Committed
+        );
+    }
+
+    #[test]
+    fn steering_receipt_attachment_records_live_tx_hash() {
+        let contract = sample_robot_tx_contract();
+        let live_hash = steering_tx_contract_hash(&contract);
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            1_704_200_000_000,
+            Some(60_000),
+        );
+
+        let attachment = steering_receipt_tx_attachment(&receipt, &live_hash, 1_704_200_000_010);
+
+        assert_eq!(attachment["kind"], "ft.steering_receipt.run");
+        assert_eq!(
+            attachment["receipt_id"].as_str(),
+            Some(receipt.receipt_id.as_str())
+        );
+        assert_eq!(
+            attachment["live_tx_contract_hash"].as_str(),
+            Some(live_hash.as_str())
+        );
+        assert_eq!(
+            attachment["tx_contract_hash"].as_str(),
+            Some(live_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn steering_receipt_revalidating_executor_allows_matching_receipt() {
+        let mut contract = sample_robot_tx_contract();
+        let live_hash = steering_tx_contract_hash(&contract);
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            1_704_200_000_000,
+            Some(60_000),
+        );
+        contract
+            .receipts
+            .push(steering_receipt_tx_attachment(&receipt, &live_hash, 5_151));
+        let executor = RecordingStepExecutor::default();
+
+        let data = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None),
+            Path::new("/tmp/tx.json"),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_151,
+        )
+        .expect("matching receipt should execute");
+
+        assert_eq!(
+            executor.recorded_calls(),
+            vec!["evaluate_gates", "execute_steps"]
+        );
+        assert_eq!(
+            data.final_state,
+            frankenterm_core::plan::MissionTxState::Committed
+        );
+    }
+
+    #[test]
+    fn steering_receipt_revalidating_executor_blocks_stale_receipt_before_steps() {
+        let mut contract = sample_robot_tx_contract();
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some("sha256:stale".to_string()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            1_704_200_000_000,
+            Some(60_000),
+        );
+        let executor = RecordingStepExecutor::default();
+
+        let data = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None),
+            Path::new("/tmp/tx.json"),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_151,
+        )
+        .expect("stale receipt should become a tx failure report");
+
+        let calls = executor.recorded_calls();
+        assert!(calls.contains(&"evaluate_gates"));
+        assert!(
+            !calls.contains(&"execute_steps"),
+            "stale receipt must stop before side-effecting commit steps"
+        );
+        let commit_report = data.commit_report.expect("commit report should be present");
+        assert_eq!(commit_report.failed_count, 1);
+        assert_eq!(
+            commit_report.error_code.as_deref(),
+            Some("robot.steer_hash_mismatch")
         );
     }
 
