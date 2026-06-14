@@ -37,6 +37,20 @@ fn arb_ipc_request() -> impl Strategy<Value = IpcRequest> {
             }),
         (0_u64..100_000).prop_map(|pane_id| IpcRequest::ClearPanePriority { pane_id }),
         proptest::collection::vec("[a-z_]{2,10}", 0..5).prop_map(|args| IpcRequest::Rpc { args }),
+        (
+            proptest::option::of(0_u64..100_000),
+            proptest::option::of("[a-z]{3,10}"),
+            proptest::option::of("[a-z.*]{3,12}"),
+            0_u64..60_000,
+        )
+            .prop_map(|(pane, severity, rule_id, heartbeat_interval_ms)| {
+                IpcRequest::SubscribeEvents {
+                    pane,
+                    severity,
+                    rule_id,
+                    heartbeat_interval_ms,
+                }
+            }),
     ]
 }
 
@@ -101,6 +115,7 @@ proptest! {
             IpcRequest::SetPanePriority { .. } => "set_pane_priority",
             IpcRequest::ClearPanePriority { .. } => "clear_pane_priority",
             IpcRequest::Rpc { .. } => "rpc",
+            IpcRequest::SubscribeEvents { .. } => "subscribe_events",
         };
         prop_assert!(
             json.contains(expected_tag),
