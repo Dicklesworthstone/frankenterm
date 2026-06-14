@@ -636,6 +636,62 @@ pub struct DomExitCodeData {
     pub code: i32,
 }
 
+/// `ft robot dom` grid-backed query kind for panes without OSC 133 zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomGridQueryKind {
+    CursorLine,
+    BottomRows,
+    ScreenDiffSinceSeq,
+}
+
+/// One terminal grid row returned by a grid-backed DOM query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomGridRowData {
+    pub y: isize,
+    pub text: String,
+    pub last_changed_seq: u64,
+}
+
+/// Cursor location plus the row currently containing the cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomGridCursorData {
+    pub x: usize,
+    pub y: isize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<DomGridRowData>,
+}
+
+/// Rows that changed after a caller-provided screen sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomGridDiffData {
+    pub since_seq: u64,
+    pub current_seq: u64,
+    /// False means the requested sequence predates retained row-change metadata.
+    pub complete: bool,
+    pub changed_rows: Vec<DomGridRowData>,
+}
+
+/// Response data for grid-backed DOM primitives on TUI/alt-screen panes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DomGridData {
+    pub pane_id: u64,
+    pub query: DomGridQueryKind,
+    pub source: String,
+    pub confidence: f64,
+    pub grid_data_unavailable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    pub alt_screen: bool,
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<DomGridCursorData>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<DomGridRowData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DomGridDiffData>,
+}
+
 /// Response data for batched `ft robot get-text --panes ...` and `--all`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchGetTextData {
@@ -3655,14 +3711,20 @@ mod tests {
         let resp: RobotResponse<BatchGetTextData> = serde_json::from_value(json).unwrap();
         let data = resp.into_result().unwrap();
         assert_eq!(data.pane_ids, vec![0, 1]);
-        match data.results.get(&0).unwrap() {
-            PaneTextResult::Ok { text, .. } => assert_eq!(text, "ready"),
-            other @ PaneTextResult::Error { .. } => panic!("expected ok variant, got {other:?}"),
-        }
-        match data.results.get(&1).unwrap() {
-            PaneTextResult::Error { code, .. } => assert_eq!(code, "robot.pane_not_found"),
-            other @ PaneTextResult::Ok { .. } => panic!("expected error variant, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                data.results.get(&0),
+                Some(PaneTextResult::Ok { text, .. }) if text == "ready"
+            ),
+            "pane 0 should decode as ok text"
+        );
+        assert!(
+            matches!(
+                data.results.get(&1),
+                Some(PaneTextResult::Error { code, .. }) if code == "robot.pane_not_found"
+            ),
+            "pane 1 should decode as pane-not-found error"
+        );
     }
 
     #[test]
@@ -3705,10 +3767,16 @@ mod tests {
         assert_eq!(data.panes.len(), 1);
         assert_eq!(data.panes[0].pane_id, 2);
         assert_eq!(data.tail_lines, 10);
-        match data.pane_text.get(&2).unwrap() {
-            PaneTextResult::Ok { truncated, .. } => assert!(*truncated),
-            other @ PaneTextResult::Error { .. } => panic!("expected ok variant, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                data.pane_text.get(&2),
+                Some(PaneTextResult::Ok {
+                    truncated: true,
+                    ..
+                })
+            ),
+            "pane 2 should decode as truncated ok text"
+        );
     }
 
     #[test]
@@ -4535,8 +4603,11 @@ mod tests {
         ];
         for raw in recognized {
             let code = ErrorCode::parse(raw).expect("recognized code parses");
-            let hint = hint_for(&code).unwrap_or_else(|| panic!("missing hint for {raw}"));
-            assert!(!hint.is_empty(), "hint for {raw} must be non-empty");
+            let hint = hint_for(&code);
+            assert!(hint.is_some(), "missing hint for {raw}");
+            if let Some(hint) = hint {
+                assert!(!hint.is_empty(), "hint for {raw} must be non-empty");
+            }
         }
     }
 
@@ -5339,10 +5410,10 @@ mod tests {
         let json = serde_json::to_string(&fast).unwrap();
         assert!(json.contains("\"type\":\"phase_fast\""));
         let parsed: SearchStreamPhase = serde_json::from_str(&json).unwrap();
-        match parsed {
-            SearchStreamPhase::Fast { result_count } => assert_eq!(result_count, 10),
-            _ => panic!("expected Fast variant"),
-        }
+        assert!(
+            matches!(parsed, SearchStreamPhase::Fast { result_count: 10 }),
+            "expected Fast variant"
+        );
 
         let quality = SearchStreamPhase::Quality { result_count: 5 };
         let json = serde_json::to_string(&quality).unwrap();
@@ -5355,16 +5426,16 @@ mod tests {
         let json = serde_json::to_string(&done).unwrap();
         assert!(json.contains("\"type\":\"phase_done\""));
         let parsed: SearchStreamPhase = serde_json::from_str(&json).unwrap();
-        match parsed {
-            SearchStreamPhase::Done {
-                total_results,
-                total_us,
-            } => {
-                assert_eq!(total_results, 15);
-                assert_eq!(total_us, 2500);
-            }
-            _ => panic!("expected Done variant"),
-        }
+        assert!(
+            matches!(
+                parsed,
+                SearchStreamPhase::Done {
+                    total_results: 15,
+                    total_us: 2500,
+                }
+            ),
+            "expected Done variant"
+        );
     }
 
     #[test]
