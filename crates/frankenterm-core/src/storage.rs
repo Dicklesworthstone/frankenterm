@@ -572,6 +572,13 @@ enum WriteCommand {
         action: AuditActionRecord,
         respond: oneshot::Sender<Result<i64>>,
     },
+    /// Attach a submit receipt to an existing audit action emitted by the policy gate.
+    UpdateAuditActionSubmitReceipt {
+        audit_action_id: i64,
+        correlation_id: String,
+        verification_summary: String,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     /// ft-h90rh: insert a policy-denied audit row (Deny / RequireApproval
     /// from the MCP mutation gate). Separate from `RecordAuditAction` so the
     /// two streams stay queryable independently.
@@ -867,6 +874,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::MarkActionUndone { .. } => "MarkActionUndone",
             Self::UpsertSession { .. } => "UpsertSession",
             Self::RecordAuditAction { .. } => "RecordAuditAction",
+            Self::UpdateAuditActionSubmitReceipt { .. } => "UpdateAuditActionSubmitReceipt",
             Self::RecordPolicyDenialAudit { .. } => "RecordPolicyDenialAudit",
             Self::PurgeAuditActions { .. } => "PurgeAuditActions",
             Self::InsertApprovalToken { .. } => "InsertApprovalToken",
@@ -2210,6 +2218,52 @@ impl StorageHandle {
                 cx,
                 WriteCommand::RecordAuditAction {
                     action,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Attach submit verification metadata to the policy audit row that emitted the send.
+    pub async fn update_audit_action_submit_receipt(
+        &self,
+        audit_action_id: i64,
+        correlation_id: String,
+        verification_summary: String,
+    ) -> Result<bool> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.update_audit_action_submit_receipt_with_cx(
+            &cx,
+            audit_action_id,
+            correlation_id,
+            verification_summary,
+        )
+        .await
+    }
+
+    /// Cx-first sibling of [`update_audit_action_submit_receipt`].
+    pub async fn update_audit_action_submit_receipt_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        audit_action_id: i64,
+        correlation_id: String,
+        verification_summary: String,
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!(
+                "update_audit_action_submit_receipt cancelled: {err}"
+            ))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpdateAuditActionSubmitReceipt {
+                    audit_action_id,
+                    correlation_id,
+                    verification_summary,
                     respond: tx,
                 },
             )
@@ -7744,6 +7798,16 @@ impl StorageIoWriterGate {
                 StorageIoClass::PolicyAudit,
                 storage_io_audit_action_bytes(action),
             )),
+            WriteCommand::UpdateAuditActionSubmitReceipt {
+                correlation_id,
+                verification_summary,
+                ..
+            } => Some(StorageIoWorkItem::new(
+                self.next_work_id(),
+                StorageIoClass::PolicyAudit,
+                storage_io_str_bytes(correlation_id)
+                    .saturating_add(storage_io_str_bytes(verification_summary)),
+            )),
             WriteCommand::RecordPolicyDenialAudit { record, .. } => Some(StorageIoWorkItem::new(
                 self.next_work_id(),
                 StorageIoClass::PolicyAudit,
@@ -8164,6 +8228,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         | WriteCommand::MarkActionUndone { respond, .. }
         | WriteCommand::DeleteAccount { respond, .. }
         | WriteCommand::ReleaseReservation { respond, .. }
+        | WriteCommand::UpdateAuditActionSubmitReceipt { respond, .. }
         | WriteCommand::DeletePaneBookmark { respond, .. }
         | WriteCommand::DeleteAgentProfile { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
@@ -8308,6 +8373,7 @@ fn storage_io_command_name(cmd: &WriteCommand) -> &'static str {
         WriteCommand::RecordGap { .. } => "RecordGap",
         WriteCommand::RecordEvent { .. } => "RecordEvent",
         WriteCommand::RecordAuditAction { .. } => "RecordAuditAction",
+        WriteCommand::UpdateAuditActionSubmitReceipt { .. } => "UpdateAuditActionSubmitReceipt",
         WriteCommand::RecordPolicyDenialAudit { .. } => "RecordPolicyDenialAudit",
         WriteCommand::SyncFts { .. } => "SyncFts",
         WriteCommand::RebuildFts { .. } => "RebuildFts",
@@ -8327,6 +8393,9 @@ fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::RecordAuditAction { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
+        }
+        WriteCommand::UpdateAuditActionSubmitReceipt { respond, .. } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::RecordPolicyDenialAudit { respond, .. } => {
@@ -9317,6 +9386,21 @@ fn dispatch_write_command_raw(
         WriteCommand::RecordAuditAction { action, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = record_audit_action_backend(backend, &action);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::UpdateAuditActionSubmitReceipt {
+            audit_action_id,
+            correlation_id,
+            verification_summary,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = update_audit_action_submit_receipt_backend(
+                backend,
+                audit_action_id,
+                &correlation_id,
+                &verification_summary,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordPolicyDenialAudit { record, respond } => {
@@ -12128,6 +12212,31 @@ fn record_audit_action_backend(
     RowReader::new(&row)
         .i64(0)
         .map_err(|err| storage_backend_error("Audit action id", err).into())
+}
+
+fn update_audit_action_submit_receipt_backend(
+    backend: &dyn StorageBackend,
+    audit_action_id: i64,
+    correlation_id: &str,
+    verification_summary: &str,
+) -> Result<bool> {
+    let row = backend
+        .query_row_typed(
+            "UPDATE audit_actions
+             SET correlation_id = ?1, verification_summary = ?2
+             WHERE id = ?3
+             RETURNING id",
+            &[
+                ToSqlValue::Text(correlation_id),
+                ToSqlValue::Text(verification_summary),
+                ToSqlValue::Integer(audit_action_id),
+            ],
+        )
+        .map_err(|err| {
+            storage_backend_error("Failed to update audit action submit receipt", err)
+        })?;
+
+    Ok(row.is_some())
 }
 
 /// Upsert an action_undo record (writer-thread, backend-trait path).

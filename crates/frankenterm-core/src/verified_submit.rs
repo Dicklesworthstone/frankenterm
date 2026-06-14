@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::patterns::{AgentType, SubmitProfile};
-use crate::robot_types::SubmitReceiptState;
+use crate::policy::InjectionResult;
+use crate::robot_types::{SubmitReceipt, SubmitReceiptState};
 use crate::wezterm::{MuxSemanticSnapshot, MuxSemanticZoneKind};
 
 const CAPTURE_CURSOR_PREFIX: &str = "pane";
@@ -36,6 +37,65 @@ pub struct VerifiedSubmitReport {
     pub polls: usize,
     pub cursor_before: Option<String>,
     pub cursor_after: Option<String>,
+}
+
+#[must_use]
+pub fn submit_receipt_state(
+    injection: &InjectionResult,
+    verification_report: Option<&VerifiedSubmitReport>,
+) -> SubmitReceiptState {
+    match injection {
+        InjectionResult::Allowed { .. } => {
+            verification_report.map_or(SubmitReceiptState::Submitted, |report| report.state)
+        }
+        InjectionResult::Denied { .. } => SubmitReceiptState::PolicyDenied,
+        InjectionResult::RequiresApproval { .. } => SubmitReceiptState::RequiresApproval,
+        InjectionResult::Error { .. } => SubmitReceiptState::SendFailed,
+    }
+}
+
+#[must_use]
+pub fn submit_receipt_evidence_rule_ids(
+    injection: &InjectionResult,
+    verification_report: Option<&VerifiedSubmitReport>,
+) -> Vec<String> {
+    let rule_id = match injection {
+        InjectionResult::Allowed { decision, .. }
+        | InjectionResult::Denied { decision, .. }
+        | InjectionResult::RequiresApproval { decision, .. }
+        | InjectionResult::Error { decision, .. } => decision.rule_id(),
+    };
+    let mut evidence_rule_ids: Vec<String> = rule_id.map(str::to_string).into_iter().collect();
+    if let Some(report) = verification_report {
+        evidence_rule_ids.extend(report.evidence_rule_ids.iter().cloned());
+    }
+    evidence_rule_ids.sort();
+    evidence_rule_ids.dedup();
+    evidence_rule_ids
+}
+
+#[must_use]
+pub fn build_submit_receipt(
+    pane_id: u64,
+    original_text: &str,
+    injection: &InjectionResult,
+    verification_report: Option<&VerifiedSubmitReport>,
+    elapsed_ms: u64,
+) -> SubmitReceipt {
+    SubmitReceipt {
+        state: submit_receipt_state(injection, verification_report),
+        agent_type: verification_report.and_then(|report| report.agent_type.clone()),
+        profile_id: verification_report.and_then(|report| report.profile_id.clone()),
+        profile_version: verification_report.and_then(|report| report.profile_version.clone()),
+        attempts: verification_report.map_or(1, |report| report.attempts),
+        evidence_rule_ids: submit_receipt_evidence_rule_ids(injection, verification_report),
+        elapsed_ms,
+        polls: verification_report.map_or(0, |report| report.polls),
+        cursor_before: verification_report.and_then(|report| report.cursor_before.clone()),
+        cursor_after: verification_report.and_then(|report| report.cursor_after.clone()),
+        idempotency_key: crate::robot_idempotency::send_text_key(pane_id, original_text)
+            .to_string(),
+    }
 }
 
 /// Classify the post-send terminal state using a data-driven submit profile.
@@ -441,7 +501,10 @@ fn capture_tail(text: &str) -> &str {
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    &text[start..]
+    match text.get(start..) {
+        Some(tail) => tail,
+        None => "",
+    }
 }
 
 fn extract_verification_canary(command_text: &str) -> Option<&str> {
@@ -451,8 +514,8 @@ fn extract_verification_canary(command_text: &str) -> Option<&str> {
     if marker_end != command_text.len() {
         return None;
     }
-    let marker = &command_text[marker_start..marker_end];
-    let digest = &marker[VERIFIED_SUBMIT_CANARY_PREFIX.len()..];
+    let marker = command_text.get(marker_start..marker_end)?;
+    let digest = marker.get(VERIFIED_SUBMIT_CANARY_PREFIX.len()..)?;
     digest
         .chars()
         .all(|ch| ch.is_ascii_hexdigit())
@@ -481,9 +544,17 @@ fn semantic_canary_status(
         zone.semantic_type == MuxSemanticZoneKind::Input
             && zone.text.to_ascii_lowercase().contains(canary_lower)
     }) {
-        let has_later_output = snapshot.zones[input_index + 1..].iter().any(|later| {
-            later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
-        });
+        let tail_start = input_index.saturating_add(1);
+        let has_later_output =
+            snapshot
+                .zones
+                .get(tail_start..)
+                .unwrap_or(&[])
+                .iter()
+                .any(|later| {
+                    later.semantic_type == MuxSemanticZoneKind::Output
+                        && !later.text.trim().is_empty()
+                });
         return if has_later_output {
             CanarySemanticStatus::Submitted
         } else {
@@ -519,9 +590,15 @@ fn semantic_has_output_after_matching_input(
         if !zone.text.to_ascii_lowercase().contains(command_lower) {
             continue;
         }
-        return snapshot.zones[index + 1..].iter().any(|later| {
-            later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
-        });
+        let tail_start = index.saturating_add(1);
+        return snapshot
+            .zones
+            .get(tail_start..)
+            .unwrap_or(&[])
+            .iter()
+            .any(|later| {
+                later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
+            });
     }
 
     false
@@ -546,14 +623,20 @@ fn semantic_latest_input_contains_command(
         return false;
     };
 
-    let has_later_output = snapshot.zones[input_index + 1..].iter().any(|later| {
-        later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
-    });
-    !has_later_output
-        && snapshot.zones[input_index]
-            .text
-            .to_ascii_lowercase()
-            .contains(command_lower)
+    let Some(input_zone) = snapshot.zones.get(input_index) else {
+        return false;
+    };
+
+    let tail_start = input_index.saturating_add(1);
+    let has_later_output = snapshot
+        .zones
+        .get(tail_start..)
+        .unwrap_or(&[])
+        .iter()
+        .any(|later| {
+            later.semantic_type == MuxSemanticZoneKind::Output && !later.text.trim().is_empty()
+        });
+    !has_later_output && input_zone.text.to_ascii_lowercase().contains(command_lower)
 }
 
 fn capture_delta_submitted(

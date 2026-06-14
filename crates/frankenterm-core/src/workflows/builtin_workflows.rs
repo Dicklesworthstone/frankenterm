@@ -75,7 +75,7 @@ fn render_compaction_prompt(
     ];
 
     for (key, value) in replacements {
-        let token = format!("{{{{{key}}}}}");
+        let token = format!("{{{{{key}}}}}"); // ubs:ignore - placeholder token syntax, not a secret.
         if rendered.contains(&token) {
             let redacted = redactor.redact(&value);
             let clipped = truncate_to_len(&redacted, max_snippet_len);
@@ -93,6 +93,26 @@ fn truncate_to_len(value: &str, max_len: usize) -> String {
     }
 
     value.chars().take(max_len).collect()
+}
+
+fn verified_submit_step_result(workflow_name: &str, submit: WorkflowVerifiedSubmit) -> StepResult {
+    match submit.receipt.state {
+        crate::robot_types::SubmitReceiptState::Submitted
+        | crate::robot_types::SubmitReceiptState::QueuedBehindOperation => StepResult::cont(),
+        state => {
+            let evidence = if submit.receipt.evidence_rule_ids.is_empty() {
+                "none".to_string()
+            } else {
+                submit.receipt.evidence_rule_ids.join(",")
+            };
+            StepResult::abort(format!(
+                "{workflow_name}: verified submit failed: state={}, idempotency_key={}, evidence={}",
+                state.as_str(),
+                submit.receipt.idempotency_key,
+                evidence
+            ))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -454,6 +474,11 @@ impl Workflow for HandleCompaction {
             None
         };
         let has_injector = ctx.has_injector();
+        let ctx_for_verified_send = if step_idx == 2 {
+            Some(ctx.clone())
+        } else {
+            None
+        };
 
         // For step 3: capture trigger info
         let (tokens_before, tokens_after) = if step_idx == 3 {
@@ -554,9 +579,12 @@ impl Workflow for HandleCompaction {
                         return StepResult::abort("No injector configured for text injection");
                     }
 
-                    // Use SendText to request the runner inject the prompt.
-                    // The runner will call the policy-gated injector and abort if denied.
-                    StepResult::send_text(prompt)
+                    let mut submit_ctx =
+                        ctx_for_verified_send.expect("step 2 captures workflow context");
+                    match submit_ctx.send_verified(&prompt).await {
+                        Ok(submit) => verified_submit_step_result("handle_compaction", submit),
+                        Err(reason) => StepResult::abort(reason),
+                    }
                 }
 
                 // Step 3: Verify the send (best-effort)
@@ -818,7 +846,11 @@ fn strip_utc_zone_marker(text: &str) -> Option<&str> {
         }
     }
     if let Some(stripped) = trimmed.strip_suffix(['Z', 'z']) {
-        if stripped.chars().last().is_some_and(|ch| ch.is_ascii_digit()) {
+        if stripped
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_ascii_digit())
+        {
             return Some(stripped);
         }
     }
@@ -911,12 +943,10 @@ fn normalize_time_of_day_text(text: &str) -> Option<String> {
 }
 
 fn normalize_meridiem_time_text(time: &str, suffix: &str) -> Option<String> {
-    let (hour_text, minute_text) = time
-        .split_once(':')
-        .map_or_else(
-            || (time.trim(), None),
-            |(hour, minute)| (hour.trim(), Some(minute.trim())),
-        );
+    let (hour_text, minute_text) = time.split_once(':').map_or_else(
+        || (time.trim(), None),
+        |(hour, minute)| (hour.trim(), Some(minute.trim())),
+    );
     let hour = hour_text.parse::<u32>().ok()?;
     if !(1..=12).contains(&hour) {
         return None;
@@ -1663,6 +1693,73 @@ mod tests {
         assert_eq!(steps[1].name, "stabilize");
         assert_eq!(steps[2].name, "send_prompt");
         assert_eq!(steps[3].name, "verify_send");
+    }
+
+    fn workflow_submit_with_state(
+        state: crate::robot_types::SubmitReceiptState,
+    ) -> WorkflowVerifiedSubmit {
+        WorkflowVerifiedSubmit {
+            injection: crate::policy::InjectionResult::Allowed {
+                decision: crate::policy::PolicyDecision::allow_with_rule("policy.allow"),
+                summary: "send_text".to_string(),
+                pane_id: 42,
+                action: crate::policy::ActionKind::SendText,
+                audit_action_id: Some(7),
+            },
+            receipt: crate::robot_types::SubmitReceipt {
+                state,
+                agent_type: Some("codex".to_string()),
+                profile_id: Some("codex.default".to_string()),
+                profile_version: Some("2026-06-08".to_string()),
+                attempts: 1,
+                evidence_rule_ids: vec![format!("submit_profile:codex.default:{}", state.as_str())],
+                elapsed_ms: 12,
+                polls: 1,
+                cursor_before: Some("pane:42:capture:sha256:before".to_string()),
+                cursor_after: Some("pane:42:capture:sha256:after".to_string()),
+                idempotency_key: "rk:test-submit".to_string(),
+            },
+            verification_report: None,
+        }
+    }
+
+    #[test]
+    fn verified_submit_step_result_continues_for_delivered_states() {
+        assert!(
+            verified_submit_step_result(
+                "handle_compaction",
+                workflow_submit_with_state(crate::robot_types::SubmitReceiptState::Submitted),
+            )
+            .is_continue()
+        );
+        assert!(
+            verified_submit_step_result(
+                "handle_compaction",
+                workflow_submit_with_state(
+                    crate::robot_types::SubmitReceiptState::QueuedBehindOperation,
+                ),
+            )
+            .is_continue()
+        );
+    }
+
+    #[test]
+    fn verified_submit_step_result_aborts_stuck_composer_with_typed_state() {
+        let result = verified_submit_step_result(
+            "handle_compaction",
+            workflow_submit_with_state(crate::robot_types::SubmitReceiptState::StuckInComposer),
+        );
+
+        assert!(
+            matches!(result, StepResult::Abort { .. }),
+            "expected typed abort for stuck composer"
+        );
+        if let StepResult::Abort { reason } = result {
+            assert!(reason.contains("handle_compaction"));
+            assert!(reason.contains("stuck_in_composer"));
+            assert!(reason.contains("rk:test-submit"));
+            assert!(reason.contains("submit_profile:codex.default:stuck_in_composer"));
+        }
     }
 
     #[test]

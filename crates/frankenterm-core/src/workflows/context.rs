@@ -84,6 +84,13 @@ pub struct WorkflowContext {
     action_plan: Option<crate::plan::ActionPlan>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkflowVerifiedSubmit {
+    pub injection: crate::policy::InjectionResult,
+    pub receipt: crate::robot_types::SubmitReceipt,
+    pub verification_report: Option<crate::verified_submit::VerifiedSubmitReport>,
+}
+
 impl WorkflowContext {
     /// Create a new workflow context
     #[must_use]
@@ -247,6 +254,100 @@ impl WorkflowContext {
         Ok(result)
     }
 
+    pub async fn send_verified(
+        &mut self,
+        text: &str,
+    ) -> Result<WorkflowVerifiedSubmit, &'static str> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_verified_with_cx(&cx, text).await
+    }
+
+    pub async fn send_verified_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        text: &str,
+    ) -> Result<WorkflowVerifiedSubmit, &'static str> {
+        let injector = self
+            .injector
+            .as_ref()
+            .ok_or("No injector configured")?
+            .clone();
+        let pane_id = self.pane_id;
+        let capabilities = self.capabilities.clone();
+        let execution_id = self.execution_id.clone();
+        let storage = Arc::clone(&self.storage);
+        let agent_type = self.submit_agent_type();
+        let submit_profile = crate::patterns::PatternEngine::new()
+            .submit_profile_for_agent(agent_type)
+            .cloned();
+        let before_text = if submit_profile.is_some() {
+            capture_verified_submit_text(cx, pane_id).await
+        } else {
+            None
+        };
+        let outbound_text = if submit_profile.is_some() && !text.trim().is_empty() {
+            crate::verified_submit::append_verification_canary(pane_id, text)
+        } else {
+            text.to_string()
+        };
+
+        let start = Instant::now();
+        let injection = injector
+            .send_text(
+                cx,
+                pane_id,
+                &outbound_text,
+                crate::policy::ActorKind::Workflow,
+                &capabilities,
+                Some(&execution_id),
+            )
+            .await;
+
+        let verification_report =
+            if matches!(&injection, crate::policy::InjectionResult::Allowed { .. }) {
+                let (after_text, after_semantic_snapshot) = if submit_profile.is_some() {
+                    let _ =
+                        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(120)).await;
+                    (
+                        capture_verified_submit_text(cx, pane_id).await,
+                        capture_verified_submit_semantic_snapshot(cx, pane_id).await,
+                    )
+                } else {
+                    (None, None)
+                };
+                Some(crate::verified_submit::classify_verified_submit(
+                    crate::verified_submit::VerifiedSubmitInput {
+                        pane_id,
+                        command_text: &outbound_text,
+                        agent_type,
+                        profile: submit_profile.as_ref(),
+                        before_text: before_text.as_deref(),
+                        after_text: after_text.as_deref(),
+                        after_semantic_snapshot: after_semantic_snapshot.as_ref(),
+                        attempts: 1,
+                        polls: 1,
+                    },
+                ))
+            } else {
+                None
+            };
+
+        let receipt = crate::verified_submit::build_submit_receipt(
+            pane_id,
+            text,
+            &injection,
+            verification_report.as_ref(),
+            elapsed_ms(start),
+        );
+        persist_verified_submit_receipt(cx, &storage, &injection, &receipt).await;
+
+        Ok(WorkflowVerifiedSubmit {
+            injection,
+            receipt,
+            verification_report,
+        })
+    }
+
     /// Send Ctrl-C (interrupt) to the target pane via policy-gated injection.
     ///
     /// See [`send_text`](Self::send_text) for lock safety rationale.
@@ -397,6 +498,107 @@ impl WorkflowContext {
     #[must_use]
     pub fn workspace_id(&self) -> Option<&str> {
         self.action_plan.as_ref().map(|p| p.workspace_id.as_str())
+    }
+
+    fn submit_agent_type(&self) -> crate::patterns::AgentType {
+        self.trigger()
+            .and_then(|trigger| trigger.get("agent_type"))
+            .and_then(|value| value.as_str())
+            .map_or(crate::patterns::AgentType::Unknown, |value| match value {
+                "codex" => crate::patterns::AgentType::Codex,
+                "claude_code" => crate::patterns::AgentType::ClaudeCode,
+                "gemini" => crate::patterns::AgentType::Gemini,
+                _ => crate::patterns::AgentType::Unknown,
+            })
+    }
+}
+
+async fn capture_verified_submit_text(cx: &crate::cx::Cx, pane_id: u64) -> Option<String> {
+    match default_wezterm_handle()
+        .get_text_with_cx(cx, pane_id, false)
+        .await
+    {
+        Ok(text) => Some(text),
+        Err(error) => {
+            tracing::debug!(
+                pane_id,
+                %error,
+                "workflow verified-submit text capture unavailable"
+            );
+            None
+        }
+    }
+}
+
+async fn capture_verified_submit_semantic_snapshot(
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+) -> Option<crate::wezterm::MuxSemanticSnapshot> {
+    match default_wezterm_handle()
+        .get_semantic_zones_with_cx(cx, pane_id)
+        .await
+    {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            tracing::debug!(
+                pane_id,
+                %error,
+                "workflow verified-submit semantic capture unavailable"
+            );
+            None
+        }
+    }
+}
+
+async fn persist_verified_submit_receipt(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    injection: &crate::policy::InjectionResult,
+    receipt: &crate::robot_types::SubmitReceipt,
+) {
+    let Some(audit_action_id) = injection.audit_action_id() else {
+        tracing::debug!(
+            idempotency_key = %receipt.idempotency_key,
+            "workflow verified-submit receipt has no audit action id to attach"
+        );
+        return;
+    };
+    let summary = match serde_json::to_string(receipt) {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                idempotency_key = %receipt.idempotency_key,
+                "failed to serialize workflow verified-submit receipt"
+            );
+            return;
+        }
+    };
+    match storage
+        .update_audit_action_submit_receipt_with_cx(
+            cx,
+            audit_action_id,
+            receipt.idempotency_key.clone(),
+            summary,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                audit_action_id,
+                idempotency_key = %receipt.idempotency_key,
+                "workflow verified-submit audit row not found for receipt attach"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                audit_action_id,
+                idempotency_key = %receipt.idempotency_key,
+                %error,
+                "failed to attach workflow verified-submit receipt"
+            );
+        }
     }
 }
 
