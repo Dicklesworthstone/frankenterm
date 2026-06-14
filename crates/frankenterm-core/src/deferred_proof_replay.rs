@@ -16,13 +16,15 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::proof_intent::{ProofIntentQueueEntry, ProofScope};
+
 pub const DEFERRED_PROOF_REPLAY_DECISION_CONTRACT_ID: &str =
     "ft.deferred_proof_replay_harness.decision.v1";
 pub const DEFERRED_PROOF_REPLAY_ATTEMPT_CONTRACT_ID: &str = "ft.deferred_proof_replay_attempt.v1";
 pub const DEFERRED_PROOF_REPLAY_SCHEMA_VERSION: u16 = 1;
 
-const SHAPE_RCH_NO_SELF_HEALING: &str = "rch-no-self-healing-v1";
-const SHAPE_STATIC_VERIFIER: &str = "static-verifier-v1";
+pub const SHAPE_RCH_NO_SELF_HEALING: &str = "rch-no-self-healing-v1";
+pub const SHAPE_STATIC_VERIFIER: &str = "static-verifier-v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredProofReceipt {
@@ -584,6 +586,60 @@ pub fn select_next_remote_receipt(
 }
 
 #[must_use]
+pub fn deferred_receipt_from_proof_intent_queue_entry(
+    entry: &ProofIntentQueueEntry,
+    rch_admission_state: Option<&str>,
+) -> DeferredProofReceipt {
+    let package = match &entry.intent.scope {
+        ProofScope::Package { package } => Some(package.clone()),
+        ProofScope::Workspace => None,
+    };
+    DeferredProofReceipt {
+        bead_id: entry.intent.bead_id.clone().unwrap_or_default(),
+        receipt_id: entry.intent.intent_id.clone(),
+        source: Some(DeferredProofSource {
+            source_text_sha256: Some(entry.intent.source_hash.clone()),
+            ..Default::default()
+        }),
+        command: DeferredProofCommand {
+            command_shape_version: if entry.intent.required_remote {
+                SHAPE_RCH_NO_SELF_HEALING.to_string()
+            } else {
+                SHAPE_STATIC_VERIFIER.to_string()
+            },
+            argv: entry.command_argv.clone(),
+            env: entry
+                .command_env
+                .iter()
+                .map(|env| DeferredProofEnvVar {
+                    name: env.name.clone(),
+                    value: env.value.clone(),
+                })
+                .collect(),
+            target_dir: entry.target_dir.clone(),
+            material_remote_required: entry.intent.required_remote,
+            ..Default::default()
+        },
+        proof: DeferredProofProof {
+            expected_kind: Some(entry.intent.kind.as_str().to_string()),
+            package,
+            material_cargo_required: entry.intent.required_remote,
+            evidence_classification: Some("deferred".to_string()),
+            ..Default::default()
+        },
+        coordination: DeferredProofCoordination {
+            rch_admission_state: Some(
+                rch_admission_state
+                    .unwrap_or(&entry.rch_admission_state)
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[must_use]
 pub fn build_live_attempt_record(
     receipt: &DeferredProofReceipt,
     output: &DeferredProofProcessOutput,
@@ -960,6 +1016,10 @@ fn path_to_string(path: PathBuf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proof_intent::{
+        ProofIntent, ProofIntentEnvVar, ProofIntentQueueEntry, ProofKind, ProofRedactionPolicy,
+        ProofScope,
+    };
 
     fn env(name: &str, value: &str) -> DeferredProofEnvVar {
         DeferredProofEnvVar {
@@ -1032,6 +1092,53 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn queued_intent_entry(admission_state: &str) -> ProofIntentQueueEntry {
+        let intent = ProofIntent::new(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-queued-proof-target cargo test -p frankenterm-core --lib proof_intent",
+            ProofScope::Package {
+                package: "frankenterm-core".to_string(),
+            },
+            ProofKind::Test,
+            "sha256:queued-tree",
+            None,
+            true,
+            Some("ft-queued".to_string()),
+            None,
+            ProofRedactionPolicy::Standard,
+            1_704_000_000_000,
+        );
+        ProofIntentQueueEntry::new(
+            intent,
+            vec![
+                "rch".to_string(),
+                "--no-self-healing".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "env".to_string(),
+                "CARGO_TARGET_DIR=/tmp/ft-queued-proof-target".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "frankenterm-core".to_string(),
+                "--lib".to_string(),
+                "proof_intent".to_string(),
+            ],
+            vec![
+                ProofIntentEnvVar {
+                    name: "RCH_REQUIRE_REMOTE".to_string(),
+                    value: "1".to_string(),
+                },
+                ProofIntentEnvVar {
+                    name: "RCH_NO_SELF_HEALING".to_string(),
+                    value: "1".to_string(),
+                },
+            ],
+            Some("/tmp/ft-queued-proof-target".to_string()),
+            admission_state,
+            1_704_000_000_000,
+        )
     }
 
     #[derive(Debug, Clone)]
@@ -1123,6 +1230,28 @@ mod tests {
         assert!(record.local_fallback_detected);
         assert!(!record.remote_cargo_reached);
         assert_eq!(record.blockers, vec!["rch.local_fallback"]);
+    }
+
+    #[test]
+    fn queued_intent_receipt_respects_admission_state() {
+        let deferred = queued_intent_entry("wait_rch");
+        let deferred_receipt = deferred_receipt_from_proof_intent_queue_entry(&deferred, None);
+        let deferred_record = decision_record(&deferred_receipt);
+        assert_eq!(
+            deferred_record.decision,
+            DeferredProofReplayDecision::DeferRemoteBlocked
+        );
+        assert_eq!(deferred_record.blockers, vec!["rch.worker_pressure"]);
+
+        let admitted_receipt =
+            deferred_receipt_from_proof_intent_queue_entry(&deferred, Some("admitted"));
+        let admitted_record = decision_record(&admitted_receipt);
+        assert_eq!(
+            admitted_record.decision,
+            DeferredProofReplayDecision::WouldRunRemote
+        );
+        assert!(admitted_record.blockers.is_empty());
+        assert!(!admitted_record.replay_allowed_now);
     }
 
     #[test]

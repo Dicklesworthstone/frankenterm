@@ -29,6 +29,11 @@ use frankenterm_core::context_horizon::{
     ContextHorizonFailureClass, ContextHorizonReport, context_horizon_unavailable_report,
     predict_context_horizon_from_sqlite,
 };
+use frankenterm_core::deferred_proof_replay::{
+    DeferredProofReplayAttemptOutcome, DeferredProofReplayDecision,
+    DeferredProofReplayDecisionRecord, DeferredProofReplayRunner, decision_record,
+    deferred_receipt_from_proof_intent_queue_entry,
+};
 use frankenterm_core::demo_scenarios::{DemoScenarioManifest, DemoScenarioSpec};
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
 #[cfg(test)]
@@ -53,6 +58,12 @@ use frankenterm_core::proof_doctor::{
     merge_proof_doctor_artifact_json,
 };
 use frankenterm_core::proof_handoff::build_proof_handoff;
+use frankenterm_core::proof_intent::{
+    ProofIntent, ProofIntentAttachedReceipt, ProofIntentEnvVar, ProofIntentQueueEntry,
+    ProofIntentReplayAttemptRef, ProofKind as ProofIntentKind,
+    ProofRedactionPolicy as ProofIntentRedactionPolicy, ProofScope as ProofIntentScope,
+    load_proof_intent_queue, queue_proof_intent, update_proof_intent_queue_entry,
+};
 use frankenterm_core::proof_lane::{
     ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofCloseoutLintArtifact,
     ProofCloseoutLintInput, ProofFindingSeverity, ProofHistoryArtifactInput, ProofHistoryIndex,
@@ -1174,6 +1185,23 @@ NOTES:
         /// Output format: plain, json, or toon
         #[arg(long, short = 'f', default_value = "plain")]
         format: String,
+    },
+
+    /// Queue, inspect, replay, or attach deferred remote proof intents
+    #[command(after_help = r#"EXAMPLES:
+    ft proof queue --bead ft-w8 --kind test --package frankenterm-core -- RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-w8-target cargo test -p frankenterm-core --lib proof_intent
+    ft proof status --format json
+    ft proof replay --admission-state admitted --artifact-dir .ft/proof-attempts --dry-run
+    ft proof attach proof:abc123 --receipt .ft/proof-attempts/proof_abc123.attempt.json
+
+NOTES:
+    This queue is fail-closed. Status and dry-run replay never substitute local
+    Cargo for a remote-required proof. Live replay only executes a canonical
+    remote-only RCH command when admission is explicitly `admitted` and the
+    queued source hash still matches the live tree."#)]
+    Proof {
+        #[command(subcommand)]
+        command: ProofCommands,
     },
 
     /// Generate a diagnostic bundle for bug reports
@@ -3099,6 +3127,120 @@ SEE ALSO:
 }
 
 #[derive(Subcommand)]
+enum ProofCommands {
+    /// Add a proof intent to the durable deferred queue
+    Queue {
+        /// Queue JSONL path (default: .ft/proof-intents.jsonl)
+        #[arg(long = "queue-file", value_name = "PATH")]
+        queue_file: Option<PathBuf>,
+
+        /// Bead whose proof this intent supports
+        #[arg(long)]
+        bead: Option<String>,
+
+        /// Cargo package scope; omitted means workspace-wide
+        #[arg(long)]
+        package: Option<String>,
+
+        /// Proof kind produced by the command
+        #[arg(long, value_enum, default_value = "test")]
+        kind: ProofIntentKindArg,
+
+        /// Source hash override; defaults to a live git source hash
+        #[arg(long = "source-hash")]
+        source_hash: Option<String>,
+
+        /// Expected proof artifact path, if any
+        #[arg(long = "expected-artifact", value_name = "PATH")]
+        expected_artifact: Option<String>,
+
+        /// Attestation slot this proof feeds, if any
+        #[arg(long = "attestation-slot")]
+        attestation_slot: Option<String>,
+
+        /// Redaction policy for captured proof output
+        #[arg(long = "redaction-policy", value_enum, default_value = "standard")]
+        redaction_policy: ProofIntentRedactionPolicyArg,
+
+        /// Captured RCH admission state; defaults to wait_rch (deferred)
+        #[arg(long = "admission-state", default_value = "wait_rch")]
+        admission_state: String,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
+
+        /// Intended proof command argv. Use `--` before the command.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Show queued proof intents and replay eligibility
+    Status {
+        /// Queue JSONL path (default: .ft/proof-intents.jsonl)
+        #[arg(long = "queue-file", value_name = "PATH")]
+        queue_file: Option<PathBuf>,
+
+        /// Source hash override; defaults to a live git source hash
+        #[arg(long = "source-hash")]
+        source_hash: Option<String>,
+
+        /// Override RCH admission state for classification
+        #[arg(long = "admission-state")]
+        admission_state: Option<String>,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
+    },
+
+    /// Replay one eligible remote proof intent
+    Replay {
+        /// Queue JSONL path (default: .ft/proof-intents.jsonl)
+        #[arg(long = "queue-file", value_name = "PATH")]
+        queue_file: Option<PathBuf>,
+
+        /// Source hash override; defaults to a live git source hash
+        #[arg(long = "source-hash")]
+        source_hash: Option<String>,
+
+        /// Current operating-envelope/RCH admission state
+        #[arg(long = "admission-state")]
+        admission_state: Option<String>,
+
+        /// Directory for retained replay attempt artifacts
+        #[arg(long = "artifact-dir", value_name = "DIR")]
+        artifact_dir: Option<PathBuf>,
+
+        /// Classify and select without executing RCH
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
+    },
+
+    /// Attach an explicit proof receipt to a queued intent
+    Attach {
+        /// Intent id to attach against
+        intent_id: String,
+
+        /// Queue JSONL path (default: .ft/proof-intents.jsonl)
+        #[arg(long = "queue-file", value_name = "PATH")]
+        queue_file: Option<PathBuf>,
+
+        /// Retained receipt or attempt record path
+        #[arg(long, value_name = "PATH")]
+        receipt: String,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum FtsCommands {
     /// Verify FTS index integrity and consistency
     Verify,
@@ -3802,6 +3944,30 @@ enum RobotCommands {
         /// Number of matching rows to skip.
         #[arg(long, default_value_t = 0)]
         offset: usize,
+    },
+
+    /// Read deferred proof queue status
+    Proof {
+        #[command(subcommand)]
+        command: RobotProofCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum RobotProofCommands {
+    /// Show queued proof intents and replay eligibility
+    Status {
+        /// Queue JSONL path (default: .ft/proof-intents.jsonl)
+        #[arg(long = "queue-file", value_name = "PATH")]
+        queue_file: Option<PathBuf>,
+
+        /// Source hash override; defaults to a live git source hash
+        #[arg(long = "source-hash")]
+        source_hash: Option<String>,
+
+        /// Override RCH admission state for classification
+        #[arg(long = "admission-state")]
+        admission_state: Option<String>,
     },
 }
 
@@ -6302,6 +6468,26 @@ enum ProofDoctorBackendArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
+enum ProofIntentKindArg {
+    Test,
+    Check,
+    Clippy,
+    Fmt,
+    Schema,
+    Fuzz,
+    Replay,
+    Attestation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ProofIntentRedactionPolicyArg {
+    Standard,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 enum ProofHistoryStatusArg {
     NotRun,
     ReachedRemoteCargo,
@@ -7193,6 +7379,28 @@ fn proof_doctor_backend(required_backend: ProofDoctorBackendArg) -> ProofBackend
     }
 }
 
+fn proof_intent_kind(kind: ProofIntentKindArg) -> ProofIntentKind {
+    match kind {
+        ProofIntentKindArg::Test => ProofIntentKind::Test,
+        ProofIntentKindArg::Check => ProofIntentKind::Check,
+        ProofIntentKindArg::Clippy => ProofIntentKind::Clippy,
+        ProofIntentKindArg::Fmt => ProofIntentKind::Fmt,
+        ProofIntentKindArg::Schema => ProofIntentKind::Schema,
+        ProofIntentKindArg::Fuzz => ProofIntentKind::Fuzz,
+        ProofIntentKindArg::Replay => ProofIntentKind::Replay,
+        ProofIntentKindArg::Attestation => ProofIntentKind::Attestation,
+    }
+}
+
+fn proof_intent_redaction_policy(
+    redaction_policy: ProofIntentRedactionPolicyArg,
+) -> ProofIntentRedactionPolicy {
+    match redaction_policy {
+        ProofIntentRedactionPolicyArg::Standard => ProofIntentRedactionPolicy::Standard,
+        ProofIntentRedactionPolicyArg::Strict => ProofIntentRedactionPolicy::Strict,
+    }
+}
+
 fn proof_history_status(status: ProofHistoryStatusArg) -> ProofState {
     match status {
         ProofHistoryStatusArg::NotRun => ProofState::NotRun,
@@ -8013,6 +8221,559 @@ fn proof_history_sha256_hex(bytes: &[u8]) -> String {
 
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
+}
+
+#[derive(Debug, Clone)]
+struct ProofCommandMetadata {
+    display_command: String,
+    argv: Vec<String>,
+    env: Vec<ProofIntentEnvVar>,
+    target_dir: Option<String>,
+}
+
+fn default_proof_queue_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".ft").join("proof-intents.jsonl")
+}
+
+fn default_proof_attempt_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".ft").join("proof-attempts")
+}
+
+fn resolve_proof_queue_path(workspace_root: &Path, queue_file: Option<&PathBuf>) -> PathBuf {
+    match queue_file {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => workspace_root.join(path),
+        None => default_proof_queue_path(workspace_root),
+    }
+}
+
+fn resolve_proof_attempt_dir(workspace_root: &Path, artifact_dir: Option<&PathBuf>) -> PathBuf {
+    match artifact_dir {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => workspace_root.join(path),
+        None => default_proof_attempt_dir(workspace_root),
+    }
+}
+
+fn proof_queue_display_path(workspace_root: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn proof_live_source_hash(workspace_root: &Path) -> String {
+    let mut bytes = Vec::new();
+    for args in [
+        ["rev-parse", "HEAD"].as_slice(),
+        ["status", "--porcelain=v1"].as_slice(),
+        ["diff", "--no-ext-diff", "--binary"].as_slice(),
+        ["diff", "--cached", "--no-ext-diff", "--binary"].as_slice(),
+    ] {
+        bytes.extend_from_slice(args.join(" ").as_bytes());
+        bytes.push(0);
+        match proof_git_output_bytes(workspace_root, args) {
+            Ok(output) => bytes.extend_from_slice(&output),
+            Err(error) => bytes.extend_from_slice(error.as_bytes()),
+        }
+        bytes.push(0);
+    }
+    format!("sha256:{}", proof_history_sha256_hex(&bytes))
+}
+
+fn proof_git_output_bytes(workspace_root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn proof_command_metadata(command: &[String]) -> ProofCommandMetadata {
+    let mut env = Vec::new();
+    let mut argv_start = 0;
+    while let Some(token) = command.get(argv_start) {
+        let Some((name, value)) = split_env_assignment(token) else {
+            break;
+        };
+        env.push(ProofIntentEnvVar { name, value });
+        argv_start += 1;
+    }
+
+    ProofCommandMetadata {
+        display_command: shell_join_for_display(command),
+        argv: command[argv_start..].to_vec(),
+        env,
+        target_dir: extract_proof_command_target_dir(command),
+    }
+}
+
+fn split_env_assignment(token: &str) -> Option<(String, String)> {
+    let (name, value) = token.split_once('=')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return None;
+    }
+    Some((name.to_string(), value.to_string()))
+}
+
+fn shell_join_for_display(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| {
+            if arg.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '=' | ':')
+            }) {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_proof_command_target_dir(command: &[String]) -> Option<String> {
+    for token in command {
+        if let Some(value) = token.strip_prefix("CARGO_TARGET_DIR=") {
+            return Some(value.to_string());
+        }
+    }
+
+    command.windows(2).find_map(|window| {
+        if window[0] == "--target-dir" {
+            Some(window[1].clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn infer_proof_command_package(command: &[String]) -> Option<String> {
+    for token in command {
+        if let Some(package) = token.strip_prefix("--package=") {
+            return Some(package.to_string());
+        }
+    }
+    command.windows(2).find_map(|window| {
+        if matches!(window[0].as_str(), "-p" | "--package") {
+            Some(window[1].clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn proof_intent_scope(package: Option<String>, command: &[String]) -> ProofIntentScope {
+    package
+        .or_else(|| infer_proof_command_package(command))
+        .map_or(ProofIntentScope::Workspace, |package| {
+            ProofIntentScope::Package { package }
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_proof_queue_payload(
+    queue_file: Option<&PathBuf>,
+    bead: Option<String>,
+    package: Option<String>,
+    kind: ProofIntentKindArg,
+    source_hash: Option<String>,
+    expected_artifact: Option<String>,
+    attestation_slot: Option<String>,
+    redaction_policy: ProofIntentRedactionPolicyArg,
+    admission_state: String,
+    command: Vec<String>,
+    workspace_root: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let queue_path = resolve_proof_queue_path(workspace_root, queue_file);
+    let metadata = proof_command_metadata(&command);
+    let captured_source_hash =
+        source_hash.unwrap_or_else(|| proof_live_source_hash(workspace_root));
+    let now = now_ms() as i64;
+    let intent = ProofIntent::new(
+        metadata.display_command.clone(),
+        proof_intent_scope(package, &command),
+        proof_intent_kind(kind),
+        captured_source_hash,
+        expected_artifact,
+        true,
+        bead,
+        attestation_slot,
+        proof_intent_redaction_policy(redaction_policy),
+        now,
+    );
+    let entry = ProofIntentQueueEntry::new(
+        intent,
+        metadata.argv,
+        metadata.env,
+        metadata.target_dir,
+        admission_state,
+        now,
+    );
+    let mutation = queue_proof_intent(&queue_path, entry)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "contract_id": "ft.proof_queue.queue.v1",
+        "operation": "queue",
+        "queue_file": proof_queue_display_path(workspace_root, &queue_path),
+        "created": mutation.created,
+        "queue_len": mutation.queue_len,
+        "entry": mutation.entry,
+    }))
+}
+
+fn proof_status_row(
+    entry: &ProofIntentQueueEntry,
+    live_source_hash: &str,
+    admission_state: Option<&str>,
+) -> serde_json::Value {
+    let stale = entry.is_stale(live_source_hash);
+    let record = if stale {
+        None
+    } else {
+        let receipt = deferred_receipt_from_proof_intent_queue_entry(entry, admission_state);
+        Some(decision_record(&receipt))
+    };
+    let status = proof_status_label(stale, entry, record.as_ref());
+
+    serde_json::json!({
+        "intent_id": entry.intent.intent_id.clone(),
+        "bead_id": entry.intent.bead_id.clone(),
+        "kind": entry.intent.kind.as_str(),
+        "scope": entry.intent.scope.clone(),
+        "source_hash": entry.intent.source_hash.clone(),
+        "source_state": if stale { "stale" } else { "current" },
+        "status": status,
+        "rch_admission_state": admission_state.unwrap_or(&entry.rch_admission_state),
+        "decision": record.as_ref().map(|record| record.decision.as_str()),
+        "blockers": record.as_ref().map_or_else(Vec::new, |record| record.blockers.clone()),
+        "replay_allowed_now": record
+            .as_ref()
+            .is_some_and(|record| record.decision == DeferredProofReplayDecision::WouldRunRemote),
+        "target_dir": entry.target_dir.clone(),
+        "command": entry.intent.command.clone(),
+        "attempt_count": entry.replay_attempts.len(),
+        "attached_receipt_count": entry.attached_receipts.len(),
+        "latest_attempt": entry.replay_attempts.last(),
+        "latest_attached_receipt": entry.attached_receipts.last(),
+    })
+}
+
+fn proof_status_label(
+    stale: bool,
+    entry: &ProofIntentQueueEntry,
+    record: Option<&DeferredProofReplayDecisionRecord>,
+) -> &'static str {
+    if stale {
+        return "stale_source";
+    }
+    if !entry.attached_receipts.is_empty() {
+        return "attached";
+    }
+    match record.map(|record| record.decision) {
+        Some(DeferredProofReplayDecision::WouldRunRemote) => "replayable",
+        Some(DeferredProofReplayDecision::RunStaticNow) => "static_runnable",
+        Some(
+            DeferredProofReplayDecision::DeferRemoteBlocked
+            | DeferredProofReplayDecision::DeferDirtyOverlap
+            | DeferredProofReplayDecision::DeferPrerequisite,
+        ) => "deferred",
+        Some(
+            DeferredProofReplayDecision::Cancelled
+            | DeferredProofReplayDecision::RejectStaleCommand
+            | DeferredProofReplayDecision::RejectNonRemoteCommand,
+        ) => "blocked",
+        Some(DeferredProofReplayDecision::RequestTriage) | None => "triage",
+    }
+}
+
+fn build_proof_status_payload(
+    queue_file: Option<&PathBuf>,
+    source_hash: Option<String>,
+    admission_state: Option<String>,
+    workspace_root: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let queue_path = resolve_proof_queue_path(workspace_root, queue_file);
+    let live_source_hash = source_hash.unwrap_or_else(|| proof_live_source_hash(workspace_root));
+    let entries = load_proof_intent_queue(&queue_path)?;
+    let rows = entries
+        .iter()
+        .map(|entry| proof_status_row(entry, &live_source_hash, admission_state.as_deref()))
+        .collect::<Vec<_>>();
+    let mut counts = BTreeMap::<String, usize>::new();
+    for row in &rows {
+        if let Some(status) = row.get("status").and_then(serde_json::Value::as_str) {
+            *counts.entry(status.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "contract_id": "ft.proof_queue.status.v1",
+        "operation": "status",
+        "queue_file": proof_queue_display_path(workspace_root, &queue_path),
+        "live_source_hash": live_source_hash,
+        "admission_state_override": admission_state,
+        "counts": counts,
+        "entries": rows,
+    }))
+}
+
+fn proof_current_remote_receipts(
+    entries: &[ProofIntentQueueEntry],
+    live_source_hash: &str,
+    admission_state: Option<&str>,
+) -> Vec<frankenterm_core::deferred_proof_replay::DeferredProofReceipt> {
+    entries
+        .iter()
+        .filter(|entry| !entry.is_stale(live_source_hash))
+        .map(|entry| deferred_receipt_from_proof_intent_queue_entry(entry, admission_state))
+        .collect()
+}
+
+fn select_remote_replay_record(
+    records: &[DeferredProofReplayDecisionRecord],
+) -> Option<&DeferredProofReplayDecisionRecord> {
+    records
+        .iter()
+        .filter(|record| record.decision == DeferredProofReplayDecision::WouldRunRemote)
+        .min_by(|left, right| {
+            left.bead_id
+                .cmp(&right.bead_id)
+                .then_with(|| left.receipt_id.cmp(&right.receipt_id))
+        })
+}
+
+fn build_proof_replay_payload(
+    queue_file: Option<&PathBuf>,
+    source_hash: Option<String>,
+    admission_state: Option<String>,
+    artifact_dir: Option<&PathBuf>,
+    dry_run: bool,
+    workspace_root: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let queue_path = resolve_proof_queue_path(workspace_root, queue_file);
+    let attempt_dir = resolve_proof_attempt_dir(workspace_root, artifact_dir);
+    let live_source_hash = source_hash.unwrap_or_else(|| proof_live_source_hash(workspace_root));
+    let entries = load_proof_intent_queue(&queue_path)?;
+    let receipts =
+        proof_current_remote_receipts(&entries, &live_source_hash, admission_state.as_deref());
+    let records = receipts.iter().map(decision_record).collect::<Vec<_>>();
+    let selected = select_remote_replay_record(&records).cloned();
+    let can_execute = admission_state.as_deref() == Some("admitted") && selected.is_some();
+
+    if dry_run || !can_execute {
+        return Ok(serde_json::json!({
+            "schema_version": 1,
+            "contract_id": "ft.proof_queue.replay.v1",
+            "operation": "replay",
+            "dry_run": true,
+            "executed": false,
+            "queue_file": proof_queue_display_path(workspace_root, &queue_path),
+            "artifact_dir": proof_queue_display_path(workspace_root, &attempt_dir),
+            "live_source_hash": live_source_hash,
+            "admission_state": admission_state,
+            "selected": selected,
+            "records": records,
+            "note": if selected.is_some() {
+                "Replay candidate found; pass --admission-state admitted without --dry-run to execute the remote RCH command."
+            } else {
+                "No remote replay candidate is currently eligible; local Cargo fallback was not attempted."
+            },
+        }));
+    }
+
+    let attempt = DeferredProofReplayRunner::default()
+        .run_live_remote_once(&receipts, &attempt_dir)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let intent_id = attempt.receipt_id.clone();
+    let updated = update_proof_intent_queue_entry(&queue_path, &intent_id, |entry| {
+        entry.record_replay_attempt(
+            ProofIntentReplayAttemptRef {
+                attempt_record_path: attempt.attempt_record_path.clone(),
+                outcome: proof_attempt_outcome_str(attempt.outcome).to_string(),
+                remote_cargo_reached: attempt.remote_cargo_reached,
+                local_fallback_detected: attempt.local_fallback_detected,
+                recorded_at_ms: now_ms() as i64,
+            },
+            now_ms() as i64,
+        );
+    })?;
+
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "contract_id": "ft.proof_queue.replay.v1",
+        "operation": "replay",
+        "dry_run": false,
+        "executed": true,
+        "queue_file": proof_queue_display_path(workspace_root, &queue_path),
+        "artifact_dir": proof_queue_display_path(workspace_root, &attempt_dir),
+        "live_source_hash": live_source_hash,
+        "admission_state": admission_state,
+        "attempt": attempt,
+        "entry": updated,
+    }))
+}
+
+fn proof_attempt_outcome_str(outcome: DeferredProofReplayAttemptOutcome) -> &'static str {
+    match outcome {
+        DeferredProofReplayAttemptOutcome::RemoteProofPassed => "remote_proof_passed",
+        DeferredProofReplayAttemptOutcome::RemoteProofFailed => "remote_proof_failed",
+        DeferredProofReplayAttemptOutcome::BlockedLocalFallback => "blocked_local_fallback",
+        DeferredProofReplayAttemptOutcome::BlockedWorkerNull => "blocked_worker_null",
+        DeferredProofReplayAttemptOutcome::BlockedNoAdmissibleWorkers => {
+            "blocked_no_admissible_workers"
+        }
+        DeferredProofReplayAttemptOutcome::BlockedExit143 => "blocked_exit_143",
+        DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout => "blocked_remote_timeout",
+        DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight => "blocked_topology_preflight",
+        DeferredProofReplayAttemptOutcome::BlockedRemoteNotConfirmed => {
+            "blocked_remote_not_confirmed"
+        }
+    }
+}
+
+fn build_proof_attach_payload(
+    queue_file: Option<&PathBuf>,
+    intent_id: String,
+    receipt: String,
+    workspace_root: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let queue_path = resolve_proof_queue_path(workspace_root, queue_file);
+    let now = now_ms() as i64;
+    let updated = update_proof_intent_queue_entry(&queue_path, &intent_id, |entry| {
+        entry.attach_receipt(
+            ProofIntentAttachedReceipt {
+                receipt_path: receipt.clone(),
+                attached_at_ms: now,
+            },
+            now,
+        );
+    })?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "contract_id": "ft.proof_queue.attach.v1",
+        "operation": "attach",
+        "queue_file": proof_queue_display_path(workspace_root, &queue_path),
+        "intent_id": intent_id,
+        "receipt": receipt,
+        "entry": updated,
+    }))
+}
+
+fn print_proof_queue_output(payload: &serde_json::Value, format: &str) -> anyhow::Result<()> {
+    let output_format = resolve_snapshot_session_output_format(format);
+    if print_snapshot_session_structured_output(payload, output_format)? {
+        return Ok(());
+    }
+    print_proof_queue_plain(payload);
+    Ok(())
+}
+
+fn print_proof_queue_plain(payload: &serde_json::Value) {
+    match payload.get("operation").and_then(serde_json::Value::as_str) {
+        Some("queue") => {
+            let created = payload
+                .get("created")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let intent_id = payload
+                .pointer("/entry/intent/intent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let queue_file = payload
+                .get("queue_file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            println!(
+                "proof queue: {} {intent_id} in {queue_file}",
+                if created { "queued" } else { "already queued" }
+            );
+        }
+        Some("status") => {
+            let queue_file = payload
+                .get("queue_file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            println!("proof queue status: {queue_file}");
+            println!("status\tbead\tkind\tintent\tblockers");
+            if let Some(entries) = payload.get("entries").and_then(serde_json::Value::as_array) {
+                for row in entries {
+                    let status = row
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-");
+                    let bead = row
+                        .get("bead_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-");
+                    let kind = row
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-");
+                    let intent = row
+                        .get("intent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("-");
+                    let blockers = row
+                        .get("blockers")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    println!("{status}\t{bead}\t{kind}\t{intent}\t{blockers}");
+                }
+            }
+        }
+        Some("replay") => {
+            let executed = payload
+                .get("executed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            println!(
+                "proof replay: {}",
+                if executed {
+                    "executed remote RCH command"
+                } else {
+                    "not executed"
+                }
+            );
+            if let Some(note) = payload.get("note").and_then(serde_json::Value::as_str) {
+                println!("{note}");
+            }
+        }
+        Some("attach") => {
+            let intent_id = payload
+                .get("intent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let receipt = payload
+                .get("receipt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            println!("proof attach: {receipt} -> {intent_id}");
+        }
+        _ => println!(
+            "{}",
+            serde_json::to_string_pretty(payload).unwrap_or_default()
+        ),
+    }
 }
 
 fn print_proof_history_output(
@@ -20552,6 +21313,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Classify proof command intent without executing it",
             },
             RobotCommandInfo {
+                name: "proof status",
+                description: "Read deferred proof queue status and replay eligibility",
+            },
+            RobotCommandInfo {
                 name: "checkpoint save",
                 description: "Save a checkpoint of the current session state (alias: ckpt)",
             },
@@ -28769,6 +29534,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(payload, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::Proof { command } => match command {
+                    RobotProofCommands::Status {
+                        queue_file,
+                        source_hash,
+                        admission_state,
+                    } => {
+                        let payload = build_proof_status_payload(
+                            queue_file.as_ref(),
+                            source_hash,
+                            admission_state,
+                            &workspace_root,
+                        )?;
+                        let response = RobotResponse::success(payload, elapsed_ms(start));
+                        print_robot_response(&response, format, stats)?;
+                    }
+                },
                 RobotCommands::CoordinationRisk { session } => {
                     let response = match load_coordination_risk_snapshot(&workspace_root, &session)
                     {
@@ -28898,6 +29679,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     match other {
                         RobotCommands::ProofCloseoutLint { .. } => unreachable!("handled above"),
                         RobotCommands::ProofHistory { .. } => unreachable!("handled above"),
+                        RobotCommands::Proof { .. } => unreachable!("handled above"),
                         RobotCommands::Attention { .. } => unreachable!("handled above"),
                         RobotCommands::Rehearsal { .. } => unreachable!("handled above"),
                         RobotCommands::Incidents { .. } => unreachable!("handled above"),
@@ -36109,6 +36891,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::CoordinationRisk { .. } => unreachable!("handled above"),
                         RobotCommands::BlockerRadar { .. } => unreachable!("handled above"),
                         RobotCommands::ProofDoctor { .. } => unreachable!("handled above"),
+                        RobotCommands::Proof { .. } => unreachable!("handled above"),
                     }
                 }
             }
@@ -43545,6 +44328,83 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 build_proof_history_payload(&records, &artifact_roots, metadata, &workspace_root)?;
             print_proof_history_output(&index, &scoreboard, &format)?;
         }
+
+        Some(Commands::Proof { command }) => match command {
+            ProofCommands::Queue {
+                queue_file,
+                bead,
+                package,
+                kind,
+                source_hash,
+                expected_artifact,
+                attestation_slot,
+                redaction_policy,
+                admission_state,
+                format,
+                command,
+            } => {
+                let payload = build_proof_queue_payload(
+                    queue_file.as_ref(),
+                    bead,
+                    package,
+                    kind,
+                    source_hash,
+                    expected_artifact,
+                    attestation_slot,
+                    redaction_policy,
+                    admission_state,
+                    command,
+                    &workspace_root,
+                )?;
+                print_proof_queue_output(&payload, &format)?;
+            }
+            ProofCommands::Status {
+                queue_file,
+                source_hash,
+                admission_state,
+                format,
+            } => {
+                let payload = build_proof_status_payload(
+                    queue_file.as_ref(),
+                    source_hash,
+                    admission_state,
+                    &workspace_root,
+                )?;
+                print_proof_queue_output(&payload, &format)?;
+            }
+            ProofCommands::Replay {
+                queue_file,
+                source_hash,
+                admission_state,
+                artifact_dir,
+                dry_run,
+                format,
+            } => {
+                let payload = build_proof_replay_payload(
+                    queue_file.as_ref(),
+                    source_hash,
+                    admission_state,
+                    artifact_dir.as_ref(),
+                    dry_run,
+                    &workspace_root,
+                )?;
+                print_proof_queue_output(&payload, &format)?;
+            }
+            ProofCommands::Attach {
+                intent_id,
+                queue_file,
+                receipt,
+                format,
+            } => {
+                let payload = build_proof_attach_payload(
+                    queue_file.as_ref(),
+                    intent_id,
+                    receipt,
+                    &workspace_root,
+                )?;
+                print_proof_queue_output(&payload, &format)?;
+            }
+        },
 
         Some(Commands::Diag { command }) => {
             match command {
