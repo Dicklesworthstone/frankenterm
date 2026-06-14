@@ -969,6 +969,43 @@ mod tests {
         );
     }
 
+    /// Fail-closed guard (ft-tf6g3.3.8): the input-to-photon SLO
+    /// operator surface MUST stay a non-claiming substrate/pending
+    /// status until a retained target-run artifact exists. RQ-S2
+    /// (macOS) and RQ-S3 (Wayland) input-to-photon target runs need
+    /// an admissible RCH lab host carrying the platform GPU stack;
+    /// until one is reached the surface must not advertise a
+    /// validated p95 bound. Flipping the status to a "validated"
+    /// form therefore requires a real artifact AND an intentional
+    /// change to this guard — it can never happen silently.
+    #[test]
+    fn input_to_photon_status_is_non_claiming_until_target_run() {
+        let report = renderer_slos_doctor_report();
+        // Constant and doctor surface agree, and both stay pending.
+        assert_eq!(
+            report.input_to_photon.status,
+            RENDERER_INPUT_TO_PHOTON_STATUS
+        );
+        assert!(
+            RENDERER_INPUT_TO_PHOTON_STATUS.contains("pending_lab_run"),
+            "input-to-photon status must remain a pending substrate status until a retained \
+             target run lands: {RENDERER_INPUT_TO_PHOTON_STATUS}"
+        );
+        assert!(
+            !RENDERER_INPUT_TO_PHOTON_STATUS.contains("validated"),
+            "input-to-photon must NOT claim a validated p95 bound without a retained target-run \
+             artifact (RQ-S2/RQ-S3 are blocked on an admissible GPU lab host): \
+             {RENDERER_INPUT_TO_PHOTON_STATUS}"
+        );
+        // The pending reason must surface the outstanding target-run
+        // gap rather than implying coverage exists.
+        assert!(
+            report.input_to_photon.pending_reason.contains("pending"),
+            "pending_reason must surface the outstanding target-run gap: {}",
+            report.input_to_photon.pending_reason
+        );
+    }
+
     #[test]
     fn renderer_slo_doctor_report_exposes_ssim_parity_contract() {
         let report = renderer_slos_doctor_report();

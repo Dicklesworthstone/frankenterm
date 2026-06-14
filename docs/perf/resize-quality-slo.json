@@ -85,7 +85,20 @@
         "source_artifact_sha256": "d56e25a50a1a17691bd45d00fdaefbc73257e2d441ee35fa93deb3bd29a4e644",
         "gap_evidence_path": "docs/attestations/perf/lindley-bounds.json",
         "gap_evidence_sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
-        "reason": "The deterministic stage telemetry substrate is wired, but no retained macOS target-run artifact proves the p95 bound."
+        "reason": "The deterministic stage telemetry substrate is wired, but no retained macOS target-run artifact proves the p95 bound.",
+        "target_run_attempt": {
+          "classification": "platform_target_run_unavailable",
+          "platform": "macos",
+          "reason": "No macOS lab host is admissible on the RCH fleet (Linux-only Contabo workers), so a CAMetalLayer input-to-photon target run cannot be scheduled; RCH admission additionally refused on every attempt (no_admissible_workers: critical_pressure / active_project_exclusion / insufficient_slots).",
+          "cargo_reached": false,
+          "test_or_bench_reached": false,
+          "rch_admission": "refused_no_admissible_workers",
+          "command": "cargo bench -p frankenterm-gui --features headless-render --bench input_to_photon -- --sample-size 10",
+          "target_dir": "/tmp/ft-tf6g338-cc4-target",
+          "prior_attempt_proof_ledger": "tests/e2e/logs/input_to_photon_release_gate_20260516T042501Z.proof-ledger.jsonl",
+          "prior_attempt_proof_ledger_sha256": "53bd27a56074cdbf01d4007f735c8aa3d326485185ce33b197b421b0f7eb6d27",
+          "follow_up_bead": "ft-tf6g3.3.8"
+        }
       },
       "blocked_by": ["ft-tf6g3.3.2"],
       "owner_bead": "ft-tf6g3.3.2"
@@ -107,7 +120,20 @@
         "source_artifact_sha256": "d56e25a50a1a17691bd45d00fdaefbc73257e2d441ee35fa93deb3bd29a4e644",
         "gap_evidence_path": "docs/attestations/perf/lindley-bounds.json",
         "gap_evidence_sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
-        "reason": "The deterministic stage telemetry substrate is wired, but no retained Wayland target-run artifact proves the p95 bound."
+        "reason": "The deterministic stage telemetry substrate is wired, but no retained Wayland target-run artifact proves the p95 bound.",
+        "target_run_attempt": {
+          "classification": "platform_target_run_unavailable",
+          "platform": "wayland",
+          "reason": "RCH admission refused on every attempt (no_admissible_workers: critical_pressure / active_project_exclusion / insufficient_slots); no admissible Wayland GPU lab host was reached. The deterministic substrate is wired, but the wl_surface commit + frame_done target run is pending an admissible GPU worker.",
+          "cargo_reached": false,
+          "test_or_bench_reached": false,
+          "rch_admission": "refused_no_admissible_workers",
+          "command": "cargo bench -p frankenterm-gui --features headless-render --bench input_to_photon -- --sample-size 10",
+          "target_dir": "/tmp/ft-tf6g338-cc4-target",
+          "prior_attempt_proof_ledger": "tests/e2e/logs/input_to_photon_release_gate_20260516T042501Z.proof-ledger.jsonl",
+          "prior_attempt_proof_ledger_sha256": "53bd27a56074cdbf01d4007f735c8aa3d326485185ce33b197b421b0f7eb6d27",
+          "follow_up_bead": "ft-tf6g3.3.8"
+        }
       },
       "blocked_by": ["ft-tf6g3.3.2"],
       "owner_bead": "ft-tf6g3.3.2"
