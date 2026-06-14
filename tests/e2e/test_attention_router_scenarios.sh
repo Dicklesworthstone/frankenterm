@@ -7,6 +7,7 @@ cd "${ROOT}"
 
 SCHEMA="docs/json-schema/ft-attention-router-scenarios.json"
 INVENTORY="fixtures/attention-router/scenarios.v1.json"
+CLOSEOUT="docs/attestations/proofs/attention-router.json"
 BLOCKER_RADAR_CONTRACT="docs/blocker-radar-contract.md"
 BLOCKER_RADAR_RUNBOOK="docs/blocker-radar-runbook.md"
 
@@ -22,10 +23,11 @@ require_file() {
 
 require_file "${SCHEMA}"
 require_file "${INVENTORY}"
+require_file "${CLOSEOUT}"
 require_file "${BLOCKER_RADAR_CONTRACT}"
 require_file "${BLOCKER_RADAR_RUNBOOK}"
 
-jq empty "${SCHEMA}" "${INVENTORY}"
+jq empty "${SCHEMA}" "${INVENTORY}" "${CLOSEOUT}"
 
 jq -e '
   .["$schema"] == "https://json-schema.org/draft/2020-12/schema"
@@ -153,6 +155,57 @@ jq -e '
     ([.source_fixture_requirements[].source_id] | unique_ids)
   )
 ' "${INVENTORY}" >/dev/null || fail "scenario ids and per-scenario source ids must be unique"
+
+jq -e '
+  .schema_version == "1.0.0"
+  and .kind == "attention-router-convergence-closeout"
+  and .category == "proofs/robot-contracts"
+  and .produced_by_bead == "ft-x3nsb.8"
+  and .status == "blocked_rch_remote_unavailable"
+  and .contract.contract_id == "ft.attention_router.v1"
+  and .contract.dry_run_only == true
+  and .contract.read_only == true
+  and .contract.side_effects_executed == false
+  and .contract.local_cargo_counts_as_proof == false
+  and .claim_boundaries.does_not_claim_remote_cargo_passed == true
+  and .claim_boundaries.does_not_claim_manifest_slot_is_active == true
+  and .claim_boundaries.does_not_claim_local_cargo_as_proof == true
+  and .forbidden_actions.agent_mail_service_restarted == false
+  and .forbidden_actions.rch_worker_mutated == false
+  and .forbidden_actions.local_heavy_cargo_fallback_counted == false
+  and any(.child_acceptance_matrix[]; .bead_id == "ft-x3nsb.8"
+    and .status == "blocked"
+    and .evidence_state == "blocked_rch_remote_unavailable")
+  and .static_validation.status == "pass"
+  and .static_validation.local_cargo_counted == false
+  and (.static_validation.commands | length >= 5)
+  and .rch_proof.status == "blocked_no_remote_worker"
+  and .rch_proof.remote_required == true
+  and .rch_proof.local_cargo_counted == false
+  and (.rch_proof.fail_closed_blockers | index("[RCH] local") != null)
+  and (.rch_proof.required_command | contains("CARGO_TARGET_DIR=/tmp/ft-x3nsb8-cod8-target"))
+  and (.rch_proof.required_command | contains("cargo test -p frankenterm-core --lib attention_router"))
+  and .release_bundle.candidate_category == "proofs/robot-contracts"
+  and .release_bundle.candidate_artifact_path == "docs/attestations/proofs/attention-router.json"
+  and .release_bundle.manifest_slot_state == "not_wired_until_remote_code_proof"
+  and .release_bundle.manifest_path == null
+  and .release_bundle.eligible_for_claim_lift == false
+  and all(.source_artifacts[];
+    (.path | type == "string" and length > 0)
+    and (.sha256 | test("^[0-9a-f]{64}$"))
+    and (.size_bytes | type == "number" and . > 0)
+  )
+' "${CLOSEOUT}" >/dev/null || fail "attention-router closeout artifact overclaims or is incomplete"
+
+while IFS=$'\t' read -r path expected_hash expected_size; do
+  require_file "${path}"
+  actual_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
+  actual_size="$(wc -c < "${path}" | tr -d '[:space:]')"
+  [[ "${actual_hash}" == "${expected_hash}" ]] \
+    || fail "closeout source artifact hash drifted: ${path}"
+  [[ "${actual_size}" == "${expected_size}" ]] \
+    || fail "closeout source artifact size drifted: ${path}"
+done < <(jq -r '.source_artifacts[] | [.path, .sha256, (.size_bytes | tostring)] | @tsv' "${CLOSEOUT}")
 
 jq -e '
   [

@@ -46,10 +46,21 @@ surface goldens are also checked by compiled Rust tests and require RCH proof
 for closeout. `tests/e2e/test_attention_router_scenarios.sh` emits one JSONL
 record per scenario with the retained classification, safe action, reason
 codes, explanation terms, and volatility level so proof logs explain why each
-case was accepted. Validating this directory requires:
+case was accepted.
+
+`docs/attestations/proofs/attention-router.json` is the current closeout
+readiness record for `ft-x3nsb.8`. It is deliberately marked
+`blocked_rch_remote_unavailable` and `not_wired_until_remote_code_proof`: it
+hashes the retained attention-router sources and static artifacts, but it is
+not an active release-manifest slot and must not be used to lift any README or
+AGENTS claim until the remote-required Cargo proof reaches an RCH worker and
+passes.
+
+Validating this directory requires:
 
 ```bash
 jq empty docs/json-schema/ft-attention-router-scenarios.json
+jq empty docs/attestations/proofs/attention-router.json
 jq empty fixtures/attention-router/scenarios.v1.json
 jq empty fixtures/attention-router/source-adapter-input.ready.v1.json
 jq empty fixtures/attention-router/surface-status.golden.json

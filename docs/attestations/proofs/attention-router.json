@@ -1,0 +1,222 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "attention-router-convergence-closeout",
+  "category": "proofs/robot-contracts",
+  "produced_by_bead": "ft-x3nsb.8",
+  "generated_at": "2026-06-14T20:46:46Z",
+  "epic_id": "ft-x3nsb",
+  "status": "blocked_rch_remote_unavailable",
+  "proof_categories": [4],
+  "scope": "Closeout-readiness record for the ft.attention_router.v1 read-only attention-router contract, retained scenario inventory, nudge-plan receipt vocabulary, Robot/MCP/CLI surface goldens, and release-attestation posture.",
+  "contract": {
+    "contract_id": "ft.attention_router.v1",
+    "scenario_inventory_contract_id": "ft.attention_router.scenario_inventory.v1",
+    "nudge_plan_receipts_contract_id": "ft.attention_router.nudge_plan_receipts.v1",
+    "snapshot_contract_id": "ft.attention_router.snapshot.v1",
+    "surface_contract_id": "ft.attention_router.surface.v1",
+    "dry_run_only": true,
+    "read_only": true,
+    "side_effects_executed": false,
+    "raw_pane_content_stored": false,
+    "service_mutation_allowed": false,
+    "worker_mutation_allowed": false,
+    "local_cargo_counts_as_proof": false,
+    "execution_claim": "not_proven_until_remote_cargo_passes"
+  },
+  "claim_boundaries": {
+    "does_not_claim_remote_cargo_passed": true,
+    "does_not_claim_manifest_slot_is_active": true,
+    "does_not_claim_agent_mail_or_rch_service_repair": true,
+    "does_not_claim_local_cargo_as_proof": true,
+    "does_not_claim_dirty_tree_is_owned_by_this_bead": true,
+    "safe_to_hash_as_blocked_readiness_artifact": true
+  },
+  "forbidden_actions": {
+    "agent_mail_service_repaired": false,
+    "agent_mail_service_restarted": false,
+    "agent_mail_process_killed": false,
+    "rch_worker_mutated": false,
+    "rch_service_restarted": false,
+    "build_cancelled": false,
+    "destructive_git_cleanup": false,
+    "file_deleted": false,
+    "local_heavy_cargo_fallback_counted": false,
+    "live_panes_mutated": false
+  },
+  "child_acceptance_matrix": [
+    {
+      "bead_id": "ft-x3nsb.4",
+      "status": "closed",
+      "evidence_state": "static_validated",
+      "claim": "Read-only status surface and source-adapter fixture exist.",
+      "artifact_paths": [
+        "fixtures/attention-router/source-adapter-input.ready.v1.json",
+        "fixtures/attention-router/surface-status.golden.json",
+        "fixtures/attention-router/surface-status.golden.toon"
+      ]
+    },
+    {
+      "bead_id": "ft-x3nsb.5",
+      "status": "closed",
+      "evidence_state": "static_validated",
+      "claim": "Nudge-plan receipts are side-effect-free and preserve force-release/status-check guardrails.",
+      "artifact_paths": [
+        "docs/json-schema/ft-attention-router-nudge-plan-receipt.json",
+        "docs/robot-contracts/attention-router-nudge-plan.md",
+        "fixtures/attention-router/nudge-plan-receipts.v1.json"
+      ],
+      "verifier": "bash fixtures/attention-router/verify-nudge-plan-receipts.sh"
+    },
+    {
+      "bead_ids": ["ft-x3nsb.6", "ft-x3nsb.6.1", "ft-x3nsb.6.3", "ft-x3nsb.6.4"],
+      "status": "closed",
+      "evidence_state": "static_validated",
+      "claim": "Golden scenario corpus covers ready, blocked, comms, stale-claim, dirty-overlap, proof-starved, reservation-firewall, and disk-pressure approval cases.",
+      "artifact_paths": [
+        "docs/json-schema/ft-attention-router-scenarios.json",
+        "fixtures/attention-router/scenarios.v1.json",
+        "crates/frankenterm-core/tests/attention_router_scenarios.rs"
+      ],
+      "verifier": "bash tests/e2e/test_attention_router_scenarios.sh"
+    },
+    {
+      "bead_id": "ft-x3nsb.7",
+      "status": "closed",
+      "evidence_state": "static_validated",
+      "claim": "Operator-facing contract documentation keeps trust boundaries and no-service-mutation rules visible.",
+      "artifact_paths": [
+        "docs/robot-contracts/attention-router.md",
+        "fixtures/attention-router/README.md"
+      ]
+    },
+    {
+      "bead_id": "ft-x3nsb.8",
+      "status": "blocked",
+      "evidence_state": "blocked_rch_remote_unavailable",
+      "claim": "Convergence cannot close or wire an active manifest slot until remote Cargo proof reaches an RCH worker and passes.",
+      "required_proof": "cargo test -p frankenterm-core --lib attention_router -- --nocapture through remote-required rch"
+    }
+  ],
+  "static_validation": {
+    "status": "pass",
+    "local_cargo_counted": false,
+    "commands": [
+      {
+        "command": "jq empty docs/json-schema/ft-attention-router-scenarios.json docs/json-schema/ft-attention-router-nudge-plan-receipt.json fixtures/attention-router/scenarios.v1.json fixtures/attention-router/source-adapter-input.ready.v1.json fixtures/attention-router/surface-status.golden.json fixtures/attention-router/nudge-plan-receipts.v1.json docs/attestations/proofs/attention-router.json",
+        "expected_exit_code": 0
+      },
+      {
+        "command": "bash fixtures/attention-router/verify-nudge-plan-receipts.sh",
+        "expected_exit_code": 0
+      },
+      {
+        "command": "bash tests/e2e/test_attention_router_scenarios.sh",
+        "expected_exit_code": 0
+      },
+      {
+        "command": "git diff --check -- docs/attestations/proofs/attention-router.json fixtures/attention-router/README.md tests/e2e/test_attention_router_scenarios.sh",
+        "expected_exit_code": 0
+      },
+      {
+        "command": "br dep cycles --json",
+        "expected_result": "{\"cycles\":[],\"count\":0}"
+      }
+    ],
+    "schema_validation_note": "If a JSON Schema CLI is unavailable, jq/static verifiers still prove parse and local contract invariants, but schema-validation conformance remains a separate rerun gate."
+  },
+  "rch_proof": {
+    "status": "blocked_no_remote_worker",
+    "remote_required": true,
+    "local_cargo_counted": false,
+    "required_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-x3nsb8-cod8-target cargo test -p frankenterm-core --lib attention_router -- --nocapture",
+    "requested_target_dir": "/tmp/ft-x3nsb8-cod8-target",
+    "latest_attempt_at": "2026-06-14T20:46:38Z",
+    "latest_attempt_exit_code": 1,
+    "latest_recorded_blocking_reason": "[RCH] local (no admissible workers: health_below_fallback=2,hard_preflight=3,active_project_exclusion=4); [RCH] remote required; refusing local fallback (no worker assigned)",
+    "fail_closed_blockers": [
+      "[RCH] local",
+      "running locally",
+      "no admissible workers",
+      "worker=null",
+      "local fallback",
+      "exit 143"
+    ]
+  },
+  "release_bundle": {
+    "candidate_category": "proofs/robot-contracts",
+    "candidate_artifact_path": "docs/attestations/proofs/attention-router.json",
+    "manifest_slot_state": "not_wired_until_remote_code_proof",
+    "manifest_path": null,
+    "required_category": false,
+    "eligible_for_claim_lift": false,
+    "reason": "The artifact is a blocked closeout-readiness record. The release manifest must not hash it as an active attention-router proof until the remote-required Cargo proof reaches an RCH worker and passes."
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/json-schema/ft-attention-router-scenarios.json",
+      "media_type": "application/schema+json",
+      "sha256": "01bab208893b5944aa25b27322bd2cce6d378c542a61f172e260ff7d86e4f79b",
+      "size_bytes": 9630
+    },
+    {
+      "path": "docs/json-schema/ft-attention-router-nudge-plan-receipt.json",
+      "media_type": "application/schema+json",
+      "sha256": "9063280818ddaf43480bdcda140562f36f231613b5b4c5092ff0a3d306be0415",
+      "size_bytes": 9856
+    },
+    {
+      "path": "fixtures/attention-router/scenarios.v1.json",
+      "media_type": "application/json",
+      "sha256": "53b020975b4bbf10ed8a3f4b83f518b6a20a6bfe94dbc47a7b1d56eb6f4b4169",
+      "size_bytes": 33422
+    },
+    {
+      "path": "fixtures/attention-router/nudge-plan-receipts.v1.json",
+      "media_type": "application/json",
+      "sha256": "5ec92ef96ce10f2ee56374f76f2a324033d196cb49205a4b0ce7d2b170d92b77",
+      "size_bytes": 10160
+    },
+    {
+      "path": "fixtures/attention-router/source-adapter-input.ready.v1.json",
+      "media_type": "application/json",
+      "sha256": "94f59cb38848eded52c3d49f39f881ab518b53ec63eb575e4095538ff24771cd",
+      "size_bytes": 4657
+    },
+    {
+      "path": "fixtures/attention-router/surface-status.golden.json",
+      "media_type": "application/json",
+      "sha256": "8be7b4f93657ee35296bf63d253ceb53d706878a96f3fa153c4fd7753f885e7a",
+      "size_bytes": 11950
+    },
+    {
+      "path": "fixtures/attention-router/surface-status.golden.toon",
+      "media_type": "text/plain",
+      "sha256": "0ec6b6fad6ee3a4eb1a21cbd1845299160422211a8f16b1c1780a6398bb57d2b",
+      "size_bytes": 1965
+    },
+    {
+      "path": "crates/frankenterm-core/src/attention_router.rs",
+      "media_type": "text/plain",
+      "sha256": "de0a19ab3995fc9cc9d09bf96a211951763edc1f6d23cb6d66ad54171264e803",
+      "size_bytes": 177597
+    },
+    {
+      "path": "crates/frankenterm-core/tests/attention_router_scenarios.rs",
+      "media_type": "text/plain",
+      "sha256": "7ecc3ccdc4c4ba297e7a2ef8d825eace219303a9eb680c05b8b1c2590c437669",
+      "size_bytes": 30747
+    },
+    {
+      "path": "docs/robot-contracts/attention-router.md",
+      "media_type": "text/markdown",
+      "sha256": "3a75929d1fb3d57817d1d8f225f2b587e23875de0c26265dfb29eb6c84fd9958",
+      "size_bytes": 13362
+    },
+    {
+      "path": "docs/robot-contracts/attention-router-nudge-plan.md",
+      "media_type": "text/markdown",
+      "sha256": "76347b2e610d900e40c0e12aaabeabf6b314b5a67c3435424c04bc151df8ee5f",
+      "size_bytes": 4916
+    }
+  ]
+}
