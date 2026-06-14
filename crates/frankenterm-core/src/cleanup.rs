@@ -30,8 +30,218 @@ pub struct CleanupPlan {
     pub dry_run: bool,
 }
 
+/// Provenance class required before the swarm janitor may even report a lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmJanitorProvenanceKind {
+    TxIntent,
+    Mission,
+}
+
+/// Explicit provenance binding for an opt-in ephemeral cleanup lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmJanitorLeaseProvenance {
+    pub kind: SwarmJanitorProvenanceKind,
+    pub id: String,
+}
+
+/// One report-only ephemeral lease candidate for janitor review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmJanitorLeaseCandidate {
+    pub lease_id: String,
+    pub path: String,
+    pub owner: String,
+    pub expires_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<SwarmJanitorLeaseProvenance>,
+}
+
+/// Machine-stable reason codes for a swarm janitor report item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmJanitorReasonCode {
+    ReportOnly,
+    EligibleAfterExplicitHumanApproval,
+    InvalidPath,
+    MissingLease,
+    MissingProvenance,
+    LeaseStillActive,
+    HardProtectedPath,
+}
+
+/// Report-only disposition for a swarm janitor candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmJanitorCandidateDecision {
+    ReviewEligible,
+    WaitForLeaseExpiry,
+    Blocked,
+}
+
+/// Per-candidate report-only swarm janitor decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmJanitorReportItem {
+    pub candidate: SwarmJanitorLeaseCandidate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_path: Option<String>,
+    pub decision: SwarmJanitorCandidateDecision,
+    pub reason_codes: Vec<SwarmJanitorReasonCode>,
+    pub requires_human_approval: bool,
+    pub would_delete: bool,
+    pub safe_action: String,
+}
+
+/// Report-only swarm janitor plan. This type intentionally has no apply mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmJanitorReport {
+    pub generated_at_ms: i64,
+    pub report_only: bool,
+    pub mutates_files: bool,
+    pub automatic_deletion_allowed: bool,
+    pub protected_paths: Vec<String>,
+    pub items: Vec<SwarmJanitorReportItem>,
+    pub review_eligible: usize,
+    pub waiting_for_lease_expiry: usize,
+    pub blocked: usize,
+}
+
 /// Batch size for apply-mode deletions to avoid long-running transactions.
 const DELETE_BATCH_SIZE: usize = 5000;
+const SWARM_JANITOR_PROTECTED_PATHS: &[&str] = &["AGENTS.md", "crates/frankenterm-core"];
+
+/// Build a report-only janitor plan for opt-in ephemeral leases.
+#[must_use]
+pub fn plan_swarm_janitor_report(
+    candidates: &[SwarmJanitorLeaseCandidate],
+    generated_at_ms: i64,
+) -> SwarmJanitorReport {
+    let items: Vec<_> = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| classify_swarm_janitor_candidate(candidate, generated_at_ms))
+        .collect();
+
+    let review_eligible = items
+        .iter()
+        .filter(|item| item.decision == SwarmJanitorCandidateDecision::ReviewEligible)
+        .count();
+    let waiting_for_lease_expiry = items
+        .iter()
+        .filter(|item| item.decision == SwarmJanitorCandidateDecision::WaitForLeaseExpiry)
+        .count();
+    let blocked = items
+        .iter()
+        .filter(|item| item.decision == SwarmJanitorCandidateDecision::Blocked)
+        .count();
+
+    SwarmJanitorReport {
+        generated_at_ms,
+        report_only: true,
+        mutates_files: false,
+        automatic_deletion_allowed: false,
+        protected_paths: SWARM_JANITOR_PROTECTED_PATHS
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+        items,
+        review_eligible,
+        waiting_for_lease_expiry,
+        blocked,
+    }
+}
+
+fn classify_swarm_janitor_candidate(
+    candidate: SwarmJanitorLeaseCandidate,
+    now_ms: i64,
+) -> SwarmJanitorReportItem {
+    let mut reason_codes = vec![SwarmJanitorReasonCode::ReportOnly];
+    let normalized_path = normalize_swarm_janitor_candidate_path(&candidate.path);
+
+    if candidate.lease_id.trim().is_empty() {
+        reason_codes.push(SwarmJanitorReasonCode::MissingLease);
+    }
+    if normalized_path.is_none() {
+        reason_codes.push(SwarmJanitorReasonCode::InvalidPath);
+    }
+    if normalized_path
+        .as_deref()
+        .is_some_and(is_hard_protected_swarm_janitor_path)
+    {
+        reason_codes.push(SwarmJanitorReasonCode::HardProtectedPath);
+    }
+    if candidate
+        .provenance
+        .as_ref()
+        .is_none_or(|provenance| provenance.id.trim().is_empty())
+    {
+        reason_codes.push(SwarmJanitorReasonCode::MissingProvenance);
+    }
+
+    let has_blocker = reason_codes.iter().any(|reason| {
+        matches!(
+            reason,
+            SwarmJanitorReasonCode::InvalidPath
+                | SwarmJanitorReasonCode::MissingLease
+                | SwarmJanitorReasonCode::MissingProvenance
+                | SwarmJanitorReasonCode::HardProtectedPath
+        )
+    });
+
+    let decision = if has_blocker {
+        SwarmJanitorCandidateDecision::Blocked
+    } else if candidate.expires_at_ms > now_ms {
+        reason_codes.push(SwarmJanitorReasonCode::LeaseStillActive);
+        SwarmJanitorCandidateDecision::WaitForLeaseExpiry
+    } else {
+        reason_codes.push(SwarmJanitorReasonCode::EligibleAfterExplicitHumanApproval);
+        SwarmJanitorCandidateDecision::ReviewEligible
+    };
+
+    let safe_action = match decision {
+        SwarmJanitorCandidateDecision::ReviewEligible => {
+            "report_only_requires_explicit_human_approval".to_string()
+        }
+        SwarmJanitorCandidateDecision::WaitForLeaseExpiry => {
+            "wait_for_lease_expiry_then_recheck".to_string()
+        }
+        SwarmJanitorCandidateDecision::Blocked => "blocked_no_cleanup".to_string(),
+    };
+
+    SwarmJanitorReportItem {
+        candidate,
+        normalized_path,
+        decision,
+        reason_codes,
+        requires_human_approval: decision == SwarmJanitorCandidateDecision::ReviewEligible,
+        would_delete: false,
+        safe_action,
+    }
+}
+
+fn normalize_swarm_janitor_candidate_path(path: &str) -> Option<String> {
+    let path = path.trim();
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.contains(':')
+        || path.split('/').any(|part| {
+            part.is_empty() || part == "." || part == ".." || part.chars().any(char::is_control)
+        })
+    {
+        return None;
+    }
+
+    Some(path.to_string())
+}
+
+fn is_hard_protected_swarm_janitor_path(path: &str) -> bool {
+    path == "AGENTS.md"
+        || path.ends_with("/AGENTS.md")
+        || path == "crates/frankenterm-core"
+        || path.starts_with("crates/frankenterm-core/")
+}
 
 fn cleanup_cancelled(operation: &'static str, err: impl std::fmt::Display) -> crate::Error {
     crate::Error::RuntimeOperation {
@@ -779,20 +989,209 @@ mod tests {
         assert!(json.contains("\"dry_run\": false"));
     }
 
+    fn swarm_janitor_candidate(
+        lease_id: &str,
+        path: &str,
+        expires_at_ms: i64,
+        provenance: Option<SwarmJanitorLeaseProvenance>,
+    ) -> SwarmJanitorLeaseCandidate {
+        SwarmJanitorLeaseCandidate {
+            lease_id: lease_id.to_string(),
+            path: path.to_string(),
+            owner: "cod_8".to_string(),
+            expires_at_ms,
+            provenance,
+        }
+    }
+
+    fn tx_provenance(id: &str) -> SwarmJanitorLeaseProvenance {
+        SwarmJanitorLeaseProvenance {
+            kind: SwarmJanitorProvenanceKind::TxIntent,
+            id: id.to_string(),
+        }
+    }
+
+    fn single_swarm_janitor_item(report: &SwarmJanitorReport) -> Option<&SwarmJanitorReportItem> {
+        assert_eq!(report.items.len(), 1);
+        report.items.first()
+    }
+
+    #[test]
+    fn swarm_janitor_report_is_report_only_even_for_review_eligible_leases() {
+        let report = plan_swarm_janitor_report(
+            &[swarm_janitor_candidate(
+                "lease-1",
+                "scratch/mission-output.tmp",
+                1_000,
+                Some(tx_provenance("tx-clean-1")),
+            )],
+            2_000,
+        );
+
+        assert!(report.report_only);
+        assert!(!report.mutates_files);
+        assert!(!report.automatic_deletion_allowed);
+        assert_eq!(report.review_eligible, 1);
+        assert_eq!(report.blocked, 0);
+
+        let Some(item) = single_swarm_janitor_item(&report) else {
+            return;
+        };
+        assert_eq!(item.decision, SwarmJanitorCandidateDecision::ReviewEligible);
+        assert_eq!(
+            item.normalized_path.as_deref(),
+            Some("scratch/mission-output.tmp")
+        );
+        assert!(item.requires_human_approval);
+        assert!(!item.would_delete);
+        assert_eq!(
+            item.safe_action,
+            "report_only_requires_explicit_human_approval"
+        );
+        assert!(
+            item.reason_codes
+                .contains(&SwarmJanitorReasonCode::EligibleAfterExplicitHumanApproval)
+        );
+    }
+
+    #[test]
+    fn swarm_janitor_report_waits_for_active_lease() {
+        let report = plan_swarm_janitor_report(
+            &[swarm_janitor_candidate(
+                "lease-active",
+                "scratch/live.tmp",
+                3_000,
+                Some(tx_provenance("tx-live")),
+            )],
+            2_000,
+        );
+
+        let Some(item) = single_swarm_janitor_item(&report) else {
+            return;
+        };
+        assert_eq!(
+            item.decision,
+            SwarmJanitorCandidateDecision::WaitForLeaseExpiry
+        );
+        assert_eq!(report.waiting_for_lease_expiry, 1);
+        assert!(!item.requires_human_approval);
+        assert!(!item.would_delete);
+        assert!(
+            item.reason_codes
+                .contains(&SwarmJanitorReasonCode::LeaseStillActive)
+        );
+    }
+
+    #[test]
+    fn swarm_janitor_report_blocks_missing_lease_and_provenance() {
+        let report = plan_swarm_janitor_report(
+            &[swarm_janitor_candidate(
+                "",
+                "scratch/orphan.tmp",
+                1_000,
+                None,
+            )],
+            2_000,
+        );
+
+        let Some(item) = single_swarm_janitor_item(&report) else {
+            return;
+        };
+        assert_eq!(item.decision, SwarmJanitorCandidateDecision::Blocked);
+        assert_eq!(report.blocked, 1);
+        assert!(!item.requires_human_approval);
+        assert!(!item.would_delete);
+        assert!(
+            item.reason_codes
+                .contains(&SwarmJanitorReasonCode::MissingLease)
+        );
+        assert!(
+            item.reason_codes
+                .contains(&SwarmJanitorReasonCode::MissingProvenance)
+        );
+    }
+
+    #[test]
+    fn swarm_janitor_report_blocks_invalid_paths() {
+        for path in ["/tmp/file", "../outside", "nested/../outside", "C:\\tmp"] {
+            let report = plan_swarm_janitor_report(
+                &[swarm_janitor_candidate(
+                    "lease-invalid",
+                    path,
+                    1_000,
+                    Some(tx_provenance("tx-invalid")),
+                )],
+                2_000,
+            );
+
+            let Some(item) = single_swarm_janitor_item(&report) else {
+                return;
+            };
+            assert_eq!(
+                item.decision,
+                SwarmJanitorCandidateDecision::Blocked,
+                "{path}"
+            );
+            assert!(
+                item.reason_codes
+                    .contains(&SwarmJanitorReasonCode::InvalidPath),
+                "{path}"
+            );
+            assert!(!item.would_delete);
+        }
+    }
+
+    #[test]
+    fn swarm_janitor_report_hard_protects_agents_and_core_paths() {
+        for path in [
+            "AGENTS.md",
+            "docs/AGENTS.md",
+            "crates/frankenterm-core",
+            "crates/frankenterm-core/src/lib.rs",
+            "./crates/frankenterm-core/",
+        ] {
+            let report = plan_swarm_janitor_report(
+                &[swarm_janitor_candidate(
+                    "lease-protected",
+                    path,
+                    1_000,
+                    Some(tx_provenance("tx-protected")),
+                )],
+                2_000,
+            );
+
+            let Some(item) = single_swarm_janitor_item(&report) else {
+                return;
+            };
+            assert_eq!(
+                item.decision,
+                SwarmJanitorCandidateDecision::Blocked,
+                "{path}"
+            );
+            assert!(
+                item.reason_codes
+                    .contains(&SwarmJanitorReasonCode::HardProtectedPath),
+                "{path}"
+            );
+            assert_eq!(item.safe_action, "blocked_no_cleanup");
+            assert!(!item.would_delete);
+        }
+    }
+
     #[test]
     fn cleanup_cancelled_uses_structured_runtime_operation_error() {
         let err = cleanup_cancelled("cleanup_preview.output_segments", "caller cancelled");
 
-        match err {
-            crate::Error::RuntimeOperation { operation, source } => {
-                assert_eq!(operation, "cleanup_preview.output_segments");
-                assert_eq!(
-                    source,
-                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
-                );
-            }
-            other => panic!("expected structured cleanup cancellation error, got {other:?}"),
-        }
+        let crate::Error::RuntimeOperation { operation, source } = err else {
+            assert!(false, "expected structured cleanup cancellation error");
+            return;
+        };
+
+        assert_eq!(operation, "cleanup_preview.output_segments");
+        assert_eq!(
+            source,
+            RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+        );
     }
 
     // ---------------------------------------------------------------
