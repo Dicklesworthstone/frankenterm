@@ -12,6 +12,7 @@
     "purpose",
     "source_policy",
     "golden_strategy",
+    "future_harness_requirements",
     "classification_vocabulary",
     "scenarios"
   ],
@@ -46,6 +47,9 @@
     "classification_vocabulary": {
       "$ref": "#/$defs/classification_vocabulary"
     },
+    "future_harness_requirements": {
+      "$ref": "#/$defs/future_harness_requirements"
+    },
     "scenarios": {
       "type": "array",
       "minItems": 6,
@@ -62,6 +66,10 @@
     "hyphen_identifier": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9]+(?:\\.[0-9]+)*$"
     },
     "non_empty_string_array": {
       "type": "array",
@@ -247,6 +255,27 @@
         "do_not_touch"
       ]
     },
+    "future_harness_requirements": {
+      "type": "object",
+      "required": [
+        "must_generate",
+        "must_fail_when",
+        "proof_policy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "must_generate": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "must_fail_when": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "proof_policy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "scenario": {
       "type": "object",
       "required": [
@@ -262,6 +291,9 @@
       "properties": {
         "scenario_id": {
           "$ref": "#/$defs/hyphen_identifier"
+        },
+        "producing_bead": {
+          "$ref": "#/$defs/bead_id"
         },
         "title": {
           "type": "string",

@@ -2930,6 +2930,7 @@ mod tests {
                 &commit_report,
                 "exec-1",
                 &mut ledger,
+                None,
                 &mut events,
                 1000,
             )
@@ -2982,6 +2983,7 @@ mod tests {
                 &comp_report,
                 "exec-1",
                 &mut ledger,
+                None,
                 &mut events,
                 1000,
             )

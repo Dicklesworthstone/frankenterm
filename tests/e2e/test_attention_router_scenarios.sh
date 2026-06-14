@@ -34,6 +34,7 @@ jq -e '
   and (.required | sort) == [
     "classification_vocabulary",
     "contract_id",
+    "future_harness_requirements",
     "golden_strategy",
     "parent_bead",
     "producing_bead",
@@ -67,6 +68,13 @@ jq -e '
   and (.golden_strategy.canonicalization | type == "array" and length >= 1)
   and .golden_strategy.review_required_before_freeze == true
   and (.golden_strategy.update_policy | type == "string" and length > 0)
+  and (.future_harness_requirements.must_generate | type == "array" and length >= 1)
+  and (.future_harness_requirements.must_fail_when | type == "array" and length >= 1)
+  and (.future_harness_requirements.must_fail_when | index("active exclusive reservations are treated as advisory rather than blocking overlap") != null)
+  and (.future_harness_requirements.must_fail_when | index("publication messages are treated as reservation releases") != null)
+  and (.future_harness_requirements.must_fail_when | index("conflicting Beads, reservation, and dirty-path owners are resolved by guessing a winner") != null)
+  and (.future_harness_requirements.must_fail_when | index("force-release or reopen happens before a status check and operator review") != null)
+  and (.future_harness_requirements.proof_policy | test("RCH-only"))
   and (.classification_vocabulary | sort) == [
     "blocked_domain",
     "blocked_infra",
@@ -113,6 +121,7 @@ jq -e '
 
   all(.scenarios[];
     (.scenario_id | type == "string" and length > 0)
+    and ((has("producing_bead") | not) or (.producing_bead | test("^ft-[a-z0-9]+(\\.[0-9]+)*$")))
     and (.title | type == "string" and length > 0)
     and (.summary | type == "string" and length > 0)
     and (.source_fixture_requirements | type == "array" and length >= 1)
@@ -144,6 +153,20 @@ jq -e '
     ([.source_fixture_requirements[].source_id] | unique_ids)
   )
 ' "${INVENTORY}" >/dev/null || fail "scenario ids and per-scenario source ids must be unique"
+
+jq -e '
+  [
+    .scenarios[]
+    | select(.producing_bead == "ft-x3nsb.6.3")
+    | .scenario_id
+  ] | sort == [
+    "active-exclusive-reservation-overlap",
+    "local-closeout-publication-pending",
+    "ownership-source-disagreement",
+    "reservation-release-message-not-released",
+    "stale-owner-status-before-force-release"
+  ]
+' "${INVENTORY}" >/dev/null || fail "reservation firewall scenario provenance drifted"
 
 jq -e '
   .scenarios[]
@@ -385,10 +408,13 @@ grep -Fq "PageRank, unblock count, and \"available for work\" language are never
   "${BLOCKER_RADAR_RUNBOOK}" || fail "blocker-radar runbook no longer rejects BV-only claims"
 
 jq -c '
+  .producing_bead as $inventory_producing_bead
+  |
   .scenarios[]
   | {
       event: "attention_router_scenario_verified",
       scenario_id,
+      producing_bead: (.producing_bead // $inventory_producing_bead),
       classification: .expected.classification,
       recommended_safe_action: .expected.recommended_safe_action,
       confidence: .expected.confidence,

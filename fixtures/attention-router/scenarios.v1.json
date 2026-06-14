@@ -464,6 +464,7 @@
     },
     {
       "scenario_id": "active-exclusive-reservation-overlap",
+      "producing_bead": "ft-x3nsb.6.3",
       "title": "Active exclusive reservation overlaps candidate paths",
       "summary": "The router must fail closed when a candidate edit path overlaps another agent's active exclusive reservation, even when the Bead looks otherwise attractive.",
       "source_fixture_requirements": [
@@ -523,6 +524,7 @@
     },
     {
       "scenario_id": "reservation-release-message-not-released",
+      "producing_bead": "ft-x3nsb.6.3",
       "title": "Release message exists but reservation is still active",
       "summary": "The router must wait for an actual reservation release or expiry when an owner announces publication but the reservation lease is still active.",
       "source_fixture_requirements": [
@@ -583,6 +585,7 @@
     },
     {
       "scenario_id": "ownership-source-disagreement",
+      "producing_bead": "ft-x3nsb.6.3",
       "title": "Beads owner, reservation holder, and dirty-path owner disagree",
       "summary": "The router must classify conflicting ownership signals as do-not-touch until a human or explicit handoff resolves the mismatch.",
       "source_fixture_requirements": [
@@ -645,6 +648,7 @@
     },
     {
       "scenario_id": "local-closeout-publication-pending",
+      "producing_bead": "ft-x3nsb.6.3",
       "title": "Local closeout exists while publication and mirror are pending",
       "summary": "The router must wait when a Bead appears closed locally but the commit, origin/main push, or legacy mirror update has not made the closeout durable.",
       "source_fixture_requirements": [
@@ -705,6 +709,7 @@
     },
     {
       "scenario_id": "stale-owner-status-before-force-release",
+      "producing_bead": "ft-x3nsb.6.3",
       "title": "Stale owner candidate requires status check before force-release review",
       "summary": "The router may recommend a status check or operator review for stale ownership, but it must not force-release or reopen work based only on age.",
       "source_fixture_requirements": [

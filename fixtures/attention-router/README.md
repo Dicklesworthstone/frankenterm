@@ -28,10 +28,12 @@ text, secrets, full Agent Mail message bodies, or unsanitized build logs.
 `ft-x3nsb.6.3` extends the same inventory with the reservation firewall matrix:
 active exclusive reservation overlap, release-message-without-release,
 ownership source disagreement, local closeout awaiting publication, and stale
-owner status-check-before-force-release. These cases are deliberately kept in
-the shared scenario inventory so the future JSON and TOON golden harness
-classifies ownership hazards with the same vocabulary as the rest of the
-attention router.
+owner status-check-before-force-release. Those rows carry scenario-level
+`producing_bead: ft-x3nsb.6.3` metadata while the inventory-level producer
+continues to identify the original `ft-x3nsb.6.1` scenario corpus. These cases
+are deliberately kept in the shared scenario inventory so the future JSON and
+TOON golden harness classifies ownership hazards with the same vocabulary as the
+rest of the attention router.
 
 `ft-x3nsb.6.4` adds the local disk-pressure approval scenario. It preserves the
 case where ENOSPC blocks writes, read-only cleanup inventory identifies
