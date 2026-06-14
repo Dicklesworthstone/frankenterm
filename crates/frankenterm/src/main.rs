@@ -8857,6 +8857,9 @@ fn proof_attempt_outcome_str(outcome: DeferredProofReplayAttemptOutcome) -> &'st
         }
         DeferredProofReplayAttemptOutcome::BlockedExit143 => "blocked_exit_143",
         DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout => "blocked_remote_timeout",
+        DeferredProofReplayAttemptOutcome::BlockedStuckDetectorCancelled => {
+            "blocked_stuck_detector_cancelled"
+        }
         DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight => "blocked_topology_preflight",
         DeferredProofReplayAttemptOutcome::BlockedRemoteNotConfirmed => {
             "blocked_remote_not_confirmed"
