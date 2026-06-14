@@ -59,6 +59,8 @@ pub enum TxEventKind {
     StepFailed,
     /// Commit phase completed (all steps committed or failure boundary reached).
     CommitCompleted,
+    /// Economic circuit breaker tripped a transaction hard stop.
+    EconomicHardStop,
 
     // ── Compensation phase ──
     /// Compensation phase started — rolling back after failure.
@@ -96,7 +98,8 @@ impl TxEventKind {
             Self::CommitStarted
             | Self::StepCommitted
             | Self::StepFailed
-            | Self::CommitCompleted => TxObservabilityPhase::Commit,
+            | Self::CommitCompleted
+            | Self::EconomicHardStop => TxObservabilityPhase::Commit,
             Self::CompensationStarted | Self::StepCompensated | Self::CompensationCompleted => {
                 TxObservabilityPhase::Compensate
             }
@@ -142,6 +145,7 @@ pub mod reason_codes {
     pub const STEP_FAILED: &str = "tx.commit.step_failed";
     pub const COMMIT_COMPLETED: &str = "tx.commit.completed";
     pub const COMMIT_PARTIAL: &str = "tx.commit.partial_failure";
+    pub const ECONOMIC_HARD_STOP: &str = "tx.economic.hard_stop";
 
     // Compensate
     pub const COMPENSATE_STARTED: &str = "tx.compensate.started";

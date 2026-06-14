@@ -3017,6 +3017,154 @@ pub struct TxPlan {
     pub compensations: Vec<TxCompensation>,
 }
 
+/// Token budget attached to a mission transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTokenBudget {
+    /// Maximum total prompt+output tokens the mission may consume.
+    pub max_tokens: u64,
+    /// Maximum prompt+output tokens that may burn without mission progress.
+    pub max_no_progress_tokens: u64,
+}
+
+impl MissionTokenBudget {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_tokens == 0 {
+            return Err("Mission token budget max_tokens must be > 0".to_string());
+        }
+        if self.max_no_progress_tokens == 0 {
+            return Err("Mission token budget max_no_progress_tokens must be > 0".to_string());
+        }
+        if self.max_no_progress_tokens > self.max_tokens {
+            return Err(format!(
+                "Mission token budget no-progress limit {} exceeds total budget {}",
+                self.max_no_progress_tokens, self.max_tokens
+            ));
+        }
+        Ok(())
+    }
+}
+
+const MISSION_TOKEN_BUDGET_ATTACHMENT_KIND: &str = "mission_token_budget";
+
+fn mission_token_budget_attachment_kind() -> String {
+    MISSION_TOKEN_BUDGET_ATTACHMENT_KIND.to_string()
+}
+
+/// One prompt/output usage observation for the economic circuit breaker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTokenUsageSample {
+    /// Prompt/input tokens observed since the previous sample.
+    pub prompt_tokens: u64,
+    /// Output/completion tokens observed since the previous sample.
+    pub output_tokens: u64,
+    /// Mission-progress markers advanced since the previous sample.
+    pub progress_delta: u64,
+    /// Observation timestamp in epoch milliseconds.
+    pub observed_at_ms: i64,
+}
+
+impl MissionTokenUsageSample {
+    #[must_use]
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+/// Accumulated economic circuit-breaker state for a mission transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MissionEconomicState {
+    /// Total prompt+output tokens observed for this transaction.
+    pub total_tokens: u64,
+    /// Tokens burned since the last recorded progress marker.
+    pub no_progress_tokens: u64,
+    /// Total progress markers observed.
+    pub progress_markers: u64,
+    /// Whether the economic breaker has tripped the mission hard stop.
+    pub hard_stop_tripped: bool,
+    /// Last hard-stop reason code, when tripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reason_code: Option<String>,
+    /// Last usage observation timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed_at_ms: Option<i64>,
+}
+
+/// Typed hard-stop envelope emitted when the economic breaker trips.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionEconomicHardStopEnvelope {
+    pub tx_id: TxId,
+    pub plan_id: TxPlanId,
+    pub correlation_id: String,
+    pub reason_code: String,
+    pub kill_switch_level: MissionKillSwitchLevel,
+    pub token_budget: MissionTokenBudget,
+    pub total_tokens: u64,
+    pub no_progress_tokens: u64,
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub progress_delta: u64,
+    pub observed_at_ms: i64,
+}
+
+/// Audit row shape for economic hard stops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionEconomicAuditRow {
+    pub actor: MissionActorRole,
+    pub action: String,
+    pub tx_id: TxId,
+    pub plan_id: TxPlanId,
+    pub correlation_id: String,
+    pub reason_code: String,
+    pub kill_switch_level: MissionKillSwitchLevel,
+    pub total_tokens: u64,
+    pub no_progress_tokens: u64,
+    pub observed_at_ms: i64,
+}
+
+/// Economic circuit-breaker decision after recording one usage sample.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum MissionEconomicBreakerDecision {
+    Continue {
+        state: MissionEconomicState,
+    },
+    HardStop {
+        envelope: MissionEconomicHardStopEnvelope,
+        audit_row: MissionEconomicAuditRow,
+    },
+}
+
+/// Typed token-budget attachment carried inside a mission transaction contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTokenBudgetAttachment {
+    #[serde(default = "mission_token_budget_attachment_kind")]
+    pub kind: String,
+    pub token_budget: MissionTokenBudget,
+    #[serde(default)]
+    pub economic_state: MissionEconomicState,
+}
+
+impl MissionTokenBudgetAttachment {
+    #[must_use]
+    pub fn new(token_budget: MissionTokenBudget) -> Self {
+        Self {
+            kind: mission_token_budget_attachment_kind(),
+            token_budget,
+            economic_state: MissionEconomicState::default(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.kind != MISSION_TOKEN_BUDGET_ATTACHMENT_KIND {
+            return Err(format!(
+                "Mission token budget attachment kind {:?} is invalid",
+                self.kind
+            ));
+        }
+        self.token_budget.validate()
+    }
+}
+
 /// Full mission transaction contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionTxContract {
@@ -3030,6 +3178,177 @@ pub struct MissionTxContract {
 }
 
 impl MissionTxContract {
+    /// Attach or replace the token budget for this mission transaction.
+    pub fn attach_token_budget(&mut self, token_budget: MissionTokenBudget) -> Result<(), String> {
+        token_budget.validate()?;
+        self.store_token_budget_attachment(MissionTokenBudgetAttachment::new(token_budget))
+    }
+
+    /// Latest token-budget attachment carried by this contract, if any.
+    pub fn token_budget_attachment(&self) -> Result<Option<MissionTokenBudgetAttachment>, String> {
+        let mut attachment = None;
+        for receipt in &self.receipts {
+            if receipt.get("kind").and_then(serde_json::Value::as_str)
+                != Some(MISSION_TOKEN_BUDGET_ATTACHMENT_KIND)
+            {
+                continue;
+            }
+            let parsed = serde_json::from_value::<MissionTokenBudgetAttachment>(receipt.clone())
+                .map_err(|err| format!("invalid mission token budget attachment: {err}"))?;
+            parsed.validate()?;
+            attachment = Some(parsed);
+        }
+        Ok(attachment)
+    }
+
+    fn store_token_budget_attachment(
+        &mut self,
+        attachment: MissionTokenBudgetAttachment,
+    ) -> Result<(), String> {
+        attachment.validate()?;
+        let value = serde_json::to_value(attachment)
+            .map_err(|err| format!("failed to serialize mission token budget attachment: {err}"))?;
+        if let Some(existing) = self.receipts.iter_mut().rev().find(|receipt| {
+            receipt.get("kind").and_then(serde_json::Value::as_str)
+                == Some(MISSION_TOKEN_BUDGET_ATTACHMENT_KIND)
+        }) {
+            *existing = value;
+        } else {
+            self.receipts.push(value);
+        }
+        Ok(())
+    }
+
+    /// Record token usage and evaluate the economic circuit breaker.
+    pub fn record_economic_usage(
+        &mut self,
+        sample: MissionTokenUsageSample,
+    ) -> Result<MissionEconomicBreakerDecision, String> {
+        let Some(mut attachment) = self.token_budget_attachment()? else {
+            return Ok(MissionEconomicBreakerDecision::Continue {
+                state: MissionEconomicState::default(),
+            });
+        };
+
+        let observed_tokens = sample.total_tokens();
+        attachment.economic_state.total_tokens = attachment
+            .economic_state
+            .total_tokens
+            .saturating_add(observed_tokens);
+        attachment.economic_state.last_observed_at_ms = Some(sample.observed_at_ms);
+
+        if sample.progress_delta > 0 {
+            attachment.economic_state.progress_markers = attachment
+                .economic_state
+                .progress_markers
+                .saturating_add(sample.progress_delta);
+            attachment.economic_state.no_progress_tokens = 0;
+        } else {
+            attachment.economic_state.no_progress_tokens = attachment
+                .economic_state
+                .no_progress_tokens
+                .saturating_add(observed_tokens);
+        }
+
+        let reason_code = if attachment.economic_state.hard_stop_tripped {
+            Some(
+                attachment
+                    .economic_state
+                    .last_reason_code
+                    .clone()
+                    .unwrap_or_else(|| "tx.economic.hard_stop".to_string()),
+            )
+        } else if attachment.economic_state.no_progress_tokens
+            >= attachment.token_budget.max_no_progress_tokens
+        {
+            Some("tx.economic.no_progress_budget_exhausted".to_string())
+        } else if attachment.economic_state.total_tokens >= attachment.token_budget.max_tokens {
+            Some("tx.economic.total_budget_exhausted".to_string())
+        } else {
+            None
+        };
+
+        let Some(reason_code) = reason_code else {
+            let state = attachment.economic_state.clone();
+            self.store_token_budget_attachment(attachment)?;
+            return Ok(MissionEconomicBreakerDecision::Continue { state });
+        };
+
+        attachment.economic_state.hard_stop_tripped = true;
+        attachment.economic_state.last_reason_code = Some(reason_code.clone());
+        let decision = self.economic_hard_stop_decision(&attachment, &sample, &reason_code);
+        self.store_token_budget_attachment(attachment)?;
+        Ok(decision)
+    }
+
+    /// Current economic hard-stop decision, if the breaker has already tripped.
+    pub fn economic_hard_stop_decision_current(
+        &self,
+        observed_at_ms: i64,
+    ) -> Result<Option<MissionEconomicBreakerDecision>, String> {
+        let Some(attachment) = self.token_budget_attachment()? else {
+            return Ok(None);
+        };
+        if !attachment.economic_state.hard_stop_tripped {
+            return Ok(None);
+        }
+        let reason_code = attachment
+            .economic_state
+            .last_reason_code
+            .as_deref()
+            .unwrap_or("tx.economic.hard_stop")
+            .to_string();
+        Ok(Some(self.economic_hard_stop_decision(
+            &attachment,
+            &MissionTokenUsageSample {
+                prompt_tokens: 0,
+                output_tokens: 0,
+                progress_delta: 0,
+                observed_at_ms,
+            },
+            &reason_code,
+        )))
+    }
+
+    fn economic_hard_stop_decision(
+        &self,
+        attachment: &MissionTokenBudgetAttachment,
+        sample: &MissionTokenUsageSample,
+        reason_code: &str,
+    ) -> MissionEconomicBreakerDecision {
+        let economic_state = &attachment.economic_state;
+        let envelope = MissionEconomicHardStopEnvelope {
+            tx_id: self.intent.tx_id.clone(),
+            plan_id: self.plan.plan_id.clone(),
+            correlation_id: self.intent.correlation_id.clone(),
+            reason_code: reason_code.to_string(),
+            kill_switch_level: MissionKillSwitchLevel::HardStop,
+            token_budget: attachment.token_budget.clone(),
+            total_tokens: economic_state.total_tokens,
+            no_progress_tokens: economic_state.no_progress_tokens,
+            prompt_tokens: sample.prompt_tokens,
+            output_tokens: sample.output_tokens,
+            progress_delta: sample.progress_delta,
+            observed_at_ms: sample.observed_at_ms,
+        };
+        let audit_row = MissionEconomicAuditRow {
+            actor: self.intent.requested_by,
+            action: "mission_economic_hard_stop".to_string(),
+            tx_id: self.intent.tx_id.clone(),
+            plan_id: self.plan.plan_id.clone(),
+            correlation_id: self.intent.correlation_id.clone(),
+            reason_code: reason_code.to_string(),
+            kill_switch_level: MissionKillSwitchLevel::HardStop,
+            total_tokens: economic_state.total_tokens,
+            no_progress_tokens: economic_state.no_progress_tokens,
+            observed_at_ms: sample.observed_at_ms,
+        };
+        MissionEconomicBreakerDecision::HardStop {
+            envelope,
+            audit_row,
+        }
+    }
+
     /// Validate contract consistency.
     pub fn validate(&self) -> Result<(), String> {
         validate_tx_identifier("intent tx_id", &self.intent.tx_id.0)?;
@@ -3047,6 +3366,7 @@ impl MissionTxContract {
         if self.plan.steps.is_empty() {
             return Err("Transaction plan has no steps".to_string());
         }
+        let _ = self.token_budget_attachment()?;
 
         let mut step_ids = HashSet::new();
         let mut ordinals = HashSet::new();
@@ -8311,6 +8631,141 @@ mod tests {
                 "{field} should fail as an invalid identifier: {err}"
             );
         }
+    }
+
+    #[test]
+    fn tx_economic_breaker_trips_on_no_progress_token_burn() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract
+            .attach_token_budget(MissionTokenBudget {
+                max_tokens: 1_000,
+                max_no_progress_tokens: 100,
+            })
+            .unwrap();
+
+        let first = contract
+            .record_economic_usage(MissionTokenUsageSample {
+                prompt_tokens: 20,
+                output_tokens: 30,
+                progress_delta: 0,
+                observed_at_ms: 1_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            first,
+            MissionEconomicBreakerDecision::Continue { .. }
+        ));
+
+        let second = contract
+            .record_economic_usage(MissionTokenUsageSample {
+                prompt_tokens: 40,
+                output_tokens: 20,
+                progress_delta: 0,
+                observed_at_ms: 1_500,
+            })
+            .unwrap();
+
+        assert!(
+            matches!(second, MissionEconomicBreakerDecision::HardStop { .. }),
+            "no-progress token burn should trip the mission hard stop"
+        );
+        if let MissionEconomicBreakerDecision::HardStop {
+            envelope,
+            audit_row,
+        } = second
+        {
+            assert_eq!(envelope.kill_switch_level, MissionKillSwitchLevel::HardStop);
+            assert_eq!(
+                envelope.reason_code,
+                "tx.economic.no_progress_budget_exhausted"
+            );
+            assert_eq!(envelope.no_progress_tokens, 110);
+            assert_eq!(envelope.total_tokens, 110);
+            assert_eq!(audit_row.action, "mission_economic_hard_stop");
+            assert_eq!(audit_row.reason_code, envelope.reason_code);
+        }
+
+        let attachment = contract
+            .token_budget_attachment()
+            .unwrap()
+            .expect("budget attachment should persist");
+        assert!(attachment.economic_state.hard_stop_tripped);
+    }
+
+    #[test]
+    fn tx_economic_breaker_progress_resets_no_progress_burn() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract
+            .attach_token_budget(MissionTokenBudget {
+                max_tokens: 500,
+                max_no_progress_tokens: 100,
+            })
+            .unwrap();
+
+        contract
+            .record_economic_usage(MissionTokenUsageSample {
+                prompt_tokens: 30,
+                output_tokens: 50,
+                progress_delta: 0,
+                observed_at_ms: 1_000,
+            })
+            .unwrap();
+        let progressed = contract
+            .record_economic_usage(MissionTokenUsageSample {
+                prompt_tokens: 10,
+                output_tokens: 20,
+                progress_delta: 1,
+                observed_at_ms: 1_500,
+            })
+            .unwrap();
+
+        assert!(
+            matches!(progressed, MissionEconomicBreakerDecision::Continue { .. }),
+            "progress within budget should not trip the hard stop"
+        );
+        if let MissionEconomicBreakerDecision::Continue { state } = progressed {
+            assert_eq!(state.no_progress_tokens, 0);
+            assert_eq!(state.progress_markers, 1);
+            assert!(!state.hard_stop_tripped);
+        }
+
+        let after_progress = contract
+            .record_economic_usage(MissionTokenUsageSample {
+                prompt_tokens: 40,
+                output_tokens: 50,
+                progress_delta: 0,
+                observed_at_ms: 2_000,
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                after_progress,
+                MissionEconomicBreakerDecision::Continue { .. }
+            ),
+            "post-progress burn below budget should continue"
+        );
+        if let MissionEconomicBreakerDecision::Continue { state } = after_progress {
+            assert_eq!(state.no_progress_tokens, 90);
+            assert!(!state.hard_stop_tripped);
+        }
+    }
+
+    #[test]
+    fn tx_contract_validate_rejects_invalid_token_budget_attachment() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.receipts.push(serde_json::json!({
+            "kind": "mission_token_budget",
+            "token_budget": {
+                "max_tokens": 10,
+                "max_no_progress_tokens": 20
+            }
+        }));
+
+        let err = contract.validate().unwrap_err();
+        assert!(
+            err.contains("no-progress limit 20 exceeds total budget 10"),
+            "invalid budget should be named in error: {err}"
+        );
     }
 
     #[test]

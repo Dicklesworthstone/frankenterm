@@ -17,6 +17,7 @@
 //! every transition emits observability events with reason codes.
 
 use crate::plan::{
+    MissionEconomicAuditRow, MissionEconomicBreakerDecision, MissionEconomicHardStopEnvelope,
     MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction, TxCommitOutcome,
     TxCommitReport, TxCommitStepInput, TxCompensationReport, TxCompensationStepInput, TxOutcome,
     TxPrepareApprovalChecker, TxPrepareEvaluationContext, TxPrepareGateInput, TxPrepareOutcome,
@@ -892,6 +893,29 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let mut ledger = TxExecutionLedger::new(&execution_id, &plan_id, 0);
         let mut events: Vec<TxObservabilityEvent> = Vec::new();
         let mut decision_path = String::new();
+        let economic_hard_stop = contract
+            .economic_hard_stop_decision_current(now_ms)
+            .map_err(TxExecutionError::InvalidContract)?;
+        let effective_kill_switch = if economic_hard_stop.is_some() {
+            MissionKillSwitchLevel::HardStop
+        } else {
+            self.config.kill_switch
+        };
+        if let Some(MissionEconomicBreakerDecision::HardStop {
+            envelope,
+            audit_row,
+        }) = &economic_hard_stop
+        {
+            self.record_economic_hard_stop_event(
+                envelope,
+                audit_row,
+                &execution_id,
+                &plan_id,
+                &mut events,
+                now_ms,
+            );
+            decision_path.push_str("economic_hard_stop->");
+        }
 
         // Phase 1: Prepare
         let prepare_report = self.run_prepare_phase(
@@ -899,6 +923,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &execution_id,
             &mut events,
             &mut decision_path,
+            effective_kill_switch,
             now_ms,
         )?;
 
@@ -959,6 +984,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &execution_id,
             &mut events,
             &mut decision_path,
+            effective_kill_switch,
             now_ms,
         )?;
 
@@ -1172,6 +1198,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         execution_id: &str,
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
+        kill_switch: MissionKillSwitchLevel,
         now_ms: i64,
     ) -> Result<TxPrepareReport, TxExecutionError> {
         events.push(self.make_event(
@@ -1191,7 +1218,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &contract.intent.tx_id,
             &contract.plan,
             &gate_inputs,
-            self.config.kill_switch,
+            kill_switch,
             now_ms,
         )
         .map_err(TxExecutionError::PreparePhase)?;
@@ -1223,6 +1250,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         execution_id: &str,
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
+        kill_switch: MissionKillSwitchLevel,
         now_ms: i64,
     ) -> Result<TxCommitReport, TxExecutionError> {
         events.push(self.make_event(
@@ -1246,22 +1274,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         }
 
         let safety_paused = self.config.paused || batch_limit_exceeded;
-        let commit_inputs =
-            if self.config.kill_switch != MissionKillSwitchLevel::Off || safety_paused {
-                Vec::new()
-            } else {
-                self.executor
-                    .execute_steps(contract, self.config.fail_step.as_deref(), now_ms)
-            };
+        let commit_inputs = if kill_switch != MissionKillSwitchLevel::Off || safety_paused {
+            Vec::new()
+        } else {
+            self.executor
+                .execute_steps(contract, self.config.fail_step.as_deref(), now_ms)
+        };
 
-        let report = execute_commit_phase(
-            contract,
-            &commit_inputs,
-            self.config.kill_switch,
-            safety_paused,
-            now_ms,
-        )
-        .map_err(TxExecutionError::CommitPhase)?;
+        let report =
+            execute_commit_phase(contract, &commit_inputs, kill_switch, safety_paused, now_ms)
+                .map_err(TxExecutionError::CommitPhase)?;
 
         decision_path.push_str(&format!("->commit({:?})", report.outcome));
         Ok(report)
@@ -1534,6 +1556,33 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             agent_id: String::new(),
             details: HashMap::new(),
         }
+    }
+
+    fn record_economic_hard_stop_event(
+        &self,
+        envelope: &MissionEconomicHardStopEnvelope,
+        audit_row: &MissionEconomicAuditRow,
+        execution_id: &str,
+        plan_id: &str,
+        events: &mut Vec<TxObservabilityEvent>,
+        now_ms: i64,
+    ) {
+        let mut event = self.make_event(
+            TxEventKind::EconomicHardStop,
+            TxObservabilityPhase::Commit,
+            crate::tx_observability::reason_codes::ECONOMIC_HARD_STOP,
+            execution_id,
+            plan_id,
+            TxPhase::Aborted,
+            now_ms,
+        );
+        if let Ok(value) = serde_json::to_value(envelope) {
+            event.details.insert("envelope".to_string(), value);
+        }
+        if let Ok(value) = serde_json::to_value(audit_row) {
+            event.details.insert("audit_row".to_string(), value);
+        }
+        events.push(event);
     }
 
     fn record_prepare_gate_events(
@@ -1861,8 +1910,9 @@ impl std::error::Error for TxExecutionError {}
 mod tests {
     use super::*;
     use crate::plan::{
-        MissionActorRole, MissionTxContract, MissionTxState, StepAction, TxCompensation, TxId,
-        TxIntent, TxOutcome, TxPlan as ContractTxPlan, TxPlanId, TxStep, TxStepId,
+        MissionActorRole, MissionEconomicBreakerDecision, MissionTokenBudget,
+        MissionTokenUsageSample, MissionTxContract, MissionTxState, StepAction, TxCompensation,
+        TxId, TxIntent, TxOutcome, TxPlan as ContractTxPlan, TxPlanId, TxStep, TxStepId,
     };
     use crate::tx_idempotency::{IdempotencyPolicy, IdempotencyStore, StepOutcome};
     use crate::tx_plan_compiler::StepRisk;
@@ -2046,6 +2096,51 @@ mod tests {
 
         assert!(!result.prepare_report.outcome.commit_eligible());
         assert!(result.commit_report.is_none());
+    }
+
+    #[test]
+    fn economic_hard_stop_blocks_prepare_and_emits_audit_event() {
+        let mut contract = make_test_contract(2);
+        contract
+            .attach_token_budget(MissionTokenBudget {
+                max_tokens: 1_000,
+                max_no_progress_tokens: 100,
+            })
+            .unwrap();
+        let decision = contract
+            .record_economic_usage(MissionTokenUsageSample {
+                prompt_tokens: 75,
+                output_tokens: 50,
+                progress_delta: 0,
+                observed_at_ms: 4_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            decision,
+            MissionEconomicBreakerDecision::HardStop { .. }
+        ));
+
+        let engine =
+            TxExecutionEngine::new(CommitDispatchPanicExecutor, TxExecutionConfig::default());
+        let result = engine.execute(&mut contract, 5_000).unwrap();
+
+        assert_eq!(result.final_state, MissionTxState::Failed);
+        assert_eq!(result.outcome, TxOutcome::Failed);
+        assert_eq!(result.prepare_report.outcome, TxPrepareOutcome::Denied);
+        assert!(result.commit_report.is_none());
+        assert!(result.decision_path.starts_with("economic_hard_stop->"));
+
+        let event = result
+            .events
+            .iter()
+            .find(|event| event.kind == TxEventKind::EconomicHardStop)
+            .expect("economic hard-stop event should be emitted");
+        assert_eq!(
+            event.reason_code,
+            crate::tx_observability::reason_codes::ECONOMIC_HARD_STOP
+        );
+        assert!(event.details.contains_key("envelope"));
+        assert!(event.details.contains_key("audit_row"));
     }
 
     #[test]
