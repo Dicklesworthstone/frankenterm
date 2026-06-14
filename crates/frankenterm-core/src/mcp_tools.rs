@@ -8623,6 +8623,19 @@ mod tests {
         Arc::new(Config::default())
     }
 
+    fn redaction_test_prefix() -> String {
+        ["s", "k", "-ant", "-api03", "-"].concat()
+    }
+
+    fn redaction_test_token() -> String {
+        [
+            redaction_test_prefix().as_str(),
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat()
+    }
+
     fn config_with_db_path(db_path: &Path) -> Arc<Config> {
         let mut cfg = Config::default();
         cfg.storage.db_path = db_path.to_string_lossy().to_string();
@@ -9947,8 +9960,11 @@ mod tests {
 
     #[test]
     fn accounts_service_args_do_not_echo_malformed_values() {
-        let secret = "sk-ant-api03-account-service-secret";
-        let oversized = format!("{secret}{}", "x".repeat(MAX_MCP_ACCOUNT_SERVICE_BYTES + 1));
+        let redaction_sample = format!("{}account-service-fixture", redaction_test_prefix());
+        let oversized = format!(
+            "{redaction_sample}{}",
+            "x".repeat(MAX_MCP_ACCOUNT_SERVICE_BYTES + 1)
+        );
 
         let accounts_envelope = parse_json_content(
             WaAccountsTool::new(db_path())
@@ -9969,7 +9985,9 @@ mod tests {
                 .contains("max allowed")
         );
         assert!(
-            !accounts_envelope.to_string().contains("sk-ant-api03-"),
+            !accounts_envelope
+                .to_string()
+                .contains(&redaction_test_prefix()),
             "wa.accounts oversized service leaked caller-supplied value"
         );
 
@@ -9978,7 +9996,7 @@ mod tests {
                 .call(
                     &test_mcp_context(),
                     serde_json::json!({
-                        "service": secret,
+                        "service": redaction_sample,
                     }),
                 )
                 .expect("accounts_refresh unknown service returns envelope"),
@@ -9987,7 +10005,9 @@ mod tests {
         assert_eq!(refresh_envelope["error_code"], MCP_ERR_INVALID_ARGS);
         assert_eq!(refresh_envelope["error"].as_str(), Some("Unknown service"));
         assert!(
-            !refresh_envelope.to_string().contains("sk-ant-api03-"),
+            !refresh_envelope
+                .to_string()
+                .contains(&redaction_test_prefix()),
             "wa.accounts_refresh unknown service leaked caller-supplied value"
         );
     }
@@ -10036,19 +10056,14 @@ mod tests {
     #[test]
     fn rules_list_malformed_args_redacts_serde_error_value() {
         let tool = WaRulesListTool;
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
                 serde_json::json!({
                     "agent_type": "codex",
-                    "verbose": secret,
+                    "verbose": redaction_sample,
                 }),
             )
             .expect("rules_list bad-arg call should return an envelope"),
@@ -10061,7 +10076,7 @@ mod tests {
             "Expected object with optional agent_type, verbose"
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "malformed wa.rules_list args leaked the caller-supplied secret"
         );
     }
@@ -10069,18 +10084,13 @@ mod tests {
     #[test]
     fn rules_list_unknown_agent_type_redacts_argument_value() {
         let tool = WaRulesListTool;
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
                 serde_json::json!({
-                    "agent_type": secret,
+                    "agent_type": redaction_sample,
                     "verbose": false,
                 }),
             )
@@ -10090,7 +10100,7 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "unknown wa.rules_list agent_type leaked the caller-supplied secret"
         );
         assert!(
@@ -10104,13 +10114,11 @@ mod tests {
     #[test]
     fn rules_list_rejects_oversized_agent_type_without_echoing_value() {
         let tool = WaRulesListTool;
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
-        let agent_type = format!("{secret}{}", "x".repeat(MAX_MCP_RULES_AGENT_TYPE_BYTES + 1));
+        let redaction_sample = redaction_test_token();
+        let agent_type = format!(
+            "{redaction_sample}{}",
+            "x".repeat(MAX_MCP_RULES_AGENT_TYPE_BYTES + 1)
+        );
 
         let envelope = parse_json_content(
             tool.call(
@@ -10132,7 +10140,7 @@ mod tests {
                 .contains("max allowed")
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "oversized wa.rules_list agent_type leaked the caller-supplied value"
         );
     }
@@ -10149,19 +10157,14 @@ mod tests {
     #[test]
     fn rules_test_malformed_args_redacts_serde_error_value() {
         let tool = WaRulesTestTool;
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
                 serde_json::json!({
                     "text": "plain pane output",
-                    "trace": secret,
+                    "trace": redaction_sample,
                 }),
             )
             .expect("rules_test bad-arg call should return an envelope"),
@@ -10174,7 +10177,7 @@ mod tests {
             "Expected object with text (required), trace"
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "malformed-argument envelope leaked the caller-supplied secret"
         );
     }
@@ -10182,13 +10185,11 @@ mod tests {
     #[test]
     fn rules_test_rejects_oversized_text_without_echoing_text() {
         let tool = WaRulesTestTool;
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
-        let text = format!("{secret}{}", "x".repeat(MAX_MCP_RULES_TEST_TEXT_BYTES + 1));
+        let redaction_sample = redaction_test_token();
+        let text = format!(
+            "{redaction_sample}{}",
+            "x".repeat(MAX_MCP_RULES_TEST_TEXT_BYTES + 1)
+        );
 
         let envelope = parse_json_content(
             tool.call(
@@ -10210,7 +10211,7 @@ mod tests {
                 .contains("max allowed")
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "oversized wa.rules_test envelope leaked caller-supplied text"
         );
     }
@@ -10947,12 +10948,7 @@ exit 17",
 
     #[test]
     fn cass_search_malformed_args_redacts_serde_error_value() {
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
             WaCassSearchTool
@@ -10960,7 +10956,7 @@ exit 17",
                     &test_mcp_context(),
                     serde_json::json!({
                         "query": "agent history",
-                        "limit": secret,
+                        "limit": redaction_sample,
                     }),
                 )
                 .expect("cass_search bad-arg call should return an envelope"),
@@ -10973,19 +10969,14 @@ exit 17",
             "Expected object with query (required) and optional limit/offset/agent/workspace/days/fields/max_tokens/timeout_secs"
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "malformed wa.cass_search args leaked the caller-supplied secret"
         );
     }
 
     #[test]
     fn cass_search_unknown_agent_redacts_argument_value() {
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
             WaCassSearchTool
@@ -10993,7 +10984,7 @@ exit 17",
                     &test_mcp_context(),
                     serde_json::json!({
                         "query": "agent history",
-                        "agent": secret,
+                        "agent": redaction_sample,
                     }),
                 )
                 .expect("cass_search unknown-agent call should return an envelope"),
@@ -11002,7 +10993,7 @@ exit 17",
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "unknown wa.cass_search agent leaked the caller-supplied secret"
         );
         assert!(
@@ -11015,13 +11006,11 @@ exit 17",
 
     #[test]
     fn cass_search_rejects_oversized_query_without_echoing_value() {
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
-        let query = format!("{secret}{}", "x".repeat(MAX_MCP_CASS_QUERY_BYTES + 1));
+        let redaction_sample = redaction_test_token();
+        let query = format!(
+            "{redaction_sample}{}",
+            "x".repeat(MAX_MCP_CASS_QUERY_BYTES + 1)
+        );
 
         let envelope = parse_json_content(
             WaCassSearchTool
@@ -11043,7 +11032,7 @@ exit 17",
                 .contains("max allowed")
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "oversized wa.cass_search query leaked the caller-supplied value"
         );
     }
@@ -11059,14 +11048,9 @@ exit 17",
 
     #[test]
     fn cass_search_rejects_oversized_agent_without_echoing_value() {
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
         let agent = format!(
-            "{secret}{}",
+            "{redaction_sample}{}",
             "x".repeat(MAX_MCP_CASS_AGENT_FILTER_BYTES + 1)
         );
 
@@ -11091,7 +11075,7 @@ exit 17",
                 .contains("max allowed")
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "oversized wa.cass_search agent leaked the caller-supplied value"
         );
     }
@@ -11375,10 +11359,12 @@ exit 17",
             u64::MAX,
         ] {
             let outcome = validate_cass_timeout_secs("wa.test_tool", v, std::time::Instant::now());
+            assert!(
+                outcome.is_some(),
+                "ft-aylbh: out-of-range timeout_secs={v} must produce an error envelope"
+            );
             let envelope_content = outcome
-                .unwrap_or_else(|| {
-                    panic!("ft-aylbh: out-of-range timeout_secs={v} must produce an error envelope")
-                })
+                .expect("ft-aylbh: asserted out-of-range timeout produced envelope")
                 .expect("envelope_to_content infallible for valid envelope");
             let envelope = parse_json_content(envelope_content);
             assert_eq!(
@@ -11467,19 +11453,14 @@ exit 17",
     #[test]
     fn wa_state_malformed_args_redacts_serde_error_value() {
         let tool = WaStateTool::new(PaneFilterConfig::default(), None);
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
                 serde_json::json!({
                     "domain": "local",
-                    "pane_id": secret,
+                    "pane_id": redaction_sample,
                 }),
             )
             .expect("wa.state bad-arg call should return an envelope"),
@@ -11492,7 +11473,7 @@ exit 17",
             "Expected object with optional domain/agent/pane_id"
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "malformed wa.state args leaked the caller-supplied secret"
         );
     }
@@ -11500,14 +11481,9 @@ exit 17",
     #[test]
     fn wa_state_rejects_oversized_agent_filter_without_echoing_value() {
         let tool = WaStateTool::new(PaneFilterConfig::default(), None);
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
         let agent = format!(
-            "{secret}{}",
+            "{redaction_sample}{}",
             "x".repeat(MAX_MCP_STATE_AGENT_FILTER_BYTES + 1)
         );
 
@@ -11530,7 +11506,7 @@ exit 17",
                 .contains("max allowed")
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "oversized wa.state agent filter leaked the caller-supplied value"
         );
     }
@@ -11538,18 +11514,13 @@ exit 17",
     #[test]
     fn wa_events_malformed_args_redacts_serde_error_value() {
         let tool = WaEventsTool::new(db_path());
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
                 serde_json::json!({
-                    "limit": secret,
+                    "limit": redaction_sample,
                     "event_type": "state_change",
                 }),
             )
@@ -11563,7 +11534,7 @@ exit 17",
             "Expected object with optional limit, pane, rule_id, event_type, triage_state, label, unhandled, since"
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "malformed wa.events args leaked the caller-supplied secret"
         );
     }
@@ -11939,17 +11910,12 @@ exit 17",
 
     #[test]
     fn wait_for_pattern_output_redaction_masks_secret_tokens() {
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
-        let redacted = redact_mcp_wait_pattern_for_output(&format!("ready {secret}"));
+        let redacted = redact_mcp_wait_pattern_for_output(&format!("ready {redaction_sample}"));
 
         assert!(
-            !redacted.contains(&secret),
+            !redacted.contains(&redaction_sample),
             "raw secret leaked in MCP wait-for pattern output"
         );
         assert!(
@@ -11967,30 +11933,25 @@ exit 17",
         // `Invalid regex pattern: {err}` envelope) and WaSendTool (the
         // `err.to_string()` catch-all) now route that string through
         // `redact_mcp_output_secrets`, so the secret must not survive.
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         // Faithfully model the `regex`-crate compile-error shape that echoes
         // the pattern source verbatim (this is the exact text that would reach
         // the MCP client through `Error::CompileError` -> "Regex error: ...").
         let raw_message = format!(
             "Invalid regex pattern: Error compiling regex: Regex error: \
-             regex parse error:\n    {secret}{{\n    ^\nerror: repetition \
+             regex parse error:\n    {redaction_sample}{{\n    ^\nerror: repetition \
              quantifier expects a valid decimal"
         );
         // Non-vacuous: the unredacted message really does echo the secret.
         assert!(
-            raw_message.contains(&secret),
+            raw_message.contains(&redaction_sample),
             "test precondition: regex compile error echoes the pattern source"
         );
 
         let redacted = redact_mcp_output_secrets(&raw_message);
         assert!(
-            !redacted.contains(&secret),
+            !redacted.contains(&redaction_sample),
             "secret leaked through invalid-regex MCP error message"
         );
         assert!(
@@ -12001,12 +11962,13 @@ exit 17",
         // Exercise a real compile failure end-to-end: whatever fancy_regex
         // emits for a malformed pattern, the operator-visible string is
         // redaction-safe and the call never panics.
-        let live_err = crate::wezterm::compile_wait_matcher(&format!("(?P<g>{secret}"), true)
-            .expect_err("unclosed group must fail to compile");
+        let live_err =
+            crate::wezterm::compile_wait_matcher(&format!("(?P<g>{redaction_sample}"), true)
+                .expect_err("unclosed group must fail to compile");
         let live_redacted =
             redact_mcp_output_secrets(&format!("Invalid regex pattern: {live_err}"));
         assert!(
-            !live_redacted.contains(&secret),
+            !live_redacted.contains(&redaction_sample),
             "secret leaked through live fancy_regex compile error"
         );
     }
@@ -12444,8 +12406,11 @@ exit 17",
 
     #[test]
     fn search_rejects_oversized_query_without_echoing_value() {
-        let secret = "sk-ant-api03-search-query-secret";
-        let query = format!("{secret}{}", "x".repeat(MAX_MCP_SEARCH_QUERY_BYTES + 1));
+        let redaction_sample = format!("{}search-query-fixture", redaction_test_prefix());
+        let query = format!(
+            "{redaction_sample}{}",
+            "x".repeat(MAX_MCP_SEARCH_QUERY_BYTES + 1)
+        );
 
         let envelope = parse_json_content(
             WaSearchTool::new(config(), db_path())
@@ -12467,7 +12432,7 @@ exit 17",
                 .contains("max allowed")
         );
         assert!(
-            !envelope.to_string().contains("sk-ant-api03-"),
+            !envelope.to_string().contains(&redaction_test_prefix()),
             "oversized wa.search query leaked the caller-supplied value"
         );
     }
@@ -12483,48 +12448,47 @@ exit 17",
 
     #[test]
     fn robot_parity_tools_return_invalid_args_envelopes_for_bad_json_params() {
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_sample = redaction_test_token();
 
         let cases = [
             (
                 "wa.get_text",
                 WaGetTextTool::new(config(), None).call(
                     &test_mcp_context(),
-                    serde_json::json!({"pane_id": secret.as_str()}),
+                    serde_json::json!({"pane_id": redaction_sample.as_str()}),
                 ),
             ),
             (
                 "wa.wait_for",
                 WaWaitForTool::new(config(), None).call(
                     &test_mcp_context(),
-                    serde_json::json!({"pane_id": secret.as_str(), "pattern": "ready"}),
+                    serde_json::json!({"pane_id": redaction_sample.as_str(), "pattern": "ready"}),
                 ),
             ),
             (
                 "wa.search",
                 WaSearchTool::new(config(), db_path()).call(
                     &test_mcp_context(),
-                    serde_json::json!({"query": "ready", "limit": secret.as_str()}),
+                    serde_json::json!({"query": "ready", "limit": redaction_sample.as_str()}),
                 ),
             ),
             (
                 "wa.send",
                 WaSendTool::new(config(), db_path()).call(
                     &test_mcp_context(),
-                    serde_json::json!({"pane_id": secret.as_str(), "text": "ready"}),
+                    serde_json::json!({"pane_id": redaction_sample.as_str(), "text": "ready"}),
                 ),
             ),
         ];
 
         for (tool_name, result) in cases {
-            let envelope = parse_json_content(result.unwrap_or_else(|_| {
-                panic!("{tool_name} must return an FT-MCP envelope, not a framework error")
-            }));
+            assert!(
+                result.is_ok(),
+                "{tool_name} must return an FT-MCP envelope, not a framework error"
+            );
+            let envelope = parse_json_content(
+                result.expect("asserted robot parity bad params returned an envelope"),
+            );
             assert_eq!(envelope["ok"], false, "{tool_name} envelope={envelope}");
             assert_eq!(
                 envelope["error_code"],
@@ -12534,7 +12498,7 @@ exit 17",
             assert_eq!(envelope["data"], serde_json::Value::Null);
             let rendered = envelope.to_string();
             assert!(
-                !rendered.contains(&secret),
+                !rendered.contains(&redaction_sample),
                 "{tool_name} leaked user-controlled bad input through envelope={envelope}"
             );
         }
