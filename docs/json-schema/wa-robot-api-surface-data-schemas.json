@@ -6,6 +6,7 @@
   "type": "object",
   "oneOf": [
     { "$ref": "#/$defs/batch_get_text" },
+    { "$ref": "#/$defs/agent_subspace_rpc" },
     { "$ref": "#/$defs/mission_state" },
     { "$ref": "#/$defs/mission_decisions" },
     { "$ref": "#/$defs/tx_plan" },
@@ -61,6 +62,86 @@
         "results": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/pane_text_result" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "agent_subspace_rpc": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "route",
+        "rpc_id",
+        "idempotency_key",
+        "sender_agent",
+        "recipient_agent",
+        "serialization",
+        "payload",
+        "payload_bytes",
+        "payload_sha256",
+        "policy",
+        "redaction",
+        "audit",
+        "delivery"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "route": { "const": "wa://subspace/rpc" },
+        "rpc_id": { "type": "string", "minLength": 1 },
+        "idempotency_key": { "type": "string", "minLength": 1 },
+        "sender_agent": { "type": "string", "minLength": 1 },
+        "recipient_agent": { "type": "string", "minLength": 1 },
+        "serialization": { "const": "json" },
+        "payload": true,
+        "payload_bytes": { "type": "integer", "minimum": 0, "maximum": 65536 },
+        "payload_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "policy": {
+          "type": "object",
+          "required": ["decision", "policy_id"],
+          "properties": {
+            "decision": {
+              "enum": ["allow", "deny", "require_approval", "defer"]
+            },
+            "policy_id": { "type": "string", "minLength": 1 },
+            "approval_code": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        },
+        "redaction": {
+          "type": "object",
+          "required": ["state", "sensitivity_tier", "redacted_field_count"],
+          "properties": {
+            "state": {
+              "enum": [
+                "redacted",
+                "no_sensitive_fields",
+                "rejected_unredactable"
+              ]
+            },
+            "sensitivity_tier": { "type": "string", "minLength": 1 },
+            "redacted_field_count": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "audit": {
+          "type": "object",
+          "required": ["audit_id", "recorded_at_ms"],
+          "properties": {
+            "audit_id": { "type": "string", "minLength": 1 },
+            "recorded_at_ms": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "delivery": {
+          "type": "object",
+          "required": ["mode", "terminal_render_buffer", "delivery_queue"],
+          "properties": {
+            "mode": { "const": "terminal_bypass" },
+            "terminal_render_buffer": { "const": false },
+            "delivery_queue": { "type": "string", "minLength": 1 },
+            "delivered_at_ms": { "type": ["integer", "null"], "minimum": 0 }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

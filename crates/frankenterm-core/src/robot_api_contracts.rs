@@ -83,6 +83,8 @@ pub enum ApiSurface {
     AgentInventory,
     /// agent-configure — apply agent configurations.
     AgentConfigure,
+    /// agent-subspace-rpc — terminal-bypass structured agent coordination.
+    AgentSubspaceRpc,
 
     // Accounts
     /// accounts-list — list provider accounts.
@@ -157,6 +159,7 @@ impl ApiSurface {
         Self::RulesLint,
         Self::AgentInventory,
         Self::AgentConfigure,
+        Self::AgentSubspaceRpc,
         Self::AccountsList,
         Self::AccountsRefresh,
         Self::Reserve,
@@ -200,6 +203,7 @@ impl ApiSurface {
             Self::RulesLint => "rules-lint",
             Self::AgentInventory => "agent-inventory",
             Self::AgentConfigure => "agent-configure",
+            Self::AgentSubspaceRpc => "agent-subspace-rpc",
             Self::AccountsList => "accounts-list",
             Self::AccountsRefresh => "accounts-refresh",
             Self::Reserve => "reserve",
@@ -231,6 +235,7 @@ impl ApiSurface {
                 | Self::WorkflowRun
                 | Self::WorkflowAbort
                 | Self::AgentConfigure
+                | Self::AgentSubspaceRpc
                 | Self::AccountsRefresh
                 | Self::Reserve
                 | Self::Release
@@ -269,7 +274,7 @@ impl ApiSurface {
                 "workflow"
             }
             Self::RulesList | Self::RulesTest | Self::RulesLint => "rules",
-            Self::AgentInventory | Self::AgentConfigure => "agent",
+            Self::AgentInventory | Self::AgentConfigure | Self::AgentSubspaceRpc => "agent",
             Self::AccountsList | Self::AccountsRefresh => "accounts",
             Self::Reserve | Self::Release => "reservations",
             Self::MissionState | Self::MissionDecisions => "mission",
@@ -1036,6 +1041,30 @@ pub fn standard_contract_matrix() -> ContractMatrix {
     );
     matrix.register(
         ContractCheck::new(
+            "schema-agent-subspace-rpc",
+            ApiSurface::AgentSubspaceRpc,
+            CheckCategory::SchemaStability,
+            "agent-subspace-rpc response has terminal-bypass policy/redaction/audit receipts",
+        )
+        .with_required_fields(&[
+            "schema_version",
+            "route",
+            "rpc_id",
+            "idempotency_key",
+            "sender_agent",
+            "recipient_agent",
+            "serialization",
+            "payload",
+            "payload_bytes",
+            "payload_sha256",
+            "policy",
+            "redaction",
+            "audit",
+            "delivery",
+        ]),
+    );
+    matrix.register(
+        ContractCheck::new(
             "schema-tx-plan",
             ApiSurface::TxPlan,
             CheckCategory::SchemaStability,
@@ -1157,6 +1186,25 @@ pub fn standard_contract_matrix() -> ContractMatrix {
             "events list is stable for same filter and event state",
         )
         .with_deterministic_fields(&["events", "total_count"]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "det-agent-subspace-rpc",
+            ApiSurface::AgentSubspaceRpc,
+            CheckCategory::Determinism,
+            "agent-subspace-rpc keeps stable routing, digest, and delivery metadata for idempotent replay",
+        )
+        .with_deterministic_fields(&[
+            "route",
+            "rpc_id",
+            "idempotency_key",
+            "payload_bytes",
+            "payload_sha256",
+            "policy",
+            "redaction",
+            "audit",
+            "delivery",
+        ]),
     );
     matrix.register(
         ContractCheck::new(
@@ -1296,6 +1344,7 @@ mod tests {
         assert!(ApiSurface::SendText.is_mutation());
         assert!(ApiSurface::Reserve.is_mutation());
         assert!(ApiSurface::TxRollback.is_mutation());
+        assert!(ApiSurface::AgentSubspaceRpc.is_mutation());
         assert!(!ApiSurface::GetText.is_mutation());
         assert!(!ApiSurface::Search.is_mutation());
     }
@@ -1566,6 +1615,36 @@ mod tests {
                     surface.command_name()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn standard_matrix_has_agent_subspace_rpc_schema_coverage() {
+        let matrix = standard_contract_matrix();
+        let check = matrix
+            .checks
+            .iter()
+            .find(|check| {
+                check.surface == ApiSurface::AgentSubspaceRpc
+                    && check.category == CheckCategory::SchemaStability
+            })
+            .expect("missing agent-subspace-rpc schema check");
+
+        for field in [
+            "route",
+            "serialization",
+            "payload",
+            "payload_bytes",
+            "payload_sha256",
+            "policy",
+            "redaction",
+            "audit",
+            "delivery",
+        ] {
+            assert!(
+                check.required_fields.iter().any(|value| value == field),
+                "missing required agent-subspace-rpc schema field `{field}`"
+            );
         }
     }
 

@@ -1903,6 +1903,275 @@ pub struct AgentConfigurePlanItem {
 }
 
 // ============================================================================
+// Agent Subspace RPC (ft-7h5da.11.11)
+// ============================================================================
+
+/// Version for the terminal-bypass agent-subspace RPC receipt contract.
+pub const AGENT_SUBSPACE_RPC_SCHEMA_VERSION: u32 = 1;
+
+/// Canonical route for inter-agent RPC that must not ride terminal scrollback.
+pub const AGENT_SUBSPACE_RPC_ROUTE: &str = "wa://subspace/rpc";
+
+/// Initial payload cap for one subspace RPC request.
+///
+/// This is intentionally smaller than the distributed wire-protocol cap. The
+/// surface is for coordination messages and compact structured payloads, not
+/// bulk artifact transfer.
+pub const AGENT_SUBSPACE_RPC_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// Serialization accepted by the first subspace RPC contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSubspaceRpcSerialization {
+    Json,
+}
+
+/// Policy decision recorded for an agent-subspace RPC request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSubspaceRpcPolicyDecision {
+    Allow,
+    Deny,
+    RequireApproval,
+    Defer,
+}
+
+/// Redaction outcome recorded before an RPC payload can leave the sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSubspaceRpcRedactionState {
+    Redacted,
+    NoSensitiveFields,
+    RejectedUnredactable,
+}
+
+/// Delivery mode for agent-subspace RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSubspaceRpcDeliveryMode {
+    TerminalBypass,
+}
+
+/// Policy receipt for `wa://subspace/rpc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSubspaceRpcPolicyReceipt {
+    pub decision: AgentSubspaceRpcPolicyDecision,
+    pub policy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_code: Option<String>,
+}
+
+/// Redaction receipt for `wa://subspace/rpc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSubspaceRpcRedactionReceipt {
+    pub state: AgentSubspaceRpcRedactionState,
+    pub sensitivity_tier: String,
+    pub redacted_field_count: usize,
+}
+
+/// Audit receipt for `wa://subspace/rpc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSubspaceRpcAuditReceipt {
+    pub audit_id: String,
+    pub recorded_at_ms: u64,
+}
+
+/// Delivery receipt for `wa://subspace/rpc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSubspaceRpcDeliveryReceipt {
+    pub mode: AgentSubspaceRpcDeliveryMode,
+    pub terminal_render_buffer: bool,
+    pub delivery_queue: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at_ms: Option<u64>,
+}
+
+/// Response data for the terminal-bypass Agent Subspace RPC contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSubspaceRpcData {
+    pub schema_version: u32,
+    pub route: String,
+    pub rpc_id: String,
+    pub idempotency_key: String,
+    pub sender_agent: String,
+    pub recipient_agent: String,
+    pub serialization: AgentSubspaceRpcSerialization,
+    pub payload: serde_json::Value,
+    pub payload_bytes: usize,
+    pub payload_sha256: String,
+    pub policy: AgentSubspaceRpcPolicyReceipt,
+    pub redaction: AgentSubspaceRpcRedactionReceipt,
+    pub audit: AgentSubspaceRpcAuditReceipt,
+    pub delivery: AgentSubspaceRpcDeliveryReceipt,
+}
+
+impl AgentSubspaceRpcData {
+    /// Validate the fields that make this a terminal-bypass, policy-gated RPC.
+    pub fn validate_contract(&self) -> Result<(), AgentSubspaceRpcContractError> {
+        if self.schema_version != AGENT_SUBSPACE_RPC_SCHEMA_VERSION {
+            return Err(AgentSubspaceRpcContractError::InvalidSchemaVersion {
+                found: self.schema_version,
+            });
+        }
+        if self.route != AGENT_SUBSPACE_RPC_ROUTE {
+            return Err(AgentSubspaceRpcContractError::InvalidRoute {
+                route: self.route.clone(),
+            });
+        }
+
+        for (field, value) in [
+            ("rpc_id", self.rpc_id.as_str()),
+            ("idempotency_key", self.idempotency_key.as_str()),
+            ("sender_agent", self.sender_agent.as_str()),
+            ("recipient_agent", self.recipient_agent.as_str()),
+            ("policy.policy_id", self.policy.policy_id.as_str()),
+            (
+                "redaction.sensitivity_tier",
+                self.redaction.sensitivity_tier.as_str(),
+            ),
+            ("audit.audit_id", self.audit.audit_id.as_str()),
+            (
+                "delivery.delivery_queue",
+                self.delivery.delivery_queue.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(AgentSubspaceRpcContractError::EmptyField { field });
+            }
+        }
+
+        let serialized_payload = serde_json::to_vec(&self.payload).map_err(|err| {
+            AgentSubspaceRpcContractError::PayloadSerializationFailed {
+                error: err.to_string(),
+            }
+        })?;
+        if serialized_payload.len() != self.payload_bytes {
+            return Err(AgentSubspaceRpcContractError::PayloadByteCountMismatch {
+                declared: self.payload_bytes,
+                actual: serialized_payload.len(),
+            });
+        }
+        if self.payload_bytes > AGENT_SUBSPACE_RPC_MAX_PAYLOAD_BYTES {
+            return Err(AgentSubspaceRpcContractError::PayloadTooLarge {
+                payload_bytes: self.payload_bytes,
+                max_payload_bytes: AGENT_SUBSPACE_RPC_MAX_PAYLOAD_BYTES,
+            });
+        }
+
+        let actual_digest = agent_subspace_rpc_payload_sha256_bytes(&serialized_payload);
+        if self.payload_sha256 != actual_digest {
+            return Err(AgentSubspaceRpcContractError::PayloadDigestMismatch {
+                declared: self.payload_sha256.clone(),
+                actual: actual_digest,
+            });
+        }
+
+        if self.delivery.mode != AgentSubspaceRpcDeliveryMode::TerminalBypass
+            || self.delivery.terminal_render_buffer
+        {
+            return Err(AgentSubspaceRpcContractError::TerminalRenderBufferDelivery);
+        }
+
+        Ok(())
+    }
+}
+
+/// Compute the stable JSON payload byte count used by `wa://subspace/rpc`.
+pub fn agent_subspace_rpc_payload_bytes(
+    payload: &serde_json::Value,
+) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec(payload).map(|bytes| bytes.len())
+}
+
+/// Compute the stable JSON payload digest used by `wa://subspace/rpc`.
+pub fn agent_subspace_rpc_payload_sha256(
+    payload: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_vec(payload).map(|bytes| agent_subspace_rpc_payload_sha256_bytes(&bytes))
+}
+
+fn agent_subspace_rpc_payload_sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Validation failures for the Agent Subspace RPC contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSubspaceRpcContractError {
+    InvalidSchemaVersion {
+        found: u32,
+    },
+    InvalidRoute {
+        route: String,
+    },
+    EmptyField {
+        field: &'static str,
+    },
+    PayloadSerializationFailed {
+        error: String,
+    },
+    PayloadByteCountMismatch {
+        declared: usize,
+        actual: usize,
+    },
+    PayloadTooLarge {
+        payload_bytes: usize,
+        max_payload_bytes: usize,
+    },
+    PayloadDigestMismatch {
+        declared: String,
+        actual: String,
+    },
+    TerminalRenderBufferDelivery,
+}
+
+impl std::fmt::Display for AgentSubspaceRpcContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSchemaVersion { found } => write!(
+                f,
+                "agent-subspace RPC schema version {found} does not match {AGENT_SUBSPACE_RPC_SCHEMA_VERSION}"
+            ),
+            Self::InvalidRoute { route } => {
+                write!(
+                    f,
+                    "agent-subspace RPC route must be {AGENT_SUBSPACE_RPC_ROUTE}, got {route}"
+                )
+            }
+            Self::EmptyField { field } => write!(f, "agent-subspace RPC field {field} is empty"),
+            Self::PayloadSerializationFailed { error } => {
+                write!(
+                    f,
+                    "agent-subspace RPC payload serialization failed: {error}"
+                )
+            }
+            Self::PayloadByteCountMismatch { declared, actual } => write!(
+                f,
+                "agent-subspace RPC payload_bytes declares {declared} bytes but serialized JSON is {actual} bytes"
+            ),
+            Self::PayloadTooLarge {
+                payload_bytes,
+                max_payload_bytes,
+            } => write!(
+                f,
+                "agent-subspace RPC payload is {payload_bytes} bytes; max is {max_payload_bytes} bytes"
+            ),
+            Self::PayloadDigestMismatch { declared, actual } => write!(
+                f,
+                "agent-subspace RPC payload_sha256 declares {declared}, computed {actual}"
+            ),
+            Self::TerminalRenderBufferDelivery => write!(
+                f,
+                "agent-subspace RPC delivery must bypass the terminal render buffer"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentSubspaceRpcContractError {}
+
+// ============================================================================
 // Mission (ft-1i2ge.5.2)
 // ============================================================================
 
@@ -5942,6 +6211,106 @@ mod tests {
         assert_eq!(data.summary.configured_count, 0);
         assert_eq!(data.summary.installed_but_idle_count, 1);
         assert_eq!(data.installed[0].config_path, None);
+    }
+
+    fn sample_agent_subspace_rpc_data() -> AgentSubspaceRpcData {
+        let payload = json!({
+            "method": "bead.status",
+            "params": {
+                "bead": "ft-7h5da.11.11",
+                "state": "in_progress"
+            }
+        });
+        AgentSubspaceRpcData {
+            schema_version: AGENT_SUBSPACE_RPC_SCHEMA_VERSION,
+            route: AGENT_SUBSPACE_RPC_ROUTE.to_string(),
+            rpc_id: "rpc-20260614-001".to_string(),
+            idempotency_key: "subspace:ft-7h5da.11.11:rpc-001".to_string(),
+            sender_agent: "cod_10".to_string(),
+            recipient_agent: "reviewer_1".to_string(),
+            serialization: AgentSubspaceRpcSerialization::Json,
+            payload_bytes: agent_subspace_rpc_payload_bytes(&payload).unwrap(),
+            payload_sha256: agent_subspace_rpc_payload_sha256(&payload).unwrap(),
+            payload,
+            policy: AgentSubspaceRpcPolicyReceipt {
+                decision: AgentSubspaceRpcPolicyDecision::Allow,
+                policy_id: "agent-subspace.default".to_string(),
+                approval_code: None,
+            },
+            redaction: AgentSubspaceRpcRedactionReceipt {
+                state: AgentSubspaceRpcRedactionState::NoSensitiveFields,
+                sensitivity_tier: "t1".to_string(),
+                redacted_field_count: 0,
+            },
+            audit: AgentSubspaceRpcAuditReceipt {
+                audit_id: "audit-subspace-001".to_string(),
+                recorded_at_ms: 1_718_384_400_000,
+            },
+            delivery: AgentSubspaceRpcDeliveryReceipt {
+                mode: AgentSubspaceRpcDeliveryMode::TerminalBypass,
+                terminal_render_buffer: false,
+                delivery_queue: "agent-subspace-rpc".to_string(),
+                delivered_at_ms: Some(1_718_384_400_005),
+            },
+        }
+    }
+
+    #[test]
+    fn agent_subspace_rpc_contract_validates_terminal_bypass_receipt() {
+        let data = sample_agent_subspace_rpc_data();
+        data.validate_contract().unwrap();
+        assert_eq!(data.route, AGENT_SUBSPACE_RPC_ROUTE);
+        assert_eq!(
+            data.delivery.mode,
+            AgentSubspaceRpcDeliveryMode::TerminalBypass
+        );
+        assert!(!data.delivery.terminal_render_buffer);
+
+        let resp = RobotResponse::success(data.clone(), 7);
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RobotResponse<AgentSubspaceRpcData> = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        back.data.unwrap().validate_contract().unwrap();
+    }
+
+    #[test]
+    fn agent_subspace_rpc_contract_rejects_terminal_render_buffer_delivery() {
+        let mut data = sample_agent_subspace_rpc_data();
+        data.delivery.terminal_render_buffer = true;
+
+        let err = data.validate_contract().unwrap_err();
+        assert_eq!(
+            err,
+            AgentSubspaceRpcContractError::TerminalRenderBufferDelivery
+        );
+    }
+
+    #[test]
+    fn agent_subspace_rpc_contract_rejects_payload_metadata_drift() {
+        let mut data = sample_agent_subspace_rpc_data();
+        data.payload["params"]["state"] = json!("closed");
+
+        let err = data.validate_contract().unwrap_err();
+        assert!(matches!(
+            err,
+            AgentSubspaceRpcContractError::PayloadByteCountMismatch { .. }
+                | AgentSubspaceRpcContractError::PayloadDigestMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn agent_subspace_rpc_contract_rejects_oversize_payload() {
+        let payload = json!({ "blob": "x".repeat(AGENT_SUBSPACE_RPC_MAX_PAYLOAD_BYTES) });
+        let mut data = sample_agent_subspace_rpc_data();
+        data.payload_bytes = agent_subspace_rpc_payload_bytes(&payload).unwrap();
+        data.payload_sha256 = agent_subspace_rpc_payload_sha256(&payload).unwrap();
+        data.payload = payload;
+
+        let err = data.validate_contract().unwrap_err();
+        assert!(matches!(
+            err,
+            AgentSubspaceRpcContractError::PayloadTooLarge { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------
