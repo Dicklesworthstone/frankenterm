@@ -26,7 +26,7 @@ const INVENTORY_JSON: &str =
 
 #[derive(Debug, Deserialize)]
 struct ScenarioInventory {
-    schema_version: String,
+    schema_version: u32,
     contract_id: String,
     classification_vocabulary: Vec<String>,
     scenarios: Vec<Scenario>,
@@ -88,7 +88,7 @@ const REQUIRED_SCENARIOS: &[&str] = &[
 fn inventory_parses_and_covers_required_scenarios() {
     let inv = load_inventory();
     assert!(
-        !inv.schema_version.is_empty() && !inv.contract_id.is_empty(),
+        inv.schema_version >= 1 && !inv.contract_id.is_empty(),
         "inventory must declare schema_version + contract_id"
     );
     assert!(
