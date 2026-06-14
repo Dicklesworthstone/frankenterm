@@ -3,6 +3,8 @@
 //! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
 
 use serde::{Deserialize, Serialize};
+
+use crate::robot_types::{SubmitGuaranteeLevel, SubmitReceipt};
 use std::sync::LazyLock;
 
 use crate::attention_router::AttentionRouterSourceAdapterInput;
@@ -326,6 +328,10 @@ pub(super) struct SendParams {
     pub text: String,
     #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
+    pub verify_submit: bool,
+    #[serde(default)]
+    pub submit_level: Option<SubmitGuaranteeLevel>,
     pub wait_for: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -372,6 +378,8 @@ pub(super) struct McpSendData {
     pub wait_for: Option<McpWaitForData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit: Option<SubmitReceipt>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
 }

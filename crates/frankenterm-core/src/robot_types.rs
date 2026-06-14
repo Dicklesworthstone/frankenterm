@@ -801,10 +801,85 @@ impl SubmitReceiptState {
     }
 }
 
+/// Caller-selected strength for verified submit receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitGuaranteeLevel {
+    /// Only prove the policy-approved write call completed.
+    Write,
+    /// Prove the text reached the agent composer or moved beyond it.
+    Composer,
+    /// Prove the text was submitted or queued behind an active operation.
+    Submitted,
+    /// Prove the submit produced working/output evidence, not just a cleared composer.
+    Working,
+}
+
+impl Default for SubmitGuaranteeLevel {
+    fn default() -> Self {
+        Self::Write
+    }
+}
+
+impl SubmitGuaranteeLevel {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Composer => "composer",
+            Self::Submitted => "submitted",
+            Self::Working => "working",
+        }
+    }
+
+    #[must_use]
+    pub const fn requires_submit_profile(self) -> bool {
+        !matches!(self, Self::Write)
+    }
+
+    #[must_use]
+    pub fn is_met_by(self, state: SubmitReceiptState, evidence_rule_ids: &[String]) -> bool {
+        match self {
+            Self::Write => matches!(
+                state,
+                SubmitReceiptState::Submitted
+                    | SubmitReceiptState::QueuedBehindOperation
+                    | SubmitReceiptState::StuckInComposer
+            ),
+            Self::Composer => matches!(
+                state,
+                SubmitReceiptState::Submitted
+                    | SubmitReceiptState::QueuedBehindOperation
+                    | SubmitReceiptState::StuckInComposer
+            ),
+            Self::Submitted => matches!(
+                state,
+                SubmitReceiptState::Submitted | SubmitReceiptState::QueuedBehindOperation
+            ),
+            Self::Working => {
+                state == SubmitReceiptState::Submitted
+                    && evidence_rule_ids.iter().any(|rule| {
+                        rule.contains(":working_state:")
+                            || rule.ends_with(":semantic_output_after_input")
+                            || rule.ends_with(":canary_semantic_output_after_input")
+                    })
+            }
+        }
+    }
+}
+
+fn default_submit_guarantee_met() -> bool {
+    true
+}
+
 /// Idempotent send receipt persisted with the corresponding audit action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitReceipt {
     pub state: SubmitReceiptState,
+    #[serde(default)]
+    pub guarantee_level: SubmitGuaranteeLevel,
+    #[serde(default = "default_submit_guarantee_met")]
+    pub guarantee_met: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4319,6 +4394,8 @@ mod tests {
         let submit = data.submit.expect("submit receipt");
 
         assert_eq!(submit.state, SubmitReceiptState::QueuedBehindOperation);
+        assert_eq!(submit.guarantee_level, SubmitGuaranteeLevel::Write);
+        assert!(submit.guarantee_met);
         assert_eq!(submit.agent_type.as_deref(), Some("codex"));
         assert_eq!(submit.profile_id.as_deref(), Some("default"));
         assert_eq!(submit.profile_version.as_deref(), Some("2026-06-07"));
@@ -4364,6 +4441,8 @@ mod tests {
 
         let receipt = SubmitReceipt {
             state: SubmitReceiptState::Submitted,
+            guarantee_level: SubmitGuaranteeLevel::Submitted,
+            guarantee_met: true,
             agent_type: None,
             profile_id: None,
             profile_version: None,

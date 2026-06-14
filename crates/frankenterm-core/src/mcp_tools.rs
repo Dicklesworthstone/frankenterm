@@ -40,8 +40,8 @@ use crate::rehearsal_score::{
     REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
 };
 use crate::robot_types::{
-    WorkflowActionPlan, WorkflowStatusData, WorkflowStatusDetailData, WorkflowStatusListData,
-    WorkflowStepLog,
+    SubmitGuaranteeLevel, WorkflowActionPlan, WorkflowStatusData, WorkflowStatusDetailData,
+    WorkflowStatusListData, WorkflowStepLog,
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::EventStreamQuery;
@@ -4289,6 +4289,167 @@ pub(super) struct WaSendTool {
     policy_rate_limiter: SharedRateLimiter,
 }
 
+fn mcp_submit_guarantee_level(params: &SendParams) -> Option<SubmitGuaranteeLevel> {
+    params.submit_level.or_else(|| {
+        params
+            .verify_submit
+            .then_some(SubmitGuaranteeLevel::Submitted)
+    })
+}
+
+fn mcp_infer_submit_agent_type(pane_info: &PaneInfo) -> AgentType {
+    let mut correlator = crate::agent_correlator::AgentCorrelator::new();
+    correlator.update_from_pane_info(pane_info);
+    if let Some(entry) = correlator.inventory().running.get(&pane_info.pane_id) {
+        let provider = AgentProvider::from_slug(&entry.slug);
+        let agent_type = provider.to_agent_type();
+        if agent_type != AgentType::Unknown {
+            return agent_type;
+        }
+    }
+    crate::sharding::infer_agent_type(pane_info)
+}
+
+fn mcp_load_submit_profile(
+    config: &Config,
+    agent_type: AgentType,
+) -> Option<crate::patterns::SubmitProfile> {
+    if matches!(agent_type, AgentType::Unknown | AgentType::Wezterm) {
+        return None;
+    }
+
+    match PatternEngine::from_config(&config.patterns) {
+        Ok(engine) => engine.submit_profile_for_agent(agent_type).cloned(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %agent_type,
+                "Failed to load submit profile pattern engine for wa.send; verified-submit will fail open"
+            );
+            None
+        }
+    }
+}
+
+async fn mcp_capture_submit_text(
+    wezterm: &crate::wezterm::WeztermHandle,
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+) -> Option<String> {
+    match wezterm.get_text_with_cx(cx, pane_id, false).await {
+        Ok(text) => Some(text),
+        Err(error) => {
+            tracing::debug!(
+                pane_id,
+                %error,
+                "wa.send verified-submit text capture unavailable"
+            );
+            None
+        }
+    }
+}
+
+async fn mcp_capture_submit_semantic_snapshot(
+    wezterm: &crate::wezterm::WeztermHandle,
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+) -> Option<crate::wezterm::MuxSemanticSnapshot> {
+    match wezterm.get_semantic_zones_with_cx(cx, pane_id).await {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            tracing::debug!(
+                pane_id,
+                %error,
+                "wa.send verified-submit semantic capture unavailable"
+            );
+            None
+        }
+    }
+}
+
+async fn mcp_classify_submit_after_send(
+    wezterm: &crate::wezterm::WeztermHandle,
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    text: &str,
+    agent_type: AgentType,
+    submit_profile: Option<&crate::patterns::SubmitProfile>,
+    before_text: Option<&str>,
+    attempts: u32,
+    polls: usize,
+) -> crate::verified_submit::VerifiedSubmitReport {
+    let (after_text, after_semantic_snapshot) = if submit_profile.is_some() {
+        let _ =
+            crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(120)).await;
+        let after_text = mcp_capture_submit_text(wezterm, cx, pane_id).await;
+        let after_semantic_snapshot =
+            mcp_capture_submit_semantic_snapshot(wezterm, cx, pane_id).await;
+        (after_text, after_semantic_snapshot)
+    } else {
+        (None, None)
+    };
+
+    crate::verified_submit::classify_verified_submit(crate::verified_submit::VerifiedSubmitInput {
+        pane_id,
+        command_text: text,
+        agent_type,
+        profile: submit_profile,
+        before_text,
+        after_text: after_text.as_deref(),
+        after_semantic_snapshot: after_semantic_snapshot.as_ref(),
+        attempts,
+        polls,
+    })
+}
+
+async fn attach_mcp_submit_receipt_to_audit(
+    storage: &StorageHandle,
+    cx: &crate::cx::Cx,
+    injection: &InjectionResult,
+    receipt: &crate::robot_types::SubmitReceipt,
+) {
+    let Some(audit_action_id) = injection.audit_action_id() else {
+        tracing::debug!(
+            idempotency_key = %receipt.idempotency_key,
+            "wa.send submit receipt has no audit action id to attach"
+        );
+        return;
+    };
+
+    let verification_summary = match serde_json::to_string(receipt) {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::warn!(%error, "Failed to serialize wa.send submit receipt");
+            return;
+        }
+    };
+
+    match storage
+        .update_audit_action_submit_receipt_with_cx(
+            cx,
+            audit_action_id,
+            receipt.idempotency_key.clone(),
+            verification_summary,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                audit_action_id,
+                "wa.send audit row not found for submit receipt attach"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                audit_action_id,
+                %error,
+                "Failed to attach wa.send submit receipt to audit"
+            );
+        }
+    }
+}
+
 impl WaSendTool {
     #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
@@ -4361,6 +4522,8 @@ impl ToolHandler for WaSendTool {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "Pane ID to send to" },
                     "text": { "type": "string", "description": "Text to send" },
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview without sending" },
+                    "verify_submit": { "type": "boolean", "default": false, "description": "Return a SubmitReceipt using the submitted guarantee level unless submit_level is set" },
+                    "submit_level": { "type": "string", "enum": ["write", "composer", "submitted", "working"], "description": "Optional SubmitReceipt guarantee level; setting this enables verified-submit receipts" },
                     "wait_for": { "type": "string", "maxLength": MAX_MCP_WAIT_PATTERN_BYTES, "description": "Wait for a pattern after sending" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Wait-for timeout (seconds)" },
                     "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" }
@@ -4428,6 +4591,7 @@ impl ToolHandler for WaSendTool {
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
+        let submit_guarantee_level = mcp_submit_guarantee_level(&params);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
@@ -4442,6 +4606,15 @@ impl ToolHandler for WaSendTool {
                 .get_pane_with_cx(&wezterm_cx, params.pane_id)
                 .await?;
             let domain = pane_info.inferred_domain();
+            let submit_agent_type = mcp_infer_submit_agent_type(&pane_info);
+            let submit_profile = submit_guarantee_level
+                .filter(|level| level.requires_submit_profile())
+                .and_then(|_| mcp_load_submit_profile(&config, submit_agent_type));
+            let verified_submit_text = (submit_profile.is_some() && !params.text.trim().is_empty())
+                .then(|| {
+                    crate::verified_submit::append_verification_canary(params.pane_id, &params.text)
+                });
+            let outbound_submit_text = verified_submit_text.as_deref().unwrap_or(&params.text);
 
             let resolution =
                 resolve_pane_capabilities(&config, Some(&storage), params.pane_id).await;
@@ -4494,16 +4667,22 @@ impl ToolHandler for WaSendTool {
                     injection,
                     wait_for: None,
                     verification_error: None,
+                    submit: None,
                     dry_run: true,
                 });
             }
 
             let mut injector =
                 PolicyGatedInjector::with_storage(engine, Arc::clone(&wezterm), storage.clone());
+            let mut submit_before_text = None;
+            if submit_profile.is_some() {
+                submit_before_text =
+                    mcp_capture_submit_text(&wezterm, &wezterm_cx, params.pane_id).await;
+            }
             let mut injection = injector
                 .send_text(
                     params.pane_id,
-                    &params.text,
+                    outbound_submit_text,
                     ActorKind::Mcp,
                     &capabilities,
                     None,
@@ -4533,6 +4712,7 @@ impl ToolHandler for WaSendTool {
                 };
             }
 
+            let mut submit = None;
             let mut wait_for_data = None;
             let mut verification_error = None;
             if injection.is_allowed() {
@@ -4596,11 +4776,57 @@ impl ToolHandler for WaSendTool {
                 }
             }
 
+            if let Some(guarantee_level) = submit_guarantee_level {
+                let submit_verification =
+                    if injection.is_allowed() && guarantee_level.requires_submit_profile() {
+                        let polls = wait_for_data
+                            .as_ref()
+                            .map_or(0, |data| data.polls)
+                            .saturating_add(usize::from(submit_profile.is_some()));
+                        Some(
+                            mcp_classify_submit_after_send(
+                                &wezterm,
+                                &wezterm_cx,
+                                params.pane_id,
+                                outbound_submit_text,
+                                submit_agent_type,
+                                submit_profile.as_ref(),
+                                submit_before_text.as_deref(),
+                                1,
+                                polls,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
+                let receipt = crate::verified_submit::build_submit_receipt_with_guarantee(
+                    params.pane_id,
+                    &params.text,
+                    &injection,
+                    submit_verification.as_ref(),
+                    elapsed_ms(start),
+                    guarantee_level,
+                );
+                if let Some(error) =
+                    crate::verified_submit::submit_guarantee_failure_message(&receipt)
+                {
+                    verification_error = Some(match verification_error.take() {
+                        Some(existing) => format!("{existing}; {error}"),
+                        None => error,
+                    });
+                }
+                attach_mcp_submit_receipt_to_audit(&storage, &wezterm_cx, &injection, &receipt)
+                    .await;
+                submit = Some(receipt);
+            }
+
             Ok(McpSendData {
                 pane_id: params.pane_id,
                 injection,
                 wait_for: wait_for_data,
                 verification_error,
+                submit,
                 dry_run: false,
             })
         });
@@ -8628,18 +8854,18 @@ mod tests {
         WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
         WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool,
         WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-        accounts_refresh_policy_input, audit_mcp_policy_denial_async,
-        authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_output_secrets,
-        redact_mcp_pane_state_fields, redact_mcp_wait_pattern_for_output,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
+        accounts_refresh_policy_input, audit_mcp_policy_denial_async, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        redact_mcp_output_secrets, redact_mcp_pane_state_fields,
+        redact_mcp_wait_pattern_for_output, serialize_mcp_audit_decision_context,
+        set_mcp_test_pane_state_override, tx_run_test_wezterm_override_slot,
         validate_cass_timeout_secs,
     };
-    use crate::mcp::mcp_types::{McpPaneState, StateParams};
+    use crate::mcp::mcp_types::{IpcPaneState, McpPaneState, StateParams};
     #[cfg(unix)]
     use crate::mcp_error::{
         MCP_ERR_CASS, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
@@ -8685,6 +8911,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp-tools-test.db");
         (dir, Arc::new(path))
+    }
+
+    fn safe_test_ipc_pane_state(pane_id: u64) -> IpcPaneState {
+        IpcPaneState {
+            pane_id,
+            known: true,
+            observed: Some(true),
+            alt_screen: Some(false),
+            last_status_at: Some(1_700_000_000_000),
+            in_gap: Some(false),
+            cursor_alt_screen: Some(false),
+            reason: None,
+        }
     }
 
     fn deny_mcp_exec_command_config(command_pattern: &str, message: &str) -> Arc<Config> {
@@ -9800,7 +10039,10 @@ mod tests {
                     .expect("wa.send rate-limited call"),
             );
 
-            assert_eq!(envelope["ok"], true);
+            assert_eq!(
+                envelope["ok"], true,
+                "wa.send fast-path envelope: {envelope:?}"
+            );
             assert_eq!(envelope["data"]["injection"]["status"], "requires_approval");
             assert!(
                 envelope["data"]["injection"]["decision"]["reason"]
@@ -9857,8 +10099,156 @@ mod tests {
                 .expect("first actual wa.send should still be allowed"),
             );
 
-            assert_eq!(envelope["ok"], true);
+            assert_eq!(
+                envelope["ok"], true,
+                "wa.send write-level envelope: {envelope:?}"
+            );
             assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+        });
+    }
+
+    #[test]
+    fn wa_send_default_fast_path_omits_submit_receipt() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_201;
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                mock as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "text": "echo fast"
+                    }),
+                )
+                .expect("wa.send fast-path call"),
+            );
+
+            assert_eq!(
+                envelope["ok"], true,
+                "wa.send fast-path envelope: {envelope:?}"
+            );
+            assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+            assert!(
+                envelope["data"].get("submit").is_none(),
+                "default wa.send should not emit a submit receipt: {envelope:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn wa_send_submit_level_write_returns_submit_receipt() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_202;
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                mock as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "text": "echo receipt",
+                        "submit_level": "write"
+                    }),
+                )
+                .expect("wa.send write-level submit call"),
+            );
+
+            assert_eq!(envelope["ok"], true);
+            let submit = envelope["data"]["submit"]
+                .as_object()
+                .expect("submit receipt should be present");
+            assert_eq!(submit["state"], serde_json::json!("submitted"));
+            assert_eq!(submit["guarantee_level"], serde_json::json!("write"));
+            assert_eq!(submit["guarantee_met"], serde_json::json!(true));
+            assert_eq!(
+                submit["idempotency_key"],
+                serde_json::json!(
+                    crate::robot_idempotency::send_text_key(pane_id, "echo receipt").to_string()
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn wa_send_verify_submit_defaults_to_submitted_level() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_203;
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                mock as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "text": "echo verified",
+                        "verify_submit": true
+                    }),
+                )
+                .expect("wa.send verified submit call"),
+            );
+
+            assert_eq!(envelope["ok"], true);
+            let submit = envelope["data"]["submit"]
+                .as_object()
+                .expect("submit receipt should be present");
+            assert_eq!(
+                submit["state"],
+                serde_json::json!("verification_unavailable")
+            );
+            assert_eq!(submit["guarantee_level"], serde_json::json!("submitted"));
+            assert_eq!(submit["guarantee_met"], serde_json::json!(false));
+            assert!(
+                envelope["data"]["verification_error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("submit guarantee 'submitted' not met")),
+                "expected submitted guarantee error, got {envelope:?}"
+            );
         });
     }
 
@@ -12440,6 +12830,19 @@ exit 17",
             .expect("wa.send schema should have properties");
         let text_schema = props.get("text").expect("text field must exist");
         assert_eq!(text_schema["type"], "string");
+        let verify_submit_schema = props
+            .get("verify_submit")
+            .expect("verify_submit field must exist");
+        assert_eq!(verify_submit_schema["type"], "boolean");
+        assert_eq!(verify_submit_schema["default"], serde_json::json!(false));
+        let submit_level_schema = props
+            .get("submit_level")
+            .expect("submit_level field must exist");
+        assert_eq!(submit_level_schema["type"], "string");
+        assert_eq!(
+            submit_level_schema["enum"],
+            serde_json::json!(["write", "composer", "submitted", "working"])
+        );
     }
 
     #[test]

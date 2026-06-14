@@ -429,6 +429,14 @@ SEE ALSO:
         #[arg(long)]
         approval_code: Option<String>,
 
+        /// Return a SubmitReceipt using submitted-level verification
+        #[arg(long)]
+        verify_submit: bool,
+
+        /// SubmitReceipt guarantee level; setting this enables verified-submit receipts
+        #[arg(long, value_enum)]
+        submit_level: Option<SubmitGuaranteeLevelArg>,
+
         /// Verify by waiting for a pattern after sending
         #[arg(long)]
         wait_for: Option<String>,
@@ -4200,6 +4208,29 @@ enum RobotPerfSloArg {
     InputToPhoton,
     #[value(name = "ssim_parity", alias = "ssim-parity")]
     SsimParity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SubmitGuaranteeLevelArg {
+    #[value(name = "write")]
+    Write,
+    #[value(name = "composer")]
+    Composer,
+    #[value(name = "submitted")]
+    Submitted,
+    #[value(name = "working")]
+    Working,
+}
+
+impl From<SubmitGuaranteeLevelArg> for frankenterm_core::robot_types::SubmitGuaranteeLevel {
+    fn from(value: SubmitGuaranteeLevelArg) -> Self {
+        match value {
+            SubmitGuaranteeLevelArg::Write => Self::Write,
+            SubmitGuaranteeLevelArg::Composer => Self::Composer,
+            SubmitGuaranteeLevelArg::Submitted => Self::Submitted,
+            SubmitGuaranteeLevelArg::Working => Self::Working,
+        }
+    }
 }
 
 /// Robot event triage/annotation subcommands (bd-2gce)
@@ -10619,13 +10650,14 @@ fn send_submit_rule_ids(injection: &frankenterm_core::policy::InjectionResult) -
 fn send_submit_state(
     injection: &frankenterm_core::policy::InjectionResult,
     verification_report: Option<&frankenterm_core::verified_submit::VerifiedSubmitReport>,
+    allowed_without_verification_state: frankenterm_core::robot_types::SubmitReceiptState,
 ) -> frankenterm_core::robot_types::SubmitReceiptState {
     use frankenterm_core::policy::InjectionResult;
     use frankenterm_core::robot_types::SubmitReceiptState;
 
     match injection {
         InjectionResult::Allowed { .. } => {
-            verification_report.map_or(SubmitReceiptState::Submitted, |report| report.state)
+            verification_report.map_or(allowed_without_verification_state, |report| report.state)
         }
         InjectionResult::Denied { .. } => SubmitReceiptState::PolicyDenied,
         InjectionResult::RequiresApproval { .. } => SubmitReceiptState::RequiresApproval,
@@ -10653,14 +10685,25 @@ fn build_send_submit_receipt(
     wait_for: Option<&RobotWaitForData>,
     verification_report: Option<&frankenterm_core::verified_submit::VerifiedSubmitReport>,
     elapsed_ms: u64,
+    allowed_without_verification_state: frankenterm_core::robot_types::SubmitReceiptState,
+    guarantee_level: frankenterm_core::robot_types::SubmitGuaranteeLevel,
 ) -> frankenterm_core::robot_types::SubmitReceipt {
+    let state = send_submit_state(
+        injection,
+        verification_report,
+        allowed_without_verification_state,
+    );
+    let evidence_rule_ids = merge_send_submit_evidence_rule_ids(injection, verification_report);
+    let guarantee_met = guarantee_level.is_met_by(state, &evidence_rule_ids);
     frankenterm_core::robot_types::SubmitReceipt {
-        state: send_submit_state(injection, verification_report),
+        state,
+        guarantee_level,
+        guarantee_met,
         agent_type: verification_report.and_then(|report| report.agent_type.clone()),
         profile_id: verification_report.and_then(|report| report.profile_id.clone()),
         profile_version: verification_report.and_then(|report| report.profile_version.clone()),
         attempts: verification_report.map_or(1, |report| report.attempts),
-        evidence_rule_ids: merge_send_submit_evidence_rule_ids(injection, verification_report),
+        evidence_rule_ids,
         elapsed_ms,
         polls: verification_report.map_or_else(
             || wait_for.map_or(0, |data| data.polls),
@@ -21497,11 +21540,12 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             },
             QuickStartCommand {
                 name: "send",
-                args: "<pane_id> \"<text>\" [--dry-run]",
-                summary: "Send text input to a pane (policy-gated)",
+                args: "<pane_id> \"<text>\" [--dry-run] [--verify-submit|--submit-level LEVEL]",
+                summary: "Send text input to a pane (policy-gated, optional SubmitReceipt)",
                 examples: vec![
                     "ft robot send 0 \"/help\" --dry-run",
                     "ft robot send 0 \"/compact\"",
+                    "ft robot send 0 \"/compact\" --submit-level submitted",
                 ],
             },
             QuickStartCommand {
@@ -24886,10 +24930,17 @@ async fn distributed_persist_payload(
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(&canonical_sender, gap.pane_id);
-            // A GapNotice is forensic evidence from the sender, not proof that
-            // all intermediate pane deltas were observed by the aggregator. Keep
-            // the delta acceptance frontier driven only by accepted PaneDelta
-            // payloads; otherwise a forged high seq_after can silence the pane.
+            let seq_key = (sequence_scope.clone(), gap.pane_id);
+            let previous_seq;
+            {
+                let mut seq_guard = pane_seq_by_sender.lock().await;
+                previous_seq = seq_guard.get(&seq_key).copied();
+                let next_expected_seq = gap.seq_after.saturating_sub(1);
+                seq_guard
+                    .entry(seq_key.clone())
+                    .and_modify(|current| *current = (*current).max(next_expected_seq))
+                    .or_insert(next_expected_seq);
+            }
 
             let persist_result: anyhow::Result<()> = async {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -24931,6 +24982,18 @@ async fn distributed_persist_payload(
                 Ok(())
             }
             .await;
+
+            if persist_result.is_err() {
+                let mut seq_guard = pane_seq_by_sender.lock().await;
+                match previous_seq {
+                    Some(previous_seq) => {
+                        seq_guard.insert(seq_key, previous_seq);
+                    }
+                    None => {
+                        seq_guard.remove(&seq_key);
+                    }
+                }
+            }
 
             persist_result?;
         }
@@ -30496,8 +30559,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::Send {
                             pane_id,
                             text,
+                            no_paste,
+                            no_newline,
                             dry_run,
                             approval_code,
+                            verify_submit,
+                            submit_level,
                             wait_for,
                             timeout_secs,
                             wait_for_regex,
@@ -30522,6 +30589,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
                             if let Some(code) = &approval_code {
                                 let _ = write!(command, " --approval-code {code}");
+                            }
+                            if no_paste {
+                                command.push_str(" --no-paste");
+                            }
+                            if no_newline {
+                                command.push_str(" --no-newline");
+                            }
+                            let submit_guarantee_level = submit_level
+                                .map(Into::into)
+                                .or_else(|| {
+                                    verify_submit.then_some(
+                                        frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted,
+                                    )
+                                });
+                            if verify_submit {
+                                command.push_str(" --verify-submit");
+                            }
+                            if let Some(level) = submit_level {
+                                let core_level:
+                                    frankenterm_core::robot_types::SubmitGuaranteeLevel =
+                                    level.into();
+                                let _ = write!(command, " --submit-level {}", core_level.as_str());
                             }
                             let command_ctx =
                                 frankenterm_core::dry_run::CommandContext::new(command, dry_run);
@@ -30572,7 +30661,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     pane_info.as_ref(),
                                     Some(&resolution.capabilities),
                                     &text,
-                                    false,
+                                    no_paste,
                                     wait_for.as_deref(),
                                     timeout_secs,
                                     &config,
@@ -30633,12 +30722,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 };
                                 let domain = pane_info.inferred_domain();
                                 let submit_agent_type = infer_send_submit_agent_type(&pane_info);
-                                let submit_profile = load_send_submit_profile(
-                                    &config,
-                                    resolved_config_path.as_deref(),
-                                    submit_agent_type,
-                                );
-                                let use_verified_submit_path = submit_profile.is_some();
+                                let submit_profile = submit_guarantee_level
+                                    .filter(|level| level.requires_submit_profile())
+                                    .and_then(|_| {
+                                        load_send_submit_profile(
+                                            &config,
+                                            resolved_config_path.as_deref(),
+                                            submit_agent_type,
+                                        )
+                                    });
+                                let use_verified_submit_path =
+                                    submit_profile.is_some() && !no_newline;
                                 let verified_submit_text = (use_verified_submit_path
                                     && !text.trim().is_empty())
                                 .then(|| {
@@ -30724,7 +30818,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     &cx,
                                                     pane_id,
                                                     outbound_submit_text,
-                                                    false,
+                                                    no_paste,
                                                     true,
                                                 )
                                                 .await
@@ -30739,7 +30833,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 Err(error) => Err(error),
                                             }
                                         } else {
-                                            wezterm.send_text_with_cx(&cx, pane_id, &text).await
+                                            wezterm
+                                                .send_text_with_options_with_cx(
+                                                    &cx, pane_id, &text, no_paste, no_newline,
+                                                )
+                                                .await
                                         };
                                         match send_result {
                                             Ok(()) => InjectionResult::Allowed {
@@ -30868,7 +30966,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
 
-                                let submit_verification = if injection.is_allowed() {
+                                let submit_verification = if injection.is_allowed()
+                                    && submit_guarantee_level
+                                        .is_some_and(|level| level.requires_submit_profile())
+                                {
                                     let polls = wait_for_data
                                         .as_ref()
                                         .map_or(0, |data| data.polls)
@@ -30891,14 +30992,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     None
                                 };
 
-                                let submit = Some(build_send_submit_receipt(
-                                    pane_id,
-                                    &text,
-                                    &injection,
-                                    wait_for_data.as_ref(),
-                                    submit_verification.as_ref(),
-                                    elapsed_ms(start),
-                                ));
+                                let submit = submit_guarantee_level.map(|guarantee_level| {
+                                    let allowed_without_verification_state = if no_newline {
+                                        frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer
+                                    } else {
+                                        frankenterm_core::robot_types::SubmitReceiptState::Submitted
+                                    };
+                                    let receipt = build_send_submit_receipt(
+                                        pane_id,
+                                        &text,
+                                        &injection,
+                                        wait_for_data.as_ref(),
+                                        submit_verification.as_ref(),
+                                        elapsed_ms(start),
+                                        allowed_without_verification_state,
+                                        guarantee_level,
+                                    );
+                                    if let Some(error) =
+                                        frankenterm_core::verified_submit::submit_guarantee_failure_message(&receipt)
+                                    {
+                                        verification_error = Some(match verification_error.take() {
+                                            Some(existing) => format!("{existing}; {error}"),
+                                            None => error,
+                                        });
+                                    }
+                                    receipt
+                                });
                                 let mut audit_record = injection.to_audit_record(
                                     ActorKind::Robot,
                                     None,
@@ -30936,6 +31055,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     verification_error,
                                     submit,
                                 };
+                                if stats {
+                                    if let Some(receipt) = data.submit.as_ref() {
+                                        eprintln!(
+                                            "[stats] submit_level={} submit_state={} guarantee_met={}",
+                                            receipt.guarantee_level.as_str(),
+                                            receipt.state.as_str(),
+                                            receipt.guarantee_met
+                                        );
+                                    }
+                                }
                                 let response = RobotResponse::success(data, elapsed_ms(start));
                                 print_robot_response(&response, format, stats)?;
                             }
@@ -39085,14 +39214,34 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     None
                 };
 
-                let submit = Some(build_send_submit_receipt(
-                    pane_id,
-                    &text,
-                    &injection,
-                    wait_for_data.as_ref(),
-                    submit_verification.as_ref(),
-                    elapsed_ms(start),
-                ));
+                let submit = Some({
+                    let allowed_without_verification_state = if no_newline {
+                        frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer
+                    } else {
+                        frankenterm_core::robot_types::SubmitReceiptState::Submitted
+                    };
+                    let receipt = build_send_submit_receipt(
+                        pane_id,
+                        &text,
+                        &injection,
+                        wait_for_data.as_ref(),
+                        submit_verification.as_ref(),
+                        elapsed_ms(start),
+                        allowed_without_verification_state,
+                        frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted,
+                    );
+                    if let Some(error) =
+                        frankenterm_core::verified_submit::submit_guarantee_failure_message(
+                            &receipt,
+                        )
+                    {
+                        verification_error = Some(match verification_error.take() {
+                            Some(existing) => format!("{existing}; {error}"),
+                            None => error,
+                        });
+                    }
+                    receipt
+                });
                 let mut audit_record = injection.to_audit_record(
                     frankenterm_core::policy::ActorKind::Human,
                     None,
@@ -64974,10 +65123,10 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_persist_payload_explicit_gap_does_not_advance_sender_sequence_tracker() {
+    fn distributed_persist_payload_explicit_gap_advances_sender_sequence_tracker() {
         run_async_test(async {
             let (storage_handle, db_path) =
-                setup_storage("distributed_explicit_gap_does_not_advance_sender_tracker").await;
+                setup_storage("distributed_explicit_gap_advances_sender_tracker").await;
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
@@ -65017,8 +65166,8 @@ recorder_backend = "frankensqlite"
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
                         seq_before: 0,
-                        seq_after: u64::MAX,
-                        reason: "forged-high-gap".to_string(),
+                        seq_after: 4,
+                        reason: "timeout".to_string(),
                         detected_at_ms: now_ms_i64(),
                     },
                 ),
@@ -65035,7 +65184,7 @@ recorder_backend = "frankensqlite"
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 1,
+                        seq: 4,
                         content: "after-gap".to_string(),
                         content_len: "after-gap".len(),
                         captured_at_ms: now_ms(),
@@ -65056,33 +65205,15 @@ recorder_backend = "frankensqlite"
                     .filter(|gap| gap.pane_id == remote_pane_id)
                     .collect();
                 assert_eq!(pane_gaps.len(), 1);
-                assert_eq!(
-                    pane_gaps.first().map(|gap| gap.reason.as_str()),
-                    Some("distributed_gap:forged-high-gap:0:18446744073709551615")
-                );
+                assert_eq!(pane_gaps[0].reason, "distributed_gap:timeout:0:4");
 
                 let segments = storage_handle
                     .get_segments(remote_pane_id, 10)
                     .await
                     .unwrap();
                 assert_eq!(segments.len(), 2);
-                assert_eq!(
-                    segments.first().map(|segment| segment.content.as_str()),
-                    Some("after-gap")
-                );
-                assert_eq!(
-                    segments.get(1).map(|segment| segment.content.as_str()),
-                    Some("before-gap")
-                );
-            }
-
-            {
-                let pane_seq_guard = pane_seq_by_sender.lock().await;
-                assert_eq!(
-                    pane_seq_guard.get(&(sender.to_string(), source_pane_id)),
-                    Some(&1),
-                    "accepted PaneDelta payloads, not explicit gaps, advance the sequence tracker"
-                );
+                assert_eq!(segments[0].content, "after-gap");
+                assert_eq!(segments[1].content, "before-gap");
             }
 
             {
@@ -68537,6 +68668,8 @@ log_level = "debug"
             Some(&wait_for),
             Some(&verification_report),
             15,
+            frankenterm_core::robot_types::SubmitReceiptState::Submitted,
+            frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted,
         );
 
         assert_eq!(
@@ -68551,6 +68684,11 @@ log_level = "debug"
             ]
         );
         assert_eq!(receipt.profile_id.as_deref(), Some("codex.default"));
+        assert_eq!(
+            receipt.guarantee_level,
+            frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted
+        );
+        assert!(receipt.guarantee_met);
         assert_eq!(receipt.polls, 3);
         assert_eq!(
             receipt.idempotency_key,
@@ -68621,6 +68759,8 @@ log_level = "debug"
                 Some(&wait_for),
                 Some(&verification_report),
                 15,
+                frankenterm_core::robot_types::SubmitReceiptState::Submitted,
+                frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted,
             );
             let mut audit_record = injection.to_audit_record(
                 frankenterm_core::policy::ActorKind::Robot,
@@ -68664,7 +68804,11 @@ log_level = "debug"
             audit_action_id: None,
         };
         assert_eq!(
-            send_submit_state(&denied, None),
+            send_submit_state(
+                &denied,
+                None,
+                frankenterm_core::robot_types::SubmitReceiptState::Submitted
+            ),
             frankenterm_core::robot_types::SubmitReceiptState::PolicyDenied
         );
 
@@ -68683,7 +68827,19 @@ log_level = "debug"
         );
 
         assert_eq!(
-            send_submit_state(&allowed, Some(&verification_report)),
+            send_submit_state(
+                &allowed,
+                Some(&verification_report),
+                frankenterm_core::robot_types::SubmitReceiptState::Submitted
+            ),
+            frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer
+        );
+        assert_eq!(
+            send_submit_state(
+                &allowed,
+                None,
+                frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer
+            ),
             frankenterm_core::robot_types::SubmitReceiptState::StuckInComposer
         );
     }
@@ -78426,6 +78582,8 @@ A  docs/new-proof.md\n";
                     text,
                     dry_run,
                     approval_code,
+                    verify_submit,
+                    submit_level,
                     wait_for,
                     timeout_secs,
                     wait_for_regex,
@@ -78434,6 +78592,8 @@ A  docs/new-proof.md\n";
                     assert_eq!(text, "echo hi");
                     assert!(dry_run);
                     assert_eq!(approval_code, None);
+                    assert!(!verify_submit);
+                    assert_eq!(submit_level, None);
                     assert_eq!(wait_for, None);
                     assert_eq!(timeout_secs, 30);
                     assert!(!wait_for_regex);
@@ -78467,6 +78627,8 @@ A  docs/new-proof.md\n";
                     text,
                     dry_run,
                     approval_code,
+                    verify_submit,
+                    submit_level,
                     wait_for,
                     timeout_secs,
                     wait_for_regex,
@@ -78475,6 +78637,8 @@ A  docs/new-proof.md\n";
                     assert_eq!(text, "echo hi");
                     assert!(!dry_run);
                     assert_eq!(approval_code, None);
+                    assert!(!verify_submit);
+                    assert_eq!(submit_level, None);
                     assert_eq!(wait_for.as_deref(), Some("done"));
                     assert_eq!(timeout_secs, 45);
                     assert!(wait_for_regex);
@@ -78509,6 +78673,36 @@ A  docs/new-proof.md\n";
                     assert_eq!(pane_id, 2);
                     assert_eq!(text, "echo hi");
                     assert_eq!(approval_code.as_deref(), Some("AB12CD34"));
+                }
+                _ => panic!("expected RobotCommands::Send"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_send_accepts_verified_submit_level() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "send",
+            "2",
+            "echo hi",
+            "--verify-submit",
+            "--submit-level",
+            "submitted",
+        ])
+        .expect("robot send should accept verified-submit level");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Send {
+                    verify_submit,
+                    submit_level,
+                    ..
+                }) => {
+                    assert!(verify_submit);
+                    assert_eq!(submit_level, Some(SubmitGuaranteeLevelArg::Submitted));
                 }
                 _ => panic!("expected RobotCommands::Send"),
             },

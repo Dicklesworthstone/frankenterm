@@ -1708,6 +1708,12 @@ mod tests {
             },
             receipt: crate::robot_types::SubmitReceipt {
                 state,
+                guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Submitted,
+                guarantee_met: matches!(
+                    state,
+                    crate::robot_types::SubmitReceiptState::Submitted
+                        | crate::robot_types::SubmitReceiptState::QueuedBehindOperation
+                ),
                 agent_type: Some("codex".to_string()),
                 profile_id: Some("codex.default".to_string()),
                 profile_version: Some("2026-06-08".to_string()),

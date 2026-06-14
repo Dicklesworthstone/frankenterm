@@ -519,6 +519,49 @@ fn check_refresh_cooldown(
     }
 }
 
+#[cfg(test)]
+fn mcp_test_pane_state_override_slot() -> &'static std::sync::Mutex<HashMap<u64, IpcPaneState>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, IpcPaneState>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) struct McpTestPaneStateOverrideGuard {
+    pane_id: u64,
+}
+
+#[cfg(test)]
+impl Drop for McpTestPaneStateOverrideGuard {
+    fn drop(&mut self) {
+        let mut overrides = mcp_test_pane_state_override_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        overrides.remove(&self.pane_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_mcp_test_pane_state_override(
+    state: IpcPaneState,
+) -> McpTestPaneStateOverrideGuard {
+    let pane_id = state.pane_id;
+    let mut overrides = mcp_test_pane_state_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    overrides.insert(pane_id, state);
+    McpTestPaneStateOverrideGuard { pane_id }
+}
+
+#[cfg(test)]
+fn mcp_test_pane_state_override(pane_id: u64) -> Option<IpcPaneState> {
+    mcp_test_pane_state_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&pane_id)
+        .cloned()
+}
+
 async fn derive_osc_state_from_storage(
     storage: &StorageHandle,
     pane_id: u64,
@@ -548,6 +591,11 @@ async fn fetch_pane_state_from_ipc(
     socket_path: &std::path::Path,
     pane_id: u64,
 ) -> std::result::Result<Option<IpcPaneState>, String> {
+    #[cfg(test)]
+    if let Some(state) = mcp_test_pane_state_override(pane_id) {
+        return Ok(Some(state));
+    }
+
     let client = crate::ipc::IpcClient::new(socket_path);
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     match client.pane_state_with_cx(&cx, pane_id).await {

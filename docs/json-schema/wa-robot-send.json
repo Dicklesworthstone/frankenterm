@@ -69,6 +69,8 @@
       "description": "Replayable receipt for a send submission.",
       "required": [
         "state",
+        "guarantee_level",
+        "guarantee_met",
         "attempts",
         "evidence_rule_ids",
         "elapsed_ms",
@@ -88,6 +90,18 @@
               "requires_approval",
               "send_failed"
           ]
+        },
+        "guarantee_level": {
+          "type": "string",
+          "enum": [
+            "write",
+            "composer",
+            "submitted",
+            "working"
+          ]
+        },
+        "guarantee_met": {
+          "type": "boolean"
         },
         "agent_type": {
           "type": "string"

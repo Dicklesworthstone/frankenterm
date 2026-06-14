@@ -262,7 +262,7 @@ ft robot quick-start
 ft robot state [--include-text] [--tail <n>] [--escapes]
 ft robot get-text <pane_id>|--panes <id,id,...>|--all [--tail <n>] [--escapes]
 ft robot dom zones|last-command|output-of|exit-code <pane_id> [--command-index <n>]
-ft robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
+ft robot send <pane_id> "<text>" [--dry-run] [--verify-submit] [--submit-level <write|composer|submitted|working>] [--wait-for "<pat>"] [--timeout-secs <n>]
 ft robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
 ft robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--until <epoch_ms>] [--limit <n>] [--snippets[=<true|false>]] [--mode <lexical|semantic|hybrid>]
 ft robot search-explain "<fts query>" [--pane <id>]
@@ -311,10 +311,13 @@ ft robot fleet status|scale|rebalance|agents
 ft robot profile list|show|apply|validate
 ```
 
-`ft robot send` success data includes `submit` when a non-dry-run send reaches
-the policy gate. The receipt records the submission state, verification polls,
-elapsed time, evidence rule IDs, and idempotency key persisted as the audit
-`correlation_id`; replay it with `ft audit --correlation-id <idempotency_key>`.
+`ft robot send` keeps the default fast path unless the caller asks for delivery
+proof. `--verify-submit` returns a submitted-level `submit` receipt; `--submit-level`
+selects `write`, `composer`, `submitted`, or `working`. The receipt records the
+submission state, requested guarantee level, `guarantee_met`, verification
+polls, elapsed time, evidence rule IDs, and idempotency key persisted as the
+audit `correlation_id`; replay it with
+`ft audit --correlation-id <idempotency_key>`.
 
 `ft robot health` includes an `active_agents` snapshot for operator
 convergence polling. The snapshot is bounded and evidence-linked; unavailable

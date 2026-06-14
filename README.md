@@ -159,10 +159,10 @@ The watcher's pattern engine has already noticed pane 1 hit a rate limit; the ev
 
 ### 4 · React safely (2 minutes — send + wait-for + policy gate)
 
-Send a `/compact` to the stuck codex pane, but block until the recovery confirms. The response `data` is a `SendData` with an `injection` blob (the wire-level bytes-sent record, an unstructured `serde_json::Value`), a `wait_for` field carrying `WaitForData { pane_id, pattern, matched, elapsed_ms, polls, is_regex }`, and a `submit` receipt persisted with the audit row under its `idempotency_key`:
+Send a `/compact` to the stuck codex pane, but block until the recovery confirms. The default send path stays fast and only returns the policy-gated injection result plus optional wait-for data. Add `--verify-submit` or `--submit-level <write|composer|submitted|working>` when the caller needs a durable `submit` receipt persisted with the audit row under its `idempotency_key`:
 
 ```bash
-$ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
+$ ft robot send 1 "/compact" --verify-submit --wait-for "compaction complete" --timeout-secs 30
 {
   "ok": true,
   "data": {
@@ -177,7 +177,9 @@ $ ft robot send 1 "/compact" --wait-for "compaction complete" --timeout-secs 30
       "is_regex": false
     },
     "submit": {
-      "state": "verified",
+      "state": "submitted",
+      "guarantee_level": "submitted",
+      "guarantee_met": true,
       "attempts": 1,
       "evidence_rule_ids": ["policy.allow"],
       "elapsed_ms": 4829,
@@ -1119,6 +1121,8 @@ ft robot get-text --all --tail 10         # all active panes
 ft robot send 1 "/compact"                          # send text (auto-detects paste mode)
 ft robot send 1 "dangerous command" --dry-run       # preview without executing
 ft robot send 1 "y" --wait-for "confirmed"          # send and wait for confirmation
+ft robot send 1 "/compact" --verify-submit          # return submitted-level SubmitReceipt
+ft robot send 1 "/compact" --submit-level working   # require working/output evidence
 ```
 
 ### Pattern waiting

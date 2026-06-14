@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::patterns::{AgentType, SubmitProfile};
 use crate::policy::InjectionResult;
-use crate::robot_types::{SubmitReceipt, SubmitReceiptState};
+use crate::robot_types::{SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState};
 use crate::wezterm::{MuxSemanticSnapshot, MuxSemanticZoneKind};
 
 const CAPTURE_CURSOR_PREFIX: &str = "pane";
@@ -82,13 +82,37 @@ pub fn build_submit_receipt(
     verification_report: Option<&VerifiedSubmitReport>,
     elapsed_ms: u64,
 ) -> SubmitReceipt {
+    build_submit_receipt_with_guarantee(
+        pane_id,
+        original_text,
+        injection,
+        verification_report,
+        elapsed_ms,
+        SubmitGuaranteeLevel::Submitted,
+    )
+}
+
+#[must_use]
+pub fn build_submit_receipt_with_guarantee(
+    pane_id: u64,
+    original_text: &str,
+    injection: &InjectionResult,
+    verification_report: Option<&VerifiedSubmitReport>,
+    elapsed_ms: u64,
+    guarantee_level: SubmitGuaranteeLevel,
+) -> SubmitReceipt {
+    let state = submit_receipt_state(injection, verification_report);
+    let evidence_rule_ids = submit_receipt_evidence_rule_ids(injection, verification_report);
+    let guarantee_met = guarantee_level.is_met_by(state, &evidence_rule_ids);
     SubmitReceipt {
-        state: submit_receipt_state(injection, verification_report),
+        state,
+        guarantee_level,
+        guarantee_met,
         agent_type: verification_report.and_then(|report| report.agent_type.clone()),
         profile_id: verification_report.and_then(|report| report.profile_id.clone()),
         profile_version: verification_report.and_then(|report| report.profile_version.clone()),
         attempts: verification_report.map_or(1, |report| report.attempts),
-        evidence_rule_ids: submit_receipt_evidence_rule_ids(injection, verification_report),
+        evidence_rule_ids,
         elapsed_ms,
         polls: verification_report.map_or(0, |report| report.polls),
         cursor_before: verification_report.and_then(|report| report.cursor_before.clone()),
@@ -96,6 +120,17 @@ pub fn build_submit_receipt(
         idempotency_key: crate::robot_idempotency::send_text_key(pane_id, original_text)
             .to_string(),
     }
+}
+
+#[must_use]
+pub fn submit_guarantee_failure_message(receipt: &SubmitReceipt) -> Option<String> {
+    (!receipt.guarantee_met).then(|| {
+        format!(
+            "submit guarantee '{}' not met: state={}",
+            receipt.guarantee_level.as_str(),
+            receipt.state.as_str()
+        )
+    })
 }
 
 /// Classify the post-send terminal state using a data-driven submit profile.
@@ -1042,6 +1077,91 @@ mod tests {
                 idempotency_outcome(Some(state)),
                 IdempotencyOutcome::Proceed,
                 "{label} was not durably delivered and must allow retry"
+            );
+        }
+    }
+
+    #[test]
+    fn submit_guarantee_matrix_pins_terminal_state_semantics() {
+        use SubmitGuaranteeLevel::{Composer, Submitted, Working, Write};
+
+        let no_evidence = Vec::new();
+        let working_evidence = vec!["submit_profile:codex.default:working_state:0".to_string()];
+        let semantic_evidence =
+            vec!["submit_profile:codex.default:semantic_output_after_input".to_string()];
+
+        let cases = [
+            (Write, SubmitReceiptState::Submitted, &no_evidence, true),
+            (
+                Write,
+                SubmitReceiptState::QueuedBehindOperation,
+                &no_evidence,
+                true,
+            ),
+            (
+                Write,
+                SubmitReceiptState::StuckInComposer,
+                &no_evidence,
+                true,
+            ),
+            (
+                Write,
+                SubmitReceiptState::PaneCrashedToShell,
+                &no_evidence,
+                false,
+            ),
+            (
+                Composer,
+                SubmitReceiptState::StuckInComposer,
+                &no_evidence,
+                true,
+            ),
+            (
+                Composer,
+                SubmitReceiptState::VerificationUnavailable,
+                &no_evidence,
+                false,
+            ),
+            (
+                Submitted,
+                SubmitReceiptState::QueuedBehindOperation,
+                &no_evidence,
+                true,
+            ),
+            (
+                Submitted,
+                SubmitReceiptState::StuckInComposer,
+                &no_evidence,
+                false,
+            ),
+            (
+                Working,
+                SubmitReceiptState::Submitted,
+                &working_evidence,
+                true,
+            ),
+            (
+                Working,
+                SubmitReceiptState::Submitted,
+                &semantic_evidence,
+                true,
+            ),
+            (Working, SubmitReceiptState::Submitted, &no_evidence, false),
+            (
+                Working,
+                SubmitReceiptState::QueuedBehindOperation,
+                &working_evidence,
+                false,
+            ),
+        ];
+
+        for (level, state, evidence, expected) in cases {
+            assert_eq!(
+                level.is_met_by(state, evidence),
+                expected,
+                "level={} state={}",
+                level.as_str(),
+                state.as_str()
             );
         }
     }
