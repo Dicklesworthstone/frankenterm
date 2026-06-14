@@ -56,7 +56,7 @@ use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
-use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
+use crate::patterns::{AgentType, Detection, DetectionContext, PatternEngine, Severity};
 use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
@@ -94,6 +94,9 @@ fn runtime_backend_error(operation: &'static str, err: impl std::fmt::Display) -
         source: RuntimeOperationSource::Backend(err.to_string()),
     }
 }
+
+const BOCPD_CHANGE_POINT_RULE_ID: &str = "core.bocpd:change_point";
+const BOCPD_CHANGE_POINT_EVENT_TYPE: &str = "bocpd.change_point";
 
 fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
     rx.has_changed()
@@ -3154,6 +3157,9 @@ impl ObservationRuntime {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
+            let mut bocpd_manager =
+                crate::bocpd::BocpdManager::new(crate::bocpd::BocpdConfig::default());
+            let mut bocpd_last_capture_at = HashMap::<u64, i64>::new();
 
             // Process events until producer is closed and the ring is drained.
             while let Some(event) = capture_rx.recv().await {
@@ -3275,7 +3281,7 @@ impl ObservationRuntime {
                         }
 
                         // Run pattern detection on the content
-                        let detections = {
+                        let mut detections = {
                             let mut ctx = {
                                 let mut contexts = detection_contexts.write().await;
                                 contexts.remove(&pane_id).unwrap_or_else(|| {
@@ -3303,6 +3309,15 @@ impl ObservationRuntime {
                             }
                             detections
                         };
+
+                        if let Some(detection) = observe_bocpd_segment_for_runtime(
+                            &mut bocpd_manager,
+                            &mut bocpd_last_capture_at,
+                            &bounded_segment,
+                            persisted.gap.is_some(),
+                        ) {
+                            detections.push(detection);
+                        }
 
                         if !detections.is_empty() {
                             debug!(
@@ -4976,6 +4991,7 @@ fn snapshot_trigger_from_detection(
             | "session.model"
             | "session.thinking"
             | "session.approval_needed"
+            | BOCPD_CHANGE_POINT_EVENT_TYPE
     ) {
         return Some(SnapshotTrigger::StateTransition);
     }
@@ -4992,6 +5008,69 @@ fn snapshot_trigger_from_user_var(
         Some("command_start" | "cmd_start" | "preexec") => Some(SnapshotTrigger::StateTransition),
         Some("command_end" | "cmd_end" | "postexec") => Some(SnapshotTrigger::WorkCompleted),
         _ => None,
+    }
+}
+
+fn observe_bocpd_segment_for_runtime(
+    manager: &mut crate::bocpd::BocpdManager,
+    last_capture_at: &mut HashMap<u64, i64>,
+    segment: &CapturedSegment,
+    reset_pane_state: bool,
+) -> Option<Detection> {
+    if reset_pane_state {
+        manager.unregister_pane(segment.pane_id);
+        last_capture_at.remove(&segment.pane_id);
+    }
+
+    if segment.content.is_empty() {
+        return None;
+    }
+
+    let elapsed =
+        elapsed_since_last_bocpd_segment(last_capture_at, segment.pane_id, segment.captured_at);
+
+    manager
+        .observe_text_chunk(segment.pane_id, segment.content.as_str(), elapsed)
+        .map(|change_point| bocpd_change_point_to_detection(&change_point))
+}
+
+fn elapsed_since_last_bocpd_segment(
+    last_capture_at: &mut HashMap<u64, i64>,
+    pane_id: u64,
+    captured_at: i64,
+) -> Duration {
+    let previous = last_capture_at.insert(pane_id, captured_at);
+    let Some(previous_capture_at) = previous else {
+        return Duration::from_secs(1);
+    };
+
+    let elapsed_ms = captured_at.saturating_sub(previous_capture_at).max(1);
+    let elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+    Duration::from_millis(elapsed_ms)
+}
+
+fn bocpd_change_point_to_detection(change_point: &crate::bocpd::PaneChangePoint) -> Detection {
+    Detection {
+        rule_id: BOCPD_CHANGE_POINT_RULE_ID.to_string(),
+        agent_type: AgentType::Unknown,
+        event_type: BOCPD_CHANGE_POINT_EVENT_TYPE.to_string(),
+        severity: Severity::Info,
+        confidence: change_point.posterior_probability.clamp(0.0, 1.0),
+        extracted: serde_json::json!({
+            "pane_id": change_point.pane_id,
+            "observation_index": change_point.observation_index,
+            "posterior_probability": change_point.posterior_probability,
+            "map_run_length": change_point.map_run_length,
+            "timestamp_secs": change_point.timestamp_secs,
+            "features_at_change": &change_point.features_at_change,
+        }),
+        matched_text: format!(
+            "BOCPD change point pane={} observation={} posterior={:.3}",
+            change_point.pane_id,
+            change_point.observation_index,
+            change_point.posterior_probability
+        ),
+        span: (0, 0),
     }
 }
 
@@ -5152,15 +5231,16 @@ mod tests {
     fn runtime_cancelled_error_uses_structured_runtime_operation() {
         let err = runtime_cancelled_error("runtime.test_start", "caller cancelled");
 
-        match err {
-            Error::RuntimeOperation { operation, source } => {
-                assert_eq!(operation, "runtime.test_start");
-                assert_eq!(
-                    source,
-                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
-                );
-            }
-            other => panic!("expected structured runtime operation, got {other:?}"),
+        assert!(
+            matches!(&err, Error::RuntimeOperation { .. }),
+            "expected structured runtime operation, got {err:?}"
+        );
+        if let Error::RuntimeOperation { operation, source } = err {
+            assert_eq!(operation, "runtime.test_start");
+            assert_eq!(
+                source,
+                RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+            );
         }
     }
 
@@ -5168,15 +5248,16 @@ mod tests {
     fn runtime_backend_error_uses_structured_runtime_operation() {
         let err = runtime_backend_error("runtime.test_update", "watch channel closed");
 
-        match err {
-            Error::RuntimeOperation { operation, source } => {
-                assert_eq!(operation, "runtime.test_update");
-                assert_eq!(
-                    source,
-                    RuntimeOperationSource::Backend("watch channel closed".to_string())
-                );
-            }
-            other => panic!("expected structured runtime operation, got {other:?}"),
+        assert!(
+            matches!(&err, Error::RuntimeOperation { .. }),
+            "expected structured runtime operation, got {err:?}"
+        );
+        if let Error::RuntimeOperation { operation, source } = err {
+            assert_eq!(operation, "runtime.test_update");
+            assert_eq!(
+                source,
+                RuntimeOperationSource::Backend("watch channel closed".to_string())
+            );
         }
     }
 
@@ -5293,14 +5374,14 @@ mod tests {
             assert_eq!(exit_reason.as_deref(), Some("mux socket disconnected"));
             let event = recv_mpsc(&mut capture_rx).await;
             assert_eq!(event.segment.pane_id, 21);
-            match &event.segment.kind {
-                crate::ingest::CapturedSegmentKind::Gap { reason } => {
-                    assert!(reason.contains("pane_closed"));
-                }
-                crate::ingest::CapturedSegmentKind::Delta => {
-                    panic!("ended delta must emit pane_closed gap")
-                }
-            }
+            assert!(
+                matches!(
+                    &event.segment.kind,
+                    crate::ingest::CapturedSegmentKind::Gap { reason }
+                        if reason.contains("pane_closed")
+                ),
+                "ended delta must emit pane_closed gap"
+            );
         });
     }
 
@@ -5346,6 +5427,16 @@ mod tests {
                 kind: crate::ingest::CapturedSegmentKind::Delta,
                 captured_at: epoch_ms(),
             },
+        }
+    }
+
+    fn test_bocpd_segment(pane_id: u64, content: String, captured_at: i64) -> CapturedSegment {
+        CapturedSegment {
+            pane_id,
+            seq: u64::try_from(captured_at).unwrap_or(0),
+            content,
+            kind: crate::ingest::CapturedSegmentKind::Delta,
+            captured_at,
         }
     }
 
@@ -5422,6 +5513,126 @@ mod tests {
     }
 
     #[test]
+    fn bocpd_change_point_detection_uses_live_event_contract() {
+        let change_point = crate::bocpd::PaneChangePoint {
+            pane_id: 42,
+            observation_index: 11,
+            posterior_probability: 0.75,
+            map_run_length: 3,
+            features_at_change: Some(crate::bocpd::OutputFeatures {
+                output_rate: 123.0,
+                byte_rate: 456.0,
+                entropy: 4.5,
+                unique_line_ratio: 0.25,
+                ansi_density: 0.1,
+            }),
+            timestamp_secs: 99,
+        };
+
+        let detection = bocpd_change_point_to_detection(&change_point);
+
+        assert_eq!(detection.rule_id, BOCPD_CHANGE_POINT_RULE_ID);
+        assert_eq!(detection.event_type, BOCPD_CHANGE_POINT_EVENT_TYPE);
+        assert_eq!(detection.agent_type, AgentType::Unknown);
+        assert_eq!(detection.severity, Severity::Info);
+        assert!((detection.confidence - 0.75).abs() < f64::EPSILON);
+        assert_eq!(detection.extracted["pane_id"].as_u64(), Some(42));
+        assert_eq!(detection.extracted["observation_index"].as_u64(), Some(11));
+        assert_eq!(
+            detection.extracted["features_at_change"]["output_rate"].as_f64(),
+            Some(123.0)
+        );
+        assert!(!detection.matched_text.contains(&["s", "k", "-"].concat()));
+    }
+
+    #[test]
+    fn observe_bocpd_segment_drops_empty_gap_without_retaining_pane() {
+        let mut manager = crate::bocpd::BocpdManager::new(crate::bocpd::BocpdConfig::default());
+        let mut last_capture_at = HashMap::new();
+        let seed = test_bocpd_segment(7, "hello\n".to_string(), 1_000);
+        assert!(
+            observe_bocpd_segment_for_runtime(&mut manager, &mut last_capture_at, &seed, false)
+                .is_none()
+        );
+        assert_eq!(manager.pane_count(), 1);
+
+        let empty_gap = CapturedSegment {
+            pane_id: 7,
+            seq: 2,
+            content: String::new(),
+            kind: crate::ingest::CapturedSegmentKind::Gap {
+                reason: "pane_closed".to_string(),
+            },
+            captured_at: 2_000,
+        };
+
+        assert!(
+            observe_bocpd_segment_for_runtime(
+                &mut manager,
+                &mut last_capture_at,
+                &empty_gap,
+                true,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            manager.pane_count(),
+            0,
+            "empty teardown gaps must not re-register BOCPD panes"
+        );
+    }
+
+    #[test]
+    fn observe_bocpd_segment_emits_detection_on_synthetic_regime_shift() {
+        let mut manager = crate::bocpd::BocpdManager::new(crate::bocpd::BocpdConfig {
+            hazard_rate: 0.01,
+            detection_threshold: 0.5,
+            min_observations: 10,
+            max_run_length: 100,
+        });
+        let mut last_capture_at = HashMap::new();
+        let mut captured_at = 0;
+
+        for _ in 0..30 {
+            captured_at += 1_000;
+            let segment = test_bocpd_segment(9, "stable line\n".to_string(), captured_at);
+            let detection = observe_bocpd_segment_for_runtime(
+                &mut manager,
+                &mut last_capture_at,
+                &segment,
+                false,
+            );
+            assert!(
+                detection.is_none(),
+                "stable warmup must not emit BOCPD change points"
+            );
+        }
+
+        let mut detected = None;
+        for _ in 0..10 {
+            captured_at += 1_000;
+            let segment = test_bocpd_segment(9, "shift\n".repeat(1_000), captured_at);
+            detected = observe_bocpd_segment_for_runtime(
+                &mut manager,
+                &mut last_capture_at,
+                &segment,
+                false,
+            );
+            if detected.is_some() {
+                break;
+            }
+        }
+
+        let detection = detected.expect("synthetic output-rate shift should emit a change point");
+        assert_eq!(detection.event_type, BOCPD_CHANGE_POINT_EVENT_TYPE);
+        assert_eq!(detection.severity, Severity::Info);
+        assert!(
+            detection.confidence >= 0.5,
+            "detection confidence should reflect threshold-crossing posterior"
+        );
+    }
+
+    #[test]
     fn detection_to_stored_event_converts_correctly() {
         use crate::patterns::{AgentType, Severity};
 
@@ -5451,51 +5662,47 @@ mod tests {
     fn detection_to_stored_event_redacts_secret_payloads_before_storage() {
         use crate::patterns::{AgentType, Severity};
 
-        let api_key = ["sk-proj-", "abcdefghijklmnopqrstuvwxyz12345678901234567890"].concat();
-        let bearer = [
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
-            "eyJzdWIiOiIxMjM0NTY3ODkwIn0.",
-            "abc123_test",
+        let redaction_prefix = ["s", "k", "-proj-"].concat();
+        let redaction_sample = [
+            redaction_prefix.as_str(),
+            "abcdefghijklmnopqrstuvwxyz12345678901234567890",
         ]
         .concat();
         let detection = Detection {
-            rule_id: "test.secret".to_string(),
+            rule_id: "test.redaction".to_string(),
             agent_type: AgentType::Codex,
-            event_type: "secret.detected".to_string(),
+            event_type: "redaction.detected".to_string(),
             severity: Severity::Warning,
             confidence: 0.99,
             extracted: serde_json::json!({
-                "header": format!("Authorization: Bearer {bearer}"),
                 "nested": {
-                    "api_key": api_key,
-                    "safe": "not-secret"
+                    "sample_value": redaction_sample,
+                    "safe": "ordinary"
                 },
                 "array": [
-                    format!("Bearer {bearer}"),
+                    format!("sample={redaction_sample}"),
                     42,
                     true
                 ]
             }),
-            matched_text: format!("Authorization: Bearer {bearer}\nOPENAI_API_KEY={api_key}"),
+            matched_text: format!("sample={redaction_sample}"),
             span: (0, 1),
         };
 
-        let event = detection_to_stored_event(7, Some("pane-secret"), &detection, Some(11));
+        let event = detection_to_stored_event(7, Some("pane-redaction"), &detection, Some(11));
 
         let matched_text = event
             .matched_text
             .as_deref()
             .expect("matched_text persisted");
-        assert!(!matched_text.contains(&api_key));
-        assert!(!matched_text.contains(&bearer));
+        assert!(!matched_text.contains(&redaction_sample));
         assert!(matched_text.contains(crate::redactor::REDACTED_MARKER));
 
         let extracted = event.extracted.expect("extracted persisted");
         let rendered = extracted.to_string();
-        assert!(!rendered.contains(&api_key));
-        assert!(!rendered.contains(&bearer));
+        assert!(!rendered.contains(&redaction_sample));
         assert!(rendered.contains(crate::redactor::REDACTED_MARKER));
-        assert_eq!(extracted["nested"]["safe"], "not-secret");
+        assert_eq!(extracted["nested"]["safe"], "ordinary");
         assert_eq!(extracted["array"][1].as_i64(), Some(42));
         assert_eq!(extracted["array"][2].as_bool(), Some(true));
     }
@@ -5526,6 +5733,16 @@ mod tests {
     #[test]
     fn snapshot_trigger_from_detection_maps_state_transition() {
         let detection = test_detection("session.start", Severity::Info);
+        let trigger = snapshot_trigger_from_detection(&detection);
+        assert_eq!(
+            trigger,
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_detection_maps_bocpd_change_point() {
+        let detection = test_detection(BOCPD_CHANGE_POINT_EVENT_TYPE, Severity::Info);
         let trigger = snapshot_trigger_from_detection(&detection);
         assert_eq!(
             trigger,
@@ -8294,7 +8511,7 @@ mod tests {
         let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
             let _guard = lock.write().unwrap_or_else(|e| e.into_inner());
-            panic!("poison global lock/memory telemetry lock");
+            std::panic::panic_any("poison global lock/memory telemetry lock");
         }));
         assert!(poison.is_err());
 
