@@ -15,6 +15,7 @@ const H0_DIMENSION: u8 = 0;
 const H1_DIMENSION: u8 = 1;
 pub const DEADWIRE_WIRING_STATUS_SCHEMA_VERSION: u32 = 1;
 pub const GOVERNED_SUBTRACTION_SCHEMA_VERSION: u32 = 1;
+pub const COGNITIVE_LOAD_SHEDDING_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapSizeError {
@@ -352,6 +353,90 @@ pub struct GovernedSubtractionInput<'a> {
     pub generated_at_ms: u64,
 }
 
+/// Coarse operator-facing tier for control-plane cognitive load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveLoadTier {
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Black,
+}
+
+/// Input signal used to compute agent/control-plane cognitive load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveLoadSignalKind {
+    UnresolvedAttentionItems,
+    ConflictingSuggestedActions,
+    StaleEvidence,
+    RepeatedToolFailures,
+    ContextAge,
+    MissionDependencyDepth,
+    SafetyCriticalBlockers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CognitiveLoadSignal {
+    pub kind: CognitiveLoadSignalKind,
+    pub count: u32,
+    pub score: u32,
+    pub reason_code: String,
+    pub summary: String,
+    pub safety_critical: bool,
+}
+
+/// Side-effect-free control-plane degradation actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveLoadSheddingAction {
+    Continue,
+    SummarizeContext,
+    BatchAttentionItems,
+    SplitMission,
+    RouteToReviewer,
+    RecommendCompaction,
+    PreserveSafetyCriticalBlockers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CognitiveLoadActionPlan {
+    pub action: CognitiveLoadSheddingAction,
+    pub reason_codes: Vec<String>,
+    pub mutates: bool,
+    pub hides_safety_critical_blockers: bool,
+}
+
+/// Report-only cognitive-load shedding receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CognitiveLoadSheddingPlan {
+    pub schema_version: u32,
+    pub produced_by_bead: String,
+    pub generated_at_ms: u64,
+    pub load_score: u32,
+    pub tier: CognitiveLoadTier,
+    pub report_only: bool,
+    pub mutates: bool,
+    pub hides_safety_critical_blockers: bool,
+    pub safety_critical_blockers_visible: u32,
+    pub signals: Vec<CognitiveLoadSignal>,
+    pub actions: Vec<CognitiveLoadActionPlan>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CognitiveLoadInput<'a> {
+    pub unresolved_attention_items: u32,
+    pub conflicting_suggested_actions: u32,
+    pub stale_evidence_items: u32,
+    pub repeated_failed_tool_calls: u32,
+    pub context_age_minutes: u32,
+    pub mission_dependency_depth: u32,
+    pub safety_critical_blockers: u32,
+    pub produced_by_bead: &'a str,
+    pub generated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DecisionApiWiringInput<'a> {
     pub declarations: &'a [DecisionApiDeclaration],
@@ -550,6 +635,225 @@ fn is_hard_protected_governed_subtraction_path(path: &str) -> bool {
         || normalized.ends_with("/AGENTS.md")
         || normalized == "crates/frankenterm-core"
         || normalized.starts_with("crates/frankenterm-core/")
+}
+
+/// Build a report-only cognitive-load shedding plan.
+///
+/// The plan recommends operator actions but never performs compaction, batching,
+/// assignment, reviewer routing, or mission splitting itself.
+pub fn plan_cognitive_load_shedding(input: CognitiveLoadInput<'_>) -> CognitiveLoadSheddingPlan {
+    let mut signals = Vec::new();
+    push_cognitive_load_signal(
+        &mut signals,
+        input.unresolved_attention_items,
+        8,
+        CognitiveLoadSignalKind::UnresolvedAttentionItems,
+        "cognitive.unresolved_attention",
+        "unresolved attention item(s) need triage",
+        false,
+    );
+    push_cognitive_load_signal(
+        &mut signals,
+        input.conflicting_suggested_actions,
+        18,
+        CognitiveLoadSignalKind::ConflictingSuggestedActions,
+        "cognitive.conflicting_actions",
+        "suggested next actions disagree",
+        false,
+    );
+    push_cognitive_load_signal(
+        &mut signals,
+        input.stale_evidence_items,
+        12,
+        CognitiveLoadSignalKind::StaleEvidence,
+        "cognitive.stale_evidence",
+        "evidence is stale or insufficiently refreshed",
+        false,
+    );
+    push_cognitive_load_signal(
+        &mut signals,
+        input.repeated_failed_tool_calls,
+        10,
+        CognitiveLoadSignalKind::RepeatedToolFailures,
+        "cognitive.repeated_tool_failures",
+        "repeated tool-call failures increase operator load",
+        false,
+    );
+    push_cognitive_load_signal(
+        &mut signals,
+        context_age_buckets(input.context_age_minutes),
+        7,
+        CognitiveLoadSignalKind::ContextAge,
+        "cognitive.context_age",
+        "context age suggests summarization or compaction review",
+        false,
+    );
+    push_cognitive_load_signal(
+        &mut signals,
+        input.mission_dependency_depth,
+        9,
+        CognitiveLoadSignalKind::MissionDependencyDepth,
+        "cognitive.mission_depth",
+        "deep dependency chains make single-threaded execution brittle",
+        false,
+    );
+    push_cognitive_load_signal(
+        &mut signals,
+        input.safety_critical_blockers,
+        40,
+        CognitiveLoadSignalKind::SafetyCriticalBlockers,
+        "cognitive.safety_critical_blocker",
+        "safety-critical blocker(s) must remain visible",
+        true,
+    );
+
+    let load_score = signals
+        .iter()
+        .fold(0_u32, |total, signal| total.saturating_add(signal.score));
+    let mut tier = cognitive_load_tier(load_score);
+    if input.safety_critical_blockers > 0 {
+        tier = tier.max(CognitiveLoadTier::Red);
+    }
+
+    let mut actions = Vec::new();
+    if signals.is_empty() {
+        push_cognitive_load_action(
+            &mut actions,
+            CognitiveLoadSheddingAction::Continue,
+            &["cognitive.load_green"],
+        );
+    }
+    if input.unresolved_attention_items >= 4 {
+        push_cognitive_load_action(
+            &mut actions,
+            CognitiveLoadSheddingAction::BatchAttentionItems,
+            &["cognitive.unresolved_attention"],
+        );
+    }
+    if input.stale_evidence_items > 0 || input.repeated_failed_tool_calls > 0 {
+        push_cognitive_load_action(
+            &mut actions,
+            CognitiveLoadSheddingAction::SummarizeContext,
+            &[
+                "cognitive.stale_evidence",
+                "cognitive.repeated_tool_failures",
+            ],
+        );
+    }
+    if input.conflicting_suggested_actions > 0 || input.safety_critical_blockers > 0 {
+        push_cognitive_load_action(
+            &mut actions,
+            CognitiveLoadSheddingAction::RouteToReviewer,
+            &[
+                "cognitive.conflicting_actions",
+                "cognitive.safety_critical_blocker",
+            ],
+        );
+    }
+    if input.mission_dependency_depth >= 4 || tier >= CognitiveLoadTier::Red {
+        push_cognitive_load_action(
+            &mut actions,
+            CognitiveLoadSheddingAction::SplitMission,
+            &["cognitive.mission_depth", "cognitive.load_red"],
+        );
+    }
+    if input.context_age_minutes >= 120 {
+        push_cognitive_load_action(
+            &mut actions,
+            CognitiveLoadSheddingAction::RecommendCompaction,
+            &["cognitive.context_age"],
+        );
+    }
+    if input.safety_critical_blockers > 0 {
+        push_cognitive_load_action(
+            &mut actions,
+            CognitiveLoadSheddingAction::PreserveSafetyCriticalBlockers,
+            &["cognitive.safety_critical_blocker"],
+        );
+    }
+
+    CognitiveLoadSheddingPlan {
+        schema_version: COGNITIVE_LOAD_SHEDDING_SCHEMA_VERSION,
+        produced_by_bead: input.produced_by_bead.to_string(),
+        generated_at_ms: input.generated_at_ms,
+        load_score,
+        tier,
+        report_only: true,
+        mutates: false,
+        hides_safety_critical_blockers: false,
+        safety_critical_blockers_visible: input.safety_critical_blockers,
+        signals,
+        actions,
+    }
+}
+
+fn push_cognitive_load_signal(
+    signals: &mut Vec<CognitiveLoadSignal>,
+    count: u32,
+    weight: u32,
+    kind: CognitiveLoadSignalKind,
+    reason_code: &str,
+    summary: &str,
+    safety_critical: bool,
+) {
+    if count == 0 {
+        return;
+    }
+    signals.push(CognitiveLoadSignal {
+        kind,
+        count,
+        score: count.saturating_mul(weight),
+        reason_code: reason_code.to_string(),
+        summary: summary.to_string(),
+        safety_critical,
+    });
+}
+
+fn push_cognitive_load_action(
+    actions: &mut Vec<CognitiveLoadActionPlan>,
+    action: CognitiveLoadSheddingAction,
+    reason_codes: &[&str],
+) {
+    if let Some(existing) = actions
+        .iter_mut()
+        .find(|existing| existing.action == action)
+    {
+        let missing_reason_codes = reason_codes
+            .iter()
+            .filter(|reason_code| {
+                !existing
+                    .reason_codes
+                    .iter()
+                    .any(|existing| existing == **reason_code)
+            })
+            .map(|reason_code| (*reason_code).to_string());
+        existing.reason_codes.extend(missing_reason_codes);
+        return;
+    }
+
+    actions.push(CognitiveLoadActionPlan {
+        action,
+        reason_codes: reason_codes
+            .iter()
+            .map(|reason_code| (*reason_code).to_string())
+            .collect(),
+        mutates: false,
+        hides_safety_critical_blockers: false,
+    });
+}
+
+fn context_age_buckets(context_age_minutes: u32) -> u32 {
+    context_age_minutes.saturating_add(29) / 30
+}
+
+fn cognitive_load_tier(load_score: u32) -> CognitiveLoadTier {
+    match load_score {
+        0..=24 => CognitiveLoadTier::Green,
+        25..=49 => CognitiveLoadTier::Yellow,
+        50..=79 => CognitiveLoadTier::Orange,
+        80..=119 => CognitiveLoadTier::Red,
+        _ => CognitiveLoadTier::Black,
+    }
 }
 
 pub fn betti_curve(bitmap: &GrayBitmap) -> Vec<BettiSample> {
@@ -1361,6 +1665,110 @@ mod tests {
         }));
         assert_eq!(plan.proposed_wired_surfaces, 2);
         assert_eq!(plan.blocked, 1);
+    }
+
+    fn cognitive_input() -> CognitiveLoadInput<'static> {
+        CognitiveLoadInput {
+            unresolved_attention_items: 0,
+            conflicting_suggested_actions: 0,
+            stale_evidence_items: 0,
+            repeated_failed_tool_calls: 0,
+            context_age_minutes: 0,
+            mission_dependency_depth: 0,
+            safety_critical_blockers: 0,
+            produced_by_bead: "ft-7h5da.11.13",
+            generated_at_ms: 1_704_000_000_000,
+        }
+    }
+
+    fn has_cognitive_action(
+        plan: &CognitiveLoadSheddingPlan,
+        action: CognitiveLoadSheddingAction,
+    ) -> bool {
+        plan.actions.iter().any(|candidate| {
+            candidate.action == action
+                && !candidate.mutates
+                && !candidate.hides_safety_critical_blockers
+        })
+    }
+
+    #[test]
+    fn cognitive_load_green_plan_is_report_only_continue() {
+        let plan = plan_cognitive_load_shedding(cognitive_input());
+
+        assert_eq!(plan.schema_version, COGNITIVE_LOAD_SHEDDING_SCHEMA_VERSION);
+        assert_eq!(plan.tier, CognitiveLoadTier::Green);
+        assert_eq!(plan.load_score, 0);
+        assert!(plan.report_only);
+        assert!(!plan.mutates);
+        assert!(!plan.hides_safety_critical_blockers);
+        assert!(plan.signals.is_empty());
+        assert!(has_cognitive_action(
+            &plan,
+            CognitiveLoadSheddingAction::Continue
+        ));
+    }
+
+    #[test]
+    fn cognitive_load_high_pressure_recommends_all_shedding_actions() {
+        let mut input = cognitive_input();
+        input.unresolved_attention_items = 5;
+        input.conflicting_suggested_actions = 1;
+        input.stale_evidence_items = 2;
+        input.repeated_failed_tool_calls = 3;
+        input.context_age_minutes = 150;
+        input.mission_dependency_depth = 5;
+
+        let plan = plan_cognitive_load_shedding(input);
+
+        assert_eq!(plan.tier, CognitiveLoadTier::Black);
+        assert!(plan.load_score >= 120);
+        for action in [
+            CognitiveLoadSheddingAction::BatchAttentionItems,
+            CognitiveLoadSheddingAction::SummarizeContext,
+            CognitiveLoadSheddingAction::SplitMission,
+            CognitiveLoadSheddingAction::RouteToReviewer,
+            CognitiveLoadSheddingAction::RecommendCompaction,
+        ] {
+            assert!(
+                has_cognitive_action(&plan, action),
+                "missing cognitive action {action:?}"
+            );
+        }
+        assert!(plan.signals.iter().any(|signal| signal.kind
+            == CognitiveLoadSignalKind::MissionDependencyDepth
+            && signal.reason_code == "cognitive.mission_depth"));
+        assert!(!plan.mutates);
+    }
+
+    #[test]
+    fn cognitive_load_safety_blockers_remain_visible_and_force_review() {
+        let mut input = cognitive_input();
+        input.safety_critical_blockers = 1;
+
+        let plan = plan_cognitive_load_shedding(input);
+
+        assert!(plan.tier >= CognitiveLoadTier::Red);
+        assert_eq!(plan.safety_critical_blockers_visible, 1);
+        assert!(!plan.hides_safety_critical_blockers);
+        assert!(has_cognitive_action(
+            &plan,
+            CognitiveLoadSheddingAction::PreserveSafetyCriticalBlockers
+        ));
+        assert!(has_cognitive_action(
+            &plan,
+            CognitiveLoadSheddingAction::RouteToReviewer
+        ));
+        assert!(plan.signals.iter().any(|signal| {
+            signal.kind == CognitiveLoadSignalKind::SafetyCriticalBlockers
+                && signal.safety_critical
+                && signal.count == 1
+        }));
+        assert!(
+            plan.actions
+                .iter()
+                .all(|action| !action.hides_safety_critical_blockers)
+        );
     }
 
     #[test]
