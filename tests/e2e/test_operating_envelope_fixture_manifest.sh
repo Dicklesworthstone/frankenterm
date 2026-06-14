@@ -105,12 +105,35 @@ require_file() {
   [[ -f "${path}" ]] || fail "missing file: ${path}"
 }
 
+known_artifact_without_git() {
+  local path="$1"
+  local basename
+
+  jq -e --arg path "${path}" '
+    any(.valid_fixtures[]?; .path == $path)
+    or any(.invalid_fixtures[]?; .path == $path)
+  ' "${MANIFEST}" >/dev/null 2>&1 && return 0
+
+  basename="$(basename "${path}")"
+  grep -F -- "\`${basename}\`" "${PROVENANCE}" >/dev/null 2>&1 && return 0
+
+  [[ "${path}" == "${PROOF_CALENDAR_FIXTURES}" ]] && return 0
+  [[ "${path}" == "${PROOF_CALENDAR_INVALID_FIXTURES}" ]] && return 0
+
+  return 1
+}
+
 require_tracked_file() {
   local path="$1"
   require_repo_relative_path "${path}"
   require_file "${path}"
-  git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1 \
-    || fail "referenced artifact is not tracked by git: ${path}"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1 \
+      || fail "referenced artifact is not tracked by git: ${path}"
+  else
+    known_artifact_without_git "${path}" \
+      || fail "referenced artifact is not known to the manifest/provenance fallback: ${path}"
+  fi
 }
 
 require_repo_relative_path() {
@@ -515,7 +538,7 @@ retained_run_jsonl="$(
 
     input_hash="$(printf 'sha256:%064x' "${retained_run_index}")"
     plan_hash="$(printf 'sha256:%064x' "$((retained_run_index + 100))")"
-    jsonl_hash="$(printf 'sha256:%064x' "$((retained_run_index + 200))")"
+    golden_hash="$(printf 'sha256:%064x' "$((retained_run_index + 200))")"
     old_hash="$(printf 'sha256:%064x' "$((retained_run_index + 300))")"
     new_hash="$(printf 'sha256:%064x' "$((retained_run_index + 400))")"
 
@@ -528,7 +551,7 @@ retained_run_jsonl="$(
       --arg required_reason "${required_reason}" \
       --arg input_hash "${input_hash}" \
       --arg plan_hash "${plan_hash}" \
-      --arg jsonl_hash "${jsonl_hash}" \
+      --arg golden_hash "${golden_hash}" \
       --arg old_hash "${old_hash}" \
       --arg new_hash "${new_hash}" \
       --argjson exit_code "${exit_code}" \
@@ -555,7 +578,7 @@ retained_run_jsonl="$(
         ],
         output_hashes: [
           {output_id: "operating_envelope_plan_json", sha256: $plan_hash},
-          {output_id: "retained_jsonl_line", sha256: $jsonl_hash}
+          {output_id: "retained_golden_body", sha256: $golden_hash}
         ],
         scrub_rules: [
           "source_summaries_only",
@@ -633,6 +656,8 @@ printf '%s\n' "${retained_run_jsonl}" | jq -s -e \
   and all(.[]; ((.command.remote_cargo_reached or .command.cargo_test_reached) | not) or ((.command.worker_id? // "") | length > 0))
   and all(.[]; (.input_fixture_hashes | length) >= 1 and all(.input_fixture_hashes[]; .sha256 | sha256_ok))
   and all(.[]; (.output_hashes | length) >= 2 and all(.output_hashes[]; .sha256 | sha256_ok))
+  and all(.[]; ([.output_hashes[].output_id] | index("operating_envelope_plan_json") != null and index("retained_golden_body") != null))
+  and all(.[]; (.output_hashes[] | select(.output_id == "operating_envelope_plan_json").sha256) != (.output_hashes[] | select(.output_id == "retained_golden_body").sha256))
   and all(.[]; .golden_update.bless_required == true and (.golden_update.old_output_sha256 | sha256_ok) and (.golden_update.new_output_sha256 | sha256_ok))
   and all(.[]; .golden_update.old_output_sha256 != .golden_update.new_output_sha256)
   and all(.[]; (.scrub_rules | index("raw_pane_content_forbidden") != null))

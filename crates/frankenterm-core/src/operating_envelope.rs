@@ -1850,7 +1850,7 @@ pub fn build_operating_envelope_retained_run_artifact(
                 sha256: sha256_prefixed(&plan_json),
             },
             OperatingEnvelopeOutputHash {
-                output_id: "retained_jsonl_line".to_string(),
+                output_id: "retained_golden_body".to_string(),
                 sha256: sha256_prefixed(new_golden_body.as_bytes()),
             },
         ],
@@ -3629,6 +3629,8 @@ mod tests {
                     String::new()
                 }
             };
+            let retained_golden_body =
+                format!("{output_body}\nretained-run={}", scenario.scenario_id);
             let artifact = match build_operating_envelope_retained_run_artifact(
                 &plan,
                 scenario.scenario_id,
@@ -3636,7 +3638,7 @@ mod tests {
                 &input_fixture_body,
                 &baseline_reason_codes,
                 "previous retained golden",
-                &output_body,
+                &retained_golden_body,
             ) {
                 Ok(value) => value,
                 Err(error) => {
@@ -3684,6 +3686,26 @@ mod tests {
             for output_hash in &artifact.output_hashes {
                 assert_sha256(&output_hash.output_id, &output_hash.sha256);
             }
+            let plan_output_hash = artifact
+                .output_hashes
+                .iter()
+                .find(|output_hash| output_hash.output_id == "operating_envelope_plan_json")
+                .map(|output_hash| output_hash.sha256.as_str());
+            let retained_golden_hash = artifact
+                .output_hashes
+                .iter()
+                .find(|output_hash| output_hash.output_id == "retained_golden_body")
+                .map(|output_hash| output_hash.sha256.as_str());
+            let expected_retained_golden_hash = sha256_prefixed(retained_golden_body.as_bytes());
+            assert_eq!(
+                retained_golden_hash,
+                Some(expected_retained_golden_hash.as_str())
+            );
+            assert_ne!(
+                plan_output_hash, retained_golden_hash,
+                "{} retained golden hash must not alias the plan JSON hash",
+                artifact.scenario_id
+            );
             assert_sha256(
                 "old_output_sha256",
                 &artifact.golden_update.old_output_sha256,
@@ -4332,6 +4354,12 @@ mod tests {
                     .decision
                     .reason_codes
                     .contains(&"telemetry.stale".to_string())
+                || plan
+                    .decision
+                    .reason_codes
+                    .contains(&"telemetry.required_source_missing".to_string()),
+            "expected fail-closed proof/telemetry reason; got {:?}",
+            plan.decision.reason_codes
         );
     }
 

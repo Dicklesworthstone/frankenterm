@@ -141,6 +141,10 @@ calendar entry.
 
 The static verifier is `bash tests/e2e/test_operating_envelope_fixture_manifest.sh`.
 Use `--json` for machine-readable summary output that includes the base fixture
-counts, proof-calendar case count, and proof-calendar invalid case count. The
-fixture manifest retains this verifier command in `static_checks` so manifest
-consumers can discover the full static proof lane from the artifact itself.
+counts, proof-calendar case count, proof-calendar invalid case count, and
+retained-run artifact count. Retained-run output hashes distinguish the
+`operating_envelope_plan_json` hash from the `retained_golden_body` hash; the
+JSONL serialization contract is validated separately by round-tripping the full
+artifact. The fixture manifest retains this verifier command in `static_checks`
+so manifest consumers can discover the full static proof lane from the artifact
+itself.
