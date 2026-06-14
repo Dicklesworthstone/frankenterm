@@ -130,6 +130,16 @@ run_rch_gui_prereq_check() {
                         pkg-config --print-errors --exists x11 || true
                         exit 42
                     fi
+                    if ! pkg-config --exists xcb-image; then
+                        echo "FT_GUI_REMOTE_PREREQ_MISSING:xcb-image" >&2
+                        pkg-config --print-errors --exists xcb-image || true
+                        exit 43
+                    fi
+                    if ! pkg-config --exists xkbcommon-x11; then
+                        echo "FT_GUI_REMOTE_PREREQ_MISSING:xkbcommon-x11" >&2
+                        pkg-config --print-errors --exists xkbcommon-x11 || true
+                        exit 44
+                    fi
                     ;;
             esac
         '
@@ -148,6 +158,20 @@ ensure_remote_gui_prereqs() {
     if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:x11' "$preflight_log"; then
         echo "Error: remote worker is missing X11 development metadata required for frankenterm-gui"
         echo "frankenterm/window has a hard x11 dependency on Linux; provision x11 dev packages on the RCH workers."
+        echo "See $preflight_log for the remote preflight output."
+        return 1
+    fi
+
+    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:xcb-image' "$preflight_log"; then
+        echo "Error: remote worker is missing xcb-image development metadata required for frankenterm-gui"
+        echo "frankenterm/window links against xcb-image on Linux; provision libxcb-image0-dev on the RCH workers."
+        echo "See $preflight_log for the remote preflight output."
+        return 1
+    fi
+
+    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:xkbcommon-x11' "$preflight_log"; then
+        echo "Error: remote worker is missing xkbcommon-x11 development metadata required for frankenterm-gui"
+        echo "frankenterm/window links against xkbcommon-x11 on Linux; provision libxkbcommon-x11-dev on the RCH workers."
         echo "See $preflight_log for the remote preflight output."
         return 1
     fi

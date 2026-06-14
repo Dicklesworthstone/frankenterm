@@ -175,7 +175,18 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  exit 0' \
     'fi' \
     'exit 0' > "\${PWD}/\${target_dir}/release/ft"
-  chmod +x "\${PWD}/\${target_dir}/release/frankenterm-gui" "\${PWD}/\${target_dir}/release/ft"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    'if [[ "${1:-}" == "--version" ]]; then' \
+    '  echo "stub 0.0.0"' \
+    '  exit 0' \
+    'fi' \
+    'if [[ "${1:-}" == "--help" ]]; then' \
+    '  echo "stub help"' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' > "\${PWD}/\${target_dir}/release/frankenterm-mux-server"
+  chmod +x "\${PWD}/\${target_dir}/release/frankenterm-gui" "\${PWD}/\${target_dir}/release/ft" "\${PWD}/\${target_dir}/release/frankenterm-mux-server"
   exit 0
 fi
 
@@ -207,6 +218,44 @@ if [[ "\${1:-}" == "exec" ]]; then
   fi
   if [[ "\$*" == *"cargo build"* ]]; then
     echo "cargo build should not run after failed x11 preflight" >&2
+    exit 99
+  fi
+  printf 'unexpected exec: %s\n' "\$*" >&2
+  exit 64
+fi
+
+printf 'unexpected invocation: %s\n' "\$*" >&2
+exit 64
+EOF
+  chmod +x "${mock_bin}/rch"
+}
+
+write_missing_gui_link_pkg_rch() {
+  local mock_bin="$1"
+  local marker_file="$2"
+  local missing_pkg="$3"
+  mkdir -p "${mock_bin}"
+  cat > "${mock_bin}/rch" <<EOF
+#!/bin/bash
+set -euo pipefail
+if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
+  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
+  exit 0
+fi
+
+if [[ "\${1:-}" == "exec" ]]; then
+  shift
+  printf '%s\n' "\$*" >> "${marker_file}"
+  if [[ "\$*" == *"pkg-config --exists ${missing_pkg}"* ]]; then
+    echo "FT_GUI_REMOTE_PREREQ_MISSING:${missing_pkg}" >&2
+    echo "Package ${missing_pkg} was not found in the pkg-config search path." >&2
+    exit 43
+  fi
+  if [[ "\$*" == *"pkg-config --exists x11"* ]]; then
+    exit 0
+  fi
+  if [[ "\$*" == *"cargo build"* ]]; then
+    echo "cargo build should not run after failed GUI link-package preflight" >&2
     exit 99
   fi
   printf 'unexpected exec: %s\n' "\$*" >&2
@@ -397,6 +446,54 @@ scenario_e2e_missing_x11_refuses_cargo() {
   record_result "e2e_missing_x11_refuses_cargo" "true"
 }
 
+scenario_e2e_missing_gui_link_pkg_refuses_cargo() {
+  local scenario_dir="${ARTIFACT_DIR}/e2e_missing_gui_link_pkg_refuses_cargo"
+  local mock_bin="${scenario_dir}/mock-bin"
+  local marker_file="${scenario_dir}/rch-exec.log"
+  local stdout_file="${scenario_dir}/stdout.log"
+  local stderr_file="${scenario_dir}/stderr.log"
+  local rc
+
+  mkdir -p "${scenario_dir}"
+  write_missing_gui_link_pkg_rch "${mock_bin}" "${marker_file}" "xcb-image"
+
+  emit_log "running" "e2e_missing_gui_link_pkg_refuses_cargo" "remote_prereq_guard" "none" "none" "${stdout_file}" "scripts/e2e_gui_bootstrap.sh missing xcb-image"
+  set +e
+  env \
+    RCH_BIN="${mock_bin}/rch" \
+    LOG_DIR="${scenario_dir}/logs" \
+    GUI_TARGET_DIR="${scenario_dir}/target" \
+    "${ROOT_DIR}/scripts/e2e_gui_bootstrap.sh" --skip-bundle >"${stdout_file}" 2>"${stderr_file}"
+  rc=$?
+  set -e
+
+  if [[ "${rc}" -eq 0 ]]; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "unexpected_success" "GUI_LINK_PKG_GUARD_MISSING" "script unexpectedly succeeded"
+    return
+  fi
+  if [[ ! -f "${marker_file}" ]]; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
+    return
+  fi
+  if ! grep -q 'pkg-config --exists xcb-image' "${marker_file}"; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_preflight_exec" "GUI_LINK_PKG_PREFLIGHT_MISSING" "script never ran the remote xcb-image preflight"
+    return
+  fi
+  if grep -q 'cargo build' "${marker_file}"; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_GUI_LINK_PKG_FAILURE" "cargo build still ran after failed GUI link-package preflight"
+    return
+  fi
+  if ! grep -q 'Remote worker is missing xcb-image development metadata required for frankenterm-gui.' "${stdout_file}"; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_gui_pkg_message" "GUI_LINK_PKG_MESSAGE_MISSING" "missing explicit xcb-image prerequisite message"
+    return
+  fi
+  if ! grep -q '\[SKIP\] 2. verify GUI binary exists (build step failed (remote worker missing pkg-config xcb-image / xcb-image.pc); GUI binary unavailable)' "${stdout_file}"; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_dependency_skip" "DEPENDENCY_SKIP_MISSING" "dependent GUI binary check did not skip after xcb-image preflight failure"
+    return
+  fi
+  record_result "e2e_missing_gui_link_pkg_refuses_cargo" "true"
+}
+
 scenario_bundle_skip_build_creates_structure() {
   local scenario_dir="${ARTIFACT_DIR}/bundle_skip_build_creates_structure"
   local mock_bin="${scenario_dir}/mock-bin"
@@ -409,6 +506,7 @@ scenario_bundle_skip_build_creates_structure() {
 
   mkdir -p "${scenario_dir}" "${target_dir}/release" "${output_dir}"
   write_stub_binary "${target_dir}/release/frankenterm-gui"
+  write_stub_binary "${target_dir}/release/frankenterm-mux-server"
   write_stub_binary "${target_dir}/release/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
@@ -451,6 +549,7 @@ scenario_bundle_refuses_overwrite() {
 
   mkdir -p "${scenario_dir}" "${target_dir}/release" "${output_dir}"
   write_stub_binary "${target_dir}/release/frankenterm-gui"
+  write_stub_binary "${target_dir}/release/frankenterm-mux-server"
   write_stub_binary "${target_dir}/release/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
@@ -558,6 +657,49 @@ scenario_bundle_missing_x11_refuses_exec() {
   record_result "bundle_missing_x11_refuses_exec" "true"
 }
 
+scenario_bundle_missing_gui_link_pkg_refuses_exec() {
+  local scenario_dir="${ARTIFACT_DIR}/bundle_missing_gui_link_pkg_refuses_exec"
+  local mock_bin="${scenario_dir}/mock-bin"
+  local marker_file="${scenario_dir}/rch-exec.log"
+  local stdout_file="${scenario_dir}/stdout.log"
+  local stderr_file="${scenario_dir}/stderr.log"
+  local rc
+
+  mkdir -p "${scenario_dir}"
+  write_missing_gui_link_pkg_rch "${mock_bin}" "${marker_file}" "xkbcommon-x11"
+
+  emit_log "running" "bundle_missing_gui_link_pkg_refuses_exec" "remote_prereq_guard" "none" "none" "${stdout_file}" "scripts/create-macos-bundle.sh missing xkbcommon-x11"
+  set +e
+  env \
+    RCH_BIN="${mock_bin}/rch" \
+    CARGO_TARGET_DIR="${scenario_dir}/target" \
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" >"${stdout_file}" 2>"${stderr_file}"
+  rc=$?
+  set -e
+
+  if [[ "${rc}" -eq 0 ]]; then
+    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "unexpected_success" "GUI_LINK_PKG_GUARD_MISSING" "bundle script unexpectedly succeeded"
+    return
+  fi
+  if [[ ! -f "${marker_file}" ]]; then
+    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
+    return
+  fi
+  if ! grep -q 'pkg-config --exists xkbcommon-x11' "${marker_file}"; then
+    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_preflight_exec" "GUI_LINK_PKG_PREFLIGHT_MISSING" "bundle script never ran the remote xkbcommon-x11 preflight"
+    return
+  fi
+  if grep -q 'cargo build' "${marker_file}"; then
+    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_GUI_LINK_PKG_FAILURE" "bundle cargo build still ran after failed GUI link-package preflight"
+    return
+  fi
+  if ! grep -q 'Error: remote worker is missing xkbcommon-x11 development metadata required for frankenterm-gui' "${stdout_file}"; then
+    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_gui_pkg_message" "GUI_LINK_PKG_MESSAGE_MISSING" "bundle script missing explicit xkbcommon-x11 prerequisite message"
+    return
+  fi
+  record_result "bundle_missing_gui_link_pkg_refuses_exec" "true"
+}
+
 scenario_bundle_build_uses_repo_relative_paths() {
   local scenario_dir="${ARTIFACT_DIR}/bundle_build_uses_repo_relative_paths"
   local mock_bin="${scenario_dir}/mock-bin"
@@ -611,10 +753,12 @@ main() {
   scenario_dry_run_skips_rch
   scenario_e2e_probe_failure_refuses_exec
   scenario_e2e_missing_x11_refuses_cargo
+  scenario_e2e_missing_gui_link_pkg_refuses_cargo
   scenario_bundle_skip_build_creates_structure
   scenario_bundle_refuses_overwrite
   scenario_bundle_probe_failure_refuses_exec
   scenario_bundle_missing_x11_refuses_exec
+  scenario_bundle_missing_gui_link_pkg_refuses_exec
   scenario_bundle_build_uses_repo_relative_paths
 
   echo ""
