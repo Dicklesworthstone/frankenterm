@@ -31,8 +31,10 @@
 //! The substrate remains in this module; the robot-facing behavior lives in the
 //! profile handler and CLI dispatch layer.
 
+use crate::patterns::AgentType;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 
 /// `CREATE TABLE` SQL for the `agent_profiles` table. Consumed by the storage
 /// migration runner.
@@ -253,6 +255,561 @@ impl AgentProfile {
     }
 }
 
+/// Schema version for [`AgentCompatibilityReceipt`].
+pub const AGENT_COMPATIBILITY_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+/// Stable contract name for Robot/MCP/CLI surfaces that expose the matrix.
+pub const AGENT_COMPATIBILITY_MATRIX_CONTRACT_ID: &str =
+    "frankenterm.agent_compatibility_matrix.v1";
+
+/// Per-agent/version certification status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCompatibilityStatus {
+    /// All declared evidence for the relevant strict mode is present.
+    Certified,
+    /// Some capability evidence exists, but at least one strict requirement is
+    /// missing or stale.
+    Partial,
+    /// Certification ran and found an incompatibility.
+    Failed,
+    /// Receipt is retained for audit but too old to authorize strict behavior.
+    Stale,
+}
+
+impl AgentCompatibilityStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+/// Status for a single certification capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCapabilityStatus {
+    /// Evidence proves this capability for the agent/version pair.
+    Certified,
+    /// Evidence proves this capability is absent or broken.
+    Missing,
+    /// Certification has not tested this capability yet.
+    #[default]
+    Unknown,
+    /// Capability is not meaningful for this agent/version pair.
+    NotApplicable,
+}
+
+impl AgentCapabilityStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+
+    #[must_use]
+    pub const fn satisfies_strict_requirement(self) -> bool {
+        matches!(self, Self::Certified)
+    }
+}
+
+/// Capability dimensions that the certification matrix understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCompatibilityRequirement {
+    ComposerDetection,
+    SecondEnterBehavior,
+    QueuedState,
+    RateLimitResetParsing,
+    NativeResume,
+    Osc133,
+    PromptDetection,
+    WorkingDetection,
+    StuckDetection,
+    RedactionSensitiveFixtures,
+}
+
+impl AgentCompatibilityRequirement {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ComposerDetection => "composer_detection",
+            Self::SecondEnterBehavior => "second_enter_behavior",
+            Self::QueuedState => "queued_state",
+            Self::RateLimitResetParsing => "rate_limit_reset_parsing",
+            Self::NativeResume => "native_resume",
+            Self::Osc133 => "osc_133",
+            Self::PromptDetection => "prompt_detection",
+            Self::WorkingDetection => "working_detection",
+            Self::StuckDetection => "stuck_detection",
+            Self::RedactionSensitiveFixtures => "redaction_sensitive_fixtures",
+        }
+    }
+}
+
+/// Strict behavior families that must be backed by certification evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStrictMode {
+    VerifiedSubmit,
+    DurableResume,
+    RateLimitAware,
+    Osc133Required,
+    RedactionSensitiveFixtures,
+}
+
+impl AgentStrictMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedSubmit => "verified_submit",
+            Self::DurableResume => "durable_resume",
+            Self::RateLimitAware => "rate_limit_aware",
+            Self::Osc133Required => "osc_133_required",
+            Self::RedactionSensitiveFixtures => "redaction_sensitive_fixtures",
+        }
+    }
+
+    #[must_use]
+    pub const fn requirements(self) -> &'static [AgentCompatibilityRequirement] {
+        match self {
+            Self::VerifiedSubmit => &[
+                AgentCompatibilityRequirement::ComposerDetection,
+                AgentCompatibilityRequirement::SecondEnterBehavior,
+                AgentCompatibilityRequirement::QueuedState,
+                AgentCompatibilityRequirement::PromptDetection,
+                AgentCompatibilityRequirement::WorkingDetection,
+                AgentCompatibilityRequirement::StuckDetection,
+                AgentCompatibilityRequirement::RedactionSensitiveFixtures,
+            ],
+            Self::DurableResume => &[
+                AgentCompatibilityRequirement::NativeResume,
+                AgentCompatibilityRequirement::PromptDetection,
+                AgentCompatibilityRequirement::WorkingDetection,
+                AgentCompatibilityRequirement::StuckDetection,
+            ],
+            Self::RateLimitAware => &[AgentCompatibilityRequirement::RateLimitResetParsing],
+            Self::Osc133Required => &[AgentCompatibilityRequirement::Osc133],
+            Self::RedactionSensitiveFixtures => {
+                &[AgentCompatibilityRequirement::RedactionSensitiveFixtures]
+            }
+        }
+    }
+}
+
+/// Capability verdicts captured by a certification run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCompatibilityCapabilities {
+    #[serde(default)]
+    pub composer_detection: AgentCapabilityStatus,
+    #[serde(default)]
+    pub second_enter_behavior: AgentCapabilityStatus,
+    #[serde(default)]
+    pub queued_state: AgentCapabilityStatus,
+    #[serde(default)]
+    pub rate_limit_reset_parsing: AgentCapabilityStatus,
+    #[serde(default)]
+    pub native_resume: AgentCapabilityStatus,
+    #[serde(default)]
+    pub osc_133: AgentCapabilityStatus,
+    #[serde(default)]
+    pub prompt_detection: AgentCapabilityStatus,
+    #[serde(default)]
+    pub working_detection: AgentCapabilityStatus,
+    #[serde(default)]
+    pub stuck_detection: AgentCapabilityStatus,
+    #[serde(default)]
+    pub redaction_sensitive_fixtures: AgentCapabilityStatus,
+}
+
+impl AgentCompatibilityCapabilities {
+    #[must_use]
+    pub const fn status_for(
+        &self,
+        requirement: AgentCompatibilityRequirement,
+    ) -> AgentCapabilityStatus {
+        match requirement {
+            AgentCompatibilityRequirement::ComposerDetection => self.composer_detection,
+            AgentCompatibilityRequirement::SecondEnterBehavior => self.second_enter_behavior,
+            AgentCompatibilityRequirement::QueuedState => self.queued_state,
+            AgentCompatibilityRequirement::RateLimitResetParsing => self.rate_limit_reset_parsing,
+            AgentCompatibilityRequirement::NativeResume => self.native_resume,
+            AgentCompatibilityRequirement::Osc133 => self.osc_133,
+            AgentCompatibilityRequirement::PromptDetection => self.prompt_detection,
+            AgentCompatibilityRequirement::WorkingDetection => self.working_detection,
+            AgentCompatibilityRequirement::StuckDetection => self.stuck_detection,
+            AgentCompatibilityRequirement::RedactionSensitiveFixtures => {
+                self.redaction_sensitive_fixtures
+            }
+        }
+    }
+}
+
+/// Evidence summary retained with a certification receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCompatibilityEvidence {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixture_ids: Vec<String>,
+    #[serde(default)]
+    pub semantic_query_count: u32,
+    #[serde(default)]
+    pub submit_profile_id: Option<String>,
+    #[serde(default)]
+    pub retained_artifact_path: Option<String>,
+    #[serde(default)]
+    pub redaction_fixture_count: u32,
+}
+
+impl AgentCompatibilityEvidence {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fixture_ids.is_empty()
+            && self.semantic_query_count == 0
+            && self.submit_profile_id.is_none()
+            && self.retained_artifact_path.is_none()
+            && self.redaction_fixture_count == 0
+    }
+}
+
+/// Per-agent/version receipt produced by `ft agent certify`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCompatibilityReceipt {
+    pub schema_version: u32,
+    pub agent_type: AgentType,
+    pub agent_version: String,
+    pub profile_id: String,
+    pub profile_version: String,
+    pub certified_at_ms: i64,
+    pub status: AgentCompatibilityStatus,
+    pub capabilities: AgentCompatibilityCapabilities,
+    pub evidence: AgentCompatibilityEvidence,
+}
+
+impl AgentCompatibilityReceipt {
+    #[must_use]
+    pub fn matrix_key(&self) -> AgentCompatibilityMatrixKey {
+        AgentCompatibilityMatrixKey {
+            agent_type: self.agent_type,
+            agent_version: self.agent_version.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn receipt_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(AGENT_COMPATIBILITY_MATRIX_CONTRACT_ID.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.schema_version.to_string().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.agent_type.to_string().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.agent_version.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.profile_id.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.profile_version.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.certified_at_ms.to_string().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.status.as_str().as_bytes());
+        for requirement in ALL_AGENT_COMPATIBILITY_REQUIREMENTS {
+            let status = self.capabilities.status_for(*requirement);
+            hasher.update(b"\n");
+            hasher.update(requirement.as_str().as_bytes());
+            hasher.update(b"=");
+            hasher.update(status.as_str().as_bytes());
+        }
+        for fixture_id in &self.evidence.fixture_ids {
+            hasher.update(b"\nfixture=");
+            hasher.update(fixture_id.as_bytes());
+        }
+        hasher.update(b"\nsemantic_query_count=");
+        hasher.update(self.evidence.semantic_query_count.to_string().as_bytes());
+        if let Some(submit_profile_id) = &self.evidence.submit_profile_id {
+            hasher.update(b"\nsubmit_profile_id=");
+            hasher.update(submit_profile_id.as_bytes());
+        }
+        if let Some(path) = &self.evidence.retained_artifact_path {
+            hasher.update(b"\nretained_artifact_path=");
+            hasher.update(path.as_bytes());
+        }
+        hasher.update(b"\nredaction_fixture_count=");
+        hasher.update(self.evidence.redaction_fixture_count.to_string().as_bytes());
+        format!("agent-compatibility:{}", hex::encode(hasher.finalize()))
+    }
+
+    pub fn validate(&self) -> Result<(), AgentCompatibilityValidationError> {
+        if self.schema_version != AGENT_COMPATIBILITY_RECEIPT_SCHEMA_VERSION {
+            return Err(
+                AgentCompatibilityValidationError::UnsupportedSchemaVersion {
+                    observed: self.schema_version,
+                    expected: AGENT_COMPATIBILITY_RECEIPT_SCHEMA_VERSION,
+                },
+            );
+        }
+        if matches!(self.agent_type, AgentType::Unknown | AgentType::Wezterm) {
+            return Err(AgentCompatibilityValidationError::UnsupportedAgentType {
+                agent_type: self.agent_type,
+            });
+        }
+        if self.agent_version.trim().is_empty() {
+            return Err(AgentCompatibilityValidationError::EmptyField {
+                field: "agent_version",
+            });
+        }
+        if self.profile_id.trim().is_empty() {
+            return Err(AgentCompatibilityValidationError::EmptyField {
+                field: "profile_id",
+            });
+        }
+        if self.profile_version.trim().is_empty() {
+            return Err(AgentCompatibilityValidationError::EmptyField {
+                field: "profile_version",
+            });
+        }
+        if self.certified_at_ms < 0 {
+            return Err(AgentCompatibilityValidationError::TimestampNegative {
+                field: "certified_at_ms",
+                value: self.certified_at_ms,
+            });
+        }
+        if self.evidence.is_empty() {
+            return Err(AgentCompatibilityValidationError::MissingEvidence);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn missing_requirements_for_mode(&self, mode: AgentStrictMode) -> Vec<String> {
+        mode.requirements()
+            .iter()
+            .filter_map(|requirement| {
+                let status = self.capabilities.status_for(*requirement);
+                if status.satisfies_strict_requirement() {
+                    None
+                } else {
+                    Some(format!("{}:{}", requirement.as_str(), status.as_str()))
+                }
+            })
+            .collect()
+    }
+}
+
+const ALL_AGENT_COMPATIBILITY_REQUIREMENTS: &[AgentCompatibilityRequirement] = &[
+    AgentCompatibilityRequirement::ComposerDetection,
+    AgentCompatibilityRequirement::SecondEnterBehavior,
+    AgentCompatibilityRequirement::QueuedState,
+    AgentCompatibilityRequirement::RateLimitResetParsing,
+    AgentCompatibilityRequirement::NativeResume,
+    AgentCompatibilityRequirement::Osc133,
+    AgentCompatibilityRequirement::PromptDetection,
+    AgentCompatibilityRequirement::WorkingDetection,
+    AgentCompatibilityRequirement::StuckDetection,
+    AgentCompatibilityRequirement::RedactionSensitiveFixtures,
+];
+
+/// Query key for a single certified agent/version pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCompatibilityMatrixKey {
+    pub agent_type: AgentType,
+    pub agent_version: String,
+}
+
+impl PartialOrd for AgentCompatibilityMatrixKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AgentCompatibilityMatrixKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        agent_type_order_key(self.agent_type)
+            .cmp(&agent_type_order_key(other.agent_type))
+            .then_with(|| self.agent_version.cmp(&other.agent_version))
+    }
+}
+
+const fn agent_type_order_key(agent_type: AgentType) -> u8 {
+    match agent_type {
+        AgentType::Codex => 0,
+        AgentType::ClaudeCode => 1,
+        AgentType::Gemini => 2,
+        AgentType::Wezterm => 3,
+        AgentType::Unknown => 4,
+    }
+}
+
+/// Queryable certification matrix consumed by strict submit/resume gates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCompatibilityMatrix {
+    pub schema_version: u32,
+    pub contract_id: String,
+    pub receipts: Vec<AgentCompatibilityReceipt>,
+}
+
+impl Default for AgentCompatibilityMatrix {
+    fn default() -> Self {
+        Self {
+            schema_version: AGENT_COMPATIBILITY_RECEIPT_SCHEMA_VERSION,
+            contract_id: AGENT_COMPATIBILITY_MATRIX_CONTRACT_ID.to_string(),
+            receipts: Vec::new(),
+        }
+    }
+}
+
+impl AgentCompatibilityMatrix {
+    pub fn upsert(
+        &mut self,
+        receipt: AgentCompatibilityReceipt,
+    ) -> Result<Option<AgentCompatibilityReceipt>, AgentCompatibilityValidationError> {
+        receipt.validate()?;
+
+        let key = receipt.matrix_key();
+        let mut receipts_by_key: BTreeMap<AgentCompatibilityMatrixKey, AgentCompatibilityReceipt> =
+            self.receipts
+                .drain(..)
+                .map(|existing| (existing.matrix_key(), existing))
+                .collect();
+        let replaced = receipts_by_key.insert(key, receipt);
+        self.receipts = receipts_by_key.into_values().collect();
+        Ok(replaced)
+    }
+
+    #[must_use]
+    pub fn get(
+        &self,
+        agent_type: AgentType,
+        agent_version: &str,
+    ) -> Option<&AgentCompatibilityReceipt> {
+        self.receipts.iter().find(|receipt| {
+            receipt.agent_type == agent_type && receipt.agent_version == agent_version
+        })
+    }
+
+    #[must_use]
+    pub fn receipts_for_agent(&self, agent_type: AgentType) -> Vec<&AgentCompatibilityReceipt> {
+        self.receipts
+            .iter()
+            .filter(|receipt| receipt.agent_type == agent_type)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn gate_strict_mode(
+        &self,
+        agent_type: AgentType,
+        agent_version: &str,
+        strict_mode: AgentStrictMode,
+    ) -> AgentStrictModeGate {
+        let Some(receipt) = self.get(agent_type, agent_version) else {
+            return AgentStrictModeGate {
+                allowed: false,
+                agent_type,
+                agent_version: agent_version.to_string(),
+                strict_mode,
+                receipt_id: None,
+                reason_codes: vec!["agent_compatibility:uncertified".to_string()],
+                missing_requirements: strict_mode
+                    .requirements()
+                    .iter()
+                    .map(|requirement| format!("{}:uncertified", requirement.as_str()))
+                    .collect(),
+            };
+        };
+
+        let mut reason_codes = Vec::new();
+        if receipt.status != AgentCompatibilityStatus::Certified {
+            reason_codes.push(format!(
+                "agent_compatibility:status:{}",
+                receipt.status.as_str()
+            ));
+        }
+        let missing_requirements = receipt.missing_requirements_for_mode(strict_mode);
+        reason_codes.extend(
+            missing_requirements
+                .iter()
+                .map(|requirement| format!("agent_compatibility:missing:{requirement}")),
+        );
+        if reason_codes.is_empty() {
+            reason_codes.push("agent_compatibility:certified".to_string());
+        }
+
+        AgentStrictModeGate {
+            allowed: receipt.status == AgentCompatibilityStatus::Certified
+                && missing_requirements.is_empty(),
+            agent_type,
+            agent_version: agent_version.to_string(),
+            strict_mode,
+            receipt_id: Some(receipt.receipt_id()),
+            reason_codes,
+            missing_requirements,
+        }
+    }
+}
+
+/// Strict-mode authorization result that workflow/Robot/MCP surfaces can attach
+/// to refusals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStrictModeGate {
+    pub allowed: bool,
+    pub agent_type: AgentType,
+    pub agent_version: String,
+    pub strict_mode: AgentStrictMode,
+    pub receipt_id: Option<String>,
+    pub reason_codes: Vec<String>,
+    pub missing_requirements: Vec<String>,
+}
+
+/// Validation errors for compatibility receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCompatibilityValidationError {
+    UnsupportedSchemaVersion { observed: u32, expected: u32 },
+    UnsupportedAgentType { agent_type: AgentType },
+    EmptyField { field: &'static str },
+    TimestampNegative { field: &'static str, value: i64 },
+    MissingEvidence,
+}
+
+impl std::fmt::Display for AgentCompatibilityValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchemaVersion { observed, expected } => write!(
+                f,
+                "agent compatibility schema version {observed} is unsupported; expected {expected}"
+            ),
+            Self::UnsupportedAgentType { agent_type } => {
+                write!(f, "agent compatibility cannot certify {agent_type}")
+            }
+            Self::EmptyField { field } => {
+                write!(
+                    f,
+                    "agent compatibility receipt field {field} must not be empty"
+                )
+            }
+            Self::TimestampNegative { field, value } => {
+                write!(
+                    f,
+                    "agent compatibility receipt {field} is negative: {value}"
+                )
+            }
+            Self::MissingEvidence => write!(
+                f,
+                "agent compatibility receipt must include at least one evidence source"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentCompatibilityValidationError {}
+
 /// Validation error taxonomy. Each variant maps to a specific
 /// invariant the handler enforces before persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,7 +994,10 @@ mod tests {
             command: Some("claude".to_string()),
             env: {
                 let mut m = HashMap::new();
-                m.insert("ANTHROPIC_API_KEY".to_string(), "sk-...".to_string());
+                m.insert(
+                    "AGENT_CONFIG_PATH".to_string(),
+                    "/tmp/agent-config".to_string(),
+                );
                 m
             },
             metadata: HashMap::new(),
@@ -518,7 +1078,7 @@ mod tests {
                 assert_eq!(len, SHELL_MAX_LEN + 1);
                 assert_eq!(max, SHELL_MAX_LEN);
             }
-            other => panic!("expected ShellTooLong; got {other:?}"),
+            other => assert!(false, "expected ShellTooLong; got {other:?}"),
         }
     }
 
@@ -531,7 +1091,7 @@ mod tests {
                 assert_eq!(len, COMMAND_MAX_LEN + 1);
                 assert_eq!(max, COMMAND_MAX_LEN);
             }
-            other => panic!("expected CommandTooLong; got {other:?}"),
+            other => assert!(false, "expected CommandTooLong; got {other:?}"),
         }
     }
 
@@ -546,7 +1106,7 @@ mod tests {
                 assert_eq!(len, ENV_MAX_COUNT + 10);
                 assert_eq!(max, ENV_MAX_COUNT);
             }
-            other => panic!("expected TooManyEnvEntries; got {other:?}"),
+            other => assert!(false, "expected TooManyEnvEntries; got {other:?}"),
         }
     }
 
@@ -561,7 +1121,7 @@ mod tests {
                 assert_eq!(len, ENV_VALUE_MAX_LEN + 1);
                 assert_eq!(max, ENV_VALUE_MAX_LEN);
             }
-            other => panic!("expected EnvValueTooLong; got {other:?}"),
+            other => assert!(false, "expected EnvValueTooLong; got {other:?}"),
         }
     }
 
@@ -576,7 +1136,7 @@ mod tests {
                 assert_eq!(len, METADATA_MAX_COUNT + 5);
                 assert_eq!(max, METADATA_MAX_COUNT);
             }
-            other => panic!("expected TooManyMetadataEntries; got {other:?}"),
+            other => assert!(false, "expected TooManyMetadataEntries; got {other:?}"),
         }
     }
 
@@ -724,8 +1284,20 @@ mod tests {
     #[test]
     fn serde_round_trips_a_profile() {
         let p = sample_profile();
-        let json = serde_json::to_string(&p).unwrap();
-        let decoded: AgentProfile = serde_json::from_str(&json).unwrap();
+        let json = match serde_json::to_string(&p) {
+            Ok(json) => json,
+            Err(err) => {
+                assert!(false, "profile serialization failed: {err}");
+                return;
+            }
+        };
+        let decoded: AgentProfile = match serde_json::from_str(&json) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                assert!(false, "profile deserialization failed: {err}");
+                return;
+            }
+        };
         assert_eq!(p, decoded);
     }
 
@@ -737,7 +1309,13 @@ mod tests {
             "created_at_ms": 0,
             "updated_at_ms": 0
         }"#;
-        let p: AgentProfile = serde_json::from_str(json).unwrap();
+        let p: AgentProfile = match serde_json::from_str(json) {
+            Ok(profile) => profile,
+            Err(err) => {
+                assert!(false, "minimal profile deserialization failed: {err}");
+                return;
+            }
+        };
         assert_eq!(p.name, "minimal");
         assert_eq!(p.role, "");
         assert!(p.tags.is_empty());
@@ -900,9 +1478,10 @@ mod tests {
         ];
         let mut last_pos = 0;
         for col in &columns_in_order {
-            let pos = AGENT_PROFILES_SCHEMA
-                .find(col)
-                .unwrap_or_else(|| panic!("column {col} missing from schema"));
+            let Some(pos) = AGENT_PROFILES_SCHEMA.find(col) else {
+                assert!(false, "column {col} missing from schema");
+                return;
+            };
             assert!(
                 pos >= last_pos,
                 "column {col} (pos {pos}) appears before previous column (pos {last_pos}) — order drifted"
@@ -923,6 +1502,159 @@ mod tests {
             p.validate(),
             Ok(()),
             "tags accept arbitrary UTF-8 content (no charset restriction)"
+        );
+    }
+
+    fn certified_codex_receipt(version: &str) -> AgentCompatibilityReceipt {
+        AgentCompatibilityReceipt {
+            schema_version: AGENT_COMPATIBILITY_RECEIPT_SCHEMA_VERSION,
+            agent_type: AgentType::Codex,
+            agent_version: version.to_string(),
+            profile_id: "codex.default".to_string(),
+            profile_version: "2026-06-14".to_string(),
+            certified_at_ms: 1_797_200_000_000,
+            status: AgentCompatibilityStatus::Certified,
+            capabilities: AgentCompatibilityCapabilities {
+                composer_detection: AgentCapabilityStatus::Certified,
+                second_enter_behavior: AgentCapabilityStatus::Certified,
+                queued_state: AgentCapabilityStatus::Certified,
+                rate_limit_reset_parsing: AgentCapabilityStatus::Certified,
+                native_resume: AgentCapabilityStatus::Certified,
+                osc_133: AgentCapabilityStatus::Missing,
+                prompt_detection: AgentCapabilityStatus::Certified,
+                working_detection: AgentCapabilityStatus::Certified,
+                stuck_detection: AgentCapabilityStatus::Certified,
+                redaction_sensitive_fixtures: AgentCapabilityStatus::Certified,
+            },
+            evidence: AgentCompatibilityEvidence {
+                fixture_ids: vec![
+                    "codex-composer-basic".to_string(),
+                    "codex-redaction-sensitive".to_string(),
+                ],
+                semantic_query_count: 4,
+                submit_profile_id: Some("codex.default".to_string()),
+                retained_artifact_path: Some(
+                    "fixtures/agent-compatibility/codex-2026-06-14.jsonl".to_string(),
+                ),
+                redaction_fixture_count: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn compatibility_receipt_serializes_with_stable_golden_shape() {
+        let receipt = certified_codex_receipt("0.12.0");
+        let value = match serde_json::to_value(&receipt) {
+            Ok(value) => value,
+            Err(err) => {
+                assert!(false, "compatibility receipt serialization failed: {err}");
+                return;
+            }
+        };
+        let expected = serde_json::json!({
+            "schema_version": 1,
+            "agent_type": "codex",
+            "agent_version": "0.12.0",
+            "profile_id": "codex.default",
+            "profile_version": "2026-06-14",
+            "certified_at_ms": 1797200000000_i64,
+            "status": "certified",
+            "capabilities": {
+                "composer_detection": "certified",
+                "second_enter_behavior": "certified",
+                "queued_state": "certified",
+                "rate_limit_reset_parsing": "certified",
+                "native_resume": "certified",
+                "osc_133": "missing",
+                "prompt_detection": "certified",
+                "working_detection": "certified",
+                "stuck_detection": "certified",
+                "redaction_sensitive_fixtures": "certified"
+            },
+            "evidence": {
+                "fixture_ids": [
+                    "codex-composer-basic",
+                    "codex-redaction-sensitive"
+                ],
+                "semantic_query_count": 4,
+                "submit_profile_id": "codex.default",
+                "retained_artifact_path": "fixtures/agent-compatibility/codex-2026-06-14.jsonl",
+                "redaction_fixture_count": 1
+            }
+        });
+        assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn compatibility_receipt_validation_rejects_uncertifiable_agents() {
+        let mut receipt = certified_codex_receipt("0.12.0");
+        receipt.agent_type = AgentType::Wezterm;
+        assert_eq!(
+            receipt.validate(),
+            Err(AgentCompatibilityValidationError::UnsupportedAgentType {
+                agent_type: AgentType::Wezterm
+            })
+        );
+    }
+
+    #[test]
+    fn compatibility_matrix_upsert_is_queryable_by_agent_and_version() {
+        let mut matrix = AgentCompatibilityMatrix::default();
+        assert_eq!(matrix.upsert(certified_codex_receipt("0.12.0")), Ok(None));
+        assert_eq!(matrix.upsert(certified_codex_receipt("0.13.0")), Ok(None));
+
+        let codex_receipts = matrix.receipts_for_agent(AgentType::Codex);
+        assert_eq!(codex_receipts.len(), 2);
+        let Some(receipt) = matrix.get(AgentType::Codex, "0.13.0") else {
+            assert!(false, "matrix should return codex 0.13.0 receipt");
+            return;
+        };
+        assert_eq!(receipt.profile_id, "codex.default");
+    }
+
+    #[test]
+    fn strict_verified_submit_gate_allows_certified_receipt() {
+        let mut matrix = AgentCompatibilityMatrix::default();
+        assert_eq!(matrix.upsert(certified_codex_receipt("0.12.0")), Ok(None));
+
+        let gate =
+            matrix.gate_strict_mode(AgentType::Codex, "0.12.0", AgentStrictMode::VerifiedSubmit);
+        assert!(gate.allowed, "certified verified-submit gate should pass");
+        assert_eq!(
+            gate.reason_codes,
+            vec!["agent_compatibility:certified".to_string()]
+        );
+        assert!(gate.receipt_id.is_some());
+        assert!(gate.missing_requirements.is_empty());
+    }
+
+    #[test]
+    fn strict_mode_gate_refuses_uncertified_or_missing_capability() {
+        let matrix = AgentCompatibilityMatrix::default();
+        let missing_receipt_gate =
+            matrix.gate_strict_mode(AgentType::Codex, "0.12.0", AgentStrictMode::VerifiedSubmit);
+        assert!(!missing_receipt_gate.allowed);
+        assert_eq!(
+            missing_receipt_gate.reason_codes,
+            vec!["agent_compatibility:uncertified".to_string()]
+        );
+
+        let mut partial = certified_codex_receipt("0.12.0");
+        partial.capabilities.second_enter_behavior = AgentCapabilityStatus::Missing;
+        partial.status = AgentCompatibilityStatus::Partial;
+        let mut matrix = AgentCompatibilityMatrix::default();
+        assert_eq!(matrix.upsert(partial), Ok(None));
+
+        let gate =
+            matrix.gate_strict_mode(AgentType::Codex, "0.12.0", AgentStrictMode::VerifiedSubmit);
+        assert!(!gate.allowed);
+        assert!(
+            gate.reason_codes
+                .contains(&"agent_compatibility:status:partial".to_string())
+        );
+        assert!(
+            gate.missing_requirements
+                .contains(&"second_enter_behavior:missing".to_string())
         );
     }
 }
